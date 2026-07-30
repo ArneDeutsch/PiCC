@@ -1,17 +1,29 @@
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import { killProcessTreeByPid, listDescendantPids } from "../util/process-tree.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
-import type { ResolvedMcpConfig, ResolvedMcpServer } from "../types.js";
+import type {
+  EnabledRemoteMcpServer,
+  EnabledStdioMcpServer,
+  ResolvedMcpConfig,
+  ResolvedMcpServer,
+} from "../types.js";
+import {
+  classifyRemoteMcpFailure,
+  createRemoteMcpTransport,
+  type RemoteMcpDisconnect,
+  type RemoteMcpTransportHandle,
+} from "./mcp-remote.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 /**
- * MCP stdio runtime manager.
+ * MCP runtime manager.
  *
- * Starts the ENABLED servers of a {@link ResolvedMcpConfig} as long-lived
- * stdio child processes via the `@modelcontextprotocol/sdk` client, exposes
- * their tools and a call API, and kills every server (process trees included,
- * Windows too) at shutdown. Session-global and non-blocking: `start()`
+ * Starts the ENABLED servers of a {@link ResolvedMcpConfig} through the
+ * `@modelcontextprotocol/sdk` client, exposes
+ * their tools and a call API, and at shutdown closes owned remote clients and
+ * transports while killing owned stdio process trees (Windows too). Session-global
+ * and non-blocking: `start()`
  * returns immediately, connects run in the background bounded by
  * `MCP_TIMEOUT`, and every failure degrades to a diagnostic — never a throw,
  * never a crash. With zero enabled servers nothing is imported and nothing is
@@ -105,6 +117,8 @@ export interface McpTimeoutPolicy {
   environmentToolTimeoutMs: number | undefined;
 }
 
+export type McpDelay = (delayMs: number, signal: AbortSignal) => Promise<void>;
+
 export interface McpRuntimeDeps {
   /**
    * Spawn cwd and `CLAUDE_PROJECT_DIR` — deliberately the project root, never
@@ -124,22 +138,45 @@ export interface McpRuntimeDeps {
   loadSdk?: () => Promise<McpSdk>;
   /** Test seam for deterministic connect-timeout settlement after test-owned readiness. */
   raceWithTimeout?: McpTimeoutRace;
+  /** Remote-only client loader; a failure must not affect stdio siblings. */
+  loadRemoteClient?: () => Promise<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>;
+  /** Remote transport factory seam for lifecycle tests; production uses the safe adapter. */
+  createRemoteTransport?: typeof createRemoteMcpTransport;
+  /** Abortable injected scheduler for retry policy tests; production uses unref'd timers. */
+  delay?: McpDelay;
 }
+
+export type McpLifecycleState =
+  | "connecting"
+  | "retrying"
+  | "connected"
+  | "reconnecting"
+  | "failed";
+
 
 export interface McpServerState {
   name: string;
-  state: "connecting" | "connected" | "failed";
+  transport: "stdio" | "http" | "sse";
+  state: McpLifecycleState;
+  attempt?: number;
+  attemptLimit?: number;
   toolCount?: number;
   diagnostic?: string;
   /** Bounded, non-secret failure class safe for direct status output. */
   statusSummary?: string;
 }
 
+type EnabledMcpServer = Extract<ResolvedMcpServer, { status: "enabled" }>;
+
 interface ServerHandle {
-  server: ResolvedMcpServer;
-  state: "connecting" | "connected" | "failed";
+  server: EnabledMcpServer;
+  state: McpLifecycleState;
+  attempt?: number;
+  attemptLimit?: number;
   client?: Client;
-  transport?: StdioClientTransport;
+  transport?: StdioClientTransport | RemoteMcpTransportHandle;
+  remoteAbort?: AbortController;
+  generation: number;
   /** Captured out-of-band: transport.pid nulls on close and connect() may never return. */
   pid?: number;
   pidPoller?: NodeJS.Timeout;
@@ -164,6 +201,7 @@ export class McpRuntime {
   private unsettledCount = 0;
   private shutdownPromise: Promise<void> | undefined;
   private exitHookRegistered = false;
+  private remoteClientCtorPromise?: Promise<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>;
 
   /**
    * Last-resort sweep for a dying harness process: taskkill (a spawn) cannot
@@ -200,6 +238,7 @@ export class McpRuntime {
         server,
         state: "connecting",
         tools: [],
+        generation: 0,
         stderrRing: "",
         stopped: false,
         settled: false,
@@ -235,11 +274,14 @@ export class McpRuntime {
     return this.connectTimeoutMs;
   }
 
-  /** Tools of already-connected servers — possibly incomplete (initially `[]`) before settle; servers settle individually. */
+  /** First catalogs retained after discovery; the aggregate is incomplete until initial settlement. */
   tools(): McpToolInfo[] {
     const out: McpToolInfo[] = [];
     for (const handle of this.handles) {
-      if (handle.state === "connected") out.push(...handle.tools);
+      if (
+        handle.tools.length > 0 &&
+        (handle.server.transport !== "stdio" || handle.state === "connected")
+      ) out.push(...handle.tools);
     }
     return out;
   }
@@ -257,8 +299,11 @@ export class McpRuntime {
   serverStates(): McpServerState[] {
     return this.handles.map((handle) => ({
       name: handle.server.name,
+      transport: handle.server.transport,
       state: handle.state,
-      ...(handle.state === "connected" ? { toolCount: handle.tools.length } : {}),
+      ...(handle.attempt !== undefined ? { attempt: handle.attempt } : {}),
+      ...(handle.attemptLimit !== undefined ? { attemptLimit: handle.attemptLimit } : {}),
+      ...(handle.tools.length > 0 || handle.state === "connected" ? { toolCount: handle.tools.length } : {}),
       ...(handle.diagnostic !== undefined ? { diagnostic: handle.diagnostic } : {}),
       ...(handle.statusSummary !== undefined ? { statusSummary: handle.statusSummary } : {}),
     }));
@@ -274,11 +319,14 @@ export class McpRuntime {
         `MCP server "${neutralizeControlChars(serverName)}" is not running (not configured or not enabled)`,
       );
     }
+    if (handle.state === "reconnecting" || handle.state === "retrying") {
+      throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
+    }
     if (handle.state !== "connected" || !handle.client) {
-      throw new Error(
-        `MCP server "${serverName}" is not connected` +
-          (handle.diagnostic ? ` (${handle.diagnostic})` : ""),
-      );
+      const suffix = handle.tools.length > 0
+        ? " is unavailable because its remote connection failed"
+        : " is not connected";
+      throw new Error(`MCP server "${serverName}"${suffix}`);
     }
     if (!handle.tools.some((tool) => tool.toolName === toolName)) {
       throw new Error(
@@ -302,6 +350,26 @@ export class McpRuntime {
           `MCP tool "${toolName}" on server "${serverName}" timed out after ${timeoutMs} ms`,
         );
       }
+      if (handle.server.transport !== "stdio" && !handle.stopped) {
+        const lifecycleState = handle.state as McpLifecycleState;
+        if (lifecycleState === "reconnecting" || lifecycleState === "retrying") {
+          throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
+        }
+        if (lifecycleState === "failed" && handle.tools.length > 0) {
+          throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
+        }
+      }
+      if (handle.server.transport !== "stdio" && isRemoteTransportFailure(err)) {
+        const failure = classifyRemoteMcpFailure(err, { stage: "call" });
+        if (failure.class === "transient") {
+          this.beginRecovery(handle, { kind: "abrupt-stream-failure" });
+          throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
+        }
+        if (failure.class !== "cancelled") {
+          this.failRemotePermanently(handle, failure.class);
+          throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
+        }
+      }
       // Reachable only on a connected server, so spawn-path error text (which
       // embeds the expanded command) never flows here; the message is the
       // server's own protocol-level speech — bounded and neutralized.
@@ -322,37 +390,46 @@ export class McpRuntime {
   // -------------------------------------------------------------------------
 
   private async connectAll(): Promise<void> {
-    let sdk: McpSdk;
-    try {
-      // Lazy import (not top-level): a broken @modelcontextprotocol/sdk
-      // install must degrade this session to MCP-unavailable diagnostics
-      // instead of failing extension load.
-      if (this.deps.loadSdk) {
-        sdk = await this.deps.loadSdk();
-      } else {
-        const [clientMod, stdioMod] = await Promise.all([
-          import("@modelcontextprotocol/sdk/client/index.js"),
-          import("@modelcontextprotocol/sdk/client/stdio.js"),
-        ]);
-        sdk = { Client: clientMod.Client, StdioClientTransport: stdioMod.StdioClientTransport };
+    const stdioHandles = this.handles.filter(
+      (handle): handle is ServerHandle & { server: EnabledStdioMcpServer } =>
+        handle.server.transport === "stdio",
+    );
+    const remoteHandles = this.handles.filter(
+      (handle): handle is ServerHandle & { server: EnabledRemoteMcpServer } =>
+        handle.server.transport !== "stdio",
+    );
+    let stdioSdk: McpSdk | undefined;
+    if (stdioHandles.length > 0) {
+      try {
+        if (this.deps.loadSdk) {
+          stdioSdk = await this.deps.loadSdk();
+        } else {
+          const [clientMod, stdioMod] = await Promise.all([
+            import("@modelcontextprotocol/sdk/client/index.js"),
+            import("@modelcontextprotocol/sdk/client/stdio.js"),
+          ]);
+          stdioSdk = { Client: clientMod.Client, StdioClientTransport: stdioMod.StdioClientTransport };
+        }
+      } catch (err) {
+        const summary = errSummary(err);
+        for (const handle of stdioHandles) {
+          this.settleHandle(
+            handle,
+            "failed",
+            `MCP server "${handle.server.name}": @modelcontextprotocol/sdk failed to load (${summary}); MCP support unavailable`,
+            "MCP support is unavailable because its SDK could not be loaded.",
+          );
+        }
       }
-    } catch (err) {
-      const summary = errSummary(err);
-      for (const handle of this.handles) {
-        this.settleHandle(
-          handle,
-          "failed",
-          `MCP server "${handle.server.name}": @modelcontextprotocol/sdk failed to load (${summary}); MCP support unavailable`,
-          "MCP support is unavailable because its SDK could not be loaded.",
-        );
-      }
-      return;
     }
-    await Promise.all(this.handles.map((handle) => this.connectOne(handle, sdk)));
+    await Promise.all([
+      ...(stdioSdk === undefined ? [] : stdioHandles.map((handle) => this.connectStdio(handle, stdioSdk!))),
+      ...remoteHandles.map((handle) => this.connectRemoteInitial(handle)),
+    ]);
   }
 
-  private async connectOne(
-    handle: ServerHandle,
+  private async connectStdio(
+    handle: ServerHandle & { server: EnabledStdioMcpServer },
     sdk: McpSdk,
   ): Promise<void> {
     const server = handle.server;
@@ -480,8 +557,9 @@ export class McpRuntime {
       // Fast-fail backstop: a spawn that errors within the first poll tick can
       // beat the pid poller — re-capture from the transport before deciding
       // whether anything needs killing.
-      if (handle.pid === undefined && typeof handle.transport?.pid === "number") {
-        handle.pid = handle.transport.pid;
+      const liveTransport = handle.transport as StdioClientTransport | undefined;
+      if (handle.pid === undefined && typeof liveTransport?.pid === "number") {
+        handle.pid = liveTransport.pid;
       }
       if (handle.stopped || handle.settled) return;
       if (handle.pid !== undefined) killProcessTreeByPid(handle.pid);
@@ -505,6 +583,299 @@ export class McpRuntime {
         "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
       );
     }
+  }
+
+  private async remoteClientCtor(): Promise<typeof import("@modelcontextprotocol/sdk/client/index.js").Client> {
+    // Keep the remote-only SDK path lazy so an unavailable remote module cannot
+    // break healthy stdio siblings or the zero-enabled path.
+    this.remoteClientCtorPromise ??= this.deps.loadRemoteClient
+      ? this.deps.loadRemoteClient()
+      : import("@modelcontextprotocol/sdk/client/index.js").then((module) => module.Client);
+    return this.remoteClientCtorPromise;
+  }
+
+  private async connectRemoteInitial(
+    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+  ): Promise<void> {
+    const epoch = ++handle.generation;
+    const controller = new AbortController();
+    handle.remoteAbort = controller;
+    const sequence = this.remoteInitialSequence(handle, epoch, controller.signal);
+    sequence.catch(() => undefined);
+    const outcome = await (this.deps.raceWithTimeout ?? raceWithTimeout)(sequence, this.connectTimeoutMs);
+    if (handle.stopped || handle.generation !== epoch) return;
+    if (outcome.timedOut) {
+      handle.generation += 1;
+      controller.abort();
+      void this.closeRemoteParts(handle, 0);
+      this.settleHandle(
+        handle,
+        "failed",
+        `MCP server "${handle.server.name}" exhausted its aggregate remote startup budget.`,
+        "Remote MCP startup timed out within the aggregate MCP_TIMEOUT budget; check the endpoint and network, adjust MCP_TIMEOUT if appropriate, then reload or start a new session.",
+      );
+    }
+  }
+
+  private async remoteInitialSequence(
+    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    epoch: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const delays = [1_000, 2_000, 4_000] as const;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      if (!this.remoteCurrent(handle, epoch, signal)) return;
+      handle.state = attempt === 1 ? "connecting" : "retrying";
+      handle.attempt = attempt;
+      handle.attemptLimit = 4;
+      try {
+        const connected = await this.openRemote(handle, epoch, signal);
+        if (!this.remoteCurrent(handle, epoch, signal)) {
+          await connected.transport.abort().catch(() => undefined);
+          return;
+        }
+        handle.client = connected.client;
+        handle.transport = connected.transport;
+        handle.tools = this.validateTools(handle.server.name, connected.tools);
+        handle.attempt = undefined;
+        handle.attemptLimit = undefined;
+        this.settleHandle(handle, "connected");
+        return;
+      } catch (error) {
+        await this.closeRemoteParts(handle);
+        if (!this.remoteCurrent(handle, epoch, signal)) return;
+        const failure = remoteAttemptFailure(error);
+        if (failure.class !== "transient" || attempt === 4) {
+          this.settleHandle(
+            handle,
+            "failed",
+            `MCP server "${handle.server.name}" remote startup failed (${failure.class}).`,
+            remoteFailureSummary(failure.class, attempt === 4),
+          );
+          return;
+        }
+        handle.state = "retrying";
+        handle.attempt = attempt + 1;
+        await (this.deps.delay ?? abortableDelay)(delays[attempt - 1]!, signal).catch(() => undefined);
+      }
+    }
+  }
+
+  private async openRemote(
+    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    epoch: number,
+    signal: AbortSignal,
+  ): Promise<{ client: Client; transport: RemoteMcpTransportHandle; tools: unknown[] }> {
+    const ClientCtor = await this.remoteClientCtor();
+    if (!this.remoteCurrent(handle, epoch, signal)) throw cancelledRemoteAttempt();
+    const factory = this.deps.createRemoteTransport ?? createRemoteMcpTransport;
+    const transport = await factory({
+      configuredType: handle.server.configuredType,
+      transportKind: handle.server.transport,
+      rawUrl: "",
+      rawHeaders: Object.create(null) as Record<string, string>,
+      url: handle.server.url,
+      headers: handle.server.headers,
+      ...(handle.server.sseDeprecation !== undefined
+        ? { sseDeprecation: handle.server.sseDeprecation }
+        : {}),
+    });
+    if (!this.remoteCurrent(handle, epoch, signal)) {
+      await transport.abort().catch(() => undefined);
+      throw cancelledRemoteAttempt();
+    }
+    handle.transport = transport;
+    const client = new ClientCtor({ name: "picc", version: "0.1.0" }, { capabilities: {} });
+    handle.client = client;
+    let published = false;
+    let transportLoss: RemoteMcpDisconnect | undefined;
+    transport.onDisconnect((event) => {
+      transportLoss = event;
+      if (published && this.remoteCurrent(handle, epoch, signal)) this.beginRecovery(handle, event);
+    });
+    transport.onerror = (error): void => {
+      if (!published || !this.remoteCurrent(handle, epoch, signal)) return;
+      const failure = classifyRemoteMcpFailure(error, { stage: "connection" });
+      if (failure.class === "transient") this.beginRecovery(handle, { kind: "abrupt-stream-failure" });
+      else if (failure.class !== "cancelled") this.failRemotePermanently(handle, failure.class);
+    };
+    try {
+      await client.connect(transport);
+    } catch (error) {
+      throw {
+        remoteFailure: classifyRemoteMcpFailure(error, {
+          stage: "connection",
+          ...(transportLoss !== undefined ? { transportLoss } : {}),
+        }),
+      };
+    }
+    if (!this.remoteCurrent(handle, epoch, signal)) {
+      if (handle.transport === transport) await this.closeRemoteParts(handle, 0);
+      throw cancelledRemoteAttempt();
+    }
+    let tools: unknown[];
+    try {
+      tools = await this.listRemoteTools(client, signal);
+    } catch (error) {
+      throw {
+        remoteFailure: classifyRemoteMcpFailure(error, {
+          stage: "discovery",
+          ...(transportLoss !== undefined ? { transportLoss } : {}),
+        }),
+      };
+    }
+    if (!this.remoteCurrent(handle, epoch, signal)) {
+      if (handle.transport === transport) await this.closeRemoteParts(handle, 0);
+      throw cancelledRemoteAttempt();
+    }
+    published = true;
+    return { client, transport, tools };
+  }
+
+  private async listRemoteTools(client: Client, signal: AbortSignal): Promise<unknown[]> {
+    const tools: unknown[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 16; page += 1) {
+      const listed = await client.listTools(
+        cursor === undefined ? {} : { cursor },
+        { signal, timeout: this.connectTimeoutMs, maxTotalTimeout: this.connectTimeoutMs },
+      );
+      tools.push(...listed.tools);
+      if (typeof listed.nextCursor !== "string" || listed.nextCursor === "") break;
+      cursor = listed.nextCursor;
+    }
+    return tools;
+  }
+
+  private beginRecovery(handle: ServerHandle, _event: RemoteMcpDisconnect): void {
+    if (handle.server.transport === "stdio" || handle.stopped) return;
+    if (handle.state === "reconnecting" || handle.state === "failed") return;
+    const epoch = ++handle.generation;
+    handle.state = "reconnecting";
+    handle.statusSummary = "Remote MCP connection was lost; bounded recovery is in progress.";
+    const oldController = handle.remoteAbort;
+    oldController?.abort();
+    const controller = new AbortController();
+    handle.remoteAbort = controller;
+    void this.closeRemoteParts(handle).then(() => this.recoveryLoop(
+      handle as ServerHandle & { server: EnabledRemoteMcpServer },
+      epoch,
+      controller.signal,
+    ));
+  }
+
+  private async recoveryLoop(
+    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    epoch: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const delays = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+    let loopEpoch = epoch;
+    for (let index = 0; index < delays.length; index += 1) {
+      handle.attempt = index + 1;
+      handle.attemptLimit = delays.length;
+      await (this.deps.delay ?? abortableDelay)(delays[index]!, signal).catch(() => undefined);
+      if (!this.remoteCurrent(handle, loopEpoch, signal)) return;
+      const attemptEpoch = ++handle.generation;
+      const attemptController = new AbortController();
+      const onLoopAbort = (): void => attemptController.abort();
+      signal.addEventListener("abort", onLoopAbort, { once: true });
+      const opening = (async () => {
+        try {
+          return await this.openRemote(handle, attemptEpoch, attemptController.signal);
+        } catch (error) {
+          // Cleanup is part of this attempt's single MCP_TIMEOUT budget. A
+          // stale attempt must not close a replacement published by a newer epoch.
+          if (handle.generation === attemptEpoch) await this.closeRemoteParts(handle);
+          throw error;
+        }
+      })();
+      opening.catch(() => undefined);
+      try {
+        const outcome = await (this.deps.raceWithTimeout ?? raceWithTimeout)(opening, this.connectTimeoutMs);
+        if (!this.remoteCurrent(handle, attemptEpoch, signal)) return;
+        if (outcome.timedOut) {
+          handle.generation += 1;
+          loopEpoch = handle.generation;
+          // Invalidate and initiate cleanup synchronously. A hanging close must
+          // not consume a second MCP_TIMEOUT before the next attempt can progress.
+          attemptController.abort();
+          void this.closeRemoteParts(handle, 0);
+          continue;
+        }
+        const connected = outcome.value;
+        handle.client = connected.client;
+        handle.transport = connected.transport;
+        // Discovery is required for connection health, but the first catalog is immutable.
+        handle.state = "connected";
+        handle.attempt = undefined;
+        handle.attemptLimit = undefined;
+        handle.diagnostic = undefined;
+        handle.statusSummary = undefined;
+        return;
+      } catch (error) {
+        const failure = remoteAttemptFailure(error);
+        if (failure.class !== "transient") {
+          this.failRemotePermanently(handle, failure.class);
+          return;
+        }
+        handle.generation += 1;
+        loopEpoch = handle.generation;
+      } finally {
+        signal.removeEventListener("abort", onLoopAbort);
+      }
+    }
+    if (!this.remoteCurrent(handle, loopEpoch, signal)) return;
+    handle.state = "failed";
+    handle.attempt = delays.length;
+    handle.attemptLimit = delays.length;
+    handle.diagnostic = `MCP server "${handle.server.name}" exhausted remote reconnect attempts.`;
+    handle.statusSummary = "Remote MCP recovery exhausted 5 reconnect attempts; check endpoint and network availability, then reload or start a new session.";
+    this.diags.push(handle.diagnostic);
+  }
+
+  private failRemotePermanently(handle: ServerHandle, failureClass: string): void {
+    if (handle.server.transport === "stdio" || handle.stopped || handle.state === "failed") return;
+    handle.generation += 1;
+    handle.remoteAbort?.abort();
+    void this.closeRemoteParts(handle, 0);
+    handle.state = "failed";
+    handle.attempt = undefined;
+    handle.attemptLimit = undefined;
+    handle.diagnostic = `MCP server "${handle.server.name}" remote connection failed (${failureClass}).`;
+    handle.statusSummary = remoteFailureSummary(failureClass, false);
+    this.diags.push(handle.diagnostic);
+  }
+
+  private remoteCurrent(handle: ServerHandle, epoch: number, signal: AbortSignal): boolean {
+    return !handle.stopped && !signal.aborted && handle.generation === epoch;
+  }
+
+  private async closeRemoteParts(
+    handle: ServerHandle,
+    maxWaitMs: number = this.connectTimeoutMs,
+  ): Promise<void> {
+    const client = handle.client;
+    const transport = handle.transport;
+    handle.client = undefined;
+    handle.transport = undefined;
+    const closing: Promise<unknown>[] = [];
+    if (client) {
+      try {
+        closing.push(client.close().catch(() => undefined));
+      } catch {
+        /* cleanup remains best-effort */
+      }
+    }
+    if (transport && "abort" in transport) {
+      try {
+        closing.push(transport.abort().catch(() => undefined));
+      } catch {
+        /* cleanup remains best-effort */
+      }
+    }
+    if (closing.length === 0 || maxWaitMs === 0) return;
+    await Promise.race([Promise.all(closing), sleep(maxWaitMs)]);
   }
 
   /**
@@ -582,8 +953,10 @@ export class McpRuntime {
   private async stopServer(handle: ServerHandle): Promise<void> {
     if (handle.stopped) return;
     handle.stopped = true;
+    handle.generation += 1;
+    handle.remoteAbort?.abort();
     this.clearPidPoller(handle);
-    if (!handle.settled && handle.state === "connecting") {
+    if (!handle.settled) {
       this.settleHandle(
         handle,
         "failed",
@@ -591,9 +964,18 @@ export class McpRuntime {
         "Connection stopped because the session shut down.",
       );
     }
+    if (handle.server.transport !== "stdio") {
+      await this.closeRemoteParts(handle, SHUTDOWN_GRACE_MS);
+      if (handle.state === "connected" || handle.state === "reconnecting") {
+        handle.state = "failed";
+        handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
+        handle.statusSummary = "Connection closed because the session shut down.";
+      }
+      return;
+    }
     // Backstop for the sub-poll-tick window: prefer the captured pid, fall
     // back to the transport's live value.
-    const transportPid = handle.transport?.pid;
+    const transportPid = (handle.transport as StdioClientTransport | undefined)?.pid;
     const pid = handle.pid ?? (typeof transportPid === "number" ? transportPid : undefined);
     // Snapshot the tree BEFORE the graceful close: once the direct child exits
     // on stdin-EOF its children reparent and no later walk can find them.
@@ -767,6 +1149,60 @@ function clampToolTimeout(ms: number): number {
  */
 function sliceForDiag(name: string): string {
   return name.length > DIAG_NAME_MAX_CHARS ? `${name.slice(0, DIAG_NAME_MAX_CHARS)}…` : name;
+}
+
+function cancelledRemoteAttempt(): { remoteFailure: ReturnType<typeof classifyRemoteMcpFailure> } {
+  return {
+    remoteFailure: { class: "cancelled", stage: "connection" },
+  };
+}
+
+function remoteAttemptFailure(error: unknown): ReturnType<typeof classifyRemoteMcpFailure> {
+  if (typeof error === "object" && error !== null && "remoteFailure" in error) {
+    const failure = (error as { remoteFailure?: unknown }).remoteFailure;
+    if (
+      typeof failure === "object" && failure !== null &&
+      "class" in failure && "stage" in failure
+    ) {
+      return failure as ReturnType<typeof classifyRemoteMcpFailure>;
+    }
+  }
+  return classifyRemoteMcpFailure(error, { stage: "connection" });
+}
+
+function isRemoteTransportFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const name = (error as { constructor?: { name?: string } }).constructor?.name;
+  return name === "RemoteMcpSafeError" || name === "StreamableHTTPError" || name === "SseError";
+}
+
+function remoteFailureSummary(failureClass: string, exhausted: boolean): string {
+  if (failureClass === "authentication") {
+    return "Remote MCP authentication failed; check configured static headers. Interactive OAuth is not supported; then reload or start a new session.";
+  }
+  if (failureClass === "not-found") {
+    return "Remote MCP endpoint was not found; check the configured URL without sharing it, then reload or start a new session.";
+  }
+  if (exhausted) {
+    return "Remote MCP startup exhausted 4 attempts; check endpoint and network availability, then reload or start a new session.";
+  }
+  return "Remote MCP connection failed permanently; check endpoint and network availability, then reload or start a new session.";
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error("cancelled"));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new Error("cancelled"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function sleep(ms: number): Promise<void> {

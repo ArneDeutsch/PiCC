@@ -11,6 +11,7 @@ import {
 import { resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
 import { loadClaudeProject } from "../src/project.js";
 import type {
+  EnabledStdioMcpServer,
   McpSettingsEntry,
   ResolvedMcpConfig,
   ResolvedMcpServer,
@@ -75,8 +76,8 @@ function resolve(opts: {
   });
 }
 
-function server(cfg: ResolvedMcpConfig, name: string): ResolvedMcpServer | undefined {
-  return cfg.servers.find((s) => s.name === name);
+function server(cfg: ResolvedMcpConfig, name: string): EnabledStdioMcpServer | undefined {
+  return cfg.servers.find((s) => s.name === name) as EnabledStdioMcpServer | undefined;
 }
 
 const gitAvailable = (() => {
@@ -180,38 +181,53 @@ describe("normalizeMcpServerBlock — entry validation", () => {
     );
     expect(servers[0]?.skipped).toBe(true);
     expect(servers[0]?.diagnostics[0]).toContain('"remote"');
-    expect(servers[0]?.diagnostics[0]).toContain('has a "url" but no "type"');
-    expect(servers[0]?.diagnostics[0]).toContain("not supported yet");
+    expect(servers[0]?.diagnostics[0]).toContain('has a "url" but no explicit remote "type"');
+    expect(servers[0]?.diagnostics[0]).toContain('use "http", "streamable-http", or "sse"');
   });
 
-  it.each(["http", "streamable-http", "sse", "ws"])(
-    "skips explicit remote transport type %s (deferred)",
+  it.each(["http", "streamable-http", "sse"] as const)(
+    "accepts explicit remote transport type %s as raw, unexpanded configuration",
     (type) => {
       const servers = normalizeMcpServerBlock(
         { h: { type, url: "https://example.com/mcp" } },
         ".mcp.json",
       );
-      expect(servers[0]?.skipped).toBe(true);
-      expect(servers[0]?.diagnostics[0]).toContain(`remote transport "${type}"`);
-      expect(servers[0]?.diagnostics[0]).toContain("not supported yet");
+      expect(servers[0]?.skipped).toBe(false);
+      expect(servers[0]?.remote).toMatchObject({
+        configuredType: type,
+        transportKind: type === "sse" ? "sse" : "http",
+        rawUrl: "https://example.com/mcp",
+      });
     },
   );
+
+  it("skips explicit WebSocket transport with actionable guidance", () => {
+    const server = normalizeMcpServerBlock(
+      { h: { type: "ws", url: "https://example.com/mcp" } },
+      ".mcp.json",
+    )[0]!;
+    expect(server.skipped).toBe(true);
+    expect(server.diagnostics[0]).toContain('unsupported WebSocket transport "ws"');
+  });
 
   it("skips unknown transport types", () => {
     const servers = normalizeMcpServerBlock({ h: { type: "carrier-pigeon", command: "x" } }, ".mcp.json");
     expect(servers[0]?.skipped).toBe(true);
     expect(servers[0]?.diagnostics[0]).toContain('unsupported type "carrier-pigeon"');
-    expect(servers[0]?.diagnostics[0]).toContain('only "stdio" is currently supported');
+    expect(servers[0]?.diagnostics[0]).toContain('"http", "streamable-http", and "sse" are supported');
   });
 
-  it('RUNS an otherwise-valid stdio entry with a stray "url" key (Claude strips unknown keys)', () => {
-    const servers = normalizeMcpServerBlock(
+  it("keeps an untyped valid-command entry as stdio and diagnoses a stray URL", () => {
+    const server = normalizeMcpServerBlock(
       { s: { command: "x", url: "https://example.com/mcp" } },
       ".mcp.json",
-    );
-    expect(servers[0]?.skipped).toBe(false);
-    expect(servers[0]?.command).toBe("x");
-    expect(servers[0]?.diagnostics.some((d) => d.includes('"url" is ignored on a stdio server'))).toBe(true);
+    )[0]!;
+    expect(server.skipped).toBe(false);
+    expect(server.command).toBe("x");
+    expect(server.remote).toBeUndefined();
+    expect(server.diagnostics).toEqual([
+      'MCP server "s": field "url" is ignored on a stdio server',
+    ]);
   });
 
   it("keeps a positive-integer timeout below 1000 ms ignored-with-fallthrough (server still runs)", () => {
@@ -262,15 +278,28 @@ describe("normalizeMcpServerBlock — entry validation", () => {
     expect(s.diagnostics.some((d) => d.includes('unknown field "cwd"'))).toBe(true);
   });
 
-  it('recognizes the deferred Claude fields "alwaysLoad"/"role" (no unknown-field noise, server runs)', () => {
+  it('recognizes deferred Claude fields without parsing their values or preventing startup', () => {
+    const oauthCanary = "OAUTH_VALUE_CANARY";
     const servers = normalizeMcpServerBlock(
-      { s: { command: "x", alwaysLoad: true, role: "reviewer" } },
+      { s: { command: "x", alwaysLoad: true, role: "reviewer", oauth: { token: oauthCanary } } },
       ".mcp.json",
     );
     const s = servers[0]!;
     expect(s.skipped).toBe(false);
     expect(s.diagnostics.some((d) => d.includes("unknown field"))).toBe(false);
-    expect(s.diagnostics.filter((d) => d.includes("deferred feature"))).toHaveLength(2);
+    expect(s.diagnostics.filter((d) => d.includes("deferred feature"))).toHaveLength(3);
+    expect(s.diagnostics).toContain(
+      'MCP server "s": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(JSON.stringify(s)).not.toContain(oauthCanary);
+
+    const resolved = resolve({
+      entries: [entry("user", "/user-settings", {
+        servers: { s: { command: "x", oauth: { token: oauthCanary } } },
+      })],
+    });
+    expect(server(resolved, "s")).toMatchObject({ status: "enabled", transport: "stdio", command: "x" });
+    expect(JSON.stringify(resolved)).not.toContain(oauthCanary);
   });
 
   it.each([
@@ -708,6 +737,7 @@ describe("resolveMcpConfig — source precedence", () => {
     if (sources.includes("project")) entries.push(entry("project", project, { servers: { srv: { command: "project-cmd" } } }));
     if (sources.includes("local")) entries.push(entry("local", local, { servers: { srv: { command: "local-cmd" } } }));
     if (sources.includes("managed")) entries.push(entry("managed", managed, { servers: { srv: { command: "managed-cmd" } } }));
+    entries.push(entry("user", `${user}.approval`, { enabledMcpjsonServers: ["srv"] }));
     return resolve({
       mcpJson: sources.includes("mcpjson") ? mcpJsonOf({ srv: { command: "json-cmd" } }) : EMPTY_MCP_JSON,
       entries,
@@ -739,6 +769,7 @@ describe("resolveMcpConfig — source precedence", () => {
       entries: [
         // Higher precedence but sparser entry — its absence of args/env/timeout must win too.
         entry("project", project, { servers: { srv: { command: "project-cmd" } } }),
+        entry("user", `${user}.approval`, { enabledMcpjsonServers: ["srv"] }),
       ],
     });
     const winner = server(cfg, "srv")!;
@@ -755,6 +786,7 @@ describe("resolveMcpConfig — source precedence", () => {
       entries: [
         entry("project", rootSettings, { servers: { srv: { command: "root-cmd" } } }),
         entry("project", nestedSettings, { servers: { srv: { command: "nested-cmd" } } }),
+        entry("user", `${user}.approval`, { enabledMcpjsonServers: ["srv"] }),
       ],
     });
     expect(server(cfg, "srv")?.command).toBe("nested-cmd");
@@ -790,6 +822,7 @@ describe("resolveMcpConfig — ${VAR} expansion", () => {
           env: { TOKEN: "${MCP_TOKEN}" },
         },
       }),
+      entries: [entry("user", "/approval", { enabledMcpjsonServers: ["srv"] })],
       env: { MCP_BIN: "/usr/bin/mcp", MCP_TOKEN: "secret-token" } as NodeJS.ProcessEnv,
     });
     const srv = server(cfg, "srv")!;
@@ -806,6 +839,7 @@ describe("resolveMcpConfig — ${VAR} expansion", () => {
       mcpJson: mcpJsonOf({
         srv: { command: "${MCP_GONE}", args: ["${MCP_GONE}"], env: { K: "${MCP_GONE}" } },
       }),
+      entries: [entry("user", "/approval", { enabledMcpjsonServers: ["srv"] })],
       env: {} as NodeJS.ProcessEnv,
     });
     const srv = server(cfg, "srv")!;
@@ -822,12 +856,119 @@ describe("resolveMcpConfig — ${VAR} expansion", () => {
       mcpJson: mcpJsonOf({
         srv: { command: "${MCP_SECRET_BIN}", args: [], env: { K: "${MCP_ALSO_GONE}" } },
       }),
+      entries: [entry("user", "/approval", { enabledMcpjsonServers: ["srv"] })],
       env: { MCP_SECRET_BIN: "hunter2-binary" } as NodeJS.ProcessEnv,
     });
     const srv = server(cfg, "srv")!;
     expect(srv.command).toBe("hunter2-binary");
     for (const d of [...srv.diagnostics, ...cfg.diagnostics]) {
       expect(d).not.toContain("hunter2-binary");
+    }
+  });
+});
+
+describe("resolveMcpConfig — remote arms and secret materialization", () => {
+  it("expands approved HTTP URL/static headers from ambient env and retains alias identity", () => {
+    const cfg = resolve({
+      entries: [entry("user", "/user-settings", {
+        servers: {
+          remote: {
+            type: "streamable-http",
+            url: "https://${HOST}/mcp",
+            headers: { Authorization: "Bearer ${TOKEN}", "X-Mode": "${MODE:-safe}" },
+          },
+        },
+      })],
+      env: { HOST: "example.test", TOKEN: "secret" },
+    });
+    expect(server(cfg, "remote")).toMatchObject({
+      status: "enabled",
+      transport: "http",
+      configuredType: "streamable-http",
+      url: "https://example.test/mcp",
+      headers: { Authorization: "Bearer secret", "X-Mode": "safe" },
+    });
+  });
+
+  it("never expands or materializes secret templates on pending, disabled, or not-configured arms", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({
+        pending: { type: "http", url: "https://${PENDING_SECRET}/mcp", headers: { Authorization: "${TOKEN}" } },
+        disabled: { type: "sse", url: "https://${DISABLED_SECRET}/sse", headers: { Authorization: "${TOKEN}" } },
+        empty: { type: "http", url: "" },
+      }),
+      entries: [entry("user", "/approval", { disabledMcpjsonServers: ["disabled"] })],
+      env: {},
+    });
+    expect(cfg.servers.map((item) => [item.name, item.status, item.transport])).toEqual([
+      ["pending", "pending-approval", "http"],
+      ["disabled", "disabled", "sse"],
+      ["empty", "not-configured", "http"],
+    ]);
+    for (const item of cfg.servers) {
+      expect(item).not.toHaveProperty("url");
+      expect(item).not.toHaveProperty("headers");
+      expect(JSON.stringify(item)).not.toMatch(/PENDING_SECRET|DISABLED_SECRET|TOKEN/u);
+    }
+  });
+
+  it("skips enabled remote entries whose expanded endpoint is invalid without leaking values", () => {
+    const cfg = resolve({
+      entries: [entry("user", "/user-settings", {
+        servers: { remote: { type: "http", url: "${BAD_URL}", headers: {} } },
+      })],
+      env: { BAD_URL: "SECRET_INVALID_ENDPOINT" },
+    });
+    const resolved = cfg.servers[0]!;
+    expect(resolved.status).toBe("skipped");
+    expect(resolved).not.toHaveProperty("url");
+    expect(resolved.diagnostics.join("\n")).toContain("malformed expanded URL");
+    expect(resolved.diagnostics.join("\n")).not.toContain("SECRET_INVALID_ENDPOINT");
+  });
+
+  it("keeps a project remote approved by name after its URL and headers change", () => {
+    const approval = entry("user", "/approval", { enabledMcpjsonServers: ["remote"] });
+    const first = resolve({
+      mcpJson: mcpJsonOf({ remote: { type: "http", url: "https://first.example/mcp", headers: { Authorization: "one" } } }),
+      entries: [approval],
+    });
+    const changed = resolve({
+      mcpJson: mcpJsonOf({ remote: { type: "http", url: "https://changed.example/mcp", headers: { Authorization: "two" } } }),
+      entries: [approval],
+    });
+    expect(server(first, "remote")).toMatchObject({ status: "enabled", url: "https://first.example/mcp" });
+    expect(server(changed, "remote")).toMatchObject({ status: "enabled", url: "https://changed.example/mcp" });
+  });
+
+  it("never expands a losing lower-precedence remote definition", () => {
+    const cfg = resolve({
+      entries: [
+        entry("user", "/user-settings", {
+          servers: { remote: { type: "http", url: "https://${LOSING_SECRET}/mcp", headers: { Authorization: "${TOKEN}" } } },
+        }),
+        entry("managed", "/managed-settings", {
+          servers: { remote: { type: "http", url: "https://winner.example/mcp" } },
+        }),
+      ],
+      env: {},
+    });
+    expect(cfg.servers).toHaveLength(1);
+    expect(cfg.servers[0]).toMatchObject({ status: "enabled", url: "https://winner.example/mcp" });
+    expect(JSON.stringify(cfg)).not.toMatch(/LOSING_SECRET|TOKEN/u);
+  });
+
+  it("keeps inactive union arms free of every enabled-arm field", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({
+        pendingRemote: { type: "http", url: "https://example.test/mcp" },
+        pendingStdio: { command: "stdio-command" },
+      }),
+    });
+    for (const resolved of cfg.servers) {
+      expect(resolved.status).not.toBe("enabled");
+      for (const key of ["command", "args", "env", "rawCommand", "url", "headers", "sseDeprecation"]) {
+        expect(resolved).not.toHaveProperty(key);
+      }
     }
   });
 });
@@ -850,6 +991,38 @@ describe("loadClaudeProject — mcp assembly", () => {
     const root = makeTmp();
     const project = loadFrom(root);
     expect(project.mcp).toEqual({ servers: [], diagnostics: [] });
+  });
+
+  it("uses ambient env rather than settings.env for remote interpolation end to end", () => {
+    const root = makeTmp();
+    const variable = "PICC_MCP_AMBIENT_SETTINGS_MATRIX";
+    const previous = process.env[variable];
+    process.env[variable] = "ambient.example";
+    writeJson(path.join(root, ".mcp.json"), {
+      mcpServers: { remote: { type: "http", url: `https://\${${variable}}/mcp` } },
+    });
+    writeJson(path.join(root, ".claude", "settings.json"), {
+      env: { [variable]: "settings.example" },
+    });
+    writeJson(path.join(root, ".claude", "settings.local.json"), {
+      enabledMcpjsonServers: ["remote"],
+    });
+    try {
+      const project = loadClaudeProject({
+        cwd: root,
+        userDir: path.join(root, "no-such-home", ".claude"),
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+      });
+      expect(server(project.mcp, "remote")).toMatchObject({
+        status: "enabled",
+        transport: "http",
+        url: "https://ambient.example/mcp",
+      });
+    } finally {
+      if (previous === undefined) delete process.env[variable];
+      else process.env[variable] = previous;
+    }
   });
 
   it("resolves .mcp.json + settings.local.json approval end to end", () => {

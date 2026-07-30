@@ -33,6 +33,12 @@ PiCC adds compatibility behavior around Pi, so it must preserve these boundaries
   operation promises.
 - **Secrets handled by PiCC.** Authentication tokens, file contents, and other sensitive values must
   not be added unnecessarily to PiCC logs, transcripts, errors, or subagent prompts.
+- **Remote MCP boundary.** Remote transport data is untrusted. PiCC confines configured static
+  authentication material to the currently configured endpoint origin rather than forwarding it
+  across cross-origin or secure-to-insecure redirects. PiCC-owned configuration, transport, status,
+  diagnostic, and local-error surfaces do not expose secret-bearing URL/header values or raw
+  non-protocol HTTP failure data; approved MCP metadata, results, and protocol-level tool errors
+  remain untrusted server-controlled content visible to the model.
 
 Model output and project content are untrusted inputs to those promises. They are not separate
 operating-system principals: after the user authorizes an arbitrary command, that command has the

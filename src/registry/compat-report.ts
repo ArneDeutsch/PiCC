@@ -157,7 +157,9 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     addFinding(deferredSettingCapability(key), `settings key "${key}" (${scope} scope)`);
   }
   for (const { key, scope } of settings.unknownKeys) {
-    unassessed.push(`settings key "${key}" (${scope} scope)`);
+    const capability = lookupCapability(`setting.${key}`);
+    if (capability) addFinding(capability, `settings key "${key}" (${scope} scope)`);
+    else unassessed.push(`settings key "${key}" (${scope} scope)`);
   }
 
   // --- Hook configs (settings + skill-scoped) -----------------------------
@@ -304,20 +306,79 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       );
     }
   }
-  for (const server of mcp.servers) {
-    const cap = lookupCapability("feature.mcp");
-    if (!cap) continue;
-    if (server.diagnostics.length > 0) {
+  const mcpDiagnosticServers: Array<{
+    server: ResolvedMcpConfig["servers"][number];
+    priority: number;
+    index: number;
+  }> = [];
+  for (const [index, server] of mcp.servers.entries()) {
+    if (server.diagnostics.length === 0 && server.status !== "skipped") continue;
+    const priority = server.status === "skipped" || server.status === "pending-approval"
+      ? 0
+      : server.status === "enabled"
+        ? 1
+        : 2;
+    mcpDiagnosticServers.push({ server, priority, index });
+  }
+  const selectedMcpServers = mcpDiagnosticServers.length <= MCP_STATUS_DETAIL_MAX
+    ? mcpDiagnosticServers
+    : [...mcpDiagnosticServers]
+        .sort((left, right) => left.priority - right.priority || left.index - right.index)
+        .slice(0, MCP_STATUS_DETAIL_MAX);
+  for (const { server } of selectedMcpServers) {
+    const oauthDiagnostic = `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`;
+    if (server.diagnostics.includes(oauthDiagnostic)) {
+      const capability = lookupCapability("feature.mcp-oauth");
+      if (capability) {
+        addFinding(
+          capability,
+          mcpStatusScalar(oauthDiagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+        );
+      }
+    }
+
+    const remainingDiagnostics = server.diagnostics.filter(
+      (diagnostic) => diagnostic !== oauthDiagnostic,
+    );
+    let evidence: string | undefined;
+    if (remainingDiagnostics.length > 0) {
       // Most stored diagnostics already quote the server name; the resolver's
       // unset-${VAR} warnings do not — prefix those so every finding names its
       // server (never expanded values, the diagnostics are raw-only).
-      const named = server.diagnostics.map((d) =>
-        d.includes(`"${server.name}"`) ? d : `MCP server "${server.name}": ${d}`,
+      evidence = remainingDiagnostics.map((diagnostic) =>
+        diagnostic.includes(`"${server.name}"`)
+          ? diagnostic
+          : `MCP server "${server.name}": ${diagnostic}`,
+      ).join("; ");
+    } else if (server.diagnostics.length === 0 && server.status === "skipped") {
+      evidence = `MCP server "${server.name}" (${server.source}) skipped: invalid entry`;
+    }
+    if (evidence === undefined) continue;
+
+    const diagnosticText = remainingDiagnostics.join("\n");
+    const capabilityId = diagnosticText.includes("WebSocket transport")
+      ? "feature.mcp-websocket"
+      : diagnosticText.includes("headersHelper")
+        ? "feature.mcp-headers-helper"
+        : server.transport === "http" || server.transport === "sse"
+          ? "feature.mcp-remote-transports"
+          : "feature.mcp";
+    const capability = lookupCapability(capabilityId);
+    if (capability) {
+      addFinding(
+        capability,
+        mcpStatusScalar(evidence, MCP_POSTURE_DIAG_MAX_CHARS),
       );
-      addFinding(cap, named.join("; "));
-    } else if (server.status === "skipped") {
-      // A skipped server without stored diagnostics still surfaces, never silently.
-      addFinding(cap, `MCP server "${server.name}" (${server.source}) skipped: invalid entry`);
+    }
+  }
+  const omittedMcpServers = mcpDiagnosticServers.length - selectedMcpServers.length;
+  if (omittedMcpServers > 0) {
+    const capability = lookupCapability("feature.mcp");
+    if (capability) {
+      addFinding(
+        capability,
+        `${omittedMcpServers} additional MCP server diagnostic finding(s) omitted; inspect the MCP configuration for complete detail`,
+      );
     }
   }
   // Config-level diagnostics (malformed .mcp.json, ignored project-scope
@@ -432,7 +493,10 @@ function buildMcpPendingNotice(pendingNames: string[]): string {
  */
 export interface McpServerLiveState {
   name: string;
-  state: "connecting" | "connected" | "failed";
+  transport?: "stdio" | "http" | "sse";
+  state: "connecting" | "retrying" | "connected" | "reconnecting" | "failed";
+  attempt?: number;
+  attemptLimit?: number;
   toolCount?: number;
   diagnostic?: string;
   statusSummary?: string;
@@ -444,65 +508,107 @@ export interface McpServerLiveState {
  * pending/disabled/skipped server from discovery. Positive/live state lives
  * HERE — never as a finding.
  */
+function mcpTransportLabel(transport: "stdio" | "http" | "sse" | "unknown"): string {
+  return transport === "sse" ? "sse (deprecated; use http)" : transport;
+}
+
+function mcpInactiveTransportSuffix(
+  server: ResolvedMcpConfig["servers"][number],
+): string {
+  return server.transport === "sse" ? ` via ${mcpTransportLabel(server.transport)}` : "";
+}
+
 function mcpPostureLine(
   mcp: ResolvedMcpConfig,
   liveStates: readonly McpServerLiveState[],
 ): string {
   if (mcp.servers.length === 0) return "MCP: no servers configured.";
   const liveByName = new Map(liveStates.map((s) => [s.name, s]));
-  const parts = mcp.servers.map((server) => {
-    switch (server.status) {
+  const ordered = mcp.servers.length <= 32 ? mcp.servers : [...mcp.servers].sort((left, right) => {
+    const actionable = (server: ResolvedMcpConfig["servers"][number]): number => {
+      const live = liveByName.get(server.name);
+      const state = server.status === "enabled" ? live?.state : server.status;
+      return state === "retrying" || state === "reconnecting" || state === "failed" ||
+        state === "skipped" || state === "pending-approval" ? 0 : 1;
+    };
+    return actionable(left) - actionable(right);
+  });
+  const selected = ordered.slice(0, 32);
+  const parts = selected.map((server) => {
+    const status = server.status;
+    switch (status) {
       case "enabled": {
         const live = liveByName.get(server.name);
         // Enabled but unknown to the runtime (states not supplied — e.g. a
         // report rendered without a running session): claim only enablement.
-        if (!live) return `${server.name}: enabled`;
-        if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
-        if (live.state === "connecting") return `${server.name}: connecting`;
-        return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+        if (!live) return `${server.name}: enabled${mcpInactiveTransportSuffix(server)}`;
+        const liveTransport = live.transport ?? server.transport ?? "unknown";
+        const transport = mcpTransportLabel(liveTransport);
+        const attempts = live.attempt !== undefined && live.attemptLimit !== undefined
+          ? ` ${live.attempt}/${live.attemptLimit}`
+          : "";
+        if (liveTransport === "stdio") {
+          if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
+          if (live.state === "connecting") return `${server.name}: connecting`;
+          return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+        }
+        if (live.state === "connected") return `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connecting") return `${server.name}: connecting via ${transport}${attempts}`;
+        if (live.state === "retrying") return `${server.name}: retrying via ${transport}${attempts}`;
+        if (live.state === "reconnecting") return `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
+        return `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
       }
       case "pending-approval":
         // No enable/decline hint here — the pending finding rendered below
         // carries the bounded guidance; repeating it would duplicate it.
-        return `${server.name}: pending approval`;
+        return `${server.name}: pending approval${mcpInactiveTransportSuffix(server)}`;
       case "disabled":
-        return `${server.name}: disabled (disabledMcpjsonServers)`;
+        return `${server.name}: disabled${mcpInactiveTransportSuffix(server)} (disabledMcpjsonServers)`;
+      case "not-configured":
+        return `${server.name}: not configured${mcpInactiveTransportSuffix(server)}`;
       case "skipped": {
         const reason = server.diagnostics[0];
-        return `${server.name}: skipped${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
-      }
-      default: {
-        // Exhaustiveness backstop: a new ResolvedMcpServer status must be
-        // rendered deliberately, never silently mislabeled as skipped.
-        const unreachable: never = server.status;
-        return `${server.name}: ${String(unreachable)}`;
+        return `${server.name}: skipped${mcpInactiveTransportSuffix(server)}${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
       }
     }
+    // Keep discovery status additions from silently rendering as undefined.
+    const unhandledStatus: never = status;
+    return unhandledStatus;
   });
-  return `MCP servers: ${parts.join("; ")}.`;
+  const omitted = mcp.servers.length - selected.length;
+  const suffix = omitted > 0
+    ? `; ${omitted} additional server name(s) omitted — inspect the MCP configuration for complete detail`
+    : "";
+  return `MCP servers: ${parts.join("; ")}${suffix}.`;
 }
 
 const MCP_STATUS_DETAIL_MAX = 32;
 const MCP_STATUS_NAME_MAX = 120;
-const MCP_STATUS_SUMMARY_MAX = 180;
+const MCP_STATUS_SUMMARY_MAX = 150;
 const MCP_STATUS_REPORT_MAX = 16_384;
 
 type McpRenderedState =
   | "enabled"
   | "connecting"
+  | "retrying"
   | "connected"
+  | "reconnecting"
   | "failed"
   | "pending approval"
   | "disabled"
+  | "not configured"
   | "skipped";
 
 const MCP_RENDERED_STATE_ORDER: readonly McpRenderedState[] = [
   "enabled",
   "connecting",
+  "retrying",
   "connected",
+  "reconnecting",
   "failed",
   "pending approval",
   "disabled",
+  "not configured",
   "skipped",
 ];
 
@@ -530,9 +636,16 @@ function mcpEffectiveState(
   live: McpServerLiveState | undefined,
 ): McpRenderedState {
   if (server.status !== "enabled") {
-    return server.status === "pending-approval" ? "pending approval" : server.status;
+    if (server.status === "pending-approval") return "pending approval";
+    if (server.status === "not-configured") return "not configured";
+    return server.status;
   }
   return live?.state ?? "enabled";
+}
+
+function mcpAttemptSuffix(live: McpServerLiveState | undefined): string {
+  if (live?.attempt === undefined || live.attemptLimit === undefined) return "";
+  return ` (attempt ${live.attempt}/${live.attemptLimit})`;
 }
 
 function mcpStatusRow(
@@ -542,24 +655,43 @@ function mcpStatusRow(
   const name = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
   switch (mcpEffectiveState(server, live)) {
     case "enabled":
-      return `- ${name}: enabled; runtime state unavailable`;
-    case "connecting":
-      return `- ${name}: connecting`;
+      return `- ${name}: enabled${mcpInactiveTransportSuffix(server)}; runtime state unavailable`;
+    case "connecting": {
+      const transport = live?.transport ?? server.transport ?? "unknown";
+      return transport === "stdio"
+        ? `- ${name}: connecting`
+        : `- ${name}: connecting via ${mcpTransportLabel(transport)}${mcpAttemptSuffix(live)}`;
+    }
+    case "retrying":
+      return `- ${name}: retrying via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)}`;
     case "connected": {
       const rawCount = live?.toolCount;
       const count = Number.isSafeInteger(rawCount) && (rawCount ?? -1) >= 0 ? rawCount! : 0;
-      return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
+      const transport = live?.transport ?? server.transport ?? "unknown";
+      if (transport === "stdio") return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
+      return `- ${name}: connected via ${mcpTransportLabel(transport)} (${count} ${count === 1 ? "tool" : "tools"})`;
+    }
+    case "reconnecting": {
+      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
+      return `- ${name}: reconnecting via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${count} retained ${count === 1 ? "tool" : "tools"})`;
     }
     case "failed": {
       const summary = mcpStatusScalar(live?.statusSummary ?? "", MCP_STATUS_SUMMARY_MAX);
-      return `- ${name}: failed — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      const transport = live?.transport ?? server.transport ?? "unknown";
+      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
+      if (transport === "stdio") {
+        return `- ${name}: failed — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      }
+      return `- ${name}: failed via ${mcpTransportLabel(transport)} (${count} retained ${count === 1 ? "tool" : "tools"}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
     }
     case "pending approval":
-      return `- ${name}: pending approval`;
+      return `- ${name}: pending approval${mcpInactiveTransportSuffix(server)}`;
     case "disabled":
-      return `- ${name}: disabled`;
+      return `- ${name}: disabled${mcpInactiveTransportSuffix(server)}`;
+    case "not configured":
+      return `- ${name}: not configured${mcpInactiveTransportSuffix(server)}`;
     case "skipped":
-      return `- ${name}: skipped — configuration is unusable; run /doctor for details`;
+      return `- ${name}: skipped${mcpInactiveTransportSuffix(server)} — configuration is unusable; run /doctor for details`;
   }
 }
 
@@ -603,19 +735,34 @@ export function renderMcpStatusReport(
         : "No MCP servers are configured.",
     );
   } else {
-    lines.push(`Configured servers: ${config.servers.length}`);
+    lines.push(`Resolved server entries: ${config.servers.length}`);
   }
 
   const liveByName = mcpLiveByName(liveStates);
   const detailCount = Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
-  for (let index = 0; index < detailCount; index += 1) {
-    const server = config.servers[index]!;
+  const indexed = config.servers.map((server, index) => ({ server, index }));
+  const selected = config.servers.length <= MCP_STATUS_DETAIL_MAX
+    ? indexed
+    : [...indexed].sort((left, right) => {
+        const priority = (item: typeof left): number => {
+          const state = mcpEffectiveState(item.server, liveByName.get(item.server.name));
+          return ["retrying", "reconnecting", "failed", "skipped", "pending approval"].includes(state)
+            ? 0
+            : state === "connected" || state === "enabled"
+              ? 2
+              : 1;
+        };
+        return priority(left) - priority(right) || left.index - right.index;
+      }).slice(0, detailCount);
+  const selectedIndexes = new Set(selected.map((item) => item.index));
+  for (const { server } of selected) {
     lines.push(mcpStatusRow(server, liveByName.get(server.name)));
   }
 
   if (config.servers.length > detailCount) {
     const omitted = new Map<McpRenderedState, number>();
-    for (let index = detailCount; index < config.servers.length; index += 1) {
+    for (let index = 0; index < config.servers.length; index += 1) {
+      if (selectedIndexes.has(index)) continue;
       const server = config.servers[index]!;
       const state = mcpEffectiveState(server, liveByName.get(server.name));
       omitted.set(state, (omitted.get(state) ?? 0) + 1);
@@ -624,7 +771,7 @@ export function renderMcpStatusReport(
       const count = omitted.get(state);
       return count === undefined ? [] : [`${state}: ${count}`];
     });
-    lines.push(`Omitted ${config.servers.length - detailCount} servers (${groups.join(", ")}).`);
+    lines.push(`Omitted ${config.servers.length - detailCount} servers (${groups.join(", ")}); run /doctor for bounded details.`);
   }
 
   if (
@@ -635,9 +782,9 @@ export function renderMcpStatusReport(
   }
 
   const pending = config.servers.filter((server) => server.status === "pending-approval");
-  const allPendingDisplayed = !config.servers
-    .slice(MCP_STATUS_DETAIL_MAX)
-    .some((server) => server.status === "pending-approval");
+  const allPendingDisplayed = config.servers.every(
+    (server, index) => server.status !== "pending-approval" || selectedIndexes.has(index),
+  );
   lines.push(...mcpStatusPendingGuidance(pending.map((server) => server.name), allPendingDisplayed));
 
   const report = lines.join("\n");

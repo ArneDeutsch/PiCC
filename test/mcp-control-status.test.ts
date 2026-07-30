@@ -19,17 +19,28 @@ function server(
   status: ResolvedMcpServer["status"],
   overrides: Partial<ResolvedMcpServer> = {},
 ): ResolvedMcpServer {
+  if (status !== "enabled") {
+    return {
+      name,
+      status,
+      source: "/SOURCE_PATH_CANARY/settings.json",
+      transport: "stdio",
+      diagnostics: [],
+      ...overrides,
+    } as ResolvedMcpServer;
+  }
   return {
     name,
     status,
     source: "/SOURCE_PATH_CANARY/settings.json",
+    transport: "stdio",
     command: "/COMMAND_CANARY/bin",
     args: ["ARG_CANARY"],
     env: { TOKEN: "ENV_CANARY" },
     rawCommand: "RAW_COMMAND_CANARY",
     diagnostics: [],
     ...overrides,
-  };
+  } as ResolvedMcpServer;
 }
 
 function config(
@@ -134,6 +145,63 @@ describe("renderMcpStatusReport", () => {
     ]);
     expect(report).not.toContain("STDERR_CANARY");
     expect(report).not.toContain("extra");
+  });
+
+  it("renders remote retry/reconnect attempts, retained tools, deprecation, and not-configured", () => {
+    const mcp = config([
+      server("retry", "enabled", { transport: "http" }),
+      server("recover", "enabled", { transport: "http" }),
+      server("legacy", "enabled", { transport: "sse", configuredType: "sse" }),
+      server("empty", "not-configured", { transport: "http", configuredType: "http" }),
+    ]);
+    const report = renderMcpStatusReport(mcp, [
+      { name: "retry", transport: "http", state: "retrying", attempt: 3, attemptLimit: 4 },
+      { name: "recover", transport: "http", state: "reconnecting", attempt: 2, attemptLimit: 5, toolCount: 4 },
+      { name: "legacy", transport: "sse", state: "connected", toolCount: 1 },
+    ]);
+    expect(report).toContain("Resolved server entries: 4");
+    expect(report).not.toContain("Configured servers:");
+    expect(report).toContain('"retry": retrying via http (attempt 3/4)');
+    expect(report).toContain('"recover": reconnecting via http (attempt 2/5) (4 retained tools)');
+    expect(report).toContain('"legacy": connected via sse (deprecated; use http) (1 tool)');
+    expect(report).toContain('"empty": not configured');
+  });
+
+  it("labels SSE as deprecated with its replacement in every lifecycle and inactive state", () => {
+    const states = ["connecting", "retrying", "connected", "reconnecting", "failed"] as const;
+    for (const state of states) {
+      const report = renderMcpStatusReport(
+        config([server(state, "enabled", { transport: "sse", configuredType: "sse" })]),
+        [{
+          name: state,
+          transport: "sse",
+          state,
+          ...(state === "retrying" || state === "reconnecting"
+            ? { attempt: 1, attemptLimit: state === "retrying" ? 4 : 5 }
+            : {}),
+          ...(state === "connected" || state === "reconnecting" || state === "failed"
+            ? { toolCount: 1 }
+            : {}),
+          ...(state === "failed" ? { statusSummary: "Safe failure." } : {}),
+        }],
+      );
+      expect(report).toContain("sse (deprecated; use http)");
+    }
+    const runtimeUnavailable = server("enabled", "enabled", {
+      transport: "sse",
+      configuredType: "sse",
+    });
+    expect(renderMcpStatusReport(config([runtimeUnavailable]), [])).toContain(
+      '"enabled": enabled via sse (deprecated; use http); runtime state unavailable',
+    );
+    expect(doctor(config([runtimeUnavailable]))).toContain(
+      "enabled: enabled via sse (deprecated; use http)",
+    );
+    for (const status of ["pending-approval", "disabled", "not-configured", "skipped"] as const) {
+      const entry = server(status, status, { transport: "sse", configuredType: "sse" });
+      expect(renderMcpStatusReport(config([entry]), [])).toContain("sse (deprecated; use http)");
+      expect(doctor(config([entry]))).toContain("sse (deprecated; use http)");
+    }
   });
 
   it("handles absent and empty configuration clearly", () => {
@@ -271,12 +339,44 @@ describe("renderMcpStatusReport", () => {
       expect(first).toBe(second);
       expect(detailRows(first)).toHaveLength(Math.min(count, 32));
       expect(first.length).toBeLessThanOrEqual(16_384);
-      for (let index = 0; index < Math.min(count, 32); index += 1) {
-        expect(detailRows(first)[index]).toContain(`server-${String(index).padStart(4, "0")}`);
+      if (count <= 32) {
+        for (let index = 0; index < count; index += 1) {
+          expect(detailRows(first)[index]).toContain(`server-${String(index).padStart(4, "0")}`);
+        }
+      } else {
+        // Failed/retrying/reconnecting rows are selected before healthy/config-order rows.
+        expect(detailRows(first)[0]).toContain("failed");
+        expect(first).toContain(`Omitted ${count - 32} servers (`);
+        expect(first).toContain("run /doctor for bounded details");
       }
-      if (count > 32) expect(first).toContain(`Omitted ${count - 32} servers (`);
     },
   );
+
+  it("prioritizes every actionable retry, reconnect, skip, auth, not-found, and failure row past 32", () => {
+    const healthy = Array.from({ length: 32 }, (_, index) => server(`healthy-${index}`, "enabled"));
+    const actionable = [
+      server("retrying", "enabled", { transport: "http" }),
+      server("reconnecting", "enabled", { transport: "http" }),
+      server("skipped", "skipped", { transport: "http" }),
+      server("auth", "enabled", { transport: "http" }),
+      server("not-found", "enabled", { transport: "http" }),
+      server("failed", "enabled", { transport: "http" }),
+    ];
+    const report = renderMcpStatusReport(config([...healthy, ...actionable]), [
+      ...healthy.map((entry) => ({ name: entry.name, state: "connected" as const, toolCount: 1 })),
+      { name: "retrying", transport: "http", state: "retrying", attempt: 2, attemptLimit: 4 },
+      { name: "reconnecting", transport: "http", state: "reconnecting", attempt: 3, attemptLimit: 5, toolCount: 1 },
+      { name: "auth", transport: "http", state: "failed", statusSummary: "Authentication failed; check configured static headers." },
+      { name: "not-found", transport: "http", state: "failed", statusSummary: "Endpoint was not found; check the configured URL." },
+      { name: "failed", transport: "http", state: "failed", statusSummary: "Recovery exhausted; check endpoint and network availability, then reload or start a new session." },
+    ]);
+    const rows = detailRows(report).join("\n");
+    for (const name of ["retrying", "reconnecting", "skipped", "auth", "not-found", "failed"]) {
+      expect(rows).toContain(`"${name}"`);
+    }
+    expect(report).toContain("run /doctor for bounded details");
+    expect(report).not.toContain("https://");
+  });
 
   it("groups omitted servers accurately by effective rendered state", () => {
     const displayed = Array.from({ length: 32 }, (_, index) => server(`shown-${index}`, "disabled"));
@@ -295,7 +395,7 @@ describe("renderMcpStatusReport", () => {
       { name: "f", state: "failed", statusSummary: "safe" },
     ]);
     expect(report).toContain(
-      "Omitted 7 servers (enabled: 1, connecting: 1, connected: 1, failed: 1, pending approval: 1, disabled: 1, skipped: 1).",
+      "Omitted 7 servers (enabled: 1, connecting: 1, connected: 1, disabled: 4); run /doctor for bounded details.",
     );
   });
 });
@@ -406,15 +506,16 @@ describe("MCP pending guidance", () => {
     expect(notice.length).toBeLessThan(1_500);
   });
 
-  it("does not enumerate a small pending set when any name is omitted", () => {
+  it("prioritizes and enumerates a small pending set even when healthy names are omitted", () => {
     const names = ["pending-a", "pending-b"];
     const mcp = config([
       ...Array.from({ length: 32 }, (_, index) => server(`enabled-${index}`, "enabled")),
       ...names.map((name) => server(name, "pending-approval")),
     ]);
     const report = renderMcpStatusReport(mcp, []);
-    expect(report).not.toContain(JSON.stringify(names));
-    expect(report).toContain("Inspect your MCP configuration");
+    expect(report).toContain(JSON.stringify(names));
+    expect(report).not.toContain("Inspect your MCP configuration");
+    expect(report).toContain("Omitted 2 servers (enabled: 2)");
   });
 
   it("keeps tracked-local diagnostics out of /mcp while retaining safe guidance", () => {

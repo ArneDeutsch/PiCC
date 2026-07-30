@@ -216,6 +216,32 @@ describe("buildMcpProxyTools execute", () => {
     ).rejects.toThrow(/timed out after 1000 ms/);
   });
 
+  it("maps only fixed runtime outage errors to retry or repair guidance while preserving protocol speech", async () => {
+    const canary = "https://token.example/SECRET_HEADER_CANARY";
+    const messages = [
+      'MCP server "srv" is temporarily unavailable while reconnecting',
+      'MCP server "srv" is unavailable because its remote connection failed',
+    ];
+    const expected = [
+      /was not called.*temporarily unavailable.*Retry later/,
+      /was not called.*recovery has stopped.*\/mcp or \/doctor.*reload or start a new session/,
+    ];
+    for (let index = 0; index < messages.length; index += 1) {
+      const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()], async () => {
+        throw new Error(messages[index]!);
+      }));
+      await expect(proxy!.execute("id-1", {}, undefined, undefined, {} as never))
+        .rejects.toThrow(expected[index]);
+    }
+
+    const protocolSpeech = `protocol failure ${canary}`;
+    const [protocolProxy] = buildMcpProxyTools(sourceFor([toolInfo()], async () => {
+      throw new Error(protocolSpeech);
+    }));
+    await expect(protocolProxy!.execute("id-3", {}, undefined, undefined, {} as never))
+      .rejects.toThrow(protocolSpeech);
+  });
+
   it("substitutes {} for a non-object params value before delegating", async () => {
     const seen: unknown[] = [];
     const source = sourceFor([toolInfo()], async (_s, _t, args) => {

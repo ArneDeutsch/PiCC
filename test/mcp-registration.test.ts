@@ -1,11 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import picc from "../src/index.js";
+import picc, { type PiccTestSeam } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
-import { waitUntil } from "./helpers/async.js";
+import { deferred, waitUntil } from "./helpers/async.js";
+import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
 import {
   createMcpProcessFixture,
   processIsAlive,
@@ -488,7 +489,7 @@ describe("MCP startup status terminal cleanup (wired)", () => {
       expect(String(result?.systemPrompt ?? "")).toContain("FAIL");
       expect(events).toEqual(["set", "clear", "notify"]);
       expect(pi.notifications).toEqual([{
-        text: "MCP server(s) failed to connect: failed — run /doctor for details.",
+        text: "MCP server(s) failed to start: failed — run /doctor for details.",
         severity: "warning",
       }]);
       expect(pi.tools.has("mcp__failed__echo")).toBe(false);
@@ -613,6 +614,184 @@ describe("MCP zero-enabled path (wired)", () => {
       expect(normalize(withPending?.systemPrompt)).not.toMatch(/mcp/i);
       await shutdownExtension(mcpPi);
     } finally {
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Remote lifecycle consumption through an injected fake runtime
+// ---------------------------------------------------------------------------
+
+describe("remote MCP stable main-session registration (fake runtime)", () => {
+  type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
+
+  it("registers once after retries, keeps the same proxy through recovery/exhaustion, and clears retrying status", async () => {
+    const dir = makeTempDir("picc-remotereg-");
+    const userDir = makeTempDir("picc-remotereg-user-");
+    writeProjectFile(dir, "CLAUDE.md", "REMOTE-STABLE-PROJECT\n");
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+
+    const settled = deferred<void>();
+    const catalog: McpToolInfo[] = [{
+      serverName: "remote",
+      toolName: "echo",
+      description: "trusted metadata canary",
+      inputSchema: { type: "object", properties: { text: { type: "string" } } },
+    }];
+    let state: McpLifecycleState = "retrying";
+    let callMode: "success" | "outage" | "failed" = "success";
+    let logicalCalls = 0;
+    const runtime: Runtime = {
+      whenSettled: () => settled.promise,
+      tools: () => catalog,
+      diagnostics: () => [],
+      serverStates: () => [{ name: "remote", transport: "http", state }],
+      shutdown: async () => {},
+      callTool: async () => {
+        logicalCalls += 1;
+        if (callMode === "outage") {
+          throw new Error('MCP server "remote" is temporarily unavailable while reconnecting');
+        }
+        if (callMode === "failed") {
+          throw new Error('MCP server "remote" is unavailable because its remote connection failed');
+        }
+        return { content: [{ type: "text", text: "trusted result canary" }] };
+      },
+    };
+    const pi = fakePi();
+    const registrations: string[] = [];
+    const registerTool = pi.api.registerTool as (tool: { name: string }) => void;
+    pi.api.registerTool = ((tool: { name: string }) => {
+      registrations.push(tool.name);
+      registerTool(tool);
+    }) as typeof pi.api.registerTool;
+    try {
+      picc(pi.api as never, {
+        mcpRuntime: runtime,
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      const firstTurn = pi.fire("before_agent_start", { systemPrompt: "BASE" }, pi.tuiCtx());
+      await waitUntil({
+        description: "retrying remote startup status",
+        predicate: () => pi.statusCalls.length === 1,
+        describeObserved: () => JSON.stringify(pi.statusCalls),
+      });
+      expect(pi.statusCalls).toEqual([{
+        key: "picc-mcp-startup",
+        text: "Waiting for MCP servers to start…",
+      }]);
+      expect(pi.tools.has("mcp__remote__echo")).toBe(false);
+
+      state = "connected";
+      settled.resolve();
+      const prompt = await firstTurn;
+      expect(String(prompt?.systemPrompt)).not.toMatch(/trusted metadata canary|trusted result canary/u);
+      expect(pi.statusCalls.at(-1)).toEqual({ key: "picc-mcp-startup", text: undefined });
+      expect(registrations.filter((name) => name === "mcp__remote__echo")).toHaveLength(1);
+      const proxy = pi.tools.get("mcp__remote__echo");
+      expect(proxy.description).toBe("trusted metadata canary");
+      expect((await proxy.execute("ok", {})).content[0].text).toBe("trusted result canary");
+
+      state = "reconnecting";
+      callMode = "outage";
+      await expect(proxy.execute("outage", {})).rejects.toThrow(/was not called.*Retry later/u);
+      expect(pi.tools.get("mcp__remote__echo")).toBe(proxy);
+
+      state = "connected";
+      callMode = "success";
+      expect((await proxy.execute("recovered", {})).content[0].text).toBe("trusted result canary");
+      expect(pi.tools.get("mcp__remote__echo")).toBe(proxy);
+
+      state = "failed";
+      callMode = "failed";
+      await expect(proxy.execute("failed", {})).rejects.toThrow(
+        /was not called.*recovery has stopped.*\/mcp or \/doctor.*reload or start a new session/u,
+      );
+      expect(logicalCalls).toBe(4);
+      expect(registrations.filter((name) => name.startsWith("mcp__remote__"))).toEqual([
+        "mcp__remote__echo",
+      ]);
+      expect([...pi.tools.keys()].filter((name) => name.startsWith("mcp__remote__"))).toEqual([
+        "mcp__remote__echo",
+      ]);
+    } finally {
+      await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+
+  it("keeps startup failure zero-context, bounded, and one-shot", async () => {
+    const dir = makeTempDir("picc-remotefail-");
+    const userDir = makeTempDir("picc-remotefail-user-");
+    writeProjectFile(dir, "CLAUDE.md", "REMOTE-FAIL-PROJECT\n");
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const runtime: Runtime = {
+      whenSettled: async () => {},
+      tools: () => [],
+      diagnostics: () => ["MCP server startup failed (authentication)."],
+      serverStates: () => Array.from({ length: 20 }, (_, index) => ({
+        name: `failed-${index}`,
+        transport: "http" as const,
+        state: "failed" as const,
+      })),
+      shutdown: async () => {},
+      callTool: async () => { throw new Error("unreachable"); },
+    };
+    const baselinePi = fakePi();
+    const failedPi = fakePi();
+    let errSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      // Independent extension instance with no MCP config/runtime replacement:
+      // this is the authority for exactly what the same project contributes.
+      picc(baselinePi.api as never, { onInitializationSettled: baselinePi.captureInitialization });
+      await baselinePi.waitForInitialization();
+      const baseline = await baselinePi.fire(
+        "before_agent_start",
+        { systemPrompt: "BASE" },
+        baselinePi.tuiCtx(),
+      );
+      await shutdownExtension(baselinePi);
+
+      errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      picc(failedPi.api as never, {
+        mcpRuntime: runtime,
+        onInitializationSettled: failedPi.captureInitialization,
+      });
+      await failedPi.waitForInitialization();
+      const first = await failedPi.fire(
+        "before_agent_start",
+        { systemPrompt: "BASE" },
+        failedPi.tuiCtx(),
+      );
+      const second = await failedPi.fire(
+        "before_agent_start",
+        { systemPrompt: "BASE" },
+        failedPi.tuiCtx(),
+      );
+      const normalize = (value: unknown): string =>
+        String(value ?? "").replace(/picc-scratch-[A-Za-z0-9]+/g, "picc-scratch-X");
+      expect(Buffer.from(normalize(first?.systemPrompt))).toEqual(
+        Buffer.from(normalize(baseline?.systemPrompt)),
+      );
+      expect(Buffer.from(normalize(second?.systemPrompt))).toEqual(
+        Buffer.from(normalize(baseline?.systemPrompt)),
+      );
+      expect([...failedPi.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
+      expect(failedPi.messages).toEqual(baselinePi.messages);
+      expect(failedPi.entries).toEqual(baselinePi.entries);
+      expect(failedPi.messages).toEqual([]);
+      expect(failedPi.entries).toEqual([]);
+      expect(failedPi.notifications).toHaveLength(1);
+      expect(failedPi.notifications[0]!.text).toContain("and 12 more");
+      expect(failedPi.notifications[0]!.text.length).toBeLessThan(300);
+    } finally {
+      errSpy?.mockRestore();
+      await shutdownExtension(failedPi);
+      await shutdownExtension(baselinePi);
       process.chdir(originalCwd);
     }
   }, 30_000);

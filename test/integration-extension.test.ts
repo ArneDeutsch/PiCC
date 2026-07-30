@@ -3097,7 +3097,7 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
         await p.fire("before_agent_start", { systemPrompt: "B" }, p.printCtx());
         expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(0);
         const errText = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
-        expect(errText).toContain("MCP server(s) failed to connect");
+        expect(errText).toContain("MCP server(s) failed to start");
         expect(errText).toContain("failing-server");
         expect(errText).toContain("run /doctor for details");
       } finally {

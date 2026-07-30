@@ -1,12 +1,16 @@
 import path from "node:path";
 import { isFile, readTextSafe } from "../util/fs.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
+import {
+  parseRemoteMcpFields,
+  type RawRemoteMcpFields,
+} from "./mcp-remote-config.js";
 
 /**
  * `.mcp.json` loader and MCP server-entry normalization.
  *
  * Parses the Claude-format project `.mcp.json` (strict JSON,
- * `{"mcpServers": {<name>: <entry>}}`) and normalizes stdio server entries —
+ * `{"mcpServers": {<name>: <entry>}}`) and normalizes MCP server entries —
  * the same entry schema is reused for `mcpServers` blocks in settings files.
  * Loader convention: NEVER throws; every rejection degrades to a diagnostic.
  *
@@ -36,13 +40,13 @@ const MAX_SERVER_NAME_CHARS = 128;
 const NAME_DIAG_SLICE_CHARS = 32;
 
 /** Entry fields we understand; anything else is ignored with a diagnostic. */
-const KNOWN_ENTRY_FIELDS = new Set(["command", "args", "env", "type", "timeout", "url", "alwaysLoad", "role"]);
+const KNOWN_ENTRY_FIELDS = new Set([
+  "command", "args", "env", "type", "timeout", "url", "headers", "headersHelper",
+  "alwaysLoad", "role", "oauth",
+]);
 
 /** Real Claude entry fields whose feature is deferred in PiCC (entry still runs). */
-const DEFERRED_ENTRY_FIELDS = ["alwaysLoad", "role"] as const;
-
-/** Explicit remote-transport `type` values Claude accepts; all deferred here. */
-const REMOTE_TYPES = new Set(["http", "streamable-http", "sse", "ws"]);
+const DEFERRED_ENTRY_FIELDS = ["alwaysLoad", "role", "oauth"] as const;
 
 /** Minimum honored per-server tool-call timeout (Claude parity: <1000 ms ignored). */
 const MIN_TIMEOUT_MS = 1000;
@@ -62,7 +66,11 @@ export interface RawMcpEntry {
   env: Record<string, string>;
   /** Per-server tool-call timeout, only when valid (>= 1000 ms). */
   timeoutMs?: number;
-  /** True when the entry must not start (invalid name, url/remote, bad shape). */
+  /** Parsed remote fields remain raw until the enablement gate permits expansion. */
+  remote?: RawRemoteMcpFields;
+  /** Explicit supported remote type with an empty URL: quietly inactive. */
+  notConfigured?: boolean;
+  /** True when the entry must not start (invalid name or bad shape). */
   skipped: boolean;
   diagnostics: string[];
 }
@@ -135,45 +143,63 @@ export function normalizeMcpServerBlock(
       continue;
     }
     const type = rawEntry.type;
-    if (typeof type === "string" && REMOTE_TYPES.has(type)) {
+    // An untyped entry with a valid command is stdio even when it carries a
+    // stray URL. Explicit remote types always take the remote parser path.
+    const hasValidCommand =
+      typeof rawEntry.command === "string" && rawEntry.command.trim() !== "";
+    const remote = type === undefined && hasValidCommand
+      ? { kind: "not-remote" as const }
+      : parseRemoteMcpFields(rawEntry, rawName, sourceLabel);
+    if (remote.kind === "skipped") {
       entry.skipped = true;
-      push(
-        `MCP server "${name}" in ${sourceLabel} uses remote transport ${JSON.stringify(type)} — remote ` +
-          `MCP transports (HTTP/SSE/WebSocket) are not supported yet; server skipped`,
-      );
+      entry.diagnostics.push(...remote.diagnostics.map(clean));
       continue;
     }
-    if (type !== undefined && type !== "stdio") {
+    if (remote.kind === "not-configured") {
+      entry.notConfigured = true;
+      entry.remote = {
+        configuredType: remote.configuredType,
+        transportKind: remote.configuredType === "sse" ? "sse" : "http",
+        rawUrl: "",
+        rawHeaders: Object.create(null) as Record<string, string>,
+        ...(remote.configuredType === "sse"
+          ? { sseDeprecation: { deprecated: true as const, replacement: "http" as const } }
+          : {}),
+      };
+      continue;
+    }
+    if (remote.kind === "supported") {
+      entry.remote = remote.fields;
+      entry.diagnostics.push(...remote.diagnostics.map(clean));
+    } else if (type !== undefined && type !== "stdio") {
       entry.skipped = true;
       push(
         `MCP server "${name}" in ${sourceLabel} has unsupported type ${JSON.stringify(type)}; ` +
-          `only "stdio" is currently supported; server skipped`,
+          `only "stdio", "http", "streamable-http", and "sse" are supported; server skipped`,
       );
       continue;
     }
-    // Claude parity: `url` alone (no `type`, no `command`) is an implicit remote
-    // entry — skipped. With a valid stdio shape, a stray `url` key is ignored.
-    if ("url" in rawEntry && type === undefined && rawEntry.command === undefined) {
-      entry.skipped = true;
-      push(
-        `MCP server "${name}" in ${sourceLabel} has a "url" but no "type" — remote MCP transports ` +
-          `are not supported yet; server skipped`,
-      );
-      continue;
-    }
-    if (typeof rawEntry.command !== "string" || rawEntry.command.trim() === "") {
-      entry.skipped = true;
-      push(`MCP server "${name}" in ${sourceLabel} is missing required string "command"; server skipped`);
-      continue;
-    }
-    entry.command = rawEntry.command;
-    if ("url" in rawEntry) {
-      push(`MCP server "${name}": field "url" is ignored on a stdio server`);
+    // With a valid stdio shape, a stray `url` key is ignored.
+    if (entry.remote === undefined) {
+      if (typeof rawEntry.command !== "string" || rawEntry.command.trim() === "") {
+        entry.skipped = true;
+        push(`MCP server "${name}" in ${sourceLabel} is missing required string "command"; server skipped`);
+        continue;
+      }
+      entry.command = rawEntry.command;
+      if ("url" in rawEntry) {
+        push(`MCP server "${name}": field "url" is ignored on a stdio server`);
+      }
     }
 
     // Claude parity (zod-schema strictness): a shape violation in args/env/
     // timeout skips the WHOLE server — never salvage a partial entry, or the
     // server would run with an argv/env its author never wrote.
+    if (entry.remote !== undefined && (rawEntry.args !== undefined || rawEntry.env !== undefined)) {
+      entry.skipped = true;
+      push(`MCP server "${name}" in ${sourceLabel} mixes remote transport fields with stdio args/env; server skipped`);
+      continue;
+    }
     if (rawEntry.args !== undefined) {
       if (!Array.isArray(rawEntry.args) || rawEntry.args.some((arg) => typeof arg !== "string")) {
         entry.skipped = true;

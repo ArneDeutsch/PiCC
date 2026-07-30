@@ -8,6 +8,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake-sdk.js";
 import { createMcpProcessFixture, type McpProcessFixture } from "./helpers/mcp-process.js";
 import type { PiSdk } from "../src/runtime/subagents.js";
+import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
 
 /**
  * Subagent MCP integration: inheritance, restriction, and drop of
@@ -77,6 +78,16 @@ describe("gateTools over a universe containing live MCP names", () => {
     expect(broadEngine.gateTools(undefined, undefined, known)).toEqual(["Read", "Bash"]);
   });
 
+  it("an exact MCP deny removes only that tool", () => {
+    const exactEngine = new PermissionEngine(rules({ deny: ["mcp__fixture__echo"] }), { cwd: CWD });
+    expect(exactEngine.gateTools(undefined, undefined, known)).toEqual([
+      "Read",
+      "Bash",
+      "mcp__fixture__report-env",
+      "mcp__other__run",
+    ]);
+  });
+
   it("a specifier'd MCP deny does NOT remove at gating (stays a call-time guard block)", () => {
     const scopedEngine = new PermissionEngine(rules({ deny: ["mcp__fixture__echo(text:secret*)"] }), {
       cwd: CWD,
@@ -119,6 +130,98 @@ afterAll(() => {
       /* best effort */
     }
   }
+});
+
+describe("subagent MCP identity across remote lifecycle states (fake runtime)", () => {
+  type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
+
+  it("builds distinct proxies over one stable permission universe while connected, reconnecting, and failed", async () => {
+    const dir = makeTempDir("picc-remotesub-");
+    const userDir = makeTempDir("picc-remotesub-user-");
+    writeProjectFile(dir, "CLAUDE.md", "REMOTE-SUB-PROJECT\n");
+    writeProjectFile(
+      dir,
+      ".claude/agents/inheritor.md",
+      "---\nname: inheritor\ndescription: inherits tools\n---\nStable universe.\n",
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/server-only.md",
+      "---\nname: server-only\ndescription: server tools only\ntools: mcp__remote\n---\nStable universe.\n",
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/dropper.md",
+      "---\nname: dropper\ndescription: no remote tools\ndisallowedTools: mcp__remote\n---\nStable universe.\n",
+    );
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+
+    const catalog: McpToolInfo[] = [
+      { serverName: "remote", toolName: "echo", description: "echo", inputSchema: { type: "object" } },
+      { serverName: "remote", toolName: "search", description: "search", inputSchema: { type: "object" } },
+    ];
+    let state: McpLifecycleState = "connected";
+    const runtime: Runtime = {
+      whenSettled: async () => {},
+      tools: () => catalog,
+      callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      diagnostics: () => [],
+      serverStates: () => [{ name: "remote", transport: "http", state }],
+      shutdown: async () => {},
+    };
+    const handle = fakeSdk({ onPrompt: async () => "DONE" });
+    const pi = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    try {
+      picc(pi.api as never, {
+        mcpRuntime: runtime,
+        sdk: handle.sdk,
+        onWired: (wired) => { internals = wired; },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      await pi.waitForTools(["Agent", "mcp__remote__echo", "mcp__remote__search"]);
+      internals.subagentRuntime.setSdkForTest(handle.sdk);
+      const mainEcho = pi.tools.get("mcp__remote__echo");
+      const expected = ["mcp__remote__echo", "mcp__remote__search"];
+      const childEchoes: unknown[] = [];
+
+      for (const lifecycle of ["connected", "reconnecting", "failed"] as const) {
+        state = lifecycle;
+        await pi.tools.get("Agent").execute(`dispatch-${lifecycle}`, {
+          subagent_type: "inheritor",
+          prompt: lifecycle,
+          run_in_background: false,
+        });
+        const created = handle.created.at(-1)!;
+        const remoteTools = (created.customTools as FakeCustomTool[])
+          .filter((tool) => tool.name.startsWith("mcp__remote__"));
+        expect(remoteTools.map((tool) => tool.name).sort(), lifecycle).toEqual(expected);
+        expect((created.tools as string[]).filter((name) => name.startsWith("mcp__remote__")).sort(), lifecycle)
+          .toEqual(expected);
+        const childEcho = remoteTools.find((tool) => tool.name === "mcp__remote__echo");
+        expect(childEcho).not.toBe(mainEcho);
+        childEchoes.push(childEcho);
+      }
+      expect(new Set(childEchoes).size).toBe(3);
+      expect(pi.tools.get("mcp__remote__echo")).toBe(mainEcho);
+
+      await pi.tools.get("Agent").execute("dispatch-server-only", {
+        subagent_type: "server-only", prompt: "failed", run_in_background: false,
+      });
+      expect((handle.created.at(-1)!.customTools as FakeCustomTool[]).map((tool) => tool.name).sort())
+        .toEqual(expected);
+      await pi.tools.get("Agent").execute("dispatch-dropper", {
+        subagent_type: "dropper", prompt: "failed", run_in_background: false,
+      });
+      expect((handle.created.at(-1)!.customTools as FakeCustomTool[])
+        .some((tool) => tool.name.startsWith("mcp__remote__"))).toBe(false);
+    } finally {
+      await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
 });
 
 describe("subagent MCP tool provisioning (wired)", () => {

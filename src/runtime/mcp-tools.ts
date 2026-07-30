@@ -9,7 +9,7 @@ import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import type { McpRuntime } from "./mcp.js";
 
 /**
- * MCP proxy-tool builder: turns a runtime's connected-server tool metadata into
+ * MCP proxy-tool builder: turns a runtime's retained initial tool catalog into
  * Pi `ToolDefinition`s named `mcp__<server>__<tool>` whose execute delegates to
  * `McpRuntime.callTool`. Consumed by the main-session registration in index.ts
  * and per-dispatch by the subagent path — called fresh wherever instances are
@@ -439,11 +439,27 @@ function reportBuilderDiagnostic(message: string): void {
   console.error(`PiCC MCP: ${message}`);
 }
 
+function mapLocalAvailabilityError(error: unknown, serverName: string, toolName: string): Error | undefined {
+  const message = error instanceof Error ? error.message : undefined;
+  if (message === `MCP server "${serverName}" is temporarily unavailable while reconnecting`) {
+    return new Error(
+      `MCP tool "${toolName}" on server "${serverName}" was not called because the server is ` +
+        "temporarily unavailable during automatic recovery. Retry later.",
+    );
+  }
+  if (message === `MCP server "${serverName}" is unavailable because its remote connection failed`) {
+    return new Error(
+      `MCP tool "${toolName}" on server "${serverName}" was not called because automatic recovery has stopped. ` +
+        "Run /mcp or /doctor, repair the service or configuration, then reload or start a new session.",
+    );
+  }
+  return undefined;
+}
+
 /**
- * Build one proxy `ToolDefinition` per connected-server tool. Fresh instances
- * per call; the runtime's metadata is already Claude-sanitized (names) and
- * bounded/neutralized (descriptions). Errors from `callTool` — timeouts
- * included — propagate as throws, which Pi turns into error tool results.
+ * Build one proxy `ToolDefinition` per tool in the retained initial catalog.
+ * Fresh proxy instances delegate every execution to the live session-global
+ * runtime, so a retained proxy follows recovery without registration or schema changes.
  */
 export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
   const out: ToolDefinition[] = [];
@@ -479,7 +495,12 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
       description: info.description,
       parameters: normalized.schema,
       async execute(_toolCallId, params) {
-        const result = await runtime.callTool(serverName, toolName, params ?? {});
+        let result: unknown;
+        try {
+          result = await runtime.callTool(serverName, toolName, params ?? {});
+        } catch (error) {
+          throw mapLocalAvailabilityError(error, serverName, toolName) ?? error;
+        }
         const mapped = mapCallResult(result, serverName);
         if (mapped.isError) {
           // MCP-protocol tool errors become Pi error tool results via throw.
