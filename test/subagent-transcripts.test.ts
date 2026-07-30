@@ -602,7 +602,7 @@ describe("model-visible agent-ID delivery", () => {
     expect(out.details.agentId).toBe(agentId);
   });
 
-  it("TaskOutput of a failed-but-resumable background task carries the ID after the failure text", async () => {
+  it("TaskOutput of a failed-but-resumable background task gives same-agent recovery guidance", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
@@ -638,9 +638,12 @@ describe("model-visible agent-ID delivery", () => {
     const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("t2", {
       task_id: taskId,
     });
+    const text = out.content[0]!.text;
     expect(out.details.status).toBe("failed");
-    expect(out.content[0]!.text).toContain("500 exploded");
-    expect(out.content[0]!.text).toContain(`[agent ${agentId} — resumable via SendMessage]`);
+    expect(text).toContain("500 exploded");
+    expect(text).toContain("Resume this same agent with SendMessage");
+    expect(text).toContain(`Failed agent ID: ${agentId}.`);
+    expect(text).toContain("This agent is technically resumable via SendMessage.");
   });
 
   it("a NON-resumable failed-with-partial (cut-off) foreground run shows the cut-off but no resume channel", async () => {
@@ -674,9 +677,9 @@ describe("model-visible agent-ID delivery", () => {
     expect(text).toContain("not resumable via SendMessage");
   });
 
-  it("a NON-resumable failed-with-partial background task reports failed with no resume channel", async () => {
-    // Same as above via the background path (createTaskOutputTool): guards the
-    // `if (task.resumable && task.agentId)` gate in background-tasks.ts.
+  it("a NON-resumable failed-with-partial background task explains unavailable continuation", async () => {
+    // Same as above via TaskOutput: guidance must report actual capability
+    // without presenting same-agent continuation as available.
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
         session.messages.push({
@@ -708,11 +711,14 @@ describe("model-visible agent-ID delivery", () => {
     const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("t2", {
       task_id: taskId,
     });
+    const text = out.content[0]!.text;
     expect(out.details.status).toBe("failed");
     expect(out.details.resumable).toBe(false);
-    expect(out.content[0]!.text).toContain("failed");
-    expect(out.content[0]!.text).toContain("500 exploded");
-    expect(out.content[0]!.text).not.toContain("resumable via SendMessage");
+    expect(text).toContain("failed");
+    expect(text).toContain("500 exploded");
+    expect(text).toContain("same-agent continuation is unavailable");
+    expect(text).toContain("This agent is not resumable via SendMessage.");
+    expect(text).not.toContain("This agent is technically resumable via SendMessage.");
   });
 
   it("a zero-progress transient failure prefers replacement and reports actual resumability", async () => {

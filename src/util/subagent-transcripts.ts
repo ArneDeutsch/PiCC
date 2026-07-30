@@ -124,8 +124,8 @@ export function resolveSubagentTranscript(
 
 /**
  * The model-visible agent-ID trailer line. Appended — clearly delimited, outside
- * the verbatim-message contract, like the cut-off note — to foreground tool
- * results and TaskOutput text of RESUMABLE agents.
+ * the verbatim-message contract, like the cut-off note — to completed and
+ * truncated-completed foreground results and TaskOutput text of RESUMABLE agents.
  * Advisory, not authenticated: a subagent could forge a look-alike line in its
  * own prose; the dispatch registry stays the source of truth for what an ID
  * reaches, bounding impact to misdirected (legitimate) delivery — the same
@@ -138,12 +138,11 @@ export function agentTrailerLine(agentId: string, opts: { completed: boolean }):
 /**
  * The STANDALONE trailer frame: the `\n\n---\n` delimiter followed by the
  * trailer line. This is the single home of the `\n\n---\n` framing string —
- * hand-writing it at each call site lets the delimiter drift. Use
- * this when the trailer opens its OWN frame (a completed message, or a failed
- * message with no prior cut-off frame). When the trailer instead rides INSIDE
- * an existing cut-off frame (truncated/partial output already ends with a
- * `---` frame), append a bare `agentTrailerLine` with a single-`\n` prefix
- * rather than opening a second frame.
+ * hand-writing it at each call site lets the delimiter drift. Use this when a
+ * completed message's trailer opens its OWN frame. When a truncated-completed
+ * message's trailer instead rides INSIDE its existing cut-off frame, append a
+ * bare `agentTrailerLine` with a single-`\n` prefix rather than opening a second
+ * frame.
  */
 export function agentTrailerFrame(agentId: string, opts: { completed: boolean }): string {
   return `\n\n---\n${agentTrailerLine(agentId, opts)}`;
