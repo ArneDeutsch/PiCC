@@ -590,6 +590,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sc?.note).toContain("Reserved Pi/PiCC names are rejected case-insensitively");
     expect(sc?.note).toContain("colliding skill remains available only through direct Skill invocation");
     expect(sc?.note).toContain("when its model-invocation metadata permits");
+    expect(sc?.note).toContain("/plugins is a PiCC-defined extension, not Claude parity");
+    const skillNote = lookupCapability("tool.Skill")?.note ?? "";
+    expect(skillNote).toContain("bare Skill tokens `plugin`, `plugins`, and `reload-plugins`");
+    expect(skillNote).toContain("corresponding /plugin, /plugins, and /reload-plugins commands");
+    expect(skillNote).toContain("/plugins is a PiCC-defined extension, not Claude parity");
     expect(sc?.note).toContain("PARTIAL:");
     expect(sc?.note).toContain("built-in commands");
     // Must NOT lead with the degraded-noop em-dash pattern.
@@ -1383,6 +1388,28 @@ describe("buildCompatReport", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderDoctorReport", () => {
+  it("separates bounded plugin execution failures from unassessed inputs", () => {
+    const project = makeProject();
+    const report = buildCompatReport(project);
+    report.unassessed.push("future setting remains unknown");
+    report.pluginRuntimeFindings = [
+      "skill owner: persistent data creation failed; execution did not occur",
+      "skill owner: persistent data creation failed; execution did not occur",
+      ...Array.from({ length: 19 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
+    ];
+    report.pluginRuntimeFindingsOmitted = 6;
+    report.pluginRuntimeFindingsOmittedAtLeast = true;
+    const doctor = renderDoctorReport(project, report);
+    const runtime = doctor.slice(
+      doctor.indexOf("Plugin runtime failures (execution did not occur):"),
+      doctor.indexOf("Unassessed (unknown"),
+    );
+    expect(runtime.match(/persistent data creation failed/g)).toHaveLength(1);
+    expect(runtime).toContain("at least 6 additional distinct failure(s) omitted");
+    expect(runtime).toContain("Repair or reinstall");
+    expect(runtime).not.toContain("future setting remains unknown");
+    expect(runtime.length).toBeLessThan(12_000);
+  });
   it("contains the baseline, findings, unassessed items, and per-tier registry counts", () => {
     const project = makeProject({
       settings: makeSettings({

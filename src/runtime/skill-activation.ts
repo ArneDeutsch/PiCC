@@ -1,13 +1,18 @@
 import path from "node:path";
-import type { ClaudeSettings, ClaudeSkill, Diagnostic } from "../types.js";
+import type { ClaudeSettings, ClaudeSkill, Diagnostic, PluginRuntimeContext } from "../types.js";
 import {
-  loadSkillBody,
+  loadSkillBodyResult,
   substituteArguments,
   substituteToolRules,
   substituteVariables,
 } from "../claude/skills.js";
 import { preprocessShellInjection } from "../engine/shell-inject.js";
 import type { HookRunnerLike } from "../engine/hook-runner.js";
+
+function boundedRuntimeLabel(value: string): string {
+  const neutral = value.replace(/[\u0000-\u001f\u007f]/g, "?");
+  return neutral.length <= 128 ? neutral : `${neutral.slice(0, 127)}…`;
+}
 
 /** Mutable preservation state owned by one main session or one child dispatch. */
 export interface SkillActivationState {
@@ -40,17 +45,16 @@ export function skillActivationVars(opts: {
   projectRoot: string;
   sessionId: string;
   effort?: string;
-  pluginRoot?: string;
-  pluginData?: string;
+  pluginContext?: PluginRuntimeContext;
 }): Record<string, string> {
   return {
     CLAUDE_SKILL_DIR: opts.skill.baseDir,
-    CLAUDE_PROJECT_DIR: opts.projectRoot,
+    CLAUDE_PROJECT_DIR: opts.pluginContext?.projectDir ?? opts.projectRoot,
     CLAUDE_SESSION_ID: opts.sessionId,
     CLAUDE_EFFORT: opts.effort ?? "",
-    CLAUDE_PLUGIN_ROOT: opts.pluginRoot ?? opts.skill.baseDir,
+    CLAUDE_PLUGIN_ROOT: opts.pluginContext?.root ?? opts.skill.baseDir,
     CLAUDE_PLUGIN_DATA:
-      opts.pluginData ?? path.join(opts.projectRoot, ".claude", ".picc", "plugin-data"),
+      opts.pluginContext?.dataDir ?? path.join(opts.projectRoot, ".claude", ".picc", "plugin-data"),
   };
 }
 
@@ -62,6 +66,16 @@ export function skillActivationVars(opts: {
  * variable + argument substitution applied; the skill object itself is never
  * mutated.
  */
+export type SkillActivationRenderResult =
+  | {
+      ok: true;
+      text: string;
+      diagnostics: Diagnostic[];
+      allowedTools?: string[];
+      disallowedTools?: string[];
+    }
+  | { ok: false; message: string; diagnostics: Diagnostic[] };
+
 export async function renderSkillForActivation(opts: {
   skill: ClaudeSkill;
   argsText: string;
@@ -70,16 +84,26 @@ export async function renderSkillForActivation(opts: {
   sessionId: string;
   effort?: string;
   settings: ClaudeSettings;
-  pluginRoot?: string;
-  pluginData?: string;
-}): Promise<{
-  text: string;
-  diagnostics: Diagnostic[];
-  allowedTools?: string[];
-  disallowedTools?: string[];
-}> {
+  pluginContext?: PluginRuntimeContext;
+  ensurePluginDataDir?: (context: PluginRuntimeContext, component: string) => { ok: true } | { ok: false; message: string };
+  onRuntimeFinding?: (message: string) => void;
+}): Promise<SkillActivationRenderResult> {
   const diagnostics: Diagnostic[] = [];
-  const body = loadSkillBody(opts.skill);
+  const fail = (message: string): SkillActivationRenderResult => {
+    diagnostics.push({ severity: "warning", message, source: opts.skill.source.path });
+    try {
+      opts.onRuntimeFinding?.(message);
+    } catch {
+      // Runtime finding observers are presentation-only.
+    }
+    return { ok: false, message, diagnostics };
+  };
+  const loaded = loadSkillBodyResult(opts.skill);
+  diagnostics.push(...loaded.diagnostics);
+  if (loaded.failure) {
+    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because its installed plugin body is no longer readable or contained. Repair or reinstall the plugin in Claude Code, then relaunch PiCC`);
+  }
+  const body = loaded.body;
   if (!body) {
     diagnostics.push({
       severity: "warning",
@@ -88,10 +112,39 @@ export async function renderSkillForActivation(opts: {
     });
   }
 
+  if (opts.skill.source.pluginId && !opts.pluginContext) {
+    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because runtime context for plugin "${boundedRuntimeLabel(opts.skill.source.pluginId)}" is unavailable. Repair or reinstall the plugin in Claude Code, then relaunch PiCC`);
+  }
+
   const args = substituteArguments(body, opts.argsText, opts.skill.arguments);
   diagnostics.push(...args.diagnostics);
-
   const vars = skillActivationVars(opts);
+  const allowedTools = substituteToolRules(
+    opts.skill.allowedTools,
+    opts.argsText,
+    vars,
+    opts.skill.arguments,
+  );
+  const disallowedTools = substituteToolRules(
+    opts.skill.disallowedTools,
+    opts.argsText,
+    vars,
+    opts.skill.arguments,
+  );
+  const rawToolRules = [...(opts.skill.allowedTools ?? []), ...(opts.skill.disallowedTools ?? [])];
+  const finalToolRules = [...(allowedTools ?? []), ...(disallowedTools ?? [])];
+  const referencesPluginData = [args.text, ...rawToolRules, ...finalToolRules]
+    .some((value) => /\$\{CLAUDE_PLUGIN_DATA\}|\$CLAUDE_PLUGIN_DATA(?![A-Za-z0-9_])/.test(value));
+  if (opts.pluginContext && referencesPluginData) {
+    const ensured = opts.ensurePluginDataDir?.(opts.pluginContext, `skill ${boundedRuntimeLabel(opts.skill.name)}`);
+    if (!ensured || !ensured.ok) {
+      const message = ensured && !ensured.ok
+        ? ensured.message
+        : `Skill "${boundedRuntimeLabel(opts.skill.name)}" could not prepare persistent data for plugin "${boundedRuntimeLabel(opts.pluginContext.pluginId)}". Repair or reinstall the plugin in Claude Code, then relaunch PiCC.`;
+      return fail(message);
+    }
+  }
+
   const withVars = substituteVariables(args.text, vars);
 
   const injected = await preprocessShellInjection(withVars, {
@@ -99,26 +152,26 @@ export async function renderSkillForActivation(opts: {
     cwd: opts.cwd,
     // Overlay only: the spawned shell inherits the full process.env (PATH,
     // HOME, SystemRoot, …) with these Claude-specific vars layered on top.
-    env: { ...opts.settings.env, CLAUDE_PROJECT_DIR: opts.projectRoot },
+    env: {
+      ...opts.settings.env,
+      CLAUDE_PROJECT_DIR: opts.pluginContext?.projectDir ?? opts.projectRoot,
+      ...(opts.pluginContext
+        ? {
+            CLAUDE_PLUGIN_ROOT: opts.pluginContext.root,
+            CLAUDE_PLUGIN_DATA: opts.pluginContext.dataDir,
+          }
+        : {}),
+    },
     disabled: opts.settings.disableSkillShellExecution,
   });
   diagnostics.push(...injected.diagnostics);
 
   return {
+    ok: true,
     text: injected.text,
     diagnostics,
-    allowedTools: substituteToolRules(
-      opts.skill.allowedTools,
-      opts.argsText,
-      vars,
-      opts.skill.arguments,
-    ),
-    disallowedTools: substituteToolRules(
-      opts.skill.disallowedTools,
-      opts.argsText,
-      vars,
-      opts.skill.arguments,
-    ),
+    allowedTools,
+    disallowedTools,
   };
 }
 

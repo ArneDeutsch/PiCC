@@ -43,6 +43,12 @@ export interface CompatReport {
   safetyFindings: CompatFinding[];
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
+  /** Bounded point-of-use plugin failures known not to have executed. */
+  pluginRuntimeFindings?: string[];
+  /** Distinct runtime findings omitted after the retained cap. */
+  pluginRuntimeFindingsOmitted?: number;
+  /** The fingerprint counter saturated, so the omitted count is a lower bound. */
+  pluginRuntimeFindingsOmittedAtLeast?: boolean;
   /**
    * Pending-approval MCP servers, as one bounded terminal-safe line for the
    * session-start `ctx.ui.notify(...)`. Pending servers are ACTIONABLE STATE,
@@ -952,6 +958,21 @@ export function renderDoctorReport(
     }
   }
   lines.push("");
+
+  const runtimeFindings = [...new Set((report.pluginRuntimeFindings ?? [])
+    .map((item) => mcpStatusScalar(item, 500))
+    .filter(Boolean))].slice(0, 20);
+  if (runtimeFindings.length > 0) {
+    lines.push("Plugin runtime failures (execution did not occur):");
+    for (const item of runtimeFindings) lines.push(`  - ${item}`);
+    const omitted = Math.max(0, Math.trunc(report.pluginRuntimeFindingsOmitted ?? 0));
+    if (omitted > 0) {
+      const qualifier = report.pluginRuntimeFindingsOmittedAtLeast ? "at least " : "";
+      lines.push(`  - ${qualifier}${omitted} additional distinct failure(s) omitted.`);
+    }
+    lines.push("  Repair or reinstall the affected plugin in Claude Code, then relaunch PiCC.");
+    lines.push("");
+  }
 
   if (report.unassessed.length > 0) {
     lines.push(`Unassessed (unknown at baseline ${CLAUDE_BASELINE} — degrade safely):`);

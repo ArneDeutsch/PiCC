@@ -10,7 +10,7 @@ import {
   skillActivationMessage,
 } from "../src/runtime/skill-activation.js";
 import { resolveShellBinary } from "../src/engine/shell-inject.js";
-import picc from "../src/index.js";
+import picc, { pluginRuntimeContextForSource } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
 
@@ -88,6 +88,130 @@ afterAll(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("qualified plugin skill activation", () => {
+  it("renders the exact qualified context when two marketplaces share a bare name", async () => {
+    const skill = writeSkill("qualified-selection", "root=${CLAUDE_PLUGIN_ROOT};data=${CLAUDE_PLUGIN_DATA}");
+    skill.source.pluginId = "same@market-b";
+    skill.source.pluginName = "same";
+    const first = {
+      pluginId: "same@market-a", pluginName: "same", root: path.join(root, "market-a"),
+      dataDir: path.join(root, "data-a"), projectDir: root,
+    };
+    const second = {
+      pluginId: "same@market-b", pluginName: "same", root: path.join(root, "market-b"),
+      dataDir: path.join(root, "data-b"), projectDir: root,
+    };
+    const selected = pluginRuntimeContextForSource(skill.source, new Map([
+      [first.pluginId, first], [second.pluginId, second],
+    ]));
+    const result = await renderSkillForActivation({
+      skill, argsText: "", projectRoot: root, cwd: root, sessionId: "session",
+      settings: baseSettings(), pluginContext: selected, ensurePluginDataDir: () => ({ ok: true }),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
+    expect(result.text).toBe(`root=${second.root};data=${second.dataDir}`);
+    expect(result.text).not.toContain(first.root);
+  });
+
+  it("creates plugin data only on reference and fails visibly when creation fails", async () => {
+    const skill = writeSkill("plugin-data", "state=${CLAUDE_PLUGIN_DATA}/state.json");
+    skill.source.pluginId = "plugin-data@market";
+    skill.source.pluginName = "plugin-data";
+    const context = {
+      pluginId: "plugin-data@market",
+      pluginName: "plugin-data",
+      root: path.join(root, "installed-root"),
+      dataDir: path.join(root, "plugin-data-dir"),
+      projectDir: root,
+    };
+    const findings: string[] = [];
+    const failed = await renderSkillForActivation({
+      skill,
+      argsText: "",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "session",
+      settings: baseSettings(),
+      pluginContext: context,
+      ensurePluginDataDir: () => ({ ok: false, message: "contained mkdir failed" }),
+      onRuntimeFinding: (message) => findings.push(message),
+    });
+    expect(failed).toMatchObject({ ok: false });
+    if (failed.ok) throw new Error("expected activation failure");
+    expect(failed.message).toContain("contained mkdir failed");
+    expect(findings[0]).toContain("contained mkdir failed");
+
+    fs.writeFileSync(skill.source.path, "---\nname: plugin-data\ndescription: pipeline test\n---\nno data variable", "utf8");
+    let creationCalls = 0;
+    const quiet = await renderSkillForActivation({
+      skill,
+      argsText: "",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "session",
+      settings: baseSettings(),
+      pluginContext: context,
+      ensurePluginDataDir: () => { creationCalls += 1; return { ok: true }; },
+    });
+    expect(quiet.ok).toBe(true);
+    if (!quiet.ok) throw new Error(quiet.message);
+    expect(quiet.text).toContain("no data variable");
+    expect(creationCalls).toBe(0);
+  });
+
+  it.runIf(hasBash)(
+    "returns the authoritative typed failure without shell egress when the runtime-finding observer throws",
+    async () => {
+      const marker = path.join(root, "throwing-observer-shell-marker");
+      const shellMarker = marker.split(path.sep).join("/");
+      const skill = writeSkill(
+        "throwing-observer",
+        "state=${CLAUDE_PLUGIN_DATA}/state.json\nreached: !`printf reached > \"$PICC_OBSERVER_THROW_MARKER\"`",
+      );
+      skill.source.pluginId = "throwing-observer@market";
+      skill.source.pluginName = "throwing-observer";
+      const context = {
+        pluginId: "throwing-observer@market",
+        pluginName: "throwing-observer",
+        root: path.join(root, "throwing-observer-root"),
+        dataDir: path.join(root, "throwing-observer-data"),
+        projectDir: root,
+      };
+      const message = "contained mkdir failed";
+      let observerCalls = 0;
+
+      fs.rmSync(marker, { force: true });
+      try {
+        const result = await renderSkillForActivation({
+          skill,
+          argsText: "",
+          projectRoot: root,
+          cwd: root,
+          sessionId: "session",
+          settings: {
+            ...baseSettings(),
+            env: { PICC_OBSERVER_THROW_MARKER: shellMarker },
+          },
+          pluginContext: context,
+          ensurePluginDataDir: () => ({ ok: false, message }),
+          onRuntimeFinding: () => { observerCalls += 1; throw new Error("observer failed"); },
+        });
+
+        expect(observerCalls).toBe(1);
+        expect(result).toEqual({
+          ok: false,
+          message,
+          diagnostics: [{ severity: "warning", message, source: skill.source.path }],
+        });
+        expect(fs.existsSync(marker)).toBe(false);
+      } finally {
+        fs.rmSync(marker, { force: true });
+      }
+    },
+  );
+});
+
 describe("renderSkillForActivation", () => {
   it.runIf(hasBash)(
     "injected commands inherit process.env, see the Claude overlay, and get args/vars substituted",
@@ -104,7 +228,7 @@ describe("renderSkillForActivation", () => {
       );
       process.env.PICC_PIPE_INHERIT = "inherit-val";
       try {
-        const { text, diagnostics } = await renderSkillForActivation({
+        const result = await renderSkillForActivation({
           skill,
           argsText: "alpha",
           projectRoot: root,
@@ -112,6 +236,9 @@ describe("renderSkillForActivation", () => {
           sessionId: "sess-1",
           settings: { ...baseSettings(), env: { PICC_PIPE_OVERLAY: "overlay-val" } },
         });
+        expect(result.ok).toBe(true);
+        if (!result.ok) throw new Error(result.message);
+        const { text, diagnostics } = result;
         expect(diagnostics).toHaveLength(0);
         expect(text).toContain(`dir=${skill.baseDir}`);
         expect(text).toContain("arg=alpha");
@@ -128,7 +255,7 @@ describe("renderSkillForActivation", () => {
 
   it("honors disableSkillShellExecution from settings", async () => {
     const skill = writeSkill("disabled-shell", "out: !`echo nope`");
-    const { text, diagnostics } = await renderSkillForActivation({
+    const result = await renderSkillForActivation({
       skill,
       argsText: "",
       projectRoot: root,
@@ -136,13 +263,16 @@ describe("renderSkillForActivation", () => {
       sessionId: "sess-1",
       settings: { ...baseSettings(), disableSkillShellExecution: true },
     });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
+    const { text, diagnostics } = result;
     expect(text).toContain("[shell execution disabled: echo nope]");
     expect(diagnostics.some((d) => d.severity === "info")).toBe(true);
   });
 
   it("degrades a missing skill file to a warning diagnostic (never throws)", async () => {
     const skill = mkSkill("gone", path.join(root, "gone", "SKILL.md"));
-    const { text, diagnostics } = await renderSkillForActivation({
+    const result = await renderSkillForActivation({
       skill,
       argsText: "",
       projectRoot: root,
@@ -150,6 +280,9 @@ describe("renderSkillForActivation", () => {
       sessionId: "sess-1",
       settings: baseSettings(),
     });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
+    const { text, diagnostics } = result;
     expect(text).toBe("");
     expect(
       diagnostics.some((d) => d.severity === "warning" && d.message.includes("empty or unreadable")),
@@ -164,6 +297,74 @@ describe("renderSkillForActivation", () => {
     expect(msg).toContain("</skill>");
   });
 
+  it("detects plugin data introduced by named arguments and final tool-rule substitution", async () => {
+    const skill = writeSkill("late-data", "target=$target");
+    skill.source.pluginId = "late-data@market";
+    skill.source.pluginName = "late-data";
+    skill.arguments = [{ name: "target" }];
+    skill.allowedTools = ["Read($0)"];
+    const context = {
+      pluginId: "late-data@market",
+      pluginName: "late-data",
+      root: path.join(root, "late-root"),
+      dataDir: path.join(root, "late-data"),
+      projectDir: root,
+    };
+    let calls = 0;
+    const result = await renderSkillForActivation({
+      skill,
+      argsText: "${CLAUDE_PLUGIN_DATA}",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "sess-1",
+      settings: baseSettings(),
+      pluginContext: context,
+      ensurePluginDataDir: () => { calls += 1; return { ok: true }; },
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  it("ignores unused raw arguments but still prepares data for raw tool-rule references", async () => {
+    const context = {
+      pluginId: "lazy-data@market", pluginName: "lazy-data", root: "/plugins/lazy",
+      dataDir: "/data/lazy", projectDir: root,
+    };
+    const unused = writeSkill("unused-data-argument", "used=$0");
+    unused.source.pluginId = context.pluginId;
+    unused.source.pluginName = context.pluginName;
+    let calls = 0;
+    const unusedResult = await renderSkillForActivation({
+      skill: unused,
+      argsText: "safe ${CLAUDE_PLUGIN_DATA}",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "sess-1",
+      settings: baseSettings(),
+      pluginContext: context,
+      ensurePluginDataDir: () => { calls += 1; return { ok: true }; },
+    });
+    expect(unusedResult.ok).toBe(true);
+    expect(calls).toBe(0);
+
+    const ruled = writeSkill("raw-data-rule", "body without data");
+    ruled.source.pluginId = context.pluginId;
+    ruled.source.pluginName = context.pluginName;
+    ruled.disallowedTools = ["Write(${CLAUDE_PLUGIN_DATA}/blocked)"];
+    const ruledResult = await renderSkillForActivation({
+      skill: ruled,
+      argsText: "unused",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "sess-1",
+      settings: baseSettings(),
+      pluginContext: context,
+      ensurePluginDataDir: () => { calls += 1; return { ok: true }; },
+    });
+    expect(ruledResult.ok).toBe(true);
+    expect(calls).toBe(1);
+  });
+
   it("substitutes ${CLAUDE_*} and $ARGUMENTS in allowed-/disallowed-tools without mutating the skill", async () => {
     const skill = writeSkill("tool-rules", "Body uses $ARGUMENTS.");
     skill.allowedTools = ["Read(${CLAUDE_PROJECT_DIR}/**)", "Bash(deploy $0:*)"];
@@ -176,6 +377,8 @@ describe("renderSkillForActivation", () => {
       sessionId: "sess-1",
       settings: baseSettings(),
     });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
     expect(result.allowedTools).toEqual([`Read(${root}/**)`, "Bash(deploy staging:*)"]);
     expect(result.disallowedTools).toEqual([
       `Write(${skill.baseDir}/*)`,

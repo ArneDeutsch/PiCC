@@ -35,7 +35,14 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
     getAgentDir: () => "/fake-agent-dir",
   };
 });
-import piccExtension from "../src/index.js";
+import piccExtension, {
+  createBoundedHeadlessDiagnosticSurface,
+  pluginRuntimeContextForSource,
+  preparePluginDataDir,
+  projectPluginAgentRuntime,
+  renderPluginStartupNotice,
+  substitutePluginRuntimeText,
+} from "../src/index.js";
 import { fakePi } from "./helpers/fake-pi.js";
 import { CwdState } from "../src/runtime/cwd-state.js";
 import {
@@ -99,7 +106,7 @@ import {
   type FakeReply,
   type SubagentRuntimeOverrides,
 } from "./helpers/fake-sdk.js";
-import type { ClaudeAgent, ClaudeSettings } from "../src/types.js";
+import type { ClaudeAgent, ClaudeSettings, Diagnostic } from "../src/types.js";
 
 function baseSettings(): ClaudeSettings {
   return {
@@ -120,6 +127,221 @@ function baseSettings(): ClaudeSettings {
     diagnostics: [],
   };
 }
+
+describe("plugin startup notice", () => {
+  it("is quiet for loaded/disabled outcomes and valid or absent policy", () => {
+    expect(renderPluginStartupNotice([
+      { pluginId: "loaded@market", status: "loaded", diagnostics: [] },
+      { pluginId: "off@market", status: "disabled", diagnostics: [] },
+    ], [])).toBeUndefined();
+  });
+
+  it("tables every failure status and deduplicates bounded identities and policy classes", () => {
+    const failureStatuses = ["enabled-but-uninstalled", "unsupported", "ambiguous", "blocked", "malformed", "rejected"] as const;
+    for (const status of failureStatuses) {
+      const notice = renderPluginStartupNotice([
+        { pluginId: `same-${status}@market`, status, diagnostics: [] },
+        { pluginId: `same-${status}@market`, status, diagnostics: [] },
+      ], []);
+      expect(notice?.match(new RegExp(`same-${status}@market`, "g"))).toHaveLength(1);
+    }
+    const policy = renderPluginStartupNotice(undefined, [
+      { severity: "warning", message: "x", category: "managed-policy-malformed", sourceClass: `class\u001b${"x".repeat(200)}`, impact: "weaker-policy-suppressed" },
+      { severity: "warning", message: "y", category: "managed-policy-unreadable", sourceClass: `class\u001b${"x".repeat(200)}`, impact: "weaker-policy-suppressed" },
+    ] as any);
+    expect(policy).not.toContain("\u001b");
+    expect(policy!.length).toBeLessThan(400);
+  });
+
+  it("bounds and sanitizes enabled failures and reports administrator policy suppression", () => {
+    const outcomes = Array.from({ length: 7 }, (_, index) => ({
+      pluginId: `bad-${index}\u001b[31m@market`,
+      status: "rejected" as const,
+      diagnostics: [],
+    }));
+    const notice = renderPluginStartupNotice(outcomes, [{
+      severity: "warning",
+      message: "raw path and content must not appear",
+      category: "managed-policy-malformed",
+      sourceClass: "system-file",
+      impact: "weaker-policy-suppressed",
+    }]);
+    expect(notice).toContain("no fallback content was used");
+    expect(notice).toContain("and 2 more");
+    expect(notice).not.toContain("\u001b");
+    expect(notice).toContain("system-file");
+    expect(notice).toContain("weaker policy was suppressed");
+    expect(notice).toContain("Repair policy and relaunch PiCC");
+    expect(notice).not.toContain("raw path and content");
+  });
+});
+
+describe("bounded plugin runtime warnings", () => {
+  it("deduplicates below the cap and emits one generic warning after saturation", () => {
+    const emitted: string[] = [];
+    const surface = createBoundedHeadlessDiagnosticSurface((text) => emitted.push(text), 3);
+    for (const message of ["one", "one", "two", "three", "four", "five"]) {
+      surface({ severity: "warning", message });
+    }
+    expect(emitted).toEqual([
+      "PiCC: one",
+      "PiCC: two",
+      "PiCC: three",
+      "PiCC: additional distinct plugin runtime warnings were suppressed; run /doctor for bounded details.",
+    ]);
+  });
+
+  it("contains emitter failures for normal and overflow warnings", () => {
+    const surface = createBoundedHeadlessDiagnosticSurface(() => { throw new Error("stderr unavailable"); }, 1);
+    expect(() => surface({ severity: "warning", message: "first" })).not.toThrow();
+    expect(() => surface({ severity: "warning", message: "overflow" })).not.toThrow();
+  });
+});
+
+describe("qualified plugin agent content", () => {
+  it("keeps same-name marketplace agent bodies and preloaded skills on their own contexts", () => {
+    const first = {
+      pluginId: "same@market-a", pluginName: "same", root: "/installed/a",
+      dataDir: "/data/a", projectDir: "/project",
+    };
+    const second = {
+      pluginId: "same@market-b", pluginName: "same", root: "/installed/b",
+      dataDir: "/data/b", projectDir: "/project",
+    };
+    const contexts = new Map([[first.pluginId, first], [second.pluginId, second]]);
+    const selectedFirst = pluginRuntimeContextForSource({ pluginId: first.pluginId, pluginName: "same" }, contexts);
+    const selectedSecond = pluginRuntimeContextForSource({ pluginId: second.pluginId, pluginName: "same" }, contexts);
+    expect(selectedFirst).toBe(first);
+    expect(selectedSecond).toBe(second);
+    expect(pluginRuntimeContextForSource({ pluginId: "same@missing", pluginName: "same" }, contexts)).toBeUndefined();
+    expect(pluginRuntimeContextForSource({ pluginName: "same" }, contexts)).toBeUndefined();
+
+    const template = "root=${CLAUDE_PLUGIN_ROOT};data=${CLAUDE_PLUGIN_DATA};project=${CLAUDE_PROJECT_DIR}";
+    expect(substitutePluginRuntimeText(template, selectedFirst!)).toBe("root=/installed/a;data=/data/a;project=/project");
+    expect(substitutePluginRuntimeText(`preload:${template}:skill=\${CLAUDE_SKILL_DIR}`, selectedSecond!, {
+      CLAUDE_SKILL_DIR: "/installed/b/skills/preloaded",
+    })).toBe("preload:root=/installed/b;data=/data/b;project=/project:skill=/installed/b/skills/preloaded");
+
+    const original = makeAgent({
+      body: template,
+      tools: [`Read(\${CLAUDE_PLUGIN_ROOT}/**)`, `Bash(cat \${CLAUDE_PLUGIN_DATA}/allow)`],
+      disallowedTools: [`Write(\${CLAUDE_PROJECT_DIR}/deny)`, `Bash(rm \${CLAUDE_PLUGIN_DATA}/deny)`],
+      source: { path: "agent.md", scope: "plugin", pluginName: "same", pluginId: second.pluginId },
+    });
+    const projectedFirst = projectPluginAgentRuntime(original, selectedFirst!);
+    const projected = projectPluginAgentRuntime(original, selectedSecond!);
+    expect(projectedFirst).toMatchObject({
+      body: "root=/installed/a;data=/data/a;project=/project",
+      tools: ["Read(/installed/a/**)", "Bash(cat /data/a/allow)"],
+      disallowedTools: ["Write(/project/deny)", "Bash(rm /data/a/deny)"],
+    });
+    expect(projected).toMatchObject({
+      body: "root=/installed/b;data=/data/b;project=/project",
+      tools: ["Read(/installed/b/**)", "Bash(cat /data/b/allow)"],
+      disallowedTools: ["Write(/project/deny)", "Bash(rm /data/b/deny)"],
+    });
+    expect(original.body).toBe(template);
+    expect(original.tools?.join("|")).toContain("${CLAUDE_PLUGIN_ROOT}");
+  });
+});
+
+describe("plugin persistent data preparation", () => {
+  it("creates only on first use and isolates qualified identities", () => {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
+    const projectRoot = path.join(userDir, "project");
+    fs.mkdirSync(projectRoot);
+    try {
+      const contexts = ["same@market-a", "same@market-b"].map((pluginId) => ({
+        pluginId,
+        pluginName: "same",
+        root: path.join(userDir, "roots", pluginId),
+        dataDir: path.join(userDir, "plugins", "data", pluginId.replace(/[^A-Za-z0-9_-]/g, "-")),
+        projectDir: projectRoot,
+      }));
+      expect(contexts.every((context) => !fs.existsSync(context.dataDir))).toBe(true);
+      expect(preparePluginDataDir({ userDir, projectRoot, context: contexts[0]! })).toEqual({ ok: true });
+      expect(fs.existsSync(contexts[0]!.dataDir)).toBe(true);
+      expect(fs.existsSync(contexts[1]!.dataDir)).toBe(false);
+      expect(preparePluginDataDir({ userDir, projectRoot, context: contexts[1]! })).toEqual({ ok: true });
+    } finally {
+      fs.rmSync(userDir, { recursive: true, force: true });
+    }
+  });
+
+  it("admits portable interior dots but rejects trailing dots/spaces and Windows devices before filesystem access", () => {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
+    const projectRoot = path.join(userDir, "project");
+    fs.mkdirSync(projectRoot);
+    try {
+      const dotted = {
+        pluginId: "portable.name", pluginName: "portable.name", root: userDir,
+        dataDir: path.join(userDir, "plugins", "data", "portable.name"), projectDir: projectRoot,
+      };
+      expect(preparePluginDataDir({ userDir, projectRoot, context: dotted })).toEqual({ ok: true });
+      expect(fs.existsSync(dotted.dataDir)).toBe(true);
+
+      for (const name of [
+        "trailing.", "trailing ", "CON", "prn.txt", "AUX.any", "NUL", "CLOCK$", "COM1.log",
+        "com9", "LPT1.txt", "lpt9", "CONIN$", "CONOUT$.txt",
+      ]) {
+        const lstat = vi.spyOn(fs, "lstatSync");
+        const mkdir = vi.spyOn(fs, "mkdirSync");
+        const realpath = vi.spyOn(fs.realpathSync, "native");
+        const context = {
+          pluginId: name, pluginName: name, root: userDir,
+          dataDir: path.join(userDir, "plugins", "data", name), projectDir: projectRoot,
+        };
+        expect(preparePluginDataDir({ userDir, projectRoot, context })).toEqual({ ok: false, code: "invalid-legacy-identity" });
+        expect(lstat).not.toHaveBeenCalled();
+        expect(mkdir).not.toHaveBeenCalled();
+        expect(realpath).not.toHaveBeenCalled();
+        lstat.mockRestore();
+        mkdir.mockRestore();
+        realpath.mockRestore();
+        expect(fs.existsSync(context.dataDir)).toBe(false);
+      }
+    } finally {
+      fs.rmSync(userDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects legacy traversal and a linked data base before outside mutation", () => {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-outside-"));
+    const projectRoot = path.join(userDir, "project");
+    fs.mkdirSync(projectRoot);
+    try {
+      const traversal = {
+        pluginId: "../escape",
+        pluginName: "../escape",
+        root: userDir,
+        dataDir: path.join(userDir, "plugins", "escape"),
+        projectDir: projectRoot,
+      };
+      expect(preparePluginDataDir({ userDir, projectRoot, context: traversal }).ok).toBe(false);
+      expect(fs.readdirSync(outside)).toEqual([]);
+
+      fs.mkdirSync(path.join(userDir, "plugins"), { recursive: true });
+      try {
+        fs.symlinkSync(outside, path.join(userDir, "plugins", "data"), process.platform === "win32" ? "junction" : "dir");
+      } catch {
+        return;
+      }
+      const linked = {
+        pluginId: "legacy",
+        pluginName: "legacy",
+        root: userDir,
+        dataDir: path.join(userDir, "plugins", "data", "legacy"),
+        projectDir: projectRoot,
+      };
+      expect(preparePluginDataDir({ userDir, projectRoot, context: linked }).ok).toBe(false);
+      expect(fs.existsSync(path.join(outside, "legacy"))).toBe(false);
+    } finally {
+      fs.rmSync(userDir, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("CwdState", () => {
   it("swaps and restores the effective cwd", () => {
@@ -943,6 +1165,175 @@ describe("SubagentRuntime (fake SDK)", () => {
     return { runtime, created };
   }
 
+  it("surfaces trusted plugin prompt preparation failure before SDK or provider construction", async () => {
+    const agent = makeAgent({
+      source: { path: "plugin-agent.md", scope: "plugin", pluginName: "owner", pluginId: "owner@market" },
+    });
+    let toolConstruction = 0;
+    const { runtime, created } = makeRuntime([agent], ["must not run"], {
+      prepareAgent: () => { throw new Error("qualified plugin data preparation failed"); },
+      customToolsFor: () => { toolConstruction += 1; return []; },
+    });
+    const result = await runtime.dispatch({ subagentType: agent.name, prompt: "p", depth: 1 });
+    expect(result).toMatchObject({ ok: false, outcome: "failed" });
+    expect(result.error).toContain("qualified plugin data preparation failed");
+    expect(created).toHaveLength(0);
+    expect(toolConstruction).toBe(0);
+  });
+
+  it("sanitizes, deduplicates, and caps preload diagnostics even when the headless sink throws", async () => {
+    const handle = fakeSdk({ replies: ["completed despite observer"] });
+    const BaseLoader = handle.sdk.DefaultResourceLoader;
+    const sdk = {
+      ...handle.sdk,
+      DefaultResourceLoader: class extends BaseLoader {
+        private readonly promptOverride: () => string;
+        constructor(options: Record<string, unknown>) {
+          super(options);
+          this.promptOverride = options.systemPromptOverride as () => string;
+        }
+        override async reload() {
+          this.promptOverride();
+        }
+      },
+    };
+    const surfaced: Diagnostic[] = [];
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+      buildSystemPrompt: (_agent, _depth, sink) => {
+        const diagnostics = Array.from({ length: 25 }, (_, index) => ({
+          severity: "warning" as const,
+          source: `hostile\u001b[31m-source-${"s".repeat(200)}`,
+          message: `preload ${index} ${"m".repeat(600)}`,
+        }));
+        for (const diagnostic of [diagnostics[0]!, ...diagnostics, diagnostics[0]!]) sink?.(diagnostic);
+        return "SYSTEM";
+      },
+      surfaceHeadlessDiagnostic: (diagnostic) => {
+        surfaced.push(diagnostic);
+        throw new Error("stderr unavailable");
+      },
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1, headless: true });
+    const retained = result.diagnostics.filter((diagnostic) =>
+      diagnostic.message.startsWith("preload ") || diagnostic.message.includes("preload diagnostics were suppressed"));
+    expect(result).toMatchObject({ ok: true, finalMessage: "completed despite observer" });
+    expect(retained).toHaveLength(21);
+    expect(retained.filter((diagnostic) => diagnostic.message.startsWith("preload 0 "))).toHaveLength(1);
+    expect(retained.every((diagnostic) => diagnostic.message.length <= 500 && (diagnostic.source?.length ?? 0) <= 120)).toBe(true);
+    expect(retained.every((diagnostic) => !diagnostic.message.includes("\u001b") && !diagnostic.source?.includes("\u001b"))).toBe(true);
+    expect(surfaced).toHaveLength(21);
+    expect(surfaced.every((diagnostic, index) => diagnostic === retained[index])).toBe(true);
+  });
+
+  it("uses the exact prepared projection for both prompt gating and actual tools", async () => {
+    const original = makeAgent({ tools: ["Read"], disallowedTools: ["Write"] });
+    const projected = { ...original, body: "projected body", tools: ["Grep"], disallowedTools: ["Bash"] };
+    let promptAgent: ClaudeAgent | undefined;
+    let toolsAgent: ClaudeAgent | undefined;
+    const { runtime, created } = makeRuntime([original], ["done"], {
+      prepareAgent: () => projected,
+      buildSystemPrompt: (agent) => { promptAgent = agent; return agent.body; },
+      customToolsFor: (agent) => { toolsAgent = agent; return []; },
+    });
+    const result = await runtime.dispatch({ subagentType: original.name, prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    const loader = created[0]!.resourceLoader as { options: { systemPromptOverride: () => string } };
+    expect(loader.options.systemPromptOverride()).toBe("projected body");
+    expect(promptAgent).toBe(projected);
+    expect(toolsAgent).toBe(projected);
+  });
+
+  it.each([
+    ["headless", true, 1],
+    ["tui", false, 0],
+  ] as const)("retains plugin-skill non-start hook warnings in %s dispatch details", async (_label, headless, surfacedCount) => {
+    const surfaced: unknown[] = [];
+    const { runtime } = makeRuntime([makeAgent()], ["done"], {
+      customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _notebook, activation) => {
+        activation.hookRunners.push({
+          fire: async (event) => ({
+            block: false,
+            askDowngraded: false,
+            diagnostics: event === "SubagentStop"
+              ? [{ severity: "warning" as const, message: "plugin skill data failed; no hook process spawned" }]
+              : [],
+          }),
+        });
+        return [];
+      },
+      surfaceHeadlessDiagnostic: (diagnostic) => surfaced.push(diagnostic),
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1, headless });
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "plugin skill data failed; no hook process spawned" }),
+    ]));
+    expect(surfaced).toHaveLength(surfacedCount);
+  });
+
+  it("contains a throwing headless sink while retaining a non-start scoped-hook warning", async () => {
+    const surfaced: Diagnostic[] = [];
+    const { runtime } = makeRuntime([makeAgent()], ["completed despite observer"], {
+      customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _notebook, activation) => {
+        activation.hookRunners.push({
+          fire: async (event) => ({
+            block: false,
+            askDowngraded: false,
+            diagnostics: event === "SubagentStop"
+              ? [{ severity: "warning" as const, source: "plugin\u001b-hook", message: "scoped failure" }]
+              : [],
+          }),
+        });
+        return [];
+      },
+      surfaceHeadlessDiagnostic: (diagnostic) => {
+        surfaced.push(diagnostic);
+        throw new Error("stderr unavailable");
+      },
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1, headless: true });
+    const retained = result.diagnostics.find((diagnostic) => diagnostic.message === "scoped failure");
+    expect(result).toMatchObject({ ok: true, finalMessage: "completed despite observer" });
+    expect(retained).toBeDefined();
+    expect(retained?.source).not.toContain("\u001b");
+    expect(surfaced).toEqual([retained]);
+  });
+
+  it("bounds duplicate and overflowing plugin-skill hook diagnostics and headless emissions", async () => {
+    const surfaced: Diagnostic[] = [];
+    const distinct = Array.from({ length: 25 }, (_, index) => ({
+      severity: "warning" as const,
+      source: `hostile\u001b-source-${"x".repeat(200)}`,
+      message: `scoped hook failure ${index}`,
+    }));
+    const { runtime } = makeRuntime([makeAgent()], ["done"], {
+      customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _notebook, activation) => {
+        activation.hookRunners.push({
+          fire: async () => ({
+            block: false,
+            askDowngraded: false,
+            diagnostics: [distinct[0]!, ...distinct, distinct[0]!],
+            systemMessages: Array.from({ length: 25 }, (_, index) => `system ${index} ${"y".repeat(600)}`),
+          }),
+        });
+        return [];
+      },
+      surfaceHeadlessDiagnostic: (diagnostic) => surfaced.push(diagnostic),
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1, headless: true });
+    const scoped = result.diagnostics.filter((diagnostic) =>
+      diagnostic.message.startsWith("scoped hook failure") ||
+      diagnostic.message.startsWith("system ") ||
+      diagnostic.message.includes("Additional distinct"),
+    );
+    expect(scoped).toHaveLength(21);
+    expect(scoped.filter((diagnostic) => diagnostic.message.includes("Additional distinct"))).toHaveLength(1);
+    expect(scoped.filter((diagnostic) => diagnostic.message === "scoped hook failure 0")).toHaveLength(1);
+    expect(scoped.every((diagnostic) => !diagnostic.message.includes("\u001b") && !diagnostic.source?.includes("\u001b"))).toBe(true);
+    expect(scoped.every((diagnostic) => diagnostic.message.length <= 500 && (diagnostic.source?.length ?? 0) <= 120)).toBe(true);
+    expect(surfaced).toHaveLength(21);
+    expect(surfaced.filter((diagnostic) => diagnostic.message.includes("Additional distinct"))).toHaveLength(1);
+  });
+
   it("returns the final assistant message verbatim", async () => {
     const { runtime } = makeRuntime([makeAgent()], ["```yaml\nverdict: approve\n```"]);
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -1388,6 +1779,41 @@ describe("SubagentRuntime (fake SDK)", () => {
     const completed = await taskOutput.execute("out", { task_id: taskId });
     expect(completed.content).toEqual([{ type: "text", text: "resumed report" }]);
     expect(completed.details.description).toBe("Review auth");
+  });
+
+  it.each([
+    ["print", true],
+    ["tui", false],
+  ] as const)("SendMessage resume propagates %s mode to omission diagnostics", async (mode, headless) => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const agentId = "agent-aabbccddeeff";
+    registry.register({
+      agentId,
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+      transcriptPath: "/x/sessions/agent-aabbccddeeff.jsonl",
+    });
+    registry.markSettled(agentId, { outcome: "completed" });
+    const dispatch = vi.fn().mockResolvedValue({
+      ok: true, outcome: "completed", finalMessage: "verbatim", agentId, agentName: "reviewer", diagnostics: [],
+    });
+    const runtime = { dispatch } as unknown as SubagentRuntime;
+    const sendMessage = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as {
+      execute: (...args: any[]) => Promise<{ details: SubagentRenderDetails }>;
+    };
+    const started = await sendMessage.execute(
+      "sm",
+      { to: agentId, message: "continue" },
+      undefined,
+      undefined,
+      { mode },
+    );
+    await backgroundTasks.wait(started.details.taskId!);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ headless }));
   });
 
   it("Agent tool definition dispatches at depth+1 and throws on failure", async () => {
@@ -1924,6 +2350,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       };
     };
     const agent = makeAgent({
+      source: { path: "plugin-agent.md", scope: "project", pluginName: "owner", pluginId: "owner@market" },
       hooks: {
         PreToolUse: [
           { matcher: "Read", hooks: [{ type: "command", command: "echo pre", raw: {} }] },
@@ -1937,6 +2364,8 @@ describe("SubagentRuntime (fake SDK)", () => {
 
     // parseHookConfig ran on the frontmatter and the scoped runner announces itself.
     expect(Object.keys(scopedConfigs[0] ?? {})).toEqual(["PreToolUse", "Stop"]);
+    expect((scopedConfigs[0]?.["PreToolUse"] as Array<{ hooks: Array<{ pluginId?: string }> }>)[0]!.hooks[0]!.pluginId)
+      .toBe("owner@market");
     expect(
       result.diagnostics.some((d) => d.severity === "info" && d.message.includes("agent-scoped hooks")),
     ).toBe(true);

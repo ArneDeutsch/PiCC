@@ -107,8 +107,16 @@ export type SubagentCustomToolsFactory = (
 
 export interface SubagentRuntimeDeps {
   getAgents: () => ClaudeAgent[];
+  /** Project and validate an agent before session/resource construction. */
+  prepareAgent?: (agent: ClaudeAgent) => ClaudeAgent;
   /** Assemble the subagent's system prompt: agent body + CLAUDE.md/rules hierarchy + env. */
-  buildSystemPrompt: (agent: ClaudeAgent, depth?: number) => string;
+  buildSystemPrompt: (
+    agent: ClaudeAgent,
+    depth?: number,
+    diagnosticSink?: (diagnostic: Diagnostic) => void,
+  ) => string;
+  /** Immediate headless diagnostic surface; TUI consumes dispatch details instead. */
+  surfaceHeadlessDiagnostic?: (diagnostic: Diagnostic) => void;
   /**
    * Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...).
    * `ownerAgentId` is the DISPATCHER's own agent id (this dispatch's minted id,
@@ -622,6 +630,50 @@ function childDeferred<T = void>(): ChildDeferred<T> {
   };
 }
 
+const CHILD_SCOPED_HOOK_DIAGNOSTIC_CAP = 20;
+const PRELOAD_DIAGNOSTIC_CAP = 20;
+
+function createPreloadDiagnosticCollector(
+  diagnostics: Diagnostic[],
+  surfaceDiagnostic?: (diagnostic: Diagnostic) => void,
+): (diagnostic: Diagnostic) => void {
+  const fingerprints = new Set<string>();
+  let saturated = false;
+  const surface = (diagnostic: Diagnostic): void => {
+    if (diagnostic.severity !== "warning" && diagnostic.severity !== "error") return;
+    try {
+      surfaceDiagnostic?.(diagnostic);
+    } catch {
+      // Diagnostics are additive observation and cannot change dispatch.
+    }
+  };
+  return (diagnostic): void => {
+    const safe: Diagnostic = {
+      ...diagnostic,
+      source: diagnostic.source === undefined ? undefined : sanitizeLine(diagnostic.source, 120),
+      message: sanitizeLine(diagnostic.message, 500),
+    };
+    const fingerprint = `${safe.severity}:${safe.source ?? ""}:${safe.message}`;
+    if (fingerprints.has(fingerprint)) return;
+    if (fingerprints.size >= PRELOAD_DIAGNOSTIC_CAP) {
+      if (!saturated) {
+        saturated = true;
+        const overflow: Diagnostic = {
+          severity: "warning",
+          source: "plugin skill preload",
+          message: "Additional distinct plugin-skill preload diagnostics were suppressed.",
+        };
+        diagnostics.push(overflow);
+        surface(overflow);
+      }
+      return;
+    }
+    fingerprints.add(fingerprint);
+    diagnostics.push(safe);
+    surface(safe);
+  };
+}
+
 /** Adapts one live child AgentSession to the shared checkpoint state machine. */
 class ChildCheckpointCoordinator {
   readonly activation: SkillActivationState;
@@ -657,6 +709,8 @@ class ChildCheckpointCoordinator {
     agentSettled: boolean;
     runCompleted: boolean;
   } | undefined;
+  private readonly scopedHookDiagnosticFingerprints = new Set<string>();
+  private scopedHookDiagnosticsSaturated = false;
 
   constructor(
     sessionId: string,
@@ -667,6 +721,7 @@ class ChildCheckpointCoordinator {
     private readonly cwd: CwdState,
     hooks: HookRunnerLike,
     private readonly diagnostics: Diagnostic[],
+    private readonly surfaceDiagnostic?: (diagnostic: Diagnostic) => void,
     private readonly emitProgress?: (snapshot: ProgressSnapshot) => void,
   ) {
     const identityWrap = (runner: HookRunnerLike): HookRunnerLike => ({
@@ -700,21 +755,66 @@ class ChildCheckpointCoordinator {
     return tools.map((tool) => this.gate.wrapTool(tool as Record<string, unknown>));
   }
 
+  private captureScopedHookDiagnostic(diagnostic: Diagnostic, fallbackSource: string): void {
+    const safe: Diagnostic = {
+      severity: diagnostic.severity,
+      source: sanitizeLine(diagnostic.source ?? fallbackSource, 120),
+      message: sanitizeLine(diagnostic.message, 500),
+    };
+    const fingerprint = `${safe.severity}:${safe.source}:${safe.message}`;
+    if (this.scopedHookDiagnosticFingerprints.has(fingerprint)) return;
+    if (this.scopedHookDiagnosticFingerprints.size >= CHILD_SCOPED_HOOK_DIAGNOSTIC_CAP) {
+      if (!this.scopedHookDiagnosticsSaturated) {
+        this.scopedHookDiagnosticsSaturated = true;
+        const overflow: Diagnostic = {
+          severity: "warning",
+          source: "plugin skill hooks",
+          message: "Additional distinct plugin-skill hook diagnostics were suppressed.",
+        };
+        this.diagnostics.push(overflow);
+        try {
+          this.surfaceDiagnostic?.(overflow);
+        } catch {
+          // Diagnostics are additive observation and cannot change child hooks.
+        }
+      }
+      return;
+    }
+    this.scopedHookDiagnosticFingerprints.add(fingerprint);
+    this.diagnostics.push(safe);
+    if (safe.severity === "warning" || safe.severity === "error") {
+      try {
+        this.surfaceDiagnostic?.(safe);
+      } catch {
+        // Diagnostics are additive observation and cannot change child hooks.
+      }
+    }
+  }
+
   hookFacade(base: HookRunnerLike): HookRunnerLike {
     return {
       fire: async (eventName, payload, toolCall) => {
-        const outcome = mergeHookOutcomes([
-          await base.fire(eventName, payload, toolCall),
-          ...await Promise.all(this.activation.hookRunners.map((runner) =>
-            runner.fire(eventName, payload, toolCall))),
-        ]);
+        const baseOutcome = await base.fire(eventName, payload, toolCall);
+        const scopedOutcomes = await Promise.all(this.activation.hookRunners.map((runner) =>
+          runner.fire(eventName, payload, toolCall)));
+        for (const scoped of scopedOutcomes) {
+          for (const diagnostic of scoped.diagnostics) {
+            this.captureScopedHookDiagnostic(diagnostic, "plugin skill hooks");
+          }
+          for (const message of scoped.systemMessages ?? []) {
+            this.captureScopedHookDiagnostic(
+              { severity: "info", message },
+              "plugin skill hook system message",
+            );
+          }
+        }
         if (eventName === "SessionStart" || eventName === "PostCompact") {
-          this.diagnostics.push(...outcome.diagnostics);
-          for (const message of outcome.systemMessages ?? []) {
+          this.diagnostics.push(...baseOutcome.diagnostics);
+          for (const message of baseOutcome.systemMessages ?? []) {
             this.diagnostics.push({ severity: "info", message: `hook (${eventName}): ${message}` });
           }
         }
-        return outcome;
+        return mergeHookOutcomes([baseOutcome, ...scopedOutcomes]);
       },
     };
   }
@@ -1334,6 +1434,8 @@ export class SubagentRuntime {
     /** Effort override (e.g. a context:fork skill's `effort:`); defaults to the agent's. */
     effort?: string;
     depth: number;
+    /** Whether immediate text diagnostics are required instead of TUI lifecycle detail. */
+    headless?: boolean;
     /**
      * Nested background bound: when a `depth > 1` dispatch is issued on
      * the BACKGROUND arm (un-awaited via `backgroundTasks.start`, or a
@@ -1418,6 +1520,10 @@ export class SubagentRuntime {
     };
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
+    const collectPreloadDiagnostic = createPreloadDiagnosticCollector(
+      diagnostics,
+      opts.headless ? this.deps.surfaceHeadlessDiagnostic : undefined,
+    );
     // Caller-provided agent ID hardening: a resume/model-derived ID MUST be the
     // minted `agent-<12 hex>` form. A hostile or malformed value fails the
     // dispatch loudly — never silently minted-over or passed through to the
@@ -1679,6 +1785,21 @@ export class SubagentRuntime {
     // SendMessage-resumable).
     const overrideDispatch = opts.agentOverride !== undefined;
 
+    try {
+      agent = this.deps.prepareAgent?.(agent) ?? agent;
+    } catch (err) {
+      return {
+        ok: false,
+        outcome: "failed",
+        finalMessage: "",
+        agentId,
+        resumable: false,
+        agentName: agent.name,
+        error: capErrorText((err as Error)?.message ?? String(err)),
+        diagnostics,
+      };
+    }
+
     // Ack-before-register window: for a fresh `run_in_background`
     // dispatch the ack (carrying agentId) is handed out by backgroundTasks.start()
     // BEFORE this async dispatch reaches the session-creation register() below, so
@@ -1722,7 +1843,11 @@ export class SubagentRuntime {
       Object.values(agent.hooks).some((entries) => entries?.length)
     ) {
       try {
-        const parsed = parseHookConfig(agent.hooks, agent.source.path);
+        const parsed = parseHookConfig(
+          agent.hooks,
+          agent.source.path,
+          agent.source.pluginId ? { pluginId: agent.source.pluginId } : undefined,
+        );
         diagnostics.push(...parsed.diagnostics);
         if (Object.keys(parsed.config).length > 0) {
           // Parity: the scoped runner keeps the MAIN session
@@ -2060,6 +2185,7 @@ export class SubagentRuntime {
         subCwd,
         hookRunner,
         diagnostics,
+        opts.headless ? this.deps.surfaceHeadlessDiagnostic : undefined,
         (snapshot) => {
           this.deps.subagentRegistry?.noteProgress(agentId, snapshot);
           opts.onProgress?.(snapshot);
@@ -2165,7 +2291,11 @@ export class SubagentRuntime {
       const loader = new sdk.DefaultResourceLoader({
         cwd,
         agentDir: sdk.agentDir(),
-        systemPromptOverride: () => this.deps.buildSystemPrompt(agent, opts.depth),
+        systemPromptOverride: () => this.deps.buildSystemPrompt(
+          agent,
+          opts.depth,
+          collectPreloadDiagnostic,
+        ),
         skillsOverride: () => ({ skills: [], diagnostics: [] }),
         agentsFilesOverride: () => ({ agentsFiles: [] }),
         promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -2994,7 +3124,7 @@ export function createAgentToolDefinition(
         content: Array<{ type: string; text: string }>;
         details?: Record<string, unknown>;
       }) => void,
-      ctx?: { abort?: () => void },
+      ctx?: { abort?: () => void; mode?: "tui" | "print" | "json" | "rpc" },
     ) {
       const subagentType = String(params.subagent_type ?? "");
       // Capture-time sanitization: the model-supplied
@@ -3021,6 +3151,7 @@ export function createAgentToolDefinition(
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,
+        headless: ctx?.mode !== "tui",
         // Propagate the runtime-set marker onto EVERY dispatch this tool
         // makes (spread into both the background and foreground arms below), so a
         // fork's own Agent/Task tool refuses a nested `subagent_type: "fork"`.
@@ -3305,7 +3436,13 @@ export function createSendMessageToolDefinition(
     ) {
       return renderSendMessageResult(result, theme, context);
     },
-    async execute(_toolCallId: string, params: Record<string, unknown>) {
+    async execute(
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      _signal?: AbortSignal,
+      _onUpdate?: unknown,
+      ctx?: { mode?: "tui" | "print" | "json" | "rpc" },
+    ) {
       const to = String(params.to ?? "");
       const message = String(params.message ?? "");
       if (!message.trim()) {
@@ -3440,6 +3577,7 @@ export function createSendMessageToolDefinition(
           subagentType: record.agentName,
           prompt: message,
           depth: record.depth,
+          headless: ctx?.mode !== "tui",
           // Nested background bound: a SendMessage resume is always
           // background. It is REQUIRED here, not optional — SendMessage is
           // parent-initiated only, so the common resumable agent is depth-1

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -429,6 +429,474 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
     } finally {
       fresh.api.appendEntry = append;
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reserved plugin-management commands", () => {
+  it("intercepts every alias across admission modes and blocks skill collisions", async () => {
+    let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
+    const sdk = fakeSdk({ replies: ["subagent complete"] });
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk }, (projectRoot) => {
+      hookFixture = createHookProcessFixture(projectRoot);
+      fs.mkdirSync(path.join(projectRoot, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ".claude", "settings.json"), JSON.stringify({
+        env: hookFixture.env,
+        hooks: { UserPromptSubmit: [{ hooks: [{
+          type: "command",
+          command: hookFixture.command,
+          args: ["complete", "reserved-submit", "MUST-NOT-SPAWN"],
+        }] }] },
+      }), "utf8");
+      const agentDir = path.join(projectRoot, ".claude", "agents");
+      fs.mkdirSync(agentDir, { recursive: true });
+      fs.writeFileSync(path.join(agentDir, "skill-runner.md"), "---\nname: skill-runner\ndescription: subagent skill test\n---\nRun skills.\n", "utf8");
+      for (const name of ["plugin", "plugins", "reload-plugins"]) {
+        for (const skillName of [`owner-${name}:${name}`, `other-${name}:${name}`]) {
+          const skillDir = path.join(projectRoot, ".claude", "skills", skillName.replace(":", "-"));
+          fs.mkdirSync(skillDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(skillDir, "SKILL.md"),
+            `---\nname: ${skillName}\ndescription: collision canary\n---\nMUST-NOT-EGRESS-${skillName}`,
+            "utf8",
+          );
+        }
+      }
+    });
+    try {
+      const admissionModes = [
+        ["tui", () => fresh.tuiCtx()],
+        ["print", () => fresh.printCtx()],
+        ["json", () => fresh.ctx({ mode: "json", hasUI: false })],
+        ["rpc", () => fresh.rpcCtx()],
+      ] as const;
+      const fixedOutputs = new Map<string, string>();
+      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
+        for (const [mode, makeCtx] of admissionModes) {
+          fresh.messages.length = 0;
+          fresh.entries.length = 0;
+          const mixed = name === "reload-plugins" ? "ReLoAd-PlUgInS" : name === "plugins" ? "PlUgInS" : "PlUgIn";
+          const secret = `SECRET-${name}-${mode}`;
+          expect(await fresh.fire("input", {
+            text: `  /${mixed}   ${secret}  `,
+            source: mode === "tui" ? "interactive" : mode,
+          }, makeCtx())).toEqual({ action: "handled" });
+          const output = String(fresh.entries.find((entry) => entry.data?.command === name)?.data?.output ?? "");
+          expect(output).not.toContain(secret);
+          expect(JSON.stringify(fresh.messages)).not.toContain("MUST-NOT-EGRESS");
+          const prior = fixedOutputs.get(name);
+          if (prior === undefined) fixedOutputs.set(name, output);
+          else expect(output).toBe(prior);
+        }
+      }
+
+      for (const name of ["plugin", "plugins"] as const) {
+        const output = fixedOutputs.get(name) ?? "";
+        expect(output).toContain("Claude Code");
+        expect(output).toContain("exit and relaunch");
+        expect(output).toContain("/new does not reload plugin state");
+        expect(output).toContain("no changes were made");
+      }
+      const reloadOutput = fixedOutputs.get("reload-plugins") ?? "";
+      expect(reloadOutput).toContain("no reload occurred");
+      expect(reloadOutput).toContain("exit and relaunch");
+
+      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
+        await fresh.commands.get(name).handler("SECRET-ARG-MUST-NOT-REFLECT", fresh.tuiCtx());
+        const direct = [...fresh.entries].reverse().find((entry) => entry.data?.command === name)?.data?.output;
+        expect(direct).toBe(fresh.entries.find((entry) => entry.data?.command === name)?.data?.output);
+        expect(String(direct)).not.toContain("SECRET-ARG-MUST-NOT-REFLECT");
+      }
+
+      const slash = fresh.tools.get("SlashCommand");
+      const skill = fresh.tools.get("Skill");
+      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
+        await expect(slash.execute(`slash-${name}`, { command: `/${name} ignored` }))
+          .rejects.toThrow("reserved by a built-in");
+        const mixed = name === "reload-plugins" ? "ReLoAd-PlUgInS" : name === "plugins" ? "PlUgInS" : "PlUgIn";
+        await expect(skill.execute(`skill-${name}`, { name: mixed }))
+          .rejects.toThrow("reserved plugin-management name");
+        const explicit = await skill.execute(`skill-explicit-${name}`, { name: `owner-${name}:${name}` });
+        expect(JSON.stringify(explicit)).toContain(`MUST-NOT-EGRESS-owner-${name}:${name}`);
+        const explicitSlash = await slash.execute(`slash-explicit-${name}`, { command: `/owner-${name}:${name}` });
+        expect(JSON.stringify(explicitSlash)).toContain(`owner-${name}:${name}`);
+      }
+      const agentTool = fresh.tools.get("Agent");
+      await agentTool.execute("subagent", {
+        subagent_type: "skill-runner",
+        prompt: "prepare subagent skill tool",
+        run_in_background: false,
+      });
+      const subagentSkill = (sdk.created[0]!.customTools as Array<{ name?: string; execute?: (...args: any[]) => Promise<any> }>)
+        .find((tool) => tool.name === "Skill")!;
+      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
+        const mixed = name === "reload-plugins" ? "ReLoAd-PlUgInS" : name === "plugins" ? "PlUgInS" : "PlUgIn";
+        await expect(subagentSkill.execute!("sub-bare", { name: mixed })).rejects.toThrow("reserved plugin-management name");
+        const explicit = await subagentSkill.execute!("sub-explicit", { name: `owner-${name}:${name}` });
+        expect(JSON.stringify(explicit)).toContain(`MUST-NOT-EGRESS-owner-${name}:${name}`);
+      }
+
+      expect(hookFixture!.spawnedChildren()).toHaveLength(0);
+      const nearPrefix = await fresh.fire("input", { text: "/pluginx", source: "rpc" }, fresh.rpcCtx());
+      expect(nearPrefix).toMatchObject({ action: "transform" });
+      expect(nearPrefix.text).toContain("/pluginx");
+    } finally {
+      await hookFixture?.cleanup("reserved-submit");
+      cleanupFixture(root);
+    }
+  });
+
+  it("reserves absent bare Skill tokens before lookup in main and subagent tools", async () => {
+    const sdk = fakeSdk({ replies: ["subagent complete"] });
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk }, (projectRoot) => {
+      const agentDir = path.join(projectRoot, ".claude", "agents");
+      fs.mkdirSync(agentDir, { recursive: true });
+      fs.writeFileSync(path.join(agentDir, "skill-runner.md"), "---\nname: skill-runner\ndescription: subagent skill test\ntools: [Skill]\n---\nRun skills.\n", "utf8");
+    });
+    try {
+      const mainSkill = fresh.tools.get("Skill");
+      await fresh.tools.get("Agent").execute("subagent", {
+        subagent_type: "skill-runner", prompt: "prepare subagent skill tool", run_in_background: false,
+      });
+      const subagentSkill = (sdk.created[0]!.customTools as Array<{ name?: string; execute?: (...args: any[]) => Promise<any> }>)
+        .find((tool) => tool.name === "Skill")!;
+      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
+        await expect(mainSkill.execute("main-absent", { name })).rejects.toThrow("reserved plugin-management name");
+        await expect(subagentSkill.execute!("sub-absent", { name })).rejects.toThrow("reserved plugin-management name");
+      }
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+});
+
+describe("pre-selection plugin discovery to first use", () => {
+  it("keeps data absent through discovery, then creates isolated directories at first skill and scoped-hook references", async () => {
+    const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
+      const userDir = path.join(projectRoot, ".claude-user");
+      fs.mkdirSync(path.join(projectRoot, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ".claude", "settings.json"), JSON.stringify({
+        enabledPlugins: { "data-owner@market": true, "hook-owner@market": true },
+      }), "utf8");
+      for (const [name, skill, body, hooks] of [
+        ["data-owner", "data-skill", "state=${CLAUDE_PLUGIN_DATA}/state.json", ""],
+        ["hook-owner", "hook-skill", "hook body without data", [
+          "hooks:", "  PreToolUse:", "    - hooks:", "        - type: command", "          command: printf hook-ran",
+        ].join("\n")],
+      ] as const) {
+        const pluginRoot = path.join(userDir, "plugins", "marketplaces", "market", "plugins", name);
+        const skillDir = path.join(pluginRoot, "skills", skill);
+        fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name }), "utf8");
+        fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+          "---", `name: ${skill}`, `description: ${skill} canary`, hooks, "---", body,
+        ].filter(Boolean).join("\n"), "utf8");
+      }
+    });
+    const dataDir = path.join(root, ".claude-user", "plugins", "data", "data-owner");
+    const hookDir = path.join(root, ".claude-user", "plugins", "data", "hook-owner");
+    try {
+      expect(fs.existsSync(dataDir)).toBe(false);
+      expect(fs.existsSync(hookDir)).toBe(false);
+      await fresh.fire("resources_discover", { reason: "startup" });
+      expect(fs.existsSync(dataDir)).toBe(false);
+      expect(fs.existsSync(hookDir)).toBe(false);
+
+      await fresh.tools.get("Skill").execute("data-first", { name: "data-owner:data-skill" });
+      expect(fs.existsSync(dataDir)).toBe(true);
+      expect(fs.existsSync(hookDir)).toBe(false);
+
+      await fresh.tools.get("Skill").execute("hook-activate", { name: "hook-owner:hook-skill" });
+      expect(fs.existsSync(hookDir)).toBe(false);
+      await fresh.fire("tool_call", { toolName: "read", toolCallId: "hook-first", input: { path: "x" } }, fresh.tuiCtx());
+      expect(fs.existsSync(hookDir)).toBe(true);
+      expect(fs.existsSync(dataDir)).toBe(true);
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+});
+
+describe("plugin startup warning wiring", () => {
+  it("warns once at TUI startup and stderr in headless startup, while non-startup and valid outcomes stay quiet", async () => {
+    const failed = [{ pluginId: "missing@market", status: "enabled-but-uninstalled" as const, diagnostics: [] }];
+    const tui = await freshControlPi({ pluginResolutionOutcomes: failed });
+    const headless = await freshControlPi({ pluginResolutionOutcomes: failed });
+    const valid = await freshControlPi({ pluginResolutionOutcomes: [
+      { pluginId: "loaded@market", status: "loaded", diagnostics: [] },
+      { pluginId: "disabled@market", status: "disabled", diagnostics: [] },
+    ] });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await tui.fresh.fire("session_start", { reason: "startup" }, tui.fresh.tuiCtx());
+      expect(tui.fresh.notifications.filter((item) => item.text.includes("missing@market"))).toHaveLength(1);
+      tui.fresh.notifications.length = 0;
+      await tui.fresh.fire("session_start", { reason: "new" }, tui.fresh.tuiCtx());
+      await tui.fresh.fire("session_start", { reason: "reload" }, tui.fresh.tuiCtx());
+      expect(tui.fresh.notifications.filter((item) => item.text.includes("missing@market"))).toHaveLength(0);
+
+      await headless.fresh.fire("session_start", { reason: "startup" }, headless.fresh.printCtx());
+      expect(error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("missing@market"))).toHaveLength(1);
+
+      await valid.fresh.fire("session_start", { reason: "startup" }, valid.fresh.tuiCtx());
+      expect(valid.fresh.notifications.some((item) => item.text.includes("plugin content did not load"))).toBe(false);
+    } finally {
+      error.mockRestore();
+      cleanupFixture(tui.root);
+      cleanupFixture(headless.root);
+      cleanupFixture(valid.root);
+    }
+  });
+});
+
+describe("plugin activation runtime failures", () => {
+  it("fails tools, typed slash, and context:fork before any staged state or provider egress, then reports once", async () => {
+    const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk }, (projectRoot) => {
+      const bundle = path.join(projectRoot, ".claude-plugin");
+      const skillDir = path.join(bundle, "skills", "broken-plugin-skill");
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "broken-owner" }), "utf8");
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+        "---",
+        "name: broken-plugin-skill",
+        "description: runtime failure canary",
+        "context: fork",
+        "hooks:",
+        "  PreToolUse:",
+        "    - hooks:",
+        "        - type: command",
+        "          command: echo MUST-NOT-RUN",
+        "---",
+        "data=${CLAUDE_PLUGIN_DATA}",
+      ].join("\n"), "utf8");
+    });
+    try {
+      const skill = fresh.tools.get("Skill");
+      const slash = fresh.tools.get("SlashCommand");
+      const skillError = await skill.execute("broken-skill", { name: "broken-plugin-skill" })
+        .then(() => undefined, (caught: unknown) => caught as Error);
+      expect(skillError?.message).toMatch(/Repair or reinstall.*relaunch PiCC/);
+      expect(skillError?.message.match(/Repair or reinstall/g)).toHaveLength(1);
+      await expect(slash.execute("broken-slash", { command: "/broken-plugin-skill" }))
+        .rejects.toThrow(/Repair or reinstall.*relaunch PiCC/);
+      const typed = await fresh.fire("input", { text: "/broken-plugin-skill", source: "interactive" }, fresh.printCtx());
+      expect(typed).toEqual({ action: "handled" });
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(sdk.created).toHaveLength(0);
+      expect(sdk.promptCalls()).toBe(0);
+      const before = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
+      expect(String(before?.systemPrompt ?? "")).not.toContain("data=${CLAUDE_PLUGIN_DATA}");
+      const unblocked = await fresh.fire("tool_call", {
+        toolName: "read", toolCallId: "after-failed-fork", input: { path: "safe.txt" },
+      }, fresh.printCtx());
+      expect(unblocked).toBeUndefined();
+
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      const report = String([...fresh.entries].reverse().find((entry) => entry.data?.command === "doctor")?.data?.output ?? "");
+      expect(report).toContain("Plugin runtime failures (execution did not occur):");
+      expect(report.match(/broken-plugin-skill/g)?.length).toBe(1);
+      expect(report).not.toContain("Unassessed (unknown at baseline");
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("caps, deduplicates, and counts distinct runtime-finding overflow", async () => {
+    const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
+      const bundle = path.join(projectRoot, ".claude-plugin");
+      fs.mkdirSync(path.join(bundle, "skills"), { recursive: true });
+      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "overflow-owner" }), "utf8");
+      for (let index = 0; index < 26; index++) {
+        const dir = path.join(bundle, "skills", `broken-${index}`);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "SKILL.md"), [
+          "---", `name: broken-${index}`, "description: overflow canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
+        ].join("\n"), "utf8");
+      }
+    });
+    try {
+      const skill = fresh.tools.get("Skill");
+      for (let index = 0; index < 22; index++) {
+        await expect(skill.execute(`overflow-${index}`, { name: `overflow-owner:broken-${index}` })).rejects.toThrow();
+      }
+      await expect(skill.execute("overflow-duplicate", { name: "overflow-owner:broken-21" })).rejects.toThrow();
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      const report = String(fresh.entries.at(-1)?.data?.output ?? "");
+      expect(report.match(/^  - skill overflow-owner:broken-/gm)).toHaveLength(20);
+      expect(report).toContain("2 additional distinct failure(s) omitted");
+      expect(report).not.toContain("at least 2");
+
+      for (let index = 22; index < 26; index++) {
+        await expect(skill.execute(`overflow-${index}`, { name: `overflow-owner:broken-${index}` })).rejects.toThrow();
+      }
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      const saturated = String(fresh.entries.at(-1)?.data?.output ?? "");
+      expect(saturated).toContain("at least 5 additional distinct failure(s) omitted");
+      expect(saturated).not.toContain("broken-25");
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("rejects a plugin agent owner through production preparation before SDK resources or provider work", async () => {
+    const handle = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+    let resourceLoaders = 0;
+    const BaseLoader = handle.sdk.DefaultResourceLoader;
+    const sdk = {
+      ...handle.sdk,
+      DefaultResourceLoader: class extends BaseLoader {
+        constructor(options: any) {
+          resourceLoaders += 1;
+          super(options);
+        }
+      },
+    };
+    const { fresh, root } = await freshControlPi({ sdk }, (projectRoot) => {
+      const bundle = path.join(projectRoot, ".claude-plugin");
+      const agentDir = path.join(bundle, "agents");
+      fs.mkdirSync(agentDir, { recursive: true });
+      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "broken-agent-owner" }), "utf8");
+      fs.writeFileSync(path.join(agentDir, "broken-agent.md"), [
+        "---", "name: broken-agent", "description: owner preparation canary",
+        "tools:", "  - Read(${CLAUDE_PLUGIN_DATA}/**)", "---", "body without data",
+      ].join("\n"), "utf8");
+    });
+    try {
+      const agent = fresh.tools.get("Agent");
+      await expect(agent.execute("broken-agent", {
+        subagent_type: "broken-agent", prompt: "must not run", run_in_background: false,
+      })).rejects.toThrow(/Agent "broken-agent-owner:broken-agent" did not start.*no provider request was made/i);
+      expect(handle.created).toHaveLength(0);
+      expect(resourceLoaders).toBe(0);
+      expect(handle.promptCalls()).toBe(0);
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      const report = String(fresh.entries.at(-1)?.data?.output ?? "");
+      expect(report).toContain("Agent \"broken-agent-owner:broken-agent\" did not start");
+      expect(report).not.toContain("trusted context");
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("omits a failed preloaded plugin skill with dispatch diagnostics and one immediate warning while the owner runs", async () => {
+    const handle = fakeSdk({ replies: Array.from({ length: 6 }, () => "LOCKED-FINAL") });
+    const BaseLoader = handle.sdk.DefaultResourceLoader;
+    const sdk = {
+      ...handle.sdk,
+      DefaultResourceLoader: class extends BaseLoader {
+        constructor(options: any) {
+          super(options);
+          options.systemPromptOverride();
+        }
+      },
+    };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { fresh, root } = await freshControlPi({ sdk }, (projectRoot) => {
+      const bundle = path.join(projectRoot, ".claude-plugin");
+      const agentDir = path.join(projectRoot, ".claude", "agents");
+      const skillDir = path.join(bundle, "skills", "broken-preload");
+      const forkDir = path.join(projectRoot, ".claude", "skills", "named-fork");
+      fs.mkdirSync(agentDir, { recursive: true });
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.mkdirSync(forkDir, { recursive: true });
+      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "preload-owner" }), "utf8");
+      fs.writeFileSync(path.join(agentDir, "preload-agent.md"), [
+        "---", "name: preload-agent", "description: preload canary", "skills:", "  - preload-owner:broken-preload", "---", "Run as owner.",
+      ].join("\n"), "utf8");
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+        "---", "name: broken-preload", "description: preload data canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
+      ].join("\n"), "utf8");
+      fs.writeFileSync(path.join(forkDir, "SKILL.md"), [
+        "---", "name: named-fork", "description: named fork canary", "context: fork", "agent: preload-agent", "---", "run named fork",
+      ].join("\n"), "utf8");
+    });
+    try {
+      const expectedTypedFork = {
+        action: "transform",
+        text: "The named-fork skill ran in a forked subagent. Its result:\n\nLOCKED-FINAL",
+      };
+      const typedPrint = await fresh.fire("input", { text: "/named-fork", source: "print" }, fresh.printCtx());
+      expect(typedPrint).toEqual(expectedTypedFork);
+      expect(fresh.notifications).toHaveLength(0);
+      const typedPrintWarnings = error.mock.calls.map((call) => String(call[0]))
+        .filter((line) => line.includes("omitted preloaded skill"));
+      expect(typedPrintWarnings).toHaveLength(1);
+      expect(typedPrintWarnings[0]).toContain("Repair or reinstall");
+
+      const agent = fresh.tools.get("Agent");
+      for (let index = 0; index < 2; index++) {
+        const result = await agent.execute(
+          `preload-${index}`,
+          { subagent_type: "preload-agent", prompt: "run", run_in_background: false },
+          undefined,
+          undefined,
+          index === 0 ? fresh.printCtx() : fresh.tuiCtx(),
+        );
+        expect(JSON.stringify(result.content)).toContain("LOCKED-FINAL");
+        expect(JSON.stringify(result.content)).not.toContain("omitted preloaded skill");
+        expect(result.details.diagnostics).toEqual(expect.arrayContaining([
+          expect.objectContaining({ severity: "warning", message: expect.stringContaining("omitted preloaded skill") }),
+        ]));
+      }
+      const skill = fresh.tools.get("Skill");
+      const slash = fresh.tools.get("SlashCommand");
+      const printFork = await skill.execute("fork-print", { name: "named-fork" }, undefined, undefined, fresh.printCtx());
+      expect(printFork.content).toEqual([{ type: "text", text: "LOCKED-FINAL" }]);
+      expect(printFork.details.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ message: expect.stringContaining("omitted preloaded skill") }),
+      ]));
+      const tuiFork = await slash.execute("fork-tui", { command: "/named-fork" }, undefined, undefined, fresh.tuiCtx());
+      expect(tuiFork.content).toEqual([{ type: "text", text: "LOCKED-FINAL" }]);
+      expect(tuiFork.details.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ message: expect.stringContaining("omitted preloaded skill") }),
+      ]));
+      expect(fresh.notifications.filter((item) => item.text.includes("omitted preloaded skill"))).toHaveLength(0);
+
+      const typedTui = await fresh.fire("input", { text: "/named-fork", source: "interactive" }, fresh.tuiCtx());
+      const repeatedTypedTui = await fresh.fire("input", { text: "/named-fork", source: "interactive" }, fresh.tuiCtx());
+      expect(typedTui).toEqual(expectedTypedFork);
+      expect(repeatedTypedTui).toEqual(expectedTypedFork);
+      const tuiWarnings = fresh.notifications.filter((item) => item.text.includes("omitted preloaded skill"));
+      expect(tuiWarnings).toHaveLength(1);
+      expect(tuiWarnings[0]).toMatchObject({ severity: "warning" });
+      expect(expectedTypedFork.text).not.toContain("omitted preloaded skill");
+
+      const warnings = error.mock.calls.map((call) => String(call[0]))
+        .filter((line) => line.includes("omitted preloaded skill"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Repair or reinstall");
+      expect(handle.promptCalls()).toBe(7);
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      expect(String(fresh.entries.at(-1)?.data?.output ?? "")).toContain("omitted preloaded skill");
+    } finally {
+      error.mockRestore();
+      cleanupFixture(root);
+    }
+  });
+
+  it("registers a successfully activated skill hook once across repeated activation", async () => {
+    const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
+      const skillDir = path.join(projectRoot, ".claude", "skills", "hook-once");
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+        "---", "name: hook-once", "description: hook once canary", "hooks:",
+        "  PreToolUse:", "    - hooks:", "        - type: command",
+        "          command: exit 2", "          once: true", "---", "valid body",
+      ].join("\n"), "utf8");
+    });
+    try {
+      const skill = fresh.tools.get("Skill");
+      await skill.execute("first", { name: "hook-once" });
+      await skill.execute("second", { name: "hook-once" });
+      const first = await fresh.fire("tool_call", { toolName: "read", toolCallId: "one", input: { path: "a" } }, fresh.tuiCtx());
+      const second = await fresh.fire("tool_call", { toolName: "read", toolCallId: "two", input: { path: "b" } }, fresh.tuiCtx());
+      expect(first).toMatchObject({ block: true });
+      expect(second).toBeUndefined();
+    } finally {
+      cleanupFixture(root);
     }
   });
 });

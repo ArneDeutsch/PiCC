@@ -78,6 +78,20 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   }
 
   it(
+    "intercepts a plugin-management command in real Pi text-print mode without provider egress",
+    async () => {
+      const result = await runPi({ script: [], prompt: "/plugin install ignored" });
+      expect(result.requests).toHaveLength(0);
+      expect(result.stdout).toContain("Plugin lifecycle management is unavailable in PiCC");
+      expect(result.stdout).toContain("no changes were made");
+      expect(result.stdout).toContain("Claude Code");
+      expect(result.stdout).toContain("exit and relaunch");
+      expect(result.stdout).toContain("/new does not reload plugin state");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     "keeps compact search presentation out of print output and the next model request",
     async () => {
       const result = await runPi({
