@@ -238,15 +238,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/transport-neutral MCP tool proxies/, /first successfully discovered/, /catalog across remote outages/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/, /reconnect never widens/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
+    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
     { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /siblings that fail before initial catalog discovery add no tools/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
     { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
-    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /retained tool counts/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
-    { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/at most three transient retries at 1\/2\/4 s/, /five reconnects run at 1\/2\/4\/8\/16 s/], precedence: [/aggregate MCP_TIMEOUT/, /discovery retries only network\/5xx/, /authentication\/not-found\/permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
+    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
+    { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });
@@ -288,15 +288,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     );
   });
 
-  it("independently pins the restored MCP proxy qualification families and ownership", () => {
+  it("independently pins the restored MCP proxy qualification families", () => {
     const proxy = lookupCapability("tool.mcp__*")?.note ?? "";
     for (const qualification of [
       "Deny rules at every grammar level",
       "guard's call-time deny as the backstop",
       "deny matching is case-sensitive",
-      "After aggregate initial settlement, one immutable tool universe is registered",
-      "fresh proxy objects per dispatch over that same universe",
-      "Reconnect never widens it",
       "input schemas are normalized",
       "Claude passes schemas through verbatim",
       "descriptions are bounded at 2KB",
@@ -306,17 +303,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "structuredContent is ignored",
       "Claude renders images natively",
       "feature.tool-output-clip",
-      "catalog across remote outages and terminal failure remains immutable",
       "calls resolve the current client",
     ]) expect(proxy, qualification).toContain(qualification);
-
-    const listChanged = lookupCapability("feature.mcp-list-changed")?.note ?? "";
-    expect(listChanged).toContain("unsupported");
-    expect(listChanged).toContain("immutable original-catalog behavior belongs to tool.mcp__*");
-    expect(listChanged).not.toContain("first successfully discovered");
-    expect(lookupCapability("feature.mcp-remote-transports")?.note).not.toContain(
-      "immutable original",
-    );
   });
 
   it("independently pins restored aggregate, status, and approval qualification families", () => {
@@ -380,11 +368,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const id of [
       "feature.mcp-oauth",
       "feature.mcp-headers-helper",
-      "feature.mcp-prompts",
-      "feature.mcp-resources",
       "feature.mcp-tool-search",
       "feature.mcp-list-changed",
       "feature.mcp-elicitation",
+      "feature.mcp-resource-templates",
+      "feature.mcp-sampling",
       "feature.mcp-roots",
       "feature.mcp-channels",
       "feature.mcp-managed-config",
@@ -415,7 +403,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("feature.mcp-oauth")?.note).toBe(
       "the real oauth MCP entry field is recognized key-only and ignored so the server may otherwise run; interactive MCP OAuth login, value parsing, requests, and token storage are deferred, and authentication failures direct users to configured static headers without claiming an HTTP status proves OAuth is required",
     );
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the SESSION's MCP tools");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("MCP tools themselves run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {

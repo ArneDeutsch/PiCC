@@ -162,8 +162,8 @@ publication that already succeeded.
 
 Deliberately out of scope — each for a reason, not from neglect:
 
-- **Full MCP surface parity.** Local stdio and selected remote HTTP/SSE servers run with
-  Claude-compatible tool exposure; other MCP surfaces remain deferred. The
+- **Full MCP surface parity.** Local stdio and selected remote HTTP/SSE servers expose tools,
+  prompts, and resources, but some protocol and UX surfaces remain deferred. The
   [capability matrix](doc/supported-features.md) records the exact limits and tiers.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
