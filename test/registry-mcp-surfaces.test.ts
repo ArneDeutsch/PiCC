@@ -168,7 +168,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "feature.mcp-claude-json-scopes": "Local and user ~/.claude.json scopes share the same absent loader, non-safety classification, and settings-file substitute.",
   "feature.mcp-cli-management": "These terminal management and import commands are all absent while file configuration remains the common PiCC remedy.",
     "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
-  "feature.mcp-list-changed": "All three list_changed notifications leave PiCC's corresponding initial catalog immutable with the same non-safety remedy.",
+  "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf share PiCC's immutable initial catalogs and the same non-safety remedy.",
   "feature.mcp-max-result-size-chars": "The metadata and persistence behavior are the same unsupported per-tool text-threshold contract, distinct from generic clipping.",
   "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share the same absent model-visible evidence channel and human-only PiCC remedy.",
   "feature.mcp-server-instructions": "Instruction forwarding and its truncation rule share one absent model-context behavior and non-safety conclusion.",
@@ -179,9 +179,10 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "setting.allowedChannelPlugins": "The allowlist plus replacement, empty-list, and development exception leaves share one inert restriction and the same explicit safety-false conclusion because PiCC cannot load channels.",
   "feature.mcp-auto-background": "The threshold and opt-in/disable controls, execution-context exclusions, and elicitation deferral all govern the same absent MCP auto-background transition and foreground-call remedy.",
   "feature.mcp-hook-matching": "The naming and matcher leaves share one existing matcher behavior, partial tier, and the same unavailable plugin-server boundary.",
+  "feature.mcp-plugin-servers": "Plugin server discovery, lifecycle/reload, placeholder substitution, scoped naming, and transport-specific behavior are all absent because PiCC discovers no plugin MCP configs.",
   "hook.event.Elicitation": "The Elicitation event, matcher, input, output, and deny leaves share one never-fired request-hook contract and unsupported server-elicitation remedy.",
   "hook.event.ElicitationResult": "The ElicitationResult event, matcher, input, output, and block leaves share one never-fired result-hook contract and unsupported server-elicitation remedy.",
-  "feature.hook-handler.mcp_tool": "The handler type and server, tool, and input fields are one absent MCP-tool handler contract with the same visible no-op behavior and remedy.",
+  "feature.hook-handler.mcp_tool": "The handler fields and lifecycle/error leaves share one absent non-enforcement MCP-tool handler contract and the same visible no-op remedy.",
   "setting.strictPluginOnlyCustomization.mcp": "The managed setting and its MCP restriction leaf are one ignored plugin-only policy whose gap can permit project/settings MCP servers to run.",
   "setting.channelsEnabled": "The setting and its master-disable behavior are one inert restriction with the same explicit safety-false conclusion because PiCC cannot load channels.",
   "feature.mcp-first-byte-timeout": "The first-byte defaults, overrides, floors, and transport exclusions share the same absent timer and aggregate-hard-wall PiCC boundary.",
@@ -190,7 +191,8 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "feature.mcp-tool-search": "Deferred loading and both documented loading-control environment variables share PiCC's upfront-schema behavior and the same unsupported tool-search remedy.",
   "feature.mcp-capability-discovery": "Capability discovery and failure coupling share PiCC's partial initial publication behavior and the same /mcp visibility remedy.",
   "feature.mcp-remote-transports": "HTTP, deprecated SSE, static headers, and automatic reconnection share PiCC's remote-client implementation, partial transport limits, non-safety conclusion, and remote-config remedy.",
-  "setting.allowManagedMcpServersOnly": "The setting and managed-only restriction behavior are one unenforced enterprise gate with the same safety conclusion and prohibited-server remedy.",
+  "setting.allowManagedMcpServersOnly": "The setting, managed-only restriction, and invalid-value fail-closed rule are one unenforced enterprise gate with the same safety conclusion and prohibited-server remedy.",
+  "setting.allowedMcpServers": "The allowlist and invalid-value empty-allowlist rule share one unenforced managed restriction, safety conclusion, and prohibited-server remedy.",
 };
 
 const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
@@ -208,6 +210,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-elicitation": ["hook.event.Elicitation","hook.event.ElicitationResult"],
   "feature.mcp-first-byte-timeout": ["feature.mcp","feature.mcp-auto-background","feature.mcp-connect-timeout-ms"],
   "feature.mcp-headers-helper": ["feature.mcp-oauth","feature.mcp-remote-transports","feature.mcp-websocket"],
+  "feature.mcp-url-without-type-validation": ["setting.mcpServers","feature.mcp-remote-transports"],
   "feature.mcp-idle-timeout": ["feature.mcp-auto-background","feature.mcp-remote-transports"],
   "feature.mcp-list-changed": ["feature.mcp-prompts","feature.mcp-resource-subscriptions","feature.mcp-resources"],
   "feature.mcp-managed-config": ["feature.mcp-project-approval","setting.allowManagedMcpServersOnly","setting.allowedMcpServers","setting.deniedMcpServers","setting.mcpServers","setting.strictPluginOnlyCustomization.mcp"],
@@ -238,8 +241,9 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-websocket": ["feature.mcp-cli-management","feature.mcp-remote-transports"],
   "hook.event.Elicitation": ["feature.mcp-elicitation","hook.event.ElicitationResult"],
   "hook.event.ElicitationResult": ["feature.mcp-elicitation","hook.event.Elicitation"],
-  "feature.mcp-hook-matching": ["feature.hook-handler.mcp_tool","feature.mcp-plugin-servers","tool.mcp__*"],
-  "feature.hook-handler.mcp_tool": ["feature.mcp","feature.mcp-hook-matching"],
+  "feature.mcp-hook-matching": ["feature.hook-handler.mcp_tool","feature.hook-handler.mcp_tool-blocking-enforcement","feature.mcp-plugin-servers","tool.mcp__*"],
+  "feature.hook-handler.mcp_tool": ["feature.hook-handler.mcp_tool-blocking-enforcement","feature.mcp","feature.mcp-hook-matching"],
+  "feature.hook-handler.mcp_tool-blocking-enforcement": ["feature.hook-handler.mcp_tool","feature.mcp","feature.mcp-hook-matching"],
   "setting.allowAllClaudeAiMcps": ["feature.mcp-connectors","setting.disableClaudeAiConnectors"],
   "setting.allowManagedMcpServersOnly": ["feature.mcp-managed-config","setting.allowedMcpServers","setting.deniedMcpServers","setting.strictPluginOnlyCustomization.mcp"],
   "setting.strictPluginOnlyCustomization.mcp": ["feature.mcp-managed-config","feature.mcp-plugin-servers","setting.allowManagedMcpServersOnly"],
@@ -279,6 +283,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("config.connect-timeout", "MCP reference", "Connection timeout", "Push messages with channels", "feature.mcp-connect-timeout-ms", "not-supported", false),
   s("config.environment-expansion", "MCP reference", "Environment variable expansion", "Environment variable expansion in .mcp.json", "setting.mcpServers", "partial", false),
   s("config.empty-url-placeholder", "MCP reference", "Empty URL placeholders", "Installing MCP servers", "setting.mcpServers", "partial", false),
+  s("config.url-without-type-validation", "MCP reference", "URL without type is skipped as a configuration error", "Option 1: Add a remote HTTP server", "feature.mcp-url-without-type-validation", "not-supported", false),
   s("config.reserved-server-names", "MCP reference", "Reserved server names", "Installing MCP servers", "setting.mcpServers", "partial", false),
   s("config.role", "MCP reference", "Server role", "Installing MCP servers", "feature.mcp-server-role", "not-supported", false),
   s("config.always-load", "MCP reference", "Server alwaysLoad", "Scale with MCP tool search", "feature.mcp-server-always-load", "not-supported", false),
@@ -315,6 +320,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("dynamic.tools-list-changed", "MCP reference", "tools/list_changed", "Dynamic tool updates", "feature.mcp-list-changed", "not-supported", false),
   s("dynamic.prompts-list-changed", "MCP reference", "prompts/list_changed", "Dynamic tool updates", "feature.mcp-list-changed", "not-supported", false),
   s("dynamic.resources-list-changed", "MCP reference", "resources/list_changed", "Dynamic tool updates", "feature.mcp-list-changed", "not-supported", false),
+  s("dynamic.failed-refresh-retains-catalog", "MCP reference", "Failed list_changed refresh retains previous catalogs", "Dynamic tool updates", "feature.mcp-list-changed", "not-supported", false),
   s("channels.behavior", "Claude Code channels", "MCP channels", "Enterprise controls", "feature.mcp-channels", "not-supported"),
   s("channels.load", "CLI reference", "--channels", "CLI flags", "feature.mcp-channels", "not-supported"),
   s("channels.development", "CLI reference", "--dangerously-load-development-channels", "CLI flags", "feature.mcp-channels", "not-supported"),
@@ -350,36 +356,42 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("resources.attachments", "MCP reference", "Resource references", "Reference MCP resources", "feature.mcp-resources", "partial"),
   s("resources.templates", "MCP reference", "Resource templates", "Use MCP resources", "feature.mcp-resource-templates", "not-supported", false),
   s("resources.subscriptions", "MCP reference", "Resource subscriptions", "Use MCP resources", "feature.mcp-resource-subscriptions", "not-supported", false),
-  s("roots.list", "MCP reference", "roots/list", "Use MCP resources", "feature.mcp-roots", "not-supported", false),
-  s("roots.list-changed", "MCP reference", "roots/list_changed", "Use MCP resources", "feature.mcp-roots", "not-supported", false),
+  s("roots.list", "MCP reference", "roots/list", "Option 3: Add a local stdio server", "feature.mcp-roots", "not-supported", false),
+  s("roots.list-changed", "MCP reference", "roots/list_changed", "Option 3: Add a local stdio server", "feature.mcp-roots", "not-supported", false),
   s("elicitation.protocol", "MCP reference", "Elicitation", "Respond to MCP elicitation requests", "feature.mcp-elicitation", "not-supported"),
   s("elicitation.hook-request", "Hooks reference", "Elicitation", "Elicitation", "hook.event.Elicitation", "degraded-noop"),
   s("elicitation.hook-result", "Hooks reference", "ElicitationResult", "ElicitationResult", "hook.event.ElicitationResult", "degraded-noop"),
   s("hooks.match-mcp-tools", "Hooks reference", "Match MCP tools", "Match MCP tools", "feature.mcp-hook-matching", "partial"),
-  s("hooks.mcp-tool-handler-type", "Hooks reference", "MCP tool hook handler type", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop"),
-  s("hooks.mcp-tool-handler-server", "Hooks reference", "MCP tool hook handler server", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop"),
-  s("hooks.mcp-tool-handler-tool", "Hooks reference", "MCP tool hook handler tool", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop"),
-  s("hooks.mcp-tool-handler-input", "Hooks reference", "MCP tool hook handler input", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop"),
+  s("hooks.mcp-tool-handler-type", "Hooks reference", "MCP tool hook handler type", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
+  s("hooks.mcp-tool-handler-server", "Hooks reference", "MCP tool hook handler server", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
+  s("hooks.mcp-tool-handler-tool", "Hooks reference", "MCP tool hook handler tool", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
+  s("hooks.mcp-tool-handler-input", "Hooks reference", "MCP tool hook handler input", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
   s("oauth.login", "MCP reference", "OAuth authentication", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.cli-login", "MCP reference", "claude mcp login", "Authenticate from the command line", "feature.mcp-oauth", "not-supported", false),
   s("oauth.cli-logout", "MCP reference", "claude mcp logout", "Authenticate from the command line", "feature.mcp-oauth", "not-supported", false),
   s("oauth.dynamic-client-registration", "MCP reference", "OAuth dynamic client registration", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
-  s("oauth.fixed-callback-port", "MCP reference", "OAuth fixed callback port", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
+  s("oauth.fixed-callback-port", "MCP reference", "OAuth fixed callback port", "Use a fixed OAuth callback port", "feature.mcp-oauth", "not-supported", false),
   s("oauth.preconfigured-client", "MCP reference", "OAuth preconfigured client credentials and CIMD", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.auth-metadata-override", "MCP reference", "OAuth authServerMetadataUrl discovery override", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.scopes", "MCP reference", "OAuth scopes restriction and precedence", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("headers.static", "MCP reference", "Static headers", "Option 1: Add a remote HTTP server", "feature.mcp-remote-transports", "partial", false),
-  s("headers.dynamic", "MCP reference", "Dynamic headers", "Option 1: Add a remote HTTP server", "feature.mcp-headers-helper", "not-supported"),
+  s("headers.dynamic", "MCP reference", "Dynamic headers", "Use dynamic headers for custom authentication", "feature.mcp-headers-helper", "not-supported"),
   s("plugins.servers", "MCP reference", "Plugin MCP servers", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
+  s("plugins.lifecycle-reload", "MCP reference", "Plugin MCP server lifecycle and reload behavior", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
+  s("plugins.placeholder-substitution", "MCP reference", "Plugin MCP placeholder expansion and substitution", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
+  s("plugins.scoped-naming", "MCP reference", "Plugin-scoped MCP tool and server naming", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
+  s("plugins.transport-substitution", "MCP reference", "Transport-specific plugin substitution and support behavior", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
   s("managed.server-config", "MCP reference", "Managed MCP configuration", "Managed MCP configuration", "feature.mcp-managed-config", "not-supported", true),
   s("managed.server-config-file", "MCP reference", "managed-mcp.json", "Managed MCP configuration", "feature.mcp-managed-config", "not-supported", true),
   s("managed.only", "Settings reference", "allowManagedMcpServersOnly", "Available settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
   s("managed.only-restriction", "Settings reference", "allowManagedMcpServersOnly restriction", "Available settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
+  s("managed.invalid-only-treated-true", "Settings reference", "Invalid allowManagedMcpServersOnly is treated as true", "Invalid entries in managed settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
   s("managed.strict-plugin-only", "Settings reference", "strictPluginOnlyCustomization with mcp", "Available settings", "setting.strictPluginOnlyCustomization.mcp", "not-supported", true),
   s("managed.allow-claude-ai", "Settings reference", "allowAllClaudeAiMcps", "Available settings", "setting.allowAllClaudeAiMcps", "not-supported"),
   s("managed.disable-connectors", "Settings reference", "disableClaudeAiConnectors", "Available settings", "setting.disableClaudeAiConnectors", "not-supported"),
   s("managed.disable-sideload", "Settings reference", "disableSideloadFlags", "Available settings", "setting.disableSideloadFlags", "not-supported"),
   s("managed.allowlist", "Settings reference", "allowedMcpServers", "Available settings", "setting.allowedMcpServers", "not-supported", true),
+  s("managed.invalid-allowlist-empty", "Settings reference", "Invalid allowedMcpServers becomes an empty allowlist", "Invalid entries in managed settings", "setting.allowedMcpServers", "not-supported", true),
   s("managed.denylist", "Settings reference", "deniedMcpServers", "Available settings", "setting.deniedMcpServers", "not-supported", true),
   s("oauth.auth-detection", "MCP reference", "401/403 authentication detection", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.refresh-reconnect-retry", "MCP reference", "automatic token refresh, reconnect, and one retry", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
@@ -406,7 +418,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("hooks.match-patterns", "Hooks reference", "MCP tool naming, matcher patterns, and plugin-scoped names", "Match MCP tools", "feature.mcp-hook-matching", "partial", false),
   s("hooks.mcp-tool-connected", "Hooks reference", "mcp_tool already-connected requirement and no connection or OAuth initiation", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
   s("hooks.mcp-tool-plugin-server", "Hooks reference", "plugin-scoped server naming", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
-  s("hooks.mcp-tool-text-output", "Hooks reference", "text output interpretation as command-hook stdout", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
+  s("hooks.mcp-tool-text-output", "Hooks reference", "text output interpretation, including valid deny/block decisions, as command-hook stdout", "MCP tool hook fields", "feature.hook-handler.mcp_tool-blocking-enforcement", "degraded-noop", true),
   s("hooks.mcp-tool-errors", "Hooks reference", "disconnected server and isError non-blocking behavior", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
   s("hooks.mcp-tool-all-events", "Hooks reference", "mcp_tool availability across all hook events", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
   s("hooks.mcp-tool-early-race", "Hooks reference", "SessionStart and Setup early connection race", "MCP tool hook fields", "feature.hook-handler.mcp_tool", "degraded-noop", false),
@@ -427,6 +439,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
 
 const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence"][number][]>> = {
   "feature.hook-handler.mcp_tool": [{"quality":"documented","source":"Hooks reference \u2014 MCP tool hook fields","reviewed":"2026-07-31"}],
+  "feature.hook-handler.mcp_tool-blocking-enforcement": [{"quality":"documented","source":"Hooks reference \u2014 MCP tool hook fields","reviewed":"2026-07-31"}],
   "feature.mcp": [{"quality":"documented","source":"MCP reference — Option 3: Add a local stdio server","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Push messages with channels","reviewed":"2026-07-31"}],
   "feature.mcp-auto-background": [{"quality":"documented","source":"MCP reference — Automatic backgrounding of long tool calls","reviewed":"2026-07-31"}],
   "feature.mcp-capability-discovery": [{"quality":"documented","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"},{"quality":"unverified","source":"MCP reference — Scale with MCP tool search (cross-capability failure coupling is not specified)","reviewed":"2026-07-31"}],
@@ -440,14 +453,15 @@ const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence
   "feature.mcp-control-status": [{"quality":"documented","source":"MCP reference — Managing your servers","reviewed":"2026-07-31"}],
   "feature.mcp-elicitation": [{"quality":"documented","source":"MCP reference — Respond to MCP elicitation requests","reviewed":"2026-07-31"}],
   "feature.mcp-first-byte-timeout": [{"quality":"documented","source":"MCP reference — Push messages with channels","reviewed":"2026-07-31"}],
-  "feature.mcp-headers-helper": [{"quality":"documented","source":"MCP reference — Option 1: Add a remote HTTP server","reviewed":"2026-07-31"}],
+  "feature.mcp-headers-helper": [{"quality":"documented","source":"MCP reference — Use dynamic headers for custom authentication","reviewed":"2026-07-31"}],
+  "feature.mcp-url-without-type-validation": [{"quality":"documented","source":"MCP reference — Option 1: Add a remote HTTP server","reviewed":"2026-07-31"}],
   "feature.mcp-hook-matching": [{"quality":"documented","source":"Hooks reference \u2014 Match MCP tools","reviewed":"2026-07-31"}],
   "feature.mcp-idle-timeout": [{"quality":"documented","source":"MCP reference — Push messages with channels","reviewed":"2026-07-31"}],
   "feature.mcp-list-changed": [{"quality":"documented","source":"MCP reference — Dynamic tool updates","reviewed":"2026-07-31"}],
   "feature.mcp-managed-config": [{"quality":"documented","source":"MCP reference \u2014 Managed MCP configuration","reviewed":"2026-07-31"}],
   "feature.mcp-max-result-size-chars": [{"quality":"documented","source":"MCP reference \u2014 MCP output limits and warnings","reviewed":"2026-07-31"}],
   "feature.mcp-model-failure-visibility": [{"quality":"documented","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"}],
-  "feature.mcp-oauth": [{"quality":"documented","source":"MCP reference — Authenticate from the command line","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Authenticate with remote MCP servers","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Use pre-configured OAuth credentials","reviewed":"2026-07-31"}],
+  "feature.mcp-oauth": [{"quality":"documented","source":"MCP reference — Authenticate from the command line","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Authenticate with remote MCP servers","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Use a fixed OAuth callback port","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Use pre-configured OAuth credentials","reviewed":"2026-07-31"}],
   "feature.mcp-output-token-cap": [{"quality":"documented","source":"MCP reference \u2014 MCP output limits and warnings","reviewed":"2026-07-31"}],
   "feature.mcp-plugin-servers": [{"quality":"documented","source":"MCP reference — Plugin-provided MCP servers","reviewed":"2026-07-31"}],
   "feature.mcp-project-approval": [{"quality":"documented","source":"MCP reference — Project scope","reviewed":"2026-07-31"}],
@@ -458,7 +472,7 @@ const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence
   "feature.mcp-resource-templates": [{"quality":"unverified","source":"MCP reference \u2014 Use MCP resources","reviewed":"2026-07-31"}],
   "feature.mcp-resources": [{"quality":"documented","source":"MCP reference — Reference MCP resources","reviewed":"2026-07-31"}],
   "feature.mcp-root-schema-combinators": [{"quality":"documented","source":"MCP reference — Tool input schemas with a root-level combinator","reviewed":"2026-07-31"}],
-  "feature.mcp-roots": [{"quality":"documented","source":"MCP reference \u2014 Use MCP resources","reviewed":"2026-07-31"}],
+  "feature.mcp-roots": [{"quality":"documented","source":"MCP reference \u2014 Option 3: Add a local stdio server","reviewed":"2026-07-31"}],
   "feature.mcp-runtime-disabled": [{"quality":"documented","source":"MCP reference — Disable a server without removing it","reviewed":"2026-07-31"}],
   "feature.mcp-runtime-enabled": [{"quality":"documented","source":"MCP reference — Managing your servers","reviewed":"2026-07-31"}],
   "feature.mcp-sampling": [{"quality":"unverified","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"}],
@@ -473,9 +487,9 @@ const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence
   "hook.event.Elicitation": [{"quality":"documented","source":"Hooks reference \u2014 Elicitation","reviewed":"2026-07-31"}],
   "hook.event.ElicitationResult": [{"quality":"documented","source":"Hooks reference \u2014 ElicitationResult","reviewed":"2026-07-31"}],
   "setting.allowAllClaudeAiMcps": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
-  "setting.allowManagedMcpServersOnly": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
+  "setting.allowManagedMcpServersOnly": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"},{"quality":"documented","source":"Settings reference \u2014 Invalid entries in managed settings","reviewed":"2026-07-31"}],
   "setting.allowedChannelPlugins": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
-  "setting.allowedMcpServers": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
+  "setting.allowedMcpServers": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"},{"quality":"documented","source":"Settings reference \u2014 Invalid entries in managed settings","reviewed":"2026-07-31"}],
   "setting.channelsEnabled": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
   "setting.deniedMcpServers": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
   "setting.disableClaudeAiConnectors": [{"quality":"documented","source":"Settings reference \u2014 Available settings","reviewed":"2026-07-31"}],
@@ -500,7 +514,7 @@ const MCP_SURFACES: readonly AuditSurface[] = RAW_MCP_SURFACES.map((row) => {
 });
 
 const EXPECTED_SURFACE_KEYS = [
-  "approval.disabled-list", "approval.enable-all", "approval.enabled-list", "channels.allowed-plugins", "channels.allowlist-replacement-empty", "channels.behavior", "channels.development", "channels.development-exception", "channels.enabled-setting", "channels.load", "channels.master-disable", "config.always-load", "config.child-session-env", "config.command-args-env", "config.connect-timeout", "config.empty-url-placeholder", "config.environment-expansion", "config.first-byte-timeout", "config.reserved-server-names", "config.role", "config.shell-prefix", "config.startup-timeout", "config.tool-timeout", "connection.automatic-reconnection", "connection.capability-discovery", "connection.failure-visibility", "connection.wait-tool", "dynamic.prompts-list-changed", "dynamic.resources-list-changed", "dynamic.tools-list-changed", "elicitation.hook-request", "elicitation.hook-result", "elicitation.protocol", "headers.dynamic", "headers.static", "hooks.elicitation-input", "hooks.elicitation-matcher", "hooks.elicitation-output", "hooks.elicitation-result-input", "hooks.elicitation-result-matcher", "hooks.elicitation-result-output", "hooks.match-mcp-tools", "hooks.match-patterns", "hooks.mcp-tool-all-events", "hooks.mcp-tool-connected", "hooks.mcp-tool-early-race", "hooks.mcp-tool-errors", "hooks.mcp-tool-handler-input", "hooks.mcp-tool-handler-server", "hooks.mcp-tool-handler-tool", "hooks.mcp-tool-handler-type", "hooks.mcp-tool-plugin-server", "hooks.mcp-tool-text-output", "invocation.bare", "invocation.mcp-config", "invocation.permission-prompt-tool", "invocation.safe-mode", "invocation.strict-mcp-config", "managed.allow-claude-ai", "managed.allowlist", "managed.denylist", "managed.disable-connectors", "managed.disable-sideload", "managed.only", "managed.only-restriction", "managed.server-config", "managed.server-config-file", "managed.strict-plugin-membership", "managed.strict-plugin-only", "managed.strict-plugin-restriction", "management.add", "management.add-from-claude-desktop", "management.add-json", "management.connectors", "management.get", "management.list", "management.remove", "management.reset-project-choices", "management.server-mode", "management.status", "oauth.auth-detection", "oauth.auth-metadata-override", "oauth.authorization-header-suppression", "oauth.clear-authentication", "oauth.cli-login", "oauth.cli-logout", "oauth.client-credentials-flags", "oauth.dynamic-client-registration", "oauth.fixed-callback-port", "oauth.headless-tool-search-visibility", "oauth.insufficient-scope", "oauth.login", "oauth.no-browser", "oauth.offline-access", "oauth.preconfigured-client", "oauth.reauthenticate", "oauth.refresh-reconnect-retry", "oauth.scopes", "oauth.startup-notice", "oauth.transport-applicability", "output.idle-timeout", "output.max-mcp-output-tokens", "output.per-tool-persistence", "plugins.servers", "prompts.catalog-and-get", "resources.attachments", "resources.list", "resources.read", "resources.subscriptions", "resources.templates", "roots.list", "roots.list-changed", "runtime.disabled", "runtime.enabled", "sampling.server-request", "scope.local", "scope.precedence", "scope.project", "scope.user", "server.instructions", "server.instructions-truncation", "timeout.first-byte-default", "timeout.first-byte-override-floor", "timeout.first-byte-transport-exclusions", "timeout.idle-disable-zero", "timeout.idle-in-process-exclusions", "timeout.idle-progress-reset", "timeout.idle-transport-defaults", "timeout.per-server-idle-floor", "timeout.progress-does-not-extend-wall", "timeout.tool-hard-wall", "tools.auto-background-disable", "tools.auto-background-elicitation-deferral", "tools.auto-background-exclusions", "tools.auto-background-noninteractive-opt-in", "tools.auto-background-threshold", "tools.deferred-schema-loading", "tools.enable-tool-search", "tools.long-call-backgrounding", "tools.max-before-defer", "tools.meta-always-load", "tools.meta-max-result-size-chars", "tools.meta-requires-user-interaction", "tools.proxy-registration", "tools.root-combinator-schema", "tools.search", "tools.search-default", "tools.search-failure-dependency", "tools.search-unsupported-paths", "tools.search-wait-selection", "tools.server-always-load", "transport.http", "transport.sse", "transport.stdio", "transport.websocket", "transport.websocket-config"
+  "approval.disabled-list", "approval.enable-all", "approval.enabled-list", "channels.allowed-plugins", "channels.allowlist-replacement-empty", "channels.behavior", "channels.development", "channels.development-exception", "channels.enabled-setting", "channels.load", "channels.master-disable", "config.always-load", "config.child-session-env", "config.command-args-env", "config.connect-timeout", "config.empty-url-placeholder", "config.environment-expansion", "config.first-byte-timeout", "config.reserved-server-names", "config.role", "config.shell-prefix", "config.startup-timeout", "config.tool-timeout", "config.url-without-type-validation", "connection.automatic-reconnection", "connection.capability-discovery", "connection.failure-visibility", "connection.wait-tool", "dynamic.failed-refresh-retains-catalog", "dynamic.prompts-list-changed", "dynamic.resources-list-changed", "dynamic.tools-list-changed", "elicitation.hook-request", "elicitation.hook-result", "elicitation.protocol", "headers.dynamic", "headers.static", "hooks.elicitation-input", "hooks.elicitation-matcher", "hooks.elicitation-output", "hooks.elicitation-result-input", "hooks.elicitation-result-matcher", "hooks.elicitation-result-output", "hooks.match-mcp-tools", "hooks.match-patterns", "hooks.mcp-tool-all-events", "hooks.mcp-tool-connected", "hooks.mcp-tool-early-race", "hooks.mcp-tool-errors", "hooks.mcp-tool-handler-input", "hooks.mcp-tool-handler-server", "hooks.mcp-tool-handler-tool", "hooks.mcp-tool-handler-type", "hooks.mcp-tool-plugin-server", "hooks.mcp-tool-text-output", "invocation.bare", "invocation.mcp-config", "invocation.permission-prompt-tool", "invocation.safe-mode", "invocation.strict-mcp-config", "managed.allow-claude-ai", "managed.allowlist", "managed.denylist", "managed.disable-connectors", "managed.disable-sideload", "managed.invalid-allowlist-empty", "managed.invalid-only-treated-true", "managed.only", "managed.only-restriction", "managed.server-config", "managed.server-config-file", "managed.strict-plugin-membership", "managed.strict-plugin-only", "managed.strict-plugin-restriction", "management.add", "management.add-from-claude-desktop", "management.add-json", "management.connectors", "management.get", "management.list", "management.remove", "management.reset-project-choices", "management.server-mode", "management.status", "oauth.auth-detection", "oauth.auth-metadata-override", "oauth.authorization-header-suppression", "oauth.clear-authentication", "oauth.cli-login", "oauth.cli-logout", "oauth.client-credentials-flags", "oauth.dynamic-client-registration", "oauth.fixed-callback-port", "oauth.headless-tool-search-visibility", "oauth.insufficient-scope", "oauth.login", "oauth.no-browser", "oauth.offline-access", "oauth.preconfigured-client", "oauth.reauthenticate", "oauth.refresh-reconnect-retry", "oauth.scopes", "oauth.startup-notice", "oauth.transport-applicability", "output.idle-timeout", "output.max-mcp-output-tokens", "output.per-tool-persistence", "plugins.lifecycle-reload", "plugins.placeholder-substitution", "plugins.scoped-naming", "plugins.servers", "plugins.transport-substitution", "prompts.catalog-and-get", "resources.attachments", "resources.list", "resources.read", "resources.subscriptions", "resources.templates", "roots.list", "roots.list-changed", "runtime.disabled", "runtime.enabled", "sampling.server-request", "scope.local", "scope.precedence", "scope.project", "scope.user", "server.instructions", "server.instructions-truncation", "timeout.first-byte-default", "timeout.first-byte-override-floor", "timeout.first-byte-transport-exclusions", "timeout.idle-disable-zero", "timeout.idle-in-process-exclusions", "timeout.idle-progress-reset", "timeout.idle-transport-defaults", "timeout.per-server-idle-floor", "timeout.progress-does-not-extend-wall", "timeout.tool-hard-wall", "tools.auto-background-disable", "tools.auto-background-elicitation-deferral", "tools.auto-background-exclusions", "tools.auto-background-noninteractive-opt-in", "tools.auto-background-threshold", "tools.deferred-schema-loading", "tools.enable-tool-search", "tools.long-call-backgrounding", "tools.max-before-defer", "tools.meta-always-load", "tools.meta-max-result-size-chars", "tools.meta-requires-user-interaction", "tools.proxy-registration", "tools.root-combinator-schema", "tools.search", "tools.search-default", "tools.search-failure-dependency", "tools.search-unsupported-paths", "tools.search-wait-selection", "tools.server-always-load", "transport.http", "transport.sse", "transport.stdio", "transport.websocket", "transport.websocket-config"
 ] as const;
 
 const ALLOWED_QUALITIES = new Set(["documented", "observed", "inferred", "unverified"]);
@@ -589,6 +603,19 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");
     expect(note("feature.mcp-server-always-load")).toContain("use Claude Code if the startup guarantee is required");
+    expect(note("feature.mcp-url-without-type-validation")).toContain("valid `command` as stdio and ignore its URL");
+    expect(note("feature.mcp-url-without-type-validation")).toContain("set an explicit `type`");
+    expect(note("feature.mcp-list-changed")).toContain("retains the previous catalogs when a list_changed refresh fails");
+    expect(note("feature.mcp-plugin-servers")).toContain("lifecycle and reload behavior");
+    expect(note("feature.mcp-plugin-servers")).toContain("placeholder expansion/substitution");
+    expect(note("feature.mcp-plugin-servers")).toContain("transport-specific substitution/support behavior");
+    expect(lookupCapability("feature.hook-handler.mcp_tool")).toMatchObject({ safetyRelevant: false });
+    expect(lookupCapability("feature.hook-handler.mcp_tool-blocking-enforcement")).toMatchObject({ safetyRelevant: true });
+    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("cannot enforce valid deny/block output");
+    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("Use a supported command hook");
+    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("Claude Code when enforcement is required");
+    expect(note("setting.allowedMcpServers")).toContain("invalid value becomes an empty allowlist");
+    expect(note("setting.allowManagedMcpServersOnly")).toContain("invalid value is treated as true");
     for (const id of ["feature.mcp-managed-config", "setting.allowManagedMcpServersOnly", "setting.allowedMcpServers", "setting.deniedMcpServers", "setting.strictPluginOnlyCustomization.mcp"]) {
       expect(note(id), id).toContain("Do not use PiCC where this enterprise policy is required");
       expect(note(id), id).toContain("independently ensure prohibited servers are absent or disabled through PiCC-supported configuration");

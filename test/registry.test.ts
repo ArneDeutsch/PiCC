@@ -20,6 +20,7 @@ import {
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
 import { resolveMcpConfig } from "../src/discovery/mcp.js";
+import { loadSettings } from "../src/discovery/settings.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -991,6 +992,72 @@ describe("buildCompatReport", () => {
     expect(report.unassessed.some((u) => u.includes('"SomeBrandNewEvent"'))).toBe(true);
   });
 
+  it("classifies mcp_tool handlers for every supported hook event", () => {
+    const blockingEvents = [
+      "PreToolUse",
+      "UserPromptSubmit",
+      "Stop",
+      "SubagentStop",
+      "PreCompact",
+      "WorktreeCreate",
+    ] as const satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][];
+    const ordinaryEvents = [
+      "PostToolUse",
+      "PostToolUseFailure",
+      "SessionStart",
+      "SessionEnd",
+      "SubagentStart",
+      "PostCompact",
+      "WorktreeRemove",
+    ] as const satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][];
+    const root = makeTempDir();
+    const userDir = path.join(root, "user");
+    fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.writeFileSync(path.join(root, ".claude", "settings.json"), JSON.stringify({
+      hooks: Object.fromEntries(SUPPORTED_HOOK_EVENTS.map((event) => [
+        event,
+        [{ hooks: [{ type: "mcp_tool", server: "policy", tool: "check", input: {} }] }],
+      ])),
+    }));
+    const settings = loadSettings({ cwd: root, projectRoot: root, userDir, managedPaths: [] });
+    const project = makeProject({ settings });
+    const report = buildCompatReport(project);
+
+    expect(blockingEvents.length + ordinaryEvents.length).toBe(SUPPORTED_HOOK_EVENTS.length);
+    for (const event of SUPPORTED_HOOK_EVENTS) {
+      expect([...blockingEvents, ...ordinaryEvents], event).toContain(event);
+    }
+    expect(report.safetyFindings).toHaveLength(blockingEvents.length);
+    expect(report.findings).toHaveLength(ordinaryEvents.length);
+    for (const event of blockingEvents) {
+      const finding = report.safetyFindings.find(({ evidence }) => evidence.includes(`on "${event}"`));
+      expect(finding, event).toMatchObject({
+        capability: {
+          id: "feature.hook-handler.mcp_tool-blocking-enforcement",
+          safetyRelevant: true,
+        },
+      });
+      expect(report.findings.some(({ evidence }) => evidence.includes(`on "${event}"`)), event)
+        .toBe(false);
+    }
+    for (const event of ordinaryEvents) {
+      const finding = report.findings.find(({ evidence }) => evidence.includes(`on "${event}"`));
+      expect(finding, event).toMatchObject({
+        capability: { id: "feature.hook-handler.mcp_tool", safetyRelevant: false },
+      });
+      expect(report.safetyFindings.some(({ evidence }) => evidence.includes(`on "${event}"`)), event)
+        .toBe(false);
+    }
+
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("SAFETY feature.hook-handler.mcp_tool-blocking-enforcement");
+    expect(doctor).toContain("cannot enforce valid deny/block output");
+    expect(doctor).toContain("Use a supported command hook, or Claude Code when enforcement is required");
+    expect(doctor).toContain("- feature.hook-handler.mcp_tool —");
+    expect(doctor).not.toContain("SAFETY feature.hook-handler.mcp_tool —");
+  });
+
   it("flags agents with memory/mcpServers/hooks set", () => {
     const project = makeProject({
       agents: [
@@ -1012,6 +1079,65 @@ describe("buildCompatReport", () => {
       expect(finding, id).toBeDefined();
       expect(finding?.evidence).toContain('agent "stateful"');
     }
+  });
+
+  it("classifies agent-scoped mcp_tool handlers by their effective events", () => {
+    const mcpToolHandler = {
+      type: "mcp_tool" as const,
+      raw: { type: "mcp_tool", server: "policy", tool: "check", input: {} },
+    };
+    const project = makeProject({
+      agents: [makeAgent({
+        name: "hooked",
+        hooks: {
+          PreToolUse: [{ hooks: [mcpToolHandler] }],
+          Stop: [{ hooks: [mcpToolHandler] }],
+          SessionStart: [{ hooks: [mcpToolHandler] }],
+        },
+      })],
+    });
+    const report = buildCompatReport(project);
+
+    const aggregate = report.findings.find(({ capability }) => capability.id === "agent.frontmatter.hooks");
+    expect(aggregate?.evidence).toContain('agent "hooked"');
+
+    const preToolUse = report.safetyFindings.find(({ evidence }) => evidence.includes('on "PreToolUse"'));
+    expect(preToolUse).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool-blocking-enforcement", safetyRelevant: true },
+    });
+    const stop = report.safetyFindings.find(({ evidence }) => evidence.includes('effective "SubagentStop"'));
+    expect(stop).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool-blocking-enforcement", safetyRelevant: true },
+      evidence: expect.stringContaining('declared as agent "Stop"'),
+    });
+    expect(stop?.evidence).not.toContain('on "Stop"');
+
+    const sessionStart = report.findings.find(({ evidence }) => evidence.includes('on "SessionStart"'));
+    expect(sessionStart).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool", safetyRelevant: false },
+    });
+    expect(report.safetyFindings.some(({ evidence }) => evidence.includes('SessionStart'))).toBe(false);
+
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("SAFETY feature.hook-handler.mcp_tool-blocking-enforcement");
+    expect(doctor).toContain("Use a supported command hook, or Claude Code when enforcement is required");
+    expect(doctor).not.toContain("SAFETY feature.hook-handler.mcp_tool —");
+  });
+
+  it("tolerates malformed raw agent hook frontmatter without throwing", () => {
+    const malformedHooks = {
+      PreToolUse: "not-a-matcher",
+      Stop: null,
+      SessionStart: [{ hooks: "not-a-handler-list" }, null],
+    } as unknown as NonNullable<ClaudeAgent["hooks"]>;
+    const project = makeProject({ agents: [makeAgent({ name: "malformed", hooks: malformedHooks })] });
+
+    expect(() => buildCompatReport(project)).not.toThrow();
+    expect(buildCompatReport(project).findings).toEqual([
+      expect.objectContaining({
+        capability: expect.objectContaining({ id: "agent.frontmatter.hooks" }),
+      }),
+    ]);
   });
 
   it("flags degraded/not-supported tools in agents' tools: and routes unknown tools to unassessed", () => {
@@ -1287,6 +1413,26 @@ describe("buildCompatReport", () => {
       expect(rendered).toContain("Check `/mcp` readiness");
       expect(rendered).toContain("use Claude Code if the startup guarantee is required");
     }
+  });
+
+  it("attributes an untyped command-plus-URL diagnostic through the full resolver pipeline", () => {
+    const project = makeProject({
+      mcp: resolveAuditedMcp({ hybrid: { command: "node", url: "https://example.invalid/mcp" } }),
+    });
+    const report = buildCompatReport(project);
+    const exactEvidence = 'MCP server "hybrid": field "url" is ignored on a stdio server';
+    expect(report.findings).toEqual([
+      expect.objectContaining({
+        capability: expect.objectContaining({ id: "feature.mcp-url-without-type-validation" }),
+        evidence: exactEvidence,
+      }),
+    ]);
+    expect(report.findings.some((finding) => finding.capability.id === "feature.mcp")).toBe(false);
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain("feature.mcp-url-without-type-validation");
+    expect(rendered).toContain(exactEvidence);
+    expect(rendered).toContain("set an explicit `type`");
+    expect(rendered).toContain("do not rely on Claude's validation behavior under PiCC");
   });
 
   it("splits remote OAuth, alwaysLoad, and role diagnostics while retaining the unrelated fallback", () => {
