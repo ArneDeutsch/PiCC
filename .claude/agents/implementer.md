@@ -20,7 +20,7 @@ You do all the work with your own hands. You have no subagents and no skills to 
      (the standard your change is reviewed against — read it before you write, not after).
 3. **Stay inside the writable surface** named in the task spec. Everything else is read-only. No workarounds, no mocking-away of problems, no scope creep beyond the spec.
 4. **Implement the goal**, deciding the "Left open" items as you go. Prefer the idioms of the surrounding code.
-5. **Verify.** Run `npm run typecheck:all` (src + tests) and the tests the task requires (`npm test`, or the narrower command the spec names). They must be green, or show no new failures versus the baseline the coordinator gave you. Report the exact result summary.
+5. **Verify proportionately.** While editing, run focused checks through each test file's executable owning lane. Run `npm run verify` (typecheck + unit) as the ordinary task gate, plus only the integration, e2e, release, or other costlier checks the task explicitly requires. Run complete `npm run verify:all` only when the task explicitly requires it; otherwise the coordinator owns complete verification at final integration. Required checks must be green, or show no new failures versus the baseline the coordinator gave you. Report the exact result summary.
 6. **Keep the execution log** at the path the task spec names (part of your writable surface): brief bullets — key decisions (especially on "Left open" items), deviations from the spec, friction, and anything surprising you found in the existing code. Write it to disk **incrementally as work proceeds** (append as you go), never deferred to task end — a mid-task crash must still leave the log the resume path reads as the sole record of a commit-less task's completion.
 
 ## Ground rules

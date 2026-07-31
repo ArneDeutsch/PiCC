@@ -315,6 +315,50 @@ describe("small stable prompt security kernels", () => {
   });
 });
 
+describe("shipped workflow verification policy", () => {
+  it("pins proportional verification ownership across the feature workflow", () => {
+    const implementer = compact(path.join(paths.agents, "implementer.md"));
+    const templates = compact(implementFile("templates.md"));
+    const phaseTwo = compact(implementFile("phase-2-workspace.md"));
+    const phaseSeven = compact(implementFile("phase-7-implementation.md"));
+    const phaseEight = compact(implementFile("phase-8-close-review.md"));
+    const phaseNine = compact(implementFile("phase-9-handoff.md"));
+    const phaseNineFork = compact(implementFile("phase-9-fork-handoff.md"));
+
+    contains(implementer, [
+      "focused checks through each test file's executable owning lane",
+      "`npm run verify` (typecheck + unit) as the ordinary task gate",
+      "only the integration, e2e, release, or other costlier checks the task explicitly requires",
+    ]);
+    contains(templates, [
+      "name the focused existing/new owner and its executable lane",
+      "why integration and e2e are or are not needed",
+      "cross-platform concerns (windows + linux)",
+    ]);
+    contains(phaseTwo, ["run `npm run verify` once", "routine typecheck-plus-unit baseline"]);
+    expect(phaseTwo).not.toContain("verify:all");
+    contains(phaseSeven, [
+      "run `npm run verify` as the ordinary task gate",
+      "only the integration, e2e, release, or other costlier checks the task explicitly requires",
+      "run `npm run verify:all` only when the task explicitly requires complete verification",
+      "do not impose unconditional complete verification per task",
+    ]);
+    contains(phaseEight, [
+      "the coordinator runs one `npm run verify:all`",
+      "final-integration complete gate",
+    ]);
+    contains(phaseNine, [
+      "if `<pushremote>/<default>` moved, merge it into the feature branch, resolve conflicts, and run `npm run verify:all` again",
+      "if there is **no remote** and the local default branch moved, merge it and run `npm run verify:all` again",
+      "without a duplicate complete run",
+    ]);
+    contains(phaseNineFork, [
+      "if it moved, merge it into the feature branch",
+      "run `npm run verify:all` again",
+    ]);
+  });
+});
+
 const EXPECTED_GITHUB_DENY = [
   "Bash(gh pr merge *)", "Bash(gh pr close *)", "Bash(gh pr reopen *)", "Bash(gh pr edit *)", "Bash(gh pr review *)",
   "Bash(gh issue edit *)", "Bash(gh issue delete *)", "Bash(gh issue lock *)", "Bash(gh issue reopen *)",

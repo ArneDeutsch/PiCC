@@ -9,11 +9,10 @@
 
 ## Automated checks
 
-- [ ] `npm run typecheck:all` is green locally
-- [ ] `npm test` is green locally
+- [ ] `npm run verify:all` is green locally
 
-CI runs the two lanes separately across Windows/Linux: `test:unit` on Node 22 and 24, `test:e2e`
-on Node 22.
+CI runs unit, offline integration, and e2e lanes across Windows/Linux: unit and integration on
+Node 22 and 24, e2e on Node 22.
 
 ## Manual verification guidance
 

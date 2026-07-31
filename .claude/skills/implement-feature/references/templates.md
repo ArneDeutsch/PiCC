@@ -64,12 +64,14 @@ Everything the implementer can't safely invent alone.>
 <Decisions deliberately deferred to the implementer.>
 
 ## Testing
-<What must be covered and at which layer (unit / offline-integration / e2e);
-cross-platform concerns (Windows + Linux).>
+<For every regression: name the focused existing/new owner and its executable lane. Name the broad
+lanes required for this task, why integration and e2e are or are not needed, and cross-platform
+concerns (Windows + Linux). `verify` is the routine gate; require `verify:all` only when this task
+needs complete verification.>
 
 ## Acceptance criteria
 - [ ] <verifiable statement>
-- [ ] typecheck and full test suite green
+- [ ] focused checks, `verify`, and any task-required broader lanes green
 
 ## Depends on
 <task ids, or –>

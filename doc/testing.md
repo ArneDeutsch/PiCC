@@ -87,39 +87,43 @@ mappings still include the richer property-and-boundary evidence required above.
 This is the canonical list of lanes.
 
 ```bash
-npm ci                 # installs the lockfile, including Pi's CLI for the e2e layer
-npm run typecheck      # strict TypeScript over src/**, no emit
-npm run typecheck:test # type-check the test suite (test/** + vitest.config.ts)
-npm run typecheck:all  # both of the above — part of the pre-commit gate
-npm test               # authoritative complete suite: test:unit, then preflight-backed test:e2e
-npm run verify          # typecheck:all, then the authoritative complete suite
-npm run test:unit      # everything except the real-Pi e2e files — the test half of the pre-commit gate
-npm run test:e2e       # installed-Pi preflight, then only the real-Pi e2e files (fork-capped)
-npm run test:coverage  # unit lane, with a src/** coverage report
-npm run test:watch     # vitest in watch mode
+npm ci                   # installs the lockfile, including Pi's CLI for the e2e layer
+npm run typecheck        # strict TypeScript over src/**, no emit
+npm run typecheck:test   # type-check the test suite (test/** + vitest.config.ts)
+npm run typecheck:all    # both of the above
+npm test                 # unit lane (same as test:unit)
+npm run test:unit        # isolated and mixed unit-owned files
+npm run test:integration # offline whole-extension integration lane
+npm run test:e2e         # installed-Pi preflight, then the real-Pi e2e lane
+npm run test:all         # unit, then integration, then e2e
+npm run verify           # routine gate: typecheck:all, then unit
+npm run verify:all       # complete gate: typecheck:all, then all three lanes
+npm run test:coverage    # both in-process lanes, with a src/** coverage report
+npm run test:watch       # unit project in watch mode
 ```
 
-The suite is split into two vitest projects (`vitest.config.ts`): a `unit` project (everything
-except `test/e2e-*.test.ts`) and an `e2e` project (the real-Pi files). Both projects retain fork
-parallelism while capping `maxWorkers` at two. Unit and e2e tests both spawn real child processes,
-so the shared bound limits process multiplication and reduces oversubscription risk on small
-runners; the cap is the contention lever, not raised timeouts. `test:coverage` instruments only
-in-process code, so it reports the unit lane's coverage of `src/**` and cannot measure the real-Pi
-child process; it is a guidance signal with no thresholds.
+The suite has three Vitest projects (`vitest.config.ts`): `unit`, `integration`, and `e2e`. Each
+retains fork parallelism while capping `maxWorkers` at two. Tests in every lane may spawn real child
+processes, so the shared bound limits process multiplication and reduces oversubscription risk on
+small runners; the cap is the contention lever, not raised timeouts. `test:coverage` spans both
+in-process projects and cannot measure the real-Pi child process; it is a guidance signal with no
+thresholds.
 
-CI type-checks with `typecheck:all` and runs `test:unit` and `test:e2e` as separate lanes across
-Windows/Linux. Contributors who opt in with `npm run hooks:install` get the faster
-`typecheck:all` then `test:unit` pre-commit gate. Run `npm run verify` before integration; it is the
-complete local authority.
+CI type-checks with `typecheck:all` and runs unit, integration, and e2e as separate lanes across
+Windows/Linux. Contributors who opt in with `npm run hooks:install` get the routine `verify`
+(typecheck plus unit) pre-commit gate. Use `verify` for ordinary task work and `verify:all` for final
+integration and releases.
 
-For a focused inner loop, pass an exact file through npm:
+For a focused inner loop, pass an exact file through its executable owning lane:
 
 ```bash
 npm run test:unit -- test/permissions.test.ts
+npm run test:integration -- test/integration-extension.test.ts
+npm run test:e2e -- test/e2e-core.test.ts
 ```
 
-To select one test, pass an anchored regular expression containing the full Vitest name, including
-its `describe` ancestry:
+The focused e2e form retains the lane's installed-Pi preflight. To select one test, pass an anchored
+regular expression containing the full Vitest name, including its `describe` ancestry:
 
 ```bash
 npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool names$"
@@ -138,8 +142,8 @@ still skip the E2E files gracefully, which is useful for narrow development comm
 
 Unit tests live in `test/*.test.ts`, **one or more per subsystem**, named after the subsystem they
 cover (`permissions.test.ts`, `worktrees.test.ts`, `skills.test.ts`, …) — the file names are the
-index, so list the directory rather than trusting a table here. Run them with `npm run test:unit`,
-which also picks up Layer 2.
+index, so list the directory rather than trusting a table here. Run unit-owned files with
+`npm run test:unit`; a mixed unit-owned file may retain conceptual Layer-2 blocks.
 
 Each subsystem is tested against its full field/behavior matrix, **including fields the reference
 project never exercises** — that is the completeness floor's bar, and it is why this layer carries
@@ -170,22 +174,25 @@ Keep local rendering cost separate from provider, network, and inference latency
 
 ## Layer 2 — offline integration (fakePi)
 
-`test/integration-extension.test.ts` loads the **whole extension** (`picc(pi)`) against the
-`examples/full-surface` conformance fixture through `test/helpers/fake-pi.ts` — a hand-written
-stand-in for Pi's `ExtensionAPI` that records every tool, command, event handler, message, and
-model/thinking call the extension makes. It also records and **drives the interactive UI
-surface** with Pi-faithful semantics — widget installs/removals, focused `custom` components,
-the raw terminal-input chain (`feedTerminalInput`), shortcut and message-renderer registration,
-an injectable keymap, and mode-shaped contexts (`tuiCtx`/`printCtx`/`rpcCtx` modeling the real
-TUI/print/RPC ctx shapes) — which is what lets TUI behavior such as the subagent status panel
-and its drill-down be tested offline in the unit lane. `test/helpers/fixture.ts` copies a fixture from `examples/`
-into a temp dir and turns it into a real git repo (so worktree and git-plumbing behavior is
-genuine).
+The dedicated integration lane contains the dominant whole-extension files selected by
+`integrationTestFiles` in `vitest.config.ts`; it does not absorb every conceptual Layer-2 block from
+a mixed unit-owned file. Run a focused file through whichever executable lane owns it.
+
+The representative whole-extension suite loads `picc(pi)` against the `examples/full-surface`
+conformance fixture through `test/helpers/fake-pi.ts` — a hand-written stand-in for Pi's
+`ExtensionAPI` that records every tool, command, event handler, message, and model/thinking call the
+extension makes. It also records and **drives the interactive UI surface** with Pi-faithful semantics
+— widget installs/removals, focused `custom` components, the raw terminal-input chain
+(`feedTerminalInput`), shortcut and message-renderer registration, an injectable keymap, and
+mode-shaped contexts (`tuiCtx`/`printCtx`/`rpcCtx` modeling the real TUI/print/RPC ctx shapes) —
+which lets TUI behavior such as the subagent status panel and its drill-down be tested offline.
+`test/helpers/fixture.ts` copies a fixture from `examples/` into a temp dir and turns it into a real
+git repo (so worktree and git-plumbing behavior is genuine).
 
 This layer asserts the **mechanical-fidelity tier end to end without any model**: the Claude tool
 surface is registered, the system prompt is assembled correctly, skills stay lazy-loaded until
 activation, deny rules and hooks fire, worktrees are created and seeded, and unknown/future features
-degrade. It is the fastest way to test cross-subsystem wiring, and it runs in the unit lane.
+degrade. It is the fastest way to test cross-subsystem wiring.
 
 ## Layer 3 — live e2e (real Pi CLI + mock OpenAI model)
 
@@ -196,8 +203,8 @@ agent dir. No real model, no subscription, no outbound network.
 
 They share the process harness and request helpers in `test/helpers/e2e-live.ts`. Group scenarios by
 cost so subagent-heavy or compaction-heavy processes do not form one serial pole. Keeping the
-`e2e-` prefix on every file is a **contract**: `test:unit` excludes `**/e2e-*.test.ts`, so the prefix
-is what keeps real-Pi spawns out of the unit lane. List `test/e2e-*.test.ts` for the current scenario
+`e2e-` prefix on every file is a **contract**: only the e2e project includes `test/e2e-*.test.ts`, so
+the prefix keeps real-Pi spawns in that lane. List `test/e2e-*.test.ts` for the current scenario
 set rather than maintaining an inventory here.
 
 `mock-openai.ts` is a scriptable SSE server: each test hands it a list of `Turn`s (either scripted

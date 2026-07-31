@@ -16,8 +16,8 @@ Windows, install Git for Windows; PiCC resolves its Git Bash installation automa
 [`doc/user-guide.md`](doc/user-guide.md).
 
 Installing dependencies does not change the checkout's Git configuration. To opt into the bundled
-pre-commit hook, run `npm run hooks:install`; it runs `npm run typecheck:all` and then
-`npm run test:unit` before every commit.
+pre-commit hook, run `npm run hooks:install`; it runs the routine `npm run verify` gate (typecheck
+plus unit) before every commit.
 
 ## Develop
 
@@ -34,16 +34,17 @@ node <path-to-PiCC>/bin/picc.mjs
 The dev loop:
 
 ```bash
-npm run typecheck:all                              # strict TypeScript over src + tests, no emit
-npm run test:unit                                  # complete non-E2E lane
-npm run test:unit -- test/permissions.test.ts      # focused exact file
+npm run test:unit -- test/permissions.test.ts                 # focused unit-owned file
+npm run test:integration -- test/integration-extension.test.ts # focused integration-owned file
 npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool names$"
-npm run verify                                     # authoritative complete check before integration
+npm run verify                                                # routine: typecheck + unit
+npm run verify:all                                            # complete: all three lanes
 ```
 
 Vitest's `-t` is a regular expression; anchor the full name, including `describe` ancestry, for an
-exact match. The pre-commit hook runs the first two commands. Use the focused commands while
-iterating and `verify` before integration.
+exact match. Select a focused file through its executable owning lane while iterating. The
+pre-commit hook and routine development gate use `verify`; use `verify:all` for pull requests and
+final integration. See `doc/testing.md` for lane selection and focused e2e commands.
 
 [`doc/architecture.md`](doc/architecture.md) is the map of `src/` — the layering, what each module
 owns, and where new code belongs. Read it before changing the harness.
@@ -99,8 +100,8 @@ npm run update:pi -- <stable-exact-version>
 The helper runs one exact, scripts-disabled npm transaction using your normal npm configuration,
 then validates the four direct Pi package manifests. If it fails, inspect or restore `package.json` and
 `package-lock.json` with Git and run `npm ci`. It does not make compatibility decisions: adapt PiCC
-semantics and documentation, run `npm run verify`, then submit the result as a human-reviewed pull
-request. Never couple Pi release detection or adoption to automatic merging or publication.
+semantics and documentation, run `npm run verify:all`, then submit the result as a human-reviewed
+pull request. Never couple Pi release detection or adoption to automatic merging or publication.
 
 ### Cutting a PiCC release
 
@@ -182,8 +183,8 @@ Deliberately out of scope — each for a reason, not from neglect:
 - Keep changes focused; match the surrounding code style.
 - Add or update tests for behavior changes at the cheapest sufficient layer; reserve end-to-end
   scenarios for boundaries that require the real Pi CLI or agent loop.
-- Run `npm run verify` before opening the PR. CI runs `test:unit` and
-  `test:e2e` as separate lanes on Windows and Linux — unit on Node 22 and 24, e2e on Node 22.
+- Run `npm run verify:all` before opening the PR. CI runs unit, offline integration, and e2e
+  lanes on Windows and Linux — unit and integration on Node 22 and 24, e2e on Node 22.
 - Note any capability-registry or documentation updates in the PR description.
 
 ### Manual verification
