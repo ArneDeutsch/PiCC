@@ -351,10 +351,12 @@ either component becomes `_`, so an astral symbol becomes `__`. Arguments are po
 server's declared order; quote multi-word values with single or double quotes, for example
 `/mcp__docs__summarize concise "release notes"`.
 If palette publication fails, the typed fallback is usable only when you already know the raw server
-and prompt names and can normalize them this way. Invocation replaces that user turn with bounded,
-explicitly untrusted prompt content. Generated palette files persist metadata only and never write
-prompt bodies or results; successful transformed content follows ordinary conversation and session
-transcript retention.
+and prompt names and can normalize them this way. PiCC owns the
+`.claude/.picc/prompts` palette metadata, attempts to git-exclude that path, and regenerates it
+during startup resource discovery and after `/reload`. Invocation replaces that user turn with
+bounded, explicitly untrusted prompt
+content. Generated palette files persist metadata only and never write prompt bodies or results;
+successful transformed content follows ordinary conversation and session transcript retention.
 
 When any settled initial server snapshot advertises resources, the model receives
 `ListMcpResourcesTool` and `ReadMcpResourceTool`, including for an empty or
@@ -376,9 +378,9 @@ resources have no `@` attachment or autocomplete. See the
 
 ### Harness configuration
 
-Lives **outside the project** (`~/.picc/config.json`) or in the harness-owned, gitignored
-`<project>/.claude/.picc/config.json` (project overrides user; the harness never touches
-tracked project files):
+Lives **outside the project** (`~/.picc/config.json`) or in the harness-owned
+`<project>/.claude/.picc/config.json` (PiCC attempts to add `.claude/.picc/` to repository-local
+excludes; project configuration overrides user configuration):
 
 ```json
 {

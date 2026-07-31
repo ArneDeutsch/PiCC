@@ -54,9 +54,9 @@ providers at will on one project and run **parallel sessions on different worktr
 models**. They do **not** exchange live session state, and there is **no mid-flight handoff** of a
 live worktree or session between them.
 
-This is why PiCC state lives outside the project or in the gitignored, harness-owned
-`.claude/.picc/`, and why compatibility work targets artifacts on disk rather than any shared
-runtime protocol. Anything that would require the two harnesses to agree at runtime is out of scope
+This is why PiCC state lives outside the project or in the harness-owned `.claude/.picc/`, which
+PiCC attempts to add to repository-local excludes, and why compatibility work targets artifacts on
+disk rather than any shared runtime protocol. Anything that would require the two harnesses to agree at runtime is out of scope
 by construction.
 
 ## Module map (`src/`)

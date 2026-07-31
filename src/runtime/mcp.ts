@@ -205,6 +205,7 @@ export interface McpServerState {
   promptCount?: number;
   resourceCount?: number;
   toolDiscoveryError?: string;
+  initialToolDiscoveryFailed?: true;
   promptDiscoveryError?: string;
   resourceDiscoveryError?: string;
   diagnostic?: string;
@@ -246,6 +247,7 @@ interface ServerHandle {
   promptsAdvertised?: boolean;
   resourcesAdvertised?: boolean;
   toolDiscoveryError?: string;
+  initialToolDiscoveryFailed?: true;
   promptDiscoveryError?: string;
   resourceDiscoveryError?: string;
   resourceServerInfo?: McpResourceServerInfo;
@@ -386,6 +388,7 @@ export class McpRuntime {
       ...(handle.promptsAdvertised ? { promptCount: handle.prompts.length } : {}),
       ...(handle.resourcesAdvertised ? { resourceCount: handle.resources.length } : {}),
       ...(handle.toolDiscoveryError !== undefined ? { toolDiscoveryError: handle.toolDiscoveryError } : {}),
+      ...(handle.initialToolDiscoveryFailed === true ? { initialToolDiscoveryFailed: true as const } : {}),
       ...(handle.promptDiscoveryError !== undefined ? { promptDiscoveryError: handle.promptDiscoveryError } : {}),
       ...(handle.resourceDiscoveryError !== undefined ? { resourceDiscoveryError: handle.resourceDiscoveryError } : {}),
       ...(handle.diagnostic !== undefined ? { diagnostic: handle.diagnostic } : {}),
@@ -722,12 +725,17 @@ export class McpRuntime {
       }
       // Raw exception text can embed expanded command values or server speech;
       // only code/name identity reaches the generic diagnostic.
+      const toolDiscoveryFailed = isInitialToolDiscoveryFailure(err) &&
+        !localCloseObserved && !localTransportErrorObserved;
+      if (toolDiscoveryFailed) handle.initialToolDiscoveryFailed = true;
       this.settleHandle(
         handle,
         "failed",
         `MCP server "${server.name}" failed to start (${errSummary(err)}) — ` +
           `command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
-        "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
+        toolDiscoveryFailed
+          ? INITIAL_TOOL_DISCOVERY_FAILURE_SUMMARY
+          : "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
       );
     }
   }
@@ -792,11 +800,15 @@ export class McpRuntime {
         if (!this.remoteCurrent(handle, epoch, signal)) return;
         const failure = remoteAttemptFailure(error);
         if (failure.class !== "transient" || attempt === 4) {
+          const toolDiscoveryFailed = isInitialToolDiscoveryFailure(error);
+          if (toolDiscoveryFailed) handle.initialToolDiscoveryFailed = true;
           this.settleHandle(
             handle,
             "failed",
             `MCP server "${handle.server.name}" remote startup failed (${failure.class}).`,
-            remoteFailureSummary(failure.class, attempt === 4),
+            toolDiscoveryFailed
+              ? INITIAL_TOOL_DISCOVERY_FAILURE_SUMMARY
+              : remoteFailureSummary(failure.class, attempt === 4),
           );
           return;
         }
@@ -905,6 +917,9 @@ export class McpRuntime {
           stage: "discovery",
           ...(transportLoss !== undefined ? { transportLoss } : {}),
         }),
+        ...(transportLoss === undefined && isInitialToolDiscoveryFailure(error)
+          ? { initialToolDiscoveryFailed: true }
+          : {}),
       };
     }
     if (!this.remoteCurrent(handle, epoch, signal)) {
@@ -969,7 +984,8 @@ export class McpRuntime {
         if (capability === "prompts") snapshot.prompts = this.validatePrompts(handle.server.name, raw, diagnostics);
         if (capability === "resources") snapshot.resources = this.validateResources(handle.server.name, raw, diagnostics);
       } catch (error) {
-        if (handle.stopped || signal?.aborted || capability === "tools") throw error;
+        if (handle.stopped || signal?.aborted) throw error;
+        if (capability === "tools") throw markInitialToolDiscoveryFailure(error);
         const failure = discoveryFailureClass(error);
         const summary = `${capability} discovery failed after ${discoveryAttempts(error)} attempt(s) (${failure})`;
         if (capability === "prompts") snapshot.promptDiscoveryError = summary;
@@ -1635,6 +1651,19 @@ function clampToolTimeout(ms: number): number {
  */
 function sliceForDiag(name: string): string {
   return name.length > DIAG_NAME_MAX_CHARS ? `${name.slice(0, DIAG_NAME_MAX_CHARS)}…` : name;
+}
+
+const INITIAL_TOOL_DISCOVERY_FAILURE_SUMMARY =
+  "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.";
+
+function markInitialToolDiscoveryFailure(error: unknown): Error & { initialToolDiscoveryFailed: true } {
+  const marked = error instanceof Error ? error : new Error("initial tools/list discovery failed");
+  return Object.assign(marked, { initialToolDiscoveryFailed: true as const });
+}
+
+function isInitialToolDiscoveryFailure(error: unknown): boolean {
+  return typeof error === "object" && error !== null &&
+    (error as { initialToolDiscoveryFailed?: unknown }).initialToolDiscoveryFailed === true;
 }
 
 function cancelledRemoteAttempt(): { remoteFailure: ReturnType<typeof classifyRemoteMcpFailure> } {

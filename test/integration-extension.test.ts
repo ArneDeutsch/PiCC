@@ -3152,6 +3152,45 @@ describe("MCP prompt/resource extension integration", () => {
     };
   }
 
+  it("gives fatal initial tools/list startup failures reload-or-restart guidance", async () => {
+    const fixture = materializeFixture("hello-claude");
+    const previous = process.cwd();
+    const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+    try {
+      const user = path.join(fixture, ".user");
+      fs.mkdirSync(user, { recursive: true });
+      process.env.PICC_CLAUDE_USER_DIR = user;
+      process.chdir(fixture);
+      const localPi = fakePi();
+      picc(localPi.api as never, {
+        mcpRuntime: {
+          ...runtimeWithPrompt(false),
+          prompts: () => [],
+          serverStates: () => [{
+            name: "safe-server",
+            transport: "stdio",
+            state: "failed",
+            initialToolDiscoveryFailed: true,
+            statusSummary: "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.",
+          }],
+        },
+        onInitializationSettled: localPi.captureInitialization,
+      });
+      await localPi.waitForInitialization();
+      await localPi.fire("before_agent_start", { systemPrompt: "base" }, localPi.tuiCtx());
+      expect(localPi.notifications.at(-1)).toMatchObject({ severity: "warning" });
+      expect(localPi.notifications.at(-1)!.text).toContain("Initial tools/list discovery failed");
+      expect(localPi.notifications.at(-1)!.text).toContain("server configuration and logs");
+      expect(localPi.notifications.at(-1)!.text).toContain("/reload or restart PiCC");
+      await localPi.fire("session_shutdown", { reason: "other" }, localPi.printCtx());
+    } finally {
+      process.chdir(previous);
+      if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+      cleanupFixture(fixture);
+    }
+  }, 30_000);
+
   it("keeps exact local and unique namespaced suffix commands ahead of colliding MCP prompts", async () => {
     const fixture = materializeFixture("hello-claude");
     const previous = process.cwd();
@@ -3481,6 +3520,69 @@ describe("MCP prompt/resource extension integration", () => {
     }
   }, 30_000);
 
+  it("retains a near-limit JSON/RPC failure hint and corrective tail through storage and rendering", async () => {
+    const fixture = materializeFixture("hello-claude");
+    const previous = process.cwd();
+    const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+    try {
+      const user = path.join(fixture, ".user");
+      fs.mkdirSync(user, { recursive: true });
+      process.env.PICC_CLAUDE_USER_DIR = user;
+      process.chdir(fixture);
+      const argumentsList = Array.from({ length: 10 }, (_, index) => ({
+        name: `arg${index}_${"x".repeat(184)}`,
+        description: "required",
+        required: true,
+      }));
+      const runtime: Runtime = {
+        ...runtimeWithPrompt(false),
+        prompts: () => [{
+          serverName: "fixture",
+          promptName: "near limit",
+          description: "Near-limit failure",
+          arguments: argumentsList,
+        }],
+      };
+      const localPi = fakePi();
+      picc(localPi.api as never, {
+        mcpRuntime: runtime,
+        onInitializationSettled: localPi.captureInitialization,
+      });
+      await localPi.waitForInitialization();
+      const command = "mcp__fixture__near_limit";
+      const hint = argumentsList.map((argument) => `<${argument.name}>`).join(" ");
+      const correctiveTail = `Usage: /${command} ${hint}.`;
+      for (const ctx of [localPi.ctx({ mode: "json", hasUI: false }), localPi.rpcCtx()]) {
+        const result = await localPi.fire("input", { source: "user", text: `/${command}` }, ctx);
+        expect(result).toEqual({ action: "handled" });
+        const entry = localPi.entries.at(-1)!;
+        expect(entry).toMatchObject({
+          customType: "picc-mcp-prompt",
+          data: { command, category: "arguments", providerRequestSent: false },
+        });
+        const stored = String(entry.data.message);
+        expect(stored.length).toBeGreaterThan(1_200);
+        expect(stored.length).toBeLessThanOrEqual(4_096);
+        expect(stored.endsWith(correctiveTail)).toBe(true);
+
+        const renderer = localPi.entryRenderers.get("picc-mcp-prompt")!;
+        for (const width of [80, 9]) {
+          const lines = renderer(entry, {}, { fg: (_slot: string, text: string) => text }).render(width);
+          expect(lines.every((line: string) => piTui.visibleWidth(line) <= width)).toBe(true);
+          const rendered = lines.join("\n").replace(/\s/gu, "");
+          expect(rendered).toContain(hint.replace(/\s/gu, ""));
+          expect(rendered.endsWith(correctiveTail.replace(/\s/gu, ""))).toBe(true);
+        }
+      }
+      await localPi.fire("session_shutdown", { reason: "other" }, localPi.printCtx());
+    } finally {
+      process.chdir(previous);
+      if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+      cleanupFixture(fixture);
+    }
+  }, 30_000);
+
   it("shows and clears delayed palette progress, coalesces publication, and retains frontmatter-only stubs", async () => {
     const fixture = materializeFixture("hello-claude");
     const previous = process.cwd();
@@ -3519,6 +3621,8 @@ describe("MCP prompt/resource extension integration", () => {
       const names = fs.readdirSync(firstResult.promptPaths[0]);
       expect(names).not.toContain("stale.md");
       expect(names.filter((name) => name === "mcp__fixture__review_code.md")).toHaveLength(1);
+      expect(fs.readdirSync(path.join(fixture, ".claude", ".picc")))
+        .not.toEqual(expect.arrayContaining([expect.stringMatching(/^\.prompts-(?:staging|backup)-/u)]));
       const promptStub = fs.readFileSync(
         path.join(firstResult.promptPaths[0], "mcp__fixture__review_code.md"), "utf8",
       );
@@ -3551,11 +3655,17 @@ describe("MCP prompt/resource extension integration", () => {
         onInitializationSettled: localPi.captureInitialization,
       });
       await localPi.waitForInitialization();
+      const published = path.join(fixture, ".claude", ".picc", "prompts");
+      fs.mkdirSync(published, { recursive: true });
+      fs.writeFileSync(path.join(published, "old.md"), "OLD_PALETTE");
       writeSpy = vi.spyOn(fs.promises, "writeFile").mockRejectedValueOnce(new Error("benign-write-canary"));
       const resources = await localPi.fire("resources_discover", {}, localPi.tuiCtx({ ui: {} }));
       expect(resources.promptPaths).toBeUndefined();
       expect(stderrSpy.mock.calls.flat().join(" ")).toContain("Slash-command palette publication failed");
       expect(stderrSpy.mock.calls.flat().join(" ")).toContain("exact typed invocation still works");
+      expect(fs.readFileSync(path.join(published, "old.md"), "utf8")).toBe("OLD_PALETTE");
+      expect(fs.readdirSync(path.dirname(published)))
+        .not.toEqual(expect.arrayContaining([expect.stringMatching(/^\.prompts-(?:staging|backup)-/u)]));
       const transformed = await localPi.fire("input", {
         source: "user", text: "/mcp__fixture__review_code safe",
       }, localPi.printCtx());
@@ -3565,6 +3675,50 @@ describe("MCP prompt/resource extension integration", () => {
     } finally {
       writeSpy?.mockRestore();
       stderrSpy.mockRestore();
+      process.chdir(previous);
+      if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+      cleanupFixture(fixture);
+    }
+  }, 30_000);
+
+  it("rolls back the old palette when the staged replacement swap fails", async () => {
+    const fixture = materializeFixture("hello-claude");
+    const previous = process.cwd();
+    const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const user = path.join(fixture, ".user");
+      fs.mkdirSync(user, { recursive: true });
+      process.env.PICC_CLAUDE_USER_DIR = user;
+      process.chdir(fixture);
+      const published = path.join(fixture, ".claude", ".picc", "prompts");
+      fs.mkdirSync(published, { recursive: true });
+      fs.writeFileSync(path.join(published, "old.md"), "OLD_PALETTE");
+      const localPi = fakePi();
+      picc(localPi.api as never, {
+        mcpRuntime: runtimeWithPrompt(false),
+        onInitializationSettled: localPi.captureInitialization,
+      });
+      await localPi.waitForInitialization();
+      const realRename = fs.promises.rename.bind(fs.promises);
+      let renameCalls = 0;
+      renameSpy = vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
+        renameCalls += 1;
+        if (renameCalls === 2) throw Object.assign(new Error("swap-canary"), { code: "EACCES" });
+        return realRename(from, to);
+      });
+      const resources = await localPi.fire("resources_discover", {}, localPi.printCtx());
+      expect(resources.promptPaths).toBeUndefined();
+      expect(renameCalls).toBe(3);
+      expect(fs.readFileSync(path.join(published, "old.md"), "utf8")).toBe("OLD_PALETTE");
+      expect(fs.readdirSync(path.dirname(published)))
+        .not.toEqual(expect.arrayContaining([expect.stringMatching(/^\.prompts-(?:staging|backup)-/u)]));
+      await localPi.fire("session_shutdown", { reason: "other" }, localPi.printCtx());
+    } finally {
+      renameSpy?.mockRestore();
+      errorSpy.mockRestore();
       process.chdir(previous);
       if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
       else process.env.PICC_CLAUDE_USER_DIR = previousUser;
@@ -3879,6 +4033,8 @@ describe("MCP prompt/resource extension integration", () => {
     const previousUser = process.env.PICC_CLAUDE_USER_DIR;
     const sentinel = path.join(external, "sentinel.txt");
     fs.writeFileSync(sentinel, "KEEP");
+    fs.mkdirSync(path.join(external, "prompts"));
+    fs.writeFileSync(path.join(external, "prompts", "old.md"), "OLD_PALETTE");
     let localPi: ReturnType<typeof fakePi> | undefined;
     try {
       const user = path.join(fixture, ".user");
@@ -3902,7 +4058,8 @@ describe("MCP prompt/resource extension integration", () => {
       const resources = await localPi.fire("resources_discover", {}, localPi.printCtx());
       expect(resources.promptPaths).toBeUndefined();
       expect(fs.readFileSync(sentinel, "utf8")).toBe("KEEP");
-      expect(fs.readdirSync(external)).toEqual(["sentinel.txt"]);
+      expect(fs.readFileSync(path.join(external, "prompts", "old.md"), "utf8")).toBe("OLD_PALETTE");
+      expect(fs.readdirSync(external).sort()).toEqual(["prompts", "sentinel.txt"]);
     } finally {
       if (localPi) await localPi.fire("session_shutdown", { reason: "other" }, localPi.printCtx());
       process.chdir(previous);
@@ -3920,6 +4077,8 @@ describe("MCP prompt/resource extension integration", () => {
     const previousUser = process.env.PICC_CLAUDE_USER_DIR;
     const sentinel = path.join(external, "sentinel.txt");
     fs.writeFileSync(sentinel, "KEEP");
+    fs.mkdirSync(path.join(external, "prompts"));
+    fs.writeFileSync(path.join(external, "prompts", "old.md"), "OLD_PALETTE");
     try {
       const user = path.join(fixture, ".user");
       fs.mkdirSync(user, { recursive: true });
@@ -3937,7 +4096,8 @@ describe("MCP prompt/resource extension integration", () => {
       const resources = await localPi.fire("resources_discover", {}, localPi.printCtx());
       expect(resources.promptPaths).toBeUndefined();
       expect(fs.readFileSync(sentinel, "utf8")).toBe("KEEP");
-      expect(fs.readdirSync(external)).toEqual(["sentinel.txt"]);
+      expect(fs.readFileSync(path.join(external, "prompts", "old.md"), "utf8")).toBe("OLD_PALETTE");
+      expect(fs.readdirSync(external).sort()).toEqual(["prompts", "sentinel.txt"]);
       const transformed = await localPi.fire("input", {
         source: "user",
         text: "/mcp__fixture__review_code safe",

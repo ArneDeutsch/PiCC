@@ -1205,8 +1205,9 @@ describe("McpRuntime degrade paths", () => {
       const state = runtime.serverStates()[0];
       expect(state).toMatchObject({
         state: "failed",
+        initialToolDiscoveryFailed: true,
         statusSummary:
-          "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
+          "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.",
       });
       expect(state).not.toHaveProperty("toolsAdvertised");
       expect(runtime.tools()).toEqual([]);
@@ -2105,6 +2106,35 @@ describe("McpRuntime remote retry and recovery", () => {
       callCount: () => callCount,
     };
   }
+
+  it("classifies fatal initial tools/list discovery identically for remote startup", async () => {
+    const harness = remoteHarness({
+      connect: ["ok"],
+      discover: [new Error("REMOTE_TOOLS_LIST_SPEECH_CANARY")],
+    });
+    const config = makeConfig(makeRemoteServer({ name: "remote-discovery-failure" }));
+    const runtime = McpRuntime.start(config, makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+    }));
+    try {
+      await runtime.whenSettled();
+      const state = runtime.serverStates()[0];
+      expect(state).toMatchObject({
+        state: "failed",
+        initialToolDiscoveryFailed: true,
+        statusSummary:
+          "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.",
+      });
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      expect(report).toContain("Initial tools/list discovery failed");
+      expect(report).toContain("/reload or restart PiCC");
+      expect(JSON.stringify(state)).not.toContain("REMOTE_TOOLS_LIST_SPEECH_CANARY");
+      expect(report).not.toContain("REMOTE_TOOLS_LIST_SPEECH_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
 
   it("round-trips initialize, discovery, call, and close through the real t02 HTTP adapter", async () => {
     const fixture = await createMcpRemoteServer();

@@ -543,6 +543,7 @@ describe("capability-aware MCP live reports", () => {
       server("failed-list", "enabled"),
       server("recover", "enabled", { transport: "http", url: "https://safe.invalid" }),
       server("terminal", "enabled", { transport: "http", url: "https://safe.invalid" }),
+      server("fatal-tools-list", "enabled"),
     ]);
     const live: McpServerLiveState[] = [
       { name: "prompt", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: false, promptCount: 2 },
@@ -552,6 +553,7 @@ describe("capability-aware MCP live reports", () => {
       { name: "failed-list", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 0, resourceCount: 0, resourceDiscoveryError: "SERVER_SPEECH_CANARY" },
       { name: "recover", transport: "http", state: "reconnecting", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 2, resourceCount: 0 },
       { name: "terminal", transport: "http", state: "failed", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 2, resourceCount: 1, statusSummary: "Safe terminal summary." },
+      { name: "fatal-tools-list", transport: "stdio", state: "failed", initialToolDiscoveryFailed: true, statusSummary: "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC." },
     ];
     const status = renderMcpStatusReport(mcp, live);
     expect(status).toContain('"prompt": connected (prompts: 2)');
@@ -561,6 +563,7 @@ describe("capability-aware MCP live reports", () => {
     expect(status).toContain('resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC');
     expect(status).toContain('prompts: 2 retained, resources: 0 retained');
     expect(status).toContain('prompts: 2 retained, resources: 1 retained');
+    expect(status).toContain('Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.');
     expect(status).not.toContain("SERVER_SPEECH_CANARY");
 
     const doctor = renderDoctorReport(project(mcp), buildCompatReport(project(mcp)), undefined, undefined, live);
@@ -568,6 +571,7 @@ describe("capability-aware MCP live reports", () => {
     expect(doctor).toContain("resource: connected (resources: 0)");
     expect(doctor).toContain("resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC");
     expect(doctor).toContain("prompts: 2 retained, resources: 1 retained");
+    expect(doctor).toContain("Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.");
     expect(doctor).not.toContain("SERVER_SPEECH_CANARY");
   });
 });

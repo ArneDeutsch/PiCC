@@ -1154,7 +1154,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // MCP runtime: session-global across stdio and remote transports, started
   // non-blocking at load. Declared above allKnownToolNames so dispatch-time
   // closures over MCP state can never hit a TDZ. Model-facing registration
-  // happens once in the detached mcpRegistration step below.
+  // happens once in the detached mcpExposure transaction below.
   const mcpRuntime = testSeam?.mcpRuntime ?? McpRuntime.start(project.mcp, {
     projectRoot: project.root,
     sessionId,
@@ -2377,12 +2377,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try {
         const failed = mcpRuntime.serverStates().filter((s) => s.state === "failed");
         if (failed.length > 0) {
-          const shown = failed.slice(0, 8).map((s) => s.name);
-          const omitted = failed.length - shown.length;
-          const message =
-            `MCP server(s) failed to start: ${shown.join(", ")}` +
-            (omitted > 0 ? `, and ${omitted} more` : "") +
-            " — run /doctor for details.";
+          const toolDiscoveryFailures = failed.filter(
+            (state) => state.initialToolDiscoveryFailed === true,
+          );
+          const selected = toolDiscoveryFailures.length > 0 ? toolDiscoveryFailures : failed;
+          const shown = selected.slice(0, 8).map((state) => state.name);
+          const omitted = selected.length - shown.length;
+          const otherFailures = failed.length - toolDiscoveryFailures.length;
+          const message = toolDiscoveryFailures.length > 0
+            ? `Initial tools/list discovery failed for MCP server(s): ${shown.join(", ")}` +
+              (omitted > 0 ? `, and ${omitted} more` : "") +
+              " — check the server configuration and logs, then run /reload or restart PiCC." +
+              (otherFailures > 0 ? ` ${otherFailures} other MCP server(s) failed; run /doctor for details.` : "")
+            : `MCP server(s) failed to start: ${shown.join(", ")}` +
+              (omitted > 0 ? `, and ${omitted} more` : "") +
+              " — run /doctor for details.";
           if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");
           else console.error(`PiCC: ${message}`);
         }
@@ -2702,6 +2711,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
+  const MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS = 4_096;
   type McpPromptFailureCategory = McpPromptInvocationErrorCategory | "unknown";
   type McpPromptFailureEntry = {
     command: string;
@@ -2715,7 +2725,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const data = (entry?.data ?? {}) as Partial<McpPromptFailureEntry>;
     const command = sanitizeDisplayText(String(data.command ?? "unknown"), 240, true) || "unknown";
     const category = sanitizeDisplayText(String(data.category ?? "response"), 40, true) || "response";
-    const message = sanitizeDisplayText(String(data.message ?? "MCP prompt invocation failed."), 1_200);
+    const message = sanitizeDisplayText(
+      String(data.message ?? "MCP prompt invocation failed."),
+      MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS,
+    );
     return {
       render(width: number): string[] {
         const columns = Math.max(1, Math.floor(width));
@@ -2733,7 +2746,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       command: sanitizeDisplayText(data.command, 240, true) || "unknown",
       ...(data.server ? { server: sanitizeDisplayText(data.server, 200, true) } : {}),
       category: data.category,
-      message: boundedMcpErrorText(data.message, 1_200),
+      message: boundedMcpErrorText(data.message, MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS),
       providerRequestSent: false,
     };
     try {
@@ -4083,7 +4096,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // fallback and never normally used — it exists purely so `/name` shows up with
   // its description and hint.
   // ---------------------------------------------------------------------------
-  // Ensure the harness-owned dir never appears as untracked in the project.
+  // Best-effort: add the harness-owned directory to repository-local excludes.
   try {
     const gitInfo = path.join(project.root, ".git", "info");
     if (fs.existsSync(gitInfo)) {
@@ -4110,7 +4123,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
   }
 
-  async function checkedPromptStubDir(): Promise<{ root: string; directory: string }> {
+  async function checkedPromptStubLocation(): Promise<{
+    root: string;
+    parent: string;
+    directory: string;
+  }> {
     const root = await fs.promises.realpath(project.root);
     let current = root;
     for (const component of promptStubComponents) {
@@ -4122,24 +4139,38 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         throw error;
       }
       const canonical = await fs.promises.realpath(current);
-      if (!isWithinCanonicalRoot(root, canonical)) {
-        throw new Error(`unsafe redirection at ${component}`);
-      }
+      if (!isWithinCanonicalRoot(root, canonical)) throw new Error(`unsafe redirection at ${component}`);
       current = canonical;
     }
-    return { root, directory: path.join(root, ...promptStubComponents) };
+    const parent = path.join(root, ...promptStubComponents.slice(0, -1));
+    return { root, parent, directory: path.join(parent, promptStubComponents.at(-1)!) };
+  }
+
+  async function canonicalContainedDirectory(root: string, directory: string): Promise<string> {
+    const canonical = await fs.promises.realpath(directory);
+    if (!isWithinCanonicalRoot(root, canonical)) throw new Error("prompt publication directory escaped the project root");
+    return canonical;
+  }
+
+  async function removeContainedDirectory(root: string, directory: string): Promise<void> {
+    const canonical = await canonicalContainedDirectory(root, directory);
+    if (canonical !== directory) throw new Error("prompt cleanup directory changed before removal");
+    await fs.promises.rm(canonical, { recursive: true, force: true });
   }
 
   async function publishPromptStubs(ctx: any): Promise<string | undefined> {
+    let staged: { root: string; directory: string } | undefined;
     try {
       await mcpExposure;
-      const checked = await checkedPromptStubDir();
-      await fs.promises.rm(checked.directory, { recursive: true, force: true });
-      await fs.promises.mkdir(checked.directory, { recursive: true });
-      const canonicalDirectory = await fs.promises.realpath(checked.directory);
-      if (!isWithinCanonicalRoot(checked.root, canonicalDirectory)) {
-        throw new Error("created prompt directory escaped the project root");
-      }
+      const initial = await checkedPromptStubLocation();
+      await fs.promises.mkdir(initial.parent, { recursive: true });
+      const canonicalParent = await canonicalContainedDirectory(initial.root, initial.parent);
+      if (canonicalParent !== initial.parent) throw new Error("prompt publication parent changed during setup");
+
+      const stagingDirectory = await fs.promises.mkdtemp(path.join(canonicalParent, ".prompts-staging-"));
+      const canonicalStaging = await canonicalContainedDirectory(initial.root, stagingDirectory);
+      if (path.dirname(canonicalStaging) !== canonicalParent) throw new Error("prompt staging directory escaped its parent");
+      staged = { root: initial.root, directory: canonicalStaging };
 
       for (const skill of project.skills) {
         if (!isPromptStubEligible(skill)) continue;
@@ -4153,9 +4184,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           `(PiCC expands this skill in full — including argument, variable and`,
           `shell-injection processing — when you invoke /${skill.name}.)`,
         ].join("\n");
-        const currentDirectory = await fs.promises.realpath(checked.directory);
-        if (currentDirectory !== canonicalDirectory) throw new Error("prompt directory changed during publication");
-        await fs.promises.writeFile(path.join(canonicalDirectory, `${skill.name}.md`), fm, "utf8");
+        if (await fs.promises.realpath(canonicalStaging) !== canonicalStaging) {
+          throw new Error("prompt staging directory changed during publication");
+        }
+        await fs.promises.writeFile(path.join(canonicalStaging, `${skill.name}.md`), fm, "utf8");
       }
       for (const command of mcpPromptCatalog.commands) {
         const fm = [
@@ -4165,13 +4197,57 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           "---",
           "",
         ].join("\n");
-        const currentDirectory = await fs.promises.realpath(checked.directory);
-        if (currentDirectory !== canonicalDirectory) throw new Error("prompt directory changed during publication");
-        await fs.promises.writeFile(path.join(canonicalDirectory, `${command.name}.md`), fm, "utf8");
+        if (await fs.promises.realpath(canonicalStaging) !== canonicalStaging) {
+          throw new Error("prompt staging directory changed during publication");
+        }
+        await fs.promises.writeFile(path.join(canonicalStaging, `${command.name}.md`), fm, "utf8");
       }
-      debug(`wrote ${(await fs.promises.readdir(canonicalDirectory)).length} prompt stubs to ${canonicalDirectory}`);
-      return canonicalDirectory;
+
+      const checked = await checkedPromptStubLocation();
+      const checkedParent = await canonicalContainedDirectory(checked.root, checked.parent);
+      if (checked.root !== initial.root || checkedParent !== canonicalParent) {
+        throw new Error("prompt publication parent changed before commit");
+      }
+      const backupReservation = await fs.promises.mkdtemp(path.join(canonicalParent, ".prompts-backup-"));
+      const backupDirectory = await canonicalContainedDirectory(checked.root, backupReservation);
+      if (path.dirname(backupDirectory) !== canonicalParent) throw new Error("prompt backup escaped its parent");
+      await fs.promises.rmdir(backupDirectory);
+
+      let oldMoved = false;
+      let newInstalled = false;
+      try {
+        try {
+          await fs.promises.lstat(checked.directory);
+          await canonicalContainedDirectory(checked.root, checked.directory);
+          await fs.promises.rename(checked.directory, backupDirectory);
+          oldMoved = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        await fs.promises.rename(canonicalStaging, checked.directory);
+        newInstalled = true;
+        staged = undefined;
+      } catch (swapError) {
+        if (oldMoved && !newInstalled) {
+          try {
+            await fs.promises.rename(backupDirectory, checked.directory);
+            oldMoved = false;
+          } catch (rollbackError) {
+            throw new Error(
+              `prompt palette swap failed and rollback failed: ${boundedMcpErrorText(swapError)}; ${boundedMcpErrorText(rollbackError)}`,
+            );
+          }
+        }
+        throw swapError;
+      }
+      if (oldMoved) await removeContainedDirectory(checked.root, backupDirectory);
+      const published = await canonicalContainedDirectory(checked.root, checked.directory);
+      debug(`wrote ${(await fs.promises.readdir(published)).length} prompt stubs to ${published}`);
+      return published;
     } catch (error) {
+      if (staged) {
+        try { await removeContainedDirectory(staged.root, staged.directory); } catch { /* report the primary failure */ }
+      }
       if (!promptPublicationDiagnosticEmitted) {
         promptPublicationDiagnosticEmitted = true;
         const message = `Slash-command palette publication failed; exact typed invocation still works. ${boundedMcpErrorText(error)}`;

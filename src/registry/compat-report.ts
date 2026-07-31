@@ -504,6 +504,7 @@ export interface McpServerLiveState {
   promptCount?: number;
   resourceCount?: number;
   toolDiscoveryError?: string;
+  initialToolDiscoveryFailed?: true;
   promptDiscoveryError?: string;
   resourceDiscoveryError?: string;
   diagnostic?: string;
@@ -608,7 +609,10 @@ function mcpPostureLine(
             ? `${server.name}: connected (${mcpCapabilitySummary(live)})`
             : `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
           if (live.state === "connecting") return `${server.name}: connecting`;
-          return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+          const failureDetail = live.initialToolDiscoveryFailed === true
+            ? live.statusSummary ?? "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC."
+            : live.diagnostic ?? "no diagnostic";
+          return `${server.name}: failed — ${boundPostureDiag(failureDetail)}`;
         }
         if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
           ? `${server.name}: connected via ${transport} (${mcpCapabilitySummary(live)})`
