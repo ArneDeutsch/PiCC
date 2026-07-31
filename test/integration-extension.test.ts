@@ -43,9 +43,32 @@ beforeAll(async () => {
   const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
   fs.mkdirSync(path.dirname(ack), { recursive: true });
   fs.writeFileSync(ack, compatAckSentinel, "utf8");
-  // Hermetic user scope: don't absorb the developer's real ~/.claude.
+  // Hermetic installed plugin: repository `.claude-plugin/` is only source fixture
+  // material and never an executable root.
   const userDir = path.join(dir, ".claude-user");
-  fs.mkdirSync(userDir, { recursive: true });
+  const pluginId = "bundled-fixture-plugin@fixture-market";
+  const installRoot = path.join(userDir, "plugins", "cache", "fixture-market", "bundled-fixture-plugin", "1.0.0");
+  fs.mkdirSync(path.join(installRoot, ".claude-plugin"), { recursive: true });
+  fs.copyFileSync(
+    path.join(dir, ".claude-plugin", "plugin.json"),
+    path.join(installRoot, ".claude-plugin", "plugin.json"),
+  );
+  fs.mkdirSync(path.join(installRoot, "skills", "plugin-skill"), { recursive: true });
+  fs.copyFileSync(
+    path.join(dir, ".claude-plugin", "skills", "plugin-skill", "SKILL.md"),
+    path.join(installRoot, "skills", "plugin-skill", "SKILL.md"),
+  );
+  fs.writeFileSync(
+    path.join(dir, ".claude-plugin", "skills", "plugin-skill", "SKILL.md"),
+    "---\ndescription: inert repository canary\n---\nCanary: FS-REPOSITORY-PLUGIN-INERT\n",
+  );
+  fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({
+    enabledPlugins: { [pluginId]: true, "disabled@fixture-market": false },
+  }));
+  fs.writeFileSync(
+    path.join(userDir, "plugins", "installed_plugins.json"),
+    JSON.stringify({ version: 2, plugins: { [pluginId]: [{ scope: "user", installPath: installRoot, version: "1.0.0" }] } }),
+  );
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
@@ -835,6 +858,8 @@ describe("system prompt assembly + progressive disclosure NFR", () => {
     expect(prompt).toContain("fork-research:");
     expect(prompt).toContain("deploy:");
     expect(prompt).toContain("plugin-skill:");
+    expect(prompt).toContain("selected installed plugin");
+    expect(prompt).not.toContain("FS-REPOSITORY-PLUGIN-INERT");
     // …but user-only skill hidden from the model listing
     expect(prompt).not.toMatch(/- secret-ritual:/);
     // THE lazy-load NFR: no skill body may be in context before activation
@@ -891,12 +916,19 @@ describe("skill activation", () => {
     await expect(skillTool.execute("t4", { name: "secret-ritual" })).rejects.toThrow(/user-only/);
   });
 
-  it("plugin-contributed skill resolves ${CLAUDE_PLUGIN_ROOT}", async () => {
+  it("installed plugin skill resolves exact variables and creates persistent data lazily", async () => {
     const skillTool = pi.tools.get("Skill");
+    const dataDir = path.join(dir, ".claude-user", "plugins", "data", "bundled-fixture-plugin-fixture-market");
+    expect(fs.existsSync(dataDir)).toBe(false);
     const result = await skillTool.execute("t5", { name: "plugin-skill" });
     const text = result.content[0].text as string;
     expect(text).toContain("FS-PLUGIN-SKILL-BODY");
     expect(text).not.toContain("${CLAUDE_PLUGIN_ROOT}");
+    expect(text).not.toContain("${CLAUDE_PLUGIN_DATA}");
+    expect(text).not.toContain("FS-REPOSITORY-PLUGIN-INERT");
+    expect(text).toContain(path.join(dir, ".claude-user", "plugins", "cache", "fixture-market", "bundled-fixture-plugin", "1.0.0"));
+    expect(text).toContain(dataDir);
+    expect(fs.statSync(dataDir).isDirectory()).toBe(true);
   });
 
   it("`/skill args` expands into the user turn via the input event (Claude slash semantics)", async () => {
@@ -1244,8 +1276,7 @@ describe("session lifecycle hooks", () => {
       // The ONE deliberate exception to quiet startup: the fixture's unapproved
       // .mcp.json server is ACTIONABLE state, so exactly one MCP pending toast
       // fires (asserted in detail in its own test below).
-      expect(pi.notifications).toHaveLength(1);
-      expect(pi.notifications[0]!.text).toContain("pending approval");
+      expect(pi.notifications.filter((item) => item.text.includes("pending approval"))).toHaveLength(1);
 
       const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
       expect(consoleText).not.toContain("PiCC compatibility:");
@@ -1258,6 +1289,58 @@ describe("session lifecycle hooks", () => {
       logSpy.mockRestore();
       errorSpy.mockRestore();
     }
+  });
+
+  it("surfaces one bounded startup notice for enabled installed-state rejection", async () => {
+    const fixture = materializeFixture("hello-claude");
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    try {
+      const rejectedUserDir = path.join(fixture, ".claude-user");
+      fs.mkdirSync(rejectedUserDir, { recursive: true });
+      const pluginId = "selected-but-rejected@fixture-market";
+      const installRoot = path.join(rejectedUserDir, "plugins", "cache", "fixture-market", "selected-but-rejected", "1.0.0");
+      fs.mkdirSync(path.join(installRoot, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(
+        path.join(installRoot, ".claude-plugin", "plugin.json"),
+        JSON.stringify({ name: "selected-but-rejected", commands: "./wrong.txt" }),
+      );
+      fs.writeFileSync(path.join(installRoot, "wrong.txt"), "wrong extension");
+      fs.writeFileSync(
+        path.join(rejectedUserDir, "settings.json"),
+        JSON.stringify({ enabledPlugins: { [pluginId]: true } }),
+      );
+      fs.mkdirSync(path.join(rejectedUserDir, "plugins"), { recursive: true });
+      fs.writeFileSync(
+        path.join(rejectedUserDir, "plugins", "installed_plugins.json"),
+        JSON.stringify({ version: 2, plugins: { [pluginId]: [{ scope: "user", installPath: installRoot, version: "1.0.0" }] } }),
+      );
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = rejectedUserDir;
+      const rejectedPi = fakePi();
+      picc(rejectedPi.api as never, {
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+        onInitializationSettled: rejectedPi.captureInitialization,
+      });
+      await rejectedPi.waitForInitialization();
+      await rejectedPi.fire("session_start", { reason: "startup" }, rejectedPi.tuiCtx());
+      const pluginNotices = rejectedPi.notifications.filter((item) => item.text.includes("Enabled plugin content did not load"));
+      expect(pluginNotices).toHaveLength(1);
+      expect(pluginNotices[0]!.text).toContain(pluginId);
+      expect(pluginNotices[0]!.text).toContain("/doctor");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      cleanupFixture(fixture);
+    }
+  });
+
+  it("emits no plugin-failure notice for loaded and disabled installed states", async () => {
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    expect(pi.notifications.filter((item) => item.text.includes("Enabled plugin content did not load"))).toEqual([]);
   });
 
   it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {

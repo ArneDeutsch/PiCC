@@ -50,6 +50,43 @@ function controlEntry(command: string) {
   return pi.entries.find((e) => e.customType === "picc-control" && e.data?.command === command);
 }
 
+function installPluginFixture(
+  projectRoot: string,
+  pluginId: string,
+  manifestName: string,
+  populate: (installRoot: string) => void,
+): string {
+  const userDir = path.join(projectRoot, ".claude-user");
+  const separator = pluginId.lastIndexOf("@");
+  const entryName = pluginId.slice(0, separator);
+  const marketplace = pluginId.slice(separator + 1);
+  const installRoot = path.join(userDir, "plugins", "cache", marketplace, entryName, "1.0.0");
+  fs.mkdirSync(path.join(installRoot, ".claude-plugin"), { recursive: true });
+  fs.writeFileSync(
+    path.join(installRoot, ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: manifestName }),
+    "utf8",
+  );
+  populate(installRoot);
+
+  const settingsPath = path.join(userDir, "settings.json");
+  const settings = fs.existsSync(settingsPath)
+    ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { enabledPlugins?: Record<string, boolean> }
+    : {};
+  settings.enabledPlugins = { ...settings.enabledPlugins, [pluginId]: true };
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
+
+  const statePath = path.join(userDir, "plugins", "installed_plugins.json");
+  const state = fs.existsSync(statePath)
+    ? JSON.parse(fs.readFileSync(statePath, "utf8")) as { version: number; plugins: Record<string, unknown[]> }
+    : { version: 2, plugins: {} };
+  state.plugins[pluginId] = [{ scope: "user", installPath: installRoot, version: "1.0.0" }];
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(state), "utf8");
+  return installRoot;
+}
+
 async function freshControlPi(
   seam?: PiccTestSeam,
   setup?: (root: string) => void,
@@ -572,36 +609,49 @@ describe("reserved plugin-management commands", () => {
 
 describe("pre-selection plugin discovery to first use", () => {
   it("keeps data absent through discovery, then creates isolated directories at first skill and scoped-hook references", async () => {
+    let hookRoot = "";
+    let marker = "";
     const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
-      const userDir = path.join(projectRoot, ".claude-user");
-      fs.mkdirSync(path.join(projectRoot, ".claude"), { recursive: true });
-      fs.writeFileSync(path.join(projectRoot, ".claude", "settings.json"), JSON.stringify({
-        enabledPlugins: { "data-owner@market": true, "hook-owner@market": true },
-      }), "utf8");
+      marker = path.join(projectRoot, "skill-hook-environment.json");
+      const script = path.join(projectRoot, "record-skill-hook.cjs");
+      fs.writeFileSync(script, [
+        'const fs = require("node:fs");',
+        'fs.writeFileSync(process.env.HOOK_MARKER, JSON.stringify({ root: process.env.CLAUDE_PLUGIN_ROOT, data: process.env.CLAUDE_PLUGIN_DATA, project: process.env.CLAUDE_PROJECT_DIR }));',
+      ].join("\n"), "utf8");
       for (const [name, skill, body, hooks] of [
         ["data-owner", "data-skill", "state=${CLAUDE_PLUGIN_DATA}/state.json", ""],
         ["hook-owner", "hook-skill", "hook body without data", [
-          "hooks:", "  PreToolUse:", "    - hooks:", "        - type: command", "          command: printf hook-ran",
+          "hooks:", "  PreToolUse:", "    - hooks:", "        - type: command", '          command: exec "$HOOK_NODE" "$HOOK_SCRIPT"',
         ].join("\n")],
       ] as const) {
-        const pluginRoot = path.join(userDir, "plugins", "marketplaces", "market", "plugins", name);
-        const skillDir = path.join(pluginRoot, "skills", skill);
-        fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
-        fs.mkdirSync(skillDir, { recursive: true });
-        fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name }), "utf8");
-        fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
-          "---", `name: ${skill}`, `description: ${skill} canary`, hooks, "---", body,
-        ].filter(Boolean).join("\n"), "utf8");
+        const installRoot = installPluginFixture(projectRoot, `${name}@market`, name, (pluginRoot) => {
+          const skillDir = path.join(pluginRoot, "skills", skill);
+          fs.mkdirSync(skillDir, { recursive: true });
+          fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+            "---", `name: ${skill}`, `description: ${skill} canary`, hooks, "---", body,
+          ].filter(Boolean).join("\n"), "utf8");
+        });
+        if (name === "hook-owner") hookRoot = installRoot;
       }
+      const settingsPath = path.join(projectRoot, ".claude-user", "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+      settings["env"] = {
+        HOOK_NODE: process.execPath.replaceAll("\\", "/"),
+        HOOK_SCRIPT: script.replaceAll("\\", "/"),
+        HOOK_MARKER: marker.replaceAll("\\", "/"),
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
     });
-    const dataDir = path.join(root, ".claude-user", "plugins", "data", "data-owner");
-    const hookDir = path.join(root, ".claude-user", "plugins", "data", "hook-owner");
+    const dataDir = path.join(root, ".claude-user", "plugins", "data", "data-owner-market");
+    const hookDir = path.join(root, ".claude-user", "plugins", "data", "hook-owner-market");
     try {
       expect(fs.existsSync(dataDir)).toBe(false);
       expect(fs.existsSync(hookDir)).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
       await fresh.fire("resources_discover", { reason: "startup" });
       expect(fs.existsSync(dataDir)).toBe(false);
       expect(fs.existsSync(hookDir)).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
 
       await fresh.tools.get("Skill").execute("data-first", { name: "data-owner:data-skill" });
       expect(fs.existsSync(dataDir)).toBe(true);
@@ -612,6 +662,11 @@ describe("pre-selection plugin discovery to first use", () => {
       await fresh.fire("tool_call", { toolName: "read", toolCallId: "hook-first", input: { path: "x" } }, fresh.tuiCtx());
       expect(fs.existsSync(hookDir)).toBe(true);
       expect(fs.existsSync(dataDir)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({
+        root: hookRoot,
+        data: hookDir,
+        project: root,
+      });
     } finally {
       cleanupFixture(root);
     }
@@ -653,25 +708,28 @@ describe("plugin startup warning wiring", () => {
 describe("plugin activation runtime failures", () => {
   it("fails tools, typed slash, and context:fork before any staged state or provider egress, then reports once", async () => {
     const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+    let skillFile = "";
     const { fresh, root } = await freshControlPi({ sdk: sdk.sdk }, (projectRoot) => {
-      const bundle = path.join(projectRoot, ".claude-plugin");
-      const skillDir = path.join(bundle, "skills", "broken-plugin-skill");
-      fs.mkdirSync(skillDir, { recursive: true });
-      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "broken-owner" }), "utf8");
-      fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
-        "---",
-        "name: broken-plugin-skill",
-        "description: runtime failure canary",
-        "context: fork",
-        "hooks:",
-        "  PreToolUse:",
-        "    - hooks:",
-        "        - type: command",
-        "          command: echo MUST-NOT-RUN",
-        "---",
-        "data=${CLAUDE_PLUGIN_DATA}",
-      ].join("\n"), "utf8");
+      installPluginFixture(projectRoot, "broken-owner@market", "broken-owner", (installRoot) => {
+        const skillDir = path.join(installRoot, "skills", "broken-plugin-skill");
+        skillFile = path.join(skillDir, "SKILL.md");
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(skillFile, [
+          "---",
+          "name: broken-plugin-skill",
+          "description: runtime failure canary",
+          "context: fork",
+          "hooks:",
+          "  PreToolUse:",
+          "    - hooks:",
+          "        - type: command",
+          "          command: echo MUST-NOT-RUN",
+          "---",
+          "data=${CLAUDE_PLUGIN_DATA}",
+        ].join("\n"), "utf8");
+      });
     });
+    fs.rmSync(skillFile);
     try {
       const skill = fresh.tools.get("Skill");
       const slash = fresh.tools.get("SlashCommand");
@@ -706,17 +764,17 @@ describe("plugin activation runtime failures", () => {
 
   it("caps, deduplicates, and counts distinct runtime-finding overflow", async () => {
     const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
-      const bundle = path.join(projectRoot, ".claude-plugin");
-      fs.mkdirSync(path.join(bundle, "skills"), { recursive: true });
-      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "overflow-owner" }), "utf8");
-      for (let index = 0; index < 26; index++) {
-        const dir = path.join(bundle, "skills", `broken-${index}`);
-        fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(path.join(dir, "SKILL.md"), [
-          "---", `name: broken-${index}`, "description: overflow canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
-        ].join("\n"), "utf8");
-      }
+      installPluginFixture(projectRoot, "overflow-owner@market", "overflow-owner", (root) => {
+        for (let index = 0; index < 26; index++) {
+          const dir = path.join(root, "skills", `broken-${index}`);
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, "SKILL.md"), [
+            "---", `name: broken-${index}`, "description: overflow canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
+          ].join("\n"), "utf8");
+        }
+      });
     });
+    fs.writeFileSync(path.join(root, ".claude-user", "plugins", "data"), "blocks data directory", "utf8");
     try {
       const skill = fresh.tools.get("Skill");
       for (let index = 0; index < 22; index++) {
@@ -755,15 +813,16 @@ describe("plugin activation runtime failures", () => {
       },
     };
     const { fresh, root } = await freshControlPi({ sdk }, (projectRoot) => {
-      const bundle = path.join(projectRoot, ".claude-plugin");
-      const agentDir = path.join(bundle, "agents");
-      fs.mkdirSync(agentDir, { recursive: true });
-      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "broken-agent-owner" }), "utf8");
-      fs.writeFileSync(path.join(agentDir, "broken-agent.md"), [
-        "---", "name: broken-agent", "description: owner preparation canary",
-        "tools:", "  - Read(${CLAUDE_PLUGIN_DATA}/**)", "---", "body without data",
-      ].join("\n"), "utf8");
+      installPluginFixture(projectRoot, "broken-agent-owner@market", "broken-agent-owner", (installRoot) => {
+        const agentDir = path.join(installRoot, "agents");
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, "broken-agent.md"), [
+          "---", "name: broken-agent", "description: owner preparation canary",
+          "tools:", "  - Read(${CLAUDE_PLUGIN_DATA}/**)", "---", "body without data",
+        ].join("\n"), "utf8");
+      });
     });
+    fs.writeFileSync(path.join(root, ".claude-user", "plugins", "data"), "blocks data directory", "utf8");
     try {
       const agent = fresh.tools.get("Agent");
       await expect(agent.execute("broken-agent", {
@@ -794,25 +853,28 @@ describe("plugin activation runtime failures", () => {
       },
     };
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    let preloadSkillFile = "";
     const { fresh, root } = await freshControlPi({ sdk }, (projectRoot) => {
-      const bundle = path.join(projectRoot, ".claude-plugin");
       const agentDir = path.join(projectRoot, ".claude", "agents");
-      const skillDir = path.join(bundle, "skills", "broken-preload");
       const forkDir = path.join(projectRoot, ".claude", "skills", "named-fork");
       fs.mkdirSync(agentDir, { recursive: true });
-      fs.mkdirSync(skillDir, { recursive: true });
       fs.mkdirSync(forkDir, { recursive: true });
-      fs.writeFileSync(path.join(bundle, "plugin.json"), JSON.stringify({ name: "preload-owner" }), "utf8");
+      installPluginFixture(projectRoot, "preload-owner@market", "preload-owner", (installRoot) => {
+        const skillDir = path.join(installRoot, "skills", "broken-preload");
+        fs.mkdirSync(skillDir, { recursive: true });
+        preloadSkillFile = path.join(skillDir, "SKILL.md");
+        fs.writeFileSync(preloadSkillFile, [
+          "---", "name: broken-preload", "description: preload data canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
+        ].join("\n"), "utf8");
+      });
       fs.writeFileSync(path.join(agentDir, "preload-agent.md"), [
         "---", "name: preload-agent", "description: preload canary", "skills:", "  - preload-owner:broken-preload", "---", "Run as owner.",
-      ].join("\n"), "utf8");
-      fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
-        "---", "name: broken-preload", "description: preload data canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
       ].join("\n"), "utf8");
       fs.writeFileSync(path.join(forkDir, "SKILL.md"), [
         "---", "name: named-fork", "description: named fork canary", "context: fork", "agent: preload-agent", "---", "run named fork",
       ].join("\n"), "utf8");
     });
+    fs.rmSync(preloadSkillFile);
     try {
       const expectedTypedFork = {
         action: "transform",

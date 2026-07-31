@@ -1,496 +1,504 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EffectivePluginEnablement, NormalizedPluginInstallation } from "../src/types.js";
 import {
-  discoverInstalledPlugins,
-  discoverProjectBundledPlugin,
   expandPluginVariables,
   loadPluginHooks,
-  type InstalledPlugin,
+  resolveInstalledPlugins,
 } from "../src/claude/plugins.js";
 
 let tmpRoot: string;
+let userDir: string;
+let projectRoot: string;
+
+const directoryLinkProbe = (() => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-dir-link-probe-"));
+  try {
+    const target = path.join(parent, "target");
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, path.join(parent, "link"), process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+})();
+
+const fileLinkProbe = (() => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-file-link-probe-"));
+  try {
+    const target = path.join(parent, "target.md");
+    fs.writeFileSync(target, "probe", "utf8");
+    fs.symlinkSync(target, path.join(parent, "link.md"), "file");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+})();
 
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-"));
+  userDir = path.join(tmpRoot, "home", ".claude");
+  projectRoot = path.join(tmpRoot, "project");
+  fs.mkdirSync(path.join(userDir, "plugins", "cache"), { recursive: true });
+  fs.mkdirSync(path.join(projectRoot, ".git"), { recursive: true });
 });
 
-afterEach(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+afterEach(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+
+function write(file: string, content: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content, "utf8");
+}
+
+function installedRoot(pluginId = "alpha@official", version = "1.0.0", cache = path.join(userDir, "plugins", "cache")): string {
+  const [name, marketplace] = pluginId.split("@");
+  const root = path.join(cache, marketplace!, name!, version);
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function record(options: Partial<NormalizedPluginInstallation> = {}): NormalizedPluginInstallation {
+  const pluginId = options.pluginId ?? "alpha@official";
+  const version = options.version ?? "1.0.0";
+  return {
+    pluginId,
+    scope: "user",
+    installPath: installedRoot(pluginId, version),
+    version,
+    provenance: { statePath: path.join(userDir, "plugins", "installed_plugins.json"), stateVersion: 2 },
+    ...options,
+  };
+}
+
+function enablement(values: Record<string, boolean>): Record<string, EffectivePluginEnablement> {
+  return Object.fromEntries(Object.entries(values).map(([id, enabled]) => [id, {
+    enabled,
+    scope: "user" as const,
+    source: path.join(userDir, "settings.json"),
+  }]));
+}
+
+function resolve(options: {
+  enabled?: Record<string, boolean>;
+  installations?: NormalizedPluginInstallation[];
+  status?: "absent" | "valid" | "unreadable" | "unsupported" | "malformed";
+  env?: NodeJS.ProcessEnv;
+  readBlocklistForTest?: (file: string) => string;
+} = {}) {
+  return resolveInstalledPlugins({
+    userDir,
+    projectRoot,
+    enablement: enablement(options.enabled ?? { "alpha@official": true }),
+    installations: options.installations ?? [record()],
+    installedStateStatus: options.status ?? "valid",
+    env: options.env ?? {},
+    ...(options.readBlocklistForTest ? { readBlocklistForTest: options.readBlocklistForTest } : {}),
+  });
+}
+
+describe("resolveInstalledPlugins — installed identity selection", () => {
+  it("loads one exact record and keeps lifecycle identity separate from manifest namespace", () => {
+    const installation = record();
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "component-name" }));
+    write(path.join(installation.installPath, "skills", "demo", "SKILL.md"), "---\ndescription: demo\n---\nbody");
+
+    const result = resolve({ installations: [installation] });
+
+    expect(result.outcomes.map(({ pluginId, status }) => ({ pluginId, status }))).toEqual([
+      { pluginId: "alpha@official", status: "loaded" },
+    ]);
+    expect(result.plugins[0]).toMatchObject({
+      pluginId: "alpha@official",
+      name: "component-name",
+      marketplace: "official",
+      version: "1.0.0",
+      root: installation.installPath,
+    });
+    expect(result.plugins[0]!.skillSources).toHaveLength(1);
+    expect(result.plugins[0]!.context.pluginId).toBe("alpha@official");
+    expect(result.plugins[0]!.dataDir).toContain("alpha-official");
+  });
+
+  it("represents false, missing, absent, unsupported, malformed, and unreadable state without loading", () => {
+    const disabled = resolve({ enabled: { "alpha@official": false } });
+    expect(disabled.outcomes[0]!.status).toBe("disabled");
+    for (const [status, expected] of [
+      ["absent", "enabled-but-uninstalled"],
+      ["unsupported", "unsupported"],
+      ["malformed", "malformed"],
+      ["unreadable", "rejected"],
+    ] as const) {
+      const result = resolve({ status, installations: [] });
+      expect(result.plugins).toEqual([]);
+      expect(result.outcomes[0]!.status).toBe(expected);
+    }
+    expect(resolve({ installations: [] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+  });
+
+  it("chooses managed precedence, deduplicates canonical equivalent winners, and rejects true conflicts", () => {
+    const user = record({ scope: "user" });
+    const project = record({ scope: "project", projectPath: projectRoot, version: "2.0.0", installPath: installedRoot("alpha@official", "2.0.0") });
+    const local = record({ scope: "local", projectPath: projectRoot, version: "3.0.0", installPath: installedRoot("alpha@official", "3.0.0") });
+    const duplicate = { ...local, provenance: { ...local.provenance, installedAt: "later" } };
+    expect(resolve({ installations: [user, project, local, duplicate] }).plugins[0]!.version).toBe("3.0.0");
+
+    const managed = record({ scope: "managed", version: "5.0.0", installPath: installedRoot("alpha@official", "5.0.0") });
+    expect(resolve({ installations: [local, managed] }).plugins[0]!.version).toBe("5.0.0");
+    projectRoot = path.join(tmpRoot, "unrelated-project");
+    fs.mkdirSync(projectRoot);
+    expect(resolve({ installations: [managed] }).outcomes[0]!.status).toBe("loaded");
+
+    projectRoot = path.join(tmpRoot, "project");
+    const rootConflict = record({ scope: "local", projectPath: projectRoot, version: "3.0.0", installPath: installedRoot("alpha@official", "3.0.0", path.join(tmpRoot, "other-cache")) });
+    const versionConflict = record({ scope: "local", projectPath: projectRoot, version: "4.0.0", installPath: installedRoot("alpha@official", "4.0.0") });
+    for (const conflict of [rootConflict, versionConflict]) {
+      const rejected = resolve({ installations: [local, conflict], env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: path.join(tmpRoot, "other-cache") } });
+      expect(rejected.plugins).toEqual([]);
+      expect(rejected.outcomes[0]!.status).toBe("ambiguous");
+    }
+  });
+
+  it.skipIf(!directoryLinkProbe)("deduplicates canonically equivalent project and installed directory-link spellings", () => {
+    const installation = record({ scope: "local", projectPath: projectRoot });
+    const equivalentProject = path.join(tmpRoot, "project-link");
+    const equivalentInstall = path.join(tmpRoot, "install-link");
+    fs.symlinkSync(projectRoot, equivalentProject, process.platform === "win32" ? "junction" : "dir");
+    fs.symlinkSync(installation.installPath, equivalentInstall, process.platform === "win32" ? "junction" : "dir");
+    const canonicalDuplicate = { ...installation, projectPath: equivalentProject, installPath: equivalentInstall };
+
+    expect(resolve({ installations: [canonicalDuplicate, installation] }).outcomes[0]!.status).toBe("loaded");
+  });
+
+  it("keeps the same entry name in different marketplaces as exact distinct installed identities", () => {
+    const first = record({ pluginId: "alpha@one", installPath: installedRoot("alpha@one") });
+    const second = record({ pluginId: "alpha@two", installPath: installedRoot("alpha@two") });
+    for (const [item, name] of [[first, "first-component"], [second, "second-component"]] as const) {
+      write(path.join(item.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name }));
+    }
+    const result = resolve({ enabled: { "alpha@one": true, "alpha@two": true }, installations: [second, first] });
+    expect(result.plugins.map((item) => item.pluginId)).toEqual(["alpha@one", "alpha@two"]);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps POSIX case-distinct neighboring project identities separate", () => {
+    const upper = path.join(tmpRoot, "Project");
+    const lower = path.join(tmpRoot, "project");
+    fs.mkdirSync(upper);
+    projectRoot = upper;
+    const installation = record({ scope: "project", projectPath: lower });
+    expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+  });
+
+  it.skipIf(process.platform !== "win32")("deduplicates Windows case, drive, and separator spellings by filesystem identity", () => {
+    const installation = record({ scope: "project", projectPath: projectRoot });
+    const alternate = {
+      ...installation,
+      projectPath: projectRoot.replaceAll("\\", "/").replace(/^[a-z]:/i, (drive) => drive.toUpperCase()),
+      installPath: installation.installPath.replaceAll("\\", "/").replace(/^[a-z]:/i, (drive) => drive.toUpperCase()),
+    };
+    expect(resolve({ installations: [alternate, installation] }).outcomes[0]!.status).toBe("loaded");
+  });
+
+  it("does not apply a project record from a neighboring checkout", () => {
+    const other = path.join(tmpRoot, "other");
+    fs.mkdirSync(other, { recursive: true });
+    const installation = record({ scope: "project", projectPath: other });
+    expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+  });
+
+  it("applies a main-checkout project record to its genuine linked worktree but rejects copied foreign indirection", () => {
+    const main = path.join(tmpRoot, "main");
+    const worktree = path.join(tmpRoot, "linked");
+    fs.mkdirSync(main);
+    execFileSync("git", ["init"], { cwd: main, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: main });
+    write(path.join(main, "tracked.txt"), "tracked");
+    execFileSync("git", ["add", "."], { cwd: main });
+    execFileSync("git", ["-c", "user.name=Test", "commit", "-m", "fixture"], { cwd: main, stdio: "ignore" });
+    execFileSync("git", ["worktree", "add", "-b", "linked-test", worktree], { cwd: main, stdio: "ignore" });
+    const installation = record({ scope: "project", projectPath: main });
+
+    projectRoot = worktree;
+    expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("loaded");
+
+    const foreign = path.join(tmpRoot, "foreign");
+    fs.mkdirSync(foreign);
+    fs.copyFileSync(path.join(worktree, ".git"), path.join(foreign, ".git"));
+    projectRoot = foreign;
+    expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+
+    const malformed = path.join(tmpRoot, "malformed-worktree");
+    fs.mkdirSync(malformed);
+    write(path.join(malformed, ".git"), "gitdir: missing-admin-directory");
+    projectRoot = malformed;
+    expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+  });
+
+  it("keeps non-equivalent or unresolvable duplicate spellings ambiguous", () => {
+    const first = record({ scope: "user", installPath: path.join(tmpRoot, "missing-one") });
+    const second = record({ scope: "user", installPath: path.join(tmpRoot, "missing-two") });
+    const result = resolve({ installations: [first, second] });
+    expect(result.outcomes[0]!.status).toBe("ambiguous");
+  });
+
+  it("rejects roots outside cache, stale cache without a record, and identity/version layout mismatches", () => {
+    const outside = path.join(tmpRoot, "outside");
+    fs.mkdirSync(outside);
+    expect(resolve({ installations: [record({ installPath: outside })] }).outcomes[0]!.status).toBe("rejected");
+    expect(resolve({ installations: [] }).plugins).toEqual([]);
+    const wrong = installedRoot("other@official", "1.0.0");
+    expect(resolve({ installations: [record({ installPath: wrong })] }).outcomes[0]!.status).toBe("rejected");
+  });
+
+  it("keeps safe root-authorization reason evidence on the owning rejected outcome", () => {
+    const secretRoot = path.join(tmpRoot, "secret-root");
+    fs.mkdirSync(secretRoot);
+    const result = resolve({ installations: [record({ installPath: secretRoot })] });
+    expect(result.outcomes[0]!.diagnostics.map((item) => item.message)).toEqual([
+      "Installed plugin root is outside every authorized plugin cache",
+      'Installed plugin "alpha@official" has an unauthorized or invalid installed root; nothing was loaded',
+    ]);
+    expect(JSON.stringify(result.outcomes[0]!.diagnostics)).not.toContain(secretRoot);
+  });
+
+  it("authorizes exact configured and seed cache bases only when a record exists", () => {
+    const configured = path.join(tmpRoot, "configured-cache");
+    fs.mkdirSync(configured);
+    const configuredRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", configured) });
+    expect(resolve({ installations: [configuredRecord], env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: configured } }).outcomes[0]!.status).toBe("loaded");
+
+    const seed = path.join(tmpRoot, "seed");
+    const seedCache = path.join(seed, "plugins", "cache");
+    fs.mkdirSync(seedCache, { recursive: true });
+    const seedRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", seedCache) });
+    expect(resolve({ installations: [seedRecord], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: seed } }).outcomes[0]!.status).toBe("loaded");
+  });
 });
 
-function write(filePath: string, content: string): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, content, "utf8");
-}
+describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
+  it("qualified deny dominates enablement", () => {
+    write(path.join(userDir, "plugins", "blocklist.json"), JSON.stringify({ plugins: [{ plugin: "alpha@official" }] }));
+    const result = resolve();
+    expect(result.plugins).toEqual([]);
+    expect(result.outcomes[0]!.status).toBe("blocked");
+  });
 
-/** Create a plugin dir at `root` with manifest + optional content. */
-function makePlugin(
-  root: string,
-  manifest: Record<string, unknown> | string,
-  opts: { skills?: boolean; agents?: boolean; commands?: boolean; hooks?: string } = {},
-): void {
-  const manifestText =
-    typeof manifest === "string" ? manifest : JSON.stringify(manifest);
-  write(path.join(root, ".claude-plugin", "plugin.json"), manifestText);
-  if (opts.skills) {
-    write(path.join(root, "skills", "demo", "SKILL.md"), "---\ndescription: d\n---\nbody");
-  }
-  if (opts.agents) {
-    write(path.join(root, "agents", "worker.md"), "---\ndescription: w\n---\nprompt");
-  }
-  if (opts.commands) {
-    write(path.join(root, "commands", "go.md"), "run it");
-  }
-  if (opts.hooks !== undefined) {
-    write(path.join(root, "hooks", "hooks.json"), opts.hooks);
-  }
-}
-
-describe("discoverInstalledPlugins", () => {
-  it("discovers a plugin at repos/<owner>/<repo>/<name> nesting depth with content dirs", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "owner", "repo", "mytool");
-    makePlugin(root, { name: "mytool", version: "1.0.0" }, {
-      skills: true,
-      agents: true,
-      commands: true,
-      hooks: JSON.stringify({ PreToolUse: [] }),
+  it("every malformed or unreadable non-absent blocklist rejects all with one bounded diagnostic", () => {
+    for (const content of ["not json", "[]", '{"plugins":{}}', '{"plugins":[{"plugin":"bare"}]}']) {
+      write(path.join(userDir, "plugins", "blocklist.json"), content);
+      const beta = record({ pluginId: "beta@official", installPath: installedRoot("beta@official") });
+      const result = resolve({ enabled: { "alpha@official": true, "beta@official": true }, installations: [record(), beta] });
+      expect(result.plugins).toEqual([]);
+      expect(result.outcomes.map((item) => item.status)).toEqual(["malformed", "malformed"]);
+      expect(result.diagnostics).toHaveLength(1);
+    }
+    const unreadable = resolve({
+      enabled: { "alpha@official": true, "beta@official": true },
+      installations: [record(), record({ pluginId: "beta@official", installPath: installedRoot("beta@official") })],
+      readBlocklistForTest: () => { const error = new Error("secret path"); Object.assign(error, { code: "EACCES" }); throw error; },
     });
-
-    const { plugins, diagnostics } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: undefined,
-    });
-
-    // (an info diagnostic about "none enabled" is expected here — filter it out)
-    expect(diagnostics.filter((d) => d.severity !== "info")).toEqual([]);
-    expect(plugins).toHaveLength(1);
-    const plugin = plugins[0]!;
-    expect(plugin.name).toBe("mytool");
-    expect(plugin.root).toBe(root);
-    expect(plugin.manifest["version"]).toBe("1.0.0");
-    expect(plugin.skillDirs).toEqual([path.join(root, "skills")]);
-    expect(plugin.agentDirs).toEqual([path.join(root, "agents")]);
-    expect(plugin.commandDirs).toEqual([path.join(root, "commands")]);
-    expect(plugin.hooksFiles).toEqual([path.join(root, "hooks", "hooks.json")]);
+    expect(unreadable.plugins).toEqual([]);
+    expect(unreadable.outcomes.map((item) => item.status)).toEqual(["rejected", "rejected"]);
+    expect(unreadable.diagnostics).toHaveLength(1);
+    expect(unreadable.diagnostics[0]!.message).not.toContain("secret path");
   });
 
-  it("omits content dirs that do not exist", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "cache", "lonely");
-    makePlugin(root, { name: "lonely" }, { skills: true });
+  it("distinguishes component namespace and persistent-data-key collisions, including both together", () => {
+    const first = record({ pluginId: "one@market", installPath: installedRoot("one@market") });
+    const second = record({ pluginId: "two@market", installPath: installedRoot("two@market") });
+    for (const item of [first, second]) write(path.join(item.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "same" }));
+    const namespace = resolve({ enabled: { "one@market": true, "two@market": true }, installations: [first, second] });
+    expect(namespace.plugins).toEqual([]);
+    expect(namespace.outcomes.map((item) => item.status)).toEqual(["rejected", "rejected"]);
+    expect(namespace.outcomes[0]!.diagnostics.map((item) => item.message).join(" ")).toContain("component namespace collision");
+    expect(namespace.outcomes[0]!.diagnostics.map((item) => item.message).join(" ")).not.toContain("persistent data key collision");
 
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins).toHaveLength(1);
-    expect(plugins[0]!.skillDirs).toHaveLength(1);
-    expect(plugins[0]!.agentDirs).toEqual([]);
-    expect(plugins[0]!.commandDirs).toEqual([]);
-    expect(plugins[0]!.hooksFiles).toEqual([]);
+    const dot = record({ pluginId: "same.name@market", installPath: installedRoot("same.name@market") });
+    const dash = record({ pluginId: "same-name@market", installPath: installedRoot("same-name@market") });
+    const data = resolve({ enabled: { "same.name@market": true, "same-name@market": true }, installations: [dot, dash] });
+    expect(data.plugins).toEqual([]);
+    expect(data.outcomes[0]!.diagnostics.map((item) => item.message).join(" ")).toContain("persistent data key collision");
+
+    for (const item of [dot, dash]) write(path.join(item.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "same" }));
+    const both = resolve({ enabled: { "same.name@market": true, "same-name@market": true }, installations: [dot, dash] });
+    const messages = both.outcomes[0]!.diagnostics.map((item) => item.message).join(" ");
+    expect(messages).toContain("component namespace collision");
+    expect(messages).toContain("persistent data key collision");
+  });
+});
+
+describe("resolveInstalledPlugins — component declarations", () => {
+  it("supports manifestless defaults, root skill fallback, and command/agent defaults", () => {
+    const installation = record();
+    write(path.join(installation.installPath, "SKILL.md"), "---\nname: root\ndescription: root\n---\nbody");
+    write(path.join(installation.installPath, "commands", "go.md"), "go");
+    write(path.join(installation.installPath, "agents", "worker.md"), "---\ndescription: worker\n---\nprompt");
+    const plugin = resolve({ installations: [installation] }).plugins[0]!;
+    expect(plugin.manifest).toEqual({});
+    expect(plugin.skillSources[0]!.source.kind).toBe("file");
+    expect(plugin.commandSources).toHaveLength(1);
+    expect(plugin.agentSources).toHaveLength(1);
   });
 
-  it("does not discover plugins beyond the depth cap of 5", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const tooDeep = path.join(userDir, "plugins", "a", "b", "c", "d", "e", "deep");
-    makePlugin(tooDeep, { name: "deep" });
-    const atCap = path.join(userDir, "plugins", "a", "b", "c", "d", "shallow");
-    makePlugin(atCap, { name: "shallow" });
+  it("adds explicit skills to defaults, replaces command/agent defaults, and merges default/path/inline hooks", () => {
+    const installation = record();
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({
+      name: "alpha",
+      skills: "./extra-skills",
+      commands: ["./custom-command.md", "./custom-commands"],
+      agents: ["./custom-agents", "./custom-agent.md"],
+      hooks: ["./custom-hooks.json", { SessionStart: [{ hooks: ["echo inline"] }] }],
+    }));
+    write(path.join(installation.installPath, "skills", "default", "SKILL.md"), "---\ndescription: d\n---\nbody");
+    write(path.join(installation.installPath, "extra-skills", "extra", "SKILL.md"), "---\ndescription: e\n---\nbody");
+    write(path.join(installation.installPath, "commands", "ignored.md"), "ignored");
+    write(path.join(installation.installPath, "custom-command.md"), "custom");
+    write(path.join(installation.installPath, "custom-commands", "nested.md"), "nested");
+    write(path.join(installation.installPath, "agents", "ignored.md"), "---\ndescription: i\n---\ni");
+    write(path.join(installation.installPath, "custom-agents", "kept.md"), "---\ndescription: k\n---\nk");
+    write(path.join(installation.installPath, "custom-agent.md"), "---\ndescription: f\n---\nf");
+    write(path.join(installation.installPath, "hooks", "hooks.json"), JSON.stringify({ PreToolUse: [{ hooks: ["echo default"] }] }));
+    write(path.join(installation.installPath, "custom-hooks.json"), JSON.stringify({ PreToolUse: [{ hooks: ["echo custom"] }] }));
 
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins.map((p) => p.name)).toEqual(["shallow"]);
+    const plugin = resolve({ installations: [installation] }).plugins[0]!;
+    expect(plugin.skillSources).toHaveLength(2);
+    expect(plugin.commandSources).toHaveLength(2);
+    expect(plugin.commandSources.map((item) => item.source.kind)).toEqual(["file", "directory"]);
+    expect(plugin.agentSources).toHaveLength(2);
+    expect(plugin.agentSources.map((item) => item.source.kind)).toEqual(["directory", "file"]);
+    expect(plugin.hookSources).toHaveLength(3);
+    const hooks = loadPluginHooks(plugin);
+    expect(hooks.diagnostics).toEqual([]);
+    expect(hooks.config["PreToolUse"]).toHaveLength(2);
+    expect(hooks.config["SessionStart"]).toHaveLength(1);
   });
 
-  it("resolves enabled from object form: explicit true enables, false / unmentioned disable", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "mytool"), { name: "mytool" });
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "offtool"), { name: "offtool" });
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "unlisted"), { name: "unlisted" });
-
-    const { plugins } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: { "mytool@mp": true, "offtool@mp": false },
-    });
-
-    const byName = new Map(plugins.map((p) => [p.name, p]));
-    expect(byName.get("mytool")!.enabled).toBe(true);
-    expect(byName.get("offtool")!.enabled).toBe(false);
-    // Not mentioned → NOT enabled (a plugin loads only when explicitly enabled).
-    expect(byName.get("unlisted")!.enabled).toBe(false);
-  });
-
-  it("resolves enabled from array form by membership", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "yes"), { name: "yes" });
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "no"), { name: "no" });
-
-    const { plugins } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: ["yes@somewhere"],
-    });
-
-    const byName = new Map(plugins.map((p) => [p.name, p]));
-    expect(byName.get("yes")!.enabled).toBe(true);
-    expect(byName.get("no")!.enabled).toBe(false);
-  });
-
-  it("enables NOTHING when enabledPlugins is undefined (a marketplace catalog is not auto-enabled)", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    // Simulate a cloned marketplace: several plugins available under marketplaces/.
-    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" }, { skills: true });
-    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "external_plugins", "bar"), { name: "bar" }, { skills: true });
-
-    const { plugins, diagnostics } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins).toHaveLength(2);
-    expect(plugins.every((p) => p.enabled)).toBe(false);
-    expect(plugins.find((p) => p.name === "foo")!.marketplace).toBe("official");
-    // Surfaces a helpful info diagnostic so the user understands why nothing loads.
-    expect(diagnostics.some((d) => d.severity === "info" && /none are enabled/.test(d.message))).toBe(true);
-  });
-
-  it("enables a marketplace plugin only when explicitly listed as name@marketplace", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" }, { skills: true });
-    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "baz"), { name: "baz" }, { skills: true });
-
-    const { plugins } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: { "foo@official": true },
-    });
-    const byName = new Map(plugins.map((p) => [p.name, p]));
-    expect(byName.get("foo")!.enabled).toBe(true);
-    expect(byName.get("baz")!.enabled).toBe(false);
-  });
-
-  it("prefers the most specific enabledPlugins key: an explicit qualified false beats a bare true", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" });
-
-    const disabled = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: { foo: true, "foo@official": false },
-    });
-    expect(disabled.plugins[0]!.enabled).toBe(false);
-
-    const enabled = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: { foo: false, "foo@official": true },
-    });
-    expect(enabled.plugins[0]!.enabled).toBe(true);
-  });
-
-  it("degrades a malformed blocklist.json to a diagnostic instead of throwing", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const pluginsRoot = path.join(userDir, "plugins");
-    makePlugin(path.join(pluginsRoot, "repos", "o", "r", "mytool"), { name: "mytool" });
-
-    for (const bad of ['{"plugins": {}}', '{"plugins": 5}', "[1,2]", "{{{ garbage"]) {
-      write(path.join(pluginsRoot, "blocklist.json"), bad);
-      const result = discoverInstalledPlugins({ userDir, enabledPlugins: { mytool: true } });
-      // Discovery survives, the plugin still loads, and the problem is visible.
-      expect(result.plugins).toHaveLength(1);
-      expect(result.plugins[0]!.enabled).toBe(true);
-      expect(
-        result.diagnostics.some((d) => d.severity === "warning" && /blocklist/i.test(d.message)),
-      ).toBe(true);
+  it("rejects all recognized wrong types and invalid component-aware explicit declarations without fallback", () => {
+    for (const field of ["skills", "commands", "agents", "hooks"] as const) {
+      const installation = record();
+      write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", [field]: 5 }));
+      const result = resolve({ installations: [installation] });
+      expect(result.plugins, field).toEqual([]);
+      expect(result.outcomes[0]!.diagnostics.map((item) => item.message).join(" ")).toContain(`manifest ${field} declaration has the wrong type`);
+      fs.rmSync(installation.installPath, { recursive: true, force: true });
     }
 
-    // An object without a "plugins" key is just an empty blocklist — no diagnostic.
-    write(path.join(pluginsRoot, "blocklist.json"), "{}");
-    const empty = discoverInstalledPlugins({ userDir, enabledPlugins: { mytool: true } });
-    expect(empty.diagnostics.filter((d) => /blocklist/i.test(d.message))).toEqual([]);
+    for (const [field, declared, create] of [
+      ["commands", "./missing", undefined],
+      ["commands", "../escape", undefined],
+      ["commands", "./wrong.txt", "file"],
+      ["agents", "./wrong.json", "file"],
+      ["skills", "./skill.md", "file"],
+      ["hooks", "./hooks", "directory"],
+      ["hooks", "./hooks.md", "file"],
+    ] as const) {
+      const installation = record();
+      const target = path.join(installation.installPath, declared.replace(/^\.\//, ""));
+      if (create === "file") write(target, "content");
+      if (create === "directory") fs.mkdirSync(target, { recursive: true });
+      write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", [field]: declared }));
+      write(path.join(installation.installPath, "commands", "fallback.md"), "must not load");
+      const result = resolve({ installations: [installation] });
+      expect(result.plugins, `${field}:${declared}`).toEqual([]);
+      const evidence = result.outcomes[0]!.diagnostics.map((item) => `${item.message} ${item.source ?? ""}`).join(" ");
+      expect(evidence).toContain(`manifest ${field} declaration`);
+      expect(evidence).not.toContain(declared);
+      expect(evidence).not.toContain(target);
+      fs.rmSync(installation.installPath, { recursive: true, force: true });
+    }
   });
 
-  it('skips a plugin whose name collides with Object.prototype (e.g. "__proto__")', () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "evil"), { name: "__proto__" });
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "fine"), { name: "fine" });
+  it.skipIf(!fileLinkProbe)("rejects an explicit file-link escape without fallback or path disclosure", () => {
+    const installation = record();
+    const declared = "./escaped-command.md";
+    const target = path.join(installation.installPath, "escaped-command.md");
+    const outside = path.join(tmpRoot, "outside-command.md");
+    write(outside, "outside");
+    fs.symlinkSync(outside, target, "file");
+    write(path.join(installation.installPath, "commands", "fallback.md"), "must not load");
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", commands: declared }));
 
-    const { plugins, diagnostics } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins.map((p) => p.name)).toEqual(["fine"]);
-    expect(diagnostics.some((d) => d.message.includes("not allowed"))).toBe(true);
-  });
+    const result = resolve({ installations: [installation] });
 
-  it("honors a manifest hooks-path override (with ${CLAUDE_PLUGIN_ROOT}) over the default hooks/hooks.json", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "o", "r", "hooked");
-    makePlugin(
-      root,
-      { name: "hooked", hooks: "${CLAUDE_PLUGIN_ROOT}/custom/h.json" },
-      { hooks: JSON.stringify({ SessionStart: [] }) }, // default file that must be ignored
-    );
-    write(path.join(root, "custom", "h.json"), JSON.stringify({ PreToolUse: [] }));
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins[0]!.hooksFiles).toEqual([path.join(root, "custom", "h.json")]);
-  });
-
-  it("honors installed-plugin manifest content-path overrides (skills)", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "o", "r", "custom");
-    makePlugin(root, { name: "custom", skills: "./my-skills" }, { skills: true });
-    write(path.join(root, "my-skills", "s", "SKILL.md"), "---\ndescription: d\n---\nbody");
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    // Manifest override wins; the default skills/ dir is not used.
-    expect(plugins[0]!.skillDirs).toEqual([path.join(root, "my-skills")]);
-  });
-
-  it("records a diagnostic when a manifest-declared content path fails to resolve (and falls back)", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "o", "r", "dangling");
-    makePlugin(root, { name: "dangling", skills: "./no-such-dir", hooks: "./no-such.json" }, { skills: true });
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    const plugin = plugins[0]!;
-    // Falls back to the default dir…
-    expect(plugin.skillDirs).toEqual([path.join(root, "skills")]);
-    // …and both dangling paths are visible.
-    expect(
-      plugin.diagnostics.filter((d) => d.message.includes("does not resolve")),
-    ).toHaveLength(2);
-  });
-
-  it("records a diagnostic for a non-string manifest hooks value (unsupported shape)", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "o", "r", "inline");
-    makePlugin(root, { name: "inline", hooks: { PreToolUse: [] } });
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(
-      plugins[0]!.diagnostics.some((d) => d.message.includes('"hooks" is not a path')),
-    ).toBe(true);
-  });
-
-  it("never enables a blocklisted plugin, even if explicitly enabled", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const pluginsRoot = path.join(userDir, "plugins");
-    makePlugin(path.join(pluginsRoot, "marketplaces", "official", "plugins", "danger"), { name: "danger" });
-    write(
-      path.join(pluginsRoot, "blocklist.json"),
-      JSON.stringify({ plugins: [{ plugin: "danger@official", reason: "security" }] }),
-    );
-
-    const { plugins } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: { "danger@official": true },
-    });
-    expect(plugins[0]!.enabled).toBe(false);
-  });
-
-  it("skips a plugin with a malformed manifest and records a diagnostic", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "broken"), "{ not json !!");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "fine"), { name: "fine" });
-
-    const { plugins, diagnostics } = discoverInstalledPlugins({
-      userDir,
-      enabledPlugins: undefined,
-    });
-
-    expect(plugins.map((p) => p.name)).toEqual(["fine"]);
-    const warnings = diagnostics.filter((d) => d.severity === "warning");
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]!.message).toContain("not valid JSON");
-  });
-
-  it("falls back to the directory name when the manifest has no name", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "dirname-tool"), {
-      description: "no name key",
-    });
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins).toHaveLength(1);
-    expect(plugins[0]!.name).toBe("dirname-tool");
-  });
-
-  it("computes dataDir as <userDir>/plugins/data/<name>", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "mytool"), { name: "mytool" });
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins[0]!.dataDir).toBe(path.join(userDir, "plugins", "data", "mytool"));
-  });
-
-  it("returns empty (no throw) when the plugins dir does not exist", () => {
-    const userDir = path.join(tmpRoot, "no-such-claude-dir");
-    const result = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
     expect(result.plugins).toEqual([]);
-    expect(result.diagnostics).toEqual([]);
-  });
-});
-
-describe("discoverProjectBundledPlugin", () => {
-  it("returns undefined when there is no .claude-plugin directory", () => {
-    expect(discoverProjectBundledPlugin(tmpRoot)).toBeUndefined();
-  });
-
-  it("loads a bundled plugin with default content dirs under .claude-plugin/", () => {
-    const projectRoot = path.join(tmpRoot, "proj");
-    write(
-      path.join(projectRoot, ".claude-plugin", "plugin.json"),
-      JSON.stringify({ name: "bundled" }),
+    expect(result.outcomes[0]!.status).toBe("rejected");
+    expect(result.outcomes[0]!.diagnostics.map((item) => item.message)).toContain(
+      "Plugin manifest commands declaration has an invalid path (path-escape)",
     );
-    write(
-      path.join(projectRoot, ".claude-plugin", "skills", "s", "SKILL.md"),
-      "---\ndescription: d\n---\nbody",
-    );
-    write(path.join(projectRoot, ".claude-plugin", "commands", "c.md"), "cmd");
-
-    const plugin = discoverProjectBundledPlugin(projectRoot);
-    expect(plugin).toBeDefined();
-    expect(plugin!.name).toBe("bundled");
-    expect(plugin!.root).toBe(projectRoot);
-    expect(plugin!.enabled).toBe(true);
-    expect(plugin!.skillDirs).toEqual([path.join(projectRoot, ".claude-plugin", "skills")]);
-    expect(plugin!.commandDirs).toEqual([path.join(projectRoot, ".claude-plugin", "commands")]);
-    expect(plugin!.agentDirs).toEqual([]);
+    const evidence = JSON.stringify(result.outcomes[0]!.diagnostics);
+    expect(evidence).not.toContain(declared);
+    expect(evidence).not.toContain(target);
+    expect(evidence).not.toContain(outside);
   });
 
-  it("honors manifest content-path overrides relative to the project root", () => {
-    const projectRoot = path.join(tmpRoot, "proj2");
-    write(
-      path.join(projectRoot, ".claude-plugin", "plugin.json"),
-      JSON.stringify({
-        name: "bundled2",
-        skills: "./my-skills",
-        commands: ["tools/cmds"],
-      }),
-    );
-    write(path.join(projectRoot, "my-skills", "s", "SKILL.md"), "body");
-    write(path.join(projectRoot, "tools", "cmds", "c.md"), "cmd");
-    // A default-location dir that must be IGNORED because the manifest overrides skills.
-    write(path.join(projectRoot, ".claude-plugin", "skills", "x", "SKILL.md"), "body");
-
-    const plugin = discoverProjectBundledPlugin(projectRoot);
-    expect(plugin!.skillDirs).toEqual([path.join(projectRoot, "my-skills")]);
-    expect(plugin!.commandDirs).toEqual([path.join(projectRoot, "tools", "cmds")]);
-  });
-
-  it("falls back to the project dir name when the manifest lacks a name, and never throws on a missing manifest", () => {
-    const projectRoot = path.join(tmpRoot, "named-by-dir");
-    fs.mkdirSync(path.join(projectRoot, ".claude-plugin"), { recursive: true });
-
-    const plugin = discoverProjectBundledPlugin(projectRoot);
-    expect(plugin).toBeDefined();
-    expect(plugin!.name).toBe("named-by-dir");
-    expect(plugin!.manifest).toEqual({});
-    expect(plugin!.diagnostics.some((d) => d.message.includes("no plugin.json"))).toBe(true);
-  });
-});
-
-describe("expandPluginVariables / loadPluginHooks", () => {
-  function stubPlugin(overrides: Partial<InstalledPlugin>): InstalledPlugin {
-    return {
-      name: "stub",
-      root: path.join(tmpRoot, "stub-root"),
-      dataDir: path.join(tmpRoot, "stub-data"),
-      manifest: {},
-      skillDirs: [],
-      agentDirs: [],
-      commandDirs: [],
-      hooksFiles: [],
-      enabled: true,
-      diagnostics: [],
-      ...overrides,
-    };
-  }
-
-  it("expands ${CLAUDE_PLUGIN_ROOT} and ${CLAUDE_PLUGIN_DATA}, repeatedly", () => {
-    const plugin = stubPlugin({});
-    const out = expandPluginVariables(
-      "run ${CLAUDE_PLUGIN_ROOT}/a and ${CLAUDE_PLUGIN_ROOT}/b into ${CLAUDE_PLUGIN_DATA}/out",
-      plugin,
-    );
-    expect(out).toBe(
-      `run ${plugin.root}/a and ${plugin.root}/b into ${plugin.dataDir}/out`,
-    );
-  });
-
-  it("loads hooks.json and expands plugin variables in nested command strings", () => {
-    const userDir = path.join(tmpRoot, ".claude");
-    const root = path.join(userDir, "plugins", "repos", "o", "r", "hooky");
-    makePlugin(root, { name: "hooky" }, {
-      hooks: JSON.stringify({
-        PreToolUse: [
-          {
-            matcher: "Bash",
-            hooks: [
-              {
-                type: "command",
-                command: "${CLAUDE_PLUGIN_ROOT}/scripts/check.sh --data ${CLAUDE_PLUGIN_DATA}",
-              },
-            ],
-          },
-        ],
-      }),
+  it("rejects a deterministically unreadable explicit file without fallback or raw I/O disclosure", () => {
+    const installation = record();
+    const declared = "./private-command.md";
+    const target = path.join(installation.installPath, "private-command.md");
+    write(target, "private");
+    write(path.join(installation.installPath, "commands", "fallback.md"), "must not load");
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", commands: declared }));
+    const nativeRealpath = fs.realpathSync.native.bind(fs.realpathSync);
+    const spy = vi.spyOn(fs.realpathSync, "native").mockImplementation((value) => {
+      if (path.normalize(String(value)) === path.normalize(target)) {
+        const error = new Error(`EACCES private source ${target}`);
+        Object.assign(error, { code: "EACCES" });
+        throw error;
+      }
+      return nativeRealpath(value);
     });
-
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    const plugin = plugins[0]!;
-    const { config, diagnostics } = loadPluginHooks(plugin);
-
-    expect(diagnostics).toEqual([]);
-    const entries = config["PreToolUse"] as Array<{ hooks: Array<{ command: string }> }>;
-    expect(entries[0]!.hooks[0]!.command).toBe(
-      `${plugin.root}/scripts/check.sh --data ${path.join(userDir, "plugins", "data", "hooky")}`,
-    );
+    try {
+      const result = resolve({ installations: [installation] });
+      expect(result.plugins).toEqual([]);
+      expect(result.outcomes[0]!.status).toBe("rejected");
+      expect(result.outcomes[0]!.diagnostics.map((item) => item.message)).toContain(
+        "Plugin manifest commands declaration has an invalid path (unreadable-path)",
+      );
+      const evidence = JSON.stringify(result.outcomes[0]!.diagnostics);
+      expect(evidence).not.toContain(declared);
+      expect(evidence).not.toContain(target);
+      expect(evidence).not.toContain("EACCES private source");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
-  it("merges multiple hooks files, concatenating entries per event", () => {
-    const fileA = path.join(tmpRoot, "hooks-a.json");
-    const fileB = path.join(tmpRoot, "hooks-b.json");
-    write(fileA, JSON.stringify({ PreToolUse: [{ matcher: "Bash", hooks: [] }] }));
-    write(
-      fileB,
-      JSON.stringify({
-        PreToolUse: [{ matcher: "Write", hooks: [] }],
-        SessionStart: [{ hooks: [] }],
-      }),
-    );
-    const plugin = stubPlugin({ hooksFiles: [fileA, fileB] });
-
-    const { config, diagnostics } = loadPluginHooks(plugin);
-    expect(diagnostics).toEqual([]);
-    expect(config["PreToolUse"]).toHaveLength(2);
-    expect((config["PreToolUse"] as Array<{ matcher: string }>).map((e) => e.matcher)).toEqual([
-      "Bash",
-      "Write",
-    ]);
-    expect(config["SessionStart"]).toHaveLength(1);
+  it("keeps an empty hooks array valid and retains the default JSON hook source", () => {
+    const installation = record();
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", hooks: [] }));
+    write(path.join(installation.installPath, "hooks", "hooks.json"), JSON.stringify({ SessionStart: [{ hooks: [] }] }));
+    const plugin = resolve({ installations: [installation] }).plugins[0]!;
+    expect(plugin.hookSources).toHaveLength(1);
+    expect(plugin.hookSources[0]!.kind).toBe("file");
   });
 
-  it('unwraps a top-level "hooks" wrapper key in a hooks file', () => {
-    const file = path.join(tmpRoot, "wrapped-hooks.json");
-    write(file, JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [] }] } }));
-    const plugin = stubPlugin({ hooksFiles: [file] });
-
-    const { config } = loadPluginHooks(plugin);
-    expect(config["PreToolUse"]).toHaveLength(1);
-    expect(config["hooks"]).toBeUndefined();
+  it("rejects a malformed manifest and a present manifest without a valid name", () => {
+    for (const manifest of ["not json", "{}", '{"name":"../bad"}']) {
+      const installation = record();
+      write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), manifest);
+      expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("rejected");
+      fs.rmSync(installation.installPath, { recursive: true, force: true });
+    }
   });
+});
 
-  it('drops a hostile "__proto__" event key in a plugin hooks file with a diagnostic', () => {
-    const file = path.join(tmpRoot, "hostile-hooks.json");
-    // Raw JSON — a JS object literal would interpret __proto__ itself.
-    write(file, '{"__proto__": [{"hooks": []}], "PreToolUse": [{"matcher": "Bash", "hooks": []}]}');
-    const plugin = stubPlugin({ hooksFiles: [file] });
-
-    const { config, diagnostics } = loadPluginHooks(plugin);
-    expect(config["PreToolUse"]).toHaveLength(1);
-    expect(Object.getPrototypeOf(config)).toBe(Object.prototype);
-    expect(diagnostics.some((d) => d.message.includes("Unsafe hook event key"))).toBe(true);
-  });
-
-  it("reports a diagnostic for a malformed hooks file instead of throwing", () => {
-    const hooksFile = path.join(tmpRoot, "bad-hooks.json");
-    write(hooksFile, "{{{ nope");
-    const plugin = stubPlugin({ hooksFiles: [hooksFile] });
-
-    const { config, diagnostics } = loadPluginHooks(plugin);
-    expect(config).toEqual({});
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0]!.severity).toBe("warning");
+describe("loadPluginHooks", () => {
+  it("expands root/data variables and drops hostile event keys without trusting raw provenance", () => {
+    const installation = record();
+    write(path.join(installation.installPath, "hooks", "hooks.json"), '{"__proto__":[{"hooks":[]}],"PreToolUse":[{"hooks":[{"command":"${CLAUDE_PLUGIN_ROOT} ${CLAUDE_PLUGIN_DATA}","pluginId":"forged"}]}]}');
+    const plugin = resolve({ installations: [installation] }).plugins[0]!;
+    const loaded = loadPluginHooks(plugin);
+    expect(Object.hasOwn(loaded.config, "__proto__")).toBe(false);
+    const command = (loaded.config["PreToolUse"] as Array<{ hooks: Array<{ command: string }> }>)[0]!.hooks[0]!.command;
+    expect(command).toContain(plugin.root);
+    expect(command).toContain(plugin.dataDir);
+    expect(loaded.diagnostics).toHaveLength(1);
+    expect(expandPluginVariables("${CLAUDE_PLUGIN_ROOT}:${CLAUDE_PLUGIN_DATA}", plugin)).toBe(`${plugin.root}:${plugin.dataDir}`);
   });
 });

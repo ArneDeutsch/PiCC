@@ -1,5 +1,5 @@
 {
   "name": "bundled-fixture-plugin",
-  "description": "Project-bundled plugin structure that must load without error.",
+  "description": "Source fixture copied into a hermetic installed-plugin root by integration tests.",
   "version": "1.0.0"
 }

@@ -19,6 +19,7 @@ import {
   renderDoctorReport,
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
+import { resolveInstalledPlugins } from "../src/claude/plugins.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -1065,8 +1066,14 @@ describe("buildCompatReport", () => {
   });
 
   it("scans installed-plugin hook configs for degraded events and handler types", () => {
-    const pluginRoot = makeTempDir();
+    const fixtureRoot = makeTempDir();
+    const userDir = path.join(fixtureRoot, ".claude");
+    const projectRoot = path.join(fixtureRoot, "project");
+    const pluginRoot = path.join(userDir, "plugins", "cache", "market", "hooky", "1.0.0");
     const hooksFile = path.join(pluginRoot, "hooks", "hooks.json");
+    fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "hooky" }), "utf8");
     fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
     fs.writeFileSync(
       hooksFile,
@@ -1076,19 +1083,24 @@ describe("buildCompatReport", () => {
       }),
       "utf8",
     );
-    const plugin = {
-      name: "hooky",
-      root: pluginRoot,
-      dataDir: pluginRoot,
-      manifest: {},
-      skillDirs: [],
-      agentDirs: [],
-      commandDirs: [],
-      hooksFiles: [hooksFile],
-      enabled: true,
-      diagnostics: [],
-    };
-    const project = { ...makeProject(), plugins: [plugin] };
+    const resolved = resolveInstalledPlugins({
+      userDir,
+      projectRoot,
+      enablement: {
+        "hooky@market": { enabled: true, scope: "user", source: path.join(userDir, "settings.json") },
+      },
+      installations: [{
+        pluginId: "hooky@market",
+        scope: "user",
+        installPath: pluginRoot,
+        version: "1.0.0",
+        provenance: { statePath: path.join(userDir, "plugins", "installed_plugins.json"), stateVersion: 2 },
+      }],
+      installedStateStatus: "valid",
+      env: {},
+    });
+    expect(resolved.outcomes[0]?.status).toBe("loaded");
+    const project = { ...makeProject(), plugins: resolved.plugins };
     const report = buildCompatReport(project);
     const event = report.findings.find((f) => f.capability.id === "hook.event.Notification");
     expect(event).toBeDefined();
