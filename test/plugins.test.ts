@@ -128,15 +128,19 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
   it("represents false, missing, absent, unsupported, malformed, and unreadable state without loading", () => {
     const disabled = resolve({ enabled: { "alpha@official": false } });
     expect(disabled.outcomes[0]!.status).toBe("disabled");
-    for (const [status, expected] of [
-      ["absent", "enabled-but-uninstalled"],
-      ["unsupported", "unsupported"],
-      ["malformed", "malformed"],
-      ["unreadable", "rejected"],
+    for (const [status, expected, cause] of [
+      ["absent", "enabled-but-uninstalled", undefined],
+      ["unsupported", "unsupported", "installed-state-unsupported"],
+      ["malformed", "malformed", "installed-state-malformed"],
+      ["unreadable", "rejected", "installed-state-unreadable"],
     ] as const) {
-      const result = resolve({ status, installations: [] });
+      const result = resolve({ status, enabled: { "alpha@official": true, "beta@official": true }, installations: [] });
       expect(result.plugins).toEqual([]);
-      expect(result.outcomes[0]!.status).toBe(expected);
+      expect(result.outcomes.map((outcome) => outcome.status)).toEqual([expected, expected]);
+      expect(result.outcomes.map((outcome) => outcome.sharedStateCauses)).toEqual([
+        cause ? [cause] : undefined,
+        cause ? [cause] : undefined,
+      ]);
     }
     expect(resolve({ installations: [] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
   });
@@ -328,6 +332,10 @@ describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
       const result = resolve({ enabled: { "alpha@official": true, "beta@official": true }, installations: [record(), beta] });
       expect(result.plugins).toEqual([]);
       expect(result.outcomes.map((item) => item.status)).toEqual(["malformed", "malformed"]);
+      expect(result.outcomes.map((item) => item.sharedStateCauses)).toEqual([
+        ["blocklist-malformed"],
+        ["blocklist-malformed"],
+      ]);
       expect(result.diagnostics).toHaveLength(1);
     }
     const unreadable = resolve({
@@ -337,8 +345,25 @@ describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
     });
     expect(unreadable.plugins).toEqual([]);
     expect(unreadable.outcomes.map((item) => item.status)).toEqual(["rejected", "rejected"]);
+    expect(unreadable.outcomes.map((item) => item.sharedStateCauses)).toEqual([
+      ["blocklist-unreadable"],
+      ["blocklist-unreadable"],
+    ]);
     expect(unreadable.diagnostics).toHaveLength(1);
     expect(unreadable.diagnostics[0]!.message).not.toContain("secret path");
+
+    const simultaneous = resolve({
+      status: "unreadable",
+      enabled: { "alpha@official": true, "beta@official": true },
+      installations: [record(), record({ pluginId: "beta@official" })],
+      readBlocklistForTest: () => "{broken",
+    });
+    expect(simultaneous.plugins).toEqual([]);
+    expect(simultaneous.outcomes.map((item) => item.status)).toEqual(["malformed", "malformed"]);
+    expect(simultaneous.outcomes.map((item) => item.sharedStateCauses)).toEqual([
+      ["installed-state-unreadable", "blocklist-malformed"],
+      ["installed-state-unreadable", "blocklist-malformed"],
+    ]);
   });
 
   it("rejects component namespace collisions without conflating punctuation-distinct data projections", () => {

@@ -51,11 +51,10 @@ surrounding command or path from it, or applies an explicit gate to it.
 
 Plugin executable roots have a narrower authorization boundary: a matching exact record in imported
 Claude installed state is necessary evidence that a qualified identity was installed. Repository
-settings may enable an applicable separately installed identity. Configured environment cache or
-seed paths may define eligible cache bases for such a record, but no environment value can authorize
-executable content by itself; settings, repository bundles, development roots, marketplace catalogs,
-and cache presence without a record likewise cannot create authorization. Development roots remain
-inert because PiCC exposes no external development-trust channel. This installed-state evidence is
+settings may enable an applicable separately installed identity. Environment configuration cannot
+authorize executable content by itself; settings, repository bundles, development roots, marketplace
+catalogs, and cache presence without a record likewise cannot create authorization. Development roots
+remain inert because PiCC exposes no external development-trust channel. This installed-state evidence is
 neither a publisher-authenticity claim nor an OS sandbox; the baseline local-user trust and
 isolation limits above still apply.
 

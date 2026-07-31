@@ -19,6 +19,7 @@ import {
   renderDoctorReport,
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
+import { resolveInstalledPlugins } from "../src/claude/plugins.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -431,7 +432,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       tier: "partial",
       core: [/read-only exact-version selection/, /qualified name@marketplace/, /load no fallback content/],
       gap: [/undocumented/, /not PiCC's permanent API/],
-      parity: [/FIXTURE-DERIVED/, /captured Claude installed-state v2/],
+      parity: [/FIXTURE-DERIVED/, /Captured Claude installed-state v2/, /PiCC-defined/],
     });
     expectDisclosure({
       id: "feature.plugins-enablement",
@@ -473,14 +474,17 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ] as const) {
       const note = lookupCapability(id)?.note ?? "";
       expect(note).toContain("Installed qualified name@marketplace identity owns selection, variable/data context");
-      expect(note).toContain(`manifest name owns the visible ${namespace} namespace`);
+      expect(note).toContain(`present validated kebab-case manifest name owns the visible ${namespace} namespace`);
+      expect(note).toContain("manifestless content uses the validated installed lifecycle name");
     }
+    const selection = lookupCapability("feature.plugins-installed-selection")?.note ?? "";
+    for (const phrase of ["CLAUDE_CODE_PLUGIN_CACHE_DIR", "path-delimited", "<seed>/cache", "existing accessible directories", "exact imported record", "does not import seed marketplaces", "first-seed lifecycle behavior", "Highest-applicable winner", "canonical equivalent deduplication", "qualified blocklist schema and global fail-closed", "namespace/data-key collision rejection", "no fallback", "PiCC-defined"]) expect(selection).toContain(phrase);
     const agents = lookupCapability("feature.plugins-agents")?.note ?? "";
-    for (const field of ["hooks", "mcpServers", "permissionMode"]) expect(agents).toContain(field);
+    for (const phrase of ["plugin-agent local names are validated", "Global ordinary-agent parser gaps", "hooks", "mcpServers", "permissionMode"]) expect(agents).toContain(phrase);
+    const hooks = lookupCapability("feature.plugins-hooks")?.note ?? "";
+    for (const phrase of ["command and argument fields alone", "canonical authorized root", "matcher, condition, URL, and arbitrary raw fields remain literal"]) expect(hooks).toContain(phrase);
     const metadata = lookupCapability("feature.plugins-manifest-metadata")?.note ?? "";
-    for (const gap of ["defaultEnabled", "marketplace-entry component overlays", "marketplace strict"]) {
-      expect(metadata).toContain(gap);
-    }
+    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible component namespace", "manifestless content uses the validated installed lifecycle name", "skills, commands, agents, and hooks", "Only wrong-typed values for those four component fields", "broader recognized metadata schema validation is unsupported", "defaultEnabled", "marketplace-entry component overlays", "marketplace strict"]) expect(metadata).toContain(phrase);
     expect(lookupCapability("feature.plugins-development-trust")).toMatchObject({ tier: "not-supported" });
     expect(lookupCapability("feature.plugins-development-trust")?.note).toContain("repository-bundled");
     for (const [id, command] of [
@@ -514,13 +518,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const managed = lookupCapability("feature.managed-policy");
     expect(managed?.tier).toBe("partial");
     for (const phrase of [
-      "managed settings file",
+      "system managed settings file",
       "drop-in files",
       "Windows HKLM",
-      "HKCU fallback",
+      "HKCU is a user-policy fallback",
       "Scalar replacement plus recursive object merge and stable array dedup",
-      "base → drop-ins → HKLM",
-      "HKCU only when no administrator policy is present",
+      "system file → drop-ins → HKLM",
+      "only when no administrator policy is present",
       "no complete server-managed settings, MDM, MDM-preference, or policy-helper parity",
     ]) expect(managed?.note).toContain(phrase);
   });
@@ -855,11 +859,13 @@ describe("capability matrix freshness", () => {
     // against the committed doc. Both sides CRLF-normalized so a Windows checkout
     // can't false-fail. This makes a stale matrix un-fakeable — a registry edit
     // without `npm run gen:capabilities` fails.
-    const regenerated = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const firstRender = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const secondRender = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
     const committedPath = fileURLToPath(new URL("../doc/supported-features.md", import.meta.url));
     const committed = fs.readFileSync(committedPath, "utf8");
     const norm = (s: string) => s.replace(/\r\n/g, "\n");
-    expect(norm(committed)).toBe(norm(regenerated));
+    expect(norm(secondRender)).toBe(norm(firstRender));
+    expect(norm(committed)).toBe(norm(firstRender));
   });
 
 
@@ -1184,15 +1190,133 @@ describe("buildCompatReport", () => {
         null,
         42,
         "junk",
-        { pluginId: 7, status: "future", diagnostics: "bad" },
-        { pluginId: "defensive@market", status: "rejected", diagnostics: [null, { message: 7 }] },
+        { pluginId: 7, status: "future", diagnostics: "bad", sharedStateCauses: "installed-state-unreadable" },
+        { pluginId: "stale@market", status: "enabled-but-uninstalled", sharedStateCauses: ["installed-state-unreadable"], diagnostics: [] },
+        { pluginId: "empty@market", status: "rejected", sharedStateCauses: [], diagnostics: [] },
+        { pluginId: "duplicate@market", status: "rejected", sharedStateCauses: ["installed-state-unreadable", "installed-state-unreadable"], diagnostics: [] },
+        { pluginId: "unknown@market", status: "rejected", sharedStateCauses: ["installed-state-unreadable", "future-cause"], diagnostics: [] },
+        { pluginId: "overlong@market", status: "malformed", sharedStateCauses: ["installed-state-malformed", "blocklist-unreadable", "blocklist-malformed"], diagnostics: [] },
+        { pluginId: "contradictory@market", status: "malformed", sharedStateCauses: ["installed-state-unreadable", "installed-state-malformed"], diagnostics: [] },
+        { pluginId: "block-contradictory@market", status: "malformed", sharedStateCauses: ["blocklist-unreadable", "blocklist-malformed"], diagnostics: [] },
+        { pluginId: "out-of-order@market", status: "malformed", sharedStateCauses: ["blocklist-malformed", "installed-state-malformed"], diagnostics: [] },
+        { pluginId: "stale-rejected@market", status: "rejected", sharedStateCauses: ["installed-state-malformed"], diagnostics: [] },
+        { pluginId: "stale-malformed@market", status: "malformed", sharedStateCauses: ["installed-state-unreadable"], diagnostics: [] },
+        { pluginId: "stale-blocklist-malformed@market", status: "rejected", sharedStateCauses: ["installed-state-unreadable", "blocklist-malformed"], diagnostics: [] },
+        { pluginId: "stale-blocklist-unreadable@market", status: "malformed", sharedStateCauses: ["installed-state-malformed", "blocklist-unreadable"], diagnostics: [] },
+        { pluginId: "defensive@market", status: "rejected", sharedStateCauses: [null, "unknown", 7], diagnostics: [null, { message: 7 }] },
       ],
     } as unknown as ClaudeProject;
     expect(() => buildCompatReport(project)).not.toThrow();
     const report = buildCompatReport(project);
-    expect(report.findings).toHaveLength(1);
-    expect(report.findings[0]?.evidence).toContain("defensive@market");
-    expect(report.findings[0]?.evidence).toContain("no fallback content loaded");
+    expect(report.findings).toHaveLength(13);
+    for (const identity of ["stale", "empty", "duplicate", "unknown", "overlong", "contradictory", "block-contradictory", "out-of-order", "stale-rejected", "stale-malformed", "stale-blocklist-malformed", "stale-blocklist-unreadable", "defensive"]) {
+      expect(report.findings.some((finding) => finding.evidence.startsWith(`${identity}@market:`))).toBe(true);
+    }
+    expect(report.findings.some((finding) => finding.evidence.includes("stale@market: enabled but no applicable installed record"))).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence.includes("stale-rejected@market: installed content was rejected"))).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence.includes("stale-malformed@market: plugin installed-state or blocklist data is malformed"))).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence.includes("plugins/installed_plugins.json"))).toBe(false);
+  });
+
+  it("reports each resolver-produced shared plugin-state cause once with only its safe recovery", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-doctor-plugin-state-"));
+    const userDir = path.join(root, "user", ".claude");
+    const projectRoot = path.join(root, "project");
+    fs.mkdirSync(projectRoot, { recursive: true });
+    const enablement = Object.fromEntries(["private-one@market", "private-two@market"].map((pluginId) => [pluginId, {
+      enabled: true,
+      scope: "user" as const,
+      source: path.join(userDir, "settings.json"),
+    }]));
+    const recoveries = [
+      "Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory",
+      "Repair or regenerate plugins/installed_plugins.json through Claude Code",
+      "Update PiCC or contact PiCC support for this format",
+      "Check access and permissions for plugins/blocklist.json relative to the active Claude user directory",
+      "Repair plugins/blocklist.json so it is a valid JSON object, its optional plugins field is an array, and each entry's plugin field is a qualified name@marketplace identity",
+    ] as const;
+    const cases = [
+      { status: "unreadable", blocklist: () => { throw Object.assign(new Error("missing C:/RAW/state"), { code: "ENOENT" }); }, recovery: recoveries[0] },
+      { status: "malformed", blocklist: () => { throw Object.assign(new Error("missing C:/RAW/state"), { code: "ENOENT" }); }, recovery: recoveries[1] },
+      { status: "unsupported", blocklist: () => { throw Object.assign(new Error("missing C:/RAW/state"), { code: "ENOENT" }); }, recovery: recoveries[2] },
+      { status: "valid", blocklist: () => { throw new Error("denied C:/RAW/blocklist.json"); }, recovery: recoveries[3] },
+      { status: "valid", blocklist: () => JSON.stringify({ plugins: [{ plugin: "unqualified RAW" }] }), recovery: recoveries[4] },
+    ] as const;
+
+    try {
+      for (const scenario of cases) {
+        let reads = 0;
+        const resolved = resolveInstalledPlugins({
+          userDir,
+          projectRoot,
+          enablement,
+          installations: [],
+          installedStateStatus: scenario.status,
+          readBlocklistForTest: (file) => {
+            reads += 1;
+            expect(file).toBe(path.join(userDir, "plugins", "blocklist.json"));
+            return scenario.blocklist();
+          },
+        });
+        expect(resolved.plugins).toEqual([]);
+        expect(resolved.outcomes).toHaveLength(2);
+        const readsAfterResolution = reads;
+        const project = { ...makeProject(), pluginResolutionOutcomes: resolved.outcomes } as unknown as ClaudeProject;
+        const report = buildCompatReport(project);
+        const doctor = renderDoctorReport(project, report);
+        expect(reads).toBe(readsAfterResolution);
+        expect(report.findings.filter((finding) => finding.capability.id === "feature.plugins-installed-selection")).toHaveLength(1);
+        expect(doctor.match(/all enabled plugins were rejected/g)).toHaveLength(1);
+        expect(doctor.split(scenario.recovery)).toHaveLength(2);
+        for (const incompatible of recoveries.filter((recovery) => recovery !== scenario.recovery)) expect(doctor).not.toContain(incompatible);
+        for (const secret of ["private-one", "private-two", root, "C:/RAW", "unqualified RAW"]) expect(doctor).not.toContain(secret);
+        expect(doctor.toLowerCase()).not.toContain("reinstall");
+        expect(doctor).toContain("Compatibility findings:");
+        expect(doctor).not.toContain("Findings (declared by this project, not fully honored):");
+        expect(doctor).not.toContain("No compatibility findings detected.");
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves simultaneous resolver-produced installed-state and blocklist causes once each", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-doctor-plugin-state-combined-"));
+    try {
+      const userDir = path.join(root, "user", ".claude");
+      const projectRoot = path.join(root, "project");
+      fs.mkdirSync(projectRoot, { recursive: true });
+      let reads = 0;
+      const resolved = resolveInstalledPlugins({
+        userDir,
+        projectRoot,
+        enablement: Object.fromEntries(["private-one@market", "private-two@market"].map((pluginId) => [pluginId, {
+          enabled: true,
+          scope: "user" as const,
+          source: path.join(userDir, "settings.json"),
+        }])),
+        installations: [],
+        installedStateStatus: "unreadable",
+        readBlocklistForTest: () => {
+          reads += 1;
+          return "{RAW malformed blocklist";
+        },
+      });
+      expect(resolved.outcomes.map((outcome) => outcome.sharedStateCauses)).toEqual([
+        ["installed-state-unreadable", "blocklist-malformed"],
+        ["installed-state-unreadable", "blocklist-malformed"],
+      ]);
+      const project = { ...makeProject(), pluginResolutionOutcomes: resolved.outcomes } as unknown as ClaudeProject;
+      const doctor = renderDoctorReport(project, buildCompatReport(project));
+      expect(reads).toBe(1);
+      expect(doctor.match(/plugins\/installed_plugins\.json/g)).toHaveLength(1);
+      expect(doctor.match(/plugins\/blocklist\.json/g)).toHaveLength(1);
+      expect(doctor).not.toContain("private-");
+      expect(doctor).not.toContain(root);
+      expect(doctor).not.toContain("RAW");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("reports every normalized plugin state, stripped agent fields, and activation policy safely", () => {
@@ -1276,24 +1400,33 @@ describe("buildCompatReport", () => {
     expect(doctor).not.toContain("quiet@market");
   });
 
-  it("bounds and orders actionable plugin outcomes with one omission finding", () => {
+  it("bounds heterogeneous plugin findings with one source-neutral omission finding", () => {
     const project = {
       ...makeProject(),
-      pluginResolutionOutcomes: Array.from({ length: 25 }, (_, index) => ({
-        pluginId: `reject-${String(index).padStart(2, "0")}@market`,
-        status: "rejected",
-        diagnostics: [{ severity: "warning", message: "path validation failure" }],
-      })),
+      pluginResolutionOutcomes: [
+        { pluginId: "state-one@market", status: "malformed", sharedStateCauses: ["installed-state-malformed"], diagnostics: [] },
+        { pluginId: "state-two@market", status: "rejected", sharedStateCauses: ["installed-state-unreadable"], diagnostics: [] },
+        { pluginId: "list-one@market", status: "malformed", sharedStateCauses: ["blocklist-malformed"], diagnostics: [] },
+        { pluginId: "list-two@market", status: "rejected", sharedStateCauses: ["blocklist-unreadable"], diagnostics: [] },
+        { pluginId: "missing@market", status: "enabled-but-uninstalled", diagnostics: [] },
+        ...Array.from({ length: 20 }, (_, index) => ({
+          pluginId: `reject-${String(index).padStart(2, "0")}@market`,
+          status: "rejected" as const,
+          diagnostics: [{ severity: "warning" as const, message: "path validation failure" }],
+        })),
+      ],
     } as unknown as ClaudeProject;
     const report = buildCompatReport(project);
     expect(report.pluginPosture?.details).toHaveLength(20);
     expect(report.pluginPosture?.omitted).toBe(5);
     const selection = report.findings.filter((finding) => finding.capability.id === "feature.plugins-installed-selection");
     expect(selection).toHaveLength(21);
-    expect(selection[0]?.evidence).toContain("reject-00@market");
-    expect(selection[19]?.evidence).toContain("reject-19@market");
-    expect(selection[20]?.evidence).toContain("5 additional actionable plugin outcome(s) omitted");
-    expect(selection.map((finding) => finding.evidence).join("\n")).not.toContain("reject-20@market");
+    expect(selection[0]?.evidence).toContain("plugins/installed_plugins.json");
+    expect(selection[4]?.evidence).toContain("missing@market");
+    expect(selection[19]?.evidence).toContain("reject-14@market");
+    expect(selection[20]?.evidence).toBe("5 additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then relaunch PiCC.");
+    expect(selection[20]?.evidence).not.toMatch(/outcome|repair/i);
+    expect(selection.map((finding) => finding.evidence).join("\n")).not.toContain("reject-15@market");
   });
 
   it("bounds stripped-agent and resolved-hook diagnostic detail independently", () => {

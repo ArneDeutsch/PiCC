@@ -8,6 +8,7 @@ import type {
   PluginInstallationScope,
   PluginResolutionOutcome,
   PluginRuntimeContext,
+  PluginSharedStateCause,
 } from "../types.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
@@ -523,8 +524,20 @@ export function resolveInstalledPlugins(options: {
       outcomes.push({ pluginId, status: "disabled", diagnostics: [] });
       continue;
     }
+    const sharedStateCauses: PluginSharedStateCause[] = [];
+    if (options.installedStateStatus === "unsupported") sharedStateCauses.push("installed-state-unsupported");
+    else if (options.installedStateStatus === "malformed") sharedStateCauses.push("installed-state-malformed");
+    else if (options.installedStateStatus === "unreadable") sharedStateCauses.push("installed-state-unreadable");
+    if (blocklist.status === "malformed") sharedStateCauses.push("blocklist-malformed");
+    else if (blocklist.status === "unreadable") sharedStateCauses.push("blocklist-unreadable");
+
     if (blocklist.status === "malformed" || blocklist.status === "unreadable") {
-      outcomes.push({ pluginId, status: blocklist.status === "malformed" ? "malformed" : "rejected", diagnostics: [] });
+      outcomes.push({
+        pluginId,
+        status: blocklist.status === "malformed" ? "malformed" : "rejected",
+        sharedStateCauses,
+        diagnostics: [],
+      });
       continue;
     }
     if (blocklist.blocked.has(pluginId)) {
@@ -537,7 +550,7 @@ export function resolveInstalledPlugins(options: {
       const status = options.installedStateStatus === "unsupported" ? "unsupported"
         : options.installedStateStatus === "malformed" ? "malformed"
         : options.installedStateStatus === "absent" ? "enabled-but-uninstalled" : "rejected";
-      outcomes.push({ pluginId, status, diagnostics: [] });
+      outcomes.push({ pluginId, status, ...(sharedStateCauses.length > 0 ? { sharedStateCauses } : {}), diagnostics: [] });
       continue;
     }
     const selected = chooseInstallation(pluginId, options.installations, projects);

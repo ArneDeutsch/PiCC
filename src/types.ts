@@ -106,9 +106,17 @@ export interface PluginRuntimeContext {
   projectDir: string;
 }
 
+export type PluginSharedStateCause =
+  | "installed-state-unreadable"
+  | "installed-state-malformed"
+  | "installed-state-unsupported"
+  | "blocklist-unreadable"
+  | "blocklist-malformed";
+
 export interface PluginResolutionOutcome {
   pluginId: string;
   status: PluginResolutionStatus;
+  sharedStateCauses?: readonly PluginSharedStateCause[];
   installation?: NormalizedPluginInstallation;
   context?: PluginRuntimeContext;
   sources?: PluginComponentSource[];

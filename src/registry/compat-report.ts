@@ -10,6 +10,7 @@ import type {
   HookConfig,
   PluginResolutionOutcome,
   PluginResolutionStatus,
+  PluginSharedStateCause,
   ResolvedMcpConfig,
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
@@ -107,6 +108,29 @@ const PLUGIN_STATUS_ORDER: readonly PluginResolutionStatus[] = [
   "rejected",
 ];
 const PLUGIN_POSTURE_DETAIL_MAX = 20;
+const PLUGIN_SHARED_STATE_ORDER = [
+  "installed-state-unreadable",
+  "installed-state-malformed",
+  "installed-state-unsupported",
+  "blocklist-unreadable",
+  "blocklist-malformed",
+] as const satisfies readonly PluginSharedStateCause[];
+const PLUGIN_SHARED_STATE_DETAILS: Readonly<Record<PluginSharedStateCause, string>> = {
+  "installed-state-unreadable": "Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then relaunch PiCC.",
+  "installed-state-malformed": "Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then relaunch PiCC.",
+  "installed-state-unsupported": "Installed plugin state uses an unsupported format; all enabled plugins were rejected and no fallback content loaded. Update PiCC or contact PiCC support for this format, then relaunch PiCC.",
+  "blocklist-unreadable": "The qualified plugin blocklist is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/blocklist.json relative to the active Claude user directory, then relaunch PiCC.",
+  "blocklist-malformed": "The qualified plugin blocklist is malformed; all enabled plugins were rejected and no fallback content loaded. Repair plugins/blocklist.json so it is a valid JSON object, its optional plugins field is an array, and each entry's plugin field is a qualified name@marketplace identity, then relaunch PiCC.",
+};
+const INSTALLED_STATE_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
+  "installed-state-unreadable",
+  "installed-state-malformed",
+  "installed-state-unsupported",
+]);
+const BLOCKLIST_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
+  "blocklist-unreadable",
+  "blocklist-malformed",
+]);
 const ADMINISTRATOR_POLICY_SOURCE_CLASSES = new Set([
   "system-file",
   "system-drop-in",
@@ -230,17 +254,59 @@ function pluginOutcomeDetail(outcome: PluginResolutionOutcome): string | undefin
   }
 }
 
+function validatedSharedStateCauses(
+  value: unknown,
+  status: PluginResolutionStatus,
+): readonly PluginSharedStateCause[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2) return undefined;
+  const causes: PluginSharedStateCause[] = [];
+  for (const cause of value) {
+    if (typeof cause !== "string" || !Object.hasOwn(PLUGIN_SHARED_STATE_DETAILS, cause)) return undefined;
+    causes.push(cause as PluginSharedStateCause);
+  }
+  if (new Set(causes).size !== causes.length) return undefined;
+  if (causes.some((cause, index) =>
+    index > 0 && PLUGIN_SHARED_STATE_ORDER.indexOf(cause) <= PLUGIN_SHARED_STATE_ORDER.indexOf(causes[index - 1]!)
+  )) return undefined;
+  const installedCauses = causes.filter((cause) => INSTALLED_STATE_CAUSES.has(cause));
+  const blocklistCauses = causes.filter((cause) => BLOCKLIST_CAUSES.has(cause));
+  if (installedCauses.length > 1 || blocklistCauses.length > 1) return undefined;
+
+  const expectedStatus = blocklistCauses[0] === "blocklist-malformed"
+    ? "malformed"
+    : blocklistCauses[0] === "blocklist-unreadable"
+      ? "rejected"
+      : installedCauses[0] === "installed-state-unsupported"
+        ? "unsupported"
+        : installedCauses[0] === "installed-state-malformed"
+          ? "malformed"
+          : installedCauses[0] === "installed-state-unreadable"
+            ? "rejected"
+            : undefined;
+  return status === expectedStatus ? causes : undefined;
+}
+
 function buildPluginPosture(outcomes: readonly PluginResolutionOutcome[]): PluginPosture | undefined {
   if (outcomes.length === 0) return undefined;
   const counts: Partial<Record<PluginResolutionStatus, number>> = {};
-  const details: string[] = [];
+  const individualDetails: string[] = [];
+  const sharedCauses = new Set<PluginSharedStateCause>();
   for (const raw of outcomes) {
     if (!raw || typeof raw !== "object" || !PLUGIN_STATUS_ORDER.includes(raw.status)) continue;
     counts[raw.status] = (counts[raw.status] ?? 0) + 1;
+    const outcomeCauses = validatedSharedStateCauses(raw.sharedStateCauses, raw.status);
+    if (outcomeCauses) {
+      for (const cause of outcomeCauses) sharedCauses.add(cause);
+      continue;
+    }
     const detail = pluginOutcomeDetail(raw);
-    if (detail) details.push(detail);
+    if (detail) individualDetails.push(detail);
   }
   if (Object.keys(counts).length === 0) return undefined;
+  const details = [
+    ...PLUGIN_SHARED_STATE_ORDER.filter((cause) => sharedCauses.has(cause)).map((cause) => PLUGIN_SHARED_STATE_DETAILS[cause]),
+    ...individualDetails,
+  ];
   return {
     counts,
     details: details.slice(0, PLUGIN_POSTURE_DETAIL_MAX),
@@ -279,7 +345,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     if (pluginPosture.omitted > 0) {
       addFinding(
         selectionCapability,
-        `${pluginPosture.omitted} additional actionable plugin outcome(s) omitted; no fallback content loaded for rejected outcomes. Inspect Claude Code's installed state, then relaunch PiCC.`,
+        `${pluginPosture.omitted} additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then relaunch PiCC.`,
       );
     }
   }
@@ -1280,7 +1346,7 @@ export function renderDoctorReport(
   if (grouped.length === 0 && !hasPluginRuntimeFindings) {
     lines.push("No compatibility findings detected.");
   } else if (grouped.length > 0) {
-    lines.push("Findings (declared by this project, not fully honored):");
+    lines.push("Compatibility findings:");
     for (const tier of TIER_ORDER) {
       const inTier = grouped.filter((g) => g.capability.tier === tier);
       if (inTier.length === 0) continue;
