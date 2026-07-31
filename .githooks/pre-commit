@@ -1,19 +1,13 @@
 #!/bin/sh
-# Pre-commit gate: type-check src + tests, then run the fast test layers
-# (unit + offline integration, no e2e). Wired via `git config core.hooksPath
-# .githooks` — done automatically by `npm install` / `npm ci` (prepare script);
-# manual after an --ignore-scripts install. Bypassing with --no-verify defeats
-# the gate; don't.
+# Pre-commit gate: type-check src + tests, then run the unit lane.
+# Install it with `npm run hooks:install`; bypassing with --no-verify defeats
+# the gate.
 #
 # Git exports GIT_DIR/GIT_INDEX_FILE into hook processes; the worktree tests
 # spawn their own git in temp repos and must not inherit this commit's context.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
-echo "pre-commit: npm run typecheck:all && npm run test:unit (e2e excluded)"
-if ! npm run typecheck:all; then
-  echo "pre-commit: typecheck failed - commit aborted." >&2
-  exit 1
-fi
-if ! npm run test:unit; then
-  echo "pre-commit: tests failed - commit aborted." >&2
+echo "pre-commit: npm run verify (unit lane only)"
+if ! npm run verify; then
+  echo "pre-commit: verification failed - commit aborted." >&2
   exit 1
 fi
