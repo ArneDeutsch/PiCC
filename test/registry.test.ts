@@ -19,6 +19,7 @@ import {
   renderDoctorReport,
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
+import { resolveMcpConfig } from "../src/discovery/mcp.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -161,6 +162,25 @@ function makeMcp(overrides: Partial<ResolvedMcpConfig> = {}): ResolvedMcpConfig 
   return { servers: [], diagnostics: [], ...overrides };
 }
 
+function resolveAuditedMcp(block: Record<string, unknown>): ResolvedMcpConfig {
+  const names = Object.keys(block);
+  return resolveMcpConfig({
+    projectRoot: path.join(os.tmpdir(), "picc-registry-audit-root"),
+    mcpJson: {
+      servers: normalizeMcpServerBlock(block, ".mcp.json"),
+      diagnostics: [],
+      present: true,
+    },
+    mcpSettings: [{
+      scope: "user",
+      sourcePath: path.join(os.tmpdir(), "picc-registry-audit-user-settings.json"),
+      enabledMcpjsonServers: names,
+    }],
+    env: {} as NodeJS.ProcessEnv,
+    isGitTracked: () => false,
+  });
+}
+
 const tempDirs: string[] = [];
 function makeTempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-registry-test-"));
@@ -238,7 +258,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
+    { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
     { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
@@ -394,17 +414,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
     // The blanket "MCP deferred" wording is swept off entries whose surface now
     // partially runs; each names its specific deferred surface instead.
-    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toBe(
-      "MCP elicitation hook events — parsed and never fired: elicitation itself is a deferred MCP surface (see feature.mcp-elicitation), while supported MCP tools otherwise run",
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain(
+      "historical PiCC compatibility alias",
     );
-    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toBe(
-      "PiCC imposes no MCP server idle timeout; remote transport or server loss may still enter recovery or terminal failure",
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain(
+      "not the current Claude Code hook contract",
     );
-    expect(lookupCapability("feature.mcp-oauth")?.note).toBe(
-      "the real oauth MCP entry field is recognized key-only and ignored so the server may otherwise run; interactive MCP OAuth login, value parsing, requests, and token storage are deferred, and authentication failures direct users to configured static headers without claiming an HTTP status proves OAuth is required",
-    );
+    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toContain("transport-specific idle timers");
+    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toContain("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0");
+    const oauth = lookupCapability("feature.mcp-oauth")?.note ?? "";
+    for (const surface of ["401/403 auth detection", "automatic token refresh", "fixed callback port", "preconfigured credentials", "authServerMetadataUrl", "oauth.scopes", "dynamic registration", "offline_access", "insufficient_scope"]) {
+      expect(oauth).toContain(surface);
+    }
+    expect(oauth).toContain("`oauth` field is ignored");
+    expect(oauth).toContain("server still runs when otherwise usable");
+    expect(oauth).toContain("must not rely on `oauth` under PiCC");
+    expect(oauth).toContain("static headers are PiCC's supported alternative");
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
-    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("MCP tools themselves run");
+    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
       expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
@@ -832,7 +859,7 @@ describe("capabilityForToolName", () => {
     const cap = capabilityForToolName("mcp__myserver__do_thing");
     expect(cap.id).toBe("tool.mcp__*");
     expect(cap.tier).toBe("partial");
-    expect(cap.safetyRelevant).toBe(true);
+    expect(cap.safetyRelevant).toBe(false);
   });
 
   it("synthesizes a safe not-supported entry for unknown tools without mutating the registry", () => {
@@ -1234,89 +1261,88 @@ describe("buildCompatReport", () => {
     expect(diags[0]!.evidence).not.toContain("/secret/expanded/bin");
   });
 
-  it("routes the key-only deferred oauth diagnostic to its dedicated capability", () => {
+  it.each([
+    ["alwaysLoad", "feature.mcp-server-always-load"],
+    ["role", "feature.mcp-server-role"],
+  ] as const)("attributes a loader-normalized %s-only server through the full resolver pipeline", (field, capabilityId) => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "oauth-server",
-          status: "enabled",
-          diagnostics: [
-            'MCP server "oauth-server": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
-          ],
-        })],
-      }),
+      mcp: resolveAuditedMcp({ only: { command: "node", [field]: true } }),
     });
     const report = buildCompatReport(project);
     expect(report.findings).toEqual([
       expect.objectContaining({
-        capability: expect.objectContaining({ id: "feature.mcp-oauth" }),
-        evidence: 'MCP server "oauth-server": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
+        capability: expect.objectContaining({ id: capabilityId }),
+        evidence: `MCP server "only": "${field}" is a deferred feature in PiCC; ignored (server still runs)`,
       }),
     ]);
-    expect(JSON.stringify(report)).not.toContain("OAUTH_VALUE_CANARY");
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain(`${capabilityId} —`);
+    expect(rendered).toContain("ignored");
+    expect(rendered).toContain("server still runs");
+    if (field === "role") {
+      expect(rendered).toContain("must not rely on the field under PiCC");
+      expect(rendered).toContain("unverified");
+    } else {
+      expect(rendered).toContain("tool-search exemption");
+      expect(rendered).toContain("Check `/mcp` readiness");
+      expect(rendered).toContain("use Claude Code if the startup guarantee is required");
+    }
   });
 
-  it("splits a loader-produced oauth diagnostic from unrelated evidence on the same server", () => {
-    const [loaded] = normalizeMcpServerBlock({
-      mixed: {
-        command: "node",
-        oauth: { clientId: "OAUTH_VALUE_CANARY" },
-        futureOption: true,
-      },
-    }, ".mcp.json");
-    expect(loaded).toBeDefined();
+  it("splits remote OAuth, alwaysLoad, and role diagnostics while retaining the unrelated fallback", () => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "mixed",
-          status: "enabled",
-          diagnostics: loaded!.diagnostics,
-        })],
+      mcp: resolveAuditedMcp({
+        mixed: {
+          type: "http",
+          url: "https://example.invalid/mcp",
+          oauth: { clientId: "OAUTH_VALUE_CANARY" },
+          alwaysLoad: true,
+          role: "reviewer",
+          futureOption: true,
+        },
       }),
     });
-
     const report = buildCompatReport(project);
-    const oauth = report.findings.filter(
-      (finding) => finding.capability.id === "feature.mcp-oauth",
-    );
-    const ordinary = report.findings.filter(
-      (finding) => finding.capability.id === "feature.mcp",
-    );
-    expect(oauth).toHaveLength(1);
-    expect(oauth[0]!.evidence).toBe(
+    const byId = new Map<string, typeof report.findings>();
+    for (const finding of report.findings) {
+      const findings = byId.get(finding.capability.id) ?? [];
+      findings.push(finding);
+      byId.set(finding.capability.id, findings);
+    }
+    expect(byId.get("feature.mcp-oauth")?.[0]?.evidence).toBe(
       'MCP server "mixed": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
     );
-    expect(oauth[0]!.evidence).not.toContain("futureOption");
-    expect(ordinary).toHaveLength(1);
-    expect(ordinary[0]!.evidence).toBe(
+    expect(byId.get("feature.mcp-server-always-load")?.[0]?.evidence).toBe(
+      'MCP server "mixed": "alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(byId.get("feature.mcp-server-role")?.[0]?.evidence).toBe(
+      'MCP server "mixed": "role" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(byId.get("feature.mcp-remote-transports")?.[0]?.evidence).toBe(
       'MCP server "mixed": unknown field "futureOption" ignored',
     );
-    expect(ordinary[0]!.evidence).not.toContain('"oauth"');
+    expect(byId.has("feature.mcp")).toBe(false);
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain("the `oauth` field is ignored");
+    expect(rendered).toContain("server still runs when otherwise usable");
+    expect(rendered).toContain("OAuth behavior is absent");
+    expect(rendered).toContain("must not rely on `oauth` under PiCC");
+    expect(rendered).toContain("static headers are PiCC's supported alternative");
+    expect(rendered).not.toContain("OAUTH_VALUE_CANARY");
     expect(JSON.stringify(report)).not.toContain("OAUTH_VALUE_CANARY");
   });
 
-  it("does not route an oauth-named server's unrelated diagnostic to the OAuth capability", () => {
+  it("does not substring-route an oauth-named unknown field", () => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "oauth",
-          status: "enabled",
-          diagnostics: [
-            'MCP server "oauth": unknown field "futureOption"',
-            'MCP server "oauth": unrelated text containing "oauth" is a deferred feature in PiCC; but not the loader-owned entry',
-          ],
-        })],
-      }),
+      mcp: resolveAuditedMcp({ oauth: { command: "node", oauthFutureOption: true } }),
     });
     const report = buildCompatReport(project);
     expect(report.findings).toEqual([
       expect.objectContaining({
         capability: expect.objectContaining({ id: "feature.mcp" }),
-        evidence:
-          'MCP server "oauth": unknown field "futureOption"; MCP server "oauth": unrelated text containing "oauth" is a deferred feature in PiCC; but not the loader-owned entry',
+        evidence: 'MCP server "oauth": unknown field "oauthFutureOption" ignored',
       }),
     ]);
-    expect(report.findings.some((finding) => finding.capability.id === "feature.mcp-oauth")).toBe(false);
   });
 
   it("bounds diagnostic-bearing MCP findings with actionable entries first", () => {

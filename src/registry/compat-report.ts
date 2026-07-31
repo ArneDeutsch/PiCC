@@ -326,19 +326,34 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
         .sort((left, right) => left.priority - right.priority || left.index - right.index)
         .slice(0, MCP_STATUS_DETAIL_MAX);
   for (const { server } of selectedMcpServers) {
-    const oauthDiagnostic = `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`;
-    if (server.diagnostics.includes(oauthDiagnostic)) {
-      const capability = lookupCapability("feature.mcp-oauth");
+    const dedicatedDiagnostics = [
+      {
+        diagnostic: `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-oauth",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-always-load",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "role" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-role",
+      },
+    ] as const;
+    for (const { diagnostic, capabilityId } of dedicatedDiagnostics) {
+      if (!server.diagnostics.includes(diagnostic)) continue;
+      const capability = lookupCapability(capabilityId);
       if (capability) {
         addFinding(
           capability,
-          mcpStatusScalar(oauthDiagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+          mcpStatusScalar(diagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
         );
       }
     }
 
+    const extractedDiagnostics = new Set<string>(dedicatedDiagnostics.map(({ diagnostic }) => diagnostic));
     const remainingDiagnostics = server.diagnostics.filter(
-      (diagnostic) => diagnostic !== oauthDiagnostic,
+      (diagnostic) => !extractedDiagnostics.has(diagnostic),
     );
     let evidence: string | undefined;
     if (remainingDiagnostics.length > 0) {
