@@ -316,7 +316,7 @@ describe("small stable prompt security kernels", () => {
 });
 
 describe("shipped workflow verification policy", () => {
-  it("pins proportional verification ownership across the feature workflow", () => {
+  it("pins proportional verification and fail-closed routine authority without executing workflow commands", () => {
     const implementer = compact(path.join(paths.agents, "implementer.md"));
     const templates = compact(implementFile("templates.md"));
     const phaseTwo = compact(implementFile("phase-2-workspace.md"));
@@ -324,28 +324,65 @@ describe("shipped workflow verification policy", () => {
     const phaseEight = compact(implementFile("phase-8-close-review.md"));
     const phaseNine = compact(implementFile("phase-9-handoff.md"));
     const phaseNineFork = compact(implementFile("phase-9-fork-handoff.md"));
+    const testing = compact(path.join(paths.root, "doc", "testing.md"));
 
     contains(implementer, [
       "focused checks through each test file's executable owning lane",
-      "`npm run verify` (typecheck + unit) as the ordinary task gate",
       "only the integration, e2e, release, or other costlier checks the task explicitly requires",
+      "do not also run the routine `npm run verify` gate",
+      "selects either the safely established reviewed pre-commit hook or a successful direct fallback",
+      "single workflow-owned authority for the reviewed task tree",
     ]);
     contains(templates, [
       "name the focused existing/new owner and its executable lane",
       "why integration and e2e are or are not needed",
       "cross-platform concerns (windows + linux)",
+      "selects either the safely established reviewed pre-commit hook or a successful direct fallback",
+      "single workflow-owned routine `verify` gate",
+      "do not require a duplicate direct run",
+    ]);
+    contains(testing, [
+      "`e2e-*` files belong to e2e",
+      "files in `integrationtestfiles` belong to integration",
+      "every other test file belongs to unit",
+      "an explicit-path “no test files found” usually means you chose the wrong owning lane",
     ]);
     contains(phaseTwo, ["run `npm run verify` once", "routine typecheck-plus-unit baseline"]);
     expect(phaseTwo).not.toContain("verify:all");
     contains(phaseSeven, [
-      "run `npm run verify` as the ordinary task gate",
+      "run the task's focused checks and every task-required costlier lane yourself",
+      "coordinator selects the safely established reviewed pre-commit hook or a successful direct fallback",
       "only the integration, e2e, release, or other costlier checks the task explicitly requires",
       "run `npm run verify:all` only when the task explicitly requires complete verification",
+      "selects exactly one workflow-owned routine `npm run verify` authority for the reviewed tree",
       "do not impose unconditional complete verification per task",
     ]);
+    const authorityStart = phaseSeven.indexOf("with the final reviewed index reconciled");
+    const authorityEnd = phaseSeven.indexOf("then commit:", authorityStart);
+    expect(authorityStart).toBeGreaterThanOrEqual(0);
+    expect(authorityEnd).toBeGreaterThan(authorityStart);
+    const authoritySelection = phaseSeven.slice(authorityStart, authorityEnd);
+    ordered(authoritySelection, [
+      "read the effective hook setting with `git config --get core.hookspath`",
+      "never set, unset, or otherwise mutate it",
+      "if and only if its exact value is `.githooks`",
+      "`.githooks/pre-commit` resolves inside the current worktree",
+      "a non-symlink regular executable file",
+      "recorded in the reviewed index as a regular executable file",
+      "has no unstaged delta from that index",
+      "if any identity, containment, index, runnability, or delta check fails, stop before commit and do not execute the hook directly",
+      "only after all checks pass",
+      "effective value is absent or anything other than `.githooks`",
+      "run `npm run verify` directly once and require success before commit",
+      "user-selected hooks are outside this workflow-owned authority and may still run during commit",
+      "if the coordinator observes a tracked-tree or index change after authority selection but before commit, return to review and authority selection",
+      "do not run a second gate on stale evidence",
+    ]);
+    expect(phaseSeven).not.toContain("git config core.hookspath .githooks");
+    expect(phaseSeven).not.toContain("configure it to `.githooks`");
     contains(phaseEight, [
-      "the coordinator runs one `npm run verify:all`",
-      "final-integration complete gate",
+      "after all accepted close fixes and required regeneration are complete, the coordinator runs one `npm run verify:all`",
+      "this is the final-integration complete gate",
     ]);
     contains(phaseNine, [
       "if `<pushremote>/<default>` moved, merge it into the feature branch, resolve conflicts, and run `npm run verify:all` again",

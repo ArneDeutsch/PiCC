@@ -114,7 +114,10 @@ Windows/Linux. Contributors who opt in with `npm run hooks:install` get the rout
 (typecheck plus unit) pre-commit gate. Use `verify` for ordinary task work and `verify:all` for final
 integration and releases.
 
-For a focused inner loop, pass an exact file through its executable owning lane:
+For a focused inner loop, pass an exact file through its executable owning lane. The lookup is
+executable: `e2e-*` files belong to e2e; files in `integrationTestFiles` belong to integration; every
+other test file belongs to unit. An explicit-path “No test files found” usually means you chose the
+wrong owning lane.
 
 ```bash
 npm run test:unit -- test/permissions.test.ts

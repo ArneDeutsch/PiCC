@@ -66,12 +66,14 @@ Everything the implementer can't safely invent alone.>
 ## Testing
 <For every regression: name the focused existing/new owner and its executable lane. Name the broad
 lanes required for this task, why integration and e2e are or are not needed, and cross-platform
-concerns (Windows + Linux). `verify` is the routine gate; require `verify:all` only when this task
-needs complete verification.>
+concerns (Windows + Linux). After review and fixes, the coordinator selects either the safely
+established reviewed pre-commit hook or a successful direct fallback as the single workflow-owned
+routine `verify` gate; do not require a duplicate direct run. Require `verify:all` only when this task needs complete
+verification.>
 
 ## Acceptance criteria
 - [ ] <verifiable statement>
-- [ ] focused checks, `verify`, and any task-required broader lanes green
+- [ ] focused checks and any task-required broader lanes green
 
 ## Depends on
 <task ids, or –>
