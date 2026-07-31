@@ -147,11 +147,35 @@ describe("plugin startup notice", () => {
       expect(notice?.match(new RegExp(`same-${status}@market`, "g"))).toHaveLength(1);
     }
     const policy = renderPluginStartupNotice(undefined, [
-      { severity: "warning", message: "x", category: "managed-policy-malformed", sourceClass: `class\u001b${"x".repeat(200)}`, impact: "weaker-policy-suppressed" },
-      { severity: "warning", message: "y", category: "managed-policy-unreadable", sourceClass: `class\u001b${"x".repeat(200)}`, impact: "weaker-policy-suppressed" },
-    ] as any);
-    expect(policy).not.toContain("\u001b");
+      { severity: "warning", message: "x", category: "managed-policy-malformed", sourceClass: "system-file", impact: "weaker-policy-suppressed" },
+      { severity: "warning", message: "y", category: "managed-policy-unreadable", sourceClass: "system-file", impact: "weaker-policy-suppressed" },
+    ]);
+    expect(policy?.match(/system-file/g)).toHaveLength(1);
     expect(policy!.length).toBeLessThan(400);
+  });
+
+  it("reports a source-ignored system administrator policy without claiming weaker suppression", () => {
+    const notice = renderPluginStartupNotice(undefined, [{
+      severity: "warning",
+      message: "raw administrator detail",
+      category: "managed-policy-malformed",
+      sourceClass: "system-drop-in",
+      impact: "source-ignored",
+    }]);
+    expect(notice).toContain("system-drop-in");
+    expect(notice).toContain("that administrator source was ignored");
+    expect(notice).not.toContain("weaker policy was suppressed");
+    expect(notice).not.toContain("raw administrator detail");
+  });
+
+  it.each(["registry-hkcu", "override"] as const)("does not call %s an administrator startup failure", (sourceClass) => {
+    expect(renderPluginStartupNotice(undefined, [{
+      severity: "warning",
+      message: "user-owned source detail",
+      category: "managed-policy-unreadable",
+      sourceClass,
+      impact: "source-ignored",
+    }])).toBeUndefined();
   });
 
   it("bounds and sanitizes enabled failures and reports administrator policy suppression", () => {

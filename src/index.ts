@@ -576,17 +576,23 @@ export function renderPluginStartupNotice(
     );
   }
 
-  const policyClasses = [...new Set(diagnostics
-    .filter((diagnostic) =>
-      (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") &&
-      diagnostic.impact === "weaker-policy-suppressed" &&
-      diagnostic.sourceClass,
-    )
-    .map((diagnostic) => sanitizeLine(diagnostic.sourceClass!, 80)))]
-    .slice(0, 3);
-  if (policyClasses.length > 0) {
+  const administratorPolicyClasses = new Set(["system-file", "system-drop-in", "registry-hklm"]);
+  const policyDiagnostics = diagnostics.filter((diagnostic) =>
+    (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") &&
+    (diagnostic.impact === "source-ignored" || diagnostic.impact === "weaker-policy-suppressed") &&
+    diagnostic.sourceClass !== undefined && administratorPolicyClasses.has(diagnostic.sourceClass),
+  );
+  for (const impact of ["source-ignored", "weaker-policy-suppressed"] as const) {
+    const policyClasses = [...new Set(policyDiagnostics
+      .filter((diagnostic) => diagnostic.impact === impact)
+      .map((diagnostic) => sanitizeLine(diagnostic.sourceClass!, 80)))]
+      .slice(0, 3);
+    if (policyClasses.length === 0) continue;
+    const consequence = impact === "weaker-policy-suppressed"
+      ? "weaker policy was suppressed and plugin enablement may differ"
+      : "that administrator source was ignored and plugin enablement may differ";
     lines.push(
-      `Administrator plugin policy was malformed or unreadable (${policyClasses.join(", ")}); weaker policy was suppressed and plugin enablement may differ. Repair policy and relaunch PiCC.`,
+      `Administrator plugin policy was malformed or unreadable (${policyClasses.join(", ")}); ${consequence}. Repair policy and relaunch PiCC.`,
     );
   }
   return lines.length > 0 ? lines.join("\n") : undefined;

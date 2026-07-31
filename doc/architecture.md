@@ -163,12 +163,14 @@ manifestless content uses the installed identity's lifecycle name.
 
 `src/project.ts` is the commit point: it combines source-aware settings enablement with imported
 records, then merges successful contributions into the ordinary project registries while preserving
-qualified runtime context. Terminal installed-root, identity, manifest, declaration, containment,
-or close-to-use failures reject the plugin as a unit. Safe component parse or loader warnings may
-instead omit only affected content while the plugin remains loaded. Runtime activation and subagent
-construction use qualified context for root/data/project substitution and create isolated persistent
-data only at point of use. Selection diagnostics and retained runtime failures flow to the
-compatibility report; no diagnostic pass rescans plugin storage.
+qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
+containment, or component-source failures reject the plugin as a unit. Safe component parse or
+loader warnings may instead omit only affected content while the plugin remains loaded. Runtime
+activation and subagent construction use qualified context for root/data/project substitution and
+create isolated persistent data only at point of use; a close-to-use failure blocks that execution
+and is retained for compatibility reporting without retroactively changing assembly. Selection
+diagnostics and retained runtime failures flow to the compatibility report; no diagnostic pass
+rescans plugin storage.
 
 ### `engine/` — the deterministic enforcement primitives
 

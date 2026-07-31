@@ -219,14 +219,14 @@ function readBlocklist(
   }
   const blocked = new Set<string>();
   for (const entry of (parsed["plugins"] ?? []) as unknown[]) {
-    if (!isPlainObject(entry) || !isQualifiedPluginId(entry["plugin"] as string)) {
+    if (!isPlainObject(entry) || typeof entry["plugin"] !== "string" || !isQualifiedPluginId(entry["plugin"])) {
       return {
         blocked: new Set(),
         status: "malformed",
         diagnostic: { severity: "warning", message: "Plugin blocklist is malformed; all enabled plugins were rejected", source: file },
       };
     }
-    blocked.add(entry["plugin"] as string);
+    blocked.add(entry["plugin"]);
   }
   return { blocked, status: "valid" };
 }
@@ -694,8 +694,15 @@ export function loadPluginHooks(plugin: InstalledPlugin): {
         diagnostics.push({ severity: "warning", message: "Unsafe plugin hook event key was ignored" });
         continue;
       }
+      if (!Array.isArray(entries)) {
+        diagnostics.push({
+          severity: "warning",
+          message: "Plugin hook event contribution must be an array and was ignored",
+        });
+        continue;
+      }
       const existing = Object.hasOwn(config, event) ? config[event] : undefined;
-      config[event] = Array.isArray(existing) && Array.isArray(entries) ? [...existing, ...entries] : entries;
+      config[event] = [...(Array.isArray(existing) ? existing : []), ...entries];
     }
   }
   return { config, diagnostics, rejected, rejectionDiagnostics };

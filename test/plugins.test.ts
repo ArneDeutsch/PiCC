@@ -326,7 +326,13 @@ describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
   });
 
   it("every malformed or unreadable non-absent blocklist rejects all with one bounded diagnostic", () => {
-    for (const content of ["not json", "[]", '{"plugins":{}}', '{"plugins":[{"plugin":"bare"}]}']) {
+    for (const content of [
+      "not json",
+      "[]",
+      '{"plugins":{}}',
+      '{"plugins":[{"plugin":"bare"}]}',
+      '{"plugins":[{"plugin":["alpha@official"]}]}',
+    ]) {
       write(path.join(userDir, "plugins", "blocklist.json"), content);
       const beta = record({ pluginId: "beta@official", installPath: installedRoot("beta@official") });
       const result = resolve({ enabled: { "alpha@official": true, "beta@official": true }, installations: [record(), beta] });
@@ -413,7 +419,13 @@ describe("resolveInstalledPlugins — component declarations", () => {
       skills: "./extra-skills",
       commands: ["./custom-command.md", "./custom-commands"],
       agents: ["./custom-agents", "./custom-agent.md"],
-      hooks: ["./custom-hooks.json", { SessionStart: [{ hooks: ["echo inline"] }] }],
+      hooks: [
+        "./custom-hooks.json",
+        { PreToolUse: [{ hooks: ["echo inline"] }] },
+        { PreToolUse: "echo malformed-string" },
+        { PreToolUse: { hooks: ["echo malformed-object"] } },
+        { PreToolUse: 42 },
+      ],
     }));
     write(path.join(installation.installPath, "skills", "default", "SKILL.md"), "---\ndescription: d\n---\nbody");
     write(path.join(installation.installPath, "extra-skills", "extra", "SKILL.md"), "---\ndescription: e\n---\nbody");
@@ -432,11 +444,18 @@ describe("resolveInstalledPlugins — component declarations", () => {
     expect(plugin.commandSources.map((item) => item.source.kind)).toEqual(["file", "directory"]);
     expect(plugin.agentSources).toHaveLength(2);
     expect(plugin.agentSources.map((item) => item.source.kind)).toEqual(["directory", "file"]);
-    expect(plugin.hookSources).toHaveLength(3);
+    expect(plugin.hookSources).toHaveLength(6);
     const hooks = loadPluginHooks(plugin);
-    expect(hooks.diagnostics).toEqual([]);
-    expect(hooks.config["PreToolUse"]).toHaveLength(2);
-    expect(hooks.config["SessionStart"]).toHaveLength(1);
+    expect(hooks.config["PreToolUse"]).toEqual([
+      { hooks: ["echo default"] },
+      { hooks: ["echo custom"] },
+      { hooks: ["echo inline"] },
+    ]);
+    expect(hooks.diagnostics).toEqual(Array.from({ length: 3 }, () => ({
+      severity: "warning",
+      message: "Plugin hook event contribution must be an array and was ignored",
+    })));
+    expect(JSON.stringify(hooks.config)).not.toContain("malformed");
   });
 
   it("rejects all recognized wrong types and invalid component-aware explicit declarations without fallback", () => {
@@ -472,6 +491,31 @@ describe("resolveInstalledPlugins — component declarations", () => {
       expect(evidence).not.toContain(target);
       fs.rmSync(installation.installPath, { recursive: true, force: true });
     }
+  });
+
+  it.each([
+    ["commands", "./valid-command.md", "valid command"],
+    ["agents", "./valid-agent.md", "---\ndescription: valid agent\n---\nvalid agent"],
+    ["hooks", "./valid-hooks.json", JSON.stringify({ PreToolUse: "echo valid-hook" })],
+  ] as const)("rejects an entire plugin when a %s path array mixes valid and invalid declarations", (field, validPath, content) => {
+    const installation = record();
+    write(path.join(installation.installPath, validPath.slice(2)), content);
+    write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({
+      name: "alpha",
+      [field]: [validPath, "./missing-source"],
+    }));
+    write(path.join(installation.installPath, "commands", "default-canary.md"), "default canary");
+    write(path.join(installation.installPath, "agents", "default-canary.md"), "---\ndescription: default canary\n---\ndefault canary");
+    write(path.join(installation.installPath, "hooks", "hooks.json"), JSON.stringify({ PreToolUse: "echo default-canary" }));
+
+    const result = resolve({ installations: [installation] });
+
+    expect(result.plugins).toEqual([]);
+    expect(result.outcomes[0]).toMatchObject({ status: "rejected" });
+    expect(result.outcomes[0]!.context).toBeUndefined();
+    expect(result.outcomes[0]!.sources).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("valid-hook");
+    expect(JSON.stringify(result)).not.toContain("default-canary");
   });
 
   it.skipIf(!fileLinkProbe)("rejects an explicit file-link escape without fallback or path disclosure", () => {

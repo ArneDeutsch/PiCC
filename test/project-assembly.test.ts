@@ -143,6 +143,34 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.skills.some((s) => s.source.pluginName === "alpha")).toBe(false);
     expect(JSON.stringify(project.mergedHooks)).not.toContain("alpha-hook");
   });
+
+  it.each([
+    ["stale cache", ["plugins", "cache", "official", "alpha", "0.9.0"], "stale-cache"],
+    ["marketplace/catalog-style", ["plugins", "marketplaces", "official", "plugins", "alpha"], "catalog"],
+  ] as const)("does not treat %s content as an installed record", (_label, segments, canary) => {
+    const { repo, userDir } = makeBase();
+    const root = path.join(userDir, ...segments);
+    write(path.join(root, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha" }));
+    writeSkill(path.join(root, "skills"), `${canary}-skill`, `${canary}-skill-description`);
+    write(path.join(root, "commands", `${canary}-command.md`), `${canary}-command-body`);
+    write(path.join(root, "agents", `${canary}-agent.md`), `---\ndescription: ${canary}-agent-description\n---\n${canary}-agent-body`);
+    write(path.join(root, "hooks", "hooks.json"), JSON.stringify({
+      PreToolUse: [{ hooks: [`echo ${canary}-hook`] }],
+    }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+
+    const project = load(repo, userDir);
+    const outcome = project.pluginResolutionOutcomes.find((item) => item.pluginId === "alpha@official")!;
+    expect(outcome).toMatchObject({ pluginId: "alpha@official", status: "enabled-but-uninstalled", diagnostics: [] });
+    expect(outcome.context).toBeUndefined();
+    expect(outcome.sources).toBeUndefined();
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.size).toBe(0);
+    expect(project.skills.some((item) => item.name.includes(`${canary}-skill`))).toBe(false);
+    expect(project.skills.some((item) => item.name.includes(`${canary}-command`))).toBe(false);
+    expect(project.agents.some((item) => item.name.includes(`${canary}-agent`))).toBe(false);
+    expect(JSON.stringify(project.mergedHooks)).not.toContain(`${canary}-hook`);
+  });
 });
 
 describe("loadClaudeProject — installed hook provenance", () => {
@@ -166,6 +194,9 @@ describe("loadClaudeProject — installed hook provenance", () => {
       hooks: [
         "./explicit-hooks.json",
         { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command, args: ["inline"] }] }] },
+        { PreToolUse: command },
+        { PreToolUse: { type: "command", command, args: ["malformed-object"] } },
+        { PreToolUse: 42 },
       ],
     }));
     write(
@@ -189,6 +220,11 @@ describe("loadClaudeProject — installed hook provenance", () => {
       "two@second-market",
     ]);
     expect(handlers.filter((handler) => handler.raw["pluginId"] === "forged@raw")).toHaveLength(2);
+    expect(project.diagnostics.filter((item) =>
+      item.message === "Plugin hook event contribution must be an array and was ignored",
+    )).toHaveLength(3);
+    expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "one@first-market")?.diagnostics)
+      .toContainEqual(expect.objectContaining({ message: expect.stringContaining("unsupported content") }));
 
     const runner = new HookRunner({
       config: project.mergedHooks,
@@ -221,6 +257,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
       { label: "inline", root: firstRoot, data: project.pluginContexts.get("one@first-market")!.dataDir, project: repo },
       { label: "shared", root: secondRoot, data: project.pluginContexts.get("two@second-market")!.dataDir, project: repo },
     ]));
+    expect(records.some((record) => record.label.startsWith("malformed"))).toBe(false);
   });
 
   it.skipIf(!directoryLinkProbe)("keeps canonical skill, agent, and hook runtime roots fixed after cache-link retargeting", async () => {
