@@ -37,7 +37,7 @@ const TIER_LEGEND = [
   ["full", "Implemented for real; every field the format defines is functional."],
   ["partial", "Works within limits — parsed and matched, but a constraint applies (see the note)."],
   ["degraded-noop", "Parsed and reported, then a visible, documented no-op. Never crashes."],
-  ["not-supported", "Out of scope; the name still resolves for gating and degrades safely."],
+  ["not-supported", "The capability behavior is unavailable in PiCC; any recognized input degrades as its note describes."],
   ["n/a", "Not applicable to this harness."],
 ];
 
@@ -59,15 +59,33 @@ function idCell(entry) {
   return `\`${escapeCell(entry.id)}\`${mark}`;
 }
 
+const EVIDENCE_ORDER = ["documented", "observed", "inferred", "unverified"];
+const compareCodeUnits = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+
+function evidenceCell(entry) {
+  return (entry.evidence ?? [])
+    .slice()
+    .sort((a, b) => {
+      const quality = EVIDENCE_ORDER.indexOf(a.quality) - EVIDENCE_ORDER.indexOf(b.quality);
+      return quality !== 0 ? quality : compareCodeUnits(a.source, b.source);
+    })
+    .map((record) => `${record.quality}: ${record.source}${record.reviewed ? ` (${record.reviewed})` : ""}`)
+    .join("; ");
+}
+
+function relatedCell(entry) {
+  return (entry.related ?? []).slice().sort(compareCodeUnits).map((id) => `\`${id}\``).join(", ");
+}
+
 function renderTable(kindEntries) {
   const rows = kindEntries
     .slice()
     .sort((a, b) => {
       const t = TIER_ORDER.indexOf(a.tier) - TIER_ORDER.indexOf(b.tier);
-      return t !== 0 ? t : a.id.localeCompare(b.id);
+      return t !== 0 ? t : compareCodeUnits(a.id, b.id);
     })
-    .map((e) => `| ${idCell(e)} | ${TIER_LABELS[e.tier] ?? e.tier} | ${escapeCell(e.note)} |`);
-  return ["| ID | Tier | Note |", "|---|---|---|", ...rows].join("\n");
+    .map((e) => `| ${idCell(e)} | ${TIER_LABELS[e.tier] ?? e.tier} | ${escapeCell(evidenceCell(e))} | ${escapeCell(relatedCell(e))} | ${escapeCell(e.note)} |`);
+  return ["| ID | Tier | Claude evidence | Related | Note |", "|---|---|---|---|---|", ...rows].join("\n");
 }
 
 /**
@@ -75,7 +93,7 @@ function renderTable(kindEntries) {
  * written to doc/supported-features.md. Pure — no I/O, no spawning — so a test
  * can call it with the imported registry and diff against the committed file.
  *
- * @param {Array<{ id: string, kind: string, tier: string, safetyRelevant?: boolean, note: string }>} entries
+ * @param {ReadonlyArray<{ id: string, kind: string, tier: string, safetyRelevant?: boolean, evidence?: ReadonlyArray<{quality: string, source: string, reviewed?: string}>, related?: ReadonlyArray<string>, note: string }>} entries
  * @param {string} baseline
  * @returns {string} the complete Markdown (ends with a single trailing newline).
  */
@@ -88,10 +106,15 @@ export function renderCapabilityMatrix(entries, baseline) {
 
   const tierCounts = Object.fromEntries(TIER_ORDER.map((t) => [t, 0]));
   let safetyCount = 0;
+  const reviewedDates = [];
   for (const e of entries) {
     tierCounts[e.tier] = (tierCounts[e.tier] ?? 0) + 1;
     if (e.safetyRelevant === true) safetyCount++;
+    for (const record of e.evidence ?? []) {
+      if (record.reviewed) reviewedDates.push(record.reviewed);
+    }
   }
+  const auditDates = [...new Set(reviewedDates)].sort(compareCodeUnits);
 
   const lines = [];
   lines.push("# Supported features");
@@ -117,9 +140,19 @@ export function renderCapabilityMatrix(entries, baseline) {
   }
   lines.push("");
   lines.push(
-    "A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended " +
-      "to restrict now runs freely. The matrix marks every safety-relevant registry entry; `/doctor` " +
-      "labels detected project-specific safety findings.",
+    "Tier and Note describe PiCC behavior. **Claude evidence** describes only the upstream Claude Code surface: " +
+      "documented = stated by an allowlisted official page; observed = reproduced on the named Claude version and bounded path; " +
+      "inferred = reasoned from indirect evidence; unverified = the reviewed evidence does not establish the behavior. " +
+      "Multiple qualities on one row are intentionally mixed; a blank cell means the entry was not part of this audit.",
+  );
+  if (auditDates.length === 1) {
+    lines.push(`The structured official-document review horizon is **${auditDates[0]}**.`);
+  } else if (auditDates.length > 1) {
+    lines.push(`The structured official-document review dates span **${auditDates[0]}** through **${auditDates.at(-1)}** (${auditDates.join(", ")}).`);
+  }
+  lines.push(
+    "**Related references** are navigation and context only; search this document or the registry by ID. They do not imply a shared tier, evidence quality, or dependency. " +
+      "A separate ⚠ marker means PiCC fails to enforce an upstream restriction or mandatory gate, allowing an operation that should be restricted to run freely; `/doctor` labels detected project-specific safety findings.",
   );
   lines.push("");
 

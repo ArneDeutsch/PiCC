@@ -57,6 +57,14 @@ export interface CompatReport {
 // ---------------------------------------------------------------------------
 
 const SUPPORTED_EVENT_SET: ReadonlySet<string> = new Set<string>(SUPPORTED_HOOK_EVENTS);
+const MCP_TOOL_BLOCKING_EVENT_SET: ReadonlySet<string> = new Set<string>([
+  "PreToolUse",
+  "UserPromptSubmit",
+  "Stop",
+  "SubagentStop",
+  "PreCompact",
+  "WorktreeCreate",
+] satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][]);
 
 /** Deferred settings key with no dedicated registry entry: recognized, degrades. */
 function deferredSettingCapability(key: string): CapabilityEntry {
@@ -167,13 +175,21 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // activation), so every shape here is project-controlled input: a single matcher
   // object instead of an array, missing `hooks`, missing handler `type` (defaults
   // to "command"). Scanning must never throw (completeness floor).
-  const scanHooks = (config: HookConfig | undefined, where: string) => {
+  const scanHooks = (
+    config: HookConfig | undefined,
+    where: string,
+    effectiveEventFor: (event: string) => string = (event) => event,
+  ) => {
     if (!config || typeof config !== "object") return;
-    for (const [event, rawMatchers] of Object.entries(config)) {
+    for (const [declaredEvent, rawMatchers] of Object.entries(config)) {
+      const event = effectiveEventFor(declaredEvent);
+      const eventEvidence = event === declaredEvent
+        ? `"${event}"`
+        : `effective "${event}" (declared as agent "${declaredEvent}")`;
       if (!SUPPORTED_EVENT_SET.has(event)) {
         const cap = degradedHookEventCapability(event);
-        if (cap) addFinding(cap, `hook event "${event}" configured in ${where}`);
-        else unassessed.push(`hook event "${event}" (${where})`);
+        if (cap) addFinding(cap, `hook event ${eventEvidence} configured in ${where}`);
+        else unassessed.push(`hook event ${eventEvidence} (${where})`);
       }
       const matchers: unknown[] = Array.isArray(rawMatchers)
         ? rawMatchers
@@ -189,11 +205,14 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
           if (!handler || typeof handler !== "object") continue;
           const type = (handler as { type?: string }).type ?? "command";
           if (type === "command") continue;
-          const cap = lookupCapability(`feature.hook-handler.${type}`);
+          const capabilityId = type === "mcp_tool" && MCP_TOOL_BLOCKING_EVENT_SET.has(event)
+            ? "feature.hook-handler.mcp_tool-blocking-enforcement"
+            : `feature.hook-handler.${type}`;
+          const cap = lookupCapability(capabilityId);
           if (cap) {
-            addFinding(cap, `hook handler type "${type}" on "${event}" in ${where}`);
+            addFinding(cap, `hook handler type "${type}" on ${eventEvidence} in ${where}`);
           } else {
-            unassessed.push(`hook handler type "${type}" on "${event}" (${where})`);
+            unassessed.push(`hook handler type "${type}" on ${eventEvidence} (${where})`);
           }
         }
       }
@@ -250,6 +269,11 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     if (agent.hooks !== undefined) {
       const cap = lookupCapability("agent.frontmatter.hooks");
       if (cap) addFinding(cap, `agent "${agent.name}" sets hooks:`);
+      scanHooks(
+        agent.hooks,
+        `agent "${agent.name}"`,
+        (event) => event === "Stop" ? "SubagentStop" : event,
+      );
     }
     if (agent.permissionMode !== undefined) {
       // Safety-relevant no-op: an agent restricting its permission mode still
@@ -326,19 +350,38 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
         .sort((left, right) => left.priority - right.priority || left.index - right.index)
         .slice(0, MCP_STATUS_DETAIL_MAX);
   for (const { server } of selectedMcpServers) {
-    const oauthDiagnostic = `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`;
-    if (server.diagnostics.includes(oauthDiagnostic)) {
-      const capability = lookupCapability("feature.mcp-oauth");
+    const dedicatedDiagnostics = [
+      {
+        diagnostic: `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-oauth",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-always-load",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "role" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-role",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": field "url" is ignored on a stdio server`,
+        capabilityId: "feature.mcp-url-without-type-validation",
+      },
+    ] as const;
+    for (const { diagnostic, capabilityId } of dedicatedDiagnostics) {
+      if (!server.diagnostics.includes(diagnostic)) continue;
+      const capability = lookupCapability(capabilityId);
       if (capability) {
         addFinding(
           capability,
-          mcpStatusScalar(oauthDiagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+          mcpStatusScalar(diagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
         );
       }
     }
 
+    const extractedDiagnostics = new Set<string>(dedicatedDiagnostics.map(({ diagnostic }) => diagnostic));
     const remainingDiagnostics = server.diagnostics.filter(
-      (diagnostic) => diagnostic !== oauthDiagnostic,
+      (diagnostic) => !extractedDiagnostics.has(diagnostic),
     );
     let evidence: string | undefined;
     if (remainingDiagnostics.length > 0) {
