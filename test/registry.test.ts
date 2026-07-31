@@ -19,7 +19,6 @@ import {
   renderDoctorReport,
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
-import { resolveInstalledPlugins } from "../src/claude/plugins.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -426,6 +425,106 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
   });
 
+  it("splits installed plugin support truth by selection, component, management, and lifecycle", () => {
+    expectDisclosure({
+      id: "feature.plugins-installed-selection",
+      tier: "partial",
+      core: [/read-only exact-version selection/, /qualified name@marketplace/, /load no fallback content/],
+      gap: [/undocumented/, /not PiCC's permanent API/],
+      parity: [/FIXTURE-DERIVED/, /captured Claude installed-state v2/],
+    });
+    expectDisclosure({
+      id: "feature.plugins-enablement",
+      tier: "partial",
+      core: [/literal booleans only/, /source-aware key-wise precedence/],
+      gap: [/defaultEnabled is unsupported/, /cannot establish development or bundled-root trust/],
+    });
+    const umbrella = lookupCapability("feature.plugins-content");
+    expect(umbrella).toMatchObject({ tier: "partial" });
+    for (const phrase of ["selected installed-plugin skills, commands, agents, and hooks", "fixture-derived", "development roots remain inert", "marketplace component overlays/strict", "feature.mcp-plugin-servers"]) {
+      expect(umbrella?.note).toContain(phrase);
+    }
+    const enablementNote = lookupCapability("setting.enabledPlugins")?.note ?? "";
+    expect(enablementNote).toContain(
+      "Realized load order is user settings, then for each directory from project root to cwd that directory's project settings followed by its local settings, then managed policy; the later value wins per qualified identity. A nested project's value can therefore override an ancestor's local value, unlike Claude's documented global local-over-project precedence.",
+    );
+    expect(enablementNote).not.toContain("managed > local > project > user");
+    for (const id of [
+      "feature.plugins-skills",
+      "feature.plugins-commands",
+      "feature.plugins-agents",
+      "feature.plugins-hooks",
+    ]) {
+      const entry = lookupCapability(id);
+      expect(entry?.tier, id).toBe("partial");
+      expect(entry?.note, id).toContain("qualified");
+      expect(entry?.note, id).toContain("lazy");
+      expect(entry?.note, id).toContain("VERIFIED rejected");
+      expect(entry?.note, id).toContain("PiCC-defined whole-plugin rejection");
+    }
+    const skills = lookupCapability("feature.plugins-skills")?.note ?? "";
+    expect(skills).toContain("explicit skill directories");
+    expect(skills).toContain("directory directly containing SKILL.md");
+    expect(skills).toContain("individual files are not skill declarations");
+    for (const [id, namespace] of [
+      ["feature.plugins-skills", "skill"],
+      ["feature.plugins-commands", "command"],
+      ["feature.plugins-agents", "agent"],
+    ] as const) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note).toContain("Installed qualified name@marketplace identity owns selection, variable/data context");
+      expect(note).toContain(`manifest name owns the visible ${namespace} namespace`);
+    }
+    const agents = lookupCapability("feature.plugins-agents")?.note ?? "";
+    for (const field of ["hooks", "mcpServers", "permissionMode"]) expect(agents).toContain(field);
+    const metadata = lookupCapability("feature.plugins-manifest-metadata")?.note ?? "";
+    for (const gap of ["defaultEnabled", "marketplace-entry component overlays", "marketplace strict"]) {
+      expect(metadata).toContain(gap);
+    }
+    expect(lookupCapability("feature.plugins-development-trust")).toMatchObject({ tier: "not-supported" });
+    expect(lookupCapability("feature.plugins-development-trust")?.note).toContain("repository-bundled");
+    for (const [id, command] of [
+      ["feature.plugins-command-plugin", "/plugin"],
+      ["feature.plugins-command-plugins", "/plugins"],
+      ["feature.plugins-command-reload", "/reload-plugins"],
+    ] as const) {
+      expect(lookupCapability(id)?.tier, id).toBe("degraded-noop");
+      expect(lookupCapability(id)?.note, id).toContain(command);
+      expect(lookupCapability(id)?.note, id).toMatch(/guidance|explains/);
+      expect(lookupCapability(id)?.note, id).toContain("no lifecycle mutation");
+    }
+    expect(lookupCapability("feature.plugins-command-plugins")?.note).toContain("PiCC-defined reserved alias");
+    for (const [id, phrase] of [
+      ["feature.plugin-install", "installation is not implemented"],
+      ["feature.plugin-update", "update is not implemented"],
+      ["feature.plugin-uninstall", "uninstall is not implemented"],
+      ["feature.plugin-marketplace", "marketplace discovery"],
+      ["feature.plugins-other-components", "LSP, workflows, themes, monitors, channels"],
+    ] as const) {
+      expect(lookupCapability(id)?.tier, id).toBe("not-supported");
+      expect(lookupCapability(id)?.note, id).toContain(phrase);
+    }
+    expect(lookupCapability("feature.plugins-other-components")?.note).toContain("feature.mcp-plugin-servers");
+  });
+
+  it("qualifies plugin-agent global fields and implemented managed-policy sources and merge", () => {
+    expect(lookupCapability("agent.frontmatter.hooks")?.note).toContain("for non-plugin agents");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("for non-plugin agents");
+    expect(lookupCapability("agent.frontmatter.permissionMode")?.note).toContain("for non-plugin agents");
+    const managed = lookupCapability("feature.managed-policy");
+    expect(managed?.tier).toBe("partial");
+    for (const phrase of [
+      "managed settings file",
+      "drop-in files",
+      "Windows HKLM",
+      "HKCU fallback",
+      "Scalar replacement plus recursive object merge and stable array dedup",
+      "base → drop-ins → HKLM",
+      "HKCU only when no administrator policy is present",
+      "no complete server-managed settings, MDM, MDM-preference, or policy-helper parity",
+    ]) expect(managed?.note).toContain(phrase);
+  });
+
   it.each<DisclosureContract>([
     { id: "tool.Grep", tier: "full", core: [/real implementation/, /Claude-baseline parameter surface/, /head_limit/, /offset/], gap: [/oversized-result clip backstop reshapes/], visibility: [/Grep-specific recovery hint/, /tighter pattern/, /smaller head_limit/, /offset/], parity: [/ripgrep\/JS engine parity/], split: [/feature\.tool-output-clip/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -681,12 +780,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it("settings tiers match their production consumers", () => {
-    for (const id of [
-      "setting.skillOverrides",
-      "setting.enabledPlugins",
-    ]) {
-      expect(lookupCapability(id)?.tier, id).toBe("full");
-    }
+    expect(lookupCapability("setting.skillOverrides")?.tier).toBe("full");
+    expect(lookupCapability("setting.enabledPlugins")?.tier).toBe("partial");
     const env = lookupCapability("setting.env");
     expect(env?.tier).toBe("partial");
     expect(env?.note).toContain("main/subagent Bash, hooks, skills, and MCP");
@@ -1065,60 +1160,337 @@ describe("buildCompatReport", () => {
     expect(report.findings.some((f) => f.capability.id === "tool.NotebookRead")).toBe(false);
   });
 
-  it("scans installed-plugin hook configs for degraded events and handler types", () => {
-    const fixtureRoot = makeTempDir();
-    const userDir = path.join(fixtureRoot, ".claude");
-    const projectRoot = path.join(fixtureRoot, "project");
-    const pluginRoot = path.join(userDir, "plugins", "cache", "market", "hooky", "1.0.0");
-    const hooksFile = path.join(pluginRoot, "hooks", "hooks.json");
-    fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
-    fs.mkdirSync(projectRoot, { recursive: true });
-    fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "hooky" }), "utf8");
-    fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
-    fs.writeFileSync(
-      hooksFile,
-      JSON.stringify({
-        Notification: [{ hooks: [{ type: "command", command: "notify.sh" }] }],
-        PreToolUse: { hooks: [{ type: "prompt", prompt: "degraded handler" }] },
-      }),
-      "utf8",
-    );
-    const resolved = resolveInstalledPlugins({
-      userDir,
-      projectRoot,
-      enablement: {
-        "hooky@market": { enabled: true, scope: "user", source: path.join(userDir, "settings.json") },
+  it("scans already-resolved installed-plugin hooks without reopening component files", () => {
+    const project = {
+      ...makeProject(),
+      mergedHooks: {
+        Notification: [{ hooks: [{ type: "command", command: "notify.sh", pluginId: "hooky@market", raw: {} }] }],
+        PreToolUse: [{ hooks: [{ type: "prompt", pluginId: "hooky@market", raw: {} }] }],
       },
-      installations: [{
-        pluginId: "hooky@market",
-        scope: "user",
-        installPath: pluginRoot,
-        version: "1.0.0",
-        provenance: { statePath: path.join(userDir, "plugins", "installed_plugins.json"), stateVersion: 2 },
-      }],
-      installedStateStatus: "valid",
-      env: {},
-    });
-    expect(resolved.outcomes[0]?.status).toBe("loaded");
-    const project = { ...makeProject(), plugins: resolved.plugins };
+    } as unknown as ClaudeProject;
     const report = buildCompatReport(project);
     const event = report.findings.find((f) => f.capability.id === "hook.event.Notification");
-    expect(event).toBeDefined();
-    expect(event?.evidence).toContain('plugin "hooky"');
+    expect(event?.evidence).toContain('installed plugin "hooky@market"');
     const handler = report.findings.find(
       (f) => f.capability.id === "feature.hook-handler.prompt",
     );
-    expect(handler).toBeDefined();
-    expect(handler?.evidence).toContain('plugin "hooky"');
+    expect(handler?.evidence).toContain('installed plugin "hooky@market"');
   });
 
-  it("tolerates malformed plugins entries without crashing the scan", () => {
+  it("tolerates malformed plugin outcome input without crashing the scan", () => {
     const project = {
       ...makeProject(),
-      plugins: [null, 42, "junk", { name: "no-hooks" }, { hooksFiles: "not-an-array" }],
+      pluginResolutionOutcomes: [
+        null,
+        42,
+        "junk",
+        { pluginId: 7, status: "future", diagnostics: "bad" },
+        { pluginId: "defensive@market", status: "rejected", diagnostics: [null, { message: 7 }] },
+      ],
     } as unknown as ClaudeProject;
     expect(() => buildCompatReport(project)).not.toThrow();
-    expect(buildCompatReport(project).findings).toEqual([]);
+    const report = buildCompatReport(project);
+    expect(report.findings).toHaveLength(1);
+    expect(report.findings[0]?.evidence).toContain("defensive@market");
+    expect(report.findings[0]?.evidence).toContain("no fallback content loaded");
+  });
+
+  it("reports every normalized plugin state, stripped agent fields, and activation policy safely", () => {
+    const outcomes = [
+      { pluginId: "loaded@market", status: "loaded", diagnostics: [{ severity: "warning", message: "Installed plugin agent loader reported unsupported content", source: "C:/SECRET/agent.md" }] },
+      { pluginId: "disabled@market", status: "disabled", diagnostics: [] },
+      { pluginId: "missing@market", status: "enabled-but-uninstalled", diagnostics: [] },
+      { pluginId: "future@market", status: "unsupported", diagnostics: [] },
+      { pluginId: "ambiguous@market", status: "ambiguous", diagnostics: [] },
+      { pluginId: "blocked@market", status: "blocked", diagnostics: [] },
+      { pluginId: "broken@market", status: "malformed", diagnostics: [] },
+      { pluginId: "escape@market", status: "rejected", diagnostics: [{ severity: "warning", message: "escaped path C:/ABSOLUTE/SECRET", source: "C:/ABSOLUTE/SECRET" }] },
+    ];
+    const stripped = makeAgent({
+      name: "plug:worker",
+      source: { path: "C:/SECRET/worker.md", scope: "plugin", pluginId: "plug@market", pluginName: "plug" },
+      diagnostics: ["hooks", "mcpServers", "permissionMode"].map((field) => ({
+        severity: "warning" as const,
+        message: `Plugin agent field "${field}" is forbidden and was removed`,
+        source: "C:/SECRET/worker.md",
+      })),
+    });
+    const project = {
+      ...makeProject({
+        agents: [stripped],
+        settings: makeSettings({
+          diagnostics: [
+            { severity: "warning", message: "raw administrator secret", category: "managed-policy-unreadable", sourceClass: "registry-hklm", impact: "weaker-policy-suppressed", source: "C:/SECRET/policy" },
+            { severity: "warning", message: 'Plugin "typed@market" in "enabledPlugins" must be a literal boolean; ignored', source: "C:/SECRET/settings.json" },
+          ],
+        }),
+      }),
+      pluginResolutionOutcomes: outcomes,
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    expect(report.pluginPosture?.counts).toEqual({
+      loaded: 1,
+      disabled: 1,
+      "enabled-but-uninstalled": 1,
+      unsupported: 1,
+      ambiguous: 1,
+      blocked: 1,
+      malformed: 1,
+      rejected: 1,
+    });
+    const doctor = renderDoctorReport(project, report);
+    for (const status of ["loaded", "disabled", "enabled-but-uninstalled", "unsupported", "ambiguous", "blocked", "malformed", "rejected"]) {
+      expect(doctor).toContain(`${status}: 1`);
+    }
+    for (const identity of ["missing@market", "future@market", "ambiguous@market", "blocked@market", "broken@market", "escape@market"]) {
+      expect(doctor).toContain(identity);
+    }
+    expect(doctor.match(/no fallback content loaded/g)?.length).toBeGreaterThanOrEqual(6);
+    expect(doctor).toContain("Administrator policy (registry-hklm) was unreadable; weaker policy was suppressed");
+    expect(doctor).toContain("non-boolean enablement value was ignored");
+    for (const [field, alternative] of [
+      ["hooks", "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."],
+      ["mcpServers", "Configure session MCP servers and gate their tools, or remove this field; per-agent MCP configuration is not retained."],
+      ["permissionMode", "Use deny rules and tools gating, or remove this field; plugin agents cannot retain permissionMode."],
+    ]) {
+      expect(doctor).toContain(`forbidden ${field} was stripped before subagent construction`);
+      expect(doctor).toContain(alternative);
+    }
+    expect(doctor).toContain('installed plugin "plug@market" agent "plug:worker"');
+    expect(doctor).not.toContain("No compatibility findings detected.");
+    for (const secret of ["C:/SECRET", "C:/ABSOLUTE", "raw administrator secret"]) expect(doctor).not.toContain(secret);
+    expect(doctor).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u);
+  });
+
+  it("keeps disabled plugin outcomes summary-only and non-error", () => {
+    const project = {
+      ...makeProject(),
+      pluginResolutionOutcomes: [{ pluginId: "quiet@market", status: "disabled", diagnostics: [] }],
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    expect(report.findings).toEqual([]);
+    expect(report.safetyFindings).toEqual([]);
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("Plugin selection: disabled: 1.");
+    expect(doctor).toContain("No compatibility findings detected.");
+    expect(doctor).not.toContain("quiet@market");
+  });
+
+  it("bounds and orders actionable plugin outcomes with one omission finding", () => {
+    const project = {
+      ...makeProject(),
+      pluginResolutionOutcomes: Array.from({ length: 25 }, (_, index) => ({
+        pluginId: `reject-${String(index).padStart(2, "0")}@market`,
+        status: "rejected",
+        diagnostics: [{ severity: "warning", message: "path validation failure" }],
+      })),
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    expect(report.pluginPosture?.details).toHaveLength(20);
+    expect(report.pluginPosture?.omitted).toBe(5);
+    const selection = report.findings.filter((finding) => finding.capability.id === "feature.plugins-installed-selection");
+    expect(selection).toHaveLength(21);
+    expect(selection[0]?.evidence).toContain("reject-00@market");
+    expect(selection[19]?.evidence).toContain("reject-19@market");
+    expect(selection[20]?.evidence).toContain("5 additional actionable plugin outcome(s) omitted");
+    expect(selection.map((finding) => finding.evidence).join("\n")).not.toContain("reject-20@market");
+  });
+
+  it("bounds stripped-agent and resolved-hook diagnostic detail independently", () => {
+    const agents = Array.from({ length: 10 }, (_, index) => makeAgent({
+      name: `plug:agent-${index}`,
+      source: { path: `<agent-${index}>`, scope: "plugin", pluginId: `plug-${index}@market`, pluginName: `plug-${index}` },
+      diagnostics: ["hooks", "mcpServers", "permissionMode"].map((field) => ({
+        severity: "warning" as const,
+        message: `Plugin agent field "${field}" is forbidden and was removed`,
+      })),
+    }));
+    const project = {
+      ...makeProject({ agents }),
+      mergedHooks: {
+        Notification: [{ hooks: Array.from({ length: 25 }, (_, index) => ({
+          type: "prompt",
+          pluginId: `hook-${index}@market`,
+          raw: {},
+        })) }],
+      },
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    const allFindings = [...report.safetyFindings, ...report.findings];
+    expect(allFindings.filter((finding) => finding.evidence.includes("was stripped before subagent construction"))).toHaveLength(20);
+    expect(report.findings.some((finding) => finding.evidence === "10 additional stripped plugin-agent field finding(s) omitted.")).toBe(true);
+    const hookDetails = report.findings.filter((finding) => finding.evidence.includes("installed plugin \"hook-"));
+    expect(hookDetails).toHaveLength(20);
+    expect(report.findings.some((finding) => finding.evidence === "30 additional installed-plugin hook limitation(s) omitted.")).toBe(true);
+  });
+
+  it("reports the managed-policy and activation diagnostic matrix with fixed safe wording", () => {
+    const diagnostics = [
+      { severity: "warning", message: "RAW malformed detail", category: "managed-policy-malformed", sourceClass: "system-file", impact: "source-ignored", source: "C:/RAW/managed.json" },
+      { severity: "warning", message: "RAW malformed suppressed", category: "managed-policy-malformed", sourceClass: "system-drop-in", impact: "weaker-policy-suppressed", source: "C:/RAW/drop-in.json" },
+      { severity: "warning", message: "RAW unreadable detail", category: "managed-policy-unreadable", sourceClass: "registry-hklm", impact: "source-ignored", source: "C:/RAW/HKLM" },
+      { severity: "warning", message: "RAW unreadable suppressed", category: "managed-policy-unreadable", sourceClass: "registry-hkcu", impact: "weaker-policy-suppressed", source: "C:/RAW/HKCU" },
+      { severity: "warning", message: "RAW override detail", category: "managed-policy-malformed", sourceClass: "override", impact: "source-ignored", source: "C:/RAW/override" },
+      { severity: "warning", message: "RAW unknown source", category: "managed-policy-unreadable", sourceClass: "RAW-SOURCE-CLASS", impact: "weaker-policy-suppressed", source: "C:/RAW/unknown" },
+      { severity: "warning", message: "RAW malformed source", category: "managed-policy-malformed", sourceClass: 7, impact: "RAW-IMPACT", source: "C:/RAW/malformed" },
+      { severity: "warning", message: "enabledPlugins must be a literal boolean RAW-VALUE", source: "C:/RAW/settings" },
+      { severity: "warning", message: "enabledPlugins is not an object RAW-OBJECT", source: "C:/RAW/settings" },
+      { severity: "warning", message: "plugin identity is invalid RAW-IDENTITY", source: "C:/RAW/settings" },
+      { severity: "warning", message: "enabledPlugins contains another invalid entry RAW-GENERIC", source: "C:/RAW/settings" },
+    ] as unknown as ClaudeSettings["diagnostics"];
+    const project = makeProject({ settings: makeSettings({ diagnostics }) });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    for (const phrase of [
+      "Administrator policy (system-file) was malformed; that source was ignored",
+      "Administrator policy (system-drop-in) was malformed; weaker policy was suppressed",
+      "Administrator policy (registry-hklm) was unreadable; that source was ignored",
+      "User policy fallback (registry-hkcu) was unreadable; weaker policy was suppressed",
+      "Managed-settings override was malformed; that source was ignored",
+      "Managed-policy source was unreadable; weaker policy was suppressed",
+      "Managed-policy source was malformed; policy processing was degraded",
+      "a non-boolean enablement value was ignored",
+      "the enablement mapping was not an object and was ignored",
+      "an invalid qualified identity was ignored",
+      "an invalid activation entry was ignored",
+    ]) expect(doctor).toContain(phrase);
+    expect(doctor).not.toContain("No compatibility findings detected.");
+    for (const raw of ["C:/RAW", "RAW-SOURCE-CLASS", "RAW-IMPACT", "RAW-VALUE", "RAW-OBJECT", "RAW-IDENTITY", "RAW-GENERIC"]) expect(doctor).not.toContain(raw);
+    expect(doctor).not.toContain("Administrator policy (override)");
+    expect(doctor).not.toContain("Administrator policy (registry-hkcu)");
+    expect(doctor.match(/Administrator policy/g)).toHaveLength(3);
+  });
+
+  it("keeps a clean loaded outcome summary-only and gives loaded component limitations bounded actions", () => {
+    const clean = {
+      ...makeProject(),
+      pluginResolutionOutcomes: [{ pluginId: "clean@market", status: "loaded", diagnostics: [] }],
+    } as unknown as ClaudeProject;
+    const cleanDoctor = renderDoctorReport(clean, buildCompatReport(clean));
+    expect(cleanDoctor).toContain("Plugin selection: loaded: 1.");
+    expect(cleanDoctor).toContain("No compatibility findings detected.");
+    expect(cleanDoctor).not.toContain("clean@market");
+
+    const limited = {
+      ...makeProject(),
+      pluginResolutionOutcomes: [
+        {
+          pluginId: "limited@market",
+          status: "loaded",
+          diagnostics: [{ severity: "warning", message: "component is not a directory", source: "C:/RAW/component" }],
+        },
+        {
+          pluginId: "stripped@market",
+          status: "loaded",
+          diagnostics: [{ severity: "warning", message: "unsupported declaration was stripped", source: "C:/RAW/stripped" }],
+        },
+      ],
+    } as unknown as ClaudeProject;
+    const limitedReport = buildCompatReport(limited);
+    const componentFindings = limitedReport.findings.filter(
+      (finding) => finding.capability.id === "feature.plugins-content",
+    );
+    const selectionFindings = limitedReport.findings.filter(
+      (finding) => finding.capability.id === "feature.plugins-installed-selection",
+    );
+    expect(componentFindings).toHaveLength(2);
+    expect(selectionFindings).toHaveLength(0);
+    const doctor = renderDoctorReport(limited, limitedReport);
+    expect(doctor).toContain("feature.plugins-content");
+    expect(doctor).toContain("limited@market: loaded with wrong component kind; some declared content was skipped");
+    expect(doctor).toContain("Correct the applicable component declaration, access, or installed file/directory kind in Claude Code");
+    expect(doctor).toContain("stripped@market: loaded with unsupported component content; some declared content was stripped");
+    expect(doctor).toContain("Remove or replace the unsupported declaration or content in Claude Code");
+    expect(doctor).toMatch(/skipped|ignored|stripped|degraded/i);
+    expect(doctor).not.toContain("no fallback content loaded");
+    expect(doctor).not.toMatch(/affected component did not load|whole plugin failed|component failed|plugin failed/i);
+    expect(doctor).not.toContain("C:/RAW");
+    expect(doctor).not.toContain("Inspect /doctor");
+    expect(doctor).not.toContain("No compatibility findings detected.");
+  });
+
+  it("caps loaded component limitations at twenty plus one accurate omission", () => {
+    const project = {
+      ...makeProject(),
+      pluginResolutionOutcomes: Array.from({ length: 23 }, (_, index) => ({
+        pluginId: `limited-${index}@market`,
+        status: "loaded",
+        diagnostics: [{ severity: "warning", message: "malformed content" }],
+      })),
+    } as unknown as ClaudeProject;
+    const findings = buildCompatReport(project).findings.filter((item) => item.capability.id === "feature.plugins-content");
+    expect(findings).toHaveLength(21);
+    expect(findings.filter((item) => item.evidence.includes("loaded with malformed content"))).toHaveLength(20);
+    expect(findings.at(-1)?.evidence).toBe("3 additional loaded-plugin component limitation(s) omitted.");
+  });
+
+  it("renders hostile plugin diagnostic identities and handler types terminal-safely", () => {
+    const hostile = `name\u001b[31m\u0000\u2060${"x".repeat(300)}@market`;
+    const hostileAgent = `agent\u001b\u0000\u200b${"y".repeat(300)}`;
+    const hostileEvent = `Future\u001b\u0000\u2060${"e".repeat(200)}`;
+    const hostileType = `future\u001b\u0000\u200b${"t".repeat(200)}`;
+    const project = {
+      ...makeProject({ agents: [makeAgent({
+        name: hostileAgent,
+        source: { path: "<hostile>", scope: "plugin", pluginId: hostile, pluginName: "name" },
+        diagnostics: [{ severity: "warning", message: 'Plugin agent field "hooks" is forbidden and was removed' }],
+      })] }),
+      pluginResolutionOutcomes: [{ pluginId: hostile, status: "rejected", diagnostics: [] }],
+      mergedHooks: {
+        [hostileEvent]: [{ hooks: [
+          { type: "prompt", pluginId: hostile, raw: {} },
+          { type: hostileType, pluginId: hostile, raw: {} },
+          { type: 7, pluginId: hostile, raw: {} },
+        ] }],
+      },
+    } as unknown as ClaudeProject;
+    expect(() => buildCompatReport(project)).not.toThrow();
+    const report = buildCompatReport(project);
+    expect(report.findings.some((item) => item.capability.id === "feature.hook-handler.prompt")).toBe(true);
+    expect(report.unassessed.some((item) => item.includes("invalid handler type"))).toBe(true);
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\p{Cf}]/u);
+    for (const evidence of [...report.findings.map((item) => item.evidence), ...report.unassessed]) {
+      expect(evidence.length).toBeLessThan(700);
+    }
+  });
+
+  it("deduplicates plugin-hook limitations before the detail cap", () => {
+    const duplicate = { type: "prompt", pluginId: "duplicate@market", raw: {} };
+    const project = {
+      ...makeProject(),
+      mergedHooks: {
+        PreToolUse: [{ hooks: [...Array.from({ length: 25 }, () => ({ ...duplicate })), { type: "agent", pluginId: "distinct@market", raw: {} }] }],
+      },
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    expect(report.findings.filter((item) => item.capability.id === "feature.hook-handler.prompt")).toHaveLength(1);
+    expect(report.findings.filter((item) => item.capability.id === "feature.hook-handler.agent")).toHaveLength(1);
+    expect(report.findings.some((item) => item.evidence.includes("installed-plugin hook limitation(s) omitted"))).toBe(false);
+  });
+
+  it("uses state-specific plugin remedies without false policy provenance or circular actions", () => {
+    const project = {
+      ...makeProject(),
+      pluginResolutionOutcomes: [
+        { pluginId: "unsupported@market", status: "unsupported", diagnostics: [] },
+        { pluginId: "ambiguous@market", status: "ambiguous", diagnostics: [] },
+        { pluginId: "blocked@market", status: "blocked", diagnostics: [] },
+        { pluginId: "malformed@market", status: "malformed", diagnostics: [] },
+        { pluginId: "access@market", status: "rejected", diagnostics: [{ severity: "warning", message: "unreadable component" }] },
+        { pluginId: "escape@market", status: "rejected", diagnostics: [{ severity: "warning", message: "path escape mismatch" }] },
+      ],
+    } as unknown as ClaudeProject;
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("Check for or update to PiCC support for this format");
+    expect(doctor).toContain("Reconcile or reinstall this qualified identity through Claude Code");
+    expect(doctor).toContain("listed in the qualified plugin blocklist");
+    expect(doctor).toContain("Review that blocklist entry");
+    expect(doctor).toContain("plugin installed-state or blocklist data is malformed");
+    expect(doctor).toContain("Check those Claude Code state inputs");
+    expect(doctor).toContain("Check the applicable component declaration and installed file or directory kind");
+    expect(doctor).toContain("Reinstall or reconcile the qualified plugin with Claude Code");
+    expect(doctor).not.toMatch(/administrator|untrusted by administrator|Ask the administrator/i);
+    expect(doctor).not.toContain("Inspect /doctor");
   });
 
   // -------------------------------------------------------------------------
@@ -1405,9 +1777,12 @@ describe("renderDoctorReport", () => {
     const report = buildCompatReport(project);
     report.unassessed.push("future setting remains unknown");
     report.pluginRuntimeFindings = [
-      "skill owner: persistent data creation failed; execution did not occur",
-      "skill owner: persistent data creation failed; execution did not occur",
-      ...Array.from({ length: 19 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
+      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
+      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
+      "agent owner: persistent data directory validation or creation failed (wrong-kind). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
+      "hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
+      "legacy owner: preparation failed for an unknown reason; execution did not occur. Repair or reinstall the affected plugin in Claude Code, then relaunch PiCC.",
+      ...Array.from({ length: 16 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
     ];
     report.pluginRuntimeFindingsOmitted = 6;
     report.pluginRuntimeFindingsOmittedAtLeast = true;
@@ -1416,11 +1791,20 @@ describe("renderDoctorReport", () => {
       doctor.indexOf("Plugin runtime failures (execution did not occur):"),
       doctor.indexOf("Unassessed (unknown"),
     );
-    expect(runtime.match(/persistent data creation failed/g)).toHaveLength(1);
+    expect(runtime.match(/skill owner: persistent data directory validation or creation failed/g)).toHaveLength(1);
+    expect(runtime).toContain("skill owner: persistent data directory validation or creation failed (unreadable-path); execution did not occur");
+    expect(runtime).toContain("agent owner: persistent data directory validation or creation failed (wrong-kind); execution did not occur");
+    expect(runtime).toContain("hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch); execution did not occur");
     expect(runtime).toContain("at least 6 additional distinct failure(s) omitted");
-    expect(runtime).toContain("Repair or reinstall");
+    expect(runtime).toContain("Recovery: check plugin-data ownership, writability, and directory kinds");
+    expect(runtime).toContain("Recovery: reinstall or reconcile the qualified plugin with Claude Code");
+    expect(runtime).toContain("Recovery: if plugin-data access or directory kind is the cause");
+    expect(runtime).not.toContain("Repair or reinstall the plugin in Claude Code");
+    expect(runtime).not.toContain("Repair or reinstall the affected plugin");
+    expect(runtime).not.toMatch(/unreadable-path[^\n]*reinstall|wrong-kind[^\n]*reinstall/i);
     expect(runtime).not.toContain("future setting remains unknown");
     expect(runtime.length).toBeLessThan(12_000);
+    expect(doctor).not.toContain("No compatibility findings detected.");
   });
   it("contains the baseline, findings, unassessed items, and per-tier registry counts", () => {
     const project = makeProject({

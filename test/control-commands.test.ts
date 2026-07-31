@@ -786,6 +786,9 @@ describe("plugin activation runtime failures", () => {
       expect(report.match(/^  - skill overflow-owner:broken-/gm)).toHaveLength(20);
       expect(report).toContain("2 additional distinct failure(s) omitted");
       expect(report).not.toContain("at least 2");
+      expect(report).toContain("Recovery: check plugin-data ownership, writability, and directory kinds");
+      expect(report).not.toContain("Repair or reinstall the plugin");
+      expect(report).toContain("execution did not occur");
 
       for (let index = 22; index < 26; index++) {
         await expect(skill.execute(`overflow-${index}`, { name: `overflow-owner:broken-${index}` })).rejects.toThrow();
