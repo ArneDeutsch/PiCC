@@ -107,9 +107,10 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 
 ```bash
 npm run typecheck:all    # strict TS over src + tests
-npm run test:unit        # fast: unit + offline integration
-npm run test:e2e         # drives the real Pi CLI against a mock model
-npm test                 # everything
+npm test                 # unit lane (same as test:unit)
+npm run test:integration # offline whole-extension integration lane
+npm run test:e2e         # real Pi CLI against a mock model
+npm run test:all         # unit + integration + e2e
 npm run gen:capabilities # regenerate doc/supported-features.md from the registry
 ```
 

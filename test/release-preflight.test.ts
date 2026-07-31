@@ -201,9 +201,15 @@ describe("release workflow", () => {
     const manifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as {
       scripts: Record<string, string>;
     };
-    expect(manifest.scripts.preversion).toBe("npm run verify");
+    expect(manifest.scripts.preversion).toBe("npm run verify:all");
     expect(manifest.scripts.version).toBeUndefined();
-    expect(manifest.scripts.prepublishOnly).toBe("npm run verify");
+    expect(manifest.scripts.prepublishOnly).toBe("npm run verify:all");
+    expect(manifest.scripts["test:source"]).toBe(
+      "npm run test:unit && npm run test:integration && node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    );
+    expect(manifest.scripts["test:packaged"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
+    );
     const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/release.yml"), "utf8")) as any;
     expect(workflow.on).toEqual({ push: { tags: ["v*"] }, workflow_dispatch: null });
     expect(workflow.permissions).toEqual({ contents: "read" });
@@ -214,6 +220,10 @@ describe("release workflow", () => {
     const publishSteps = publishJob.steps as any[];
     const allSteps = [...packageSteps, ...publishSteps];
     const runs = allSteps.map((step) => step.run ?? "");
+    expect(packageSteps.find((step) => step.name === "Verify source")?.run)
+      .toBe("npm run typecheck:all && npm run test:source");
+    expect(packageSteps.find((step) => step.name === "Test exact packaged product")?.run)
+      .toBe("npm run test:packaged");
     expect(runs.filter((run) => run.includes("scripts/pack-release.mjs"))).toHaveLength(1);
     expect(packageJob.outputs).toEqual({
       filename: "${{ steps.pack.outputs.filename }}",

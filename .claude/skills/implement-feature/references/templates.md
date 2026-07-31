@@ -64,12 +64,16 @@ Everything the implementer can't safely invent alone.>
 <Decisions deliberately deferred to the implementer.>
 
 ## Testing
-<What must be covered and at which layer (unit / offline-integration / e2e);
-cross-platform concerns (Windows + Linux).>
+<For every regression: name the focused existing/new owner and its executable lane. Name the broad
+lanes required for this task, why integration and e2e are or are not needed, and cross-platform
+concerns (Windows + Linux). After review and fixes, the coordinator selects either the safely
+established reviewed pre-commit hook or a successful direct fallback as the single workflow-owned
+routine `verify` gate; do not require a duplicate direct run. Require `verify:all` only when this task needs complete
+verification.>
 
 ## Acceptance criteria
 - [ ] <verifiable statement>
-- [ ] typecheck and full test suite green
+- [ ] focused checks and any task-required broader lanes green
 
 ## Depends on
 <task ids, or –>

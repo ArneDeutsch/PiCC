@@ -23,7 +23,7 @@ the body until the rules are available** — do not distill a body with the rule
 
 1. **Merge, then push to the fork.** Re-fetch the **target's** default via a temporary named remote
    (as in Phase 2 — [phase-2-workspace.md](phase-2-workspace.md)); if it moved, merge it into the
-   feature branch, resolve conflicts, and verify typecheck + full suite green again. Then apply
+   feature branch, resolve conflicts, and run `npm run verify:all` again. Then apply
    [phase-9-handoff.md](phase-9-handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
    `git push -u <pushRemote> feature/<feature-slug>` — its first-push condition, established-self-owned
    criteria, foreign-ref stop, "nothing is lost" framing, never-force rule, and non-atomic-race caveat
