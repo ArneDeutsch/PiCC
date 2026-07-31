@@ -22,7 +22,7 @@ import {
 } from "./plugin-paths.js";
 import type { PluginSkillLoaderSource } from "./skills.js";
 
-const COMPONENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const COMPONENT_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SCOPE_RANK: Readonly<Record<PluginInstallationScope, number>> = {
   user: 0,
   project: 1,
@@ -45,8 +45,6 @@ export interface InstalledPlugin {
   agentSources: PluginAgentLoaderSource[];
   hookSources: PluginComponentSource[];
   hookPathSources: Array<{ source: Exclude<PluginComponentSource, { kind: "inline" }>; validatedPath: ValidatedPluginPath }>;
-  /** Contained normalized file projection retained for compatibility reporting. */
-  hooksFiles: string[];
   enabled: true;
   diagnostics: Diagnostic[];
   installation: NormalizedPluginInstallation;
@@ -235,7 +233,9 @@ function readBlocklist(
 function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): string[] {
   const candidates = [path.join(userDir, "plugins", "cache")];
   if (env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]) candidates.push(env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]);
-  if (env["CLAUDE_CODE_PLUGIN_SEED_DIR"]) candidates.push(path.join(env["CLAUDE_CODE_PLUGIN_SEED_DIR"], "plugins", "cache"));
+  for (const seed of (env["CLAUDE_CODE_PLUGIN_SEED_DIR"] ?? "").split(path.delimiter)) {
+    if (seed) candidates.push(path.join(seed, "cache"));
+  }
   const canonical = candidates.map(canonicalDirectory).filter((value): value is string => value !== undefined);
   return [...new Set(canonical)].sort(compareText);
 }
@@ -350,7 +350,13 @@ function readManifest(root: AuthorizedPluginRoot):
   const parsed = parseJsonSafe(readTextSafe(current.value.lexicalPath));
   if (!isPlainObject(parsed)) return { ok: false, diagnostic: { severity: "warning", message: "Plugin manifest is unreadable or malformed" } };
   if (typeof parsed["name"] !== "string" || !COMPONENT_NAME.test(parsed["name"])) {
-    return { ok: false, diagnostic: { severity: "warning", message: "Plugin manifest requires a valid component name" } };
+    return {
+      ok: false,
+      diagnostic: {
+        severity: "warning",
+        message: "Plugin manifest name is malformed; expected lowercase letters or digits separated by single hyphens",
+      },
+    };
   }
   return { ok: true, manifest: parsed, manifestPath: current.value };
 }
@@ -371,14 +377,20 @@ function resolveComponents(options: {
   if (!manifestResult.ok) return { ok: false, diagnostics: [manifestResult.diagnostic] };
   const manifest = manifestResult.manifest;
   const pluginName = manifestResult.manifestPath ? manifest["name"] as string : options.lifecycleName;
-  if (!COMPONENT_NAME.test(pluginName)) return { ok: false, diagnostics: [{ severity: "warning", message: "Installed plugin identity cannot form a component namespace" }] };
+  if (!COMPONENT_NAME.test(pluginName)) return {
+    ok: false,
+    diagnostics: [{
+      severity: "warning",
+      message: "Plugin component namespace is malformed; expected lowercase letters or digits separated by single hyphens",
+    }],
+  };
 
   const data = resolvePluginDataLocation(options.userDir, options.pluginId);
   if (!data.ok) return { ok: false, diagnostics: [data.diagnostic] };
   const context: PluginRuntimeContext = {
     pluginId: options.pluginId,
     pluginName,
-    root: options.root.lexicalPath,
+    root: options.root.canonicalPath,
     dataDir: data.value.lexicalPath,
     projectDir: options.projectRoot,
   };
@@ -472,7 +484,7 @@ function resolveComponents(options: {
     version: options.version,
     scope: options.scope,
     ...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
-    root: options.root.lexicalPath,
+    root: options.root.canonicalPath,
     dataDir: data.value.lexicalPath,
     manifest,
     skillSources,
@@ -480,7 +492,6 @@ function resolveComponents(options: {
     agentSources,
     hookSources,
     hookPathSources,
-    hooksFiles: hookPathSources.map((entry) => entry.validatedPath.lexicalPath),
     enabled: true,
     diagnostics,
     installation: options.installation,
@@ -624,22 +635,6 @@ export function resolveInstalledPlugins(options: {
   };
 }
 
-export function expandPluginVariables(text: string, plugin: Pick<InstalledPlugin, "root" | "dataDir">): string {
-  return text.split("${CLAUDE_PLUGIN_ROOT}").join(plugin.root).split("${CLAUDE_PLUGIN_DATA}").join(plugin.dataDir);
-}
-
-function expandDeep(value: unknown, plugin: Pick<InstalledPlugin, "root" | "dataDir">): unknown {
-  if (typeof value === "string") return expandPluginVariables(value, plugin);
-  if (Array.isArray(value)) return value.map((entry) => expandDeep(entry, plugin));
-  if (!isPlainObject(value)) return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    // Defining own data properties keeps hostile keys such as __proto__ from mutating the output prototype.
-    Object.defineProperty(out, key, { value: expandDeep(entry, plugin), enumerable: true, writable: true, configurable: true });
-  }
-  return out;
-}
-
 export function loadPluginHooks(plugin: InstalledPlugin): {
   config: Record<string, unknown>;
   diagnostics: Diagnostic[];
@@ -681,8 +676,7 @@ export function loadPluginHooks(plugin: InstalledPlugin): {
       continue;
     }
     const eventMap = isPlainObject(parsed["hooks"]) ? parsed["hooks"] : parsed;
-    const expanded = expandDeep(eventMap, plugin) as Record<string, unknown>;
-    for (const [event, entries] of Object.entries(expanded)) {
+    for (const [event, entries] of Object.entries(eventMap)) {
       if (event in Object.prototype) {
         diagnostics.push({ severity: "warning", message: "Unsafe plugin hook event key was ignored" });
         continue;

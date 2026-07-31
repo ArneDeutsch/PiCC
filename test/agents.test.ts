@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   builtinAgents,
   loadAgents,
@@ -47,8 +47,8 @@ function writeAgent(relPath: string, content: string): string {
   return full;
 }
 
-function load(opts?: { pluginName?: string }) {
-  return loadAgents([{ dir: tmpDir, scope: "project" }], opts);
+function load() {
+  return loadAgents([{ dir: tmpDir, scope: "project" }]);
 }
 
 function pluginSource(
@@ -358,15 +358,6 @@ describe("loadAgents", () => {
     expect(diagnostics).toEqual([]);
   });
 
-  it("stamps pluginName onto the source when provided", () => {
-    writeAgent("p.md", ["---", "description: d", "---", "b"].join("\n"));
-    const { agents } = loadAgents([{ dir: tmpDir, scope: "plugin" }], {
-      pluginName: "my-plugin",
-    });
-    expect(agents[0]!.source.pluginName).toBe("my-plugin");
-    expect(agents[0]!.source.scope).toBe("plugin");
-  });
-
   it("returns empty results for a missing directory without throwing", () => {
     const { agents, diagnostics } = loadAgents([
       { dir: path.join(tmpDir, "does-not-exist"), scope: "user" },
@@ -402,6 +393,110 @@ describe("loadPluginAgents", () => {
       pluginSource(pluginRoot, "./outside.md", "file"),
     ]);
     expect(file.agents.map((agent) => agent.name)).toEqual(["explicit-name"]);
+  });
+
+  it("omits invalid plugin-agent local and later nested segments without affecting a multi-level sibling", () => {
+    const pluginRoot = path.join(tmpDir, "name-grammar");
+    for (const [relative, frontmatterName] of [
+      ["agents/valid-agent.md", undefined],
+      ["agents/Upper.md", undefined],
+      ["agents/agent1.md", undefined],
+      ["agents/under_score.md", undefined],
+      ["agents/has space.md", undefined],
+      ["agents/colon.md", "has:colon"],
+      ["agents/good-parent/good-child/nested-agent.md", undefined],
+      ["agents/good-parent/Bad-child/ignored.md", undefined],
+      ["agents/good-parent/child2/ignored.md", undefined],
+      ["agents/good-parent/under_score-child/ignored.md", undefined],
+      ["agents/good-parent/has space/ignored.md", undefined],
+    ] as const) {
+      writeAgent(`name-grammar/${relative}`, `---\n${frontmatterName ? `name: ${frontmatterName}\n` : ""}description: agent\n---\nbody`);
+    }
+
+    const result = loadPluginAgents([pluginSource(pluginRoot, "./agents", "directory")]);
+    expect(result.agents.map((agent) => agent.name)).toEqual([
+      "good-parent:good-child:nested-agent",
+      "valid-agent",
+    ]);
+    const grammarDiagnostics = result.diagnostics.filter((item) => item.message.includes("expected lowercase letters"));
+    expect(grammarDiagnostics).toHaveLength(9);
+    expect(new Set(grammarDiagnostics.map((item) => item.message))).toEqual(new Set([
+      "Plugin agent directory name is malformed; expected lowercase letters separated by single hyphens; agent skipped",
+      "Plugin agent local name is malformed; expected lowercase letters separated by single hyphens; agent skipped",
+    ]));
+    for (const rejected of ["Upper", "agent1", "under_score", "has space", "has:colon", "Bad-child", "child2"]) {
+      expect(grammarDiagnostics.every((item) => !item.message.includes(rejected))).toBe(true);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("omits a colon in a later nested segment without affecting a multi-level sibling", () => {
+    const pluginRoot = path.join(tmpDir, "colon-directory");
+    writeAgent("colon-directory/agents/good-parent/good-child/valid-agent.md", "---\ndescription: valid\n---\nbody");
+    writeAgent("colon-directory/agents/good-parent/bad:child/ignored.md", "---\ndescription: ignored\n---\nbody");
+    const result = loadPluginAgents([pluginSource(pluginRoot, "./agents", "directory")]);
+    expect(result.agents.map((agent) => agent.name)).toEqual(["good-parent:good-child:valid-agent"]);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "Plugin path must not contain an alternate-data-stream or drive separator" }),
+    ]));
+    expect(result.diagnostics.every((item) => !item.message.includes("bad:child"))).toBe(true);
+  });
+
+  it("reports a direct explicit final-read failure as terminal typed evidence", () => {
+    const pluginRoot = path.join(tmpDir, "final-read");
+    const file = writeAgent("final-read/agent.md", "---\ndescription: agent\n---\nbody");
+    const input = pluginSource(pluginRoot, "./agent.md", "file");
+    const nativeRead = fs.readFileSync.bind(fs);
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((value: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (path.normalize(String(value)) === path.normalize(file)) {
+        const error = Object.assign(new Error("private final read"), { code: "EACCES" });
+        throw error;
+      }
+      return nativeRead(value, options as never);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginAgents([input]);
+      expect(result.agents).toEqual([]);
+      expect(result.pathFailures).toHaveLength(1);
+      expect(result.pathFailures![0]).toMatchObject({
+        pluginId: "agents@trusted-market",
+        component: "agent",
+        source: input.source,
+        terminal: true,
+        failure: { code: "unreadable-path" },
+      });
+      expect(JSON.stringify(result.pathFailures)).not.toContain("private final read");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps a final-read failure below an explicit directory component-local", () => {
+    const pluginRoot = path.join(tmpDir, "directory-final-read");
+    const failed = writeAgent("directory-final-read/agents/a-failed.md", "---\ndescription: failed\n---\nbody");
+    writeAgent("directory-final-read/agents/b-valid.md", "---\ndescription: valid\n---\nbody");
+    const nativeRead = fs.readFileSync.bind(fs);
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((value: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (path.normalize(String(value)) === path.normalize(failed)) {
+        throw Object.assign(new Error("private descendant read"), { code: "EACCES" });
+      }
+      return nativeRead(value, options as never);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginAgents([pluginSource(pluginRoot, "./agents", "directory")]);
+      expect(result.agents.map((agent) => agent.name)).toEqual(["b-valid"]);
+      expect(result.agents[0]!.source).toMatchObject({
+        scope: "plugin",
+        pluginId: "agents@trusted-market",
+        pluginName: "agents",
+      });
+      expect(result.pathFailures).toEqual([]);
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({ message: "Could not read agent file; skipped" }),
+      ]);
+      expect(JSON.stringify(result)).not.toContain("private descendant read");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it.each([

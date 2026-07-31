@@ -250,17 +250,15 @@ function qualifiedNameFor(rootDir: string, containerDir: string, name: string): 
 export function loadSkills(
   skillDirs: Array<{ dir: string; scope: Scope }>,
   commandDirs: Array<{ dir: string; scope: Scope }>,
-  opts: { pluginName?: string } = {},
 ): LoadSkillsResult {
   const diagnostics: Diagnostic[] = [];
-  const plugin = opts.pluginName ? { pluginName: opts.pluginName } : undefined;
   type Entry = { skill: ClaudeSkill; qualified?: string };
   const skills: Entry[] = [];
   for (const { dir, scope } of skillDirs) {
     if (!isDirectory(dir)) continue;
     const files = walkFiles(dir, (name) => name === "SKILL.md").sort();
     for (const file of files) {
-      const skill = parseSkillFile(file, scope, plugin, diagnostics);
+      const skill = parseSkillFile(file, scope, undefined, diagnostics);
       if (!skill) continue;
       // Intermediate dirs only: the skill's OWN directory is its identity, not a namespace.
       const qualified = qualifiedNameFor(dir, path.dirname(skill.baseDir), skill.name);
@@ -273,7 +271,7 @@ export function loadSkills(
     if (!isDirectory(dir)) continue;
     const files = walkFiles(dir, (name) => name.toLowerCase().endsWith(".md")).sort();
     for (const file of files) {
-      const cmd = parseCommandFile(file, path.dirname(file), scope, plugin, diagnostics);
+      const cmd = parseCommandFile(file, path.dirname(file), scope, undefined, diagnostics);
       if (!cmd) continue;
       const qualified = qualifiedNameFor(dir, path.dirname(file), cmd.name);
       commands.push({ skill: cmd, qualified });
@@ -324,6 +322,25 @@ export function loadPluginSkills(
         "plugin",
         pluginIdentity(input.source),
         diagnostics,
+        () => {
+          if (input.source.kind !== "file") return;
+          const failure: PluginPathFailure = {
+            ok: false,
+            code: "unreadable-path",
+            diagnostic: {
+              severity: "warning",
+              message: "Plugin command file became unreadable after path revalidation",
+              source: file.lexicalPath,
+            },
+          };
+          pathFailures.push({
+            pluginId: input.source.metadata.pluginId,
+            component: "command",
+            source: input.source,
+            terminal: true,
+            failure,
+          });
+        },
       );
       if (!command) continue;
       bindLazyPluginSource(command, file);
@@ -574,6 +591,7 @@ function parseCommandFile(
   scope: Scope,
   plugin: PluginIdentity | undefined,
   outDiagnostics: Diagnostic[],
+  onUnreadable?: () => void,
 ): ClaudeSkill | undefined {
   const raw = readTextSafe(file);
   if (raw === undefined) {
@@ -582,6 +600,7 @@ function parseCommandFile(
       message: `Cannot read command file; skipped`,
       source: file,
     });
+    onUnreadable?.();
     return undefined;
   }
   const parsed = parseMarkdown(raw, file);

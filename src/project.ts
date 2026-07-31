@@ -113,7 +113,7 @@ export function loadClaudeProject(opts: {
       rejectedAtLoad.add(plugin.pluginId);
       const rejection = {
         severity: "warning" as const,
-        message: `Installed plugin "${plugin.pluginId}" changed during component loading; all contributions were rejected`,
+        message: "Installed plugin components could not be loaded safely; all contributions were rejected",
       };
       outcome.diagnostics = boundedOutcomeDiagnostics(
         outcome.diagnostics,

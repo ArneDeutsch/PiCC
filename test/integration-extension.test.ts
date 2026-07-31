@@ -18,6 +18,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/f
 import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadSkills } from "../src/claude/skills.js";
+import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
 import type { NotebookSessionState } from "../src/runtime/notebook-session.js";
 
 /**
@@ -918,7 +919,13 @@ describe("skill activation", () => {
 
   it("installed plugin skill resolves exact variables and creates persistent data lazily", async () => {
     const skillTool = pi.tools.get("Skill");
-    const dataDir = path.join(dir, ".claude-user", "plugins", "data", "bundled-fixture-plugin-fixture-market");
+    const dataDir = path.join(
+      dir,
+      ".claude-user",
+      "plugins",
+      "data",
+      sanitizePluginDataKey("bundled-fixture-plugin@fixture-market"),
+    );
     expect(fs.existsSync(dataDir)).toBe(false);
     const result = await skillTool.execute("t5", { name: "plugin-skill" });
     const text = result.content[0].text as string;

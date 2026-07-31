@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HookRunner } from "../src/engine/hook-runner.js";
+import { loadSkillBody } from "../src/claude/skills.js";
+import { projectPluginAgentRuntime, substitutePluginRuntimeText } from "../src/index.js";
 import { findByName, loadClaudeProject } from "../src/project.js";
 import {
   buildSystemPromptSuffix,
@@ -22,6 +24,20 @@ import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
  */
 
 const tempDirs: string[] = [];
+
+const directoryLinkProbe = (() => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-dir-link-probe-"));
+  try {
+    const target = path.join(parent, "target");
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, path.join(parent, "link"), process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+})();
 
 function makeTmp(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-"));
@@ -207,6 +223,60 @@ describe("loadClaudeProject — installed hook provenance", () => {
     ]));
   });
 
+  it.skipIf(!directoryLinkProbe)("keeps canonical skill, agent, and hook runtime roots fixed after cache-link retargeting", async () => {
+    const { base, repo, userDir } = makeBase();
+    const cacheLink = path.join(userDir, "plugins", "cache");
+    const firstCache = path.join(base, "first-cache");
+    const secondCache = path.join(base, "second-cache");
+    fs.mkdirSync(path.dirname(cacheLink), { recursive: true });
+    fs.mkdirSync(firstCache);
+    fs.mkdirSync(secondCache);
+    fs.symlinkSync(firstCache, cacheLink, process.platform === "win32" ? "junction" : "dir");
+    const lexicalRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    const skillFile = path.join(lexicalRoot, "skills", "alpha-skill", "SKILL.md");
+    write(skillFile, "---\ndescription: canonical skill\n---\nroot=${CLAUDE_PLUGIN_ROOT}");
+    write(
+      path.join(lexicalRoot, "agents", "alpha-agent.md"),
+      "---\nname: alpha-agent\ndescription: canonical agent\n---\nroot=${CLAUDE_PLUGIN_ROOT}",
+    );
+    const script = path.join(repo, "print-plugin-root.cjs");
+    const marker = path.join(repo, "hook-root.txt");
+    write(script, 'require("node:fs").writeFileSync(process.env.HOOK_MARKER, process.env.CLAUDE_PLUGIN_ROOT ?? "missing");');
+    write(path.join(lexicalRoot, "hooks", "hooks.json"), JSON.stringify({
+      PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: 'exec "$HOOK_NODE" "$HOOK_SCRIPT"' }] }],
+    }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+
+    const project = load(repo, userDir);
+    const context = project.pluginContexts.get("alpha@official")!;
+    const canonicalRoot = fs.realpathSync.native(lexicalRoot);
+    const skill = project.skills.find((item) => item.source.pluginId === context.pluginId)!;
+    const loadedSkillBody = loadSkillBody(skill);
+    const agent = project.agents.find((item) => item.source.pluginId === context.pluginId)!;
+    fs.unlinkSync(cacheLink);
+    fs.symlinkSync(secondCache, cacheLink, process.platform === "win32" ? "junction" : "dir");
+
+    expect(context.root).toBe(canonicalRoot);
+    expect(substitutePluginRuntimeText(loadedSkillBody, context)).toBe(`root=${canonicalRoot}`);
+    expect(projectPluginAgentRuntime(agent, context).body).toBe(`root=${canonicalRoot}`);
+    const runner = new HookRunner({
+      config: project.mergedHooks,
+      projectDir: repo,
+      sessionId: "canonical-root",
+      env: {
+        HOOK_NODE: process.execPath.replaceAll("\\", "/"),
+        HOOK_SCRIPT: script.replaceAll("\\", "/"),
+        HOOK_MARKER: marker.replaceAll("\\", "/"),
+      },
+      disableAllHooks: false,
+      pluginContexts: project.pluginContexts,
+      ensurePluginDataDir: () => ({ ok: true }),
+    });
+    const outcome = await runner.fire("PreToolUse", { tool_name: "Bash", tool_input: {} });
+    expect(outcome.diagnostics).toEqual([]);
+    expect(fs.readFileSync(marker, "utf8")).toBe(canonicalRoot);
+  });
+
   it("reserves bounded terminal reasons for only the identity that fails late", () => {
     const { repo, userDir } = makeBase();
     const alphaRoot = makeMarketplacePlugin(userDir, "official", "alpha");
@@ -239,7 +309,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
       expect(outcome.diagnostics.map((item) => item.message)).toEqual(expect.arrayContaining([
         "Installed plugin skill/command loader reported malformed content",
         "Installed plugin hook source loader reported unreadable content",
-        'Installed plugin "alpha@official" changed during component loading; all contributions were rejected',
+        "Installed plugin components could not be loaded safely; all contributions were rejected",
       ]));
       expect(outcome.diagnostics.length).toBeLessThanOrEqual(20);
       expect(outcome.diagnostics.every((item) => item.source === undefined)).toBe(true);
@@ -263,12 +333,67 @@ describe("loadClaudeProject — installed hook provenance", () => {
     }
   });
 
+  it.each(["commands", "agents"] as const)(
+    "rejects a plugin when a directly declared explicit %s file fails at the final read",
+    (field) => {
+      const { repo, userDir } = makeBase();
+      const alphaRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+      makeMarketplacePlugin(userDir, "official", "beta");
+      const direct = path.join(alphaRoot, `direct-${field}.md`);
+      write(
+        direct,
+        field === "agents" ? "---\ndescription: direct agent\n---\nbody" : "---\ndescription: direct command\n---\nbody",
+      );
+      write(
+        path.join(alphaRoot, ".claude-plugin", "plugin.json"),
+        JSON.stringify({ name: "alpha", [field]: `./direct-${field}.md` }),
+      );
+      write(path.join(userDir, "settings.json"), JSON.stringify({
+        enabledPlugins: { "alpha@official": true, "beta@official": true },
+      }));
+      const originalReadFileSync = fs.readFileSync;
+      const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+        if (filePath === direct) {
+          throw Object.assign(new Error("private final read"), { code: "EACCES" });
+        }
+        return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+      }) as typeof fs.readFileSync);
+      try {
+        const project = load(repo, userDir);
+        const outcome = project.pluginResolutionOutcomes.find((item) => item.pluginId === "alpha@official")!;
+        expect(outcome.status).toBe("rejected");
+        expect(outcome.context).toBeUndefined();
+        expect(outcome.sources).toBeUndefined();
+        expect(project.pluginContexts.has("alpha@official")).toBe(false);
+        expect(project.plugins.some((item) => item.pluginId === "alpha@official")).toBe(false);
+        expect(project.skills.some((item) => item.source.pluginId === "alpha@official")).toBe(false);
+        expect(project.agents.some((item) => item.source.pluginId === "alpha@official")).toBe(false);
+        expect(JSON.stringify(project.mergedHooks)).not.toContain("alpha-hook");
+        expect(outcome.diagnostics.map((item) => item.message)).toEqual(expect.arrayContaining([
+          `Installed plugin ${field === "agents" ? "agent" : "skill/command"} loader reported unreadable content`,
+          "Installed plugin components could not be loaded safely; all contributions were rejected",
+        ]));
+        expect(JSON.stringify(outcome.diagnostics)).not.toContain("private final read");
+        const siblingOutcome = project.pluginResolutionOutcomes.find((item) => item.pluginId === "beta@official")!;
+        expect(siblingOutcome.status).toBe("loaded");
+        expect(siblingOutcome.context).toEqual(project.pluginContexts.get("beta@official"));
+        expect(siblingOutcome.sources?.length).toBeGreaterThan(0);
+        expect(project.skills.some((item) => item.source.pluginId === "beta@official")).toBe(true);
+        expect(project.agents.some((item) => item.source.pluginId === "beta@official")).toBe(true);
+        expect(JSON.stringify(project.mergedHooks)).toContain("beta-hook");
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+
   it("attaches safe component-local loader warnings to the owning loaded outcome", () => {
     const { repo, userDir } = makeBase();
     makeMarketplacePlugin(userDir, "official", "alpha");
     write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
     const root = path.join(userDir, "plugins", "cache", "official", "alpha", "1.0.0");
     write(path.join(root, "skills", "malformed", "SKILL.md"), "body without required description");
+    write(path.join(root, "agents", "Upper.md"), "---\ndescription: malformed name\n---\nbody");
     write(path.join(root, "hooks", "hooks.json"), "not json");
 
     const project = load(repo, userDir);
@@ -276,6 +401,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
     expect(outcome.status).toBe("loaded");
     expect(outcome.diagnostics.map((item) => item.message)).toEqual(expect.arrayContaining([
       "Installed plugin skill/command loader reported malformed content",
+      "Installed plugin agent loader reported malformed content",
       "Installed plugin hook source loader reported malformed content",
     ]));
     expect(outcome.diagnostics.every((item) => item.source === undefined)).toBe(true);

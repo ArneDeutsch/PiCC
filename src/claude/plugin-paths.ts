@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Diagnostic } from "../types.js";
@@ -374,7 +375,9 @@ export function walkPluginFiles(options: {
 }
 
 export function sanitizePluginDataKey(qualifiedIdentity: string): string {
-  return qualifiedIdentity.replace(/[^A-Za-z0-9_-]/g, "-");
+  const readablePrefix = qualifiedIdentity.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80);
+  const digest = createHash("sha256").update(qualifiedIdentity, "utf8").digest("hex");
+  return `${readablePrefix}--${digest}`;
 }
 
 function resolveProjectedPath(

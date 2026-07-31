@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { Diagnostic, HookOutcome, HookPayload, PluginResolutionOutcome, PluginRuntimeContext, SourceRef, ToolCallDescriptor } from "./types.js";
+import type { Diagnostic, HookOutcome, HookPayload, PluginResolutionOutcome, PluginRuntimeContext, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
@@ -435,18 +435,11 @@ export async function writeFdFully(
 
 const PLUGIN_STARTUP_ID_CAP = 5;
 const PLUGIN_CONTROL_NAMES = new Set(["plugin", "plugins", "reload-plugins"]);
-const LEGACY_PLUGIN_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
-const WINDOWS_RESERVED_DATA_NAME_RE = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9]|lpt[1-9])(?:\..*)?$/i;
-
 export function pluginRuntimeContextForSource(
-  source: Pick<SourceRef, "pluginId" | "pluginName">,
+  source: { pluginId?: string },
   contexts: ReadonlyMap<string, PluginRuntimeContext>,
 ): PluginRuntimeContext | undefined {
-  if (source.pluginId) return contexts.get(source.pluginId);
-  if (!source.pluginName) return undefined;
-  return [...contexts.values()].find(
-    (context) => context.pluginId === source.pluginName && context.pluginName === source.pluginName,
-  );
+  return source.pluginId === undefined ? undefined : contexts.get(source.pluginId);
 }
 
 export function preparePluginDataDir(opts: {
@@ -455,71 +448,18 @@ export function preparePluginDataDir(opts: {
   context: PluginRuntimeContext;
 }): { ok: true } | { ok: false; code: string } {
   const { context } = opts;
-  const legacyIdentity = !context.pluginId.includes("@");
-  if (legacyIdentity && (
-    context.pluginId !== context.pluginName ||
-    !LEGACY_PLUGIN_NAME_RE.test(context.pluginName) ||
-    context.pluginName.endsWith(".") ||
-    context.pluginName.endsWith(" ") ||
-    WINDOWS_RESERVED_DATA_NAME_RE.test(context.pluginName)
-  )) {
-    return { ok: false, code: "invalid-legacy-identity" };
-  }
   if (path.resolve(context.projectDir) !== path.resolve(opts.projectRoot)) {
     return { ok: false, code: "project-context-mismatch" };
   }
   try {
-    if (context.pluginId.includes("@")) {
-      const location = resolvePluginDataLocation(opts.userDir, context.pluginId);
-      if (!location.ok) return { ok: false, code: location.code };
-      if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) {
-        return { ok: false, code: "qualified-projection-mismatch" };
-      }
-      fs.mkdirSync(location.value.lexicalPath, { recursive: true });
-      const current = revalidatePluginDataLocation(location.value);
-      return current.ok ? { ok: true } : { ok: false, code: current.code };
+    const location = resolvePluginDataLocation(opts.userDir, context.pluginId);
+    if (!location.ok) return { ok: false, code: location.code };
+    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) {
+      return { ok: false, code: "qualified-projection-mismatch" };
     }
-
-    const userDir = path.resolve(opts.userDir);
-    const expected = path.join(userDir, "plugins", "data", context.pluginName);
-    if (path.resolve(context.dataDir) !== expected) {
-      return { ok: false, code: "legacy-projection-mismatch" };
-    }
-
-    const canonicalUserDir = fs.realpathSync.native(userDir);
-    let canonicalParent = canonicalUserDir;
-    let lexicalParent = userDir;
-    for (const segment of ["plugins", "data", context.pluginName]) {
-      lexicalParent = path.join(lexicalParent, segment);
-      try {
-        const stat = fs.lstatSync(lexicalParent);
-        if (!stat.isDirectory() && !stat.isSymbolicLink()) {
-          return { ok: false, code: "legacy-ancestor-wrong-kind" };
-        }
-        canonicalParent = fs.realpathSync.native(lexicalParent);
-        if (!fs.statSync(canonicalParent).isDirectory()) {
-          return { ok: false, code: "legacy-ancestor-wrong-kind" };
-        }
-        const relative = path.relative(canonicalUserDir, canonicalParent);
-        if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
-          return { ok: false, code: "legacy-ancestor-escape" };
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          return { ok: false, code: "legacy-ancestor-unreadable" };
-        }
-        canonicalParent = path.join(canonicalParent, segment);
-      }
-    }
-
-    fs.mkdirSync(expected, { recursive: true });
-    const canonicalBase = fs.realpathSync.native(path.join(userDir, "plugins", "data"));
-    const canonicalTarget = fs.realpathSync.native(expected);
-    const relative = path.relative(canonicalBase, canonicalTarget);
-    if (relative === "" || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
-      return { ok: false, code: "legacy-post-create-escape" };
-    }
-    return { ok: true };
+    fs.mkdirSync(location.value.lexicalPath, { recursive: true });
+    const current = revalidatePluginDataLocation(location.value);
+    return current.ok ? { ok: true } : { ok: false, code: current.code };
   } catch {
     return { ok: false, code: "data-directory-preparation-failed" };
   }
@@ -758,21 +698,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   };
   let compat: CompatReport = { findings: [], safetyFindings: [], unassessed: [] };
-  const suppliedPluginContexts = (project as LoadedProject & {
-    pluginContexts?: ReadonlyMap<string, PluginRuntimeContext>;
-  }).pluginContexts;
-  const pluginContexts = suppliedPluginContexts ?? new Map<string, PluginRuntimeContext>(
-    project.plugins.map((plugin) => {
-      const pluginId = (plugin as typeof plugin & { pluginId?: string }).pluginId ?? plugin.name;
-      return [pluginId, {
-        pluginId,
-        pluginName: plugin.name,
-        root: plugin.root,
-        dataDir: plugin.dataDir,
-        projectDir: project.root,
-      }];
-    }),
-  );
+  const pluginContexts = project.pluginContexts;
   const RUNTIME_FINDING_RETAIN_CAP = 20;
   const RUNTIME_FINDING_FINGERPRINT_CAP = 25;
   const runtimeFindingFingerprints = new Set<string>();
@@ -1012,7 +938,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Skill activation (shared by Skill tool, slash commands, context:fork)
   // ---------------------------------------------------------------------------
   const pluginContextFor = (source: ClaudeSkill["source"]): PluginRuntimeContext | undefined =>
-    pluginRuntimeContextForSource(source, pluginContexts);
+    source.pluginId ? pluginRuntimeContextForSource({ pluginId: source.pluginId }, pluginContexts) : undefined;
 
   const mainActivation = newSkillActivationState(state.activeSkills);
   const activeSkillDenyRules = mainActivation.denyRules;

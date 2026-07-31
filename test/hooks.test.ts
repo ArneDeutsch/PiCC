@@ -972,6 +972,48 @@ describe("HookRunner placeholders and environment", () => {
     expect(outcome.stdout).toBe(`${pluginData}/state.json|${pluginRoot}/bin`);
   });
 
+  it("expands only command and args at execution while matcher, condition, URL, and raw fields stay literal", async () => {
+    const context = runtimeContext("literal-fields@market", makeTempDir(), makeTempDir());
+    const config = parseHookConfig(
+      {
+        UserPromptSubmit: [
+          {
+            hooks: [{
+              type: "command",
+              command: "printf '%s|%s'",
+              args: ["${CLAUDE_PLUGIN_ROOT}", "${CLAUDE_PLUGIN_DATA}"],
+              url: "https://example.test/${CLAUDE_PLUGIN_ROOT}",
+              arbitrary: "${CLAUDE_PLUGIN_DATA}",
+            }],
+          },
+          {
+            matcher: "${CLAUDE_PLUGIN_ROOT}",
+            if: "${CLAUDE_PLUGIN_DATA}",
+            hooks: [],
+          },
+        ],
+      },
+      "<plugin>",
+      { pluginId: context.pluginId },
+    ).config;
+    const literalEntry = config["UserPromptSubmit"]![1]!;
+    const raw = config["UserPromptSubmit"]![0]!.hooks[0]!.raw;
+    const { runner } = makeRunner(undefined, {
+      config,
+      pluginContexts: new Map([[context.pluginId, context]]),
+    });
+
+    expect((await runner.fire("UserPromptSubmit", {})).stdout).toBe(`${context.root}|${context.dataDir}`);
+    expect(literalEntry.matcher).toBe("${CLAUDE_PLUGIN_ROOT}");
+    expect(literalEntry.if).toBe("${CLAUDE_PLUGIN_DATA}");
+    expect(raw["url"]).toBe("https://example.test/${CLAUDE_PLUGIN_ROOT}");
+    expect(raw["arbitrary"]).toBe("${CLAUDE_PLUGIN_DATA}");
+    expect(config["UserPromptSubmit"]![0]!.hooks[0]!.args).toEqual([
+      "${CLAUDE_PLUGIN_ROOT}",
+      "${CLAUDE_PLUGIN_DATA}",
+    ]);
+  });
+
   it("keeps project and qualified contexts distinct while same-context duplicates dedupe", async () => {
     const context = runtimeContext("same@market-a", makeTempDir());
     const projectConfig = parseHookConfig(

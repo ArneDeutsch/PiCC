@@ -511,6 +511,66 @@ describe("loadPluginSkills", () => {
     expect(loadSkillBody(result.skills[0]!)).toBe("SELECTED BODY");
   });
 
+  it("reports a direct explicit command final-read failure as terminal typed evidence", () => {
+    const pluginRoot = path.join(root, "plugin-command-final-read");
+    const commandFile = write(
+      "plugin-command-final-read/command.md",
+      "---\ndescription: command\n---\nbody",
+    );
+    const input = pluginSource(pluginRoot, "./command.md", "file");
+    const originalReadFileSync = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+      if (filePath === commandFile) {
+        throw Object.assign(new Error("private final read"), { code: "EACCES" });
+      }
+      return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginSkills([], [input]);
+      expect(result.skills).toEqual([]);
+      expect(result.pathFailures).toHaveLength(1);
+      expect(result.pathFailures![0]).toMatchObject({
+        pluginId: "tools@trusted-market",
+        component: "command",
+        source: input.source,
+        terminal: true,
+        failure: { code: "unreadable-path" },
+      });
+      expect(JSON.stringify(result.pathFailures)).not.toContain("private final read");
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("keeps a command descendant final-read failure below an explicit directory component-local", () => {
+    const pluginRoot = path.join(root, "plugin-command-directory-final-read");
+    const failed = write("plugin-command-directory-final-read/commands/a-failed.md", "failed body");
+    write("plugin-command-directory-final-read/commands/b-valid.md", "---\ndescription: valid\n---\nvalid body");
+    const originalReadFileSync = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+      if (filePath === failed) {
+        throw Object.assign(new Error("private descendant read"), { code: "EACCES" });
+      }
+      return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginSkills([], [pluginSource(pluginRoot, "./commands", "directory")]);
+      expect(result.skills.map((skill) => skill.name)).toEqual(["b-valid"]);
+      expect(result.skills[0]!.source).toMatchObject({
+        scope: "plugin",
+        pluginId: "tools@trusted-market",
+        pluginName: "tools",
+      });
+      expect(result.pathFailures).toEqual([]);
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({ message: "Cannot read command file; skipped" }),
+      ]);
+      expect(JSON.stringify(result)).not.toContain("private descendant read");
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("recursively discovers an absent-root skill directory with qualified aliases, collisions, and deduplication", () => {
     const pluginRoot = path.join(root, "plugin-nested-skills");
     write("plugin-nested-skills/skills/alpha/SKILL.md", "---\ndescription: alpha\n---\nalpha");

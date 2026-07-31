@@ -44,6 +44,7 @@ import piccExtension, {
   substitutePluginRuntimeText,
 } from "../src/index.js";
 import { fakePi } from "./helpers/fake-pi.js";
+import { resolvePluginDataLocation } from "../src/claude/plugin-paths.js";
 import { CwdState } from "../src/runtime/cwd-state.js";
 import {
   applyUpdatedInput,
@@ -209,12 +210,11 @@ describe("qualified plugin agent content", () => {
       dataDir: "/data/b", projectDir: "/project",
     };
     const contexts = new Map([[first.pluginId, first], [second.pluginId, second]]);
-    const selectedFirst = pluginRuntimeContextForSource({ pluginId: first.pluginId, pluginName: "same" }, contexts);
-    const selectedSecond = pluginRuntimeContextForSource({ pluginId: second.pluginId, pluginName: "same" }, contexts);
+    const selectedFirst = pluginRuntimeContextForSource({ pluginId: first.pluginId }, contexts);
+    const selectedSecond = pluginRuntimeContextForSource({ pluginId: second.pluginId }, contexts);
     expect(selectedFirst).toBe(first);
     expect(selectedSecond).toBe(second);
-    expect(pluginRuntimeContextForSource({ pluginId: "same@missing", pluginName: "same" }, contexts)).toBeUndefined();
-    expect(pluginRuntimeContextForSource({ pluginName: "same" }, contexts)).toBeUndefined();
+    expect(pluginRuntimeContextForSource({ pluginId: "same@missing" }, contexts)).toBeUndefined();
 
     const template = "root=${CLAUDE_PLUGIN_ROOT};data=${CLAUDE_PLUGIN_DATA};project=${CLAUDE_PROJECT_DIR}";
     expect(substitutePluginRuntimeText(template, selectedFirst!)).toBe("root=/installed/a;data=/data/a;project=/project");
@@ -246,99 +246,73 @@ describe("qualified plugin agent content", () => {
 });
 
 describe("plugin persistent data preparation", () => {
-  it("creates only on first use and isolates qualified identities", () => {
+  it("prepares collision-prone marketplace identities sequentially without marker or legacy-path reuse", () => {
     const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
     const projectRoot = path.join(userDir, "project");
     fs.mkdirSync(projectRoot);
     try {
-      const contexts = ["same@market-a", "same@market-b"].map((pluginId) => ({
-        pluginId,
-        pluginName: "same",
-        root: path.join(userDir, "roots", pluginId),
-        dataDir: path.join(userDir, "plugins", "data", pluginId.replace(/[^A-Za-z0-9_-]/g, "-")),
-        projectDir: projectRoot,
-      }));
-      expect(contexts.every((context) => !fs.existsSync(context.dataDir))).toBe(true);
-      expect(preparePluginDataDir({ userDir, projectRoot, context: contexts[0]! })).toEqual({ ok: true });
-      expect(fs.existsSync(contexts[0]!.dataDir)).toBe(true);
-      expect(fs.existsSync(contexts[1]!.dataDir)).toBe(false);
-      expect(preparePluginDataDir({ userDir, projectRoot, context: contexts[1]! })).toEqual({ ok: true });
-    } finally {
-      fs.rmSync(userDir, { recursive: true, force: true });
-    }
-  });
-
-  it("admits portable interior dots but rejects trailing dots/spaces and Windows devices before filesystem access", () => {
-    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
-    const projectRoot = path.join(userDir, "project");
-    fs.mkdirSync(projectRoot);
-    try {
-      const dotted = {
-        pluginId: "portable.name", pluginName: "portable.name", root: userDir,
-        dataDir: path.join(userDir, "plugins", "data", "portable.name"), projectDir: projectRoot,
-      };
-      expect(preparePluginDataDir({ userDir, projectRoot, context: dotted })).toEqual({ ok: true });
-      expect(fs.existsSync(dotted.dataDir)).toBe(true);
-
-      for (const name of [
-        "trailing.", "trailing ", "CON", "prn.txt", "AUX.any", "NUL", "CLOCK$", "COM1.log",
-        "com9", "LPT1.txt", "lpt9", "CONIN$", "CONOUT$.txt",
-      ]) {
-        const lstat = vi.spyOn(fs, "lstatSync");
-        const mkdir = vi.spyOn(fs, "mkdirSync");
-        const realpath = vi.spyOn(fs.realpathSync, "native");
-        const context = {
-          pluginId: name, pluginName: name, root: userDir,
-          dataDir: path.join(userDir, "plugins", "data", name), projectDir: projectRoot,
+      const identities = [
+        "alpha@market.one",
+        "alpha@market-one",
+        "alpha@Market.one",
+        "alpha@Market-one",
+      ];
+      const contexts = identities.map((pluginId) => {
+        const location = resolvePluginDataLocation(userDir, pluginId);
+        if (!location.ok) throw new Error(location.diagnostic.message);
+        return {
+          pluginId,
+          pluginName: "alpha",
+          root: path.join(userDir, "roots", pluginId),
+          dataDir: location.value.lexicalPath,
+          projectDir: projectRoot,
         };
-        expect(preparePluginDataDir({ userDir, projectRoot, context })).toEqual({ ok: false, code: "invalid-legacy-identity" });
-        expect(lstat).not.toHaveBeenCalled();
-        expect(mkdir).not.toHaveBeenCalled();
-        expect(realpath).not.toHaveBeenCalled();
-        lstat.mockRestore();
-        mkdir.mockRestore();
-        realpath.mockRestore();
-        expect(fs.existsSync(context.dataDir)).toBe(false);
+      });
+      expect(new Set(contexts.map((context) => context.dataDir)).size).toBe(4);
+
+      const oldAmbiguousDir = path.join(userDir, "plugins", "data", "alpha-market-one");
+      const oldBareDir = path.join(userDir, "plugins", "data", "alpha");
+      fs.mkdirSync(oldAmbiguousDir, { recursive: true });
+      fs.mkdirSync(oldBareDir, { recursive: true });
+      fs.writeFileSync(path.join(oldAmbiguousDir, "marker"), "legacy-undigested");
+      fs.writeFileSync(path.join(oldBareDir, "marker"), "legacy-bare");
+      for (const [index, context] of contexts.entries()) {
+        expect(preparePluginDataDir({ userDir, projectRoot, context })).toEqual({ ok: true });
+        expect(fs.existsSync(path.join(context.dataDir, "marker"))).toBe(false);
+        fs.writeFileSync(path.join(context.dataDir, "marker"), `identity-${index}`);
+        for (let prior = 0; prior < index; prior++) {
+          expect(fs.readFileSync(path.join(contexts[prior]!.dataDir, "marker"), "utf8")).toBe(`identity-${prior}`);
+        }
       }
+      expect(fs.readFileSync(path.join(oldAmbiguousDir, "marker"), "utf8")).toBe("legacy-undigested");
+      expect(fs.readFileSync(path.join(oldBareDir, "marker"), "utf8")).toBe("legacy-bare");
     } finally {
       fs.rmSync(userDir, { recursive: true, force: true });
     }
   });
 
-  it("rejects legacy traversal and a linked data base before outside mutation", () => {
+  it("rejects a non-qualified identity before creating persistent data", () => {
     const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-data-"));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-outside-"));
     const projectRoot = path.join(userDir, "project");
     fs.mkdirSync(projectRoot);
     try {
-      const traversal = {
-        pluginId: "../escape",
-        pluginName: "../escape",
+      const mkdir = vi.spyOn(fs, "mkdirSync");
+      const context = {
+        pluginId: "bare-name",
+        pluginName: "bare-name",
         root: userDir,
-        dataDir: path.join(userDir, "plugins", "escape"),
+        dataDir: path.join(userDir, "plugins", "data", "bare-name"),
         projectDir: projectRoot,
       };
-      expect(preparePluginDataDir({ userDir, projectRoot, context: traversal }).ok).toBe(false);
-      expect(fs.readdirSync(outside)).toEqual([]);
-
-      fs.mkdirSync(path.join(userDir, "plugins"), { recursive: true });
-      try {
-        fs.symlinkSync(outside, path.join(userDir, "plugins", "data"), process.platform === "win32" ? "junction" : "dir");
-      } catch {
-        return;
-      }
-      const linked = {
-        pluginId: "legacy",
-        pluginName: "legacy",
-        root: userDir,
-        dataDir: path.join(userDir, "plugins", "data", "legacy"),
-        projectDir: projectRoot,
-      };
-      expect(preparePluginDataDir({ userDir, projectRoot, context: linked }).ok).toBe(false);
-      expect(fs.existsSync(path.join(outside, "legacy"))).toBe(false);
+      expect(preparePluginDataDir({ userDir, projectRoot, context })).toEqual({
+        ok: false,
+        code: "invalid-path",
+      });
+      expect(mkdir).not.toHaveBeenCalled();
+      mkdir.mockRestore();
+      expect(fs.existsSync(context.dataDir)).toBe(false);
     } finally {
       fs.rmSync(userDir, { recursive: true, force: true });
-      fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 });

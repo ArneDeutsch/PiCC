@@ -547,43 +547,46 @@ describe("contained plugin walker", () => {
 });
 
 describe("qualified plugin data locations", () => {
-  it("preserves Claude case while exposing punctuation and case-folded collisions", () => {
-    expect(sanitizePluginDataKey("Plugin.Name@Market")).toBe("Plugin-Name-Market");
-    expect(sanitizePluginDataKey("a.b@c")).toBe(sanitizePluginDataKey("a-b@c"));
-    expect(sanitizePluginDataKey("safe_Name-1@market")).toBe("safe_Name-1-market");
-    const userDir = temporaryDirectory("picc-plugin-collision-");
-    const dotted = resolvePluginDataLocation(userDir, "Plugin.Name@Market");
-    const dashed = resolvePluginDataLocation(userDir, "Plugin-Name@market");
-    expect(dotted).toMatchObject({ ok: true, value: { key: "Plugin-Name-Market", collisionToken: "plugin-name-market" } });
-    expect(dashed).toMatchObject({ ok: true, value: { key: "Plugin-Name-market", collisionToken: "plugin-name-market" } });
+  const pluginMarketDataKey = sanitizePluginDataKey("plugin@market");
+
+  it("uses a bounded readable prefix and a stable full-identity digest", () => {
+    expect(sanitizePluginDataKey("Plugin.Name@Market")).toBe(
+      "Plugin-Name-Market--385fc5b2c1b14ff3d09714c6364ce8b208a08e0a373a62850a95cea6af304e34",
+    );
+    expect(sanitizePluginDataKey("a.b@c")).not.toBe(sanitizePluginDataKey("a-b@c"));
+    expect(sanitizePluginDataKey("Plugin.Name@market")).not.toBe(sanitizePluginDataKey("plugin.name@market"));
+    const longKey = sanitizePluginDataKey(`${"a".repeat(400)}@market`);
+    expect(longKey).toHaveLength(146);
+    expect(longKey).toMatch(/^a{80}--[a-f0-9]{64}$/);
   });
 
-  it("enforces the portable 255-character data-key boundary before user-directory lookup", () => {
-    const userDir = temporaryDirectory("picc-plugin-key-length-");
-    expect(resolvePluginDataLocation(userDir, `${"a".repeat(253)}@m`)).toMatchObject({ ok: true });
-    const overlongIdentity = `${"a".repeat(254)}@m`;
-    expect(resolvePluginDataLocation(userDir, overlongIdentity)).toMatchObject({
-      ok: false,
-      code: "invalid-path",
-      diagnostic: { message: expect.stringContaining("at most 255 ASCII characters") },
-    });
-    expect(resolvePluginDataLocation(path.join(userDir, "unavailable"), overlongIdentity)).toMatchObject({
-      ok: false,
-      code: "invalid-path",
-      diagnostic: { message: expect.stringContaining("at most 255 ASCII characters") },
-    });
+  it("gives collision-prone qualified marketplaces separate portable locations for one valid lifecycle", () => {
+    const userDir = temporaryDirectory("picc-plugin-collision-");
+    const identities = [
+      "alpha@market.one",
+      "alpha@market-one",
+      "alpha@Market.one",
+      "alpha@Market-one",
+    ];
+    const results = identities.map((identity) => resolvePluginDataLocation(userDir, identity));
+    expect(results.every((result) => result.ok)).toBe(true);
+    const locations = results.flatMap((result) => result.ok ? [result.value] : []);
+    expect(new Set(locations.map((location) => location.key)).size).toBe(4);
+    expect(new Set(locations.map((location) => location.collisionToken)).size).toBe(4);
+    expect(locations.every((location) => location.key.length <= 255)).toBe(true);
   });
 
   it("returns a typed lazy location beneath the user data base and revalidates it", () => {
     const userDir = temporaryDirectory("picc-plugin-user-");
     expect(resolvePluginDataLocation(userDir, "unqualified")).toMatchObject({ ok: false, code: "invalid-path" });
     const result = resolvePluginDataLocation(userDir, "plugin.name@market");
+    const expectedKey = "plugin-name-market--9868dc4a00d3d05808afb224c346a03078632138ca0c407424040b1cbf07e140";
     expect(result).toMatchObject({
       ok: true,
       value: {
-        key: "plugin-name-market",
+        key: expectedKey,
         lexicalBasePath: path.join(userDir, "plugins", "data"),
-        lexicalPath: path.join(userDir, "plugins", "data", "plugin-name-market"),
+        lexicalPath: path.join(userDir, "plugins", "data", expectedKey),
       },
     });
     expect(result.ok && revalidatePluginDataLocation(result.value)).toMatchObject({ ok: true });
@@ -604,7 +607,7 @@ describe("qualified plugin data locations", () => {
     });
   });
 
-  it.each(["plugins", path.join("plugins", "data"), path.join("plugins", "data", "plugin-market")])(
+  it.each(["plugins", path.join("plugins", "data"), path.join("plugins", "data", pluginMarketDataKey)])(
     "rejects a file at generated directory component %s",
     (component) => {
       const userDir = temporaryDirectory("picc-plugin-data-kind-");
@@ -621,7 +624,7 @@ describe("qualified plugin data locations", () => {
     const actualKey = path.join(actualData, "actual-key");
     fs.mkdirSync(actualKey, { recursive: true });
     directoryLink(actualPlugins, path.join(userDir, "plugins"));
-    directoryLink(actualKey, path.join(actualData, "plugin-market"));
+    directoryLink(actualKey, path.join(actualData, pluginMarketDataKey));
     expect(resolvePluginDataLocation(userDir, "plugin@market")).toMatchObject({
       ok: true,
       value: { canonicalBasePath: actualData, canonicalPath: actualKey },
@@ -646,7 +649,7 @@ describe("qualified plugin data locations", () => {
 
     fs.rmSync(path.join(userDir, "plugins", "data"), { recursive: true, force: true });
     fs.mkdirSync(path.join(userDir, "plugins", "data"));
-    directoryLink(outside, path.join(userDir, "plugins", "data", "plugin-market"));
+    directoryLink(outside, path.join(userDir, "plugins", "data", pluginMarketDataKey));
     expect(resolvePluginDataLocation(userDir, "plugin@market")).toMatchObject({ ok: false, code: "path-escape" });
   });
 
@@ -657,7 +660,7 @@ describe("qualified plugin data locations", () => {
     const second = path.join(dataBase, "second");
     fs.mkdirSync(first, { recursive: true });
     fs.mkdirSync(second);
-    const locationPath = path.join(dataBase, "plugin-market");
+    const locationPath = path.join(dataBase, pluginMarketDataKey);
     directoryLink(first, locationPath);
     const location = resolvePluginDataLocation(userDir, "plugin@market");
     expect(location.ok).toBe(true);
@@ -674,7 +677,7 @@ describe("qualified plugin data locations", () => {
     const outside = path.join(parent, "outside");
     fs.mkdirSync(contained, { recursive: true });
     fs.mkdirSync(outside);
-    const locationPath = path.join(dataBase, "plugin-market");
+    const locationPath = path.join(dataBase, pluginMarketDataKey);
     directoryLink(contained, locationPath);
     const location = resolvePluginDataLocation(userDir, "plugin@market");
     expect(location.ok).toBe(true);

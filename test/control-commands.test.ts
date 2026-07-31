@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
+import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred } from "./helpers/async.js";
 import { fakeSdk } from "./helpers/fake-sdk.js";
@@ -642,8 +643,8 @@ describe("pre-selection plugin discovery to first use", () => {
       };
       fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
     });
-    const dataDir = path.join(root, ".claude-user", "plugins", "data", "data-owner-market");
-    const hookDir = path.join(root, ".claude-user", "plugins", "data", "hook-owner-market");
+    const dataDir = path.join(root, ".claude-user", "plugins", "data", sanitizePluginDataKey("data-owner@market"));
+    const hookDir = path.join(root, ".claude-user", "plugins", "data", sanitizePluginDataKey("hook-owner@market"));
     try {
       expect(fs.existsSync(dataDir)).toBe(false);
       expect(fs.existsSync(hookDir)).toBe(false);

@@ -5,7 +5,6 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EffectivePluginEnablement, NormalizedPluginInstallation } from "../src/types.js";
 import {
-  expandPluginVariables,
   loadPluginHooks,
   resolveInstalledPlugins,
 } from "../src/claude/plugins.js";
@@ -240,6 +239,25 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
   });
 
+  it.skipIf(!directoryLinkProbe)("projects the canonical runtime root even after an authorized cache spelling retargets", () => {
+    const firstCache = path.join(tmpRoot, "canonical-cache-a");
+    const secondCache = path.join(tmpRoot, "canonical-cache-b");
+    fs.mkdirSync(firstCache);
+    fs.mkdirSync(secondCache);
+    const cacheLink = path.join(tmpRoot, "configured-cache-link");
+    fs.symlinkSync(firstCache, cacheLink, process.platform === "win32" ? "junction" : "dir");
+    const installation = record({ installPath: installedRoot("alpha@official", "1.0.0", cacheLink) });
+    const result = resolve({ installations: [installation], env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: cacheLink } });
+    const canonicalRoot = fs.realpathSync.native(installation.installPath);
+    expect(result.plugins[0]!.root).toBe(canonicalRoot);
+    expect(result.plugins[0]!.context.root).toBe(canonicalRoot);
+
+    fs.unlinkSync(cacheLink);
+    fs.symlinkSync(secondCache, cacheLink, process.platform === "win32" ? "junction" : "dir");
+    expect(result.plugins[0]!.root).toBe(canonicalRoot);
+    expect(result.plugins[0]!.context.root).toBe(canonicalRoot);
+  });
+
   it("keeps non-equivalent or unresolvable duplicate spellings ambiguous", () => {
     const first = record({ scope: "user", installPath: path.join(tmpRoot, "missing-one") });
     const second = record({ scope: "user", installPath: path.join(tmpRoot, "missing-two") });
@@ -267,17 +285,31 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     expect(JSON.stringify(result.outcomes[0]!.diagnostics)).not.toContain(secretRoot);
   });
 
-  it("authorizes exact configured and seed cache bases only when a record exists", () => {
+  it("authorizes configured and path-delimited seed cache bases only for exact records", () => {
     const configured = path.join(tmpRoot, "configured-cache");
     fs.mkdirSync(configured);
     const configuredRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", configured) });
     expect(resolve({ installations: [configuredRecord], env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: configured } }).outcomes[0]!.status).toBe("loaded");
 
-    const seed = path.join(tmpRoot, "seed");
-    const seedCache = path.join(seed, "plugins", "cache");
-    fs.mkdirSync(seedCache, { recursive: true });
-    const seedRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", seedCache) });
-    expect(resolve({ installations: [seedRecord], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: seed } }).outcomes[0]!.status).toBe("loaded");
+    const firstSeed = path.join(tmpRoot, "first-seed");
+    const secondSeed = path.join(tmpRoot, "second-seed");
+    const firstCache = path.join(firstSeed, "cache");
+    const secondCache = path.join(secondSeed, "cache");
+    fs.mkdirSync(firstCache, { recursive: true });
+    fs.mkdirSync(secondCache, { recursive: true });
+    const firstRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", firstCache) });
+    expect(resolve({ installations: [firstRecord], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: firstSeed } }).outcomes[0]!.status).toBe("loaded");
+
+    const secondRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", secondCache) });
+    const seeds = ["", firstSeed, secondSeed, firstSeed, ""].join(path.delimiter);
+    expect(resolve({ installations: [secondRecord], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: seeds } }).outcomes[0]!.status).toBe("loaded");
+    expect(resolve({ installations: [], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: seeds } }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+
+    const erroneous = path.join(tmpRoot, "erroneous-seed");
+    const erroneousCache = path.join(erroneous, "plugins", "cache");
+    fs.mkdirSync(erroneousCache, { recursive: true });
+    const erroneousRecord = record({ installPath: installedRoot("alpha@official", "1.0.0", erroneousCache) });
+    expect(resolve({ installations: [erroneousRecord], env: { CLAUDE_CODE_PLUGIN_SEED_DIR: erroneous } }).outcomes[0]!.status).toBe("rejected");
   });
 });
 
@@ -309,7 +341,7 @@ describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
     expect(unreadable.diagnostics[0]!.message).not.toContain("secret path");
   });
 
-  it("distinguishes component namespace and persistent-data-key collisions, including both together", () => {
+  it("rejects component namespace collisions without conflating punctuation-distinct data projections", () => {
     const first = record({ pluginId: "one@market", installPath: installedRoot("one@market") });
     const second = record({ pluginId: "two@market", installPath: installedRoot("two@market") });
     for (const item of [first, second]) write(path.join(item.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "same" }));
@@ -321,15 +353,18 @@ describe("resolveInstalledPlugins — blocklist and collision boundary", () => {
 
     const dot = record({ pluginId: "same.name@market", installPath: installedRoot("same.name@market") });
     const dash = record({ pluginId: "same-name@market", installPath: installedRoot("same-name@market") });
+    write(path.join(dot.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "dot-component" }));
+    write(path.join(dash.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "dash-component" }));
     const data = resolve({ enabled: { "same.name@market": true, "same-name@market": true }, installations: [dot, dash] });
-    expect(data.plugins).toEqual([]);
-    expect(data.outcomes[0]!.diagnostics.map((item) => item.message).join(" ")).toContain("persistent data key collision");
+    expect(data.plugins.map((plugin) => plugin.pluginId)).toEqual(["same-name@market", "same.name@market"]);
+    expect(data.outcomes.every((outcome) => outcome.status === "loaded")).toBe(true);
+    expect(new Set(data.plugins.map((plugin) => path.basename(plugin.dataDir))).size).toBe(2);
 
     for (const item of [dot, dash]) write(path.join(item.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "same" }));
     const both = resolve({ enabled: { "same.name@market": true, "same-name@market": true }, installations: [dot, dash] });
     const messages = both.outcomes[0]!.diagnostics.map((item) => item.message).join(" ");
     expect(messages).toContain("component namespace collision");
-    expect(messages).toContain("persistent data key collision");
+    expect(messages).not.toContain("persistent data key collision");
   });
 });
 
@@ -478,27 +513,81 @@ describe("resolveInstalledPlugins — component declarations", () => {
     expect(plugin.hookSources[0]!.kind).toBe("file");
   });
 
-  it("rejects a malformed manifest and a present manifest without a valid name", () => {
-    for (const manifest of ["not json", "{}", '{"name":"../bad"}']) {
+  it("rejects an invalid manifestless lifecycle namespace with neutral fixed wording", () => {
+    const installation = record({
+      pluginId: "Alpha@official",
+      installPath: installedRoot("Alpha@official"),
+    });
+    const outcome = resolve({ enabled: { "Alpha@official": true }, installations: [installation] }).outcomes[0]!;
+    expect(outcome.status).toBe("rejected");
+    expect(outcome.diagnostics).toContainEqual({
+      severity: "warning",
+      message: "Plugin component namespace is malformed; expected lowercase letters or digits separated by single hyphens",
+    });
+    const namespaceDiagnostic = outcome.diagnostics.find((item) => item.message.startsWith("Plugin component namespace"));
+    expect(namespaceDiagnostic?.message).not.toContain("Alpha");
+    expect(namespaceDiagnostic?.message).not.toContain("manifest");
+  });
+
+  it("accepts only kebab-case manifest component namespaces", () => {
+    for (const name of ["alpha", "alpha-2", "2-alpha"]) {
+      const installation = record();
+      write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name }));
+      expect(resolve({ installations: [installation] }).outcomes[0]!.status, name).toBe("loaded");
+      fs.rmSync(installation.installPath, { recursive: true, force: true });
+    }
+    for (const manifest of ["not json", "{}"]) {
       const installation = record();
       write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), manifest);
-      expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("rejected");
+      expect(resolve({ installations: [installation] }).outcomes[0]!.status, manifest).toBe("rejected");
+      fs.rmSync(installation.installPath, { recursive: true, force: true });
+    }
+    for (const name of ["../bad", "Upper", "has.dot", "has_under", "-leading", "trailing-", "two--hyphens"]) {
+      const installation = record();
+      write(path.join(installation.installPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name }));
+      const outcome = resolve({ installations: [installation] }).outcomes[0]!;
+      expect(outcome.status, name).toBe("rejected");
+      expect(outcome.diagnostics.map((diagnostic) => diagnostic.message)).toContain(
+        "Plugin manifest name is malformed; expected lowercase letters or digits separated by single hyphens",
+      );
+      expect(JSON.stringify(outcome.diagnostics)).not.toContain(name);
       fs.rmSync(installation.installPath, { recursive: true, force: true });
     }
   });
 });
 
 describe("loadPluginHooks", () => {
-  it("expands root/data variables and drops hostile event keys without trusting raw provenance", () => {
+  it("preserves placeholders literally outside execution and drops hostile event keys", () => {
     const installation = record();
-    write(path.join(installation.installPath, "hooks", "hooks.json"), '{"__proto__":[{"hooks":[]}],"PreToolUse":[{"hooks":[{"command":"${CLAUDE_PLUGIN_ROOT} ${CLAUDE_PLUGIN_DATA}","pluginId":"forged"}]}]}');
+    write(path.join(installation.installPath, "hooks", "hooks.json"), JSON.stringify({
+      ["__proto__"]: [{ hooks: [] }],
+      PreToolUse: [{
+        matcher: "Bash(${CLAUDE_PLUGIN_ROOT})",
+        if: "${CLAUDE_PLUGIN_DATA}",
+        hooks: [{
+          command: "${CLAUDE_PLUGIN_ROOT}",
+          args: ["${CLAUDE_PLUGIN_DATA}"],
+          url: "https://example.test/${CLAUDE_PLUGIN_ROOT}",
+          rawField: "${CLAUDE_PLUGIN_DATA}",
+        }],
+      }],
+    }));
     const plugin = resolve({ installations: [installation] }).plugins[0]!;
     const loaded = loadPluginHooks(plugin);
     expect(Object.hasOwn(loaded.config, "__proto__")).toBe(false);
-    const command = (loaded.config["PreToolUse"] as Array<{ hooks: Array<{ command: string }> }>)[0]!.hooks[0]!.command;
-    expect(command).toContain(plugin.root);
-    expect(command).toContain(plugin.dataDir);
+    const entry = (loaded.config["PreToolUse"] as Array<{
+      matcher: string; if: string; hooks: Array<Record<string, unknown>>;
+    }>)[0]!;
+    expect(entry).toEqual({
+      matcher: "Bash(${CLAUDE_PLUGIN_ROOT})",
+      if: "${CLAUDE_PLUGIN_DATA}",
+      hooks: [{
+        command: "${CLAUDE_PLUGIN_ROOT}",
+        args: ["${CLAUDE_PLUGIN_DATA}"],
+        url: "https://example.test/${CLAUDE_PLUGIN_ROOT}",
+        rawField: "${CLAUDE_PLUGIN_DATA}",
+      }],
+    });
     expect(loaded.diagnostics).toHaveLength(1);
-    expect(expandPluginVariables("${CLAUDE_PLUGIN_ROOT}:${CLAUDE_PLUGIN_DATA}", plugin)).toBe(`${plugin.root}:${plugin.dataDir}`);
   });
 });

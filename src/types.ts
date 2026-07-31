@@ -57,12 +57,6 @@ export interface Diagnostic {
 // Installed plugins
 // ---------------------------------------------------------------------------
 
-export interface QualifiedPluginIdentity {
-  id: string;
-  name: string;
-  marketplace: string;
-}
-
 export type PluginInstallationScope = "managed" | "local" | "project" | "user";
 
 export interface PluginInstallationProvenance {

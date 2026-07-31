@@ -58,6 +58,7 @@ const KNOWN_HANDLER_TYPES: readonly string[] = [
 
 /** Tools whose presence makes an agent NOT read-only for catalog purposes. */
 const WRITE_CAPABLE_TOOLS = new Set(["write", "edit", "bash"]);
+const PLUGIN_AGENT_LOCAL_NAME = /^[a-z]+(?:-[a-z]+)*$/;
 
 export interface LoadAgentsResult {
   agents: ClaudeAgent[];
@@ -94,15 +95,13 @@ interface PluginIdentity {
  */
 export function loadAgents(
   agentDirs: Array<{ dir: string; scope: Scope }>,
-  opts?: { pluginName?: string },
 ): LoadAgentsResult {
   const agents: ClaudeAgent[] = [];
   const diagnostics: Diagnostic[] = [];
 
   for (const { dir, scope } of agentDirs) {
     for (const filePath of collectAgentFiles(dir)) {
-      const plugin = opts?.pluginName ? { pluginName: opts.pluginName } : undefined;
-      const agent = loadAgentFile(filePath, scope, diagnostics, plugin);
+      const agent = loadAgentFile(filePath, scope, diagnostics);
       if (agent) agents.push(agent);
     }
   }
@@ -121,13 +120,40 @@ export function loadPluginAgents(sources: PluginAgentLoaderSource[]): LoadAgents
       const parent = validated.kind === "directory"
         ? path.relative(validated.lexicalPath, path.dirname(file.lexicalPath))
         : "";
-      const namePrefix = parent && !parent.startsWith("..") && !path.isAbsolute(parent)
-        ? parent.split(/[\\/]/).filter(Boolean).join(":")
-        : undefined;
+      const prefixSegments = parent && !parent.startsWith("..") && !path.isAbsolute(parent)
+        ? parent.split(/[\\/]/).filter(Boolean)
+        : [];
+      if (prefixSegments.some((segment) => !PLUGIN_AGENT_LOCAL_NAME.test(segment))) {
+        diagnostics.push({
+          severity: "warning",
+          message: "Plugin agent directory name is malformed; expected lowercase letters separated by single hyphens; agent skipped",
+          source: file.lexicalPath,
+        });
+        continue;
+      }
+      const namePrefix = prefixSegments.length > 0 ? prefixSegments.join(":") : undefined;
       const agent = loadAgentFile(file.lexicalPath, "plugin", diagnostics, {
         pluginId: input.source.metadata.pluginId,
         pluginName: input.source.metadata.pluginName,
-      }, namePrefix);
+      }, namePrefix, () => {
+        if (input.source.kind !== "file") return;
+        const failure: PluginPathFailure = {
+          ok: false,
+          code: "unreadable-path",
+          diagnostic: {
+            severity: "warning",
+            message: "Plugin agent file became unreadable after path revalidation",
+            source: file.lexicalPath,
+          },
+        };
+        pathFailures.push({
+          pluginId: input.source.metadata.pluginId,
+          component: "agent",
+          source: input.source,
+          terminal: true,
+          failure,
+        });
+      });
       if (agent) agents.push(agent);
     }
   }
@@ -239,6 +265,7 @@ function loadAgentFile(
   globalDiagnostics: Diagnostic[],
   plugin?: PluginIdentity,
   namePrefix?: string,
+  onUnreadable?: () => void,
 ): ClaudeAgent | undefined {
   const content = readTextSafe(filePath);
   if (content === undefined) {
@@ -247,6 +274,7 @@ function loadAgentFile(
       message: "Could not read agent file; skipped",
       source: filePath,
     });
+    onUnreadable?.();
     return undefined;
   }
 
@@ -280,6 +308,14 @@ function loadAgentFile(
 
   const localName =
     toOptionalString(fm["name"])?.trim() || path.basename(filePath, path.extname(filePath));
+  if (pluginProvided && !PLUGIN_AGENT_LOCAL_NAME.test(localName)) {
+    globalDiagnostics.push(...forbiddenDiagnostics, {
+      severity: "warning",
+      message: "Plugin agent local name is malformed; expected lowercase letters separated by single hyphens; agent skipped",
+      source: filePath,
+    });
+    return undefined;
+  }
   const name = namePrefix ? `${namePrefix}:${localName}` : localName;
   globalDiagnostics.push(...forbiddenDiagnostics);
 
