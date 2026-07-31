@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
+import type { Diagnostic, HookOutcome, HookPayload, PluginResolutionOutcome, PluginRuntimeContext, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
@@ -92,7 +92,8 @@ import {
   renderMcpStatusReport,
   type CompatReport,
 } from "./registry/compat-report.js";
-import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
+import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
+import { resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
@@ -359,6 +360,8 @@ export interface PiccTestSeam {
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
   checkpointDeadlinePolicy?: HostDeadlinePolicy;
+  /** TEST-ONLY future-producer outcomes; in-process only and unreachable from project files/environment. */
+  pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -454,8 +457,182 @@ export async function writeFdFully(
   }
 }
 
+const PLUGIN_STARTUP_ID_CAP = 5;
+const PLUGIN_CONTROL_NAMES = new Set(["plugin", "plugins", "reload-plugins"]);
+const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
+const PLUGIN_RECONCILE_RECOVERY = `Reconcile or reinstall the plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}`;
+
+function pluginDataFailureRecovery(code: string): string {
+  return code === "unreadable-path" || code === "wrong-kind"
+    ? "Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required"
+    : PLUGIN_RECONCILE_RECOVERY;
+}
+export function pluginRuntimeContextForSource(
+  source: { pluginId?: string },
+  contexts: ReadonlyMap<string, PluginRuntimeContext>,
+): PluginRuntimeContext | undefined {
+  return source.pluginId === undefined ? undefined : contexts.get(source.pluginId);
+}
+
+export function preparePluginDataDir(opts: {
+  userDir: string;
+  projectRoot: string;
+  context: PluginRuntimeContext;
+}): { ok: true } | { ok: false; code: string } {
+  const { context } = opts;
+  if (path.resolve(context.projectDir) !== path.resolve(opts.projectRoot)) {
+    return { ok: false, code: "project-context-mismatch" };
+  }
+  try {
+    const location = resolvePluginDataLocation(opts.userDir, context.pluginId);
+    if (!location.ok) return { ok: false, code: location.code };
+    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) {
+      return { ok: false, code: "qualified-projection-mismatch" };
+    }
+    fs.mkdirSync(location.value.lexicalPath, { recursive: true });
+    const current = revalidatePluginDataLocation(location.value);
+    return current.ok ? { ok: true } : { ok: false, code: current.code };
+  } catch {
+    return { ok: false, code: "data-directory-preparation-failed" };
+  }
+}
+
+export function substitutePluginRuntimeText(
+  text: string,
+  context: PluginRuntimeContext,
+  extra: Record<string, string> = {},
+): string {
+  return substituteVariables(text, {
+    ...extra,
+    CLAUDE_PLUGIN_ROOT: context.root,
+    CLAUDE_PLUGIN_DATA: context.dataDir,
+    CLAUDE_PROJECT_DIR: context.projectDir,
+  });
+}
+
+/** Pure runtime projection; loaded project definitions remain immutable. */
+export function projectPluginAgentRuntime(
+  agent: ClaudeAgent,
+  context: PluginRuntimeContext,
+): ClaudeAgent {
+  const projectRules = (rules: string[] | undefined): string[] | undefined =>
+    rules?.map((rule) => substitutePluginRuntimeText(rule, context));
+  return {
+    ...agent,
+    body: substitutePluginRuntimeText(agent.body, context),
+    tools: projectRules(agent.tools),
+    disallowedTools: projectRules(agent.disallowedTools),
+  };
+}
+
+export function createBoundedHeadlessDiagnosticSurface(
+  emit: (text: string) => void,
+  fingerprintCap = 20,
+): (diagnostic: Diagnostic) => void {
+  const reported = new Set<string>();
+  let saturated = false;
+  return (diagnostic: Diagnostic): void => {
+    const bounded = sanitizeLine(diagnostic.message, 500);
+    const fingerprint = bounded;
+    if (reported.has(fingerprint)) return;
+    if (reported.size >= fingerprintCap) {
+      if (!saturated) {
+        saturated = true;
+        try {
+          emit("PiCC: additional distinct plugin runtime warnings were suppressed; run /doctor for bounded details.");
+        } catch {
+          // Diagnostics are additive observation and cannot change runtime work.
+        }
+      }
+      return;
+    }
+    reported.add(fingerprint);
+    try {
+      emit(`PiCC: ${bounded}`);
+    } catch {
+      // Diagnostics are additive observation and cannot change runtime work.
+    }
+  };
+}
+
+function createBoundedTuiDiagnosticSurface(fingerprintCap = 20): (
+  diagnostics: readonly Diagnostic[],
+  notify: (text: string, severity: "warning" | "error") => void,
+) => void {
+  const reported = new Set<string>();
+  let saturated = false;
+  return (diagnostics, notify): void => {
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.severity !== "warning" && diagnostic.severity !== "error") continue;
+      const message = sanitizeLine(diagnostic.message, 500);
+      const source = sanitizeLine(diagnostic.source ?? "", 120);
+      const fingerprint = `${diagnostic.severity}:${source}:${message}`;
+      if (reported.has(fingerprint)) continue;
+      if (reported.size >= fingerprintCap) {
+        if (!saturated) {
+          saturated = true;
+          try {
+            notify("PiCC: additional distinct plugin runtime warnings were suppressed; run /doctor for bounded details.", "warning");
+          } catch {
+            // A failed UI notification must not replay the fork or leak its raw slash input.
+          }
+        }
+        continue;
+      }
+      reported.add(fingerprint);
+      try {
+        notify(`PiCC: ${message}`, diagnostic.severity);
+      } catch {
+        // Diagnostics are additive presentation; the completed transform remains authoritative.
+      }
+    }
+  };
+}
+
+export function renderPluginStartupNotice(
+  outcomes: readonly PluginResolutionOutcome[] | undefined,
+  diagnostics: readonly Diagnostic[],
+): string | undefined {
+  const lines: string[] = [];
+  const failed = (outcomes ?? []).filter((outcome) =>
+    outcome.status !== "loaded" && outcome.status !== "disabled",
+  );
+  if (failed.length > 0) {
+    const ids = [...new Set(failed.map((outcome) => sanitizeLine(outcome.pluginId, 128)))]
+      .slice(0, PLUGIN_STARTUP_ID_CAP);
+    const omitted = new Set(failed.map((outcome) => sanitizeLine(outcome.pluginId, 128))).size - ids.length;
+    lines.push(
+      `Enabled plugin content did not load and no fallback content was used: ${ids.join(", ")}` +
+        (omitted > 0 ? `, and ${omitted} more` : "") +
+        ". Run /doctor for details.",
+    );
+  }
+
+  const administratorPolicyClasses = new Set(["system-file", "system-drop-in", "registry-hklm"]);
+  const policyDiagnostics = diagnostics.filter((diagnostic) =>
+    (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") &&
+    (diagnostic.impact === "source-ignored" || diagnostic.impact === "weaker-policy-suppressed") &&
+    diagnostic.sourceClass !== undefined && administratorPolicyClasses.has(diagnostic.sourceClass),
+  );
+  for (const impact of ["source-ignored", "weaker-policy-suppressed"] as const) {
+    const policyClasses = [...new Set(policyDiagnostics
+      .filter((diagnostic) => diagnostic.impact === impact)
+      .map((diagnostic) => sanitizeLine(diagnostic.sourceClass!, 80)))]
+      .slice(0, 3);
+    if (policyClasses.length === 0) continue;
+    const consequence = impact === "weaker-policy-suppressed"
+      ? "weaker policy was suppressed and plugin enablement may differ"
+      : "that administrator source was ignored and plugin enablement may differ";
+    lines.push(
+      `Administrator plugin policy was malformed or unreadable (${policyClasses.join(", ")}); ${consequence}. Repair policy, then ${PLUGIN_REFRESH_ACTION}.`,
+    );
+  }
+  return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const routeMainSessionTool = testSeam?.renderMainSessionTool ?? renderMainSessionTool;
+  const surfaceTypedForkTuiDiagnostics = createBoundedTuiDiagnosticSurface();
   // Capture once before project loading can spawn or inspect anything. PICC_* is
   // removed inside this call; PI_SKIP_VERSION_CHECK remains only for Pi's
   // adjacent interactive startup work and is cleared at first user admission.
@@ -558,17 +735,55 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return undefined;
     }
   };
-  // ${CLAUDE_PLUGIN_DATA} expansion mirrors ${CLAUDE_PLUGIN_ROOT}.
-  const pluginDataDirs: Record<string, string> = {};
-  for (const p of project.plugins) pluginDataDirs[p.name] = p.dataDir;
+  let compat: CompatReport = { findings: [], safetyFindings: [], unassessed: [] };
+  const pluginContexts = project.pluginContexts;
+  const RUNTIME_FINDING_RETAIN_CAP = 20;
+  const RUNTIME_FINDING_FINGERPRINT_CAP = 25;
+  const runtimeFindingFingerprints = new Set<string>();
+  const retainRuntimeFinding = (message: string): void => {
+    const bounded = sanitizeLine(message, 500);
+    const fingerprint = bounded;
+    if (runtimeFindingFingerprints.has(fingerprint)) return;
+    if (runtimeFindingFingerprints.size >= RUNTIME_FINDING_FINGERPRINT_CAP) {
+      compat.pluginRuntimeFindingsOmittedAtLeast = true;
+      return;
+    }
+    runtimeFindingFingerprints.add(fingerprint);
+    if (runtimeFindingFingerprints.size <= RUNTIME_FINDING_RETAIN_CAP) {
+      (compat.pluginRuntimeFindings ??= []).push(bounded);
+    } else {
+      compat.pluginRuntimeFindingsOmitted = runtimeFindingFingerprints.size - RUNTIME_FINDING_RETAIN_CAP;
+      if (runtimeFindingFingerprints.size === RUNTIME_FINDING_FINGERPRINT_CAP) {
+        compat.pluginRuntimeFindingsOmittedAtLeast = true;
+      }
+    }
+  };
+  const ensurePluginDataDir = (
+    context: PluginRuntimeContext,
+    component: string,
+  ): { ok: true } | { ok: false; message: string } => {
+    const fail = (action: string): { ok: false; message: string } => ({
+      ok: false,
+      message: `${sanitizeLine(component, 128)} for plugin "${sanitizeLine(context.pluginId, 128)}": ${action}; execution did not occur`,
+    });
+    const prepared = preparePluginDataDir({
+      userDir: project.userDir,
+      projectRoot: project.root,
+      context,
+    });
+    return prepared.ok
+      ? prepared
+      : fail(`persistent data directory validation or creation failed (${prepared.code}). ${pluginDataFailureRecovery(prepared.code)}`);
+  };
   const baseHooks = new HookRunner({
     config: project.mergedHooks,
     projectDir: project.root,
     sessionId,
     env: project.settings.env,
     disableAllHooks: project.settings.disableAllHooks,
-    pluginRoots: project.pluginRoots,
-    pluginDataDirs,
+    pluginContexts,
+    ensurePluginDataDir,
+    onRuntimeFinding: retainRuntimeFinding,
     transcriptPath,
   });
   const hooks = new HookMultiplexer(baseHooks);
@@ -607,7 +822,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   void orphanReaping;
   const state = newSessionContextState(project.claudeMd);
   // Completeness floor: a report failure must never abort extension init.
-  let compat: CompatReport;
   try {
     compat = buildCompatReport(project);
   } catch (err) {
@@ -761,12 +975,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Skill activation (shared by Skill tool, slash commands, context:fork)
   // ---------------------------------------------------------------------------
-  function pluginContextFor(skill: ClaudeSkill): { root?: string; data?: string } {
-    const pluginName = skill.source.pluginName;
-    if (!pluginName) return {};
-    const plugin = project.plugins.find((p) => p.name === pluginName);
-    return plugin ? { root: plugin.root, data: plugin.dataDir } : {};
-  }
+  const pluginContextFor = (source: ClaudeSkill["source"]): PluginRuntimeContext | undefined =>
+    source.pluginId ? pluginRuntimeContextForSource({ pluginId: source.pluginId }, pluginContexts) : undefined;
 
   const mainActivation = newSkillActivationState(state.activeSkills);
   const activeSkillDenyRules = mainActivation.denyRules;
@@ -813,19 +1023,39 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     skill: ClaudeSkill,
     argsText: string,
     opts: { fork?: boolean; activation?: SkillActivationState; cwd?: string } = {},
-  ): Promise<string> {
+  ) {
     const activation = opts.activation ?? mainActivation;
+    const pluginContext = pluginContextFor(skill.source);
+    const rendered = await renderSkillForActivation({
+      skill,
+      argsText,
+      projectRoot: project.root,
+      cwd: opts.cwd ?? cwdState.get(),
+      sessionId,
+      effort: skill.effort ?? config.effort,
+      settings: project.settings,
+      pluginContext,
+      ensurePluginDataDir,
+      onRuntimeFinding: retainRuntimeFinding,
+    });
+    if (!rendered.ok) return rendered;
+
     if (skill.hooks && Object.keys(skill.hooks).length && !activation.scopedHookSkills.has(skill.name)) {
       activation.scopedHookSkills.add(skill.name);
-      const parsed = parseHookConfig(skill.hooks, skill.source.path);
+      const parsed = parseHookConfig(
+        skill.hooks,
+        skill.source.path,
+        pluginContext ? { pluginId: pluginContext.pluginId } : undefined,
+      );
       const runner = new HookRunner({
         config: parsed.config,
         projectDir: project.root,
         sessionId,
         env: project.settings.env,
         disableAllHooks: project.settings.disableAllHooks,
-        pluginRoots: project.pluginRoots,
-        pluginDataDirs,
+        pluginContexts,
+        ensurePluginDataDir,
+        onRuntimeFinding: retainRuntimeFinding,
         transcriptPath,
       });
       const identity = skillHookIdentity(skill);
@@ -836,18 +1066,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         mainActivationStages.get(activation)?.hookRunners.set(identity, wrapped as HookRunner);
       }
     }
-    const plugin = pluginContextFor(skill);
-    const rendered = await renderSkillForActivation({
-      skill,
-      argsText,
-      projectRoot: project.root,
-      cwd: opts.cwd ?? cwdState.get(),
-      sessionId,
-      effort: skill.effort ?? config.effort,
-      settings: project.settings,
-      pluginRoot: plugin.root,
-      pluginData: plugin.data,
-    });
     // context:fork bodies go to the fork only. Keeping them resident in the
     // parent would defeat the fork's token-efficiency purpose.
     if (!opts.fork) {
@@ -858,7 +1076,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         [...(rendered.disallowedTools ?? skill.disallowedTools ?? [])],
       );
     }
-    return rendered.text;
+    return rendered;
   }
 
   /**
@@ -901,15 +1119,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     depth: number,
     argsText = "",
     abortSignal?: AbortSignal,
+    headless = false,
   ) {
-    const plugin = pluginContextFor(skill);
+    const pluginContext = pluginContextFor(skill.source);
     const vars = skillActivationVars({
       skill,
       projectRoot: project.root,
       sessionId,
       effort: skill.effort ?? config.effort,
-      pluginRoot: plugin.root,
-      pluginData: plugin.data,
+      pluginContext,
     });
     const agentOverride: ClaudeAgent | undefined = skill.forkAgentType
       ? undefined
@@ -936,6 +1154,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       model: skill.model,
       effort: skill.effort,
       depth,
+      headless,
       agentOverride,
       abortSignal,
     });
@@ -1071,7 +1290,41 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
   let modelRegistryRef: any;
 
-  function buildSubagentSystemPrompt(agent: ClaudeAgent, depth = 0): string {
+  function preparePluginAgentOwner(agent: ClaudeAgent): ClaudeAgent {
+    const agentContext = pluginContextFor(agent.source);
+    const fail = (reason: string, recovery = PLUGIN_RECONCILE_RECOVERY): never => {
+      const message = `Agent "${sanitizeLine(agent.name, 128)}" did not start: ${reason}; no provider request was made. ${recovery}.`;
+      retainRuntimeFinding(message);
+      throw new Error(message);
+    };
+    if (agent.source.pluginId && !agentContext) {
+      fail(`plugin "${sanitizeLine(agent.source.pluginId, 128)}" runtime context is unavailable`);
+    }
+    if (!agentContext) return agent;
+
+    const projected = projectPluginAgentRuntime(agent, agentContext);
+    const effectiveText = [
+      agent.body,
+      ...(agent.tools ?? []),
+      ...(agent.disallowedTools ?? []),
+      projected.body,
+      ...(projected.tools ?? []),
+      ...(projected.disallowedTools ?? []),
+    ];
+    if (effectiveText.some((text) => /\$\{CLAUDE_PLUGIN_DATA\}|\$CLAUDE_PLUGIN_DATA(?![A-Za-z0-9_])/.test(text))) {
+      const prepared = preparePluginDataDir({ userDir: project.userDir, projectRoot: project.root, context: agentContext });
+      if (!prepared.ok) {
+        fail(`plugin persistent data could not be prepared (${prepared.code})`, pluginDataFailureRecovery(prepared.code));
+      }
+    }
+    return projected;
+  }
+
+  function buildSubagentSystemPrompt(
+    agent: ClaudeAgent,
+    depth = 0,
+    diagnosticSink?: (diagnostic: Diagnostic) => void,
+  ): string {
     const sections: string[] = [agent.body.trim()];
     // Preloaded skills (agent `skills:`): body + variables, no args/shell (sync path).
     for (const name of agent.skills ?? []) {
@@ -1084,12 +1337,38 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         );
         continue;
       }
-      const body = substituteVariables(loadSkillBody(skill), {
+      const loaded = loadSkillBodyResult(skill);
+      if (loaded.failure) {
+        const message = `Agent "${sanitizeLine(agent.name, 128)}" omitted preloaded skill "${sanitizeLine(name, 128)}": its plugin body failed lazy path validation. ${PLUGIN_RECONCILE_RECOVERY}.`;
+        retainRuntimeFinding(message);
+        diagnosticSink?.({ severity: "warning", message, source: skill.source.path });
+        continue;
+      }
+      const skillContext = pluginContextFor(skill.source);
+      if (skill.source.pluginId && !skillContext) {
+        const message = `Agent "${sanitizeLine(agent.name, 128)}" omitted preloaded skill "${sanitizeLine(name, 128)}": plugin runtime context is unavailable. ${PLUGIN_RECONCILE_RECOVERY}.`;
+        retainRuntimeFinding(message);
+        diagnosticSink?.({ severity: "warning", message, source: skill.source.path });
+        continue;
+      }
+      if (skillContext && /\$\{CLAUDE_PLUGIN_DATA\}|\$CLAUDE_PLUGIN_DATA(?![A-Za-z0-9_])/.test(loaded.body)) {
+        const ensured = ensurePluginDataDir(skillContext, `agent-preloaded skill ${name}`);
+        if (!ensured.ok) {
+          const message = `Agent "${sanitizeLine(agent.name, 128)}" omitted preloaded skill "${sanitizeLine(name, 128)}": ${ensured.message}.`;
+          retainRuntimeFinding(message);
+          diagnosticSink?.({ severity: "warning", message, source: skill.source.path });
+          continue;
+        }
+      }
+      const skillVars = {
         CLAUDE_SKILL_DIR: skill.baseDir,
-        CLAUDE_PROJECT_DIR: project.root,
+        CLAUDE_PROJECT_DIR: skillContext?.projectDir ?? project.root,
         CLAUDE_SESSION_ID: sessionId,
         CLAUDE_EFFORT: agent.effort ?? "",
-      });
+      };
+      const body = skillContext
+        ? substitutePluginRuntimeText(loaded.body, skillContext, skillVars)
+        : substituteVariables(loaded.body, skillVars);
       sections.push(`## Preloaded skill: ${name}\n\n${body.trim()}`);
     }
     // `memory:` frontmatter scope loads the agent's MEMORY.md and points the
@@ -1207,7 +1486,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentBashShellPath = resolveGitBashPath();
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
+    prepareAgent: preparePluginAgentOwner,
     buildSystemPrompt: buildSubagentSystemPrompt,
+    surfaceHeadlessDiagnostic: createBoundedHeadlessDiagnosticSurface((text) => console.error(text)),
     customToolsFor: (
       agent: ClaudeAgent,
       granted: string[],
@@ -1329,8 +1610,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         sessionId,
         env: project.settings.env,
         disableAllHooks: project.settings.disableAllHooks,
-        pluginRoots: project.pluginRoots,
-        pluginDataDirs,
+        pluginContexts,
+        ensurePluginDataDir,
+        onRuntimeFinding: retainRuntimeFinding,
         transcriptPath,
       }),
     // Subagent transcripts persist next to the MAIN session's transcript.
@@ -1885,10 +2167,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       depth: number;
       invokedName: string;
       signal?: AbortSignal;
+      headless?: boolean;
       activation?: SkillActivationState;
       cwd?: string;
     },
   ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
+    const invokedCollision = opts.invokedName.trim().toLowerCase();
+    if (PLUGIN_CONTROL_NAMES.has(invokedCollision)) {
+      throw new Error(
+        `Built-in /${invokedCollision} owns this reserved plugin-management name; no skill activation occurred. Use the explicit namespaced skill name if you intended plugin content.`,
+      );
+    }
     if (skill.disableModelInvocation) {
       const reserved = reservedBuiltinName(skill.name);
       if (reserved) {
@@ -1904,7 +2193,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         activation: opts.activation,
         cwd: opts.cwd,
       });
-      const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
+      if (!rendered.ok) throw new Error(rendered.message);
+      const result = await forkDispatch(
+        skill,
+        rendered.text,
+        opts.depth + 1,
+        argsText,
+        opts.signal,
+        opts.headless,
+      );
       // Forks are non-resumable: suppress every resume trailer. The shared
       // presenter reproduces the Agent tool's four-branch mapping —
       // failed-with-partial preserves the partial + names the cause;
@@ -1914,14 +2211,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (p.kind === "failure") throw new Error(p.message);
       return {
         content: [{ type: "text", text: p.text }],
-        details: { forked: true, agent: result.agentName, cutOff: p.cutOff },
+        details: {
+          forked: true,
+          agent: result.agentName,
+          cutOff: p.cutOff,
+          diagnostics: result.diagnostics,
+        },
       };
     }
     const rendered = await activateSkill(skill, argsText, {
       activation: opts.activation,
       cwd: opts.cwd,
     });
-    const note = skillDedupNote(skill, rendered, opts.activation);
+    if (!rendered.ok) throw new Error(rendered.message);
+    const note = skillDedupNote(skill, rendered.text, opts.activation);
     if (note) {
       return {
         content: [{ type: "text", text: note }],
@@ -1929,7 +2232,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       };
     }
     return {
-      content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
+      content: [{ type: "text", text: skillActivationMessage(skill, rendered.text) }],
       details: { skill: skill.name },
     };
   }
@@ -1958,7 +2261,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         _id: string,
         params: { name: string; arguments?: string },
         signal?: AbortSignal,
+        _onUpdate?: unknown,
+        ctx?: { mode?: "tui" | "print" | "json" | "rpc" },
       ) {
+        const requested = params.name.trim().toLowerCase();
+        if (PLUGIN_CONTROL_NAMES.has(requested)) {
+          throw new Error(
+            `Built-in /${requested} owns this reserved plugin-management name; no skill activation occurred. Use the explicit namespaced skill name if you intended plugin content.`,
+          );
+        }
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, params.name);
         if (!skill) throw new Error(`Unknown skill: ${params.name}`);
@@ -1967,6 +2278,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: params.name,
           signal,
+          headless: ctx?.mode !== "tui",
           activation: opts.activation,
           cwd: opts.getCwd?.(),
         });
@@ -1996,7 +2308,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       parameters: Type.Object({
         command: Type.String({ description: 'A slash command such as "/deploy staging 1.2.3"' }),
       }),
-      async execute(_id: string, params: { command: string }, signal?: AbortSignal) {
+      async execute(
+        _id: string,
+        params: { command: string },
+        signal?: AbortSignal,
+        _onUpdate?: unknown,
+        ctx?: { mode?: "tui" | "print" | "json" | "rpc" },
+      ) {
         const parsed = parseSlashCommand(params.command);
         if (!parsed) throw new Error(`SlashCommand requires a command like "/name args".`);
         const reserved = reservedBuiltinName(parsed.name);
@@ -2011,6 +2329,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: parsed.name,
           signal,
+          headless: ctx?.mode !== "tui",
           activation: opts.activation,
           cwd: opts.getCwd?.(),
         });
@@ -2606,6 +2925,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           }
         }
       }
+      if (event.reason === "startup") {
+        const resolutionOutcomes = testSeam?.pluginResolutionOutcomes ?? (project as LoadedProject & {
+          pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
+        }).pluginResolutionOutcomes;
+        const pluginNotice = renderPluginStartupNotice(
+          resolutionOutcomes,
+          [...project.diagnostics, ...project.settings.diagnostics],
+        );
+        if (pluginNotice) {
+          if (ctx.mode === "tui") ctx.ui?.notify?.(pluginNotice, "warning");
+          else console.error(`PiCC: ${pluginNotice}`);
+        }
+      }
       const sessionStartSource = event.reason === "new"
         ? "clear"
         : event.reason === "reload"
@@ -3071,6 +3403,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             fork: skill.contextFork,
             activation: stagedActivation,
           });
+          if (!rendered.ok) {
+            const message = sanitizeLine(rendered.message, 500);
+            try {
+              if (ctx.mode === "tui") ctx.ui?.notify?.(message, "error");
+              else console.error(`PiCC: ${message}`);
+            } catch {
+              console.error(`PiCC: ${message}`);
+            }
+            return { action: "handled" };
+          }
           if (skill.contextFork) {
             // A typed `/forked-skill` runs synchronously inside this input hook,
             // BEFORE the turn streams — so `ctx.signal` is undefined here (there is
@@ -3118,7 +3460,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             try {
               result = await hooks.withScoped(
                 mainActivationStages.get(stagedActivation)?.hookRunners ?? new Map(),
-                () => forkDispatch(skill, rendered, 1, argsText, forkSignal),
+                () => forkDispatch(
+                  skill,
+                  rendered.text,
+                  1,
+                  argsText,
+                  forkSignal,
+                  ctx.mode !== "tui",
+                ),
               );
             } finally {
               // Teardown must never throw over a computed result.
@@ -3127,6 +3476,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
               } catch {
                 /* ignore terminal-input unsubscribe failure */
               }
+            }
+            if (ctx.mode === "tui") {
+              surfaceTypedForkTuiDiagnostics(
+                result.diagnostics,
+                (message, severity) => ctx.ui?.notify?.(message, severity),
+              );
             }
             const p = presentDispatchResult(result, { allowResumeTrailer: false });
             parts.push(
@@ -3141,8 +3496,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             continue;
           }
           // Byte-identical re-invocation → short note instead of a second copy.
-          const note = skillDedupNote(skill, rendered, stagedActivation);
-          parts.push(note ?? skillActivationMessage(skill, rendered));
+          const note = skillDedupNote(skill, rendered.text, stagedActivation);
+          parts.push(note ?? skillActivationMessage(skill, rendered.text));
         }
         // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
@@ -3943,6 +4298,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
   const CONTROL_ERROR_RESPONSE =
     "PiCC could not produce that control-command report. No action occurred; try again or run /doctor.";
+  const PLUGIN_GUIDANCE =
+    "Plugin lifecycle management is unavailable in PiCC; no changes were made. Manage installation and enablement in Claude Code, then run the canonical /reload in the interactive TUI to reload the whole extension, including installed plugin state, or exit and relaunch PiCC. /doctor reports currently available compatibility and retained plugin-runtime failure findings; /new does not reload plugin state.";
+  const PLUGINS_ALIAS_GUIDANCE =
+    `/plugins is a PiCC-defined convenience alias. ${PLUGIN_GUIDANCE}`;
+  const PLUGIN_RELOAD_GUIDANCE =
+    "/reload-plugins did no reload and made no changes. Manage installation and enablement in Claude Code, then run the canonical /reload in the interactive TUI to reload the whole extension, including installed plugin state, or exit and relaunch PiCC. /doctor reports currently available compatibility and retained plugin-runtime failure findings; /new does not reload plugin state.";
 
   const controlCommands = new Map<string, ControlCommandEntry>([
     ["doctor", {
@@ -3964,6 +4325,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ["usage", {
       description: "PiCC: per-subagent token/cost this session (subagents only — not the main agent's own usage), with a total",
       render: async () => renderUsageReport(),
+    }],
+    ["plugin", {
+      description: "PiCC: non-mutating plugin lifecycle guidance",
+      render: async () => PLUGIN_GUIDANCE,
+    }],
+    ["plugins", {
+      description: "PiCC: plugin lifecycle guidance (convenience alias)",
+      render: async () => PLUGINS_ALIAS_GUIDANCE,
+    }],
+    ["reload-plugins", {
+      description: "PiCC: non-mutating plugin reload guidance",
+      render: async () => PLUGIN_RELOAD_GUIDANCE,
     }],
     ["mcp", {
       description: "PiCC: read-only MCP server status",

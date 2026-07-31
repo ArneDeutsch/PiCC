@@ -3,17 +3,17 @@
  * the generated matrix share the same support claims. buildCompatReport() scans
  * the assembled project; renderDoctorReport() gives a project-specific report.
  */
-import fs from "node:fs";
-import path from "node:path";
-
 import type {
   CapabilityEntry,
   ClaudeProject,
+  Diagnostic,
   HookConfig,
+  PluginResolutionOutcome,
+  PluginResolutionStatus,
+  PluginSharedStateCause,
   ResolvedMcpConfig,
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
-import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { modelSupportsImages } from "../util/model.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
@@ -36,6 +36,13 @@ export interface CompatFinding {
   evidence: string;
 }
 
+export interface PluginPosture {
+  counts: Partial<Record<PluginResolutionStatus, number>>;
+  /** Bounded actionable outcome descriptions; loaded/disabled remain summary-only. */
+  details: string[];
+  omitted: number;
+}
+
 export interface CompatReport {
   /** Functionality findings (a declared feature simply won't work). */
   findings: CompatFinding[];
@@ -43,6 +50,14 @@ export interface CompatReport {
   safetyFindings: CompatFinding[];
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
+  /** Normalized installed-plugin selection posture; never reconstructed from disk. */
+  pluginPosture?: PluginPosture;
+  /** Bounded point-of-use plugin failures known not to have executed. */
+  pluginRuntimeFindings?: string[];
+  /** Distinct runtime findings omitted after the retained cap. */
+  pluginRuntimeFindingsOmitted?: number;
+  /** The fingerprint counter saturated, so the omitted count is a lower bound. */
+  pluginRuntimeFindingsOmittedAtLeast?: boolean;
   /**
    * Pending-approval MCP servers, as one bounded terminal-safe line for the
    * session-start `ctx.ui.notify(...)`. Pending servers are ACTIONABLE STATE,
@@ -65,6 +80,12 @@ const MCP_TOOL_BLOCKING_EVENT_SET: ReadonlySet<string> = new Set<string>([
   "PreCompact",
   "WorktreeCreate",
 ] satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][]);
+
+function hookHandlerCapabilityId(type: string, effectiveEvent: string): string {
+  return type === "mcp_tool" && MCP_TOOL_BLOCKING_EVENT_SET.has(effectiveEvent)
+    ? "feature.hook-handler.mcp_tool-blocking-enforcement"
+    : `feature.hook-handler.${type}`;
+}
 
 /** Deferred settings key with no dedicated registry entry: recognized, degrades. */
 function deferredSettingCapability(key: string): CapabilityEntry {
@@ -90,6 +111,224 @@ function degradedHookEventCapability(event: string): CapabilityEntry | undefined
   return undefined;
 }
 
+const PLUGIN_STATUS_ORDER: readonly PluginResolutionStatus[] = [
+  "loaded",
+  "disabled",
+  "enabled-but-uninstalled",
+  "unsupported",
+  "ambiguous",
+  "blocked",
+  "malformed",
+  "rejected",
+];
+const PLUGIN_POSTURE_DETAIL_MAX = 20;
+const PLUGIN_SHARED_STATE_ORDER = [
+  "installed-state-unreadable",
+  "installed-state-malformed",
+  "installed-state-unsupported",
+  "blocklist-unreadable",
+  "blocklist-malformed",
+] as const satisfies readonly PluginSharedStateCause[];
+const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
+const PLUGIN_SHARED_STATE_DETAILS: Readonly<Record<PluginSharedStateCause, string>> = {
+  "installed-state-unreadable": `Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
+  "installed-state-malformed": `Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+  "installed-state-unsupported": `Installed plugin state uses an unsupported format; all enabled plugins were rejected and no fallback content loaded. Update PiCC or contact PiCC support for this format, then ${PLUGIN_REFRESH_ACTION}.`,
+  "blocklist-unreadable": `The qualified plugin blocklist is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/blocklist.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
+  "blocklist-malformed": `The qualified plugin blocklist is malformed; all enabled plugins were rejected and no fallback content loaded. Repair plugins/blocklist.json so it is a valid JSON object, its optional plugins field is an array, and each entry's plugin field is a qualified name@marketplace identity, then ${PLUGIN_REFRESH_ACTION}.`,
+};
+const INSTALLED_STATE_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
+  "installed-state-unreadable",
+  "installed-state-malformed",
+  "installed-state-unsupported",
+]);
+const BLOCKLIST_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
+  "blocklist-unreadable",
+  "blocklist-malformed",
+]);
+const ADMINISTRATOR_POLICY_SOURCE_CLASSES = new Set([
+  "system-file",
+  "system-drop-in",
+  "registry-hklm",
+]);
+
+function managedPolicySourceLabel(sourceClass: unknown): string {
+  if (typeof sourceClass === "string" && ADMINISTRATOR_POLICY_SOURCE_CLASSES.has(sourceClass)) {
+    return `Administrator policy (${sourceClass})`;
+  }
+  if (sourceClass === "registry-hkcu") return "User policy fallback (registry-hkcu)";
+  if (sourceClass === "override") return "Managed-settings override";
+  return "Managed-policy source";
+}
+
+function managedPolicyImpactLabel(impact: unknown): string {
+  if (impact === "weaker-policy-suppressed") return "; weaker policy was suppressed";
+  if (impact === "source-ignored") return "; that source was ignored";
+  return "; policy processing was degraded";
+}
+
+function safePluginIdentity(value: unknown): string {
+  if (typeof value !== "string") return "unknown qualified identity";
+  return mcpStatusScalar(value, 128) || "unknown qualified identity";
+}
+
+type PluginDiagnosticClass =
+  | "path validation"
+  | "unreadable content"
+  | "wrong component kind"
+  | "malformed content"
+  | "unsupported component content"
+  | "component limitation";
+
+function pluginDiagnosticClass(diagnostics: readonly Diagnostic[]): PluginDiagnosticClass | undefined {
+  const text = diagnostics
+    .map((item) => typeof item?.message === "string" ? item.message.toLowerCase() : "")
+    .join("\n");
+  if (/wrong[- ]kind|not a (?:regular )?file|not a directory/.test(text)) return "wrong component kind";
+  if (/unreadable|cannot read|access/.test(text)) return "unreadable content";
+  if (/path|filesystem|root|escape|mismatch|integrity/.test(text)) return "path validation";
+  if (/malformed|not a valid|no description/.test(text)) return "malformed content";
+  if (/unsupported|not allowed|ignored|forbidden/.test(text)) return "unsupported component content";
+  return diagnostics.length > 0 ? "component limitation" : undefined;
+}
+
+function rejectedPluginAction(reason: PluginDiagnosticClass | undefined): string {
+  switch (reason) {
+    case "unreadable content":
+    case "wrong component kind":
+      return `Check the applicable component declaration and installed file or directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "malformed content":
+    case "unsupported component content":
+    case "component limitation":
+      return `Repair or remove the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "path validation":
+      return `Reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+    case undefined:
+      return `Check the installed plugin declaration and files in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+  }
+}
+
+function loadedPluginLimitation(
+  reason: PluginDiagnosticClass,
+  diagnostics: readonly Diagnostic[],
+): { effect: string; action: string } {
+  switch (reason) {
+    case "unreadable content":
+    case "wrong component kind":
+      return {
+        effect: "some declared content was skipped",
+        action: `Correct the applicable component declaration, access, or installed file/directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+      };
+    case "path validation":
+      return {
+        effect: "some declared content was skipped",
+        action: `Reconcile or reinstall the qualified plugin through Claude Code to correct the applicable component path, then ${PLUGIN_REFRESH_ACTION}.`,
+      };
+    case "malformed content":
+      return {
+        effect: "some declared content was ignored",
+        action: `Correct or remove the malformed declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+      };
+    case "unsupported component content": {
+      const wasStripped = diagnostics.some((item) =>
+        typeof item?.message === "string" && /stripp|removed/i.test(item.message)
+      );
+      return {
+        effect: `some declared content was ${wasStripped ? "stripped" : "ignored"}`,
+        action: `Remove or replace the unsupported declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+      };
+    }
+    case "component limitation":
+      return {
+        effect: "some declared content was degraded",
+        action: `Check and correct the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+      };
+  }
+}
+
+function pluginOutcomeDetail(outcome: PluginResolutionOutcome): string | undefined {
+  const id = safePluginIdentity(outcome.pluginId);
+  switch (outcome.status) {
+    case "loaded":
+    case "disabled":
+      return undefined;
+    case "enabled-but-uninstalled":
+      return `${id}: enabled but no applicable installed record was selected; no fallback content loaded. Install the qualified plugin with Claude Code or disable its qualified setting, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "unsupported":
+      return `${id}: installed-state format is unsupported; no fallback content loaded. Check for or update to PiCC support for this format, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "ambiguous":
+      return `${id}: highest-scope installed records are ambiguous; no fallback content loaded. Reconcile or reinstall this qualified identity through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "blocked":
+      return `${id}: listed in the qualified plugin blocklist; no fallback content loaded. Review that blocklist entry and remove it only if this plugin should be allowed, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "malformed":
+      return `${id}: plugin installed-state or blocklist data is malformed; no fallback content loaded. Check those Claude Code state inputs, then ${PLUGIN_REFRESH_ACTION}.`;
+    case "rejected": {
+      const reason = pluginDiagnosticClass(Array.isArray(outcome.diagnostics) ? outcome.diagnostics : []);
+      return `${id}: installed content was rejected${reason ? ` (${reason})` : ""}; no fallback content loaded. ${rejectedPluginAction(reason)}`;
+    }
+  }
+}
+
+function validatedSharedStateCauses(
+  value: unknown,
+  status: PluginResolutionStatus,
+): readonly PluginSharedStateCause[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2) return undefined;
+  const causes: PluginSharedStateCause[] = [];
+  for (const cause of value) {
+    if (typeof cause !== "string" || !Object.hasOwn(PLUGIN_SHARED_STATE_DETAILS, cause)) return undefined;
+    causes.push(cause as PluginSharedStateCause);
+  }
+  if (new Set(causes).size !== causes.length) return undefined;
+  if (causes.some((cause, index) =>
+    index > 0 && PLUGIN_SHARED_STATE_ORDER.indexOf(cause) <= PLUGIN_SHARED_STATE_ORDER.indexOf(causes[index - 1]!)
+  )) return undefined;
+  const installedCauses = causes.filter((cause) => INSTALLED_STATE_CAUSES.has(cause));
+  const blocklistCauses = causes.filter((cause) => BLOCKLIST_CAUSES.has(cause));
+  if (installedCauses.length > 1 || blocklistCauses.length > 1) return undefined;
+
+  const expectedStatus = blocklistCauses[0] === "blocklist-malformed"
+    ? "malformed"
+    : blocklistCauses[0] === "blocklist-unreadable"
+      ? "rejected"
+      : installedCauses[0] === "installed-state-unsupported"
+        ? "unsupported"
+        : installedCauses[0] === "installed-state-malformed"
+          ? "malformed"
+          : installedCauses[0] === "installed-state-unreadable"
+            ? "rejected"
+            : undefined;
+  return status === expectedStatus ? causes : undefined;
+}
+
+function buildPluginPosture(outcomes: readonly PluginResolutionOutcome[]): PluginPosture | undefined {
+  if (outcomes.length === 0) return undefined;
+  const counts: Partial<Record<PluginResolutionStatus, number>> = {};
+  const individualDetails: string[] = [];
+  const sharedCauses = new Set<PluginSharedStateCause>();
+  for (const raw of outcomes) {
+    if (!raw || typeof raw !== "object" || !PLUGIN_STATUS_ORDER.includes(raw.status)) continue;
+    counts[raw.status] = (counts[raw.status] ?? 0) + 1;
+    const outcomeCauses = validatedSharedStateCauses(raw.sharedStateCauses, raw.status);
+    if (outcomeCauses) {
+      for (const cause of outcomeCauses) sharedCauses.add(cause);
+      continue;
+    }
+    const detail = pluginOutcomeDetail(raw);
+    if (detail) individualDetails.push(detail);
+  }
+  if (Object.keys(counts).length === 0) return undefined;
+  const details = [
+    ...PLUGIN_SHARED_STATE_ORDER.filter((cause) => sharedCauses.has(cause)).map((cause) => PLUGIN_SHARED_STATE_DETAILS[cause]),
+    ...individualDetails,
+  ];
+  return {
+    counts,
+    details: details.slice(0, PLUGIN_POSTURE_DETAIL_MAX),
+    omitted: Math.max(0, details.length - PLUGIN_POSTURE_DETAIL_MAX),
+  };
+}
+
 /**
  * Scan the assembled project for declared-but-not-fully-honored usage.
  * Splits safety-relevant findings from functionality findings; anything not
@@ -104,6 +343,81 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   };
 
   const { settings } = project;
+  const assembled = project as ClaudeProject & {
+    pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
+    mergedHooks?: HookConfig;
+  };
+  const normalizedPluginOutcomes = Array.isArray(assembled.pluginResolutionOutcomes)
+    ? assembled.pluginResolutionOutcomes
+    : [];
+  const pluginPosture = buildPluginPosture(normalizedPluginOutcomes);
+
+  // --- Installed-plugin selection and activation diagnostics -------------
+  const selectionCapability = lookupCapability("feature.plugins-installed-selection");
+  const componentCapability = lookupCapability("feature.plugins-content");
+  if (selectionCapability && pluginPosture) {
+    for (const detail of pluginPosture.details) addFinding(selectionCapability, detail);
+    if (pluginPosture.omitted > 0) {
+      addFinding(
+        selectionCapability,
+        `${pluginPosture.omitted} additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then ${PLUGIN_REFRESH_ACTION}.`,
+      );
+    }
+  }
+  let componentDetails = 0;
+  for (const outcome of normalizedPluginOutcomes) {
+    if (!outcome || typeof outcome !== "object" || outcome.status !== "loaded") continue;
+    const diagnostics = Array.isArray(outcome.diagnostics) ? outcome.diagnostics : [];
+    if (diagnostics.length === 0 || !componentCapability || componentDetails >= PLUGIN_POSTURE_DETAIL_MAX) continue;
+    componentDetails += 1;
+    const reason = pluginDiagnosticClass(diagnostics) ?? "component limitation";
+    const limitation = loadedPluginLimitation(reason, diagnostics);
+    addFinding(
+      componentCapability,
+      `${safePluginIdentity(outcome.pluginId)}: loaded with ${reason}; ${limitation.effect}. ${limitation.action}`,
+    );
+  }
+  if (componentCapability && componentDetails === PLUGIN_POSTURE_DETAIL_MAX) {
+    const total = normalizedPluginOutcomes.filter((outcome) =>
+      outcome?.status === "loaded" && Array.isArray(outcome.diagnostics) && outcome.diagnostics.length > 0,
+    ).length;
+    if (total > componentDetails) {
+      addFinding(componentCapability, `${total - componentDetails} additional loaded-plugin component limitation(s) omitted.`);
+    }
+  }
+
+  const enablementCapability = lookupCapability("feature.plugins-enablement");
+  const managedPolicyCapability = lookupCapability("feature.managed-policy");
+  for (const diagnostic of settings.diagnostics) {
+    if (
+      managedPolicyCapability &&
+      (diagnostic.category === "managed-policy-malformed" ||
+        diagnostic.category === "managed-policy-unreadable")
+    ) {
+      const condition = diagnostic.category === "managed-policy-malformed" ? "malformed" : "unreadable";
+      const source = managedPolicySourceLabel(diagnostic.sourceClass);
+      const impact = managedPolicyImpactLabel(diagnostic.impact);
+      addFinding(
+        managedPolicyCapability,
+        `${source} was ${condition}${impact}. Repair the applicable managed policy input, then ${PLUGIN_REFRESH_ACTION}.`,
+      );
+      continue;
+    }
+    const diagnosticMessage = typeof diagnostic.message === "string" ? diagnostic.message : "";
+    if (enablementCapability && /enabledPlugins|plugin identity/i.test(diagnosticMessage)) {
+      const reason = /literal boolean/i.test(diagnosticMessage)
+        ? "a non-boolean enablement value was ignored"
+        : /not an object/i.test(diagnosticMessage)
+          ? "the enablement mapping was not an object and was ignored"
+          : /identity/i.test(diagnosticMessage)
+            ? "an invalid qualified identity was ignored"
+            : "an invalid activation entry was ignored";
+      addFinding(
+        enablementCapability,
+        `Plugin activation settings: ${reason}; no rejected setting authorized fallback content. Use qualified identities with literal booleans, then ${PLUGIN_REFRESH_ACTION}.`,
+      );
+    }
+  }
 
   // --- Permissions --------------------------------------------------------
   if (settings.permissions.ask.length > 0) {
@@ -205,10 +519,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
           if (!handler || typeof handler !== "object") continue;
           const type = (handler as { type?: string }).type ?? "command";
           if (type === "command") continue;
-          const capabilityId = type === "mcp_tool" && MCP_TOOL_BLOCKING_EVENT_SET.has(event)
-            ? "feature.hook-handler.mcp_tool-blocking-enforcement"
-            : `feature.hook-handler.${type}`;
-          const cap = lookupCapability(capabilityId);
+          const cap = lookupCapability(hookHandlerCapabilityId(type, event));
           if (cap) {
             addFinding(cap, `hook handler type "${type}" on ${eventEvidence} in ${where}`);
           } else {
@@ -222,19 +533,104 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   for (const skill of project.skills) {
     scanHooks(skill.hooks, `skill "${skill.name}"`);
   }
-  // Installed-plugin hook configs (folded into mergedHooks at load) must be
-  // scanned too — a plugin declaring a Notification event or a prompt/agent
-  // handler degrades exactly like the same config in settings.json. Plugins are
-  // only present on the assembled LoadedProject; scan defensively when given.
-  const plugins = (project as { plugins?: unknown }).plugins;
-  if (Array.isArray(plugins)) {
-    for (const plugin of plugins) {
-      if (!plugin || typeof plugin !== "object") continue;
-      const p = plugin as InstalledPlugin;
-      if (!Array.isArray(p.hooksFiles) || p.hooksFiles.length === 0) continue;
-      const raw = loadPluginHooks(p);
-      scanHooks(raw.config as HookConfig, `plugin "${p.name}"`);
+  // Plugin hooks are scanned from the already-resolved merged config. The
+  // parser-stamped pluginId is trusted evidence; source files are never reopened
+  // merely to explain a compatibility finding.
+  type PluginHookCandidate =
+    | { kind: "finding"; capability: CapabilityEntry; evidence: string }
+    | { kind: "unassessed"; evidence: string };
+  const PLUGIN_HOOK_CANDIDATE_MAX_PER_CLASS = PLUGIN_POSTURE_DETAIL_MAX * 4;
+  const pluginHookCandidates = {
+    safety: [] as PluginHookCandidate[],
+    ordinary: [] as PluginHookCandidate[],
+  };
+  const pluginHookFingerprints = {
+    safety: new Set<string>(),
+    ordinary: new Set<string>(),
+  };
+  const pluginHookCandidateOverflow = { safety: false, ordinary: false };
+  const collectPluginHookCandidate = (
+    candidate: PluginHookCandidate,
+    fingerprint: string,
+    safetyRelevant: boolean,
+  ) => {
+    const classification = safetyRelevant ? "safety" : "ordinary";
+    const fingerprints = pluginHookFingerprints[classification];
+    if (fingerprints.has(fingerprint)) return;
+    if (fingerprints.size >= PLUGIN_HOOK_CANDIDATE_MAX_PER_CLASS) {
+      pluginHookCandidateOverflow[classification] = true;
+      return;
     }
+    fingerprints.add(fingerprint);
+    pluginHookCandidates[classification].push(candidate);
+  };
+  const addPluginHookFinding = (capability: CapabilityEntry, evidence: string) => {
+    collectPluginHookCandidate(
+      { kind: "finding", capability, evidence },
+      `finding|${capability.id}|${evidence}`,
+      capability.safetyRelevant === true,
+    );
+  };
+  const addPluginHookUnassessed = (evidence: string) => {
+    collectPluginHookCandidate({ kind: "unassessed", evidence }, `unassessed|${evidence}`, false);
+  };
+  if (assembled.mergedHooks && typeof assembled.mergedHooks === "object") {
+    for (const [event, matchers] of Object.entries(assembled.mergedHooks)) {
+      if (!Array.isArray(matchers)) continue;
+      for (const matcher of matchers) {
+        if (!matcher || !Array.isArray(matcher.hooks)) continue;
+        for (const handler of matcher.hooks) {
+          if (!handler?.pluginId) continue;
+          const pluginId = safePluginIdentity(handler.pluginId);
+          const safeEvent = mcpStatusScalar(event, 80) || "unknown event";
+          if (!SUPPORTED_EVENT_SET.has(event)) {
+            const capability = degradedHookEventCapability(event);
+            const evidence = `hook event "${safeEvent}" configured by installed plugin "${pluginId}"`;
+            if (capability) addPluginHookFinding(capability, evidence);
+            else addPluginHookUnassessed(`hook event "${safeEvent}" (installed plugin "${pluginId}")`);
+          }
+          const type = typeof handler.type === "string" ? handler.type : undefined;
+          if (type !== "command") {
+            const safeType = type === undefined
+              ? "invalid handler type"
+              : mcpStatusScalar(type, 80) || "unnamed handler type";
+            const capability = type === undefined
+              ? undefined
+              : lookupCapability(hookHandlerCapabilityId(type, event));
+            const evidence = `hook handler type "${safeType}" on "${safeEvent}" from installed plugin "${pluginId}"`;
+            if (capability) addPluginHookFinding(capability, evidence);
+            else addPluginHookUnassessed(`${evidence} (unassessed)`);
+          }
+        }
+      }
+    }
+  }
+  const selectedPluginHookCandidates = [
+    ...pluginHookCandidates.safety,
+    ...pluginHookCandidates.ordinary,
+  ].slice(0, PLUGIN_POSTURE_DETAIL_MAX);
+  for (const candidate of selectedPluginHookCandidates) {
+    if (candidate.kind === "finding") addFinding(candidate.capability, candidate.evidence);
+    else unassessed.push(candidate.evidence);
+  }
+  const selectedSafetyCount = Math.min(
+    pluginHookCandidates.safety.length,
+    PLUGIN_POSTURE_DETAIL_MAX,
+  );
+  const selectedOrdinaryCount = selectedPluginHookCandidates.length - selectedSafetyCount;
+  const omittedSafetyCount = pluginHookCandidates.safety.length - selectedSafetyCount;
+  const omittedOrdinaryCount = pluginHookCandidates.ordinary.length - selectedOrdinaryCount;
+  if (omittedSafetyCount > 0 || pluginHookCandidateOverflow.safety) {
+    const capability = lookupCapability("feature.hook-handler.mcp_tool-blocking-enforcement");
+    const lowerBound = omittedSafetyCount + (pluginHookCandidateOverflow.safety ? 1 : 0);
+    const qualifier = pluginHookCandidateOverflow.safety ? "At least " : "";
+    if (capability) addFinding(capability, `${qualifier}${lowerBound} additional safety-relevant installed-plugin hook limitation(s) omitted.`);
+  }
+  if (omittedOrdinaryCount > 0 || pluginHookCandidateOverflow.ordinary) {
+    const capability = lookupCapability("feature.plugins-hooks");
+    const lowerBound = omittedOrdinaryCount + (pluginHookCandidateOverflow.ordinary ? 1 : 0);
+    const qualifier = pluginHookCandidateOverflow.ordinary ? "At least " : "";
+    if (capability) addFinding(capability, `${qualifier}${lowerBound} additional installed-plugin hook limitation(s) omitted.`);
   }
 
   // Tool lists (`tools:` on agents, `allowed-tools:` on skills): flag degraded/
@@ -257,7 +653,31 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   };
 
   // --- Agents --------------------------------------------------------------
+  let strippedAgentFindingCount = 0;
+  let strippedAgentFindingsOmitted = 0;
   for (const agent of project.agents) {
+    if (agent.source.scope === "plugin" && agent.source.pluginId) {
+      const pluginId = safePluginIdentity(agent.source.pluginId);
+      const component = mcpStatusScalar(agent.name, 128) || "unnamed agent";
+      for (const field of ["hooks", "mcpServers", "permissionMode"] as const) {
+        if (!agent.diagnostics.some((item) => item.message === `Plugin agent field "${field}" is forbidden and was removed`)) continue;
+        const capability = lookupCapability(`agent.frontmatter.${field}`);
+        if (capability && strippedAgentFindingCount < PLUGIN_POSTURE_DETAIL_MAX) {
+          strippedAgentFindingCount += 1;
+          const alternative = field === "hooks"
+            ? "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."
+            : field === "mcpServers"
+              ? "Configure session MCP servers and gate their tools, or remove this field; per-agent MCP configuration is not retained."
+              : "Use deny rules and tools gating, or remove this field; plugin agents cannot retain permissionMode.";
+          addFinding(
+            capability,
+            `installed plugin "${pluginId}" agent "${component}": forbidden ${field} was stripped before subagent construction. ${alternative}`,
+          );
+        } else if (capability) {
+          strippedAgentFindingsOmitted += 1;
+        }
+      }
+    }
     if (agent.memory !== undefined) {
       const cap = lookupCapability("agent.frontmatter.memory");
       if (cap) addFinding(cap, `agent "${agent.name}" sets memory:`);
@@ -287,6 +707,10 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     for (const key of agent.unknownKeys) {
       unassessed.push(`agent "${agent.name}" frontmatter key "${key}"`);
     }
+  }
+  if (strippedAgentFindingsOmitted > 0) {
+    const capability = lookupCapability("feature.plugins-agents");
+    if (capability) addFinding(capability, `${strippedAgentFindingsOmitted} additional stripped plugin-agent field finding(s) omitted.`);
   }
 
   // --- Skills (allowed-tools + unknown frontmatter) ------------------------
@@ -448,6 +872,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     findings: deduped.filter((f) => f.capability.safetyRelevant !== true),
     safetyFindings: deduped.filter((f) => f.capability.safetyRelevant === true),
     unassessed: [...new Set(unassessed)],
+    ...(pluginPosture !== undefined ? { pluginPosture } : {}),
     ...(mcpPendingNotice !== undefined ? { mcpPendingNotice } : {}),
   };
 }
@@ -1024,6 +1449,15 @@ function subagentPostureLine(project: ClaudeProject): string {
  * `proactiveCompactPercent`/`clipMaxTokens` overrides actually took effect
  * (an out-of-range value fails closed to the default and is reported here as-resolved).
  */
+function pluginPostureLine(posture: PluginPosture | undefined): string {
+  if (!posture) return "Plugin selection: no normalized outcomes.";
+  const parts = PLUGIN_STATUS_ORDER.flatMap((status) => {
+    const count = posture.counts[status];
+    return count === undefined ? [] : [`${status}: ${count}`];
+  });
+  return `Plugin selection: ${parts.join(", ")}.`;
+}
+
 function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: unknown): string {
   const api = activeModel && typeof activeModel === "object"
     ? (activeModel as { api?: unknown }).api
@@ -1036,6 +1470,22 @@ function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: 
   const supported = [...PROACTIVE_COMPACTION_APIS];
   const supportedLabel = `${supported.slice(0, -1).join(", ")}, and ${supported.at(-1)}`;
   return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
+}
+
+const GENERIC_PLUGIN_RUNTIME_REPAIR = /(?:\s*\.?)?\s*(?:Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required|(?:Repair|Reconcile) or reinstall (?:the affected |the )?plugin (?:in|through) Claude Code, then (?:run the canonical \/reload in the interactive TUI or exit and relaunch|relaunch) PiCC)\.?(?=\s*;\s*(?:execution did not occur|no provider request was made)|\s*$)/iu;
+
+interface NormalizedPluginRuntimeFinding {
+  evidence: string;
+  recovery: string;
+}
+
+function normalizePluginRuntimeFinding(value: string): NormalizedPluginRuntimeFinding {
+  const withoutGenericRepair = value.replace(GENERIC_PLUGIN_RUNTIME_REPAIR, "").trim();
+  const classification = withoutGenericRepair.toLowerCase();
+  const recovery = /\((?:unreadable-path|wrong-kind)\)/.test(classification)
+    ? "Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required."
+    : `Recovery: reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+  return { evidence: mcpStatusScalar(withoutGenericRepair, 500), recovery };
 }
 
 /** Project-specific /doctor compatibility report, generated from the registry. */
@@ -1052,15 +1502,17 @@ export function renderDoctorReport(
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
     mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
+    pluginPostureLine(report.pluginPosture),
     ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",
   ];
 
   const grouped = groupByCapability([...report.safetyFindings, ...report.findings]);
-  if (grouped.length === 0) {
+  const hasPluginRuntimeFindings = (report.pluginRuntimeFindings ?? []).length > 0;
+  if (grouped.length === 0 && !hasPluginRuntimeFindings) {
     lines.push("No compatibility findings detected.");
-  } else {
-    lines.push("Findings (declared by this project, not fully honored):");
+  } else if (grouped.length > 0) {
+    lines.push("Compatibility findings:");
     for (const tier of TIER_ORDER) {
       const inTier = grouped.filter((g) => g.capability.tier === tier);
       if (inTier.length === 0) continue;
@@ -1075,6 +1527,26 @@ export function renderDoctorReport(
     }
   }
   lines.push("");
+
+  const normalizedRuntimeFindings = (report.pluginRuntimeFindings ?? [])
+    .filter((item): item is string => typeof item === "string")
+    .map(normalizePluginRuntimeFinding)
+    .filter((item) => item.evidence.length > 0);
+  const runtimeFindings = [...new Map(normalizedRuntimeFindings
+    .map((item) => [item.evidence, item] as const)).values()].slice(0, 20);
+  if (runtimeFindings.length > 0) {
+    lines.push("Plugin runtime failures (execution did not occur):");
+    for (const item of runtimeFindings) lines.push(`  - ${item.evidence}`);
+    const omitted = Math.max(0, Math.trunc(report.pluginRuntimeFindingsOmitted ?? 0));
+    if (omitted > 0) {
+      const qualifier = report.pluginRuntimeFindingsOmittedAtLeast ? "at least " : "";
+      lines.push(`  - ${qualifier}${omitted} additional distinct failure(s) omitted.`);
+    }
+    for (const recovery of new Set(runtimeFindings.map((item) => item.recovery))) {
+      lines.push(`  ${recovery}`);
+    }
+    lines.push("");
+  }
 
   if (report.unassessed.length > 0) {
     lines.push(`Unassessed (unknown at baseline ${CLAUDE_BASELINE} — degrade safely):`);

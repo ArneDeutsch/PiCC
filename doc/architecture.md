@@ -112,6 +112,11 @@ and the enablement gate — project-origin servers stay pending until approved f
 scope, and a git-tracked `settings.local.json` is demoted to project scope so a cloned repo can
 never self-approve.
 
+**Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
+source contributions after ordinary settings. Plugin enablement is validated per qualified identity
+at each source before later sources replace that identity, so malformed policy cannot be coerced
+into activation or lose its diagnostic owner.
+
 **Placement:** new scopes, precedence rules, or settings-shape handling. Nothing that interprets an
 artifact's *content*.
 
@@ -133,11 +138,39 @@ Invariants across the folder:
   change that eagerly holds bodies defeats the whole design.
 - **The startup skill listing degrades tier by tier, but never omits a skill.** A budget may shrink
   an entry to its name; it may not make a skill invisible.
-- Plugin **content** is folded into the same registries. Installation and marketplace machinery are
-  out of scope.
+- Plugin **content** is folded into the same registries only after installed-state selection and
+  whole-plugin validation succeed. Marketplace catalogs and repository/development roots are not
+  loader inputs.
 
 **Placement:** a new artifact format, or a change to how an existing one parses. No session
 awareness, no I/O beyond reading the artifact.
+
+#### Installed-plugin assembly boundary
+
+`claude/plugin-installed-state.ts` adapts the captured Claude installed-state v2 fixture layout into
+normalized records; the upstream format is undocumented and is not a permanent PiCC API. Exact-record
+selection and no-fallback failure are PiCC-defined; the generated
+[capability matrix](supported-features.md) owns exhaustive tiers and limits. The adapter does not scan
+storage for candidates. `claude/plugins.ts` owns qualified-identity selection and turns one
+applicable record into normalized component loader inputs. `claude/plugin-paths.ts` owns the canonical
+selected-root and persistent-data containment boundary, including close-to-use revalidation.
+Component loaders consume those validated inputs rather than reopening authority from manifest
+values.
+
+The qualified `name@marketplace` identity owns root authorization, installed version, and runtime and
+persistent-data context. A valid manifest `name` owns the visible skill, command, and agent namespace;
+manifestless content uses the installed identity's lifecycle name.
+
+`src/project.ts` is the commit point: it combines source-aware settings enablement with imported
+records, then merges successful contributions into the ordinary project registries while preserving
+qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
+containment, or component-source failures reject the plugin as a unit. Safe component parse or
+loader warnings may instead omit only affected content while the plugin remains loaded. Runtime
+activation and subagent construction use qualified context for root/data/project substitution and
+create isolated persistent data only at point of use; a close-to-use failure blocks that execution
+and is retained for compatibility reporting without retroactively changing assembly. Selection
+diagnostics and retained runtime failures flow to the compatibility report; no diagnostic pass
+rescans plugin storage.
 
 ### `engine/` — the deterministic enforcement primitives
 

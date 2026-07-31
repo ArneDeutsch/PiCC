@@ -11,6 +11,7 @@ import type {
   HookHandler,
   HookOutcome,
   HookPayload,
+  PluginRuntimeContext,
   ToolCallDescriptor,
 } from "../types.js";
 
@@ -113,10 +114,12 @@ export interface HookRunnerOptions {
   /** settings `env` — layered over process.env for hook subprocesses. */
   env: Record<string, string>;
   disableAllHooks: boolean;
-  /** plugin name -> plugin root dir, for ${CLAUDE_PLUGIN_ROOT} expansion. */
-  pluginRoots?: Record<string, string>;
-  /** plugin name -> plugin data dir, for ${CLAUDE_PLUGIN_DATA} expansion. */
-  pluginDataDirs?: Record<string, string>;
+  /** Trusted installed identity -> exact runtime variable context. */
+  pluginContexts?: ReadonlyMap<string, PluginRuntimeContext>;
+  /** Creates and revalidates the qualified persistent-data directory at point of use. */
+  ensurePluginDataDir?: (context: PluginRuntimeContext, component: string) => { ok: true } | { ok: false; message: string };
+  /** Retains a bounded point-of-use failure for later session diagnostics. */
+  onRuntimeFinding?: (message: string) => void;
   /** Session transcript file, when the host exposes one (payload `transcript_path`). */
   transcriptPath?: () => string | undefined;
   /** Test-only observer for the successfully spawned command process. */
@@ -249,7 +252,7 @@ export class HookRunner {
         for (const handler of entry.hooks) {
           if (!handler) continue;
           if (handler.once && this.firedOnce.has(handler)) continue;
-          const key = dedupKey(handler);
+          const key = dedupKey(handler, this.opts.pluginContexts?.get(handler.pluginId ?? ""));
           if (seenKeys.has(key)) {
             // A deduped-away duplicate counts as fired too, or its own
             // `once: true` identity would fire on the NEXT fire().
@@ -439,7 +442,36 @@ export class HookRunner {
       return undefined;
     }
 
-    let commandStr = this.expandPlaceholders(handler.command, handler, eventName, diagnostics);
+    const pluginContext = handler.pluginId
+      ? this.opts.pluginContexts?.get(handler.pluginId)
+      : undefined;
+    if (handler.pluginId && !pluginContext) {
+      const message = `hook (${eventName}) for plugin "${boundedIdentity(handler.pluginId)}": trusted runtime context is unavailable; command not spawned`;
+      diagnostics.push({ severity: "warning", message });
+      try {
+        this.opts.onRuntimeFinding?.(message);
+      } catch {
+        // Runtime finding observers are presentation-only.
+      }
+      return undefined;
+    }
+    if (pluginContext) {
+      const ensured = this.opts.ensurePluginDataDir?.(pluginContext, `hook ${eventName}`);
+      if (!ensured || !ensured.ok) {
+        const message = ensured && !ensured.ok
+          ? ensured.message
+          : `hook (${eventName}) for plugin "${boundedIdentity(pluginContext.pluginId)}": persistent data directory could not be prepared; command not spawned`;
+        diagnostics.push({ severity: "warning", message });
+        try {
+          this.opts.onRuntimeFinding?.(message);
+        } catch {
+          // Runtime finding observers are presentation-only.
+        }
+        return undefined;
+      }
+    }
+
+    let commandStr = this.expandPlaceholders(handler.command, pluginContext, eventName, diagnostics);
     const shellKind = handler.shell === "powershell" ? "powershell" : "bash";
     if (handler.args && handler.args.length > 0) {
       // Placeholders are expanded in args too — quoting (single quotes for
@@ -448,7 +480,7 @@ export class HookRunner {
         " " +
         handler.args
           .map((a) =>
-            quoteArg(this.expandPlaceholders(a, handler, eventName, diagnostics), shellKind),
+            quoteArg(this.expandPlaceholders(a, pluginContext, eventName, diagnostics), shellKind),
           )
           .join(" ");
     }
@@ -475,9 +507,15 @@ export class HookRunner {
       process.env,
       this.opts.env,
       {
-        CLAUDE_PROJECT_DIR: this.opts.projectDir,
+        CLAUDE_PROJECT_DIR: pluginContext?.projectDir ?? this.opts.projectDir,
         CLAUDE_SESSION_ID: this.opts.sessionId,
         CLAUDE_HOOK_EVENT: eventName,
+        ...(pluginContext
+          ? {
+              CLAUDE_PLUGIN_ROOT: pluginContext.root,
+              CLAUDE_PLUGIN_DATA: pluginContext.dataDir,
+            }
+          : {}),
       },
     ));
     const timeoutSec = effectiveTimeoutSeconds(handler, eventName);
@@ -559,19 +597,15 @@ export class HookRunner {
    */
   private expandPlaceholders(
     command: string,
-    handler: HookHandler,
+    pluginContext: PluginRuntimeContext | undefined,
     eventName: string,
     diagnostics: Diagnostic[],
   ): string {
-    const project = this.opts.projectDir;
+    const project = pluginContext?.projectDir ?? this.opts.projectDir;
     let out = command
       .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, () => project)
       .replace(/\$CLAUDE_PROJECT_DIR(?![A-Za-z0-9_])/g, () => project);
 
-    const pluginName =
-      typeof handler.raw?.["__pluginName"] === "string"
-        ? (handler.raw["__pluginName"] as string)
-        : undefined;
     const expandPluginVar = (
       varName: string,
       value: string | undefined,
@@ -585,19 +619,19 @@ export class HookRunner {
         diagnostics.push({
           severity: "warning",
           message: `hook (${eventName}): command references \${${varName}} but no plugin ${description} is known${
-            pluginName ? ` for plugin "${pluginName}"` : ""
+            pluginContext ? ` for plugin "${boundedIdentity(pluginContext.pluginId)}"` : ""
           }; left unexpanded`,
         });
       }
     };
     expandPluginVar(
       "CLAUDE_PLUGIN_ROOT",
-      pluginName ? this.opts.pluginRoots?.[pluginName] : undefined,
+      pluginContext?.root,
       "root",
     );
     expandPluginVar(
       "CLAUDE_PLUGIN_DATA",
-      pluginName ? this.opts.pluginDataDirs?.[pluginName] : undefined,
+      pluginContext?.dataDir,
       "data dir",
     );
     return out;
@@ -847,9 +881,13 @@ export type HookRunnerLike = Pick<HookRunner, "fire"> & Partial<Pick<HookRunner,
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Dedup identity within one fire(): identical commands/urls run once (Claude). */
-function dedupKey(handler: HookHandler): string {
+/** Dedup identity within one fire(): identical commands/urls run once per execution context. */
+function dedupKey(handler: HookHandler, context: PluginRuntimeContext | undefined): string {
   return JSON.stringify([
+    handler.pluginId ?? null,
+    context?.root ?? null,
+    context?.dataDir ?? null,
+    context?.projectDir ?? null,
     handler.type,
     handler.command ?? null,
     handler.args ?? null,
@@ -869,6 +907,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     return value as Record<string, unknown>;
   }
   return undefined;
+}
+
+function boundedIdentity(value: string): string {
+  const neutral = value.replace(/[\u0000-\u001f\u007f]/g, "?");
+  return neutral.length <= 128 ? neutral : `${neutral.slice(0, 127)}…`;
 }
 
 function truncateObserverError(value: string): string {

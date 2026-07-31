@@ -10,7 +10,7 @@ import { mergeHookConfigs, parseHookConfig } from "../src/claude/hooks.js";
 import { HookRunner, effectiveTimeoutSeconds } from "../src/engine/hook-runner.js";
 import { createGuardExtension } from "../src/runtime/guard.js";
 import { PermissionEngine } from "../src/engine/permissions.js";
-import type { HookConfig, HookHandler, HookPayload, ToolCallDescriptor } from "../src/types.js";
+import type { HookConfig, HookHandler, HookPayload, PluginRuntimeContext, ToolCallDescriptor } from "../src/types.js";
 import { waitUntil } from "./helpers/async.js";
 import { createHookProcessFixture } from "./helpers/hook-process.js";
 import {
@@ -63,27 +63,45 @@ function makeRunner(
     sessionId?: string;
     env?: Record<string, string>;
     disableAllHooks?: boolean;
-    pluginRoots?: Record<string, string>;
-    pluginDataDirs?: Record<string, string>;
+    trustedPluginId?: string;
+    pluginContexts?: ReadonlyMap<string, PluginRuntimeContext>;
+    ensurePluginDataDir?: (context: PluginRuntimeContext, component: string) => { ok: true } | { ok: false; message: string };
+    onRuntimeFinding?: (message: string) => void;
     transcriptPath?: () => string | undefined;
     config?: HookConfig;
     onSpawnForTest?: (child: ChildProcess) => void;
   } = {},
 ): { runner: HookRunner; projectDir: string } {
   const projectDir = overrides.projectDir ?? makeTempDir();
-  const config = overrides.config ?? parseHookConfig(rawHooks, "<test>").config;
+  const config = overrides.config ?? parseHookConfig(
+    rawHooks,
+    "<test>",
+    overrides.trustedPluginId ? { pluginId: overrides.trustedPluginId } : undefined,
+  ).config;
   const runner = new HookRunner({
     config,
     projectDir,
     sessionId: overrides.sessionId ?? "sess-test-1",
     env: overrides.env ?? {},
     disableAllHooks: overrides.disableAllHooks ?? false,
-    ...(overrides.pluginRoots ? { pluginRoots: overrides.pluginRoots } : {}),
-    ...(overrides.pluginDataDirs ? { pluginDataDirs: overrides.pluginDataDirs } : {}),
+    ...(overrides.pluginContexts ? { pluginContexts: overrides.pluginContexts } : {}),
+    ...(overrides.pluginContexts
+      ? { ensurePluginDataDir: overrides.ensurePluginDataDir ?? (() => ({ ok: true as const })) }
+      : {}),
+    ...(overrides.onRuntimeFinding ? { onRuntimeFinding: overrides.onRuntimeFinding } : {}),
     ...(overrides.transcriptPath ? { transcriptPath: overrides.transcriptPath } : {}),
     ...(overrides.onSpawnForTest ? { onSpawnForTest: overrides.onSpawnForTest } : {}),
   });
   return { runner, projectDir };
+}
+
+function runtimeContext(
+  pluginId: string,
+  root: string,
+  dataDir = makeTempDir(),
+  projectDir = makeTempDir(),
+): PluginRuntimeContext {
+  return { pluginId, pluginName: pluginId.split("@")[0]!, root, dataDir, projectDir };
 }
 
 const bashCall: ToolCallDescriptor = {
@@ -126,6 +144,23 @@ describe("parseHookConfig", () => {
     });
     expect(entry.hooks[1]).toMatchObject({ type: "command", command: "echo shorthand" });
     expect(diagnostics.filter((d) => d.severity === "error")).toHaveLength(0);
+  });
+
+  it("stamps only explicit trusted plugin provenance outside raw handler data", () => {
+    const pluginId = "safe@market-a";
+    const { config } = parseHookConfig(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo ok", pluginId: "forged@evil", __pluginName: "evil" }, "echo short"] }] },
+      "<plugin-hook>",
+      { pluginId },
+    );
+    expect(config["UserPromptSubmit"]![0]!.hooks.map((handler) => handler.pluginId)).toEqual([
+      pluginId,
+      pluginId,
+    ]);
+    expect(config["UserPromptSubmit"]![0]!.hooks[0]!.raw).toMatchObject({
+      pluginId: "forged@evil",
+      __pluginName: "evil",
+    });
   });
 
   it("keeps unknown event names with an info diagnostic", () => {
@@ -828,6 +863,10 @@ describe("HookRunner placeholders and environment", () => {
   });
 
   it("sanitizes a SessionStart hook before first user admission", async () => {
+    const previous = {
+      PICC_VERSION: process.env.PICC_VERSION,
+      PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK,
+    };
     process.env.PICC_VERSION = "1.2.3";
     process.env.PI_SKIP_VERSION_CHECK = "1";
     try {
@@ -837,28 +876,28 @@ describe("HookRunner placeholders and environment", () => {
       const outcome = await runner.fire("SessionStart", { source: "startup" });
       expect(outcome.stdout).toBe("|");
     } finally {
-      delete process.env.PICC_VERSION;
-      delete process.env.PI_SKIP_VERSION_CHECK;
+      if (previous.PICC_VERSION === undefined) delete process.env.PICC_VERSION;
+      else process.env.PICC_VERSION = previous.PICC_VERSION;
+      if (previous.PI_SKIP_VERSION_CHECK === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
+      else process.env.PI_SKIP_VERSION_CHECK = previous.PI_SKIP_VERSION_CHECK;
     }
   });
 
-  it("expands ${CLAUDE_PLUGIN_ROOT} for plugin-contributed handlers", async () => {
+  it("expands plugin variables only from trusted qualified parser context", async () => {
     const pluginRoot = makeTempDir();
+    const pluginId = "my-plugin@market-a";
     const { runner } = makeRunner(
       {
-        UserPromptSubmit: [
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `printf '%s' '\${CLAUDE_PLUGIN_ROOT}'`,
-                __pluginName: "my-plugin",
-              },
-            ],
-          },
-        ],
+        UserPromptSubmit: [{ hooks: [{
+          type: "command",
+          command: `printf '%s' '\${CLAUDE_PLUGIN_ROOT}'`,
+          __pluginName: "forged-plugin",
+        }] }],
       },
-      { pluginRoots: { "my-plugin": pluginRoot } },
+      {
+        trustedPluginId: pluginId,
+        pluginContexts: new Map([[pluginId, runtimeContext(pluginId, pluginRoot)]]),
+      },
     );
     const outcome = await runner.fire("UserPromptSubmit", {});
     expect(outcome.stdout).toBe(pluginRoot);
@@ -890,24 +929,15 @@ describe("HookRunner placeholders and environment", () => {
     expect(outcome.stdout).toBe(`${projectDir}/src`);
   });
 
-  it("expands ${CLAUDE_PLUGIN_ROOT} in args for plugin-contributed handlers", async () => {
+  it("expands ${CLAUDE_PLUGIN_ROOT} in args for a qualified plugin handler", async () => {
     const pluginRoot = makeTempDir();
+    const pluginId = "my-plugin@market-a";
     const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: `printf '%s'`, args: ["${CLAUDE_PLUGIN_ROOT}/bin"] }] }] },
       {
-        UserPromptSubmit: [
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `printf '%s'`,
-                args: ["${CLAUDE_PLUGIN_ROOT}/bin"],
-                __pluginName: "my-plugin",
-              },
-            ],
-          },
-        ],
+        trustedPluginId: pluginId,
+        pluginContexts: new Map([[pluginId, runtimeContext(pluginId, pluginRoot)]]),
       },
-      { pluginRoots: { "my-plugin": pluginRoot } },
     );
     const outcome = await runner.fire("UserPromptSubmit", {});
     expect(outcome.stdout).toBe(`${pluginRoot}/bin`);
@@ -932,45 +962,221 @@ describe("HookRunner placeholders and environment", () => {
         ],
       },
       {
-        pluginRoots: { "my-plugin": pluginRoot },
-        pluginDataDirs: { "my-plugin": pluginData },
+        trustedPluginId: "my-plugin@market-a",
+        pluginContexts: new Map([
+          ["my-plugin@market-a", runtimeContext("my-plugin@market-a", pluginRoot, pluginData)],
+        ]),
       },
     );
     const outcome = await runner.fire("UserPromptSubmit", {});
     expect(outcome.stdout).toBe(`${pluginData}/state.json|${pluginRoot}/bin`);
   });
 
-  it("leaves ${CLAUDE_PLUGIN_DATA} unexpanded with a warning when no data dir is known", async () => {
-    const { runner } = makeRunner({
-      UserPromptSubmit: [
-        {
-          hooks: [
-            {
+  it("expands only command and args at execution while matcher, condition, URL, and raw fields stay literal", async () => {
+    const context = runtimeContext("literal-fields@market", makeTempDir(), makeTempDir());
+    const config = parseHookConfig(
+      {
+        UserPromptSubmit: [
+          {
+            hooks: [{
               type: "command",
-              command: `printf '%s' '\${CLAUDE_PLUGIN_DATA}'`,
-              __pluginName: "my-plugin",
-            },
-          ],
-        },
-      ],
+              command: "printf '%s|%s'",
+              args: ["${CLAUDE_PLUGIN_ROOT}", "${CLAUDE_PLUGIN_DATA}"],
+              url: "https://example.test/${CLAUDE_PLUGIN_ROOT}",
+              arbitrary: "${CLAUDE_PLUGIN_DATA}",
+            }],
+          },
+          {
+            matcher: "${CLAUDE_PLUGIN_ROOT}",
+            if: "${CLAUDE_PLUGIN_DATA}",
+            hooks: [],
+          },
+        ],
+      },
+      "<plugin>",
+      { pluginId: context.pluginId },
+    ).config;
+    const literalEntry = config["UserPromptSubmit"]![1]!;
+    const raw = config["UserPromptSubmit"]![0]!.hooks[0]!.raw;
+    const { runner } = makeRunner(undefined, {
+      config,
+      pluginContexts: new Map([[context.pluginId, context]]),
     });
+
+    expect((await runner.fire("UserPromptSubmit", {})).stdout).toBe(`${context.root}|${context.dataDir}`);
+    expect(literalEntry.matcher).toBe("${CLAUDE_PLUGIN_ROOT}");
+    expect(literalEntry.if).toBe("${CLAUDE_PLUGIN_DATA}");
+    expect(raw["url"]).toBe("https://example.test/${CLAUDE_PLUGIN_ROOT}");
+    expect(raw["arbitrary"]).toBe("${CLAUDE_PLUGIN_DATA}");
+    expect(config["UserPromptSubmit"]![0]!.hooks[0]!.args).toEqual([
+      "${CLAUDE_PLUGIN_ROOT}",
+      "${CLAUDE_PLUGIN_DATA}",
+    ]);
+  });
+
+  it("keeps project and qualified contexts distinct while same-context duplicates dedupe", async () => {
+    const context = runtimeContext("same@market-a", makeTempDir());
+    const projectConfig = parseHookConfig(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: "printf x" }] }] },
+      "<project>",
+    ).config;
+    const pluginConfig = parseHookConfig(
+      { UserPromptSubmit: [{ hooks: [
+        { type: "command", command: "printf x" },
+        { type: "command", command: "printf x" },
+      ] }] },
+      "<plugin>",
+      { pluginId: context.pluginId },
+    ).config;
+    const { runner } = makeRunner(undefined, {
+      config: mergeHookConfigs(projectConfig, pluginConfig),
+      pluginContexts: new Map([[context.pluginId, context]]),
+    });
+    expect((await runner.fire("UserPromptSubmit", {})).stdout).toBe("x\nx");
+  });
+
+  it("keeps qualified hook contexts distinct for dedup and exports non-overridable env", async () => {
+    const first = runtimeContext("same@market-a", makeTempDir(), makeTempDir(), makeTempDir());
+    const second = runtimeContext("same@market-b", makeTempDir(), makeTempDir(), makeTempDir());
+    const firstConfig = parseHookConfig(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: `printf '%s|%s|%s' "$CLAUDE_PLUGIN_ROOT" "$CLAUDE_PLUGIN_DATA" "$CLAUDE_PROJECT_DIR"` }] }] },
+      "<first>",
+      { pluginId: first.pluginId },
+    ).config;
+    const secondConfig = parseHookConfig(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: `printf '%s|%s|%s' "$CLAUDE_PLUGIN_ROOT" "$CLAUDE_PLUGIN_DATA" "$CLAUDE_PROJECT_DIR"` }] }] },
+      "<second>",
+      { pluginId: second.pluginId },
+    ).config;
+    const previous = {
+      CLAUDE_PLUGIN_ROOT: process.env.CLAUDE_PLUGIN_ROOT,
+      CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA,
+      CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR,
+    };
+    process.env.CLAUDE_PLUGIN_ROOT = "ambient-root";
+    process.env.CLAUDE_PLUGIN_DATA = "ambient-data";
+    process.env.CLAUDE_PROJECT_DIR = "ambient-project";
+    const { runner } = makeRunner(undefined, {
+      config: mergeHookConfigs(firstConfig, secondConfig),
+      env: {
+        CLAUDE_PLUGIN_ROOT: "attacker-root",
+        CLAUDE_PLUGIN_DATA: "attacker-data",
+        CLAUDE_PROJECT_DIR: "attacker-project",
+      },
+      pluginContexts: new Map([[first.pluginId, first], [second.pluginId, second]]),
+    });
+    try {
+      const outcome = await runner.fire("UserPromptSubmit", {});
+      expect(outcome.stdout).toBe(
+        `${first.root}|${first.dataDir}|${first.projectDir}\n${second.root}|${second.dataDir}|${second.projectDir}`,
+      );
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("reports data creation failure immediately and retains it without spawning", async () => {
+    const context = runtimeContext("broken@market-a", makeTempDir());
+    const retained: string[] = [];
+    let spawned = false;
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo must-not-run" }] }] },
+      {
+        trustedPluginId: context.pluginId,
+        pluginContexts: new Map([[context.pluginId, context]]),
+        ensurePluginDataDir: () => ({ ok: false, message: "qualified data mkdir failed; command not spawned" }),
+        onRuntimeFinding: (message) => retained.push(message),
+        onSpawnForTest: () => { spawned = true; },
+      },
+    );
     const outcome = await runner.fire("UserPromptSubmit", {});
-    expect(outcome.stdout).toBe("${CLAUDE_PLUGIN_DATA}");
+    expect(spawned).toBe(false);
+    expect(outcome.diagnostics.map((diagnostic) => diagnostic.message)).toContain("qualified data mkdir failed; command not spawned");
+    expect(retained).toEqual(["qualified data mkdir failed; command not spawned"]);
+  });
+
+  it("contains a throwing runtime-finding observer when plugin context is unavailable", async () => {
+    const pluginId = "missing-context@market";
+    const message = `hook (UserPromptSubmit) for plugin "${pluginId}": trusted runtime context is unavailable; command not spawned`;
+    let spawned = false;
+    let observerCalls = 0;
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo must-not-run" }] }] },
+      {
+        trustedPluginId: pluginId,
+        onRuntimeFinding: () => { observerCalls += 1; throw new Error("observer failed"); },
+        onSpawnForTest: () => { spawned = true; },
+      },
+    );
+
+    const outcome = await runner.fire("UserPromptSubmit", {});
+
+    expect(spawned).toBe(false);
+    expect(observerCalls).toBe(1);
+    expect(outcome.diagnostics).toEqual([{ severity: "warning", message }]);
+  });
+
+  it("contains a throwing runtime-finding observer when plugin data preparation fails", async () => {
+    const context = runtimeContext("broken-observer@market", makeTempDir());
+    const message = "qualified data mkdir failed; command not spawned";
+    let spawned = false;
+    let observerCalls = 0;
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo must-not-run" }] }] },
+      {
+        trustedPluginId: context.pluginId,
+        pluginContexts: new Map([[context.pluginId, context]]),
+        ensurePluginDataDir: () => ({ ok: false, message }),
+        onRuntimeFinding: () => { observerCalls += 1; throw new Error("observer failed"); },
+        onSpawnForTest: () => { spawned = true; },
+      },
+    );
+
+    const outcome = await runner.fire("UserPromptSubmit", {});
+
+    expect(spawned).toBe(false);
+    expect(observerCalls).toBe(1);
+    expect(outcome.diagnostics).toEqual([{ severity: "warning", message }]);
+  });
+
+  it("leaves ${CLAUDE_PLUGIN_DATA} unexpanded with a warning when no data dir is known", async () => {
+    const { runner } = makeRunner(
+      {
+        UserPromptSubmit: [{ hooks: [{
+          type: "command",
+          command: `printf '%s' '\${CLAUDE_PLUGIN_DATA}'`,
+          __pluginName: "my-plugin",
+        }] }],
+      },
+      { trustedPluginId: "my-plugin@market-a" },
+    );
+    const outcome = await runner.fire("UserPromptSubmit", {});
+    expect(outcome.stdout).toBeUndefined();
     expect(
       outcome.diagnostics.some(
-        (d) => d.severity === "warning" && d.message.includes("CLAUDE_PLUGIN_DATA"),
+        (d) => d.severity === "warning" && d.message.includes("trusted runtime context is unavailable"),
       ),
     ).toBe(true);
   });
 
-  it.runIf(process.platform === "win32")("runs powershell hooks when shell is powershell", async () => {
-    const { runner } = makeRunner({
-      UserPromptSubmit: [
-        { hooks: [{ type: "command", command: "Write-Output 'ps-out'", shell: "powershell" }] },
-      ],
-    });
+  it.runIf(process.platform === "win32")("runs powershell hooks with structural plugin variables", async () => {
+    const context = runtimeContext("powershell@market", makeTempDir(), makeTempDir(), makeTempDir());
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command",
+        command: "Write-Output \"$env:CLAUDE_PLUGIN_ROOT|$env:CLAUDE_PLUGIN_DATA|$env:CLAUDE_PROJECT_DIR\"",
+        shell: "powershell",
+      }] }] },
+      {
+        trustedPluginId: context.pluginId,
+        pluginContexts: new Map([[context.pluginId, context]]),
+      },
+    );
     const outcome = await runner.fire("UserPromptSubmit", {});
-    expect(outcome.stdout).toBe("ps-out");
+    expect(outcome.stdout).toBe(`${context.root}|${context.dataDir}|${context.projectDir}`);
   }, 20000);
 });
 

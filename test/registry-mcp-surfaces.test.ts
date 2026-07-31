@@ -612,8 +612,8 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(lookupCapability("feature.hook-handler.mcp_tool")).toMatchObject({ safetyRelevant: false });
     expect(lookupCapability("feature.hook-handler.mcp_tool-blocking-enforcement")).toMatchObject({ safetyRelevant: true });
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("cannot enforce valid deny/block output");
-    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("Use a supported command hook");
-    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("Claude Code when enforcement is required");
+    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("For events where PiCC enforces command-hook blocking results");
+    expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("WorktreeCreate creation-time enforcement or other unavailable enforcement");
     expect(note("setting.allowedMcpServers")).toContain("invalid value becomes an empty allowlist");
     expect(note("setting.allowManagedMcpServersOnly")).toContain("invalid value is treated as true");
     for (const id of ["feature.mcp-managed-config", "setting.allowManagedMcpServersOnly", "setting.allowedMcpServers", "setting.deniedMcpServers", "setting.strictPluginOnlyCustomization.mcp"]) {

@@ -71,7 +71,8 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   the [capability matrix](doc/supported-features.md) for exact limits.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
-- **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
+- **Plugins** — enabled plugins require matching exact imported installed-state records; see the
+  [capability matrix](doc/supported-features.md) for current limits.
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a
   non-vision model; notebooks can be edited cell-by-cell with `NotebookEdit`; a genuinely unsupported

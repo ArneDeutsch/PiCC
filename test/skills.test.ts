@@ -2,14 +2,18 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  loadPluginSkills,
   loadSkillBody,
+  loadSkillBodyResult,
   loadSkills,
   renderSkillListing,
   substituteArguments,
   substituteVariables,
+  type PluginSkillLoaderSource,
 } from "../src/claude/skills.js";
+import { authorizePluginRoot, resolvePluginPath } from "../src/claude/plugin-paths.js";
 import {
   preprocessShellInjection,
   resolveGitBashPath,
@@ -19,6 +23,29 @@ import {
 import type { ClaudeSkill } from "../src/types.js";
 
 const SENTINEL = "PD_SENTINEL_BODY_2c8f71";
+
+function supportsLink(kind: "file" | "directory"): boolean {
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), `picc-skill-${kind}-link-`));
+  try {
+    const target = path.join(probe, "target");
+    const link = path.join(probe, "link");
+    if (kind === "directory") {
+      fs.mkdirSync(target);
+      fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+    } else {
+      fs.writeFileSync(target, "target", "utf8");
+      fs.symlinkSync(target, link, "file");
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+const canLinkDirectory = supportsLink("directory");
+const canLinkFile = supportsLink("file");
 
 let root: string;
 let skillsDir: string;
@@ -221,6 +248,36 @@ function load() {
   );
 }
 
+function pluginSource(
+  pluginRoot: string,
+  declaredPath: string,
+  kind: "file" | "directory",
+): PluginSkillLoaderSource {
+  const authorized = authorizePluginRoot(pluginRoot);
+  if (!authorized.ok) throw new Error(authorized.diagnostic.message);
+  const resolved = resolvePluginPath({
+    root: authorized.value,
+    declaredPath,
+    inputKind: "explicit",
+    kind,
+  });
+  if (!resolved.ok) throw new Error(resolved.diagnostic.message);
+  return {
+    source: {
+      kind,
+      path: resolved.value.lexicalPath,
+      metadata: {
+        pluginId: "tools@trusted-market",
+        pluginName: "tools",
+        authorizedRoot: authorized.value.canonicalPath,
+        lexicalPath: resolved.value.lexicalPath,
+        canonicalPath: resolved.value.canonicalPath,
+      },
+    },
+    validatedPath: resolved.value,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // loadSkills
 // ---------------------------------------------------------------------------
@@ -417,6 +474,390 @@ describe("loadSkills", () => {
     expect(s.diagnostics.some((d) => d.message.includes("leniently"))).toBe(true);
     expect(loadSkillBody(s)).toContain("Body of broken-yaml skill.");
   });
+});
+
+describe("loadPluginSkills", () => {
+  it("loads validated skill directories, root skills, and explicit command files with trusted provenance", () => {
+    const pluginRoot = path.join(root, "plugin-inputs");
+    write(
+      "plugin-inputs/selected/SKILL.md",
+      "---\ndescription: selected skill\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: safe-hook\n---\nSELECTED BODY",
+    );
+    write("plugin-inputs/SKILL.md", "---\nname: root-skill\ndescription: root skill\n---\nROOT BODY");
+    write("plugin-inputs/commands/z.md", "---\ndescription: z command\n---\nZ BODY");
+    write("plugin-inputs/commands/a.md", "---\ndescription: a command\n---\nA BODY");
+
+    const result = loadPluginSkills(
+      [
+        pluginSource(pluginRoot, "./selected", "directory"),
+        pluginSource(pluginRoot, "./", "directory"),
+      ],
+      [pluginSource(pluginRoot, "./commands/a.md", "file")],
+    );
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.skills.map((skill) => skill.name)).toEqual(["selected", "root-skill", "a"]);
+    for (const skill of result.skills) {
+      expect(skill.source).toMatchObject({
+        scope: "plugin",
+        pluginId: "tools@trusted-market",
+        pluginName: "tools",
+      });
+      expect(skill.body).toBeUndefined();
+    }
+    expect(result.skills[0]!.hooks).toBeDefined();
+    expect(result.skills[0]!.source.pluginId).toBe("tools@trusted-market");
+    expect(JSON.stringify(result)).not.toContain("SELECTED BODY");
+    expect(loadSkillBody(result.skills[0]!)).toBe("SELECTED BODY");
+  });
+
+  it("reports a direct explicit command final-read failure as terminal typed evidence", () => {
+    const pluginRoot = path.join(root, "plugin-command-final-read");
+    const commandFile = write(
+      "plugin-command-final-read/command.md",
+      "---\ndescription: command\n---\nbody",
+    );
+    const input = pluginSource(pluginRoot, "./command.md", "file");
+    const originalReadFileSync = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+      if (filePath === commandFile) {
+        throw Object.assign(new Error("private final read"), { code: "EACCES" });
+      }
+      return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginSkills([], [input]);
+      expect(result.skills).toEqual([]);
+      expect(result.pathFailures).toHaveLength(1);
+      expect(result.pathFailures![0]).toMatchObject({
+        pluginId: "tools@trusted-market",
+        component: "command",
+        source: input.source,
+        terminal: true,
+        failure: { code: "unreadable-path" },
+      });
+      expect(JSON.stringify(result.pathFailures)).not.toContain("private final read");
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("keeps a command descendant final-read failure below an explicit directory component-local", () => {
+    const pluginRoot = path.join(root, "plugin-command-directory-final-read");
+    const failed = write("plugin-command-directory-final-read/commands/a-failed.md", "failed body");
+    write("plugin-command-directory-final-read/commands/b-valid.md", "---\ndescription: valid\n---\nvalid body");
+    const originalReadFileSync = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+      if (filePath === failed) {
+        throw Object.assign(new Error("private descendant read"), { code: "EACCES" });
+      }
+      return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = loadPluginSkills([], [pluginSource(pluginRoot, "./commands", "directory")]);
+      expect(result.skills.map((skill) => skill.name)).toEqual(["b-valid"]);
+      expect(result.skills[0]!.source).toMatchObject({
+        scope: "plugin",
+        pluginId: "tools@trusted-market",
+        pluginName: "tools",
+      });
+      expect(result.pathFailures).toEqual([]);
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({ message: "Cannot read command file; skipped" }),
+      ]);
+      expect(JSON.stringify(result)).not.toContain("private descendant read");
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("recursively discovers an absent-root skill directory with qualified aliases, collisions, and deduplication", () => {
+    const pluginRoot = path.join(root, "plugin-nested-skills");
+    write("plugin-nested-skills/skills/alpha/SKILL.md", "---\ndescription: alpha\n---\nalpha");
+    write("plugin-nested-skills/skills/group/alpha/SKILL.md", "---\ndescription: nested alpha\n---\nnested alpha");
+    const betaFile = write(
+      "plugin-nested-skills/skills/group/beta/SKILL.md",
+      "---\ndescription: beta\n---\nbeta",
+    );
+    const source = pluginSource(pluginRoot, "./skills", "directory");
+
+    const result = loadPluginSkills([source, source], []);
+    expect(result.skills.map((skill) => skill.name)).toEqual([
+      "alpha",
+      "group:alpha",
+      "beta",
+      "group:beta",
+    ]);
+    expect(result.skills.find((skill) => skill.name === "group:alpha")?.description).toBe("nested alpha");
+    const beta = result.skills.find((skill) => skill.name === "beta")!;
+    const alias = result.skills.find((skill) => skill.name === "group:beta")!;
+    expect(alias.disableModelInvocation).toBe(true);
+    expect(alias.source).toBe(beta.source);
+    const shallowNamespaced = { ...beta, name: "plugin:group:beta" };
+    beta.source.path = path.join(root, "outside-mutation.md");
+    fs.writeFileSync(betaFile, "---\ndescription: beta\n---\nfresh beta", "utf8");
+    expect(loadSkillBody(alias)).toBe("fresh beta");
+    expect(loadSkillBody(shallowNamespaced)).toBe("fresh beta");
+    expect(new Set(result.skills.map((skill) => skill.name)).size).toBe(result.skills.length);
+  });
+
+  it("fails closed when the selected directory has an existing invalid root entry", () => {
+    const pluginRoot = path.join(root, "plugin-invalid-root");
+    fs.mkdirSync(path.join(pluginRoot, "skills", "SKILL.md"), { recursive: true });
+    write("plugin-invalid-root/skills/nested/SKILL.md", "---\ndescription: must not load\n---\nbody");
+
+    const result = loadPluginSkills([pluginSource(pluginRoot, "./skills", "directory")], []);
+    expect(result.skills).toEqual([]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]).toMatchObject({
+      severity: "warning",
+      source: path.join(pluginRoot, "skills", "SKILL.md"),
+    });
+    expect(result.diagnostics[0]!.message).toContain("not a file");
+    expect(result.pathFailures).toEqual([
+      {
+        pluginId: "tools@trusted-market",
+        component: "skill",
+        source: expect.objectContaining({ path: path.join(pluginRoot, "skills") }),
+        terminal: false,
+        failure: expect.objectContaining({ code: "wrong-kind" }),
+      },
+    ]);
+    expect(result.pathFailures![0]!.failure.diagnostic).toBe(result.diagnostics[0]);
+  });
+
+  it("preserves ordered skill and command path-failure sidecars without link dependence", () => {
+    const pluginRoot = path.join(root, "plugin-failure-sidecars");
+    const terminalSkillFile = write(
+      "plugin-failure-sidecars/terminal-skill/SKILL.md",
+      "---\ndescription: terminal skill\n---\nbody",
+    );
+    const nonterminalSkillFile = write(
+      "plugin-failure-sidecars/nonterminal-skill/SKILL.md",
+      "---\ndescription: nonterminal skill\n---\nbody",
+    );
+    const terminalCommandFile = write(
+      "plugin-failure-sidecars/commands/terminal.md",
+      "---\ndescription: terminal command\n---\nbody",
+    );
+    const terminalSkill = pluginSource(pluginRoot, "./terminal-skill/SKILL.md", "file");
+    const nonterminalSkill = pluginSource(pluginRoot, "./nonterminal-skill", "directory");
+    const terminalCommand = pluginSource(pluginRoot, "./commands/terminal.md", "file");
+
+    fs.unlinkSync(terminalSkillFile);
+    fs.unlinkSync(nonterminalSkillFile);
+    fs.mkdirSync(nonterminalSkillFile);
+    fs.unlinkSync(terminalCommandFile);
+
+    const result = loadPluginSkills(
+      [terminalSkill, nonterminalSkill],
+      [terminalCommand],
+    );
+    expect(result.skills).toEqual([]);
+    expect(result.pathFailures?.map(({ pluginId, component, source, terminal, failure }) => ({
+      pluginId,
+      component,
+      source: source.path,
+      terminal,
+      code: failure.code,
+      diagnosticSource: failure.diagnostic.source,
+    }))).toEqual([
+      {
+        pluginId: "tools@trusted-market",
+        component: "skill",
+        source: terminalSkill.source.path,
+        terminal: true,
+        code: "unreadable-path",
+        diagnosticSource: terminalSkill.source.path,
+      },
+      {
+        pluginId: "tools@trusted-market",
+        component: "skill",
+        source: nonterminalSkill.source.path,
+        terminal: false,
+        code: "wrong-kind",
+        diagnosticSource: nonterminalSkillFile,
+      },
+      {
+        pluginId: "tools@trusted-market",
+        component: "command",
+        source: terminalCommand.source.path,
+        terminal: true,
+        code: "unreadable-path",
+        diagnosticSource: terminalCommand.source.path,
+      },
+    ]);
+    expect(result.pathFailures![0]!.source).toBe(terminalSkill.source);
+    expect(result.pathFailures![1]!.source).toBe(nonterminalSkill.source);
+    expect(result.pathFailures![2]!.source).toBe(terminalCommand.source);
+    for (const [index, pathFailure] of result.pathFailures!.entries()) {
+      expect(pathFailure.failure.diagnostic).toBe(result.diagnostics[index]);
+    }
+  });
+
+  it("loads validated command directories in deterministic order without parent widening", () => {
+    const pluginRoot = path.join(root, "plugin-command-directory");
+    write("plugin-command-directory/commands/b.md", "---\ndescription: b\n---\nb");
+    write("plugin-command-directory/commands/a.md", "---\ndescription: a\n---\na");
+    write("plugin-command-directory/outside.md", "---\ndescription: outside\n---\noutside");
+
+    const result = loadPluginSkills(
+      [],
+      [pluginSource(pluginRoot, "./commands", "directory")],
+    );
+    expect(result.skills.map((skill) => skill.name)).toEqual(["a", "b"]);
+  });
+
+  it("rejects source metadata that does not match the validated capability", () => {
+    const pluginRoot = path.join(root, "plugin-mismatch");
+    write("plugin-mismatch/SKILL.md", "---\ndescription: mismatch\n---\nbody");
+    const input = pluginSource(pluginRoot, "./", "directory");
+    input.source.metadata.canonicalPath = path.join(pluginRoot, "invented");
+
+    const result = loadPluginSkills([input], []);
+    expect(result.skills).toEqual([]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]!.message).toContain("does not match");
+  });
+
+  it("reports current explicit-file failures across recovery while retaining the first diagnostic", () => {
+    const pluginRoot = path.join(root, "plugin-lazy-mutations");
+    const file = write(
+      "plugin-lazy-mutations/SKILL.md",
+      "---\ndescription: mutable\n---\nINITIAL BODY",
+    );
+    const skill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
+
+    expect(loadSkillBodyResult(skill)).toEqual({ body: "INITIAL BODY", diagnostics: [] });
+
+    fs.unlinkSync(file);
+    const unreadable = loadSkillBodyResult(skill);
+    expect(unreadable.body).toBe("");
+    expect(unreadable.failure?.code).toBe("unreadable-path");
+    expect(unreadable.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
+    expect(skill.diagnostics).toHaveLength(1);
+    expect(skill.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
+
+    fs.writeFileSync(file, "---\ndescription: mutable\n---\nRESTORED BODY", "utf8");
+    expect(loadSkillBodyResult(skill)).toEqual({ body: "RESTORED BODY", diagnostics: [] });
+
+    fs.unlinkSync(file);
+    fs.mkdirSync(file);
+    const wrongKind = loadSkillBodyResult(skill);
+    expect(wrongKind.body).toBe("");
+    expect(wrongKind.failure?.code).toBe("wrong-kind");
+    expect(wrongKind.diagnostics[0]).toBe(wrongKind.failure?.diagnostic);
+    expect(wrongKind.failure?.diagnostic).not.toEqual(unreadable.failure?.diagnostic);
+    expect(skill.diagnostics).toHaveLength(1);
+    expect(skill.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
+  });
+
+  it.skipIf(!canLinkDirectory)("binds lazy capability to shared source across clones and clears cached bodies on directory retarget", () => {
+    const pluginRoot = path.join(root, "plugin-retarget");
+    const inside = path.join(pluginRoot, "inside");
+    const outside = path.join(root, "plugin-retarget-outside");
+    fs.mkdirSync(inside, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    const trustedFile = path.join(inside, "SKILL.md");
+    const escapedFile = path.join(outside, "SKILL.md");
+    fs.writeFileSync(trustedFile, "---\ndescription: linked\n---\nTRUSTED BODY", "utf8");
+    fs.writeFileSync(escapedFile, "---\ndescription: linked\n---\nESCAPED BODY", "utf8");
+    const selected = path.join(pluginRoot, "selected");
+    fs.symlinkSync(inside, selected, process.platform === "win32" ? "junction" : "dir");
+
+    const result = loadPluginSkills([pluginSource(pluginRoot, "./selected", "directory")], []);
+    const skill = result.skills[0]!;
+    const clone = { ...skill, name: "namespaced:linked" };
+    skill.source.path = escapedFile;
+    expect(loadSkillBody(skill)).toBe("TRUSTED BODY");
+    expect(loadSkillBody(clone)).toBe("TRUSTED BODY");
+
+    fs.writeFileSync(trustedFile, "---\ndescription: linked\n---\nFRESH BODY", "utf8");
+    expect(loadSkillBody(clone)).toBe("FRESH BODY");
+
+    fs.unlinkSync(selected);
+    fs.symlinkSync(outside, selected, process.platform === "win32" ? "junction" : "dir");
+    const failed = loadSkillBodyResult(skill);
+    expect(failed.body).toBe("");
+    expect(failed.failure?.code).toBe("path-escape");
+    expect(failed.diagnostics).toEqual([failed.failure?.diagnostic]);
+    expect(skill.body).toBeUndefined();
+    expect(clone.body).toBeUndefined();
+    const repeated = loadSkillBodyResult(clone);
+    expect(repeated.failure?.code).toBe("path-escape");
+    expect(repeated.diagnostics).toEqual([repeated.failure?.diagnostic]);
+    expect(skill.diagnostics).toHaveLength(1);
+    expect(skill.diagnostics[0]).toBe(failed.failure?.diagnostic);
+    expect(clone.diagnostics).toBe(skill.diagnostics);
+  });
+
+  it("returns a typed failure when the final plugin read is denied without changing ordinary reads", () => {
+    const pluginRoot = path.join(root, "plugin-final-read");
+    const pluginFile = write("plugin-final-read/SKILL.md", "---\ndescription: plugin\n---\nPLUGIN");
+    const ordinaryFile = write("ordinary-final-read/skill/SKILL.md", "---\ndescription: ordinary\n---\nORDINARY");
+    const pluginSkill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
+    const clone = { ...pluginSkill, name: "plugin:clone" };
+    expect(loadSkillBody(clone)).toBe("PLUGIN");
+    const ordinary = loadSkills(
+      [{ dir: path.join(root, "ordinary-final-read"), scope: "user" }],
+      [],
+    ).skills[0]!;
+    const originalReadFileSync = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
+      if (filePath === pluginFile) {
+        throw Object.assign(new Error("private EACCES detail"), { code: "EACCES" });
+      }
+      return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const failed = loadSkillBodyResult(pluginSkill);
+      expect(failed).toMatchObject({
+        body: "",
+        failure: {
+          code: "unreadable-path",
+          diagnostic: {
+            severity: "warning",
+            message: "Plugin skill body became unreadable after path revalidation",
+            source: pluginFile,
+          },
+        },
+      });
+      expect(failed.diagnostics).toEqual([failed.failure?.diagnostic]);
+      expect(pluginSkill.body).toBeUndefined();
+      expect(clone.body).toBeUndefined();
+      expect(loadSkillBody(ordinary)).toBe("ORDINARY");
+      expect(ordinary.source.path).toBe(ordinaryFile);
+      expect(ordinary.diagnostics).toEqual([]);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it.skipIf(!canLinkFile)("fails closed when an explicit plugin skill file symlink is retargeted", () => {
+    const pluginRoot = path.join(root, "plugin-file-retarget");
+    const inside = write("plugin-file-retarget/inside.md", "---\ndescription: linked\n---\nINSIDE");
+    const outside = write("plugin-file-retarget-outside.md", "---\ndescription: linked\n---\nOUTSIDE");
+    const selected = path.join(pluginRoot, "SKILL.md");
+    fs.symlinkSync(inside, selected, "file");
+    const skill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
+    expect(loadSkillBody(skill)).toBe("INSIDE");
+
+    fs.unlinkSync(selected);
+    fs.symlinkSync(outside, selected, "file");
+    const failed = loadSkillBodyResult(skill);
+    expect(failed.body).toBe("");
+    expect(failed.failure?.code).toBe("path-escape");
+    expect(skill.body).toBeUndefined();
+  });
+});
+
+it("keeps ordinary user skill body loading lazy and fresh", () => {
+  const userDir = path.join(root, "ordinary-user-skills");
+  const file = write("ordinary-user-skills/fresh/SKILL.md", "---\ndescription: user skill\n---\nFIRST");
+  const skill = loadSkills([{ dir: userDir, scope: "user" }], []).skills[0]!;
+  expect(skill.body).toBeUndefined();
+  fs.writeFileSync(file, "---\ndescription: user skill\n---\nSECOND", "utf8");
+  expect(loadSkillBody(skill)).toBe("SECOND");
 });
 
 // ---------------------------------------------------------------------------

@@ -5,18 +5,19 @@ import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discov
 import { loadSettings } from "./discovery/settings.js";
 import { resolveMcpConfig } from "./discovery/mcp.js";
 import { loadMcpJson } from "./claude/mcp-config.js";
-import { loadSkills } from "./claude/skills.js";
-import { loadAgents } from "./claude/agents.js";
+import { loadPluginSkills, loadSkills } from "./claude/skills.js";
+import { loadAgents, loadPluginAgents } from "./claude/agents.js";
 import { loadRules } from "./claude/rules.js";
 import { loadClaudeMdHierarchy } from "./claude/claude-md.js";
 import { loadAutoMemory, type MemorySnapshot } from "./claude/memory.js";
 import { parseHookConfig, mergeHookConfigs } from "./claude/hooks.js";
+import { loadPluginInstalledState } from "./claude/plugin-installed-state.js";
 import {
-  discoverInstalledPlugins,
-  discoverProjectBundledPlugin,
   loadPluginHooks,
+  resolveInstalledPlugins,
   type InstalledPlugin,
 } from "./claude/plugins.js";
+import type { PluginResolutionOutcome, PluginRuntimeContext } from "./types.js";
 
 /**
  * Assemble the full Claude-artifact model of a project: settings with
@@ -29,7 +30,8 @@ export interface LoadedProject extends ClaudeProject {
   /** Fully merged hook config: settings hooks + plugin hooks. */
   mergedHooks: HookConfig;
   plugins: InstalledPlugin[];
-  pluginRoots: Record<string, string>;
+  pluginResolutionOutcomes: PluginResolutionOutcome[];
+  pluginContexts: ReadonlyMap<string, PluginRuntimeContext>;
   /** Auto memory: dir + truncated MEMORY.md; undefined when disabled. */
   autoMemory?: MemorySnapshot;
 }
@@ -60,47 +62,86 @@ export function loadClaudeProject(opts: {
     managedDirs: opts.managedArtifactDirs,
   });
 
-  const pluginResult = discoverInstalledPlugins({
+  diagnostics.push(...settings.diagnostics);
+  const installedState = loadPluginInstalledState(userDir);
+  diagnostics.push(...installedState.diagnostics);
+  const pluginResult = resolveInstalledPlugins({
     userDir,
-    enabledPlugins: settings.enabledPlugins,
+    projectRoot: root,
+    enablement: settings.effectivePluginEnablement ?? {},
+    installations: installedState.installations,
+    installedStateStatus: installedState.status,
   });
   diagnostics.push(...pluginResult.diagnostics);
-  const plugins = pluginResult.plugins.filter((p) => p.enabled);
-  const bundled = discoverProjectBundledPlugin(root);
-  if (bundled) plugins.push(bundled);
-  // Per-plugin diagnostics (malformed manifests, dangling manifest paths, …)
-  // must surface into the project diagnostics for /doctor and the compat report.
-  for (const p of plugins) diagnostics.push(...p.diagnostics);
-  const pluginRoots: Record<string, string> = {};
-  for (const p of plugins) pluginRoots[p.name] = p.root;
+  let plugins = pluginResult.plugins;
+  const pluginResolutionOutcomes = [...pluginResult.outcomes];
 
-  // Skills & commands (project/user scope first, then plugin content; first-wins
-  // dedupe). Plugin content is namespaced `<plugin>:<name>` exactly like Claude
-  // Code, whose plugin skills never collide — so a plugin skill is never
-  // silently shadowed by a same-named project/user skill.
+  // Project/user artifacts retain precedence. Installed plugin contributions are
+  // committed only after every independently resolved loader input remains valid.
   const skillsResult = loadSkills(dirs.skillDirs, dirs.commandDirs);
   diagnostics.push(...skillsResult.diagnostics);
   let skills = skillsResult.skills;
-  for (const plugin of plugins) {
-    const pluginSkills = loadSkills(
-      plugin.skillDirs.map((dir) => ({ dir, scope: "plugin" as const })),
-      plugin.commandDirs.map((dir) => ({ dir, scope: "plugin" as const })),
-      { pluginName: plugin.name },
-    );
-    diagnostics.push(...pluginSkills.diagnostics);
-    skills = dedupeByName([...skills, ...namespacePluginContent(pluginSkills.skills, plugin.name)]);
-  }
-
   const agentsResult = loadAgents(dirs.agentDirs);
   diagnostics.push(...agentsResult.diagnostics);
   let agents = agentsResult.agents;
+  const loadedPluginSkills = new Map<string, ClaudeSkill[]>();
+  const loadedPluginAgents = new Map<string, typeof agents>();
+  const loadedPluginHooks = new Map<string, ReturnType<typeof loadPluginHooks>>();
+  const rejectedAtLoad = new Set<string>();
   for (const plugin of plugins) {
-    const pluginAgents = loadAgents(
-      plugin.agentDirs.map((dir) => ({ dir, scope: "plugin" as const })),
-      { pluginName: plugin.name },
+    const outcome = pluginResolutionOutcomes.find((item) => item.pluginId === plugin.pluginId)!;
+    const pluginSkills = loadPluginSkills(plugin.skillSources, plugin.commandSources);
+    const pluginAgents = loadPluginAgents(plugin.agentSources);
+    const pluginHooks = loadPluginHooks(plugin);
+    const loaderEvidence = [
+      ...safeLoaderEvidence("skill/command", pluginSkills.diagnostics),
+      ...safeLoaderEvidence("agent", pluginAgents.diagnostics),
+      ...safeLoaderEvidence("hook source", pluginHooks.diagnostics),
+      ...safeLoaderEvidence("plugin", plugin.diagnostics),
+    ];
+    diagnostics.push(...pluginSkills.diagnostics, ...pluginAgents.diagnostics, ...pluginHooks.diagnostics);
+    const terminalSkillEvidence = safeLoaderEvidence(
+      "skill/command",
+      pluginSkills.pathFailures?.filter((failure) => failure.terminal).map((failure) => failure.failure.diagnostic) ?? [],
     );
-    diagnostics.push(...pluginAgents.diagnostics);
-    agents = dedupeByName([...agents, ...namespacePluginContent(pluginAgents.agents, plugin.name)]);
+    const terminalAgentEvidence = safeLoaderEvidence(
+      "agent",
+      pluginAgents.pathFailures?.filter((failure) => failure.terminal).map((failure) => failure.failure.diagnostic) ?? [],
+    );
+    const terminalHookEvidence = safeLoaderEvidence("hook source", pluginHooks.rejectionDiagnostics);
+    if (terminalSkillEvidence.length > 0 || terminalAgentEvidence.length > 0 || pluginHooks.rejected) {
+      rejectedAtLoad.add(plugin.pluginId);
+      const rejection = {
+        severity: "warning" as const,
+        message: "Installed plugin components could not be loaded safely; all contributions were rejected",
+      };
+      outcome.diagnostics = boundedOutcomeDiagnostics(
+        outcome.diagnostics,
+        loaderEvidence,
+        [...terminalSkillEvidence, ...terminalAgentEvidence, ...terminalHookEvidence, rejection],
+      );
+      diagnostics.push(rejection);
+      continue;
+    }
+    outcome.diagnostics = boundedOutcomeDiagnostics(outcome.diagnostics, loaderEvidence);
+
+    loadedPluginSkills.set(plugin.pluginId, namespacePluginContent(pluginSkills.skills, plugin.name));
+    loadedPluginAgents.set(plugin.pluginId, namespacePluginContent(pluginAgents.agents, plugin.name));
+    loadedPluginHooks.set(plugin.pluginId, pluginHooks);
+  }
+  if (rejectedAtLoad.size > 0) {
+    plugins = plugins.filter((plugin) => !rejectedAtLoad.has(plugin.pluginId));
+    for (const outcome of pluginResolutionOutcomes) {
+      if (rejectedAtLoad.has(outcome.pluginId)) {
+        outcome.status = "rejected";
+        outcome.context = undefined;
+        outcome.sources = undefined;
+      }
+    }
+  }
+  for (const plugin of plugins) {
+    skills = dedupeByName([...skills, ...(loadedPluginSkills.get(plugin.pluginId) ?? [])]);
+    agents = dedupeByName([...agents, ...(loadedPluginAgents.get(plugin.pluginId) ?? [])]);
   }
 
   skills = applySkillOverrides(skills, settings.skillOverrides, diagnostics);
@@ -136,11 +177,15 @@ export function loadClaudeProject(opts: {
 
   const hookConfigs: HookConfig[] = [settings.hooks];
   for (const plugin of plugins) {
-    const rawHooks = loadPluginHooks(plugin);
-    diagnostics.push(...rawHooks.diagnostics);
+    const rawHooks = loadedPluginHooks.get(plugin.pluginId)!;
     if (Object.keys(rawHooks.config).length) {
-      const parsed = parseHookConfig(rawHooks.config, `plugin:${plugin.name}`);
+      const parsed = parseHookConfig(rawHooks.config, `plugin:${plugin.pluginId}`, { pluginId: plugin.pluginId });
       diagnostics.push(...parsed.diagnostics);
+      const outcome = pluginResolutionOutcomes.find((item) => item.pluginId === plugin.pluginId)!;
+      outcome.diagnostics = boundedOutcomeDiagnostics(
+        outcome.diagnostics,
+        safeLoaderEvidence("hook", parsed.diagnostics),
+      );
       hookConfigs.push(parsed.config);
     }
   }
@@ -158,7 +203,8 @@ export function loadClaudeProject(opts: {
     diagnostics,
     mergedHooks: mergeHookConfigs(...hookConfigs),
     plugins,
-    pluginRoots,
+    pluginResolutionOutcomes,
+    pluginContexts: new Map(plugins.map((plugin) => [plugin.pluginId, plugin.context])),
     autoMemory,
   };
 }
@@ -168,6 +214,40 @@ export function loadClaudeProject(opts: {
  * (`my-plugin/skills/review/` → `/my-plugin:review`). The bare name stays
  * reachable via {@link findByName} when unambiguous.
  */
+function safeLoaderEvidence(component: string, entries: readonly Diagnostic[]): Diagnostic[] {
+  return entries.map((entry) => {
+    const message = entry.message.toLowerCase();
+    const reason = message.includes("unreadable") || message.includes("cannot read") ? "unreadable content"
+      : message.includes("malformed") || message.includes("no description") || message.includes("not a valid") ? "malformed content"
+      : message.includes("unsupported") || message.includes("not allowed") || message.includes("ignored") ? "unsupported content"
+      : message.includes("path") || message.includes("filesystem") ? "path validation failure"
+      : "a loader warning";
+    return { severity: entry.severity, message: `Installed plugin ${component} loader reported ${reason}` };
+  });
+}
+
+function boundedOutcomeDiagnostics(
+  existing: readonly Diagnostic[],
+  ordinary: readonly Diagnostic[],
+  reserved: readonly Diagnostic[] = [],
+): Diagnostic[] {
+  const unique = (entries: readonly Diagnostic[]): Diagnostic[] => {
+    const seen = new Set<string>();
+    return entries.filter((entry) => {
+      const key = `${entry.severity}\0${entry.message}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  const terminal = unique(reserved).slice(-20);
+  const terminalKeys = new Set(terminal.map((entry) => `${entry.severity}\0${entry.message}`));
+  const prefix = unique([...existing, ...ordinary])
+    .filter((entry) => !terminalKeys.has(`${entry.severity}\0${entry.message}`))
+    .slice(0, 20 - terminal.length);
+  return [...prefix, ...terminal];
+}
+
 function namespacePluginContent<T extends { name: string }>(items: T[], pluginName: string): T[] {
   return items.map((item) =>
     item.name.startsWith(`${pluginName}:`) ? item : { ...item, name: `${pluginName}:${item.name}` },

@@ -1,11 +1,15 @@
+import fs from "node:fs";
 import path from "node:path";
 import type {
   ClaudeSkill,
   Diagnostic,
   HookConfig,
+  PluginComponentSource,
   Scope,
   SkillArgumentSpec,
 } from "../types.js";
+import type { PluginPathFailure, ValidatedPluginPath } from "./plugin-paths.js";
+import { resolvePluginPath, revalidatePluginPath, walkPluginFiles } from "./plugin-paths.js";
 import { parseMarkdown, toBool, toStringList } from "../util/markdown.js";
 import { isDirectory, readTextSafe, walkFiles } from "../util/fs.js";
 
@@ -176,6 +180,44 @@ function toHookConfig(
 export interface LoadSkillsResult {
   skills: ClaudeSkill[];
   diagnostics: Diagnostic[];
+  pathFailures?: PluginSkillPathFailure[];
+}
+
+type FileDirectoryPluginSource = Exclude<PluginComponentSource, { kind: "inline" }>;
+
+export interface PluginSkillPathFailure {
+  pluginId: string;
+  component: "skill" | "command";
+  source: FileDirectoryPluginSource;
+  terminal: boolean;
+  failure: PluginPathFailure;
+}
+
+export interface PluginSkillLoaderSource {
+  source: FileDirectoryPluginSource;
+  validatedPath: ValidatedPluginPath;
+}
+
+interface PluginIdentity {
+  pluginId?: string;
+  pluginName: string;
+}
+
+interface LazyPluginSource {
+  source: ValidatedPluginPath;
+  skills: Set<ClaudeSkill>;
+  reportedDiagnostics: WeakSet<Diagnostic[]>;
+}
+
+const lazyPluginSources = new WeakMap<ClaudeSkill["source"], LazyPluginSource>();
+
+function bindLazyPluginSource(skill: ClaudeSkill, source: ValidatedPluginPath): void {
+  let lazy = lazyPluginSources.get(skill.source);
+  if (!lazy) {
+    lazy = { source, skills: new Set(), reportedDiagnostics: new WeakSet() };
+    lazyPluginSources.set(skill.source, lazy);
+  }
+  lazy.skills.add(skill);
 }
 
 /**
@@ -208,7 +250,6 @@ function qualifiedNameFor(rootDir: string, containerDir: string, name: string): 
 export function loadSkills(
   skillDirs: Array<{ dir: string; scope: Scope }>,
   commandDirs: Array<{ dir: string; scope: Scope }>,
-  opts: { pluginName?: string } = {},
 ): LoadSkillsResult {
   const diagnostics: Diagnostic[] = [];
   type Entry = { skill: ClaudeSkill; qualified?: string };
@@ -217,7 +258,7 @@ export function loadSkills(
     if (!isDirectory(dir)) continue;
     const files = walkFiles(dir, (name) => name === "SKILL.md").sort();
     for (const file of files) {
-      const skill = parseSkillFile(file, scope, opts.pluginName, diagnostics);
+      const skill = parseSkillFile(file, scope, undefined, diagnostics);
       if (!skill) continue;
       // Intermediate dirs only: the skill's OWN directory is its identity, not a namespace.
       const qualified = qualifiedNameFor(dir, path.dirname(skill.baseDir), skill.name);
@@ -230,24 +271,223 @@ export function loadSkills(
     if (!isDirectory(dir)) continue;
     const files = walkFiles(dir, (name) => name.toLowerCase().endsWith(".md")).sort();
     for (const file of files) {
-      const cmd = parseCommandFile(file, path.dirname(file), scope, opts.pluginName, diagnostics);
+      const cmd = parseCommandFile(file, path.dirname(file), scope, undefined, diagnostics);
       if (!cmd) continue;
       const qualified = qualifiedNameFor(dir, path.dirname(file), cmd.name);
       commands.push({ skill: cmd, qualified });
     }
   }
 
+  return finalizeSkills(skills, commands, diagnostics);
+}
+
+export function loadPluginSkills(
+  skillSources: PluginSkillLoaderSource[],
+  commandSources: PluginSkillLoaderSource[],
+): LoadSkillsResult {
+  const diagnostics: Diagnostic[] = [];
+  const pathFailures: PluginSkillPathFailure[] = [];
+  type Entry = { skill: ClaudeSkill; qualified?: string };
+  const skills: Entry[] = [];
+  const commands: Entry[] = [];
+
+  for (const input of skillSources) {
+    const validated = validatePluginInput(input, "skill", diagnostics, pathFailures);
+    if (!validated) continue;
+    const files = pluginSkillFiles(input, validated, diagnostics, pathFailures);
+    for (const file of files) {
+      const skill = parseSkillFile(file.lexicalPath, "plugin", pluginIdentity(input.source), diagnostics);
+      if (!skill) continue;
+      bindLazyPluginSource(skill, file);
+      const qualified = qualifiedNameFor(validated.lexicalPath, path.dirname(skill.baseDir), skill.name);
+      skills.push({ skill, qualified });
+    }
+  }
+
+  for (const input of commandSources) {
+    const validated = validatePluginInput(input, "command", diagnostics, pathFailures);
+    if (!validated) continue;
+    const files = pluginFiles(
+      input,
+      "command",
+      validated,
+      (name) => name.toLowerCase().endsWith(".md"),
+      diagnostics,
+      pathFailures,
+    );
+    for (const file of files) {
+      const command = parseCommandFile(
+        file.lexicalPath,
+        path.dirname(file.lexicalPath),
+        "plugin",
+        pluginIdentity(input.source),
+        diagnostics,
+        () => {
+          if (input.source.kind !== "file") return;
+          const failure: PluginPathFailure = {
+            ok: false,
+            code: "unreadable-path",
+            diagnostic: {
+              severity: "warning",
+              message: "Plugin command file became unreadable after path revalidation",
+              source: file.lexicalPath,
+            },
+          };
+          pathFailures.push({
+            pluginId: input.source.metadata.pluginId,
+            component: "command",
+            source: input.source,
+            terminal: true,
+            failure,
+          });
+        },
+      );
+      if (!command) continue;
+      bindLazyPluginSource(command, file);
+      const qualified = qualifiedNameFor(validated.lexicalPath, path.dirname(file.lexicalPath), command.name);
+      commands.push({ skill: command, qualified });
+    }
+  }
+
+  return finalizeSkills(skills, commands, diagnostics, pathFailures);
+}
+
+function pluginIdentity(source: FileDirectoryPluginSource): PluginIdentity {
+  return { pluginId: source.metadata.pluginId, pluginName: source.metadata.pluginName };
+}
+
+function validatePluginInput(
+  input: PluginSkillLoaderSource,
+  component: "skill" | "command",
+  diagnostics: Diagnostic[],
+  pathFailures: PluginSkillPathFailure[],
+): ValidatedPluginPath | undefined {
+  const { source, validatedPath } = input;
+  const metadata = source.metadata;
+  if (
+    source.kind !== validatedPath.kind ||
+    source.path !== validatedPath.lexicalPath ||
+    metadata.authorizedRoot !== validatedPath.root.canonicalPath ||
+    metadata.lexicalPath !== validatedPath.lexicalPath ||
+    metadata.canonicalPath !== validatedPath.canonicalPath
+  ) {
+    diagnostics.push({
+      severity: "warning",
+      message: "Validated plugin component metadata does not match its filesystem capability; skipped",
+      source: source.path,
+    });
+    return undefined;
+  }
+  const current = revalidatePluginPath(validatedPath);
+  if (!current.ok) {
+    diagnostics.push(current.diagnostic);
+    pathFailures.push({
+      pluginId: metadata.pluginId,
+      component,
+      source,
+      terminal: true,
+      failure: current,
+    });
+    return undefined;
+  }
+  return current.value;
+}
+
+function pluginSkillFiles(
+  input: PluginSkillLoaderSource,
+  source: ValidatedPluginPath,
+  diagnostics: Diagnostic[],
+  pathFailures: PluginSkillPathFailure[],
+): ValidatedPluginPath[] {
+  if (source.kind === "directory") {
+    const relative = path.join(source.relativePath, "SKILL.md").split(path.sep).join("/");
+    const direct = resolvePluginPath({
+      root: source.root,
+      declaredPath: relative,
+      inputKind: "generated",
+      kind: "file",
+    });
+    if (direct.ok) return [direct.value];
+
+    // Only a genuinely absent root skill enables recursive discovery. lstat is
+    // deliberately just an existence classification inside the validated directory.
+    const directPath = path.join(source.lexicalPath, "SKILL.md");
+    try {
+      fs.lstatSync(directPath);
+      diagnostics.push(direct.diagnostic);
+      pathFailures.push({
+        pluginId: input.source.metadata.pluginId,
+        component: "skill",
+        source: input.source,
+        terminal: false,
+        failure: direct,
+      });
+      return [];
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+        diagnostics.push(direct.diagnostic);
+        pathFailures.push({
+          pluginId: input.source.metadata.pluginId,
+          component: "skill",
+          source: input.source,
+          terminal: false,
+          failure: direct,
+        });
+        return [];
+      }
+    }
+  }
+  return pluginFiles(input, "skill", source, (name) => name === "SKILL.md", diagnostics, pathFailures);
+}
+
+function pluginFiles(
+  input: PluginSkillLoaderSource,
+  component: "skill" | "command",
+  source: ValidatedPluginPath,
+  predicate: (name: string) => boolean,
+  diagnostics: Diagnostic[],
+  pathFailures: PluginSkillPathFailure[],
+): ValidatedPluginPath[] {
+  if (source.kind === "file") {
+    if (!predicate(path.basename(source.lexicalPath))) {
+      diagnostics.push({
+        severity: "warning",
+        message: "Plugin component file has an unsupported filename; skipped",
+        source: source.lexicalPath,
+      });
+      return [];
+    }
+    return [source];
+  }
+  const walked = walkPluginFiles({ directory: source, predicate });
+  diagnostics.push(...walked.diagnostics);
+  pathFailures.push(...walked.failures.map((failure) => ({
+    pluginId: input.source.metadata.pluginId,
+    component,
+    source: input.source,
+    terminal: false,
+    failure,
+  })));
+  return walked.files;
+}
+
+function finalizeSkills(
+  skills: Array<{ skill: ClaudeSkill; qualified?: string }>,
+  commands: Array<{ skill: ClaudeSkill; qualified?: string }>,
+  diagnostics: Diagnostic[],
+  pathFailures?: PluginSkillPathFailure[],
+): LoadSkillsResult {
   const byName = new Map<string, ClaudeSkill>();
   for (const { skill: entry, qualified } of [...skills, ...commands]) {
     const existing = byName.get(entry.name);
     if (!existing) {
       byName.set(entry.name, entry);
-      // Nested entries are ALWAYS reachable under their colon-qualified name
-      // too (not only on collision): register a lightweight alias entry that
-      // is hidden from the model listing (the plain stem already lists) but
-      // keeps the entry's own user-invocability for `/sub:name` slash calls.
+      // Keep nested entries slash-addressable without listing the same content twice.
       if (qualified && !byName.has(qualified)) {
-        byName.set(qualified, { ...entry, name: qualified, disableModelInvocation: true });
+        const alias = { ...entry, name: qualified, disableModelInvocation: true };
+        const pluginSource = lazyPluginSources.get(entry.source);
+        if (pluginSource) pluginSource.skills.add(alias);
+        byName.set(qualified, alias);
       }
       continue;
     }
@@ -267,13 +507,17 @@ export function loadSkills(
       source: entry.source.path,
     });
   }
-  return { skills: [...byName.values()], diagnostics };
+  return {
+    skills: [...byName.values()],
+    diagnostics,
+    ...(pathFailures === undefined ? {} : { pathFailures }),
+  };
 }
 
 function parseSkillFile(
   file: string,
   scope: Scope,
-  pluginName: string | undefined,
+  plugin: PluginIdentity | undefined,
   outDiagnostics: Diagnostic[],
 ): ClaudeSkill | undefined {
   const raw = readTextSafe(file);
@@ -322,7 +566,7 @@ function parseSkillFile(
     shell: parseShell(fm["shell"], skillDiagnostics, file),
     metadata: toSkillMetadata(fm),
     baseDir,
-    source: { path: file, scope, ...(pluginName ? { pluginName } : {}) },
+    source: { path: file, scope, ...plugin },
     body: undefined, // progressive disclosure — loaded only via loadSkillBody
     legacyCommand: false,
     unknownKeys: Object.keys(fm).filter((k) => !KNOWN_KEYS.has(k)),
@@ -345,8 +589,9 @@ function parseCommandFile(
   file: string,
   commandDir: string,
   scope: Scope,
-  pluginName: string | undefined,
+  plugin: PluginIdentity | undefined,
   outDiagnostics: Diagnostic[],
+  onUnreadable?: () => void,
 ): ClaudeSkill | undefined {
   const raw = readTextSafe(file);
   if (raw === undefined) {
@@ -355,6 +600,7 @@ function parseCommandFile(
       message: `Cannot read command file; skipped`,
       source: file,
     });
+    onUnreadable?.();
     return undefined;
   }
   const parsed = parseMarkdown(raw, file);
@@ -386,12 +632,62 @@ function parseCommandFile(
     shell: parseShell(fm["shell"], skillDiagnostics, file),
     metadata: toSkillMetadata(fm),
     baseDir: commandDir,
-    source: { path: file, scope, ...(pluginName ? { pluginName } : {}) },
+    source: { path: file, scope, ...plugin },
     body: undefined,
     legacyCommand: true,
     unknownKeys: Object.keys(fm).filter((k) => !KNOWN_KEYS.has(k)),
     diagnostics: skillDiagnostics,
   };
+}
+
+export interface LoadSkillBodyResult {
+  body: string;
+  failure?: PluginPathFailure;
+  diagnostics: Diagnostic[];
+}
+
+/** Result-bearing lazy body load for callers that need typed plugin path failures. */
+export function loadSkillBodyResult(skill: ClaudeSkill): LoadSkillBodyResult {
+  const pluginSource = lazyPluginSources.get(skill.source);
+  pluginSource?.skills.add(skill);
+
+  let readPath = skill.source.path;
+  if (pluginSource) {
+    const current = revalidatePluginPath(pluginSource.source);
+    if (!current.ok) return recordLazyPluginFailure(pluginSource, skill, current);
+    readPath = current.value.lexicalPath;
+  }
+
+  const raw = readTextSafe(readPath);
+  if (raw === undefined) {
+    if (!pluginSource) return { body: "", diagnostics: [] };
+    const failure: PluginPathFailure = {
+      ok: false,
+      code: "unreadable-path",
+      diagnostic: {
+        severity: "warning",
+        message: "Plugin skill body became unreadable after path revalidation",
+        source: readPath,
+      },
+    };
+    return recordLazyPluginFailure(pluginSource, skill, failure);
+  }
+  const body = parseMarkdown(raw, readPath).body;
+  skill.body = body;
+  return { body, diagnostics: [] };
+}
+
+function recordLazyPluginFailure(
+  pluginSource: LazyPluginSource,
+  skill: ClaudeSkill,
+  failure: PluginPathFailure,
+): LoadSkillBodyResult {
+  for (const boundSkill of pluginSource.skills) boundSkill.body = undefined;
+  if (!pluginSource.reportedDiagnostics.has(skill.diagnostics)) {
+    skill.diagnostics.push(failure.diagnostic);
+    pluginSource.reportedDiagnostics.add(skill.diagnostics);
+  }
+  return { body: "", failure, diagnostics: [failure.diagnostic] };
 }
 
 /**
@@ -400,11 +696,7 @@ function parseCommandFile(
  * file yields "". On success the body is also cached on `skill.body`.
  */
 export function loadSkillBody(skill: ClaudeSkill): string {
-  const raw = readTextSafe(skill.source.path);
-  if (raw === undefined) return "";
-  const body = parseMarkdown(raw, skill.source.path).body;
-  skill.body = body;
-  return body;
+  return loadSkillBodyResult(skill).body;
 }
 
 // ---------------------------------------------------------------------------

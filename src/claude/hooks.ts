@@ -31,7 +31,15 @@ export interface ParsedHookConfig {
   diagnostics: Diagnostic[];
 }
 
-export function parseHookConfig(raw: unknown, sourcePath: string): ParsedHookConfig {
+export interface TrustedHookParserContext {
+  pluginId: string;
+}
+
+export function parseHookConfig(
+  raw: unknown,
+  sourcePath: string,
+  trustedContext?: TrustedHookParserContext,
+): ParsedHookConfig {
   const config: HookConfig = {};
   const diagnostics: Diagnostic[] = [];
   try {
@@ -71,7 +79,7 @@ export function parseHookConfig(raw: unknown, sourcePath: string): ParsedHookCon
 
       const entries: HookMatcherEntry[] = [];
       for (const rawEntry of rawEntries) {
-        const entry = parseMatcherEntry(rawEntry, eventName, sourcePath, diagnostics);
+        const entry = parseMatcherEntry(rawEntry, eventName, sourcePath, diagnostics, trustedContext);
         if (entry) entries.push(entry);
       }
       config[eventName] = (config[eventName] ?? []).concat(entries);
@@ -91,10 +99,11 @@ function parseMatcherEntry(
   eventName: string,
   sourcePath: string,
   diagnostics: Diagnostic[],
+  trustedContext?: TrustedHookParserContext,
 ): HookMatcherEntry | undefined {
   // Ultra-shorthand: the entry itself is a command string.
   if (typeof rawEntry === "string") {
-    return { hooks: [commandHandlerFromString(rawEntry)] };
+    return { hooks: [commandHandlerFromString(rawEntry, trustedContext)] };
   }
   if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) {
     diagnostics.push({
@@ -131,7 +140,7 @@ function parseMatcherEntry(
 
   const hooks: HookHandler[] = [];
   for (const rawHandler of rawHooks) {
-    const handler = parseHandler(rawHandler, eventName, sourcePath, diagnostics);
+    const handler = parseHandler(rawHandler, eventName, sourcePath, diagnostics, trustedContext);
     if (handler) hooks.push(handler);
   }
 
@@ -141,8 +150,16 @@ function parseMatcherEntry(
   return result;
 }
 
-function commandHandlerFromString(command: string): HookHandler {
-  return { type: "command", command, raw: { type: "command", command } };
+function commandHandlerFromString(
+  command: string,
+  trustedContext?: TrustedHookParserContext,
+): HookHandler {
+  return {
+    type: "command",
+    command,
+    raw: { type: "command", command },
+    ...(trustedContext ? { pluginId: trustedContext.pluginId } : {}),
+  };
 }
 
 function parseHandler(
@@ -150,10 +167,11 @@ function parseHandler(
   eventName: string,
   sourcePath: string,
   diagnostics: Diagnostic[],
+  trustedContext?: TrustedHookParserContext,
 ): HookHandler | undefined {
   // Common shorthand: a plain string means a command hook.
   if (typeof rawHandler === "string") {
-    return commandHandlerFromString(rawHandler);
+    return commandHandlerFromString(rawHandler, trustedContext);
   }
   if (typeof rawHandler !== "object" || rawHandler === null || Array.isArray(rawHandler)) {
     diagnostics.push({
@@ -172,7 +190,11 @@ function parseHandler(
   // runner), so the cast is a widening we accept deliberately.
   const type = typeText as HookHandlerType;
 
-  const handler: HookHandler = { type, raw: h };
+  const handler: HookHandler = {
+    type,
+    raw: h,
+    ...(trustedContext ? { pluginId: trustedContext.pluginId } : {}),
+  };
   if (typeof h["command"] === "string") handler.command = h["command"];
   if (Array.isArray(h["args"])) {
     handler.args = (h["args"] as unknown[]).map((a) =>

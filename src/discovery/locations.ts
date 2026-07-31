@@ -1,6 +1,7 @@
 import path from "node:path";
 import { findRepoRoot, isDirectory } from "../util/fs.js";
 import type { Scope, SourceRef } from "../types.js";
+import { defaultManagedPolicyDescription } from "./managed-policy.js";
 
 /**
  * Artifact location resolution: where skills/agents/rules/commands live,
@@ -34,15 +35,11 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Default managed/policy artifact base directories. Mirrors the managed settings
- * locations in settings.ts; degrade-silent when absent. Also the base for the
- * managed CLAUDE.md (claude-md.ts).
+ * Default managed/policy artifact base directories from the shared policy
+ * description; degrade-silent when absent. Also the base for managed CLAUDE.md.
  */
-export function defaultManagedDirs(): string[] {
-  if (process.platform === "win32") {
-    return [path.join("C:\\", "ProgramData", "ClaudeCode")];
-  }
-  return [path.join("/etc", "claude-code")];
+export function defaultManagedDirs(platform: NodeJS.Platform = process.platform): string[] {
+  return defaultManagedPolicyDescription(platform).artifactDirs;
 }
 
 /**

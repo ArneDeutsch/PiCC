@@ -26,14 +26,101 @@ export interface SourceRef {
   /** Absolute path of the file this artifact came from ("<virtual>" for synthesized). */
   path: string;
   scope: Scope;
-  /** For plugin-contributed artifacts: the plugin name. */
+  /** For plugin-contributed artifacts: the user-visible component namespace. */
   pluginName?: string;
+  /** Stable installed lifecycle identity (`name@marketplace`). */
+  pluginId?: string;
 }
+
+export type ManagedPolicySourceClass =
+  | "system-file"
+  | "system-drop-in"
+  | "registry-hklm"
+  | "registry-hkcu"
+  | "override";
+
+export type ManagedPolicyDiagnosticCategory =
+  | "managed-policy-malformed"
+  | "managed-policy-unreadable";
 
 export interface Diagnostic {
   severity: "info" | "warning" | "error";
   message: string;
   source?: string;
+  /** Stable policy classification for startup handling; absent on ordinary diagnostics. */
+  category?: ManagedPolicyDiagnosticCategory;
+  sourceClass?: ManagedPolicySourceClass;
+  impact?: "source-ignored" | "weaker-policy-suppressed";
+}
+
+// ---------------------------------------------------------------------------
+// Installed plugins
+// ---------------------------------------------------------------------------
+
+export type PluginInstallationScope = "managed" | "local" | "project" | "user";
+
+export interface PluginInstallationProvenance {
+  statePath: string;
+  stateVersion: number;
+  installedAt?: string;
+  lastUpdated?: string;
+}
+
+export interface NormalizedPluginInstallation {
+  pluginId: string;
+  scope: PluginInstallationScope;
+  projectPath?: string;
+  installPath: string;
+  version: string;
+  provenance: PluginInstallationProvenance;
+}
+
+export type PluginResolutionStatus =
+  | "loaded"
+  | "disabled"
+  | "enabled-but-uninstalled"
+  | "unsupported"
+  | "ambiguous"
+  | "blocked"
+  | "malformed"
+  | "rejected";
+
+export interface ValidatedPluginSourceMetadata {
+  pluginId: string;
+  pluginName: string;
+  authorizedRoot: string;
+  lexicalPath: string;
+  canonicalPath: string;
+}
+
+export type PluginComponentSource =
+  | { kind: "file"; path: string; metadata: ValidatedPluginSourceMetadata }
+  | { kind: "directory"; path: string; metadata: ValidatedPluginSourceMetadata }
+  | { kind: "inline"; value: unknown; pluginId: string; pluginName: string; source: string };
+
+export interface PluginRuntimeContext {
+  pluginId: string;
+  pluginName: string;
+  root: string;
+  dataDir: string;
+  projectDir: string;
+}
+
+export type PluginSharedStateCause =
+  | "installed-state-unreadable"
+  | "installed-state-malformed"
+  | "installed-state-unsupported"
+  | "blocklist-unreadable"
+  | "blocklist-malformed";
+
+export interface PluginResolutionOutcome {
+  pluginId: string;
+  status: PluginResolutionStatus;
+  sharedStateCauses?: readonly PluginSharedStateCause[];
+  installation?: NormalizedPluginInstallation;
+  context?: PluginRuntimeContext;
+  sources?: PluginComponentSource[];
+  diagnostics: Diagnostic[];
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +282,8 @@ export type HookHandlerType = "command" | "http" | "prompt" | "agent" | "mcp_too
 
 export interface HookHandler {
   type: HookHandlerType;
+  /** Trusted installed identity, stamped by a plugin-aware parser context. */
+  pluginId?: string;
   /** command handler */
   command?: string;
   args?: string[];
@@ -277,6 +366,12 @@ export interface WorktreeSettings {
   baseRef: "head" | "fresh";
 }
 
+export interface EffectivePluginEnablement {
+  enabled: boolean;
+  scope: Scope;
+  source: string;
+}
+
 export interface ClaudeSettings {
   permissions: PermissionRules;
   hooks: HookConfig;
@@ -303,7 +398,10 @@ export interface ClaudeSettings {
   subagentsEnabled: boolean;
   subagentMaxDepth: number;
   subagentConcurrency: number;
-  enabledPlugins: Record<string, boolean> | string[] | undefined;
+  /** Compatibility projection only; enablement does not authorize an installation root. */
+  enabledPlugins: Record<string, boolean> | undefined;
+  /** Effective exact qualified-ID values with their winning settings provenance. */
+  effectivePluginEnablement?: Record<string, EffectivePluginEnablement>;
   /**
    * Scope-tagged MCP contributions, one entry per settings file that carries
    * any of the four MCP keys (never merged across scopes — the enablement gate
