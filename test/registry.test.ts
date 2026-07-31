@@ -455,13 +455,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/PARTIAL residual/, /notice is next-turn/],
       precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/],
-      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /print\/RPC rendering unchanged/],
+      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /shared terminal recovery guidance also reaches print\/RPC delivery/],
       parity: [/Claude-faithful/, /not verified parity/, /PiCC's conservative default/, /subagents\.maxDepth.*explicit nesting control/],
       split: [/feature\.background-agents/, /tool\.Agent\.fork/],
     },
     { id: "tool.Task", tier: "partial", core: [/alias of the Agent subagent-dispatch tool/, /loud-failure/], gap: [/conditional/, /remaining uncollected/], precedence: [/background-by-default/, /terminal TaskOutput collection suppresses/], visibility: [/settlement notice/], parity: [/PiCC UX hardening rather than verified parity/], split: [/tool\.Agent\.fork/] },
     { id: "feature.tool-output-clip", tier: "partial", core: [/tool-result clip backstop/, /head \+ tail kept, middle dropped/], gap: [/Built-in Read\/Bash keep Pi's OWN 50 KB truncation/], precedence: [/clipMaxTokens, default 20k tokens/], visibility: [/model-visible/, /human rendering summarizes/], parity: [/PiCC HARDENING, NOT Claude parity/, /DIRECTIONAL DIVERGENCE/], split: [/tool\.Read \/ tool\.Bash/] },
-    { id: "tool.SendMessage", tier: "partial", core: [/resumes a completed/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
+    { id: "tool.SendMessage", tier: "partial", core: [/resumes any actually resumable completed or failed subagent/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
     { id: "tool.Agent.fork", tier: "partial", core: [/inherits the parent conversation/, /OUTPUT ISOLATION IS KEPT/], gap: [/NON-RESUMABLE/, /CANNOT SPAWN ANOTHER FORK/], precedence: [/CLAUDE_CODE_FORK_SUBAGENT/, /UNSET ⇒ ENABLED/, /CLAUDE_CODE_SUBAGENT_MODEL/, /per-call `model`/], visibility: [/visibly degrades/, /footer notice/], parity: [/VERIFIED behavior/, /PiCC-DEFINED \/ INFERRED/], split: [/SendMessage/] },
     {
       id: "tool.TaskOutput",
@@ -479,12 +479,74 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
       precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
-      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible settled retrieval/],
+      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible completed or truncated-completed resumable retrieval/],
       parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
     },
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
+  });
+
+  it("keeps the full state-aware policy only in tool.Agent and pins each consumer consequence", () => {
+    const canonical = lookupCapability("tool.Agent")?.note ?? "";
+    for (const clause of [
+      "STATE-AWARE RECOVERY",
+      "complete lifecycle observation proves a transient-category failure had no successful assistant response, retained model/tool-call content, or started tool execution",
+      "Observed progress or incomplete lifecycle evidence takes the conservative branch",
+      "SendMessage is favored only when the result says the agent is factually resumable",
+      "otherwise retained work and possible side effects require review before another explicit dispatch",
+      "Non-transient or unclassified failures recommend neither blind replacement nor resume",
+      "Guidance and resumability are separate",
+      "PiCC takes no automatic action",
+      "not verified Claude Code recovery-policy parity",
+    ]) expect(canonical, clause).toContain(clause);
+
+    const consumers: Array<{ id: string; consequences: readonly string[] }> = [
+      {
+        id: "tool.Task",
+        consequences: ["terminal failures with a structured recovery disposition carry tool.Agent's canonical state-aware guidance", "loud-failure/agent-id semantics"],
+      },
+      {
+        id: "tool.TaskOutput",
+        consequences: ["completed or truncated-completed resumable results may carry identity framing", "Failed results with a structured recovery disposition carry the separate state-aware guidance canonically defined by tool.Agent", "a failed task with a structured recovery disposition reports failed status with separate state-aware guidance"],
+      },
+      {
+        id: "feature.background-agents",
+        consequences: ["failed terminal delivery with a structured recovery disposition carries tool.Agent's canonical state-aware guidance", "state-aware terminal recovery guidance when a structured recovery disposition exists", "shared with print/RPC delivery"],
+      },
+      {
+        id: "tool.Agent.fork",
+        consequences: ["non-resumable consumer of tool.Agent's failure presenter", "require review of retained work and possible side effects rather than a resume recommendation"],
+      },
+      {
+        id: "skill.frontmatter.context",
+        consequences: ["consumes tool.Agent's state-aware failure presenter", "require review of retained work and possible side effects before another explicit dispatch"],
+      },
+    ];
+
+    for (const consumer of consumers) {
+      const note = lookupCapability(consumer.id)?.note ?? "";
+      for (const consequence of consumer.consequences) expect(note, consumer.id).toContain(consequence);
+      expect(note, `${consumer.id} must not duplicate the canonical policy`).not.toContain("complete lifecycle observation proves");
+      expect(note, `${consumer.id} must not own the canonical marker`).not.toContain("STATE-AWARE RECOVERY");
+    }
+
+    expect(lookupCapability("tool.Task")?.note).not.toContain("its terminal failures carry tool.Agent's canonical state-aware guidance");
+    expect(lookupCapability("tool.TaskOutput")?.note).not.toContain("Failed results carry the separate state-aware guidance");
+    expect(lookupCapability("tool.TaskOutput")?.note).not.toContain("a failed task reports failed status with separate state-aware guidance");
+    expect(lookupCapability("feature.background-agents")?.note).not.toContain("failed terminal delivery carries tool.Agent's canonical state-aware guidance");
+    expect(lookupCapability("feature.background-agents")?.note).not.toContain("state-aware terminal recovery guidance — are shared with print/RPC delivery");
+  });
+
+  it("limits resume trailers to completed or truncated-completed resumable results", () => {
+    const agent = lookupCapability("tool.Agent")?.note ?? "";
+    const taskOutput = lookupCapability("tool.TaskOutput")?.note ?? "";
+
+    expect(agent).toContain("completed or truncated-completed resumable result appends a clearly-delimited in-band identity/resume trailer");
+    expect(taskOutput).toContain("completed or truncated-completed resumable results may carry identity framing");
+    expect(taskOutput).toContain("model-visible completed or truncated-completed resumable retrieval may append the existing resume identity framing");
+    expect(agent).not.toContain("a resumable dispatch appends");
+    expect(taskOutput).not.toContain("model-visible settled retrieval may append");
   });
 
   it("keeps touched subagent notes conservative about nesting and user-facing about resize", () => {
@@ -549,7 +611,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
       precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
-      visibility: [/interactive TUI/, /canonical\/model-visible results/, /print\/RPC output remain unchanged/],
+      visibility: [/interactive TUI/, /canonical model-visible results/, /shared with print\/RPC delivery/],
       parity: [/NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
       split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/],
     },
@@ -749,7 +811,14 @@ describe("capability matrix freshness", () => {
     expect(norm(committed)).toBe(norm(regenerated));
   });
 
+  it("pins the complete bounded user-guide TUI-only bullet without a print/RPC exemption", () => {
+    const guidePath = fileURLToPath(new URL("../doc/user-guide.md", import.meta.url));
+    const guide = fs.readFileSync(guidePath, "utf8");
+    const bullet = guide.match(/^- \*\*Interactive TUI only\.\*\*[^\n]*(?:\n  [^\n]*)*/m)?.[0].replace(/\r/g, "");
 
+    expect(bullet).toBe("- **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the\n  interactive TUI.");
+    expect(bullet).not.toMatch(/print|RPC/);
+  });
 });
 
 describe("capabilityForToolName", () => {

@@ -10,6 +10,10 @@ import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } f
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
+import {
+  formatSubagentRecoveryGuidance,
+  type RecoveryGuidanceInput,
+} from "../src/runtime/subagent-recovery.js";
 import type { PiSessionMessage } from "../src/runtime/subagents.js";
 import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
@@ -853,6 +857,48 @@ describe("system prompt assembly + progressive disclosure NFR", () => {
     expect(prompt).toMatch(/- planner( \(read-only\))?: Plans multi-step work/);
     expect(prompt).toMatch(/- reviewer \(read-only\): Read-only reviewer/);
     expect(prompt).toMatch(/- isolated-worker: Performs implementation work/);
+  });
+
+  it("pins the single state-aware recovery rule and its dynamic disposition semantics", async () => {
+    const result = await pi.fire("before_agent_start", { systemPrompt: "BASE-PROMPT" });
+    const prompt = result.systemPrompt as string;
+    const expectedRule = "- Subagent failure recovery: follow each terminal result, which is authoritative for that run. Favor a fresh explicit Agent/Task dispatch only when complete lifecycle observation proves a transient-category failure had no successful assistant response, retained model/tool-call content, or started tool execution. Observed progress or incomplete lifecycle evidence takes the conservative branch: use SendMessage only if the result says the agent is resumable; otherwise review retained work and possible side effects before another explicit dispatch. For non-transient or unclassified failures, address the cause rather than blindly replacing or resuming. PiCC takes no automatic action.";
+    const recoveryLines = prompt.split("\n").filter((line) => line.startsWith("- Subagent failure recovery:"));
+
+    expect(recoveryLines).toEqual([expectedRule]);
+
+    const cases: Array<{
+      name: string;
+      input: RecoveryGuidanceInput;
+      staticClauses: readonly string[];
+      dynamicClauses: readonly string[];
+    }> = [
+      {
+        name: "proven zero progress favors fresh dispatch despite resumability",
+        input: { disposition: "fresh-dispatch-preferred", resumable: true },
+        staticClauses: ["complete lifecycle observation proves", "fresh explicit Agent/Task dispatch"],
+        dynamicClauses: ["observed no assistant or tool progress", "fresh replacement agent", "technically resumable via SendMessage"],
+      },
+      {
+        name: "observed or uncertain progress favors resume when available",
+        input: { disposition: "resume-preferred", resumable: true },
+        staticClauses: ["Observed progress or incomplete lifecycle evidence takes the conservative branch", "use SendMessage only if the result says the agent is resumable"],
+        dynamicClauses: ["progress may have occurred", "Resume this same agent with SendMessage", "technically resumable via SendMessage"],
+      },
+      {
+        name: "observed or uncertain non-resumable progress requires review",
+        input: { disposition: "progressed-non-resumable", resumable: false },
+        staticClauses: ["incomplete lifecycle evidence takes the conservative branch", "otherwise review retained work and possible side effects"],
+        dynamicClauses: ["progress may have occurred", "same-agent continuation is unavailable", "not resumable via SendMessage", "Review retained work and possible tool side effects"],
+      },
+    ];
+
+    for (const testCase of cases) {
+      const dynamic = formatSubagentRecoveryGuidance(testCase.input);
+      expect(dynamic, testCase.name).toBeDefined();
+      for (const clause of testCase.staticClauses) expect(expectedRule, testCase.name).toContain(clause);
+      for (const clause of testCase.dynamicClauses) expect(dynamic, testCase.name).toContain(clause);
+    }
   });
 });
 

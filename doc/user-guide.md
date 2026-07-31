@@ -300,7 +300,7 @@ Every subagent is visible, both to you and to the coordinating model:
   resolves — fork dispatches are never resumable, and a user-stopped
   agent refuses resume and steering permanently.
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
-  interactive TUI; print and RPC runs keep their previous subagent output unchanged.
+  interactive TUI.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 

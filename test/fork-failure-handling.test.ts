@@ -78,6 +78,8 @@ describe("Skill-tool fork consumer", () => {
     expect(text).toMatch(API_DEATH);
     expect(text).toContain("503 upstream unavailable");
     expect(text).toContain("\n\n---\n"); // the cut-off frame (byte-identical, not hand-written here)
+    expect(text).toContain("same-agent continuation is unavailable");
+    expect(text).toContain("Review retained work and possible tool side effects");
     expect(res.details.cutOff).toBe(true);
     expect(res.details.forked).toBe(true);
     expect(res.details.agent).toBeTruthy(); // the fork's identity survives on the partial path

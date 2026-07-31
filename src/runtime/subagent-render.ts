@@ -1172,8 +1172,8 @@ function runningStatusLines(
  * this local display copy drops it, so the footer can present the ID + a single
  * resumable hint without the raw `---`/`[agent …]` plumbing showing up too.
  * Case 1: a completed trailer opened its own `\n\n---\n` frame — drop the frame.
- * Case 2: a truncated/failed trailer rode inside an existing cut-off frame with a
- * single `\n` prefix — drop only the trailer line, keeping the cut-off frame.
+ * Case 2: a truncated-completed trailer rode inside an existing cut-off frame
+ * with a single `\n` prefix — drop only the trailer line, keeping the cut-off frame.
  */
 function stripAgentTrailerForDisplay(text: string): string {
   const framed = text.replace(/\n\n---\n\[agent agent-[0-9a-f]{12}[^\]\n]*\]\s*$/, "");
@@ -1481,7 +1481,7 @@ export function renderAgentResult(
         footer.push(`description: ${sanitizeInline(details.description)}`);
       }
       if (semanticTerminal && isTaskId(details.taskId)) footer.push(`task: ${details.taskId}`);
-      if (semanticTerminal && stableAgentId) footer.push(`agent: ${stableAgentId}`);
+      if (stableAgentId && (semanticTerminal || outcome === "failed")) footer.push(`agent: ${stableAgentId}`);
       if (typeof details.transcriptPath === "string" && details.transcriptPath) {
         // UX: a full session path is often far wider than the terminal and wraps
         // into unreadable, hard-sliced fragments. Show it whole only when it fits;
@@ -1502,7 +1502,7 @@ export function renderAgentResult(
       if (duration) footer.push(`duration: ${duration}`);
       const usage = formatUsageLine(details.usage);
       if (usage) footer.push(`usage: ${usage}`);
-      if (details.resumable === true) {
+      if (details.resumable === true && outcome !== "failed") {
         footer.push(!semanticTerminal && stableAgentId
           ? `resumable via SendMessage — agent ${stableAgentId}`
           : "resumable via SendMessage");
@@ -1934,17 +1934,22 @@ export function renderSettlementRecord(
   if (normalized.nested === true) return undefined;
   const finalText = normalized.finalText ?? "";
   const outcome = normalized.outcome ?? "completed";
-  // Compose the expanded body the way the TaskOutput display reads: reason +
-  // partial output for a failure, the discard note for an abort, the verbatim
-  // final text otherwise. renderAgentResult sanitizes it before display.
+  // Compose the expanded body the way the TaskOutput display reads: error +
+  // recovery note + retained output for a failure, the discard note for an
+  // abort, the verbatim final text otherwise. renderAgentResult sanitizes it
+  // before display.
   let text = finalText;
   if (outcome === "failed") {
     const err = normalized.error || "unknown error";
     const errorAlreadyRetained = containsEquivalentErrorFraming(finalText, err);
     const displayError = sanitizeInline(err);
-    text = finalText
-      ? errorAlreadyRetained ? finalText : `${displayError}\n\nPartial output before the failure:\n${finalText}`
-      : displayError;
+    const note = normalized.note ? humanDisplayText(normalized.note, false) : "";
+    const retained = finalText
+      ? errorAlreadyRetained ? finalText : `Partial output before the failure:\n${finalText}`
+      : "";
+    text = [errorAlreadyRetained ? "" : displayError, note, retained]
+      .filter(Boolean)
+      .join("\n\n") || finalText;
   } else if (outcome === "aborted") {
     text = "The task was stopped before completing; its result was discarded.";
   }

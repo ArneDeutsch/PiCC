@@ -463,27 +463,36 @@ These are the choices where "close enough" breaks real projects.
   subagent e2e (which runs a real subprocess), not the settings-manager backstop.
 
 - **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
-  summarizing, no wrapping. Eligible resumable results append clearly delimited identity framing
-  outside that body (the human TUI strips it), and settled `TaskOutput` retrieval may append compact
-  usage metadata outside the body. A strict JSON/YAML consumer must parse the body and account for
-  this documented surrounding metadata, or use a foreground one-shot dispatch when it needs no
-  resume framing; background consumers must still account for retrieval metadata.
+  summarizing, no wrapping. Completed or truncated-completed resumable results append clearly
+  delimited identity framing outside that body (the human TUI strips it), and settled `TaskOutput`
+  retrieval may append compact usage metadata outside the body. A strict JSON/YAML consumer must
+  parse the body and account for this documented surrounding metadata, or use a foreground one-shot
+  dispatch when it needs no resume framing; background consumers must still account for retrieval
+  metadata.
 
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
   - **completed** — the run finished; its verbatim final message is returned.
-  - **failed** — the run ended on a terminal API or session error. The tool reports a **loud,
-    category-authored failure** without exposing raw provider/session error text. An empty success
-    here is the exact failure mode that lets a coordinator commit under-reviewed work believing a
-    subagent approved it.
+  - **failed** — the dispatch or run ended through the loud failure channel. Ordinary terminal
+    assistant errors expose capped, sanitized provider/API cause text as untrusted input and may
+    carry a structured disposition rendered by PiCC's fixed formatter. Identity, setup, depth,
+    policy, hook, checkpoint, and other specialized failures instead retain their cause-specific
+    framing and receive no generic disposition. An empty success here is the exact failure mode that lets a
+    coordinator commit under-reviewed work believing a subagent approved it.
   - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
     wins on every settle path, and a deliberately stopped background result discards its output.
   - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;
     a turn-cap truncation also pushes a warning diagnostic, never silent.
-  - The contract holds identically on the foreground, background, and `context: fork` paths, which is
-    why the presentation is rendered from **one** shared helper rather than per call site. A
-    background failure is never shown as completed. Retry behavior stays exactly Pi's own — no extra
-    recovery logic.
+  - For ordinary terminal assistant errors carrying a disposition, the contract holds on the
+    foreground, background-settlement, and `TaskOutput` paths through the shared structured
+    disposition and fixed guidance formatter; each surface retains its own result envelope. A
+    background failure is never shown as completed.
+  - Pi owns retry execution, budget, and backoff. After those retries settle, PiCC derives guidance
+    only from Pi's transient-error classifier and lifecycle observation. Complete observation can
+    prove no successful assistant response, retained model/tool-call content, or started tool
+    execution; observed progress or incomplete evidence takes the conservative branch. The
+    recommendation is separate from factual resumability, and PiCC never dispatches or resumes
+    automatically.
 
   Dispatch is **background-by-default**, matching Claude Code 2.1.198: an omitted `run_in_background`
   returns a task id so an implicit-concurrency fan-out parallelizes; `run_in_background: false` opts
