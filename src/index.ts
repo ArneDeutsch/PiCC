@@ -97,6 +97,21 @@ import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/sh
 import { McpRuntime } from "./runtime/mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import {
+  buildMcpPromptCatalog,
+  invokeMcpPrompt,
+  matchMcpPromptInvocation,
+  McpPromptInvocationError,
+  type McpPromptCatalog,
+  type McpPromptInvocationErrorCategory,
+} from "./runtime/mcp-prompts.js";
+import {
+  buildMcpResourceTools,
+  ListMcpResourcesTool,
+  ReadMcpResourceTool,
+} from "./runtime/mcp-resources.js";
+import { boundedMcpErrorText } from "./runtime/mcp-content.js";
+import { clampLines, pushColored, sanitizeDisplayText } from "./runtime/render-util.js";
+import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
 } from "./runtime/picc-update.js";
@@ -316,7 +331,16 @@ export interface PiccTestSeam {
   /** TEST-ONLY replacement for the session-global MCP runtime; never used by production wiring. */
   mcpRuntime?: Pick<
     McpRuntime,
-    "whenSettled" | "tools" | "callTool" | "diagnostics" | "serverStates" | "shutdown"
+    | "whenSettled"
+    | "tools"
+    | "prompts"
+    | "resourceServers"
+    | "callTool"
+    | "getPrompt"
+    | "readResource"
+    | "diagnostics"
+    | "serverStates"
+    | "shutdown"
   >;
   /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
   mcpControl?: {
@@ -1130,7 +1154,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // MCP runtime: session-global across stdio and remote transports, started
   // non-blocking at load. Declared above allKnownToolNames so dispatch-time
   // closures over MCP state can never hit a TDZ. Model-facing registration
-  // happens once in the detached mcpRegistration step below.
+  // happens once in the detached mcpExposure transaction below.
   const mcpRuntime = testSeam?.mcpRuntime ?? McpRuntime.start(project.mcp, {
     projectRoot: project.root,
     sessionId,
@@ -1171,6 +1195,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // remains in the universe but has no proxy instance (the builder drops it
       // from the wire), so granting it is inert.
       ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
+      ...(mcpRuntime.resourceServers().length > 0
+        ? [ListMcpResourcesTool, ReadMcpResourceTool]
+        : []),
     ];
   }
 
@@ -1210,6 +1237,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // bare-name deny removal have all been decided by the time we get here.
       for (const proxy of buildMcpProxyTools(mcpRuntime)) {
         if (granted.includes(proxy.name)) tools.push(proxy as unknown as Record<string, unknown>);
+      }
+      for (const resourceTool of buildMcpResourceTools(mcpRuntime, {
+        clipMaxTokens: config.compaction.clipMaxTokens,
+      })) {
+        if (granted.includes(resourceTool.name)) {
+          tools.push(resourceTool as unknown as Record<string, unknown>);
+        }
       }
       if (granted.includes("Skill")) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
@@ -2144,49 +2178,134 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }));
 
   // ---------------------------------------------------------------------------
-  // MCP tool exposure (detached; the first-turn barrier below awaits it)
+  // MCP exposure transaction (detached; input and first-turn barriers await it)
   // ---------------------------------------------------------------------------
-  // Complete initial settlement publishes each discovered catalog, which the
-  // runtime retains across recovery. Its tools register once as
-  // `mcp__<server>__<tool>` proxies through the same decoration pipeline as
-  // every other main-session custom tool; reconnect never changes this set.
-  // Bare-name and server-level deny rules remove matching tools from the model's
-  // context entirely (Claude parity — gateTools already owns that removal grammar);
-  // the guard's
-  // call-time deny stays the backstop for everything else. Zero enabled
-  // servers: whenSettled is pre-resolved and zero proxies build — nothing
-  // registers, nothing is printed, the model's context is untouched.
-  const mcpRegistration = (async () => {
+  let mcpPromptCatalog: McpPromptCatalog = buildMcpPromptCatalog([], []);
+  let mcpExposureFailure: string | undefined;
+  const failedPromptMarker = "picc_failed_prompt_discovery";
+  const failedPromptRecordLimit = 8;
+  const failedPromptMessageNameLimit = 3;
+  const mcpPromptRecoveryGuidance = "Check the server configuration and logs, then restart PiCC.";
+  type FailedPromptNamespace = Readonly<{ commandPrefix: string; server: string }>;
+  let failedPromptNamespaces: Readonly<{
+    records: readonly FailedPromptNamespace[];
+    omittedCount: number;
+  }> = Object.freeze({ records: Object.freeze([]), omittedCount: 0 });
+
+  function failedPromptNamespace(serverName: string): FailedPromptNamespace | undefined {
+    const synthetic = buildMcpPromptCatalog([{
+      serverName,
+      promptName: failedPromptMarker,
+      description: "",
+      arguments: [],
+    }], []).commands[0];
+    if (!synthetic) return undefined;
+    const suffix = `__${failedPromptMarker}`;
+    if (!synthetic.name.endsWith(suffix)) return undefined;
+    const commandPrefix = synthetic.name.slice(0, -failedPromptMarker.length);
+    const server = synthetic.name.slice("mcp__".length, -suffix.length);
+    return Object.freeze({ commandPrefix, server });
+  }
+
+  function boundedPromptRecoveryMessage(prefix: string): string {
+    const tail = ` ${mcpPromptRecoveryGuidance}`;
+    const prefixBudget = Math.max(1, 1_200 - Array.from(tail).length);
+    return `${boundedMcpErrorText(prefix, prefixBudget)}${tail}`;
+  }
+
+  function promptDiscoveryFailureMessage(record?: FailedPromptNamespace): string {
+    if (record) {
+      return boundedPromptRecoveryMessage(`MCP prompt discovery failed for server ${record.server}.`);
+    }
+    const shown = failedPromptNamespaces.records.slice(0, failedPromptMessageNameLimit);
+    const omitted = failedPromptNamespaces.omittedCount + failedPromptNamespaces.records.length - shown.length;
+    const subject = shown.length === 0
+      ? "one or more servers"
+      : `${shown.map((entry) => entry.server).join(", ")}${
+        omitted > 0 ? ` and ${omitted} other${omitted === 1 ? "" : "s"}` : ""
+      }`;
+    return boundedPromptRecoveryMessage(`MCP prompt discovery failed for servers ${subject}.`);
+  }
+
+  function mcpPromptReservedNames(): Set<string> {
+    const names = new Set<string>([...piBuiltinNames, ...controlCommands.keys()]);
+    const suffixCounts = new Map<string, number>();
+    for (const skill of project.skills) {
+      if (!isTypedSlashInvocable(skill)) continue;
+      names.add(skill.name);
+      const colon = skill.name.lastIndexOf(":");
+      if (colon >= 0) {
+        const suffix = skill.name.slice(colon + 1);
+        suffixCounts.set(suffix, (suffixCounts.get(suffix) ?? 0) + 1);
+      }
+    }
+    for (const skill of project.skills) {
+      if (!isTypedSlashInvocable(skill)) continue;
+      const colon = skill.name.lastIndexOf(":");
+      if (colon >= 0) {
+        const suffix = skill.name.slice(colon + 1);
+        if (suffixCounts.get(suffix) === 1) names.add(suffix);
+      }
+    }
+    return names;
+  }
+
+  const mcpExposure = (async () => {
     try {
       await mcpRuntime.whenSettled();
-      // Settle-time stderr drain: the runtime's accumulated diagnostics
-      // (connect failures, timeouts, dropped tools — each already bounded and
-      // control-stripped) go to stderr one line each. These verbose operational
-      // diagnostics complement the bounded human-facing status/report surfaces
-      // and one-time startup notice; this is the stderr surface the registry's
-      // feature.mcp note claims.
-      for (const diag of mcpRuntime.diagnostics()) {
+      mcpPromptCatalog = buildMcpPromptCatalog(mcpRuntime.prompts(), mcpPromptReservedNames());
+      const failedRecords: FailedPromptNamespace[] = [];
+      const retainedPrefixes = new Set<string>();
+      let omittedFailedServers = 0;
+      for (const state of mcpRuntime.serverStates()) {
+        if (state.promptsAdvertised !== true || state.promptDiscoveryError === undefined) continue;
+        const record = failedPromptNamespace(state.name);
+        if (
+          !record || retainedPrefixes.has(record.commandPrefix) ||
+          failedRecords.length >= failedPromptRecordLimit
+        ) {
+          omittedFailedServers += 1;
+          continue;
+        }
+        retainedPrefixes.add(record.commandPrefix);
+        failedRecords.push(record);
+      }
+      failedPromptNamespaces = Object.freeze({
+        records: Object.freeze(failedRecords),
+        omittedCount: omittedFailedServers,
+      });
+      for (const diag of [...mcpRuntime.diagnostics(), ...mcpPromptCatalog.diagnostics]) {
         console.error(`PiCC: MCP: ${diag}`);
       }
-      const proxies = buildMcpProxyTools(mcpRuntime);
-      if (proxies.length === 0) return;
+
+      const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(mcpRuntime)];
+      if (mcpRuntime.resourceServers().length > 0) {
+        definitions.push(...buildMcpResourceTools(mcpRuntime, {
+          clipMaxTokens: config.compaction.clipMaxTokens,
+        }));
+      }
       const admitted = new Set(
-        permissionEngine.gateTools(undefined, undefined, proxies.map((t) => t.name)),
+        permissionEngine.gateTools(undefined, undefined, definitions.map((tool) => tool.name)),
       );
-      for (const proxy of proxies) {
-        if (!admitted.has(proxy.name)) continue;
-        // Per-tool catch (same idiom as the claudeNamedTools loop): one
-        // throwing registerTool must not drop the sibling tools behind it.
+      for (const definition of definitions) {
+        if (!admitted.has(definition.name)) continue;
         try {
-          pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(proxy, {
-            fallbackCallDisplayName: proxy.label,
+          pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definition, {
+            fallbackCallDisplayName: definition.label,
           }) as unknown as Record<string, unknown>));
         } catch (err) {
-          console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);
+          console.error(
+            `PiCC: failed to register MCP tool "${definition.name}": ${boundedMcpErrorText(err)}`,
+          );
         }
       }
     } catch (err) {
-      console.error(`PiCC: MCP tool registration failed: ${(err as Error).message}`);
+      // Retain a bounded failed-exposure state so MCP-shaped input cannot become
+      // an ordinary provider prompt after startup failed. A genuine settled
+      // zero-prompt runtime remains distinguishable and keeps passthrough.
+      mcpExposureFailure = boundedMcpErrorText(err);
+      mcpPromptCatalog = buildMcpPromptCatalog([], []);
+      console.error(`PiCC: MCP exposure failed: ${mcpExposureFailure}`);
     }
   })();
 
@@ -2238,7 +2357,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
     }
     try {
-      await mcpRegistration;
+      await mcpExposure;
     } finally {
       if (showsMcpStartupStatus) {
         try {
@@ -2258,12 +2377,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try {
         const failed = mcpRuntime.serverStates().filter((s) => s.state === "failed");
         if (failed.length > 0) {
-          const shown = failed.slice(0, 8).map((s) => s.name);
-          const omitted = failed.length - shown.length;
-          const message =
-            `MCP server(s) failed to start: ${shown.join(", ")}` +
-            (omitted > 0 ? `, and ${omitted} more` : "") +
-            " — run /doctor for details.";
+          const toolDiscoveryFailures = failed.filter(
+            (state) => state.initialToolDiscoveryFailed === true,
+          );
+          const selected = toolDiscoveryFailures.length > 0 ? toolDiscoveryFailures : failed;
+          const shown = selected.slice(0, 8).map((state) => state.name);
+          const omitted = selected.length - shown.length;
+          const otherFailures = failed.length - toolDiscoveryFailures.length;
+          const message = toolDiscoveryFailures.length > 0
+            ? `Initial tools/list discovery failed for MCP server(s): ${shown.join(", ")}` +
+              (omitted > 0 ? `, and ${omitted} more` : "") +
+              " — check the server configuration and logs, then run /reload or restart PiCC." +
+              (otherFailures > 0 ? ` ${otherFailures} other MCP server(s) failed; run /doctor for details.` : "")
+            : `MCP server(s) failed to start: ${shown.join(", ")}` +
+              (omitted > 0 ? `, and ${omitted} more` : "") +
+              " — run /doctor for details.";
           if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");
           else console.error(`PiCC: ${message}`);
         }
@@ -2583,6 +2711,61 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
+  const MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS = 4_096;
+  type McpPromptFailureCategory = McpPromptInvocationErrorCategory | "unknown";
+  type McpPromptFailureEntry = {
+    command: string;
+    server?: string;
+    category: McpPromptFailureCategory;
+    message: string;
+    providerRequestSent: false;
+  };
+
+  pi.registerEntryRenderer("picc-mcp-prompt", (entry: any, _opts: any, theme: any) => {
+    const data = (entry?.data ?? {}) as Partial<McpPromptFailureEntry>;
+    const command = sanitizeDisplayText(String(data.command ?? "unknown"), 240, true) || "unknown";
+    const category = sanitizeDisplayText(String(data.category ?? "response"), 40, true) || "response";
+    const message = sanitizeDisplayText(
+      String(data.message ?? "MCP prompt invocation failed."),
+      MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS,
+    );
+    return {
+      render(width: number): string[] {
+        const columns = Math.max(1, Math.floor(width));
+        const lines: string[] = [];
+        const tone = category === "unknown" || category === "arguments" ? "warning" : "error";
+        pushColored(theme, tone, `MCP prompt /${command} — ${category}`, columns, lines);
+        for (const paragraph of message.split("\n")) pushColored(theme, "text", paragraph, columns, lines);
+        return clampLines(lines, columns);
+      },
+    };
+  });
+
+  async function presentMcpPromptFailure(data: McpPromptFailureEntry, ctx: any): Promise<void> {
+    const bounded: McpPromptFailureEntry = {
+      command: sanitizeDisplayText(data.command, 240, true) || "unknown",
+      ...(data.server ? { server: sanitizeDisplayText(data.server, 200, true) } : {}),
+      category: data.category,
+      message: boundedMcpErrorText(data.message, MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS),
+      providerRequestSent: false,
+    };
+    try {
+      if (ctx?.mode === "tui") {
+        if (typeof ctx.ui?.notify !== "function") throw new Error("TUI notification unavailable");
+        ctx.ui.notify(
+          bounded.message,
+          bounded.category === "unknown" || bounded.category === "arguments" ? "warning" : "error",
+        );
+      } else if (isTextPrintMode(ctx)) {
+        console.error(`PiCC: ${bounded.message}`);
+      } else {
+        pi.appendEntry("picc-mcp-prompt", bounded);
+      }
+    } catch {
+      try { process.stderr.write(`PiCC: ${bounded.message}\n`); } catch { /* failure remains handled */ }
+    }
+  }
+
   pi.on("input", async (event: any, ctx: any) => {
     try {
       // Extension continuations are internal. Every other admitted input is a
@@ -2777,14 +2960,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const extra = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n").trim();
       const hookSuffix = extra ? `\n\n<hook-context>\n${extra}\n</hook-context>` : "";
 
-      // 2) Skill slash command(s): expand `/name [args]` into the user turn,
-      //    exactly as Claude Code does (this is why it must be a transform, not
-      //    a self-dispatching extension command — those can't reliably trigger
-      //    a turn in print mode). Up to 5 LEADING skill tokens stack
-      //    (`/skill-a /skill-b remaining text`, Claude v2.1.199): all activate
-      //    in order and the remaining text is the LAST skill's arguments — its
-      //    rendered activation carries the text (via $ARGUMENTS/$N markers, or
-      //    the ARGUMENTS: fallback when the body has none).
+      // Resolve local/project/plugin spellings before entering the MCP namespace.
+      // This identification also tells us whether a typed fork must wait for the
+      // settled parent tool universe before it snapshots a child.
       const text: string = event.text ?? "";
       let rest = text.trim();
       const stacked: ClaudeSkill[] = [];
@@ -2793,11 +2971,95 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (!m) break;
         if (reservedBuiltinName(m[1]!)) break;
         const found = findByName(project.skills, m[1]!);
-        // Stop at the first token that doesn't resolve to a user-invocable skill.
         if (!found?.userInvocable) break;
         stacked.push(found);
         rest = rest.slice(m[0].length).replace(/^[ \t]+/, "");
       }
+
+      if (stacked.some((skill) => skill.contextFork)) await mcpExposure;
+
+      if (stacked.length === 0 && text.trimStart().startsWith("/mcp__")) {
+        await mcpExposure;
+        const command = text.trim().slice(1).split(/\s/u, 1)[0] ?? "mcp__unknown";
+        if (mcpExposureFailure !== undefined) {
+          await presentMcpPromptFailure({
+            command,
+            category: "call",
+            message: boundedPromptRecoveryMessage(
+              `MCP prompt exposure failed during server startup: ${mcpExposureFailure}.`,
+            ),
+            providerRequestSent: false,
+          }, ctx);
+          return { action: "handled" };
+        }
+        const match = matchMcpPromptInvocation(text.trim(), mcpPromptCatalog);
+        const failedNamespace = match?.kind === "known"
+          ? undefined
+          : failedPromptNamespaces.records.find((record) => command.startsWith(record.commandPrefix));
+        const hasPromptDiscoveryFailures = failedPromptNamespaces.records.length > 0 ||
+          failedPromptNamespaces.omittedCount > 0;
+        if (failedNamespace || (
+          match === undefined && mcpPromptCatalog.commands.length === 0 && hasPromptDiscoveryFailures
+        )) {
+          await presentMcpPromptFailure({
+            command,
+            ...(failedNamespace ? { server: failedNamespace.server } : {}),
+            category: "call",
+            message: promptDiscoveryFailureMessage(failedNamespace),
+            providerRequestSent: false,
+          }, ctx);
+          return { action: "handled" };
+        }
+        if (match?.kind === "unknown") {
+          await presentMcpPromptFailure({
+            command: match.name,
+            category: "unknown",
+            message: `${match.error}. Use a published MCP prompt command from the slash palette or run /mcp to inspect server state.`,
+            providerRequestSent: false,
+          }, ctx);
+          return { action: "handled" };
+        }
+        if (match?.kind === "known") {
+          try {
+            const expanded = await invokeMcpPrompt(
+              mcpRuntime,
+              match.command,
+              match.argumentText,
+              config.compaction.clipMaxTokens,
+            );
+            return accept(withCapturedImages({
+              action: "transform",
+              text: expanded + hookSuffix,
+            }));
+          } catch (error) {
+            const failure = error instanceof McpPromptInvocationError
+              ? error
+              : new McpPromptInvocationError("response", boundedMcpErrorText(error));
+            const correction = failure.category === "arguments"
+              ? ` Usage: /${match.command.name}${match.command.argumentHint ? ` ${match.command.argumentHint}` : ""}.`
+              : failure.category === "call"
+                ? " Retry later; check the server configuration and logs if the failure persists."
+                : " The server returned unusable prompt content; check or fix the server's prompt implementation.";
+            await presentMcpPromptFailure({
+              command: match.command.name,
+              server: match.command.serverName,
+              category: failure.category,
+              message: `${failure.message}${correction}`,
+              providerRequestSent: false,
+            }, ctx);
+            return { action: "handled" };
+          }
+        }
+      }
+
+      // 2) Skill slash command(s): expand `/name [args]` into the user turn,
+      //    exactly as Claude Code does (this is why it must be a transform, not
+      //    a self-dispatching extension command — those can't reliably trigger
+      //    a turn in print mode). Up to 5 LEADING skill tokens stack
+      //    (`/skill-a /skill-b remaining text`, Claude v2.1.199): all activate
+      //    in order and the remaining text is the LAST skill's arguments — its
+      //    rendered activation carries the text (via $ARGUMENTS/$N markers, or
+      //    the ARGUMENTS: fallback when the body has none).
       if (stacked.length) {
         const stagedActivation = stageMainActivation();
         const parts: string[] = [];
@@ -3834,7 +4096,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // fallback and never normally used — it exists purely so `/name` shows up with
   // its description and hint.
   // ---------------------------------------------------------------------------
-  // Ensure the harness-owned dir never appears as untracked in the project.
+  // Best-effort: add the harness-owned directory to repository-local excludes.
   try {
     const gitInfo = path.join(project.root, ".git", "info");
     if (fs.existsSync(gitInfo)) {
@@ -3851,30 +4113,184 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     /* best-effort — never fail startup over gitignore hygiene */
   }
 
-  const promptStubDir = path.join(project.root, ".claude", ".picc", "prompts");
-  try {
-    fs.rmSync(promptStubDir, { recursive: true, force: true });
-    fs.mkdirSync(promptStubDir, { recursive: true });
-    for (const skill of project.skills) {
-      if (!isPromptStubEligible(skill)) continue;
-      const fm = [
-        "---",
-        `description: ${JSON.stringify(skill.description || `Run the ${skill.name} skill`)}`,
-        ...(skill.argumentHint ? [`argument-hint: ${JSON.stringify(skill.argumentHint)}`] : []),
-        "---",
-        `Run the project skill "${skill.name}"${skill.argumentHint ? ` with arguments: $ARGUMENTS` : ""}.`,
-        "",
-        `(PiCC expands this skill in full — including argument, variable and`,
-        `shell-injection processing — when you invoke /${skill.name}.)`,
-      ].join("\n");
-      fs.writeFileSync(path.join(promptStubDir, `${skill.name}.md`), fm, "utf8");
-    }
-    debug(`wrote ${fs.readdirSync(promptStubDir).length} prompt stubs to ${promptStubDir}`);
-  } catch (err) {
-    debug(`prompt-stub generation failed (typed-slash-eligible skills still work via input; reserved collisions remain shadowed): ${(err as Error).message}`);
+  const promptStubComponents = [".claude", ".picc", "prompts"] as const;
+  let promptPublication: Promise<string | undefined> | undefined;
+  let promptPublicationDiagnosticEmitted = false;
+  let promptDiscoveryProgressVisible = false;
+
+  function isWithinCanonicalRoot(root: string, candidate: string): boolean {
+    const relative = path.relative(root, candidate);
+    return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
   }
 
-  pi.on("resources_discover", () => ({ promptPaths: [promptStubDir] }));
+  async function checkedPromptStubLocation(): Promise<{
+    root: string;
+    parent: string;
+    directory: string;
+  }> {
+    const root = await fs.promises.realpath(project.root);
+    let current = root;
+    for (const component of promptStubComponents) {
+      current = path.join(current, component);
+      try {
+        await fs.promises.lstat(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+      const canonical = await fs.promises.realpath(current);
+      if (!isWithinCanonicalRoot(root, canonical)) throw new Error(`unsafe redirection at ${component}`);
+      current = canonical;
+    }
+    const parent = path.join(root, ...promptStubComponents.slice(0, -1));
+    return { root, parent, directory: path.join(parent, promptStubComponents.at(-1)!) };
+  }
+
+  async function canonicalContainedDirectory(root: string, directory: string): Promise<string> {
+    const canonical = await fs.promises.realpath(directory);
+    if (!isWithinCanonicalRoot(root, canonical)) throw new Error("prompt publication directory escaped the project root");
+    return canonical;
+  }
+
+  async function removeContainedDirectory(root: string, directory: string): Promise<void> {
+    const canonical = await canonicalContainedDirectory(root, directory);
+    if (canonical !== directory) throw new Error("prompt cleanup directory changed before removal");
+    await fs.promises.rm(canonical, { recursive: true, force: true });
+  }
+
+  async function publishPromptStubs(ctx: any): Promise<string | undefined> {
+    let staged: { root: string; directory: string } | undefined;
+    try {
+      await mcpExposure;
+      const initial = await checkedPromptStubLocation();
+      await fs.promises.mkdir(initial.parent, { recursive: true });
+      const canonicalParent = await canonicalContainedDirectory(initial.root, initial.parent);
+      if (canonicalParent !== initial.parent) throw new Error("prompt publication parent changed during setup");
+
+      const stagingDirectory = await fs.promises.mkdtemp(path.join(canonicalParent, ".prompts-staging-"));
+      const canonicalStaging = await canonicalContainedDirectory(initial.root, stagingDirectory);
+      if (path.dirname(canonicalStaging) !== canonicalParent) throw new Error("prompt staging directory escaped its parent");
+      staged = { root: initial.root, directory: canonicalStaging };
+
+      for (const skill of project.skills) {
+        if (!isPromptStubEligible(skill)) continue;
+        const fm = [
+          "---",
+          `description: ${JSON.stringify(skill.description || `Run the ${skill.name} skill`)}`,
+          ...(skill.argumentHint ? [`argument-hint: ${JSON.stringify(skill.argumentHint)}`] : []),
+          "---",
+          `Run the project skill "${skill.name}"${skill.argumentHint ? ` with arguments: $ARGUMENTS` : ""}.`,
+          "",
+          `(PiCC expands this skill in full — including argument, variable and`,
+          `shell-injection processing — when you invoke /${skill.name}.)`,
+        ].join("\n");
+        if (await fs.promises.realpath(canonicalStaging) !== canonicalStaging) {
+          throw new Error("prompt staging directory changed during publication");
+        }
+        await fs.promises.writeFile(path.join(canonicalStaging, `${skill.name}.md`), fm, "utf8");
+      }
+      for (const command of mcpPromptCatalog.commands) {
+        const fm = [
+          "---",
+          `description: ${JSON.stringify(command.description || `Run MCP prompt /${command.name}`)}`,
+          ...(command.argumentHint ? [`argument-hint: ${JSON.stringify(command.argumentHint)}`] : []),
+          "---",
+          "",
+        ].join("\n");
+        if (await fs.promises.realpath(canonicalStaging) !== canonicalStaging) {
+          throw new Error("prompt staging directory changed during publication");
+        }
+        await fs.promises.writeFile(path.join(canonicalStaging, `${command.name}.md`), fm, "utf8");
+      }
+
+      const checked = await checkedPromptStubLocation();
+      const checkedParent = await canonicalContainedDirectory(checked.root, checked.parent);
+      if (checked.root !== initial.root || checkedParent !== canonicalParent) {
+        throw new Error("prompt publication parent changed before commit");
+      }
+      const backupReservation = await fs.promises.mkdtemp(path.join(canonicalParent, ".prompts-backup-"));
+      const backupDirectory = await canonicalContainedDirectory(checked.root, backupReservation);
+      if (path.dirname(backupDirectory) !== canonicalParent) throw new Error("prompt backup escaped its parent");
+      await fs.promises.rmdir(backupDirectory);
+
+      let oldMoved = false;
+      let newInstalled = false;
+      try {
+        try {
+          await fs.promises.lstat(checked.directory);
+          await canonicalContainedDirectory(checked.root, checked.directory);
+          await fs.promises.rename(checked.directory, backupDirectory);
+          oldMoved = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        await fs.promises.rename(canonicalStaging, checked.directory);
+        newInstalled = true;
+        staged = undefined;
+      } catch (swapError) {
+        if (oldMoved && !newInstalled) {
+          try {
+            await fs.promises.rename(backupDirectory, checked.directory);
+            oldMoved = false;
+          } catch (rollbackError) {
+            throw new Error(
+              `prompt palette swap failed and rollback failed: ${boundedMcpErrorText(swapError)}; ${boundedMcpErrorText(rollbackError)}`,
+            );
+          }
+        }
+        throw swapError;
+      }
+      if (oldMoved) await removeContainedDirectory(checked.root, backupDirectory);
+      const published = await canonicalContainedDirectory(checked.root, checked.directory);
+      debug(`wrote ${(await fs.promises.readdir(published)).length} prompt stubs to ${published}`);
+      return published;
+    } catch (error) {
+      if (staged) {
+        try { await removeContainedDirectory(staged.root, staged.directory); } catch { /* report the primary failure */ }
+      }
+      if (!promptPublicationDiagnosticEmitted) {
+        promptPublicationDiagnosticEmitted = true;
+        const message = `Slash-command palette publication failed; exact typed invocation still works. ${boundedMcpErrorText(error)}`;
+        try {
+          if (ctx?.mode === "tui") {
+            if (typeof ctx.ui?.notify !== "function") throw new Error("TUI notification unavailable");
+            ctx.ui.notify(message, "warning");
+          } else console.error(`PiCC: ${message}`);
+        } catch {
+          try { process.stderr.write(`PiCC: ${message}\n`); } catch { /* typed routing remains available */ }
+        }
+      }
+      return undefined;
+    }
+  }
+
+  pi.on("resources_discover", async (_event: any, ctx: any) => {
+    let finished = false;
+    const progress = setTimeout(() => {
+      if (finished || ctx?.mode !== "tui") return;
+      try {
+        const pending = mcpRuntime.serverStates().some(
+          (state) => state.state === "connecting" || state.state === "retrying",
+        );
+        if (pending && !promptDiscoveryProgressVisible) {
+          promptDiscoveryProgressVisible = true;
+          ctx.ui?.setStatus?.("picc-mcp-prompt-discovery", "Discovering MCP prompts…");
+        }
+      } catch { /* progress is presentation-only */ }
+    }, 150);
+    try {
+      promptPublication ??= publishPromptStubs(ctx);
+      const published = await promptPublication;
+      return published ? { promptPaths: [published] } : {};
+    } finally {
+      finished = true;
+      clearTimeout(progress);
+      if (promptDiscoveryProgressVisible) {
+        promptDiscoveryProgressVisible = false;
+        try { ctx.ui?.setStatus?.("picc-mcp-prompt-discovery", undefined); } catch { /* presentation-only */ }
+      }
+    }
+  });
 
   testSeam?.onInitializationSettled?.(Promise.all([orphanReaping, builtInRegistration]).then(() => undefined));
 }

@@ -9,6 +9,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake
 import { createMcpProcessFixture, type McpProcessFixture } from "./helpers/mcp-process.js";
 import type { PiSdk } from "../src/runtime/subagents.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 
 /**
  * Subagent MCP integration: inheritance, restriction, and drop of
@@ -136,6 +137,8 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
   type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
 
   it("builds distinct proxies over one stable permission universe while connected, reconnecting, and failed", async () => {
+    const savedForkGate = process.env.CLAUDE_CODE_FORK_SUBAGENT;
+    delete process.env.CLAUDE_CODE_FORK_SUBAGENT;
     const dir = makeTempDir("picc-remotesub-");
     const userDir = makeTempDir("picc-remotesub-user-");
     writeProjectFile(dir, "CLAUDE.md", "REMOTE-SUB-PROJECT\n");
@@ -154,6 +157,26 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
       ".claude/agents/dropper.md",
       "---\nname: dropper\ndescription: no remote tools\ndisallowedTools: mcp__remote\n---\nStable universe.\n",
     );
+    writeProjectFile(
+      dir,
+      ".claude/agents/resource-list.md",
+      "---\nname: resource-list\ndescription: list resources only\ntools: ListMcpResourcesTool\n---\nList resources.\n",
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/resource-read.md",
+      "---\nname: resource-read\ndescription: read resources only\ntools: ReadMcpResourceTool\n---\nRead resources.\n",
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/resource-drop-read.md",
+      "---\nname: resource-drop-read\ndescription: inherit except resource reads\ndisallowedTools: ReadMcpResourceTool\n---\nDo not read resources.\n",
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/resource-drop-list.md",
+      "---\nname: resource-drop-list\ndescription: inherit except resource lists\ndisallowedTools: ListMcpResourcesTool\n---\nDo not list resources.\n",
+    );
     process.env.PICC_CLAUDE_USER_DIR = userDir;
     process.chdir(dir);
 
@@ -165,6 +188,10 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
     const runtime: Runtime = {
       whenSettled: async () => {},
       tools: () => catalog,
+      prompts: () => [],
+      resourceServers: () => [{ serverName: "remote", resources: [] }],
+      getPrompt: async () => { throw new Error("unreachable"); },
+      readResource: async () => ({ contents: [{ uri: "test:", text: "resource" }] }),
       callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
       diagnostics: () => [],
       serverStates: () => [{ name: "remote", transport: "http", state }],
@@ -181,11 +208,19 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
         onInitializationSettled: pi.captureInitialization,
       });
       await pi.waitForInitialization();
-      await pi.waitForTools(["Agent", "mcp__remote__echo", "mcp__remote__search"]);
+      await pi.waitForTools([
+        "Agent",
+        "mcp__remote__echo",
+        "mcp__remote__search",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+      ]);
       internals.subagentRuntime.setSdkForTest(handle.sdk);
       const mainEcho = pi.tools.get("mcp__remote__echo");
       const expected = ["mcp__remote__echo", "mcp__remote__search"];
       const childEchoes: unknown[] = [];
+      const childResourceLists: unknown[] = [];
+      const childResourceReads: unknown[] = [];
 
       for (const lifecycle of ["connected", "reconnecting", "failed"] as const) {
         state = lifecycle;
@@ -203,8 +238,20 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
         const childEcho = remoteTools.find((tool) => tool.name === "mcp__remote__echo");
         expect(childEcho).not.toBe(mainEcho);
         childEchoes.push(childEcho);
+        const childResourceList = (created.customTools as FakeCustomTool[])
+          .find((tool) => tool.name === "ListMcpResourcesTool");
+        expect(childResourceList).toBeDefined();
+        expect(childResourceList).not.toBe(pi.tools.get("ListMcpResourcesTool"));
+        childResourceLists.push(childResourceList);
+        const childResourceRead = (created.customTools as FakeCustomTool[])
+          .find((tool) => tool.name === "ReadMcpResourceTool");
+        expect(childResourceRead).toBeDefined();
+        expect(childResourceRead).not.toBe(pi.tools.get("ReadMcpResourceTool"));
+        childResourceReads.push(childResourceRead);
       }
       expect(new Set(childEchoes).size).toBe(3);
+      expect(new Set(childResourceLists).size).toBe(3);
+      expect(new Set(childResourceReads).size).toBe(3);
       expect(pi.tools.get("mcp__remote__echo")).toBe(mainEcho);
 
       await pi.tools.get("Agent").execute("dispatch-server-only", {
@@ -217,8 +264,232 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
       });
       expect((handle.created.at(-1)!.customTools as FakeCustomTool[])
         .some((tool) => tool.name.startsWith("mcp__remote__"))).toBe(false);
+
+      for (const [agent, expectedResource] of [
+        ["resource-list", "ListMcpResourcesTool"],
+        ["resource-read", "ReadMcpResourceTool"],
+      ] as const) {
+        await pi.tools.get("Agent").execute(`dispatch-${agent}`, {
+          subagent_type: agent, prompt: agent, run_in_background: false,
+        });
+        expect((handle.created.at(-1)!.customTools as FakeCustomTool[]).map((tool) => tool.name))
+          .toEqual([expectedResource]);
+      }
+      for (const [agent, retained, dropped] of [
+        ["resource-drop-read", "ListMcpResourcesTool", "ReadMcpResourceTool"],
+        ["resource-drop-list", "ReadMcpResourceTool", "ListMcpResourcesTool"],
+      ] as const) {
+        await pi.tools.get("Agent").execute(`dispatch-${agent}`, {
+          subagent_type: agent, prompt: agent, run_in_background: false,
+        });
+        const names = (handle.created.at(-1)!.customTools as FakeCustomTool[])
+          .map((tool) => tool.name);
+        expect(names).toContain(retained);
+        expect(names).not.toContain(dropped);
+      }
+
+      const beforeBackground = handle.created.length;
+      await pi.tools.get("Agent").execute("dispatch-background", {
+        subagent_type: "inheritor", prompt: "background", run_in_background: true,
+      });
+      await waitUntil({
+        description: "background child session creation",
+        predicate: () => handle.created.length > beforeBackground,
+        describeObserved: () => String(handle.created.length),
+      });
+      const backgroundNames = (handle.created.at(-1)!.customTools as FakeCustomTool[])
+        .map((tool) => tool.name);
+      expect(backgroundNames).not.toContain("ListMcpResourcesTool");
+      expect(backgroundNames).not.toContain("ReadMcpResourceTool");
+      expect(backgroundNames).toContain("mcp__remote__echo");
+
+      await pi.fire("session_start", {}, pi.ctx({
+        sessionManager: { getSessionFile: () => path.join(dir, "parent.jsonl") },
+      }));
+      await pi.tools.get("Agent").execute("dispatch-fork-foreground", {
+        subagent_type: "fork", prompt: "fork foreground", run_in_background: false,
+      });
+      const foregroundForkNames = (handle.created.at(-1)!.customTools as FakeCustomTool[])
+        .map((tool) => tool.name);
+      expect(foregroundForkNames).toEqual(expect.arrayContaining([
+        "ListMcpResourcesTool", "ReadMcpResourceTool", "mcp__remote__echo",
+      ]));
+
+      const beforeDefaultFork = handle.created.length;
+      await pi.tools.get("Agent").execute("dispatch-fork-default-background", {
+        subagent_type: "fork", prompt: "fork default background",
+      });
+      await waitUntil({
+        description: "default-background conversation fork child creation",
+        predicate: () => handle.created.length > beforeDefaultFork,
+        describeObserved: () => String(handle.created.length),
+      });
+      const defaultForkNames = (handle.created.at(-1)!.customTools as FakeCustomTool[])
+        .map((tool) => tool.name);
+      expect(defaultForkNames).toEqual(expect.arrayContaining([
+        "ListMcpResourcesTool", "ReadMcpResourceTool", "mcp__remote__echo",
+      ]));
     } finally {
       await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
+      process.chdir(originalCwd);
+      if (savedForkGate === undefined) delete process.env.CLAUDE_CODE_FORK_SUBAGENT;
+      else process.env.CLAUDE_CODE_FORK_SUBAGENT = savedForkGate;
+    }
+  }, 30_000);
+});
+
+describe("subagent fixed resource restrictions", () => {
+  type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
+  const resourceNames = ["ListMcpResourcesTool", "ReadMcpResourceTool"] as const;
+
+  function resourceRuntime(): Runtime {
+    return {
+      whenSettled: async () => {},
+      tools: () => [],
+      prompts: () => [],
+      resourceServers: () => [{ serverName: "fixture", resources: [] }],
+      getPrompt: async () => ({ messages: [] }),
+      readResource: async () => ({ contents: [] }),
+      callTool: async () => ({ content: [] }),
+      diagnostics: () => [],
+      serverStates: () => [{
+        name: "fixture", transport: "stdio", state: "connected",
+        resourcesAdvertised: true, resourceCount: 0,
+      }],
+      shutdown: async () => {},
+    };
+  }
+
+  async function childTools(options: {
+    deny?: string;
+    agents: Record<string, string>;
+    dispatch: readonly string[];
+  }): Promise<string[][]> {
+    const dir = makeTempDir("picc-resource-restrict-");
+    const userDir = makeTempDir("picc-resource-restrict-user-");
+    writeProjectFile(dir, "CLAUDE.md", "RESOURCE-RESTRICTION\n");
+    if (options.deny) {
+      writeProjectFile(dir, ".claude/settings.json", JSON.stringify({
+        permissions: { deny: [options.deny] },
+      }));
+    }
+    for (const [name, frontmatter] of Object.entries(options.agents)) {
+      writeProjectFile(dir, `.claude/agents/${name}.md`, `---\nname: ${name}\ndescription: ${name}\n${frontmatter}---\nRestricted child.\n`);
+    }
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const handle = fakeSdk({ onPrompt: async () => "DONE" });
+    const pi = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    try {
+      picc(pi.api as never, {
+        mcpRuntime: resourceRuntime(),
+        sdk: handle.sdk,
+        onWired: (wired) => { internals = wired; },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      await pi.waitForTools([
+        "Agent",
+        ...resourceNames.filter((name) => name !== options.deny),
+      ]);
+      internals.subagentRuntime.setSdkForTest(handle.sdk);
+      const rows: string[][] = [];
+      for (const agent of options.dispatch) {
+        await pi.tools.get("Agent").execute(`dispatch-${agent}`, {
+          subagent_type: agent, prompt: agent, run_in_background: false,
+        });
+        rows.push((handle.created.at(-1)!.customTools as FakeCustomTool[]).map((tool) => tool.name));
+      }
+      return rows;
+    } finally {
+      await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
+      process.chdir(originalCwd);
+    }
+  }
+
+  it.each(resourceNames)("an exact settings deny for %s removes only that fixed resource name from a child", async (denied) => {
+    const [names] = await childTools({
+      deny: denied,
+      agents: { inheritor: "" },
+      dispatch: ["inheritor"],
+    });
+    expect(names).not.toContain(denied);
+    expect(names).toContain(resourceNames.find((name) => name !== denied));
+  }, 30_000);
+
+  it("empty and unrelated tools: child rows receive no fixed resource tools", async () => {
+    const [emptyNames, unrelatedNames] = await childTools({
+      agents: {
+        empty: "tools: []\n",
+        unrelated: "tools: Read\n",
+      },
+      dispatch: ["empty", "unrelated"],
+    });
+    for (const names of [emptyNames, unrelatedNames]) {
+      expect(names).not.toContain("ListMcpResourcesTool");
+      expect(names).not.toContain("ReadMcpResourceTool");
+    }
+    expect(emptyNames).toEqual([]);
+    expect(unrelatedNames).toContain("read");
+  }, 30_000);
+});
+
+describe("deferred first typed fork MCP settlement", () => {
+  type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
+
+  it("waits for exposure before snapshotting the fork's resources and existing MCP proxy", async () => {
+    const dir = makeTempDir("picc-mcp-typed-fork-");
+    const userDir = makeTempDir("picc-mcp-typed-fork-user-");
+    writeProjectFile(dir, "CLAUDE.md", "MCP-TYPED-FORK\n");
+    writeProjectFile(dir, ".claude/skills/fork-mcp/SKILL.md", [
+      "---", "name: fork-mcp", "description: fork after MCP settlement", "context: fork", "---",
+      "Use the settled MCP surface for $ARGUMENTS.", "",
+    ].join("\n"));
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const settled = deferred<void>();
+    const runtime: Runtime = {
+      whenSettled: () => settled.promise,
+      tools: () => [{ serverName: "fixture", toolName: "echo", description: "echo", inputSchema: { type: "object" } }],
+      prompts: () => [],
+      resourceServers: () => [{ serverName: "fixture", resources: [] }],
+      getPrompt: async () => ({ messages: [] }), readResource: async () => ({ contents: [] }),
+      callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      diagnostics: () => [],
+      serverStates: () => [{ name: "fixture", transport: "stdio", state: "connecting" }],
+      shutdown: async () => {},
+    };
+    const handle = fakeSdk({ onPrompt: async () => "FORK-DONE" });
+    const localPi = fakePi();
+    try {
+      picc(localPi.api as never, {
+        mcpRuntime: runtime,
+        sdk: handle.sdk,
+        onInitializationSettled: localPi.captureInitialization,
+      });
+      await localPi.waitForInitialization();
+      const input = localPi.fire("input", {
+        source: "user", text: "/fork-mcp inspect",
+      }, localPi.printCtx());
+      await Promise.resolve();
+      expect(handle.created).toHaveLength(0);
+      settled.resolve();
+      const result = await input;
+      expect(result).toMatchObject({ action: "transform" });
+      expect(result.text).toContain("FORK-DONE");
+      await waitUntil({
+        description: "typed context fork child creation after MCP settlement",
+        predicate: () => handle.created.length === 1,
+        describeObserved: () => String(handle.created.length),
+      });
+      const names = (handle.created[0]!.customTools as FakeCustomTool[]).map((tool) => tool.name);
+      expect(names).toEqual(expect.arrayContaining([
+        "mcp__fixture__echo", "ListMcpResourcesTool", "ReadMcpResourceTool",
+      ]));
+    } finally {
+      settled.resolve();
+      await localPi.fire("session_shutdown", { reason: "other" }, localPi.printCtx());
       process.chdir(originalCwd);
     }
   }, 30_000);

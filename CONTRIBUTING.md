@@ -152,8 +152,8 @@ publication that already succeeded.
   reference projects never use is still worth implementing: other projects use other fields, and
   our own workflows adopt Claude features that exist but that we had not needed yet. Coverage
   tracks Claude Code's surface, not our current sample of it.
-- **No changes to the target project.** Harness state lives outside the project or in the
-  gitignored, harness-owned `.claude/.picc/`.
+- **Keep harness state separate.** Harness state lives outside the project or in the harness-owned
+  `.claude/.picc/`, which PiCC attempts to add to repository-local excludes.
 - **No drift.** New capability claims go in `src/registry/capability-registry.ts`; the
   compatibility report and `doc/supported-features.md` are generated from it. Run
   `npm run gen:capabilities` after registry changes.
@@ -162,8 +162,8 @@ publication that already succeeded.
 
 Deliberately out of scope — each for a reason, not from neglect:
 
-- **Full MCP surface parity.** Local stdio and selected remote HTTP/SSE servers run with
-  Claude-compatible tool exposure; other MCP surfaces remain deferred. The
+- **Full MCP surface parity.** Local stdio and selected remote HTTP/SSE servers expose tools,
+  prompts, and resources, but some protocol and UX surfaces remain deferred. The
   [capability matrix](doc/supported-features.md) records the exact limits and tiers.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
