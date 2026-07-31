@@ -529,6 +529,20 @@ export type SupportTier =
   | "not-supported"
   | "na";
 
+export type CapabilityEvidenceQuality =
+  | "documented"
+  | "observed"
+  | "inferred"
+  | "unverified";
+
+export interface CapabilityEvidence {
+  quality: CapabilityEvidenceQuality;
+  /** Non-empty concise description of the evidence source. */
+  source: string;
+  /** ISO date when the evidence was reviewed. */
+  reviewed?: string;
+}
+
 export interface CapabilityEntry {
   /** e.g. "skill.frontmatter.context", "hook.event.PreToolUse", "tool.WebFetch", "setting.permissions.ask" */
   id: string;
@@ -536,6 +550,8 @@ export interface CapabilityEntry {
   tier: SupportTier;
   /** True when the divergence is safety-relevant (something restricted now runs freely). */
   safetyRelevant?: boolean;
+  evidence?: readonly CapabilityEvidence[];
+  related?: readonly string[];
   note: string;
 }
 

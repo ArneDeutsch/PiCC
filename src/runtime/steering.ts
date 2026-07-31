@@ -7,9 +7,10 @@ import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 
 /**
  * Harness control surface config — lives OUTSIDE the target project
- * (user level) or in a harness-owned gitignored location inside it (never tracked files):
+ * (user level) or in the harness-owned project location that PiCC attempts to add
+ * to repository-local excludes:
  *   - user:    ~/.picc/config.json
- *   - project: <projectRoot>/.claude/.picc/config.json   (harness-owned, gitignored)
+ *   - project: <projectRoot>/.claude/.picc/config.json
  * Project overrides user, key-wise.
  */
 export interface PiCCConfig {

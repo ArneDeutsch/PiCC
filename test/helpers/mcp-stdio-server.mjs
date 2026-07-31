@@ -9,6 +9,11 @@
 //   spawn-grandchild — serve + a live grandchild process; publishes both pids
 //   exit-early       — exits immediately after publishing its pid
 //   hostile-tools    — advertises invalid/duplicate/oversized tool metadata
+//   prompt-only      — advertises prompts without tools
+//   gated-prompt-discovery — prompt-only; `prompts/list` waits for prompt-discovery.release
+//   resource-only    — advertises resources without tools
+//   prompt-resource  — advertises prompts and resources without tools
+//   empty-capabilities — advertises empty prompt/resource catalogs
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -50,9 +55,14 @@ if (mode === "exit-early") {
 async function serve() {
   const { Server } = await import("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-  const { ListToolsRequestSchema, CallToolRequestSchema } = await import(
-    "@modelcontextprotocol/sdk/types.js"
-  );
+  const {
+    ListToolsRequestSchema,
+    CallToolRequestSchema,
+    ListPromptsRequestSchema,
+    GetPromptRequestSchema,
+    ListResourcesRequestSchema,
+    ReadResourceRequestSchema,
+  } = await import("@modelcontextprotocol/sdk/types.js");
 
   if (mode === "spawn-grandchild") {
     // A real, live grandchild (not detached, not unref'd): it keeps this
@@ -109,12 +119,31 @@ async function serve() {
     ];
   }
 
+  const hasTools = ![
+    "prompt-only",
+    "gated-prompt-discovery",
+    "resource-only",
+    "prompt-resource",
+    "empty-capabilities",
+  ].includes(mode);
+  const hasPrompts = [
+    "prompt-only",
+    "gated-prompt-discovery",
+    "prompt-resource",
+    "empty-capabilities",
+  ].includes(mode);
+  const hasResources = ["resource-only", "prompt-resource", "empty-capabilities"].includes(mode);
+  const capabilities = {
+    ...(hasTools ? { tools: {} } : {}),
+    ...(hasPrompts ? { prompts: {} } : {}),
+    ...(hasResources ? { resources: {} } : {}),
+  };
   const server = new Server(
     { name: `picc-fixture-${mode}`, version: "1.0.0" },
-    { capabilities: { tools: {} } },
+    { capabilities },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (hasTools) server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+  if (hasTools) server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     if (name === "echo") return textResult(String(args.text ?? ""));
     if (name === "report-env") {
@@ -132,5 +161,44 @@ async function serve() {
     }
     throw new Error(`unknown tool: ${name}`);
   });
+  if (hasPrompts) {
+    server.setRequestHandler(ListPromptsRequestSchema, async () => {
+      if (mode === "gated-prompt-discovery") {
+        publish("prompt-discovery.entered", JSON.stringify({ pid: process.pid }));
+        await waitForMarker("prompt-discovery.release");
+        publish("prompt-discovery.done", JSON.stringify({ pid: process.pid }));
+      }
+      return {
+        prompts: mode === "empty-capabilities" ? [] : [{
+          name: "fixture-prompt",
+          description: "Builds a fixture prompt",
+          arguments: [
+            { name: "required", description: "required value", required: true },
+            { name: "optional", description: "optional value" },
+          ],
+        }],
+      };
+    });
+    server.setRequestHandler(GetPromptRequestSchema, async (request) => ({
+      description: "fixture result",
+      messages: [{
+        role: "user",
+        content: { type: "text", text: JSON.stringify(request.params.arguments ?? {}) },
+      }],
+    }));
+  }
+  if (hasResources) {
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: mode === "empty-capabilities" ? [] : [
+        { uri: "fixture://text", name: "fixture text", mimeType: "text/plain", size: 12 },
+        { uri: "fixture://binary", name: "fixture binary", mimeType: "application/octet-stream" },
+      ],
+    }));
+    server.setRequestHandler(ReadResourceRequestSchema, async (request) => ({
+      contents: request.params.uri === "fixture://binary"
+        ? [{ uri: request.params.uri, mimeType: "application/octet-stream", blob: "AAEC" }]
+        : [{ uri: request.params.uri, mimeType: "text/plain", text: "fixture text" }],
+    }));
+  }
   await server.connect(new StdioServerTransport());
 }

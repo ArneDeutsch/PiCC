@@ -531,13 +531,17 @@ describe("reserved plugin-management commands", () => {
       for (const name of ["plugin", "plugins"] as const) {
         const output = fixedOutputs.get(name) ?? "";
         expect(output).toContain("Claude Code");
-        expect(output).toContain("exit and relaunch");
+        expect(output).toContain("canonical /reload in the interactive TUI");
+        expect(output).toContain("whole extension, including installed plugin state");
+        expect(output).toContain("or exit and relaunch");
         expect(output).toContain("/new does not reload plugin state");
         expect(output).toContain("no changes were made");
       }
       const reloadOutput = fixedOutputs.get("reload-plugins") ?? "";
-      expect(reloadOutput).toContain("no reload occurred");
-      expect(reloadOutput).toContain("exit and relaunch");
+      expect(reloadOutput).toContain("/reload-plugins did no reload");
+      expect(reloadOutput).toContain("canonical /reload in the interactive TUI");
+      expect(reloadOutput).toContain("whole extension, including installed plugin state");
+      expect(reloadOutput).toContain("or exit and relaunch");
 
       for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
         await fresh.commands.get(name).handler("SECRET-ARG-MUST-NOT-REFLECT", fresh.tuiCtx());
@@ -736,10 +740,10 @@ describe("plugin activation runtime failures", () => {
       const slash = fresh.tools.get("SlashCommand");
       const skillError = await skill.execute("broken-skill", { name: "broken-plugin-skill" })
         .then(() => undefined, (caught: unknown) => caught as Error);
-      expect(skillError?.message).toMatch(/Repair or reinstall.*relaunch PiCC/);
-      expect(skillError?.message.match(/Repair or reinstall/g)).toHaveLength(1);
+      expect(skillError?.message).toMatch(/Reconcile or reinstall.*canonical \/reload.*exit and relaunch PiCC/);
+      expect(skillError?.message.match(/Reconcile or reinstall/g)).toHaveLength(1);
       await expect(slash.execute("broken-slash", { command: "/broken-plugin-skill" }))
-        .rejects.toThrow(/Repair or reinstall.*relaunch PiCC/);
+        .rejects.toThrow(/Reconcile or reinstall.*canonical \/reload.*exit and relaunch PiCC/);
       const typed = await fresh.fire("input", { text: "/broken-plugin-skill", source: "interactive" }, fresh.printCtx());
       expect(typed).toEqual({ action: "handled" });
       expect(fresh.messages).toEqual([]);
@@ -787,8 +791,9 @@ describe("plugin activation runtime failures", () => {
       expect(report.match(/^  - skill overflow-owner:broken-/gm)).toHaveLength(20);
       expect(report).toContain("2 additional distinct failure(s) omitted");
       expect(report).not.toContain("at least 2");
-      expect(report).toContain("Recovery: check plugin-data ownership, writability, and directory kinds");
-      expect(report).not.toContain("Repair or reinstall the plugin");
+      expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
+      expect(report).not.toContain("Reconcile or reinstall the plugin");
+      expect(report).not.toContain("canonical /reload");
       expect(report).toContain("execution did not occur");
 
       for (let index = 22; index < 26; index++) {
@@ -829,15 +834,21 @@ describe("plugin activation runtime failures", () => {
     fs.writeFileSync(path.join(root, ".claude-user", "plugins", "data"), "blocks data directory", "utf8");
     try {
       const agent = fresh.tools.get("Agent");
-      await expect(agent.execute("broken-agent", {
+      const agentError = await agent.execute("broken-agent", {
         subagent_type: "broken-agent", prompt: "must not run", run_in_background: false,
-      })).rejects.toThrow(/Agent "broken-agent-owner:broken-agent" did not start.*no provider request was made/i);
+      }).then(() => undefined, (caught: unknown) => caught as Error);
+      expect(agentError?.message).toMatch(/Agent "broken-agent-owner:broken-agent" did not start.*no provider request was made/i);
+      expect(agentError?.message).toContain("Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
+      expect(agentError?.message).not.toContain("Reconcile or reinstall");
+      expect(agentError?.message).not.toContain("canonical /reload");
       expect(handle.created).toHaveLength(0);
       expect(resourceLoaders).toBe(0);
       expect(handle.promptCalls()).toBe(0);
       await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
       const report = String(fresh.entries.at(-1)?.data?.output ?? "");
       expect(report).toContain("Agent \"broken-agent-owner:broken-agent\" did not start");
+      expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
+      expect(report).not.toContain("canonical /reload");
       expect(report).not.toContain("trusted context");
     } finally {
       cleanupFixture(root);
@@ -890,7 +901,8 @@ describe("plugin activation runtime failures", () => {
       const typedPrintWarnings = error.mock.calls.map((call) => String(call[0]))
         .filter((line) => line.includes("omitted preloaded skill"));
       expect(typedPrintWarnings).toHaveLength(1);
-      expect(typedPrintWarnings[0]).toContain("Repair or reinstall");
+      expect(typedPrintWarnings[0]).toContain("Reconcile or reinstall");
+      expect(typedPrintWarnings[0]).toContain("canonical /reload");
 
       const agent = fresh.tools.get("Agent");
       for (let index = 0; index < 2; index++) {
@@ -933,7 +945,8 @@ describe("plugin activation runtime failures", () => {
       const warnings = error.mock.calls.map((call) => String(call[0]))
         .filter((line) => line.includes("omitted preloaded skill"));
       expect(warnings).toHaveLength(1);
-      expect(warnings[0]).toContain("Repair or reinstall");
+      expect(warnings[0]).toContain("Reconcile or reinstall");
+      expect(warnings[0]).toContain("canonical /reload");
       expect(handle.promptCalls()).toBe(7);
       await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
       expect(String(fresh.entries.at(-1)?.data?.output ?? "")).toContain("omitted preloaded skill");

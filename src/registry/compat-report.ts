@@ -72,6 +72,20 @@ export interface CompatReport {
 // ---------------------------------------------------------------------------
 
 const SUPPORTED_EVENT_SET: ReadonlySet<string> = new Set<string>(SUPPORTED_HOOK_EVENTS);
+const MCP_TOOL_BLOCKING_EVENT_SET: ReadonlySet<string> = new Set<string>([
+  "PreToolUse",
+  "UserPromptSubmit",
+  "Stop",
+  "SubagentStop",
+  "PreCompact",
+  "WorktreeCreate",
+] satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][]);
+
+function hookHandlerCapabilityId(type: string, effectiveEvent: string): string {
+  return type === "mcp_tool" && MCP_TOOL_BLOCKING_EVENT_SET.has(effectiveEvent)
+    ? "feature.hook-handler.mcp_tool-blocking-enforcement"
+    : `feature.hook-handler.${type}`;
+}
 
 /** Deferred settings key with no dedicated registry entry: recognized, degrades. */
 function deferredSettingCapability(key: string): CapabilityEntry {
@@ -115,12 +129,13 @@ const PLUGIN_SHARED_STATE_ORDER = [
   "blocklist-unreadable",
   "blocklist-malformed",
 ] as const satisfies readonly PluginSharedStateCause[];
+const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
 const PLUGIN_SHARED_STATE_DETAILS: Readonly<Record<PluginSharedStateCause, string>> = {
-  "installed-state-unreadable": "Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then relaunch PiCC.",
-  "installed-state-malformed": "Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then relaunch PiCC.",
-  "installed-state-unsupported": "Installed plugin state uses an unsupported format; all enabled plugins were rejected and no fallback content loaded. Update PiCC or contact PiCC support for this format, then relaunch PiCC.",
-  "blocklist-unreadable": "The qualified plugin blocklist is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/blocklist.json relative to the active Claude user directory, then relaunch PiCC.",
-  "blocklist-malformed": "The qualified plugin blocklist is malformed; all enabled plugins were rejected and no fallback content loaded. Repair plugins/blocklist.json so it is a valid JSON object, its optional plugins field is an array, and each entry's plugin field is a qualified name@marketplace identity, then relaunch PiCC.",
+  "installed-state-unreadable": `Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
+  "installed-state-malformed": `Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+  "installed-state-unsupported": `Installed plugin state uses an unsupported format; all enabled plugins were rejected and no fallback content loaded. Update PiCC or contact PiCC support for this format, then ${PLUGIN_REFRESH_ACTION}.`,
+  "blocklist-unreadable": `The qualified plugin blocklist is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/blocklist.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
+  "blocklist-malformed": `The qualified plugin blocklist is malformed; all enabled plugins were rejected and no fallback content loaded. Repair plugins/blocklist.json so it is a valid JSON object, its optional plugins field is an array, and each entry's plugin field is a qualified name@marketplace identity, then ${PLUGIN_REFRESH_ACTION}.`,
 };
 const INSTALLED_STATE_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
   "installed-state-unreadable",
@@ -181,15 +196,15 @@ function rejectedPluginAction(reason: PluginDiagnosticClass | undefined): string
   switch (reason) {
     case "unreadable content":
     case "wrong component kind":
-      return "Check the applicable component declaration and installed file or directory kind in Claude Code, then relaunch PiCC.";
+      return `Check the applicable component declaration and installed file or directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
     case "malformed content":
     case "unsupported component content":
     case "component limitation":
-      return "Repair or remove the applicable component declaration or content in Claude Code, then relaunch PiCC.";
+      return `Repair or remove the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
     case "path validation":
-      return "Reinstall or reconcile the qualified plugin with Claude Code, then relaunch PiCC.";
+      return `Reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
     case undefined:
-      return "Check the installed plugin declaration and files in Claude Code, then relaunch PiCC.";
+      return `Check the installed plugin declaration and files in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
   }
 }
 
@@ -202,17 +217,17 @@ function loadedPluginLimitation(
     case "wrong component kind":
       return {
         effect: "some declared content was skipped",
-        action: "Correct the applicable component declaration, access, or installed file/directory kind in Claude Code, then relaunch PiCC.",
+        action: `Correct the applicable component declaration, access, or installed file/directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
       };
     case "path validation":
       return {
         effect: "some declared content was skipped",
-        action: "Correct the applicable component path or reconcile the qualified plugin with Claude Code, then relaunch PiCC.",
+        action: `Reconcile or reinstall the qualified plugin through Claude Code to correct the applicable component path, then ${PLUGIN_REFRESH_ACTION}.`,
       };
     case "malformed content":
       return {
         effect: "some declared content was ignored",
-        action: "Correct or remove the malformed declaration or content in Claude Code, then relaunch PiCC.",
+        action: `Correct or remove the malformed declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
       };
     case "unsupported component content": {
       const wasStripped = diagnostics.some((item) =>
@@ -220,13 +235,13 @@ function loadedPluginLimitation(
       );
       return {
         effect: `some declared content was ${wasStripped ? "stripped" : "ignored"}`,
-        action: "Remove or replace the unsupported declaration or content in Claude Code, then relaunch PiCC.",
+        action: `Remove or replace the unsupported declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
       };
     }
     case "component limitation":
       return {
         effect: "some declared content was degraded",
-        action: "Check and correct the applicable component declaration or content in Claude Code, then relaunch PiCC.",
+        action: `Check and correct the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
       };
   }
 }
@@ -238,15 +253,15 @@ function pluginOutcomeDetail(outcome: PluginResolutionOutcome): string | undefin
     case "disabled":
       return undefined;
     case "enabled-but-uninstalled":
-      return `${id}: enabled but no applicable installed record was selected; no fallback content loaded. Install the qualified plugin with Claude Code or disable its qualified setting, then relaunch PiCC.`;
+      return `${id}: enabled but no applicable installed record was selected; no fallback content loaded. Install the qualified plugin with Claude Code or disable its qualified setting, then ${PLUGIN_REFRESH_ACTION}.`;
     case "unsupported":
-      return `${id}: installed-state format is unsupported; no fallback content loaded. Check for or update to PiCC support for this format, then relaunch PiCC.`;
+      return `${id}: installed-state format is unsupported; no fallback content loaded. Check for or update to PiCC support for this format, then ${PLUGIN_REFRESH_ACTION}.`;
     case "ambiguous":
-      return `${id}: highest-scope installed records are ambiguous; no fallback content loaded. Reconcile or reinstall this qualified identity through Claude Code, then relaunch PiCC.`;
+      return `${id}: highest-scope installed records are ambiguous; no fallback content loaded. Reconcile or reinstall this qualified identity through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
     case "blocked":
-      return `${id}: listed in the qualified plugin blocklist; no fallback content loaded. Review that blocklist entry and remove it only if this plugin should be allowed, then relaunch PiCC.`;
+      return `${id}: listed in the qualified plugin blocklist; no fallback content loaded. Review that blocklist entry and remove it only if this plugin should be allowed, then ${PLUGIN_REFRESH_ACTION}.`;
     case "malformed":
-      return `${id}: plugin installed-state or blocklist data is malformed; no fallback content loaded. Check those Claude Code state inputs, then relaunch PiCC.`;
+      return `${id}: plugin installed-state or blocklist data is malformed; no fallback content loaded. Check those Claude Code state inputs, then ${PLUGIN_REFRESH_ACTION}.`;
     case "rejected": {
       const reason = pluginDiagnosticClass(Array.isArray(outcome.diagnostics) ? outcome.diagnostics : []);
       return `${id}: installed content was rejected${reason ? ` (${reason})` : ""}; no fallback content loaded. ${rejectedPluginAction(reason)}`;
@@ -345,7 +360,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     if (pluginPosture.omitted > 0) {
       addFinding(
         selectionCapability,
-        `${pluginPosture.omitted} additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then relaunch PiCC.`,
+        `${pluginPosture.omitted} additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then ${PLUGIN_REFRESH_ACTION}.`,
       );
     }
   }
@@ -384,7 +399,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       const impact = managedPolicyImpactLabel(diagnostic.impact);
       addFinding(
         managedPolicyCapability,
-        `${source} was ${condition}${impact}. Repair the applicable managed policy input and relaunch PiCC.`,
+        `${source} was ${condition}${impact}. Repair the applicable managed policy input, then ${PLUGIN_REFRESH_ACTION}.`,
       );
       continue;
     }
@@ -399,7 +414,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
             : "an invalid activation entry was ignored";
       addFinding(
         enablementCapability,
-        `Plugin activation settings: ${reason}; no rejected setting authorized fallback content. Use qualified identities with literal booleans, then relaunch PiCC.`,
+        `Plugin activation settings: ${reason}; no rejected setting authorized fallback content. Use qualified identities with literal booleans, then ${PLUGIN_REFRESH_ACTION}.`,
       );
     }
   }
@@ -474,13 +489,21 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // activation), so every shape here is project-controlled input: a single matcher
   // object instead of an array, missing `hooks`, missing handler `type` (defaults
   // to "command"). Scanning must never throw (completeness floor).
-  const scanHooks = (config: HookConfig | undefined, where: string) => {
+  const scanHooks = (
+    config: HookConfig | undefined,
+    where: string,
+    effectiveEventFor: (event: string) => string = (event) => event,
+  ) => {
     if (!config || typeof config !== "object") return;
-    for (const [event, rawMatchers] of Object.entries(config)) {
+    for (const [declaredEvent, rawMatchers] of Object.entries(config)) {
+      const event = effectiveEventFor(declaredEvent);
+      const eventEvidence = event === declaredEvent
+        ? `"${event}"`
+        : `effective "${event}" (declared as agent "${declaredEvent}")`;
       if (!SUPPORTED_EVENT_SET.has(event)) {
         const cap = degradedHookEventCapability(event);
-        if (cap) addFinding(cap, `hook event "${event}" configured in ${where}`);
-        else unassessed.push(`hook event "${event}" (${where})`);
+        if (cap) addFinding(cap, `hook event ${eventEvidence} configured in ${where}`);
+        else unassessed.push(`hook event ${eventEvidence} (${where})`);
       }
       const matchers: unknown[] = Array.isArray(rawMatchers)
         ? rawMatchers
@@ -496,11 +519,11 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
           if (!handler || typeof handler !== "object") continue;
           const type = (handler as { type?: string }).type ?? "command";
           if (type === "command") continue;
-          const cap = lookupCapability(`feature.hook-handler.${type}`);
+          const cap = lookupCapability(hookHandlerCapabilityId(type, event));
           if (cap) {
-            addFinding(cap, `hook handler type "${type}" on "${event}" in ${where}`);
+            addFinding(cap, `hook handler type "${type}" on ${eventEvidence} in ${where}`);
           } else {
-            unassessed.push(`hook handler type "${type}" on "${event}" (${where})`);
+            unassessed.push(`hook handler type "${type}" on ${eventEvidence} (${where})`);
           }
         }
       }
@@ -513,24 +536,43 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // Plugin hooks are scanned from the already-resolved merged config. The
   // parser-stamped pluginId is trusted evidence; source files are never reopened
   // merely to explain a compatibility finding.
-  let pluginHookFindingCount = 0;
-  let pluginHookFindingsOmitted = 0;
-  const pluginHookFingerprints = new Set<string>();
-  const reserveDistinctPluginHookDetail = (fingerprint: string): boolean => {
-    if (pluginHookFingerprints.has(fingerprint)) return false;
-    pluginHookFingerprints.add(fingerprint);
-    if (pluginHookFindingCount >= PLUGIN_POSTURE_DETAIL_MAX) {
-      pluginHookFindingsOmitted += 1;
-      return false;
+  type PluginHookCandidate =
+    | { kind: "finding"; capability: CapabilityEntry; evidence: string }
+    | { kind: "unassessed"; evidence: string };
+  const PLUGIN_HOOK_CANDIDATE_MAX_PER_CLASS = PLUGIN_POSTURE_DETAIL_MAX * 4;
+  const pluginHookCandidates = {
+    safety: [] as PluginHookCandidate[],
+    ordinary: [] as PluginHookCandidate[],
+  };
+  const pluginHookFingerprints = {
+    safety: new Set<string>(),
+    ordinary: new Set<string>(),
+  };
+  const pluginHookCandidateOverflow = { safety: false, ordinary: false };
+  const collectPluginHookCandidate = (
+    candidate: PluginHookCandidate,
+    fingerprint: string,
+    safetyRelevant: boolean,
+  ) => {
+    const classification = safetyRelevant ? "safety" : "ordinary";
+    const fingerprints = pluginHookFingerprints[classification];
+    if (fingerprints.has(fingerprint)) return;
+    if (fingerprints.size >= PLUGIN_HOOK_CANDIDATE_MAX_PER_CLASS) {
+      pluginHookCandidateOverflow[classification] = true;
+      return;
     }
-    pluginHookFindingCount += 1;
-    return true;
+    fingerprints.add(fingerprint);
+    pluginHookCandidates[classification].push(candidate);
   };
   const addPluginHookFinding = (capability: CapabilityEntry, evidence: string) => {
-    if (reserveDistinctPluginHookDetail(`finding|${capability.id}|${evidence}`)) addFinding(capability, evidence);
+    collectPluginHookCandidate(
+      { kind: "finding", capability, evidence },
+      `finding|${capability.id}|${evidence}`,
+      capability.safetyRelevant === true,
+    );
   };
   const addPluginHookUnassessed = (evidence: string) => {
-    if (reserveDistinctPluginHookDetail(`unassessed|${evidence}`)) unassessed.push(evidence);
+    collectPluginHookCandidate({ kind: "unassessed", evidence }, `unassessed|${evidence}`, false);
   };
   if (assembled.mergedHooks && typeof assembled.mergedHooks === "object") {
     for (const [event, matchers] of Object.entries(assembled.mergedHooks)) {
@@ -554,7 +596,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
               : mcpStatusScalar(type, 80) || "unnamed handler type";
             const capability = type === undefined
               ? undefined
-              : lookupCapability(`feature.hook-handler.${type}`);
+              : lookupCapability(hookHandlerCapabilityId(type, event));
             const evidence = `hook handler type "${safeType}" on "${safeEvent}" from installed plugin "${pluginId}"`;
             if (capability) addPluginHookFinding(capability, evidence);
             else addPluginHookUnassessed(`${evidence} (unassessed)`);
@@ -563,9 +605,32 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       }
     }
   }
-  if (pluginHookFindingsOmitted > 0) {
+  const selectedPluginHookCandidates = [
+    ...pluginHookCandidates.safety,
+    ...pluginHookCandidates.ordinary,
+  ].slice(0, PLUGIN_POSTURE_DETAIL_MAX);
+  for (const candidate of selectedPluginHookCandidates) {
+    if (candidate.kind === "finding") addFinding(candidate.capability, candidate.evidence);
+    else unassessed.push(candidate.evidence);
+  }
+  const selectedSafetyCount = Math.min(
+    pluginHookCandidates.safety.length,
+    PLUGIN_POSTURE_DETAIL_MAX,
+  );
+  const selectedOrdinaryCount = selectedPluginHookCandidates.length - selectedSafetyCount;
+  const omittedSafetyCount = pluginHookCandidates.safety.length - selectedSafetyCount;
+  const omittedOrdinaryCount = pluginHookCandidates.ordinary.length - selectedOrdinaryCount;
+  if (omittedSafetyCount > 0 || pluginHookCandidateOverflow.safety) {
+    const capability = lookupCapability("feature.hook-handler.mcp_tool-blocking-enforcement");
+    const lowerBound = omittedSafetyCount + (pluginHookCandidateOverflow.safety ? 1 : 0);
+    const qualifier = pluginHookCandidateOverflow.safety ? "At least " : "";
+    if (capability) addFinding(capability, `${qualifier}${lowerBound} additional safety-relevant installed-plugin hook limitation(s) omitted.`);
+  }
+  if (omittedOrdinaryCount > 0 || pluginHookCandidateOverflow.ordinary) {
     const capability = lookupCapability("feature.plugins-hooks");
-    if (capability) addFinding(capability, `${pluginHookFindingsOmitted} additional installed-plugin hook limitation(s) omitted.`);
+    const lowerBound = omittedOrdinaryCount + (pluginHookCandidateOverflow.ordinary ? 1 : 0);
+    const qualifier = pluginHookCandidateOverflow.ordinary ? "At least " : "";
+    if (capability) addFinding(capability, `${qualifier}${lowerBound} additional installed-plugin hook limitation(s) omitted.`);
   }
 
   // Tool lists (`tools:` on agents, `allowed-tools:` on skills): flag degraded/
@@ -624,6 +689,11 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     if (agent.hooks !== undefined) {
       const cap = lookupCapability("agent.frontmatter.hooks");
       if (cap) addFinding(cap, `agent "${agent.name}" sets hooks:`);
+      scanHooks(
+        agent.hooks,
+        `agent "${agent.name}"`,
+        (event) => event === "Stop" ? "SubagentStop" : event,
+      );
     }
     if (agent.permissionMode !== undefined) {
       // Safety-relevant no-op: an agent restricting its permission mode still
@@ -704,19 +774,38 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
         .sort((left, right) => left.priority - right.priority || left.index - right.index)
         .slice(0, MCP_STATUS_DETAIL_MAX);
   for (const { server } of selectedMcpServers) {
-    const oauthDiagnostic = `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`;
-    if (server.diagnostics.includes(oauthDiagnostic)) {
-      const capability = lookupCapability("feature.mcp-oauth");
+    const dedicatedDiagnostics = [
+      {
+        diagnostic: `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-oauth",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-always-load",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": "role" is a deferred feature in PiCC; ignored (server still runs)`,
+        capabilityId: "feature.mcp-server-role",
+      },
+      {
+        diagnostic: `MCP server "${server.name}": field "url" is ignored on a stdio server`,
+        capabilityId: "feature.mcp-url-without-type-validation",
+      },
+    ] as const;
+    for (const { diagnostic, capabilityId } of dedicatedDiagnostics) {
+      if (!server.diagnostics.includes(diagnostic)) continue;
+      const capability = lookupCapability(capabilityId);
       if (capability) {
         addFinding(
           capability,
-          mcpStatusScalar(oauthDiagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+          mcpStatusScalar(diagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
         );
       }
     }
 
+    const extractedDiagnostics = new Set<string>(dedicatedDiagnostics.map(({ diagnostic }) => diagnostic));
     const remainingDiagnostics = server.diagnostics.filter(
-      (diagnostic) => diagnostic !== oauthDiagnostic,
+      (diagnostic) => !extractedDiagnostics.has(diagnostic),
     );
     let evidence: string | undefined;
     if (remainingDiagnostics.length > 0) {
@@ -876,7 +965,16 @@ export interface McpServerLiveState {
   state: "connecting" | "retrying" | "connected" | "reconnecting" | "failed";
   attempt?: number;
   attemptLimit?: number;
+  toolsAdvertised?: boolean;
+  promptsAdvertised?: boolean;
+  resourcesAdvertised?: boolean;
   toolCount?: number;
+  promptCount?: number;
+  resourceCount?: number;
+  toolDiscoveryError?: string;
+  initialToolDiscoveryFailed?: true;
+  promptDiscoveryError?: string;
+  resourceDiscoveryError?: string;
   diagnostic?: string;
   statusSummary?: string;
 }
@@ -895,6 +993,54 @@ function mcpInactiveTransportSuffix(
   server: ResolvedMcpConfig["servers"][number],
 ): string {
   return server.transport === "sse" ? ` via ${mcpTransportLabel(server.transport)}` : "";
+}
+
+function hasMcpCapabilityState(live: McpServerLiveState): boolean {
+  return live.toolsAdvertised !== undefined || live.promptsAdvertised !== undefined ||
+    live.resourcesAdvertised !== undefined;
+}
+
+function isMcpToolOnlyState(live: McpServerLiveState): boolean {
+  return live.toolsAdvertised === true && live.promptsAdvertised === false &&
+    live.resourcesAdvertised === false && live.toolDiscoveryError === undefined;
+}
+
+function mcpCapabilitySummary(live: McpServerLiveState, retained = false): string {
+  const surfaces: string[] = [];
+  const add = (
+    label: "tools" | "prompts" | "resources",
+    advertised: boolean | undefined,
+    count: number | undefined,
+    discoveryError: string | undefined,
+  ): void => {
+    if (advertised !== true) return;
+    if (discoveryError !== undefined) {
+      surfaces.push(`${label}: advertised, discovery failed`);
+      return;
+    }
+    const safeCount = Number.isSafeInteger(count) && (count ?? -1) >= 0 ? count! : 0;
+    surfaces.push(`${label}: ${safeCount}${retained ? " retained" : ""}`);
+  };
+  add("tools", live.toolsAdvertised, live.toolCount, live.toolDiscoveryError);
+  add("prompts", live.promptsAdvertised, live.promptCount, live.promptDiscoveryError);
+  add("resources", live.resourcesAdvertised, live.resourceCount, live.resourceDiscoveryError);
+  if (surfaces.length > 0) {
+    const summary = surfaces.join(", ");
+    const discoveryFailed = live.toolDiscoveryError !== undefined ||
+      live.promptDiscoveryError !== undefined || live.resourceDiscoveryError !== undefined;
+    return discoveryFailed
+      ? `${summary}; check the server configuration and logs, then restart PiCC`
+      : summary;
+  }
+  if (
+    live.toolsAdvertised === false &&
+    live.promptsAdvertised === false &&
+    live.resourcesAdvertised === false
+  ) return "no tool, prompt, or resource capabilities advertised";
+  const fallbackCount = Number.isSafeInteger(live.toolCount) && (live.toolCount ?? -1) >= 0
+    ? live.toolCount!
+    : 0;
+  return `tools: ${fallbackCount}${retained ? " retained" : ""}`;
 }
 
 function mcpPostureLine(
@@ -927,15 +1073,26 @@ function mcpPostureLine(
           ? ` ${live.attempt}/${live.attemptLimit}`
           : "";
         if (liveTransport === "stdio") {
-          if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
+          if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+            ? `${server.name}: connected (${mcpCapabilitySummary(live)})`
+            : `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
           if (live.state === "connecting") return `${server.name}: connecting`;
-          return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+          const failureDetail = live.initialToolDiscoveryFailed === true
+            ? live.statusSummary ?? "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC."
+            : live.diagnostic ?? "no diagnostic";
+          return `${server.name}: failed — ${boundPostureDiag(failureDetail)}`;
         }
-        if (live.state === "connected") return `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: connected via ${transport} (${mcpCapabilitySummary(live)})`
+          : `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
         if (live.state === "connecting") return `${server.name}: connecting via ${transport}${attempts}`;
         if (live.state === "retrying") return `${server.name}: retrying via ${transport}${attempts}`;
-        if (live.state === "reconnecting") return `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
-        return `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
+        if (live.state === "reconnecting") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: reconnecting via ${transport}${attempts} (${mcpCapabilitySummary(live, true)})`
+          : `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
+        return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: failed via ${transport} (${mcpCapabilitySummary(live, true)}) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`
+          : `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
       }
       case "pending-approval":
         // No enable/decline hint here — the pending finding rendered below
@@ -1044,24 +1201,36 @@ function mcpStatusRow(
     case "retrying":
       return `- ${name}: retrying via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)}`;
     case "connected": {
-      const rawCount = live?.toolCount;
-      const count = Number.isSafeInteger(rawCount) && (rawCount ?? -1) >= 0 ? rawCount! : 0;
       const transport = live?.transport ?? server.transport ?? "unknown";
-      if (transport === "stdio") return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
-      return `- ${name}: connected via ${mcpTransportLabel(transport)} (${count} ${count === 1 ? "tool" : "tools"})`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) && (live.toolCount ?? -1) >= 0 ? live.toolCount! : 0;
+        if (transport === "stdio") return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
+        return `- ${name}: connected via ${mcpTransportLabel(transport)} (${count} ${count === 1 ? "tool" : "tools"})`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live) : "tools: 0";
+      if (transport === "stdio") return `- ${name}: connected (${capabilities})`;
+      return `- ${name}: connected via ${mcpTransportLabel(transport)} (${capabilities})`;
     }
     case "reconnecting": {
-      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
-      return `- ${name}: reconnecting via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${count} retained ${count === 1 ? "tool" : "tools"})`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) ? live.toolCount! : 0;
+        return `- ${name}: reconnecting via ${mcpTransportLabel(live.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${count} retained ${count === 1 ? "tool" : "tools"})`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live, true) : "tools: 0 retained";
+      return `- ${name}: reconnecting via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${capabilities})`;
     }
     case "failed": {
       const summary = mcpStatusScalar(live?.statusSummary ?? "", MCP_STATUS_SUMMARY_MAX);
       const transport = live?.transport ?? server.transport ?? "unknown";
-      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
       if (transport === "stdio") {
         return `- ${name}: failed — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
       }
-      return `- ${name}: failed via ${mcpTransportLabel(transport)} (${count} retained ${count === 1 ? "tool" : "tools"}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) ? live.toolCount! : 0;
+        return `- ${name}: failed via ${mcpTransportLabel(transport)} (${count} retained ${count === 1 ? "tool" : "tools"}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live, true) : "tools: 0 retained";
+      return `- ${name}: failed via ${mcpTransportLabel(transport)} (${capabilities}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
     }
     case "pending approval":
       return `- ${name}: pending approval${mcpInactiveTransportSuffix(server)}`;
@@ -1303,7 +1472,7 @@ function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: 
   return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
 }
 
-const GENERIC_PLUGIN_RUNTIME_REPAIR = /(?:\s*\.?)?\s*Repair or reinstall (?:the affected |the )?plugin in Claude Code, then relaunch PiCC\.?(?=\s*;\s*execution did not occur|\s*$)/iu;
+const GENERIC_PLUGIN_RUNTIME_REPAIR = /(?:\s*\.?)?\s*(?:Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required|(?:Repair|Reconcile) or reinstall (?:the affected |the )?plugin (?:in|through) Claude Code, then (?:run the canonical \/reload in the interactive TUI or exit and relaunch|relaunch) PiCC)\.?(?=\s*;\s*(?:execution did not occur|no provider request was made)|\s*$)/iu;
 
 interface NormalizedPluginRuntimeFinding {
   evidence: string;
@@ -1313,12 +1482,9 @@ interface NormalizedPluginRuntimeFinding {
 function normalizePluginRuntimeFinding(value: string): NormalizedPluginRuntimeFinding {
   const withoutGenericRepair = value.replace(GENERIC_PLUGIN_RUNTIME_REPAIR, "").trim();
   const classification = withoutGenericRepair.toLowerCase();
-  const recovery = /persistent data|data directory/.test(classification) &&
-      /unreadable-path|wrong-kind|ancestor-wrong-kind|eacces|eperm|access|ownership|writab|not a directory/.test(classification)
-    ? "Recovery: check plugin-data ownership, writability, and directory kinds, then relaunch PiCC."
-    : /path-escape|changed-path|invalid-path|mismatch|contain|integrity|runtime context|lazy path validation|no longer readable/.test(classification)
-      ? "Recovery: reinstall or reconcile the qualified plugin with Claude Code, then relaunch PiCC."
-      : "Recovery: if plugin-data access or directory kind is the cause, check ownership and writability; otherwise reconcile the qualified plugin with Claude Code, then relaunch PiCC.";
+  const recovery = /\((?:unreadable-path|wrong-kind)\)/.test(classification)
+    ? "Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required."
+    : `Recovery: reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
   return { evidence: mcpStatusScalar(withoutGenericRepair, 500), recovery };
 }
 

@@ -20,6 +20,8 @@ import {
 } from "../src/registry/compat-report.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
 import { resolveInstalledPlugins } from "../src/claude/plugins.js";
+import { resolveMcpConfig } from "../src/discovery/mcp.js";
+import { loadSettings } from "../src/discovery/settings.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
@@ -162,6 +164,25 @@ function makeMcp(overrides: Partial<ResolvedMcpConfig> = {}): ResolvedMcpConfig 
   return { servers: [], diagnostics: [], ...overrides };
 }
 
+function resolveAuditedMcp(block: Record<string, unknown>): ResolvedMcpConfig {
+  const names = Object.keys(block);
+  return resolveMcpConfig({
+    projectRoot: path.join(os.tmpdir(), "picc-registry-audit-root"),
+    mcpJson: {
+      servers: normalizeMcpServerBlock(block, ".mcp.json"),
+      diagnostics: [],
+      present: true,
+    },
+    mcpSettings: [{
+      scope: "user",
+      sourcePath: path.join(os.tmpdir(), "picc-registry-audit-user-settings.json"),
+      enabledMcpjsonServers: names,
+    }],
+    env: {} as NodeJS.ProcessEnv,
+    isGitTracked: () => false,
+  });
+}
+
 const tempDirs: string[] = [];
 function makeTempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-registry-test-"));
@@ -239,15 +260,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/transport-neutral MCP tool proxies/, /first successfully discovered/, /catalog across remote outages/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/, /reconnect never widens/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
+    { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
     { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /siblings that fail before initial catalog discovery add no tools/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
     { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
-    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /retained tool counts/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
-    { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/at most three transient retries at 1\/2\/4 s/, /five reconnects run at 1\/2\/4\/8\/16 s/], precedence: [/aggregate MCP_TIMEOUT/, /discovery retries only network\/5xx/, /authentication\/not-found\/permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
+    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
+    { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });
@@ -289,15 +310,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     );
   });
 
-  it("independently pins the restored MCP proxy qualification families and ownership", () => {
+  it("independently pins the restored MCP proxy qualification families", () => {
     const proxy = lookupCapability("tool.mcp__*")?.note ?? "";
     for (const qualification of [
       "Deny rules at every grammar level",
       "guard's call-time deny as the backstop",
       "deny matching is case-sensitive",
-      "After aggregate initial settlement, one immutable tool universe is registered",
-      "fresh proxy objects per dispatch over that same universe",
-      "Reconnect never widens it",
       "input schemas are normalized",
       "Claude passes schemas through verbatim",
       "descriptions are bounded at 2KB",
@@ -307,17 +325,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "structuredContent is ignored",
       "Claude renders images natively",
       "feature.tool-output-clip",
-      "catalog across remote outages and terminal failure remains immutable",
       "calls resolve the current client",
     ]) expect(proxy, qualification).toContain(qualification);
-
-    const listChanged = lookupCapability("feature.mcp-list-changed")?.note ?? "";
-    expect(listChanged).toContain("unsupported");
-    expect(listChanged).toContain("immutable original-catalog behavior belongs to tool.mcp__*");
-    expect(listChanged).not.toContain("first successfully discovered");
-    expect(lookupCapability("feature.mcp-remote-transports")?.note).not.toContain(
-      "immutable original",
-    );
   });
 
   it("independently pins restored aggregate, status, and approval qualification families", () => {
@@ -381,11 +390,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const id of [
       "feature.mcp-oauth",
       "feature.mcp-headers-helper",
-      "feature.mcp-prompts",
-      "feature.mcp-resources",
       "feature.mcp-tool-search",
       "feature.mcp-list-changed",
       "feature.mcp-elicitation",
+      "feature.mcp-resource-templates",
+      "feature.mcp-sampling",
       "feature.mcp-roots",
       "feature.mcp-channels",
       "feature.mcp-managed-config",
@@ -407,17 +416,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
     // The blanket "MCP deferred" wording is swept off entries whose surface now
     // partially runs; each names its specific deferred surface instead.
-    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toBe(
-      "MCP elicitation hook events — parsed and never fired: elicitation itself is a deferred MCP surface (see feature.mcp-elicitation), while supported MCP tools otherwise run",
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain(
+      "historical PiCC compatibility alias",
     );
-    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toBe(
-      "PiCC imposes no MCP server idle timeout; remote transport or server loss may still enter recovery or terminal failure",
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain(
+      "not the current Claude Code hook contract",
     );
-    expect(lookupCapability("feature.mcp-oauth")?.note).toBe(
-      "the real oauth MCP entry field is recognized key-only and ignored so the server may otherwise run; interactive MCP OAuth login, value parsing, requests, and token storage are deferred, and authentication failures direct users to configured static headers without claiming an HTTP status proves OAuth is required",
-    );
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the SESSION's MCP tools");
-    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("MCP tools themselves run");
+    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toContain("transport-specific idle timers");
+    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toContain("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0");
+    const oauth = lookupCapability("feature.mcp-oauth")?.note ?? "";
+    for (const surface of ["401/403 auth detection", "automatic token refresh", "fixed callback port", "preconfigured credentials", "authServerMetadataUrl", "oauth.scopes", "dynamic registration", "offline_access", "insufficient_scope"]) {
+      expect(oauth).toContain(surface);
+    }
+    expect(oauth).toContain("`oauth` field is ignored");
+    expect(oauth).toContain("server still runs when otherwise usable");
+    expect(oauth).toContain("must not rely on `oauth` under PiCC");
+    expect(oauth).toContain("static headers are PiCC's supported alternative");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
+    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
       expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
@@ -494,10 +510,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ] as const) {
       expect(lookupCapability(id)?.tier, id).toBe("degraded-noop");
       expect(lookupCapability(id)?.note, id).toContain(command);
-      expect(lookupCapability(id)?.note, id).toMatch(/guidance|explains/);
+      expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
+      expect(lookupCapability(id)?.note, id).toContain("whole extension including installed plugin state");
       expect(lookupCapability(id)?.note, id).toContain("no lifecycle mutation");
     }
     expect(lookupCapability("feature.plugins-command-plugins")?.note).toContain("PiCC-defined reserved alias");
+    expect(lookupCapability("feature.plugins-command-reload")?.note).toContain("performs no reload");
     for (const [id, phrase] of [
       ["feature.plugin-install", "installation is not implemented"],
       ["feature.plugin-update", "update is not implemented"],
@@ -507,6 +525,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ] as const) {
       expect(lookupCapability(id)?.tier, id).toBe("not-supported");
       expect(lookupCapability(id)?.note, id).toContain(phrase);
+    }
+    for (const id of ["feature.plugin-install", "feature.plugin-update", "feature.plugin-uninstall"]) {
+      expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
+      expect(lookupCapability(id)?.note, id).toContain("or relaunch PiCC");
     }
     expect(lookupCapability("feature.plugins-other-components")?.note).toContain("feature.mcp-plugin-servers");
   });
@@ -571,13 +593,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/PARTIAL residual/, /notice is next-turn/],
       precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/],
-      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /print\/RPC rendering unchanged/],
+      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /shared terminal recovery guidance also reaches print\/RPC delivery/],
       parity: [/Claude-faithful/, /not verified parity/, /PiCC's conservative default/, /subagents\.maxDepth.*explicit nesting control/],
       split: [/feature\.background-agents/, /tool\.Agent\.fork/],
     },
     { id: "tool.Task", tier: "partial", core: [/alias of the Agent subagent-dispatch tool/, /loud-failure/], gap: [/conditional/, /remaining uncollected/], precedence: [/background-by-default/, /terminal TaskOutput collection suppresses/], visibility: [/settlement notice/], parity: [/PiCC UX hardening rather than verified parity/], split: [/tool\.Agent\.fork/] },
     { id: "feature.tool-output-clip", tier: "partial", core: [/tool-result clip backstop/, /head \+ tail kept, middle dropped/], gap: [/Built-in Read\/Bash keep Pi's OWN 50 KB truncation/], precedence: [/clipMaxTokens, default 20k tokens/], visibility: [/model-visible/, /human rendering summarizes/], parity: [/PiCC HARDENING, NOT Claude parity/, /DIRECTIONAL DIVERGENCE/], split: [/tool\.Read \/ tool\.Bash/] },
-    { id: "tool.SendMessage", tier: "partial", core: [/resumes a completed/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
+    { id: "tool.SendMessage", tier: "partial", core: [/resumes any actually resumable completed or failed subagent/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
     { id: "tool.Agent.fork", tier: "partial", core: [/inherits the parent conversation/, /OUTPUT ISOLATION IS KEPT/], gap: [/NON-RESUMABLE/, /CANNOT SPAWN ANOTHER FORK/], precedence: [/CLAUDE_CODE_FORK_SUBAGENT/, /UNSET ⇒ ENABLED/, /CLAUDE_CODE_SUBAGENT_MODEL/, /per-call `model`/], visibility: [/visibly degrades/, /footer notice/], parity: [/VERIFIED behavior/, /PiCC-DEFINED \/ INFERRED/], split: [/SendMessage/] },
     {
       id: "tool.TaskOutput",
@@ -595,12 +617,74 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
       precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
-      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible settled retrieval/],
+      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible completed or truncated-completed resumable retrieval/],
       parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
     },
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
+  });
+
+  it("keeps the full state-aware policy only in tool.Agent and pins each consumer consequence", () => {
+    const canonical = lookupCapability("tool.Agent")?.note ?? "";
+    for (const clause of [
+      "STATE-AWARE RECOVERY",
+      "complete lifecycle observation proves a transient-category failure had no successful assistant response, retained model/tool-call content, or started tool execution",
+      "Observed progress or incomplete lifecycle evidence takes the conservative branch",
+      "SendMessage is favored only when the result says the agent is factually resumable",
+      "otherwise retained work and possible side effects require review before another explicit dispatch",
+      "Non-transient or unclassified failures recommend neither blind replacement nor resume",
+      "Guidance and resumability are separate",
+      "PiCC takes no automatic action",
+      "not verified Claude Code recovery-policy parity",
+    ]) expect(canonical, clause).toContain(clause);
+
+    const consumers: Array<{ id: string; consequences: readonly string[] }> = [
+      {
+        id: "tool.Task",
+        consequences: ["terminal failures with a structured recovery disposition carry tool.Agent's canonical state-aware guidance", "loud-failure/agent-id semantics"],
+      },
+      {
+        id: "tool.TaskOutput",
+        consequences: ["completed or truncated-completed resumable results may carry identity framing", "Failed results with a structured recovery disposition carry the separate state-aware guidance canonically defined by tool.Agent", "a failed task with a structured recovery disposition reports failed status with separate state-aware guidance"],
+      },
+      {
+        id: "feature.background-agents",
+        consequences: ["failed terminal delivery with a structured recovery disposition carries tool.Agent's canonical state-aware guidance", "state-aware terminal recovery guidance when a structured recovery disposition exists", "shared with print/RPC delivery"],
+      },
+      {
+        id: "tool.Agent.fork",
+        consequences: ["non-resumable consumer of tool.Agent's failure presenter", "require review of retained work and possible side effects rather than a resume recommendation"],
+      },
+      {
+        id: "skill.frontmatter.context",
+        consequences: ["consumes tool.Agent's state-aware failure presenter", "require review of retained work and possible side effects before another explicit dispatch"],
+      },
+    ];
+
+    for (const consumer of consumers) {
+      const note = lookupCapability(consumer.id)?.note ?? "";
+      for (const consequence of consumer.consequences) expect(note, consumer.id).toContain(consequence);
+      expect(note, `${consumer.id} must not duplicate the canonical policy`).not.toContain("complete lifecycle observation proves");
+      expect(note, `${consumer.id} must not own the canonical marker`).not.toContain("STATE-AWARE RECOVERY");
+    }
+
+    expect(lookupCapability("tool.Task")?.note).not.toContain("its terminal failures carry tool.Agent's canonical state-aware guidance");
+    expect(lookupCapability("tool.TaskOutput")?.note).not.toContain("Failed results carry the separate state-aware guidance");
+    expect(lookupCapability("tool.TaskOutput")?.note).not.toContain("a failed task reports failed status with separate state-aware guidance");
+    expect(lookupCapability("feature.background-agents")?.note).not.toContain("failed terminal delivery carries tool.Agent's canonical state-aware guidance");
+    expect(lookupCapability("feature.background-agents")?.note).not.toContain("state-aware terminal recovery guidance — are shared with print/RPC delivery");
+  });
+
+  it("limits resume trailers to completed or truncated-completed resumable results", () => {
+    const agent = lookupCapability("tool.Agent")?.note ?? "";
+    const taskOutput = lookupCapability("tool.TaskOutput")?.note ?? "";
+
+    expect(agent).toContain("completed or truncated-completed resumable result appends a clearly-delimited in-band identity/resume trailer");
+    expect(taskOutput).toContain("completed or truncated-completed resumable results may carry identity framing");
+    expect(taskOutput).toContain("model-visible completed or truncated-completed resumable retrieval may append the existing resume identity framing");
+    expect(agent).not.toContain("a resumable dispatch appends");
+    expect(taskOutput).not.toContain("model-visible settled retrieval may append");
   });
 
   it("keeps touched subagent notes conservative about nesting and user-facing about resize", () => {
@@ -665,7 +749,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
       precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
-      visibility: [/interactive TUI/, /canonical\/model-visible results/, /print\/RPC output remain unchanged/],
+      visibility: [/interactive TUI/, /canonical model-visible results/, /shared with print\/RPC delivery/],
       parity: [/NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
       split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/],
     },
@@ -868,7 +952,14 @@ describe("capability matrix freshness", () => {
     expect(norm(committed)).toBe(norm(firstRender));
   });
 
+  it("pins the complete bounded user-guide TUI-only bullet without a print/RPC exemption", () => {
+    const guidePath = fileURLToPath(new URL("../doc/user-guide.md", import.meta.url));
+    const guide = fs.readFileSync(guidePath, "utf8");
+    const bullet = guide.match(/^- \*\*Interactive TUI only\.\*\*[^\n]*(?:\n  [^\n]*)*/m)?.[0].replace(/\r/g, "");
 
+    expect(bullet).toBe("- **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the\n  interactive TUI.");
+    expect(bullet).not.toMatch(/print|RPC/);
+  });
 });
 
 describe("capabilityForToolName", () => {
@@ -882,7 +973,7 @@ describe("capabilityForToolName", () => {
     const cap = capabilityForToolName("mcp__myserver__do_thing");
     expect(cap.id).toBe("tool.mcp__*");
     expect(cap.tier).toBe("partial");
-    expect(cap.safetyRelevant).toBe(true);
+    expect(cap.safetyRelevant).toBe(false);
   });
 
   it("synthesizes a safe not-supported entry for unknown tools without mutating the registry", () => {
@@ -1014,6 +1105,76 @@ describe("buildCompatReport", () => {
     expect(report.unassessed.some((u) => u.includes('"SomeBrandNewEvent"'))).toBe(true);
   });
 
+  it("classifies mcp_tool handlers for every supported hook event", () => {
+    const blockingEvents = [
+      "PreToolUse",
+      "UserPromptSubmit",
+      "Stop",
+      "SubagentStop",
+      "PreCompact",
+      "WorktreeCreate",
+    ] as const satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][];
+    const ordinaryEvents = [
+      "PostToolUse",
+      "PostToolUseFailure",
+      "SessionStart",
+      "SessionEnd",
+      "SubagentStart",
+      "PostCompact",
+      "WorktreeRemove",
+    ] as const satisfies readonly (typeof SUPPORTED_HOOK_EVENTS)[number][];
+    const root = makeTempDir();
+    const userDir = path.join(root, "user");
+    fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.writeFileSync(path.join(root, ".claude", "settings.json"), JSON.stringify({
+      hooks: Object.fromEntries(SUPPORTED_HOOK_EVENTS.map((event) => [
+        event,
+        [{ hooks: [{ type: "mcp_tool", server: "policy", tool: "check", input: {} }] }],
+      ])),
+    }));
+    const settings = loadSettings({ cwd: root, projectRoot: root, userDir, managedPaths: [] });
+    const project = makeProject({ settings });
+    const report = buildCompatReport(project);
+
+    expect(blockingEvents.length + ordinaryEvents.length).toBe(SUPPORTED_HOOK_EVENTS.length);
+    for (const event of SUPPORTED_HOOK_EVENTS) {
+      expect([...blockingEvents, ...ordinaryEvents], event).toContain(event);
+    }
+    expect(report.safetyFindings).toHaveLength(blockingEvents.length);
+    expect(report.findings).toHaveLength(ordinaryEvents.length);
+    for (const event of blockingEvents) {
+      const finding = report.safetyFindings.find(({ evidence }) => evidence.includes(`on "${event}"`));
+      expect(finding, event).toMatchObject({
+        capability: {
+          id: "feature.hook-handler.mcp_tool-blocking-enforcement",
+          safetyRelevant: true,
+        },
+      });
+      expect(report.findings.some(({ evidence }) => evidence.includes(`on "${event}"`)), event)
+        .toBe(false);
+    }
+    for (const event of ordinaryEvents) {
+      const finding = report.findings.find(({ evidence }) => evidence.includes(`on "${event}"`));
+      expect(finding, event).toMatchObject({
+        capability: { id: "feature.hook-handler.mcp_tool", safetyRelevant: false },
+      });
+      expect(report.safetyFindings.some(({ evidence }) => evidence.includes(`on "${event}"`)), event)
+        .toBe(false);
+    }
+
+    const blockingNote = lookupCapability("feature.hook-handler.mcp_tool-blocking-enforcement")?.note ?? "";
+    expect(blockingNote).toContain("For events where PiCC enforces command-hook blocking results");
+    expect(blockingNote).toContain("WorktreeCreate creation-time enforcement or other unavailable enforcement");
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("SAFETY feature.hook-handler.mcp_tool-blocking-enforcement");
+    expect(doctor).toContain("cannot enforce valid deny/block output");
+    expect(doctor).toContain("For events where PiCC enforces command-hook blocking results, use a supported command hook");
+    expect(doctor).toContain("use Claude Code when WorktreeCreate creation-time enforcement or other unavailable enforcement is required");
+    expect(doctor).toContain("- feature.hook-handler.mcp_tool —");
+    expect(doctor).not.toContain("SAFETY feature.hook-handler.mcp_tool —");
+  });
+
   it("flags agents with memory/mcpServers/hooks set", () => {
     const project = makeProject({
       agents: [
@@ -1035,6 +1196,66 @@ describe("buildCompatReport", () => {
       expect(finding, id).toBeDefined();
       expect(finding?.evidence).toContain('agent "stateful"');
     }
+  });
+
+  it("classifies agent-scoped mcp_tool handlers by their effective events", () => {
+    const mcpToolHandler = {
+      type: "mcp_tool" as const,
+      raw: { type: "mcp_tool", server: "policy", tool: "check", input: {} },
+    };
+    const project = makeProject({
+      agents: [makeAgent({
+        name: "hooked",
+        hooks: {
+          PreToolUse: [{ hooks: [mcpToolHandler] }],
+          Stop: [{ hooks: [mcpToolHandler] }],
+          SessionStart: [{ hooks: [mcpToolHandler] }],
+        },
+      })],
+    });
+    const report = buildCompatReport(project);
+
+    const aggregate = report.findings.find(({ capability }) => capability.id === "agent.frontmatter.hooks");
+    expect(aggregate?.evidence).toContain('agent "hooked"');
+
+    const preToolUse = report.safetyFindings.find(({ evidence }) => evidence.includes('on "PreToolUse"'));
+    expect(preToolUse).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool-blocking-enforcement", safetyRelevant: true },
+    });
+    const stop = report.safetyFindings.find(({ evidence }) => evidence.includes('effective "SubagentStop"'));
+    expect(stop).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool-blocking-enforcement", safetyRelevant: true },
+      evidence: expect.stringContaining('declared as agent "Stop"'),
+    });
+    expect(stop?.evidence).not.toContain('on "Stop"');
+
+    const sessionStart = report.findings.find(({ evidence }) => evidence.includes('on "SessionStart"'));
+    expect(sessionStart).toMatchObject({
+      capability: { id: "feature.hook-handler.mcp_tool", safetyRelevant: false },
+    });
+    expect(report.safetyFindings.some(({ evidence }) => evidence.includes('SessionStart'))).toBe(false);
+
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("SAFETY feature.hook-handler.mcp_tool-blocking-enforcement");
+    expect(doctor).toContain("For events where PiCC enforces command-hook blocking results, use a supported command hook");
+    expect(doctor).toContain("use Claude Code when WorktreeCreate creation-time enforcement or other unavailable enforcement is required");
+    expect(doctor).not.toContain("SAFETY feature.hook-handler.mcp_tool —");
+  });
+
+  it("tolerates malformed raw agent hook frontmatter without throwing", () => {
+    const malformedHooks = {
+      PreToolUse: "not-a-matcher",
+      Stop: null,
+      SessionStart: [{ hooks: "not-a-handler-list" }, null],
+    } as unknown as NonNullable<ClaudeAgent["hooks"]>;
+    const project = makeProject({ agents: [makeAgent({ name: "malformed", hooks: malformedHooks })] });
+
+    expect(() => buildCompatReport(project)).not.toThrow();
+    expect(buildCompatReport(project).findings).toEqual([
+      expect.objectContaining({
+        capability: expect.objectContaining({ id: "agent.frontmatter.hooks" }),
+      }),
+    ]);
   });
 
   it("flags degraded/not-supported tools in agents' tools: and routes unknown tools to unassessed", () => {
@@ -1171,7 +1392,11 @@ describe("buildCompatReport", () => {
       ...makeProject(),
       mergedHooks: {
         Notification: [{ hooks: [{ type: "command", command: "notify.sh", pluginId: "hooky@market", raw: {} }] }],
-        PreToolUse: [{ hooks: [{ type: "prompt", pluginId: "hooky@market", raw: {} }] }],
+        PreToolUse: [{ hooks: [
+          { type: "prompt", pluginId: "hooky@market", raw: {} },
+          { type: "mcp_tool", pluginId: "hooky@market", raw: {} },
+        ] }],
+        SessionStart: [{ hooks: [{ type: "mcp_tool", pluginId: "hooky@market", raw: {} }] }],
       },
     } as unknown as ClaudeProject;
     const report = buildCompatReport(project);
@@ -1181,6 +1406,79 @@ describe("buildCompatReport", () => {
       (f) => f.capability.id === "feature.hook-handler.prompt",
     );
     expect(handler?.evidence).toContain('installed plugin "hooky@market"');
+    expect(report.safetyFindings).toContainEqual(expect.objectContaining({
+      capability: expect.objectContaining({ id: "feature.hook-handler.mcp_tool-blocking-enforcement" }),
+      evidence: expect.stringContaining('on "PreToolUse" from installed plugin "hooky@market"'),
+    }));
+    expect(report.findings).toContainEqual(expect.objectContaining({
+      capability: expect.objectContaining({ id: "feature.hook-handler.mcp_tool" }),
+      evidence: expect.stringContaining('on "SessionStart" from installed plugin "hooky@market"'),
+    }));
+    expect(report.safetyFindings.some(({ evidence }) => evidence.includes('on "SessionStart"'))).toBe(false);
+  });
+
+  it("prioritizes late safety-relevant installed-plugin hook details within the shared budget", () => {
+    const project = {
+      ...makeProject(),
+      mergedHooks: {
+        SessionStart: [{ hooks: Array.from({ length: 20 }, (_, index) => ({
+          type: "prompt",
+          pluginId: `ordinary-${index}@market`,
+          raw: {},
+        })) }],
+        PreToolUse: [{ hooks: [{
+          type: "mcp_tool",
+          pluginId: "blocking@market",
+          raw: {},
+        }] }],
+      },
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+
+    expect(report.safetyFindings).toContainEqual(expect.objectContaining({
+      capability: expect.objectContaining({
+        id: "feature.hook-handler.mcp_tool-blocking-enforcement",
+        safetyRelevant: true,
+      }),
+      evidence: expect.stringContaining('from installed plugin "blocking@market"'),
+    }));
+    expect(report.findings.filter(({ capability, evidence }) =>
+      capability.id === "feature.hook-handler.prompt" && evidence.includes("ordinary-"),
+    )).toHaveLength(19);
+    expect(report.findings).toContainEqual(expect.objectContaining({
+      capability: expect.objectContaining({ id: "feature.plugins-hooks" }),
+      evidence: "1 additional installed-plugin hook limitation(s) omitted.",
+    }));
+  });
+
+  it("emits a safety-relevant omission when blocking installed-plugin hook candidates exceed the bounded collection", () => {
+    const project = {
+      ...makeProject(),
+      mergedHooks: {
+        PreToolUse: [{ hooks: Array.from({ length: 100 }, (_, index) => ({
+          type: "mcp_tool",
+          pluginId: `blocking-${index}@market`,
+          raw: {},
+        })) }],
+      },
+    } as unknown as ClaudeProject;
+    const report = buildCompatReport(project);
+    const safetyDetails = report.safetyFindings.filter(({ evidence }) =>
+      evidence.includes('from installed plugin "blocking-'),
+    );
+    const safetyOmissions = report.safetyFindings.filter(({ evidence }) =>
+      evidence.includes("additional safety-relevant installed-plugin hook limitation(s) omitted"),
+    );
+
+    expect(safetyDetails).toHaveLength(20);
+    expect(safetyOmissions).toEqual([expect.objectContaining({
+      capability: expect.objectContaining({
+        id: "feature.hook-handler.mcp_tool-blocking-enforcement",
+        safetyRelevant: true,
+      }),
+      evidence: "At least 61 additional safety-relevant installed-plugin hook limitation(s) omitted.",
+    })]);
+    expect(safetyOmissions[0]?.evidence).not.toContain("blocking-");
   });
 
   it("tolerates malformed plugin outcome input without crashing the scan", () => {
@@ -1268,6 +1566,8 @@ describe("buildCompatReport", () => {
         expect(report.findings.filter((finding) => finding.capability.id === "feature.plugins-installed-selection")).toHaveLength(1);
         expect(doctor.match(/all enabled plugins were rejected/g)).toHaveLength(1);
         expect(doctor.split(scenario.recovery)).toHaveLength(2);
+        expect(doctor).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+        expect(doctor).not.toContain("/new");
         for (const incompatible of recoveries.filter((recovery) => recovery !== scenario.recovery)) expect(doctor).not.toContain(incompatible);
         for (const secret of ["private-one", "private-two", root, "C:/RAW", "unqualified RAW"]) expect(doctor).not.toContain(secret);
         expect(doctor.toLowerCase()).not.toContain("reinstall");
@@ -1367,11 +1667,16 @@ describe("buildCompatReport", () => {
       expect(doctor).toContain(`${status}: 1`);
     }
     for (const identity of ["missing@market", "future@market", "ambiguous@market", "blocked@market", "broken@market", "escape@market"]) {
-      expect(doctor).toContain(identity);
+      const outcomeLine = doctor.split("\n").find((line) => line.includes(identity)) ?? "";
+      expect(outcomeLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+      expect(outcomeLine).not.toContain("/new");
     }
     expect(doctor.match(/no fallback content loaded/g)?.length).toBeGreaterThanOrEqual(6);
     expect(doctor).toContain("Administrator policy (registry-hklm) was unreadable; weaker policy was suppressed");
     expect(doctor).toContain("non-boolean enablement value was ignored");
+    const enablementLine = doctor.split("\n").find((line) => line.includes("non-boolean enablement value was ignored")) ?? "";
+    expect(enablementLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(enablementLine).not.toContain("/new");
     for (const [field, alternative] of [
       ["hooks", "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."],
       ["mcpServers", "Configure session MCP servers and gate their tools, or remove this field; per-agent MCP configuration is not retained."],
@@ -1424,7 +1729,7 @@ describe("buildCompatReport", () => {
     expect(selection[0]?.evidence).toContain("plugins/installed_plugins.json");
     expect(selection[4]?.evidence).toContain("missing@market");
     expect(selection[19]?.evidence).toContain("reject-14@market");
-    expect(selection[20]?.evidence).toBe("5 additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then relaunch PiCC.");
+    expect(selection[20]?.evidence).toBe("5 additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
     expect(selection[20]?.evidence).not.toMatch(/outcome|repair/i);
     expect(selection.map((finding) => finding.evidence).join("\n")).not.toContain("reject-15@market");
   });
@@ -1491,6 +1796,11 @@ describe("buildCompatReport", () => {
     expect(doctor).not.toContain("Administrator policy (override)");
     expect(doctor).not.toContain("Administrator policy (registry-hkcu)");
     expect(doctor.match(/Administrator policy/g)).toHaveLength(3);
+    const managedPolicyLine = doctor.split("\n").find((line) =>
+      line.includes("Administrator policy (system-file) was malformed")
+    ) ?? "";
+    expect(managedPolicyLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(managedPolicyLine).not.toContain("/new");
   });
 
   it("keeps a clean loaded outcome summary-only and gives loaded component limitations bounded actions", () => {
@@ -1533,6 +1843,7 @@ describe("buildCompatReport", () => {
     expect(doctor).toContain("Correct the applicable component declaration, access, or installed file/directory kind in Claude Code");
     expect(doctor).toContain("stripped@market: loaded with unsupported component content; some declared content was stripped");
     expect(doctor).toContain("Remove or replace the unsupported declaration or content in Claude Code");
+    expect(doctor.match(/run the canonical \/reload in the interactive TUI or exit and relaunch PiCC/g)).toHaveLength(2);
     expect(doctor).toMatch(/skipped|ignored|stripped|degraded/i);
     expect(doctor).not.toContain("no fallback content loaded");
     expect(doctor).not.toMatch(/affected component did not load|whole plugin failed|component failed|plugin failed/i);
@@ -1621,7 +1932,8 @@ describe("buildCompatReport", () => {
     expect(doctor).toContain("plugin installed-state or blocklist data is malformed");
     expect(doctor).toContain("Check those Claude Code state inputs");
     expect(doctor).toContain("Check the applicable component declaration and installed file or directory kind");
-    expect(doctor).toContain("Reinstall or reconcile the qualified plugin with Claude Code");
+    expect(doctor).toContain("Reconcile or reinstall the qualified plugin through Claude Code");
+    expect(doctor).not.toContain("reinstall or reconcile");
     expect(doctor).not.toMatch(/administrator|untrusted by administrator|Ask the administrator/i);
     expect(doctor).not.toContain("Inspect /doctor");
   });
@@ -1699,89 +2011,108 @@ describe("buildCompatReport", () => {
     expect(diags[0]!.evidence).not.toContain("/secret/expanded/bin");
   });
 
-  it("routes the key-only deferred oauth diagnostic to its dedicated capability", () => {
+  it.each([
+    ["alwaysLoad", "feature.mcp-server-always-load"],
+    ["role", "feature.mcp-server-role"],
+  ] as const)("attributes a loader-normalized %s-only server through the full resolver pipeline", (field, capabilityId) => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "oauth-server",
-          status: "enabled",
-          diagnostics: [
-            'MCP server "oauth-server": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
-          ],
-        })],
-      }),
+      mcp: resolveAuditedMcp({ only: { command: "node", [field]: true } }),
     });
     const report = buildCompatReport(project);
     expect(report.findings).toEqual([
       expect.objectContaining({
-        capability: expect.objectContaining({ id: "feature.mcp-oauth" }),
-        evidence: 'MCP server "oauth-server": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
+        capability: expect.objectContaining({ id: capabilityId }),
+        evidence: `MCP server "only": "${field}" is a deferred feature in PiCC; ignored (server still runs)`,
       }),
     ]);
-    expect(JSON.stringify(report)).not.toContain("OAUTH_VALUE_CANARY");
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain(`${capabilityId} —`);
+    expect(rendered).toContain("ignored");
+    expect(rendered).toContain("server still runs");
+    if (field === "role") {
+      expect(rendered).toContain("must not rely on the field under PiCC");
+      expect(rendered).toContain("unverified");
+    } else {
+      expect(rendered).toContain("tool-search exemption");
+      expect(rendered).toContain("Check `/mcp` readiness");
+      expect(rendered).toContain("use Claude Code if the startup guarantee is required");
+    }
   });
 
-  it("splits a loader-produced oauth diagnostic from unrelated evidence on the same server", () => {
-    const [loaded] = normalizeMcpServerBlock({
-      mixed: {
-        command: "node",
-        oauth: { clientId: "OAUTH_VALUE_CANARY" },
-        futureOption: true,
-      },
-    }, ".mcp.json");
-    expect(loaded).toBeDefined();
+  it("attributes an untyped command-plus-URL diagnostic through the full resolver pipeline", () => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "mixed",
-          status: "enabled",
-          diagnostics: loaded!.diagnostics,
-        })],
+      mcp: resolveAuditedMcp({ hybrid: { command: "node", url: "https://example.invalid/mcp" } }),
+    });
+    const report = buildCompatReport(project);
+    const exactEvidence = 'MCP server "hybrid": field "url" is ignored on a stdio server';
+    expect(report.findings).toEqual([
+      expect.objectContaining({
+        capability: expect.objectContaining({ id: "feature.mcp-url-without-type-validation" }),
+        evidence: exactEvidence,
+      }),
+    ]);
+    expect(report.findings.some((finding) => finding.capability.id === "feature.mcp")).toBe(false);
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain("feature.mcp-url-without-type-validation");
+    expect(rendered).toContain(exactEvidence);
+    expect(rendered).toContain("set an explicit `type`");
+    expect(rendered).toContain("do not rely on Claude's validation behavior under PiCC");
+  });
+
+  it("splits remote OAuth, alwaysLoad, and role diagnostics while retaining the unrelated fallback", () => {
+    const project = makeProject({
+      mcp: resolveAuditedMcp({
+        mixed: {
+          type: "http",
+          url: "https://example.invalid/mcp",
+          oauth: { clientId: "OAUTH_VALUE_CANARY" },
+          alwaysLoad: true,
+          role: "reviewer",
+          futureOption: true,
+        },
       }),
     });
-
     const report = buildCompatReport(project);
-    const oauth = report.findings.filter(
-      (finding) => finding.capability.id === "feature.mcp-oauth",
-    );
-    const ordinary = report.findings.filter(
-      (finding) => finding.capability.id === "feature.mcp",
-    );
-    expect(oauth).toHaveLength(1);
-    expect(oauth[0]!.evidence).toBe(
+    const byId = new Map<string, typeof report.findings>();
+    for (const finding of report.findings) {
+      const findings = byId.get(finding.capability.id) ?? [];
+      findings.push(finding);
+      byId.set(finding.capability.id, findings);
+    }
+    expect(byId.get("feature.mcp-oauth")?.[0]?.evidence).toBe(
       'MCP server "mixed": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
     );
-    expect(oauth[0]!.evidence).not.toContain("futureOption");
-    expect(ordinary).toHaveLength(1);
-    expect(ordinary[0]!.evidence).toBe(
+    expect(byId.get("feature.mcp-server-always-load")?.[0]?.evidence).toBe(
+      'MCP server "mixed": "alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(byId.get("feature.mcp-server-role")?.[0]?.evidence).toBe(
+      'MCP server "mixed": "role" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(byId.get("feature.mcp-remote-transports")?.[0]?.evidence).toBe(
       'MCP server "mixed": unknown field "futureOption" ignored',
     );
-    expect(ordinary[0]!.evidence).not.toContain('"oauth"');
+    expect(byId.has("feature.mcp")).toBe(false);
+    const rendered = renderDoctorReport(project, report);
+    expect(rendered).toContain("the `oauth` field is ignored");
+    expect(rendered).toContain("server still runs when otherwise usable");
+    expect(rendered).toContain("OAuth behavior is absent");
+    expect(rendered).toContain("must not rely on `oauth` under PiCC");
+    expect(rendered).toContain("static headers are PiCC's supported alternative");
+    expect(rendered).not.toContain("OAUTH_VALUE_CANARY");
     expect(JSON.stringify(report)).not.toContain("OAUTH_VALUE_CANARY");
   });
 
-  it("does not route an oauth-named server's unrelated diagnostic to the OAuth capability", () => {
+  it("does not substring-route an oauth-named unknown field", () => {
     const project = makeProject({
-      mcp: makeMcp({
-        servers: [makeMcpServer({
-          name: "oauth",
-          status: "enabled",
-          diagnostics: [
-            'MCP server "oauth": unknown field "futureOption"',
-            'MCP server "oauth": unrelated text containing "oauth" is a deferred feature in PiCC; but not the loader-owned entry',
-          ],
-        })],
-      }),
+      mcp: resolveAuditedMcp({ oauth: { command: "node", oauthFutureOption: true } }),
     });
     const report = buildCompatReport(project);
     expect(report.findings).toEqual([
       expect.objectContaining({
         capability: expect.objectContaining({ id: "feature.mcp" }),
-        evidence:
-          'MCP server "oauth": unknown field "futureOption"; MCP server "oauth": unrelated text containing "oauth" is a deferred feature in PiCC; but not the loader-owned entry',
+        evidence: 'MCP server "oauth": unknown field "oauthFutureOption" ignored',
       }),
     ]);
-    expect(report.findings.some((finding) => finding.capability.id === "feature.mcp-oauth")).toBe(false);
   });
 
   it("bounds diagnostic-bearing MCP findings with actionable entries first", () => {
@@ -1910,12 +2241,13 @@ describe("renderDoctorReport", () => {
     const report = buildCompatReport(project);
     report.unassessed.push("future setting remains unknown");
     report.pluginRuntimeFindings = [
-      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
-      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
-      "agent owner: persistent data directory validation or creation failed (wrong-kind). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
-      "hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch). Repair or reinstall the plugin in Claude Code, then relaunch PiCC; execution did not occur",
-      "legacy owner: preparation failed for an unknown reason; execution did not occur. Repair or reinstall the affected plugin in Claude Code, then relaunch PiCC.",
-      ...Array.from({ length: 16 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
+      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
+      "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
+      "agent owner: persistent data directory validation or creation failed (wrong-kind). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
+      "fallback owner: persistent data directory validation or creation failed (data-directory-preparation-failed). Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC; execution did not occur",
+      "hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch). Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC; execution did not occur",
+      "legacy owner: preparation failed for an unknown reason; execution did not occur. Reconcile or reinstall the affected plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.",
+      ...Array.from({ length: 15 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
     ];
     report.pluginRuntimeFindingsOmitted = 6;
     report.pluginRuntimeFindingsOmittedAtLeast = true;
@@ -1927,14 +2259,16 @@ describe("renderDoctorReport", () => {
     expect(runtime.match(/skill owner: persistent data directory validation or creation failed/g)).toHaveLength(1);
     expect(runtime).toContain("skill owner: persistent data directory validation or creation failed (unreadable-path); execution did not occur");
     expect(runtime).toContain("agent owner: persistent data directory validation or creation failed (wrong-kind); execution did not occur");
+    expect(runtime).toContain("fallback owner: persistent data directory validation or creation failed (data-directory-preparation-failed); execution did not occur");
     expect(runtime).toContain("hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch); execution did not occur");
     expect(runtime).toContain("at least 6 additional distinct failure(s) omitted");
-    expect(runtime).toContain("Recovery: check plugin-data ownership, writability, and directory kinds");
-    expect(runtime).toContain("Recovery: reinstall or reconcile the qualified plugin with Claude Code");
-    expect(runtime).toContain("Recovery: if plugin-data access or directory kind is the cause");
-    expect(runtime).not.toContain("Repair or reinstall the plugin in Claude Code");
-    expect(runtime).not.toContain("Repair or reinstall the affected plugin");
+    expect(runtime).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
+    expect(runtime).toContain("Recovery: reconcile or reinstall the qualified plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+    expect(runtime).not.toContain("if plugin-data access");
+    expect(runtime).not.toContain("Reconcile or reinstall the plugin through Claude Code");
+    expect(runtime).not.toContain("Reconcile or reinstall the affected plugin");
     expect(runtime).not.toMatch(/unreadable-path[^\n]*reinstall|wrong-kind[^\n]*reinstall/i);
+    expect(runtime).toMatch(/data-directory-preparation-failed[^\n]*execution did not occur/i);
     expect(runtime).not.toContain("future setting remains unknown");
     expect(runtime.length).toBeLessThan(12_000);
     expect(doctor).not.toContain("No compatibility findings detected.");

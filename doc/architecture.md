@@ -54,9 +54,9 @@ providers at will on one project and run **parallel sessions on different worktr
 models**. They do **not** exchange live session state, and there is **no mid-flight handoff** of a
 live worktree or session between them.
 
-This is why PiCC state lives outside the project or in the gitignored, harness-owned
-`.claude/.picc/`, and why compatibility work targets artifacts on disk rather than any shared
-runtime protocol. Anything that would require the two harnesses to agree at runtime is out of scope
+This is why PiCC state lives outside the project or in the harness-owned `.claude/.picc/`, which
+PiCC attempts to add to repository-local excludes, and why compatibility work targets artifacts on
+disk rather than any shared runtime protocol. Anything that would require the two harnesses to agree at runtime is out of scope
 by construction.
 
 ## Module map (`src/`)
@@ -278,16 +278,18 @@ where to start reading, not the extent of its cluster.
 - **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
 
-- **MCP runtime** (`mcp.ts`, `mcp-remote.ts`, `mcp-tools.ts`) — starts the **enabled**
-  discovery-resolved servers without blocking extension load and exposes discovered tools as
-  `mcp__<server>__<tool>` proxies through the same guard/decoration pipeline as every other tool.
-  `mcp.ts` owns the transport-neutral lifecycle and retry authority: stdio child process-tree
-  cleanup and remote client connection/recovery. `mcp-remote.ts` owns the safe remote adapter and
-  typed failure/disconnect evidence. The first successful tool catalog is
-  immutable, proxies register once and resolve the current client, and recovery cannot widen the
-  session or inherited subagent tool set. The enablement gate is enforced by construction; failed
-  startup adds no tools, owned resources close with the session, and when nothing is both configured
-  and enabled the model receives **no MCP-related context of any kind**.
+- **MCP runtime** (`mcp.ts`, `mcp-remote.ts`, `mcp-tools.ts`, `mcp-prompts.ts`,
+  `mcp-resources.ts`) — starts the **enabled** discovery-resolved servers without blocking extension
+  load. `mcp.ts` owns transport lifecycle, capability negotiation, immutable initial tool/prompt/
+  resource snapshots, live status, and recovery-aware operations over the current client;
+  `mcp-remote.ts` owns the safe remote adapter and typed failure/disconnect evidence. Tool catalogs
+  become guarded `mcp__<server>__<tool>` proxies, prompt catalogs feed the user-input and palette
+  path, and a settled initial snapshot advertising resource capability conditionally registers two
+  guarded fixed tools even when its catalog is empty or failed. Recovery cannot widen any catalog or
+  inherited tool set, and the fixed resource schemas survive reconnect and terminal retained states.
+  The enablement gate is enforced by construction: no enabled server means no MCP context; no
+  published prompt means no prompt metadata; and no advertised resource capability in the settled
+  initial snapshots means no resource-tool schemas. Owned resources close with the session.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
@@ -384,10 +386,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
    multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime`
    (enabled MCP servers begin connecting in the background, non-blocking) are constructed. All
-   Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
-   the guard extension is installed on tool events, and prompt-template stubs are written for each
-   user-invocable skill with an eligible, non-reserved name so it appears in the `/` palette. The
-   per-session scratch dir is created
+   Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard
+   extension is installed on tool events, and extension load creates the MCP exposure transaction.
+   When initial settlement completes, that transaction publishes stable proxies, the prompt command
+   catalog, and conditional resource tools. The later async `resources_discover` event awaits the
+   settled exposure and writes frontmatter-only stubs for each eligible user-invocable skill and
+   published MCP prompt so it appears in the `/` palette. The per-session scratch dir is created
    eagerly here and its literal path held for injection.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
@@ -416,9 +420,11 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    commands therefore remain available during a readiness failure. Ordinary project input across
    TUI, print, JSON, and RPC proceeds only after readiness: fire the `UserPromptSubmit` hook (block or
    inject context); expand `/skill [args]` slash commands by activating the skills and
-   **transforming the user turn** into the rendered bodies; then checkpoint-capture accepted input
-   before model delivery. The gate covers this ordinary input path, not authenticated extension
-   continuations or arbitrary third-party direct-trigger turns that bypass it. Pi's exact router
+   **transforming the user turn** into the rendered bodies; after local command precedence, fetch a
+   known MCP prompt and transform its result into bounded user content; then checkpoint-capture
+   accepted input before model delivery. Handled MCP prompt failures send no provider request. The
+   gate covers this ordinary input path, not authenticated extension continuations or arbitrary
+   third-party direct-trigger turns that bypass it. Pi's exact router
    normally owns canonical interactive built-ins; any reserved Pi token reaching this admitted user
    path receives fixed canonical guidance outside hooks, skills, and model context.
 
@@ -490,27 +496,36 @@ These are the choices where "close enough" breaks real projects.
   subagent e2e (which runs a real subprocess), not the settings-manager backstop.
 
 - **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
-  summarizing, no wrapping. Eligible resumable results append clearly delimited identity framing
-  outside that body (the human TUI strips it), and settled `TaskOutput` retrieval may append compact
-  usage metadata outside the body. A strict JSON/YAML consumer must parse the body and account for
-  this documented surrounding metadata, or use a foreground one-shot dispatch when it needs no
-  resume framing; background consumers must still account for retrieval metadata.
+  summarizing, no wrapping. Completed or truncated-completed resumable results append clearly
+  delimited identity framing outside that body (the human TUI strips it), and settled `TaskOutput`
+  retrieval may append compact usage metadata outside the body. A strict JSON/YAML consumer must
+  parse the body and account for this documented surrounding metadata, or use a foreground one-shot
+  dispatch when it needs no resume framing; background consumers must still account for retrieval
+  metadata.
 
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
   - **completed** — the run finished; its verbatim final message is returned.
-  - **failed** — the run ended on a terminal API or session error. The tool reports a **loud,
-    category-authored failure** without exposing raw provider/session error text. An empty success
-    here is the exact failure mode that lets a coordinator commit under-reviewed work believing a
-    subagent approved it.
+  - **failed** — the dispatch or run ended through the loud failure channel. Ordinary terminal
+    assistant errors expose capped, sanitized provider/API cause text as untrusted input and may
+    carry a structured disposition rendered by PiCC's fixed formatter. Identity, setup, depth,
+    policy, hook, checkpoint, and other specialized failures instead retain their cause-specific
+    framing and receive no generic disposition. An empty success here is the exact failure mode that lets a
+    coordinator commit under-reviewed work believing a subagent approved it.
   - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
     wins on every settle path, and a deliberately stopped background result discards its output.
   - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;
     a turn-cap truncation also pushes a warning diagnostic, never silent.
-  - The contract holds identically on the foreground, background, and `context: fork` paths, which is
-    why the presentation is rendered from **one** shared helper rather than per call site. A
-    background failure is never shown as completed. Retry behavior stays exactly Pi's own — no extra
-    recovery logic.
+  - For ordinary terminal assistant errors carrying a disposition, the contract holds on the
+    foreground, background-settlement, and `TaskOutput` paths through the shared structured
+    disposition and fixed guidance formatter; each surface retains its own result envelope. A
+    background failure is never shown as completed.
+  - Pi owns retry execution, budget, and backoff. After those retries settle, PiCC derives guidance
+    only from Pi's transient-error classifier and lifecycle observation. Complete observation can
+    prove no successful assistant response, retained model/tool-call content, or started tool
+    execution; observed progress or incomplete evidence takes the conservative branch. The
+    recommendation is separate from factual resumability, and PiCC never dispatches or resumes
+    automatically.
 
   Dispatch is **background-by-default**, matching Claude Code 2.1.198: an omitted `run_in_background`
   returns a task id so an implicit-concurrency fan-out parallelizes; `run_in_background: false` opts

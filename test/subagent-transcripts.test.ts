@@ -533,7 +533,7 @@ describe("model-visible agent-ID delivery", () => {
     expect(res.details.resumable).toBe(false);
   });
 
-  it("the cut-off path (failed with partial output) carries the ID inside the delimited frame", async () => {
+  it("the cut-off path preserves partial output and carries state-aware resume guidance", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
@@ -559,7 +559,8 @@ describe("model-visible agent-ID delivery", () => {
     const agentId = String(res.details.agentId);
     expect(text.startsWith("half a review")).toBe(true);
     expect(text).toContain("[subagent cut off]");
-    expect(text.endsWith(`\n[agent ${agentId} — resumable via SendMessage]`)).toBe(true);
+    expect(text).toContain("Resume this same agent with SendMessage");
+    expect(text).toContain(`Failed agent ID: ${agentId}.`);
     expect(res.details.cutOff).toBe(true);
   });
 
@@ -601,7 +602,7 @@ describe("model-visible agent-ID delivery", () => {
     expect(out.details.agentId).toBe(agentId);
   });
 
-  it("TaskOutput of a failed-but-resumable background task carries the ID after the failure text", async () => {
+  it("TaskOutput of a failed-but-resumable background task gives same-agent recovery guidance", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
@@ -637,9 +638,12 @@ describe("model-visible agent-ID delivery", () => {
     const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("t2", {
       task_id: taskId,
     });
+    const text = out.content[0]!.text;
     expect(out.details.status).toBe("failed");
-    expect(out.content[0]!.text).toContain("500 exploded");
-    expect(out.content[0]!.text).toContain(`[agent ${agentId} — resumable via SendMessage]`);
+    expect(text).toContain("500 exploded");
+    expect(text).toContain("Resume this same agent with SendMessage");
+    expect(text).toContain(`Failed agent ID: ${agentId}.`);
+    expect(text).toContain("This agent is technically resumable via SendMessage.");
   });
 
   it("a NON-resumable failed-with-partial (cut-off) foreground run shows the cut-off but no resume channel", async () => {
@@ -669,12 +673,13 @@ describe("model-visible agent-ID delivery", () => {
     expect(res.details.resumable).toBe(false);
     expect(text).toContain("half a review");
     expect(text).toContain("[subagent cut off]");
-    expect(text).not.toContain("resumable via SendMessage");
+    expect(text).toContain("same-agent continuation is unavailable");
+    expect(text).toContain("not resumable via SendMessage");
   });
 
-  it("a NON-resumable failed-with-partial background task reports failed with no resume channel", async () => {
-    // Same as above via the background path (createTaskOutputTool): guards the
-    // `if (task.resumable && task.agentId)` gate in background-tasks.ts.
+  it("a NON-resumable failed-with-partial background task explains unavailable continuation", async () => {
+    // Same as above via TaskOutput: guidance must report actual capability
+    // without presenting same-agent continuation as available.
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
         session.messages.push({
@@ -706,14 +711,17 @@ describe("model-visible agent-ID delivery", () => {
     const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("t2", {
       task_id: taskId,
     });
+    const text = out.content[0]!.text;
     expect(out.details.status).toBe("failed");
     expect(out.details.resumable).toBe(false);
-    expect(out.content[0]!.text).toContain("failed");
-    expect(out.content[0]!.text).toContain("500 exploded");
-    expect(out.content[0]!.text).not.toContain("resumable via SendMessage");
+    expect(text).toContain("failed");
+    expect(text).toContain("500 exploded");
+    expect(text).toContain("same-agent continuation is unavailable");
+    expect(text).toContain("This agent is not resumable via SendMessage.");
+    expect(text).not.toContain("This agent is technically resumable via SendMessage.");
   });
 
-  it("a resumable FAILED-with-no-partial run delivers the agent ID in the thrown error; a non-resumable one does not", async () => {
+  it("a zero-progress transient failure prefers replacement and reports actual resumability", async () => {
     const failNoPartial = () =>
       fakeSdk({
         onPrompt: (_t: string, s: FakeSessionState) => {
@@ -728,7 +736,7 @@ describe("model-visible agent-ID delivery", () => {
         },
       });
 
-    // Resumable (persisted): the thrown error ends with the non-completed trailer.
+    // Resumable (persisted): replacement preference stays separate from capability.
     const main = fakeMainSessionFile();
     const runtimeR = makeSubagentRuntime([makeAgent()], failNoPartial().sdk, {
       getMainSessionFile: () => main,
@@ -741,12 +749,12 @@ describe("model-visible agent-ID delivery", () => {
       resumableMsg = (e as Error).message;
     }
     expect(resumableMsg).toContain("API error");
-    expect(resumableMsg).toMatch(
-      /\n\n---\n\[agent agent-[0-9a-f]{12} — resumable via SendMessage\]$/,
-    );
+    expect(resumableMsg).toContain("Prefer explicitly dispatching a fresh replacement agent");
+    expect(resumableMsg).toMatch(/Failed agent ID: agent-[0-9a-f]{12}\./);
+    expect(resumableMsg).toContain("technically resumable via SendMessage");
 
-    // Non-resumable (in-memory fallback): the failure names its cause but never
-    // advertises a resume channel.
+    // Non-resumable (in-memory fallback): replacement guidance still reports
+    // that the failed identity cannot be resumed.
     const runtimeN = makeSubagentRuntime([makeAgent()], failNoPartial().sdk); // no getMainSessionFile
     const toolN = createAgentToolDefinition(runtimeN, { depth: 0 }) as unknown as ToolLike;
     let nonResumableMsg = "";
@@ -756,7 +764,8 @@ describe("model-visible agent-ID delivery", () => {
       nonResumableMsg = (e as Error).message;
     }
     expect(nonResumableMsg).toContain("API error");
-    expect(nonResumableMsg).not.toContain("resumable via SendMessage");
+    expect(nonResumableMsg).toContain("Prefer explicitly dispatching a fresh replacement agent");
+    expect(nonResumableMsg).toContain("not resumable via SendMessage");
   });
 
   it("a truncated COMPLETED run rides the ID trailer INSIDE the single cut-off frame (no double ---)", async () => {

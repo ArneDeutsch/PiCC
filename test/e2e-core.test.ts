@@ -85,7 +85,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(result.stdout).toContain("Plugin lifecycle management is unavailable in PiCC");
       expect(result.stdout).toContain("no changes were made");
       expect(result.stdout).toContain("Claude Code");
-      expect(result.stdout).toContain("exit and relaunch");
+      expect(result.stdout).toContain("canonical /reload in the interactive TUI");
+      expect(result.stdout).toContain("whole extension, including installed plugin state");
+      expect(result.stdout).toContain("or exit and relaunch");
       expect(result.stdout).toContain("/new does not reload plugin state");
     },
     TEST_TIMEOUT_MS,

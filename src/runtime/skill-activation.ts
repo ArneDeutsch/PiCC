@@ -14,6 +14,8 @@ function boundedRuntimeLabel(value: string): string {
   return neutral.length <= 128 ? neutral : `${neutral.slice(0, 127)}…`;
 }
 
+const PLUGIN_RECONCILE_RECOVERY = "Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.";
+
 /** Mutable preservation state owned by one main session or one child dispatch. */
 export interface SkillActivationState {
   activeSkills: Map<string, string>;
@@ -101,7 +103,7 @@ export async function renderSkillForActivation(opts: {
   const loaded = loadSkillBodyResult(opts.skill);
   diagnostics.push(...loaded.diagnostics);
   if (loaded.failure) {
-    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because its installed plugin body is no longer readable or contained. Repair or reinstall the plugin in Claude Code, then relaunch PiCC`);
+    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because its installed plugin body is no longer readable or contained. ${PLUGIN_RECONCILE_RECOVERY}`);
   }
   const body = loaded.body;
   if (!body) {
@@ -113,7 +115,7 @@ export async function renderSkillForActivation(opts: {
   }
 
   if (opts.skill.source.pluginId && !opts.pluginContext) {
-    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because runtime context for plugin "${boundedRuntimeLabel(opts.skill.source.pluginId)}" is unavailable. Repair or reinstall the plugin in Claude Code, then relaunch PiCC`);
+    return fail(`Skill "${boundedRuntimeLabel(opts.skill.name)}" could not activate because runtime context for plugin "${boundedRuntimeLabel(opts.skill.source.pluginId)}" is unavailable. ${PLUGIN_RECONCILE_RECOVERY}`);
   }
 
   const args = substituteArguments(body, opts.argsText, opts.skill.arguments);
@@ -140,7 +142,7 @@ export async function renderSkillForActivation(opts: {
     if (!ensured || !ensured.ok) {
       const message = ensured && !ensured.ok
         ? ensured.message
-        : `Skill "${boundedRuntimeLabel(opts.skill.name)}" could not prepare persistent data for plugin "${boundedRuntimeLabel(opts.pluginContext.pluginId)}". Repair or reinstall the plugin in Claude Code, then relaunch PiCC.`;
+        : `Skill "${boundedRuntimeLabel(opts.skill.name)}" could not prepare persistent data for plugin "${boundedRuntimeLabel(opts.pluginContext.pluginId)}". ${PLUGIN_RECONCILE_RECOVERY}`;
       return fail(message);
     }
   }

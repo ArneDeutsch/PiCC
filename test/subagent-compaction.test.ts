@@ -695,6 +695,7 @@ describe("subagent mid-run compaction", () => {
       "checkpoint paused: recovery required",
     ]);
     expect(result.checkpointPaused).toBe(true);
+    expect(result.recoveryDisposition).toBeUndefined();
     expect(result.error).toContain("paused and no continuation ran");
     expect(harness.compactCalls()).toBe(1);
     expect(harness.sessionCreations()).toBe(1);

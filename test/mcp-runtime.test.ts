@@ -383,7 +383,7 @@ describe("McpRuntime stdio lifecycle", () => {
       // Exit-sweep listener discipline: exactly one listener while running.
       expect(process.listenerCount("exit")).toBe(exitListenerBaseline + 1);
       expect(runtime.serverStates()).toEqual([
-        { name: "fixture", transport: "stdio", state: "connected", toolCount: 3 },
+        { name: "fixture", transport: "stdio", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 3 },
       ]);
       const tools = runtime.tools();
       expect(tools.map((t) => t.toolName).sort()).toEqual(["big-output", "echo", "report-env"]);
@@ -563,7 +563,7 @@ describe("McpRuntime stdio lifecycle", () => {
       );
       try {
         await runtime.whenSettled();
-        expect(runtime.serverStates()).toEqual([{ name: "shim", transport: "stdio", state: "connected", toolCount: 3 }]);
+        expect(runtime.serverStates()).toEqual([{ name: "shim", transport: "stdio", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 3 }]);
         const result = await runtime.callTool("shim", "echo", { text: "via cmd shim" });
         expect(firstText(result)).toBe("via cmd shim");
       } finally {
@@ -573,6 +573,549 @@ describe("McpRuntime stdio lifecycle", () => {
     },
     25_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Prompt and resource capability snapshots
+// ---------------------------------------------------------------------------
+
+describe("McpRuntime prompt and resource capabilities", () => {
+  it("connects tool-only, prompt-only, resource-only, mixed, and advertised-empty stdio servers", async () => {
+    const fixture = createMcpProcessFixture(makeTempDir());
+    const modes = ["serve", "prompt-only", "resource-only", "prompt-resource", "empty-capabilities"] as const;
+    const runtime = McpRuntime.start(makeConfig(...modes.map((mode) => makeServer({
+      name: mode,
+      args: [fixture.serverScript, mode],
+      env: fixture.env,
+    }))), makeDeps());
+    try {
+      await runtime.whenSettled();
+      const states = new Map(runtime.serverStates().map((state) => [state.name, state]));
+      expect(states.get("serve")).toMatchObject({ toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 3 });
+      expect(states.get("prompt-only")).toMatchObject({ toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: false, promptCount: 1 });
+      expect(states.get("resource-only")).toMatchObject({ toolsAdvertised: false, promptsAdvertised: false, resourcesAdvertised: true, resourceCount: 2 });
+      expect(states.get("prompt-resource")).toMatchObject({ toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 1, resourceCount: 2 });
+      expect(states.get("empty-capabilities")).toMatchObject({ promptsAdvertised: true, resourcesAdvertised: true, promptCount: 0, resourceCount: 0 });
+      expect(runtime.tools().every((tool) => tool.serverName === "serve")).toBe(true);
+      expect(runtime.prompts().map((prompt) => prompt.serverName).sort()).toEqual(["prompt-only", "prompt-resource"]);
+      expect(runtime.resourceServers().map((server) => [server.serverName, server.resources.length]).sort()).toEqual([
+        ["empty-capabilities", 0], ["prompt-resource", 2], ["resource-only", 2],
+      ]);
+
+      const promptResult = await runtime.getPrompt("prompt-only", "fixture-prompt", { required: "yes" });
+      expect(promptResult).toMatchObject({ messages: [{ content: { text: '{"required":"yes"}' } }] });
+      expect(await runtime.readResource("resource-only", "fixture://text")).toMatchObject({
+        contents: [{ uri: "fixture://text", text: "fixture text" }],
+      });
+      expect(await runtime.readResource("resource-only", "fixture://binary")).toMatchObject({
+        contents: [{ uri: "fixture://binary", blob: "AAEC" }],
+      });
+    } finally {
+      await runtime.shutdown();
+      await fixture.cleanup();
+    }
+  }, 25_000);
+
+  it.each([
+    ["tools", ["tools"]],
+    ["prompts", ["prompts"]],
+    ["resources", ["resources"]],
+  ] as const)("calls exactly the advertised %s list method", async (capability, expectedCalls) => {
+    const calls: string[] = [];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { [capability]: {} }; }
+      async listTools() { calls.push("tools"); return { tools: [] }; }
+      async listPrompts() { calls.push("prompts"); return { prompts: [] }; }
+      async listResources() { calls.push("resources"); return { resources: [] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: `only-${capability}` })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(calls).toEqual(expectedCalls);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("requests only advertised capabilities and publishes sanitized frozen metadata", async () => {
+    const calls: string[] = [];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {}, resources: {} }; }
+      async listTools(): Promise<never> { calls.push("tools"); throw new Error("must not list tools"); }
+      async listPrompts(): Promise<{ prompts: unknown[] }> {
+        calls.push("prompts");
+        return { prompts: [{
+          name: "raw.prompt",
+          description: "hello\u001bworld",
+          arguments: [{ name: "first", description: "a\u0007b", required: true }],
+        }] };
+      }
+      async listResources(): Promise<{ resources: unknown[] }> {
+        calls.push("resources");
+        return { resources: [{
+          uri: "opaque://host/value",
+          name: "resource",
+          title: "title\u001b",
+          description: "description",
+          mimeType: "text/plain",
+          size: 12,
+        }, { uri: "opaque://invalid-size", name: "other", size: -1 },
+        { uri: "opaque://control\nvalue", name: "control" }] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "caps" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(calls.sort()).toEqual(["prompts", "resources"]);
+      const prompt = runtime.prompts()[0]!;
+      expect(prompt).toEqual({
+        serverName: "caps",
+        promptName: "raw.prompt",
+        description: "hello world",
+        arguments: [{ name: "first", description: "a b", required: true }],
+      });
+      expect(Object.isFrozen(prompt)).toBe(true);
+      expect(Object.isFrozen(prompt.arguments)).toBe(true);
+      const resources = runtime.resourceServers()[0]!;
+      expect(resources.resources[0]).toEqual({
+        serverName: "caps", uri: "opaque://host/value", name: "resource", title: "title ",
+        description: "description", mimeType: "text/plain", size: 12,
+      });
+      expect(resources.resources[1]).not.toHaveProperty("size");
+      expect(resources.resources).toHaveLength(2);
+      expect(Object.isFrozen(resources.resources)).toBe(true);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("keeps complete prompt argument declarations and drops every invalid declaration list fail-closed", async () => {
+    const validArguments = Array.from({ length: 1_024 }, (_, index) => ({
+      name: `argument-${index}`,
+      description: `description-${index}`,
+      required: index % 2 === 0,
+    }));
+    const hostileArgumentCanaries = [
+      "HOSTILE_NON_ARRAY_CANARY",
+      "HOSTILE_NULL_ENTRY_CANARY",
+      "HOSTILE_ARRAY_ENTRY_CANARY",
+      "HOSTILE_SCALAR_ENTRY_CANARY",
+      "HOSTILE_MISSING_NAME_CANARY",
+      "HOSTILE_NON_STRING_NAME_CANARY",
+      "HOSTILE_EMPTY_NAME_CANARY",
+      "HOSTILE_CONTROL_NAME_CANARY",
+      "HOSTILE_OVERSIZED_NAME_CANARY",
+      "HOSTILE_DESCRIPTION_CANARY",
+      "HOSTILE_REQUIRED_CANARY",
+      "HOSTILE_DUPLICATE_NAME_CANARY",
+      "HOSTILE_OVER_LIMIT_CANARY",
+    ] as const;
+    const invalidArgumentLists: Array<[string, unknown]> = [
+      ["non-array", { name: hostileArgumentCanaries[0] }],
+      ["null-entry", [{ name: hostileArgumentCanaries[1] }, null]],
+      ["array-entry", [[hostileArgumentCanaries[2]]]],
+      ["scalar-entry", [hostileArgumentCanaries[3]]],
+      ["missing-name", [{ description: hostileArgumentCanaries[4] }]],
+      ["non-string-name", [{ name: { marker: hostileArgumentCanaries[5] } }]],
+      ["empty-name", [{ name: "", description: hostileArgumentCanaries[6] }]],
+      ["control-name", [{ name: `${hostileArgumentCanaries[7]}\u001b` }]],
+      ["oversized-name", [{ name: `${hostileArgumentCanaries[8]}${"n".repeat(1_025)}` }]],
+      ["invalid-description", [{ name: "argument", description: { marker: hostileArgumentCanaries[9] } }]],
+      ["invalid-required", [{ name: "argument", required: hostileArgumentCanaries[10] }]],
+      ["duplicate-name", [{ name: hostileArgumentCanaries[11] }, { name: hostileArgumentCanaries[11] }]],
+      ["over-limit", [
+        ...Array.from({ length: 1_024 }, (_, index) => ({ name: `over-limit-${index}` })),
+        { name: hostileArgumentCanaries[12] },
+      ]],
+    ];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {} }; }
+      async listPrompts(): Promise<{ prompts: unknown[] }> {
+        return { prompts: [
+          { name: "absent" },
+          { name: "maximum-valid", arguments: validArguments },
+          ...invalidArgumentLists.map(([name, arguments_]) => ({ name, arguments: arguments_ })),
+        ] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "prompt-arguments" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      const prompts = runtime.prompts();
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toEqual({
+        serverName: "prompt-arguments",
+        promptName: "absent",
+        description: "",
+        arguments: [],
+      });
+      expect(prompts[1]?.arguments).toHaveLength(1_024);
+      expect(prompts[1]?.arguments).toEqual(validArguments);
+      expect(prompts.every((prompt) => Object.isFrozen(prompt.arguments))).toBe(true);
+      expect(prompts.flatMap((prompt) => prompt.arguments).every(Object.isFrozen)).toBe(true);
+      expect(runtime.diagnostics()).toContain(
+        `MCP server "prompt-arguments": dropped ${invalidArgumentLists.length} invalid prompt metadata entries`,
+      );
+      const diagnostics = runtime.diagnostics().join("\n");
+      for (const canary of hostileArgumentCanaries) expect(diagnostics).not.toContain(canary);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("retains an advertised resource server entry when its isolated catalog discovery fails", async () => {
+    class StreamableHTTPError extends Error { constructor(readonly status: number) { super("RESOURCE_SPEECH_CANARY"); } }
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {}, resources: {} }; }
+      async listPrompts() { return { prompts: [] }; }
+      async listResources(): Promise<never> { throw new StreamableHTTPError(400); }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "resource-failure" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.resourceServers()).toEqual([{
+        serverName: "resource-failure",
+        resources: [],
+        discoveryError: "resources discovery failed after 1 attempt(s) (permanent)",
+      }]);
+      expect(runtime.serverStates()[0]).toMatchObject({
+        state: "connected",
+        promptsAdvertised: true,
+        promptCount: 0,
+        resourcesAdvertised: true,
+        resourceCount: 0,
+        resourceDiscoveryError: "resources discovery failed after 1 attempt(s) (permanent)",
+      });
+      expect(runtime.diagnostics().join("\n")).not.toContain("RESOURCE_SPEECH_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["close", "error"] as const)(
+    "fails stdio startup when transport emits %s during otherwise-isolated prompt discovery",
+    async (event) => {
+      class FakeTransport {
+        readonly pid = undefined;
+        readonly stderr = undefined;
+        onclose?: () => void;
+        onerror?: (error: Error) => void;
+      }
+      class FakeClient {
+        private transport?: FakeTransport;
+        async connect(transport: FakeTransport): Promise<void> { this.transport = transport; }
+        getServerCapabilities() { return { prompts: {} }; }
+        async listPrompts(): Promise<never> {
+          if (event === "close") this.transport?.onclose?.();
+          else this.transport?.onerror?.(new Error("TRANSPORT_ERROR_CANARY"));
+          throw new Error("PROMPT_PROTOCOL_CANARY");
+        }
+        async close(): Promise<void> {}
+      }
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: `prompt-${event}` })), makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      }));
+      try {
+        await runtime.whenSettled();
+        expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+        expect(runtime.serverStates()[0]).not.toHaveProperty("promptsAdvertised");
+        expect(runtime.prompts()).toEqual([]);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("does not publish late prompt/resource discovery after stdio startup times out", async () => {
+    const promptGate = deferred<void>();
+    const resourceGate = deferred<void>();
+    const bothListsEntered = deferred<void>();
+    let entered = 0;
+    let startupAttempt: Promise<unknown> | undefined;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {}, resources: {} }; }
+      async listPrompts() {
+        if (++entered === 2) bothListsEntered.resolve();
+        await promptGate.promise;
+        return {
+          prompts: Array.from({ length: 1_025 }, (_, index) => ({ name: `late-prompt-${index}` })),
+        };
+      }
+      async listResources() {
+        if (++entered === 2) bothListsEntered.resolve();
+        await resourceGate.promise;
+        return {
+          resources: Array.from({ length: 1_025 }, (_, index) => ({
+            uri: `late:${index}`,
+            name: `late-resource-${index}`,
+          })),
+        };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "late-discovery" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      raceWithTimeout: async (promise) => {
+        startupAttempt = promise;
+        await bothListsEntered.promise;
+        return { timedOut: true };
+      },
+    }));
+    try {
+      await runtime.whenSettled();
+      const state = runtime.serverStates()[0]!;
+      expect(state.state).toBe("failed");
+      for (const field of [
+        "toolsAdvertised", "promptsAdvertised", "resourcesAdvertised",
+        "toolCount", "promptCount", "resourceCount",
+        "toolDiscoveryError", "promptDiscoveryError", "resourceDiscoveryError",
+      ]) {
+        expect(state).not.toHaveProperty(field);
+      }
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.prompts()).toEqual([]);
+      expect(runtime.resourceServers()).toEqual([]);
+      const diagnosticsAtTimeout = runtime.diagnostics();
+
+      promptGate.resolve();
+      resourceGate.resolve();
+      await startupAttempt;
+
+      expect(runtime.serverStates()[0]).toEqual(state);
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.prompts()).toEqual([]);
+      expect(runtime.resourceServers()).toEqual([]);
+      expect(runtime.diagnostics()).toEqual(diagnosticsAtTimeout);
+      expect(runtime.diagnostics().join("\n")).not.toContain("catalog truncated");
+    } finally {
+      promptGate.resolve();
+      resourceGate.resolve();
+      await runtime.shutdown();
+    }
+  });
+
+  it("bounds catalogs and reports cursor cycles and page/item truncation", async () => {
+    let promptPage = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { tools: {}, prompts: {}, resources: {} }; }
+      async listTools(params: { cursor?: string }): Promise<{ tools: Array<{ name: string }>; nextCursor: string }> {
+        return { tools: [{ name: params.cursor ? "second" : "first" }], nextCursor: "cycle" };
+      }
+      async listPrompts(): Promise<{ prompts: Array<{ name: string }>; nextCursor: string }> {
+        const page = promptPage++;
+        return { prompts: [{ name: `prompt-${page}` }], nextCursor: `page-${page + 1}` };
+      }
+      async listResources(): Promise<{ resources: Array<{ uri: string; name: string }>; nextCursor: string }> {
+        return {
+          resources: Array.from({ length: 1_025 }, (_, index) => ({ uri: `opaque:${index}`, name: `resource-${index}` })),
+          nextCursor: "more",
+        };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "bounded" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.tools()).toHaveLength(2);
+      expect(runtime.prompts()).toHaveLength(16);
+      expect(runtime.resourceServers()[0]?.resources).toHaveLength(1_024);
+      const diagnostics = runtime.diagnostics().join("\n");
+      expect(diagnostics).toContain("tools pagination cursor cycle stopped");
+      expect(diagnostics).toContain("prompts pagination truncated at 16 pages");
+      expect(diagnostics).toContain("resources catalog truncated at 1024 items");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["tools", "prompts", "resources"] as const)(
+    "retries transient %s discovery from page one and does not retry auth, 4xx, or request timeout",
+    async (capability) => {
+      class StreamableHTTPError extends Error { constructor(readonly status: number) { super("SERVER_CANARY"); } }
+      for (const row of [
+        { errors: [new StreamableHTTPError(500), new StreamableHTTPError(500), new StreamableHTTPError(500)], expectedCalls: 4, expectedDelays: [100, 200, 400] },
+        { errors: [new StreamableHTTPError(401)], expectedCalls: 1, expectedDelays: [] },
+        { errors: [new StreamableHTTPError(400)], expectedCalls: 1, expectedDelays: [] },
+        { errors: [Object.assign(new Error("TIMEOUT_CANARY"), { code: -32_001 })], expectedCalls: 1, expectedDelays: [] },
+      ]) {
+        let calls = 0;
+        const delays: number[] = [];
+        class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+        class FakeClient {
+          async connect(): Promise<void> {}
+          getServerCapabilities() { return { [capability]: {} }; }
+          private async list(): Promise<Record<string, unknown>> {
+            const error = row.errors[calls++];
+            if (error) throw error;
+            return { [capability]: [] };
+          }
+          listTools = () => this.list();
+          listPrompts = () => this.list();
+          listResources = () => this.list();
+          async close(): Promise<void> {}
+        }
+        const runtime = McpRuntime.start(makeConfig(makeServer({ name: `retry-${capability}` })), makeDeps({
+          loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+          delay: async (ms) => { delays.push(ms); },
+        }));
+        try {
+          await runtime.whenSettled();
+          expect(calls).toBe(row.expectedCalls);
+          expect(delays).toEqual(row.expectedDelays);
+          expect(runtime.diagnostics().join("\n")).not.toMatch(/SERVER_CANARY|TIMEOUT_CANARY/);
+        } finally {
+          await runtime.shutdown();
+        }
+      }
+    },
+  );
+
+  it.each(["tools", "prompts", "resources"] as const)(
+    "restarts page-two transient %s discovery at page one",
+    async (capability) => {
+      const cursors: Array<string | undefined> = [];
+      let failedPageTwo = false;
+      class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+      class FakeClient {
+        async connect(): Promise<void> {}
+        getServerCapabilities() { return { [capability]: {} }; }
+        private async list(params: { cursor?: string }) {
+          cursors.push(params.cursor);
+          if (params.cursor === "page-two" && !failedPageTwo) {
+            failedPageTwo = true;
+            throw Object.assign(new Error("TRANSIENT_CANARY"), { code: "ECONNRESET" });
+          }
+          return params.cursor === undefined
+            ? { [capability]: [], nextCursor: "page-two" }
+            : { [capability]: [] };
+        }
+        listTools = (params: { cursor?: string }) => this.list(params);
+        listPrompts = (params: { cursor?: string }) => this.list(params);
+        listResources = (params: { cursor?: string }) => this.list(params);
+        async close(): Promise<void> {}
+      }
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: `page-two-${capability}` })), makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+        delay: async (ms) => { delays.push(ms); },
+      }));
+      try {
+        await runtime.whenSettled();
+        expect(cursors).toEqual([undefined, "page-two", undefined, "page-two"]);
+        expect(delays).toEqual([100]);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it.each(["prompts", "resources"] as const)(
+    "isolates four-failure %s exhaustion after three delays and keeps a healthy sibling",
+    async (capability) => {
+      let clients = 0;
+      const calls = [0, 0];
+      const delays: number[] = [];
+      class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+      class FakeClient {
+        private readonly index = clients++;
+        async connect(): Promise<void> {}
+        getServerCapabilities() { return { [capability]: {} }; }
+        private async list() {
+          calls[this.index]! += 1;
+          if (this.index === 0) throw Object.assign(new Error("FAIL_CANARY"), { code: "ECONNRESET" });
+          return { [capability]: [] };
+        }
+        listPrompts = () => this.list();
+        listResources = () => this.list();
+        async close(): Promise<void> {}
+      }
+      const runtime = McpRuntime.start(makeConfig(
+        makeServer({ name: "failed" }),
+        makeServer({ name: "healthy" }),
+      ), makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+        delay: async (ms) => { delays.push(ms); },
+      }));
+      try {
+        await runtime.whenSettled();
+        expect(calls).toEqual([4, 1]);
+        expect(delays).toEqual([100, 200, 400]);
+        expect(runtime.serverStates()).toEqual([
+          expect.objectContaining({
+            name: "failed",
+            state: "connected",
+            [`${capability.slice(0, -1)}DiscoveryError`]: `${capability} discovery failed after 4 attempt(s) (transient)`,
+          }),
+          expect.objectContaining({ name: "healthy", state: "connected" }),
+        ]);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("exhausts tool discovery after four failures and three delays without harming a healthy sibling", async () => {
+    const calls = new Map<string, number>();
+    const delays: number[] = [];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly index: number;
+      constructor() { this.index = calls.size; calls.set(`server-${this.index}`, 0); }
+      async connect(): Promise<void> {}
+      async listTools() {
+        const key = `server-${this.index}`;
+        calls.set(key, calls.get(key)! + 1);
+        if (this.index === 0) throw Object.assign(new Error("FAIL_CANARY"), { code: "ECONNRESET" });
+        return { tools: [{ name: "healthy" }] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(
+      makeServer({ name: "failed" }),
+      makeServer({ name: "healthy" }),
+    ), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      delay: async (ms) => { delays.push(ms); },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(calls.get("server-0")).toBe(4);
+      expect(delays).toEqual([100, 200, 400]);
+      expect(runtime.serverStates()).toEqual([
+        expect.objectContaining({ name: "failed", state: "failed" }),
+        expect.objectContaining({ name: "healthy", state: "connected", toolCount: 1 }),
+      ]);
+      expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["healthy"]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -662,11 +1205,13 @@ describe("McpRuntime degrade paths", () => {
       const state = runtime.serverStates()[0];
       expect(state).toMatchObject({
         state: "failed",
+        initialToolDiscoveryFailed: true,
         statusSummary:
-          "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+          "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.",
       });
+      expect(state).not.toHaveProperty("toolsAdvertised");
+      expect(runtime.tools()).toEqual([]);
       const report = renderMcpStatusReport(config, runtime.serverStates());
-      expect(report).toContain(state!.statusSummary!);
       expect(report).not.toContain("LIST_TOOLS_EXCEPTION_CANARY");
       expect(report).not.toContain("PRIVATE_DISCOVERY_PATH");
       expect(report).not.toContain("DISCOVERY_RAW_COMMAND_CANARY");
@@ -720,7 +1265,7 @@ describe("McpRuntime degrade paths", () => {
       expect(state).toMatchObject({
         state: "failed",
         statusSummary:
-          "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
+          "MCP startup timed out during connection, initialization, or capability discovery; run /doctor for details.",
       });
       const report = renderMcpStatusReport(config, runtime.serverStates());
       expect(report).toContain(state!.statusSummary!);
@@ -751,14 +1296,14 @@ describe("McpRuntime degrade paths", () => {
       expect(states.get("hung")?.diagnostic).toMatch(/failed to connect within 8000 ms/);
       expect(states.get("hung")?.diagnostic).toContain("hang-cmd");
       expect(states.get("hung")?.statusSummary).toBe(
-        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or capability discovery; run /doctor for details.",
       );
       const status = renderMcpStatusReport(
         makeConfig(makeServer({ name: "hung", rawCommand: "hang-cmd" })),
         runtime.serverStates(),
       );
       expect(status).toContain(
-        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or capability discovery; run /doctor for details.",
       );
       expect(status).not.toContain("hang-cmd");
       expect(runtime.diagnostics().some((d) => d.includes('"hung"'))).toBe(true);
@@ -838,9 +1383,9 @@ describe("McpRuntime degrade paths", () => {
         await runtime.whenSettled();
         const state = runtime.serverStates()[0];
         expect(state?.statusSummary, row.label).toBe(
-          "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+          "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
         );
-        expect(state?.diagnostic, row.label).not.toContain(
+        expect(state?.diagnostic ?? "", row.label).not.toContain(
           "connection closed before MCP initialization completed",
         );
         const surfaces = `${state?.diagnostic ?? ""}\n${state?.statusSummary ?? ""}`;
@@ -1030,7 +1575,7 @@ describe("McpRuntime degrade paths", () => {
       expect(diagnostic).not.toContain("y".repeat(500));
       expect(diagnostic.length).toBeLessThanOrEqual(700);
       expect(runtime.serverStates()[0]?.statusSummary).toBe(
-        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or capability discovery; run /doctor for details.",
       );
       expect(renderMcpStatusReport(makeConfig(makeServer({ name: "garbage" })), runtime.serverStates()))
         .not.toContain("GARBAGE_STDERR_TAIL_MARKER");
@@ -1063,7 +1608,7 @@ describe("McpRuntime degrade paths", () => {
       const state = runtime.serverStates()[0];
       expect(state?.diagnostic ?? "").not.toContain("picc-secret-expanded-value");
       expect(state?.statusSummary).toBe(
-        "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+        "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
       );
       const report = renderMcpStatusReport(
         makeConfig(makeServer({ name: "leaky", command: expandedSecret })),
@@ -1087,7 +1632,7 @@ describe("McpRuntime degrade paths", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "hostile", transport: "stdio", state: "connected", toolCount: 8 },
+        { name: "hostile", transport: "stdio", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 8 },
       ]);
       const tools = runtime.tools();
       const names = tools.map((t) => t.toolName);
@@ -1236,6 +1781,109 @@ describe("McpRuntime tool-call timeouts", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Prompt and resource live operations
+// ---------------------------------------------------------------------------
+
+describe("McpRuntime prompt/resource live operations", () => {
+  it.each(["prompt", "resource"] as const)(
+    "forwards exact %s requests and the shared resolved timeout, then classifies SDK timeout safely",
+    async (operation) => {
+      const requests: unknown[] = [];
+      const timeouts: number[] = [];
+      let operationCalls = 0;
+      class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+      class FakeClient {
+        async connect(): Promise<void> {}
+        getServerCapabilities() { return operation === "prompt" ? { prompts: {} } : { resources: {} }; }
+        async listPrompts() { return { prompts: [{ name: "raw.prompt" }] }; }
+        async listResources() { return { resources: [{ uri: "opaque://listed", name: "listed" }] }; }
+        async getPrompt(params: unknown, options: { timeout: number }) {
+          return this.operate(params, options);
+        }
+        async readResource(params: unknown, options: { timeout: number }) {
+          return this.operate(params, options);
+        }
+        private async operate(params: unknown, options: { timeout: number }) {
+          requests.push(params);
+          timeouts.push(options.timeout);
+          operationCalls += 1;
+          if (operationCalls === 2) {
+            throw Object.assign(new Error("UPSTREAM_TIMEOUT_CANARY"), { code: -32_001 });
+          }
+          return operation === "prompt" ? { messages: [] } : { contents: [] };
+        }
+        async close(): Promise<void> {}
+      }
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: "live" })), makeDeps({
+        settingsEnv: { MCP_TOOL_TIMEOUT: "2500" },
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      }));
+      try {
+        await runtime.whenSettled();
+        const invoke = () => operation === "prompt"
+          ? runtime.getPrompt("live", "raw.prompt", { one: "1", two: "2" })
+          : runtime.readResource("live", "opaque://not-parsed/../value");
+        await expect(invoke()).resolves.toEqual(operation === "prompt" ? { messages: [] } : { contents: [] });
+        expect(requests[0]).toEqual(operation === "prompt"
+          ? { name: "raw.prompt", arguments: { one: "1", two: "2" } }
+          : { uri: "opaque://not-parsed/../value" });
+        await expect(invoke()).rejects.toThrow(
+          operation === "prompt"
+            ? 'MCP prompt "raw.prompt" on server "live" timed out after 2500 ms'
+            : 'MCP resource read on server "live" timed out after 2500 ms',
+        );
+        expect(timeouts).toEqual([2_500, 2_500]);
+        expect(runtime.diagnostics().join("\n")).not.toContain("UPSTREAM_TIMEOUT_CANARY");
+        if (operation === "prompt") {
+          await expect(runtime.getPrompt("live", "missing", {})).rejects.toThrow(/has no prompt "missing"/);
+        }
+        await expect(runtime.readResource("missing", "opaque:any")).rejects.toThrow(/not running/);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("rejects control-bearing resource URIs and bounds caller-controlled identifiers", async () => {
+    let reads = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {}, resources: {}, tools: {} }; }
+      async listPrompts() { return { prompts: [{ name: "known" }] }; }
+      async listResources() { return { resources: [] }; }
+      async listTools() { return { tools: [{ name: "known" }] }; }
+      async readResource({ uri }: { uri: string }) { reads += 1; return { contents: [{ uri }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "bounded" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const huge = `prefix-${"x".repeat(10_000)}-suffix`;
+    try {
+      await runtime.whenSettled();
+      await expect(runtime.readResource("bounded", "opaque://clean/%2e%2e/value")).resolves.toEqual({
+        contents: [{ uri: "opaque://clean/%2e%2e/value" }],
+      });
+      await expect(runtime.readResource("bounded", "opaque://bad\nvalue")).rejects.toThrow(/display-control/);
+      expect(reads).toBe(1);
+      for (const reject of [
+        () => runtime.callTool("bounded", huge, {}),
+        () => runtime.getPrompt("bounded", huge, {}),
+        () => runtime.callTool(huge, "known", {}),
+      ]) {
+        const error = await reject().then(() => undefined, (value: unknown) => value as Error);
+        expect(error?.message.length).toBeLessThan(500);
+        expect(error?.message).toContain("prefix-");
+        expect(error?.message).not.toContain("-suffix");
+      }
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Kill discipline
 // ---------------------------------------------------------------------------
 
@@ -1251,7 +1899,7 @@ describe("McpRuntime kill discipline", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "family", transport: "stdio", state: "connected", toolCount: 3 },
+        { name: "family", transport: "stdio", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 3 },
       ]);
       await fixture.waitFor(
         ["spawn-grandchild.pid", "grandchild.pid"],
@@ -1358,12 +2006,14 @@ describe("McpRuntime remote retry and recovery", () => {
     calls?: RemoteOutcome[];
     closes?: RemoteOutcome[];
     catalogs?: string[][];
+    capabilities?: { tools?: object; prompts?: object; resources?: object };
   }) {
     const disconnects: Array<(event: { kind: "graceful-eof" | "abrupt-stream-failure" }) => void> = [];
     const transportErrors: Array<(error: Error) => void> = [];
     const closed: number[] = [];
     const aborted: number[] = [];
     let clients = 0;
+    let discoveryCount = 0;
     let callCount = 0;
     const events: string[] = [];
     const run = async (outcome: RemoteOutcome | undefined): Promise<void> => {
@@ -1379,8 +2029,11 @@ describe("McpRuntime remote retry and recovery", () => {
         events.push(`client:${this.index}`);
       }
       async connect(): Promise<void> { await run(options.connect[this.index]); }
+      getServerCapabilities(): { tools?: object; prompts?: object; resources?: object } {
+        return options.capabilities ?? { tools: {} };
+      }
       async listTools(): Promise<{ tools: Array<{ name: string; description: string; inputSchema: object }> }> {
-        await run(options.discover?.[this.index]);
+        await run(options.discover?.[discoveryCount++]);
         return {
           tools: (options.catalogs?.[this.index] ?? ["alpha"]).map((name) => ({
             name,
@@ -1389,9 +2042,31 @@ describe("McpRuntime remote retry and recovery", () => {
           })),
         };
       }
+      async listPrompts(): Promise<{ prompts: Array<{ name: string; arguments: Array<{ name: string }> }> }> {
+        await run(options.discover?.[discoveryCount++]);
+        return { prompts: (options.catalogs?.[this.index] ?? ["fixture-prompt"]).map((name) => ({
+          name,
+          arguments: [{ name: `argument-${this.index}` }],
+        })) };
+      }
+      async listResources(): Promise<{ resources: Array<{ uri: string; name: string }> }> {
+        await run(options.discover?.[discoveryCount++]);
+        return { resources: (options.catalogs?.[this.index] ?? ["resource"]).map((name) => ({
+          uri: `fixture://${name}`,
+          name: `${name}-${this.index}`,
+        })) };
+      }
       async callTool(): Promise<{ content: Array<{ type: "text"; text: string }> }> {
         await run(options.calls?.[callCount++]);
         return { content: [{ type: "text", text: `client-${this.index}` }] };
+      }
+      async getPrompt(): Promise<{ messages: Array<{ role: "user"; content: { type: "text"; text: string } }> }> {
+        await run(options.calls?.[callCount++]);
+        return { messages: [{ role: "user", content: { type: "text", text: `client-${this.index}` } }] };
+      }
+      async readResource(): Promise<{ contents: Array<{ uri: string; text: string }> }> {
+        await run(options.calls?.[callCount++]);
+        return { contents: [{ uri: "fixture://resource", text: `client-${this.index}` }] };
       }
       async close(): Promise<void> {
         closed.push(this.index);
@@ -1427,9 +2102,39 @@ describe("McpRuntime remote retry and recovery", () => {
       aborted,
       events,
       clientCount: () => clients,
+      discoveryCount: () => discoveryCount,
       callCount: () => callCount,
     };
   }
+
+  it("classifies fatal initial tools/list discovery identically for remote startup", async () => {
+    const harness = remoteHarness({
+      connect: ["ok"],
+      discover: [new Error("REMOTE_TOOLS_LIST_SPEECH_CANARY")],
+    });
+    const config = makeConfig(makeRemoteServer({ name: "remote-discovery-failure" }));
+    const runtime = McpRuntime.start(config, makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+    }));
+    try {
+      await runtime.whenSettled();
+      const state = runtime.serverStates()[0];
+      expect(state).toMatchObject({
+        state: "failed",
+        initialToolDiscoveryFailed: true,
+        statusSummary:
+          "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.",
+      });
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      expect(report).toContain("Initial tools/list discovery failed");
+      expect(report).toContain("/reload or restart PiCC");
+      expect(JSON.stringify(state)).not.toContain("REMOTE_TOOLS_LIST_SPEECH_CANARY");
+      expect(report).not.toContain("REMOTE_TOOLS_LIST_SPEECH_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
 
   it("round-trips initialize, discovery, call, and close through the real t02 HTTP adapter", async () => {
     const fixture = await createMcpRemoteServer();
@@ -1440,7 +2145,7 @@ describe("McpRuntime remote retry and recovery", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "loopback", transport: "http", state: "connected", toolCount: 1 },
+        { name: "loopback", transport: "http", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 1 },
       ]);
       expect(runtime.tools()).toEqual([
         expect.objectContaining({
@@ -1463,6 +2168,126 @@ describe("McpRuntime remote retry and recovery", () => {
     expect(fixture.stats()).toEqual({ listenerOpen: false, sockets: 0, streams: 0, timers: 0 });
   });
 
+  it.each(["prompt", "resource"] as const)(
+    "recovers a transient %s operation, retains its initial catalog, and routes through the replacement client",
+    async (operation) => {
+      const capabilities = operation === "prompt" ? { prompts: {} } : { resources: {} };
+      const harness = remoteHarness({
+        connect: ["ok", "ok"],
+        calls: [new StreamableHTTPError(503), "ok"],
+        capabilities,
+        catalogs: operation === "prompt"
+          ? [["fixture-prompt"], ["fixture-prompt", "replacement-only"]]
+          : [["resource"], ["resource", "replacement-only"]],
+      });
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: `live-${operation}` })), makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }));
+      try {
+        await runtime.whenSettled();
+        const initialCatalog = operation === "prompt" ? runtime.prompts() : runtime.resourceServers();
+        const initialServerEntry = operation === "resource" ? runtime.resourceServers()[0]! : undefined;
+        const initialEntry = operation === "prompt"
+          ? runtime.prompts()[0]!
+          : initialServerEntry!.resources[0]!;
+        const initialNestedArray = operation === "prompt"
+          ? runtime.prompts()[0]!.arguments
+          : runtime.resourceServers()[0]!.resources;
+        const invoke = () => operation === "prompt"
+          ? runtime.getPrompt(`live-${operation}`, "fixture-prompt", {})
+          : runtime.readResource(`live-${operation}`, "fixture://resource");
+        await expect(invoke()).rejects.toThrow(/temporarily unavailable while reconnecting/);
+        await waitUntil({
+          description: `${operation} recovery to publish replacement client`,
+          predicate: () => harness.clientCount() === 2 && runtime.serverStates()[0]?.state === "connected",
+        });
+        expect(delays).toEqual([1_000]);
+        expect(operation === "prompt" ? runtime.prompts() : runtime.resourceServers()).toEqual(initialCatalog);
+        const currentServerEntry = operation === "resource" ? runtime.resourceServers()[0]! : undefined;
+        const currentEntry = operation === "prompt"
+          ? runtime.prompts()[0]!
+          : currentServerEntry!.resources[0]!;
+        const currentNestedArray = operation === "prompt"
+          ? runtime.prompts()[0]!.arguments
+          : runtime.resourceServers()[0]!.resources;
+        expect(currentEntry).toBe(initialEntry);
+        if (operation === "resource") expect(currentServerEntry).toBe(initialServerEntry);
+        expect(currentNestedArray).toBe(initialNestedArray);
+        expect(Object.isFrozen(operation === "prompt" ? runtime.prompts() : runtime.resourceServers())).toBe(true);
+        expect(Object.isFrozen(currentEntry)).toBe(true);
+        expect(Object.isFrozen(currentNestedArray)).toBe(true);
+        expect(JSON.stringify(operation === "prompt" ? runtime.prompts() : runtime.resourceServers()))
+          .not.toContain("replacement-only");
+        const result = await invoke();
+        expect(JSON.stringify(result)).toContain("client-1");
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it.each(["prompt", "resource"] as const)(
+    "rejects late stale %s success after client replacement",
+    async (operation) => {
+      const callGate = deferred<void>();
+      const capabilities = operation === "prompt" ? { prompts: {} } : { resources: {} };
+      const harness = remoteHarness({ connect: ["ok", "ok"], calls: [callGate.promise], capabilities });
+      const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: `stale-${operation}` })), makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async () => undefined,
+      }));
+      try {
+        await runtime.whenSettled();
+        const pending = operation === "prompt"
+          ? runtime.getPrompt(`stale-${operation}`, "fixture-prompt", {})
+          : runtime.readResource(`stale-${operation}`, "fixture://resource");
+        await waitUntil({ description: `${operation} call to enter`, predicate: () => harness.callCount() === 1 });
+        harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+        await waitUntil({
+          description: `${operation} replacement client`,
+          predicate: () => harness.clientCount() === 2 && runtime.serverStates()[0]?.state === "connected",
+        });
+        callGate.resolve();
+        await expect(pending).rejects.toThrow(/connection was replaced/);
+      } finally {
+        callGate.resolve();
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it.each(["prompt", "resource"] as const)(
+    "refuses terminal %s calls without SDK invocation after recovery exhaustion",
+    async (operation) => {
+      const capabilities = operation === "prompt" ? { prompts: {} } : { resources: {} };
+      const harness = remoteHarness({ connect: ["ok", 503, 503, 503, 503, 503], capabilities });
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: `terminal-${operation}` })), makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }));
+      try {
+        await runtime.whenSettled();
+        harness.disconnects[0]!({ kind: "graceful-eof" });
+        await waitUntil({ description: `${operation} recovery exhaustion`, predicate: () => runtime.serverStates()[0]?.state === "failed" });
+        const invoke = () => operation === "prompt"
+          ? runtime.getPrompt(`terminal-${operation}`, "fixture-prompt", {})
+          : runtime.readResource(`terminal-${operation}`, "fixture://resource");
+        await expect(invoke()).rejects.toThrow(/remote connection failed/);
+        expect(harness.callCount()).toBe(0);
+        expect(harness.clientCount()).toBe(6);
+        expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000]);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
   it("retries transient initial failures at exactly 1/2/4 seconds within one settlement", async () => {
     const harness = remoteHarness({ connect: [503, 503, 503, "ok"] });
     const delays: number[] = [];
@@ -1479,7 +2304,7 @@ describe("McpRuntime remote retry and recovery", () => {
       expect(delays).toEqual([1_000, 2_000, 4_000]);
       expect(harness.clientCount()).toBe(4);
       expect(runtime.serverStates()).toEqual([
-        { name: "remote", transport: "http", state: "connected", toolCount: 1 },
+        { name: "remote", transport: "http", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 1 },
       ]);
       expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["alpha"]);
     } finally {
@@ -1516,11 +2341,7 @@ describe("McpRuntime remote retry and recovery", () => {
         await runtime.whenSettled();
         expect(delays).toEqual([1_000, 2_000, 4_000]);
         expect(harness.clientCount()).toBe(4);
-        expect(runtime.serverStates()[0]).toMatchObject({
-          state: "failed",
-          statusSummary:
-            "Remote MCP startup exhausted 4 attempts; check endpoint and network availability, then reload or start a new session.",
-        });
+        expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
         expect(`${runtime.diagnostics().join("\n")}\n${JSON.stringify(runtime.serverStates())}`)
           .not.toContain("GENERIC_INITIAL_CANARY");
       } finally {
@@ -1543,7 +2364,7 @@ describe("McpRuntime remote retry and recovery", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "legacy", transport: "sse", state: "connected", toolCount: 1 },
+        { name: "legacy", transport: "sse", state: "connected", toolsAdvertised: true, promptsAdvertised: false, resourcesAdvertised: false, toolCount: 1 },
       ]);
       expect(firstText(await runtime.callTool("legacy", "alpha", {}))).toBe("client-0");
     } finally {
@@ -1671,14 +2492,14 @@ describe("McpRuntime remote retry and recovery", () => {
   });
 
   it.each([
-    ["connection 408", [408], undefined, 2],
-    ["connection 429", [429], undefined, 2],
-    ["connection 500", [500], undefined, 2],
-    ["connection 400", [400], undefined, 1],
-    ["connection 404", [404], undefined, 1],
-    ["discovery 500", ["ok", "ok"], [500, "ok"], 2],
-    ["discovery 400", ["ok"], [400], 1],
-  ] as const)("applies stage-aware initial retry policy for %s", async (_label, connect, discover, attempts) => {
+    ["connection 408", [408], undefined, 2, [1_000]],
+    ["connection 429", [429], undefined, 2, [1_000]],
+    ["connection 500", [500], undefined, 2, [1_000]],
+    ["connection 400", [400], undefined, 1, []],
+    ["connection 404", [404], undefined, 1, []],
+    ["discovery 500", ["ok"], [500, "ok"], 1, [100]],
+    ["discovery 400", ["ok"], [400], 1, []],
+  ] as const)("applies stage-aware initial retry policy for %s", async (_label, connect, discover, attempts, expectedDelays) => {
     const harness = remoteHarness({
       connect: [...connect] as RemoteOutcome[],
       ...(discover === undefined ? {} : { discover: [...discover] as RemoteOutcome[] }),
@@ -1692,7 +2513,7 @@ describe("McpRuntime remote retry and recovery", () => {
     try {
       await runtime.whenSettled();
       expect(harness.clientCount()).toBe(attempts);
-      expect(delays).toEqual(attempts === 2 ? [1_000] : []);
+      expect(delays).toEqual(expectedDelays);
     } finally {
       await runtime.shutdown();
     }
@@ -1717,6 +2538,96 @@ describe("McpRuntime remote retry and recovery", () => {
       expect(delays).toEqual([]);
       expect(runtime.diagnostics().join("\n")).not.toMatch(/SERVER_TIMEOUT_CANARY|ABORT_CANARY|UNKNOWN_CANARY/);
     } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("publishes no partial remote capability state or diagnostics after aggregate discovery timeout", async () => {
+    const promptGate = deferred<void>();
+    const promptEntered = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok"], capabilities: { tools: {}, prompts: {} } });
+    class PartialClient extends harness.FakeRemoteClient {
+      override async listTools() {
+        return {
+          tools: Array.from({ length: 1_025 }, (_, index) => ({
+            name: `tool-${index}`, description: "", inputSchema: {},
+          })),
+        };
+      }
+      override async listPrompts() {
+        promptEntered.resolve();
+        await promptGate.promise;
+        return { prompts: [{ name: "late", arguments: [] }] };
+      }
+    }
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "partial" })), makeDeps({
+      loadRemoteClient: async () => PartialClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      raceWithTimeout: async () => {
+        await promptEntered.promise;
+        return { timedOut: true };
+      },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.prompts()).toEqual([]);
+      expect(runtime.diagnostics().join("\n")).not.toContain("catalog truncated");
+      expect(runtime.serverStates()[0]).not.toHaveProperty("toolsAdvertised");
+      promptGate.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.prompts()).toEqual([]);
+    } finally {
+      promptGate.resolve();
+      await runtime.shutdown();
+    }
+  });
+
+  it("preserves a concurrent sibling diagnostic when remote discovery loses transport", async () => {
+    const remoteEntered = deferred<void>();
+    const releaseRemote = deferred<void>();
+    const harness = remoteHarness({ connect: [] , capabilities: { prompts: {} } });
+    class LosingRemoteClient extends harness.FakeRemoteClient {
+      override async connect(): Promise<void> {
+        if (this.index > 0) throw new StreamableHTTPError(400);
+      }
+      override async listPrompts() {
+        remoteEntered.resolve();
+        await releaseRemote.promise;
+        harness.disconnects[this.index]!({ kind: "abrupt-stream-failure" });
+        return { prompts: [] };
+      }
+    }
+    class FakeStdioTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class DiagnosticStdioClient {
+      async connect(): Promise<void> {}
+      async listTools() {
+        await remoteEntered.promise;
+        return { tools: [{ name: "bad name" }] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(
+      makeRemoteServer({ name: "losing" }),
+      makeServer({ name: "sibling" }),
+    ), makeDeps({
+      loadRemoteClient: async () => LosingRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      loadSdk: async () => ({ Client: DiagnosticStdioClient, StdioClientTransport: FakeStdioTransport }) as never,
+      delay: async () => undefined,
+    }));
+    try {
+      await waitUntil({
+        description: "sibling diagnostic publication",
+        predicate: () => runtime.diagnostics().some((line) => line.includes('tool name "bad name" sanitized')),
+      });
+      releaseRemote.resolve();
+      await runtime.whenSettled();
+      expect(runtime.diagnostics().some((line) => line.includes('tool name "bad name" sanitized'))).toBe(true);
+      expect(runtime.serverStates().find((state) => state.name === "sibling")).toMatchObject({ state: "connected" });
+    } finally {
+      releaseRemote.resolve();
       await runtime.shutdown();
     }
   });

@@ -15,6 +15,8 @@ It is built as an extension bundle on [Pi](https://github.com/earendil-works/pi)
 already solves the two hardest problems — spending a ChatGPT/Codex subscription and abstracting
 the model provider. PiCC adds the Claude Code compatibility layer on top.
 
+![Four PiCC instances](doc/picc_tui.png)
+
 ## Quick start
 
 Install and link a source checkout with one setup command:
@@ -64,9 +66,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   bridge), auto memory, and `.claude/rules/`.
 - **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
   as a hard block.
-- **MCP servers** — local stdio and selected remote HTTP/SSE servers from `.mcp.json` and settings
-  `mcpServers`, exposed under Claude's `mcp__<server>__<tool>` naming with a project-server approval
-  gate; see the [capability matrix](doc/supported-features.md) for transport limits.
+- **MCP servers** — local stdio and selected remote HTTP/SSE servers expose tools, user-invoked
+  prompts, and model-facing resource listing/reading behind the project-server approval gate; see
+  the [capability matrix](doc/supported-features.md) for exact limits.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
 - **Plugins** — enabled plugins require matching exact imported installed-state records; see the
@@ -106,9 +108,10 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 
 ```bash
 npm run typecheck:all    # strict TS over src + tests
-npm run test:unit        # fast: unit + offline integration
-npm run test:e2e         # drives the real Pi CLI against a mock model
-npm test                 # everything
+npm test                 # unit lane (same as test:unit)
+npm run test:integration # offline whole-extension integration lane
+npm run test:e2e         # real Pi CLI against a mock model
+npm run test:all         # unit + integration + e2e
 npm run gen:capabilities # regenerate doc/supported-features.md from the registry
 ```
 

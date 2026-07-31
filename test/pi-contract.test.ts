@@ -12,6 +12,8 @@ import {
 } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   createAssistantMessageEventStream,
+  isContextOverflow,
+  isRetryableAssistantError,
   type AssistantMessage,
   type Context,
   type Model,
@@ -116,6 +118,32 @@ describe("mock wire request classification", () => {
 });
 
 describe("pi 0.82.0 API contract", () => {
+  it("exports the transient assistant classifier while context overflow remains a separate category", () => {
+    const message = (errorMessage: string): AssistantMessage => ({
+      role: "assistant",
+      content: [],
+      api: "openai-completions",
+      provider: "contract",
+      model: "contract-model",
+      usage: {
+        input: 1,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 1,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "error",
+      errorMessage,
+      timestamp: 1,
+    });
+    expect(isRetryableAssistantError(message("503 service unavailable"))).toBe(true);
+    expect(isRetryableAssistantError(message("quota exceeded"))).toBe(false);
+    const overflow = message("503 server error: input exceeds the context window");
+    expect(isRetryableAssistantError(overflow)).toBe(true);
+    expect(isContextOverflow(overflow, 100_000)).toBe(true);
+  });
+
   it("declares and resolves the four direct Pi 0.82.0 packages", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
@@ -1104,7 +1132,7 @@ describe("pi 0.82.0 API contract", () => {
     expect(typeof StringEnum).toBe("function");
   });
 
-  it("type pins compile against the pinned Pi: stopReason/errorMessage, 5-arg execute, transcript surface, subscribe + event kinds", async () => {
+  it("type pins compile against the pinned Pi: stopReason/errorMessage, execute, transcripts, and full lifecycle event payloads", async () => {
     // vitest strips types without checking them and the project tsconfig
     // excludes test/, so the pins live in test/helpers/pi-contract-pins.ts and
     // are compiled HERE with the real TypeScript checker — Pi type churn fails

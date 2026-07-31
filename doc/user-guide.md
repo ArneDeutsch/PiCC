@@ -201,10 +201,11 @@ fallback read only when no administrator source is present. The system file is
 `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, and
 `/etc/claude-code/managed-settings.json` on Linux; each drop-in directory is beside that file.
 
-Plugin state is fixed when the PiCC process starts. `/plugin` and `/reload-plugins` are reserved,
-non-mutating guidance commands; `/plugins` is PiCC's reserved convenience alias with the same
-behavior. Manage installation and enablement in Claude Code, then exit PiCC completely and relaunch
-it. `/new` starts a session but does not reload plugin state.
+`/plugin` and `/reload-plugins` are reserved, non-mutating guidance commands; `/plugins` is PiCC's
+reserved convenience alias with the same behavior. Manage installation and enablement in Claude
+Code, then run the canonical `/reload` in the interactive TUI to reload the whole extension,
+including installed plugin state, or exit PiCC completely and relaunch it. `/reload-plugins` itself
+does no reload, and `/new` starts a session without reloading plugin state.
 
 > **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
 > it only when you explicitly ask it to remember something (e.g. "remember to…"). This is a
@@ -338,7 +339,7 @@ Every subagent is visible, both to you and to the coordinating model:
   resolves — fork dispatches are never resumable, and a user-stopped
   agent refuses resume and steering permanently.
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
-  interactive TUI; print and RPC runs keep their previous subagent output unchanged.
+  interactive TUI.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
@@ -370,7 +371,7 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | `/skills` | Categorize loaded skills by typed-slash availability; unsupported-name and reserved-shadowing rows separately state whether direct `Skill` invocation remains allowed |
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
-| `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and discover tools or time out. See [MCP server settings](#6-security--permission-posture) |
+| `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and settle advertised tool, prompt, and resource catalogs or time out. See [MCP server settings](#6-security--permission-posture) |
 | `/plugin`, `/plugins`, `/reload-plugins` | Reserved plugin-management guidance; see [Installed plugins](#installed-plugins) |
 | `/picc-update` | In a direct `picc` launch, show fixed installation-aware exit-and-update guidance; never mutates the running installation. External Pi hosting does not register it |
 | `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
@@ -382,11 +383,44 @@ built-ins appear in the `/` menu with their description and argument hint — ty
 start typing a name to filter. Selecting one expands the skill into your turn exactly as Claude Code
 does.
 
+### MCP prompts and resources
+
+The `/` palette is the primary way to discover connected MCP prompts. Their command form is
+`/mcp__<server>__<prompt>`; each UTF-16 code unit outside ASCII letters, digits, `_`, and `-` in
+either component becomes `_`, so an astral symbol becomes `__`. Arguments are positional in the
+server's declared order; quote multi-word values with single or double quotes, for example
+`/mcp__docs__summarize concise "release notes"`.
+If palette publication fails, the typed fallback is usable only when you already know the raw server
+and prompt names and can normalize them this way. PiCC owns the
+`.claude/.picc/prompts` palette metadata, attempts to git-exclude that path, and regenerates it
+during startup resource discovery and after `/reload`. Invocation replaces that user turn with
+bounded, explicitly untrusted prompt
+content. Generated palette files persist metadata only and never write prompt bodies or results;
+successful transformed content follows ordinary conversation and session transcript retention.
+
+When any settled initial server snapshot advertises resources, the model receives
+`ListMcpResourcesTool` and `ReadMcpResourceTool`, including for an empty or
+`resources/list`-failed catalog.
+The schemas remain registered through reconnect and terminal retained states; they are absent only
+when no initial settled snapshot advertised resources. Deny either fixed name directly, or use the
+generic top-level forms
+`ListMcpResourcesTool(server:...)`, `ReadMcpResourceTool(server:...)`, and
+`ReadMcpResourceTool(uri:...)`; `mcp__server` and `Read(...)` are not aliases. Foreground
+subagents and conversation forks inherit these tools through normal `tools:`/`disallowedTools:`
+gating, while non-fork background subagents do not. MCP prompt commands remain user-only.
+
+Resource text and complete in-budget binary as labeled base64 are bounded by the configured MCP
+content budget; oversized or unsupported content degrades visibly. Prompt and resource catalogs are
+immutable initial snapshots. To discover server changes, run `/reload` (which reloads extensions and
+prompts) or exit and start PiCC again; reconnecting or resuming alone does not refresh them. MCP
+resources have no `@` attachment or autocomplete. See the
+[capability matrix](supported-features.md) for exhaustive limits and deferred MCP surfaces.
+
 ### Harness configuration
 
-Lives **outside the project** (`~/.picc/config.json`) or in the harness-owned, gitignored
-`<project>/.claude/.picc/config.json` (project overrides user; the harness never touches
-tracked project files):
+Lives **outside the project** (`~/.picc/config.json`) or in the harness-owned
+`<project>/.claude/.picc/config.json` (PiCC attempts to add `.claude/.picc/` to repository-local
+excludes; project configuration overrides user configuration):
 
 ```json
 {
@@ -507,7 +541,7 @@ administration, so settings such as `GIT_DIR` cannot redirect those maintenance 
 | `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
 | `MCP_TIMEOUT` | MCP startup bound in ms (default `30000` — 30 s): for remote servers, the aggregate initial connection/discovery/retry settlement bound and the finite bound for each reconnect attempt; see the capability matrix for retry policy |
-| `MCP_TOOL_TIMEOUT` | MCP tool-call timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
+| `MCP_TOOL_TIMEOUT` | MCP tool-call, prompt-get, and resource-read timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
@@ -577,8 +611,8 @@ picc
 Do not put a secret-bearing `${VAR:-default}` in tracked configuration. PiCC-owned configuration,
 transport, status, diagnostic, and local tool-error surfaces omit expanded URLs and headers, raw
 non-protocol HTTP failure bodies/status/redirect targets, and SDK/fetch exception text. Once enabled,
-valid MCP metadata, successful tool results, and protocol-level tool errors remain untrusted,
-server-controlled model content.
+valid MCP metadata, prompt/resource content, successful tool results, and protocol-level errors
+remain untrusted, server-controlled model content.
 
 Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
 `.claude/settings.json`) are pending by default and never start until you approve them. Approve
@@ -594,12 +628,17 @@ MCP definitions after updates and before launching with secrets. Static authenti
 confined to the currently configured origin across redirects; approval does not make an endpoint
 immutable.
 
-Remote startup and transient recovery are bounded. A server that fails before its initial catalog
-is discovered adds no tools; fix the endpoint, headers, or network, then reload or start a new
-session. Retained proxies and automatic recovery apply only after that initial discovery. During an
+Remote startup and transient recovery are bounded. An initial `tools/list` failure is fatal to that
+server's staged capability publication: it publishes no capability snapshot, `mcp__...` proxies, or
+fixed resource tools. Separately, a `resources/list` failure on an otherwise successfully settled
+resource-advertising server retains that advertised capability and registers the fixed resource
+tools with an attributable catalog failure. Fix the endpoint, headers, or network, then run `/reload`
+or exit and start PiCC again. Retained catalogs and automatic recovery apply only after successful
+initial publication.
+During an
 outage, the original tool proxies stay present and return a transient local failure; after recovery
 stops or a permanent failure, those proxies return a terminal local failure until the server is
-fixed and the session is reloaded. An authentication or authorization failure means to check the
+fixed and the extension is reloaded. An authentication or authorization failure means to check the
 configured static headers, not that OAuth is required. Use `/mcp` for current lifecycle state and
 `/doctor` for configuration compatibility.
 The [capability matrix](supported-features.md) owns alternative transports, deprecations, retry
@@ -655,11 +694,11 @@ behaviors worth knowing:
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | `/doctor` shows aggregate plugin posture and actionable failures, not every clean loaded identity. Review the qualified entries across your `enabledPlugins` sources and Claude Code's installed-plugin view or listing; only a literal `true` plus a matching exact imported record can load content. |
-| An enabled plugin is reported as uninstalled or its installed state is rejected | Follow `/doctor`'s aggregate cause. Relative to the active Claude user directory, fix access/permissions for `plugins/installed_plugins.json` when unreadable or repair/regenerate it through Claude Code when malformed. For an unsupported format, update PiCC or contact PiCC support. Only an actually missing exact record calls for installing the qualified plugin or disabling its setting. Exit PiCC completely and relaunch it; `/new` does not reload state. |
-| The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. Relaunch PiCC after repair. |
-| Plugin policy is ignored or a weaker Windows policy did not apply | `/doctor` identifies the safe source class, not a concrete file or path. For `system-file` or `registry-hklm`, ask the administrator to inspect that class; for `system-drop-in`, ask the administrator to inspect every JSON drop-in. For `registry-hkcu` or `override`, inspect the corresponding user fallback or override input. Relaunch PiCC after repair. |
-| A plugin root or component is rejected | Reinstall the plugin through Claude Code rather than moving files or treating an environment/catalog path as a substitute for the exact record. PiCC rejects declarations or content that are malformed, escaping, missing, unreadable, the wrong kind, or no longer resolve to the same contained target. |
-| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user directory (`~/.claude` by default, or the `PICC_CLAUDE_USER_DIR` override), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. Repair permissions and filesystem integrity; if the installation is suspect, reinstall through Claude Code, then exit and relaunch PiCC. The affected execution did not occur. |
+| An enabled plugin is reported as uninstalled or its installed state is rejected | Follow `/doctor`'s aggregate cause. Relative to the active Claude user directory, fix access/permissions for `plugins/installed_plugins.json` when unreadable or repair/regenerate it through Claude Code when malformed. For an unsupported format, update PiCC or contact PiCC support. Only an actually missing exact record calls for installing the qualified plugin or disabling its setting. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC; `/new` does not reload state. |
+| The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
+| Plugin policy is ignored or a weaker Windows policy did not apply | `/doctor` identifies the safe source class, not a concrete file or path. For `system-file` or `registry-hklm`, ask the administrator to inspect that class; for `system-drop-in`, ask the administrator to inspect every JSON drop-in. For `registry-hkcu` or `override`, inspect the corresponding user fallback or override input. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
+| A plugin root or component is rejected | Reinstall the plugin through Claude Code rather than moving files or treating an environment/catalog path as a substitute for the exact record. PiCC rejects declarations or content that are malformed, escaping, missing, unreadable, the wrong kind, or no longer resolve to the same contained target. After reinstalling, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
+| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user directory (`~/.claude` by default, or the `PICC_CLAUDE_USER_DIR` override), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. For ownership, writability, or wrong-directory-kind failures, repair the filesystem and retry the affected skill, hook, or agent action without reloading. If integrity or context must instead be reconciled or the plugin reinstalled through Claude Code, then use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. The affected execution did not occur. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
 

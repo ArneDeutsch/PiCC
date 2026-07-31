@@ -119,6 +119,7 @@ export interface FakeSdkOptions {
    * when the session cannot stream events (older SDK / minimal fake).
    */
   noSubscribe?: boolean;
+  subscribeThrows?: boolean;
   /**
    * Scripted session stats: fake sessions return this from
    * `getSessionStats()`. A value is returned as-is; a function is evaluated per
@@ -280,7 +281,11 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       // dispatch handed them one with appendMessage (the real SessionManager
       // from persistedSessionManager below; the in-memory `{}` is a no-op).
       const manager = sessionOptions.sessionManager as
-        | { appendMessage?: (message: unknown) => unknown; __forkSeed?: PiSessionMessage[] }
+        | {
+            appendMessage?: (message: unknown) => unknown;
+            __forkSeed?: PiSessionMessage[];
+            __resumeSeed?: PiSessionMessage[];
+          }
         | undefined;
       // Fork inheritance: a fork's fake session manager carries a captured
       // seed of the parent history (`__forkSeed`) — pre-load it into the child
@@ -290,6 +295,8 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       if (manager?.__forkSeed?.length) {
         for (const seeded of manager.__forkSeed) state.messages.push(seeded);
         state.inheritedMessageCount = manager.__forkSeed.length;
+      } else if (manager?.__resumeSeed?.length) {
+        for (const seeded of manager.__resumeSeed) state.messages.push(seeded);
       }
       const record = (message: PiSessionMessage) => {
         state.messages.push(message);
@@ -311,6 +318,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         }
       };
       const subscribe = (listener: (event: unknown) => void) => {
+        if (options.subscribeThrows) throw new Error("subscribe setup failed");
         listeners.add(listener);
         return () => listeners.delete(listener);
       };
@@ -415,10 +423,18 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       ? (transcriptPath: string, sessionDir: string, cwd: string) =>
           realSessionManager!.open(transcriptPath, sessionDir, cwd)
       : options.fakePersistedSessions
-        ? (transcriptPath: string) => fakeManager(
-            transcriptPath,
-            sessionBranches.get(transcriptPath) ?? [],
-          )
+        ? (transcriptPath: string) => {
+            const branch = sessionBranches.get(transcriptPath) ?? [];
+            const messages = branch.flatMap((entry) => {
+              if (typeof entry !== "object" || entry === null) return [];
+              const candidate = entry as { type?: unknown; message?: unknown };
+              return candidate.type === "message" ? [candidate.message as PiSessionMessage] : [];
+            });
+            return {
+              ...fakeManager(transcriptPath, branch),
+              __resumeSeed: messages,
+            } as unknown as PiSessionManagerLike;
+          }
         : undefined,
     // Fork: seed a NEW subagent transcript from a source session's history.
     // With the real SessionManager injected, exercise the genuine on-disk

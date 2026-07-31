@@ -142,6 +142,23 @@ describe("qualified plugin skill activation", () => {
     expect(failed.message).toContain("contained mkdir failed");
     expect(findings[0]).toContain("contained mkdir failed");
 
+    const missingCallback = await renderSkillForActivation({
+      skill,
+      argsText: "",
+      projectRoot: root,
+      cwd: root,
+      sessionId: "session",
+      settings: baseSettings(),
+      pluginContext: context,
+      onRuntimeFinding: (message) => findings.push(message),
+    });
+    expect(missingCallback).toMatchObject({ ok: false });
+    if (missingCallback.ok) throw new Error("expected missing callback to fail activation");
+    expect(missingCallback.message).toContain("Reconcile or reinstall the plugin through Claude Code");
+    expect(missingCallback.message).toContain("canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(missingCallback.message).not.toMatch(/retry|no reload/i);
+    expect(findings).toContain(missingCallback.message);
+
     fs.writeFileSync(skill.source.path, "---\nname: plugin-data\ndescription: pipeline test\n---\nno data variable", "utf8");
     let creationCalls = 0;
     const quiet = await renderSkillForActivation({

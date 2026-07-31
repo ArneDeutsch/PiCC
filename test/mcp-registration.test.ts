@@ -626,6 +626,177 @@ describe("MCP zero-enabled path (wired)", () => {
 describe("remote MCP stable main-session registration (fake runtime)", () => {
   type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
 
+  it("registers the capability cross-product without widening prompt-only, failure, or no-server sessions", async () => {
+    const cases = [
+      { name: "none", tools: false, prompts: false, resources: false, empty: false, failure: false, expected: [] },
+      { name: "tool", tools: true, prompts: false, resources: false, empty: false, failure: false, expected: ["mcp__fixture__echo"] },
+      { name: "prompt", tools: false, prompts: true, resources: false, empty: false, failure: false, expected: [] },
+      { name: "resource", tools: false, prompts: false, resources: true, empty: false, failure: false, expected: ["ListMcpResourcesTool", "ReadMcpResourceTool"] },
+      { name: "mixed", tools: true, prompts: true, resources: true, empty: false, failure: false, expected: ["mcp__fixture__echo", "ListMcpResourcesTool", "ReadMcpResourceTool"] },
+      { name: "failure", tools: true, prompts: true, resources: true, empty: false, failure: true, expected: [] },
+      { name: "advertised-empty", tools: false, prompts: false, resources: true, empty: true, failure: false, expected: ["ListMcpResourcesTool", "ReadMcpResourceTool"] },
+    ] as const;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const row of cases) {
+        const dir = makeTempDir(`picc-mcp-cross-${row.name}-`);
+        const userDir = makeTempDir(`picc-mcp-cross-${row.name}-user-`);
+        writeProjectFile(dir, "CLAUDE.md", `MCP-${row.name}\n`);
+        process.env.PICC_CLAUDE_USER_DIR = userDir;
+        process.chdir(dir);
+        const runtime: Runtime = {
+          whenSettled: async () => { if (row.failure) throw new Error("startup failed"); },
+          tools: () => row.tools ? [{
+            serverName: "fixture", toolName: "echo", description: "echo", inputSchema: { type: "object" },
+          }] : [],
+          prompts: () => row.prompts ? [{
+            serverName: "fixture", promptName: "review", description: "review", arguments: [],
+          }] : [],
+          resourceServers: () => row.resources ? [{
+            serverName: "fixture",
+            resources: row.empty ? [] : [{ serverName: "fixture", uri: "fixture:item", name: "item" }],
+          }] : [],
+          getPrompt: async () => ({ messages: [] }),
+          readResource: async () => ({ contents: [] }),
+          callTool: async () => ({ content: [] }),
+          diagnostics: () => [],
+          serverStates: () => [],
+          shutdown: async () => {},
+        };
+        const localPi = fakePi();
+        picc(localPi.api as never, {
+          mcpRuntime: runtime,
+          onInitializationSettled: localPi.captureInitialization,
+        });
+        await localPi.waitForInitialization();
+        await localPi.fire("before_agent_start", { systemPrompt: "BASE" }, localPi.printCtx());
+        const exposed = [...localPi.tools.keys()].filter((name) =>
+          name.startsWith("mcp__") || name === "ListMcpResourcesTool" || name === "ReadMcpResourceTool"
+        );
+        expect(exposed.sort(), row.name).toEqual([...row.expected].sort());
+        await shutdownExtension(localPi);
+      }
+    } finally {
+      errSpy.mockRestore();
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+
+  it("routes both resource definitions through checkpoint, guard, hooks, scoped denies, and clipping", async () => {
+    const dir = makeTempDir("picc-resource-pipeline-");
+    const userDir = makeTempDir("picc-resource-pipeline-user-");
+    writeProjectFile(dir, "CLAUDE.md", "RESOURCE-PIPELINE\n");
+    writeProjectFile(dir, ".claude/settings.json", JSON.stringify({
+      permissions: { deny: [
+        "ListMcpResourcesTool(server:blocked)",
+        "ReadMcpResourceTool(uri:secret*)",
+      ] },
+      hooks: { PreToolUse: [{ matcher: "ListMcpResourcesTool", hooks: [{
+        type: "command", command: 'echo resource-hook >> "$CLAUDE_PROJECT_DIR/.resource-hook"',
+      }] }] },
+      compaction: { clipMaxTokens: 64 },
+    }));
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const runtime: Runtime = {
+      whenSettled: async () => {},
+      tools: () => [{ serverName: "fixture", toolName: "echo", description: "echo", inputSchema: { type: "object" } }],
+      prompts: () => [],
+      resourceServers: () => [{ serverName: "fixture", resources: [{
+        serverName: "fixture", uri: "fixture:item", name: "item",
+      }] }],
+      getPrompt: async () => ({ messages: [] }),
+      readResource: async (_server, uri) => ({ contents: [{ uri, text: "x".repeat(200_000) }] }),
+      callTool: async () => ({ content: [{ type: "text", text: "proxy-ok" }] }),
+      diagnostics: () => [],
+      serverStates: () => [],
+      shutdown: async () => {},
+    };
+    const localPi = fakePi();
+    const wrapped: string[] = [];
+    try {
+      picc(localPi.api as never, {
+        mcpRuntime: runtime,
+        onInitializationSettled: localPi.captureInitialization,
+        onWired: ({ mainCheckpointGate }) => {
+          const real = mainCheckpointGate.wrapTool.bind(mainCheckpointGate);
+          mainCheckpointGate.wrapTool = ((definition: Record<string, unknown>) => {
+            wrapped.push(String(definition.name));
+            return real(definition);
+          }) as typeof mainCheckpointGate.wrapTool;
+        },
+      });
+      await localPi.waitForInitialization();
+      await localPi.fire("before_agent_start", { systemPrompt: "BASE" }, localPi.printCtx());
+      for (const name of ["ListMcpResourcesTool", "ReadMcpResourceTool", "mcp__fixture__echo"]) {
+        expect(localPi.tools.has(name), name).toBe(true);
+        expect(wrapped.filter((candidate) => candidate === name), name).toHaveLength(1);
+      }
+      expect((await localPi.tools.get("ListMcpResourcesTool").execute("list", {})).content[0].text)
+        .toContain("fixture:item");
+      expect((await localPi.tools.get("ReadMcpResourceTool").execute("read", {
+        server: "fixture", uri: "fixture:item",
+      })).content[0].text).toContain("PiCC omitted remaining MCP resource text");
+      expect((await localPi.tools.get("mcp__fixture__echo").execute("proxy", {})).content[0].text)
+        .toBe("proxy-ok");
+
+      const listDenied = await localPi.fire("tool_call", {
+        toolName: "ListMcpResourcesTool", toolCallId: "deny-list", input: { server: "blocked" },
+      }, localPi.printCtx());
+      expect(listDenied).toMatchObject({ block: true });
+      const readDenied = await localPi.fire("tool_call", {
+        toolName: "ReadMcpResourceTool", toolCallId: "deny-read", input: { server: "fixture", uri: "secret:item" },
+      }, localPi.printCtx());
+      expect(readDenied).toMatchObject({ block: true });
+      const listAllowed = await localPi.fire("tool_call", {
+        toolName: "ListMcpResourcesTool", toolCallId: "allow-list", input: { server: "fixture" },
+      }, localPi.printCtx());
+      expect(listAllowed?.block).not.toBe(true);
+      expect(fs.readFileSync(path.join(dir, ".resource-hook"), "utf8")).toContain("resource-hook");
+
+      const patched = await localPi.fire("tool_result", {
+        toolName: "ReadMcpResourceTool", toolCallId: "clip", input: { server: "fixture", uri: "fixture:item" },
+        content: [{ type: "text", text: "z".repeat(200_000) }], isError: false,
+      }, localPi.printCtx());
+      expect(patched.content[0].text).toContain("[PiCC clipped");
+    } finally {
+      await shutdownExtension(localPi);
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+
+  it.each([
+    ["ListMcpResourcesTool", ["ReadMcpResourceTool"]],
+    ["ReadMcpResourceTool", ["ListMcpResourcesTool"]],
+    ["*", []],
+  ] as const)("applies the main-session bare deny %s before resource registration", async (deny, expected) => {
+    const dir = makeTempDir("picc-resource-deny-");
+    const userDir = makeTempDir("picc-resource-deny-user-");
+    writeProjectFile(dir, "CLAUDE.md", "RESOURCE-DENY\n");
+    writeProjectFile(dir, ".claude/settings.json", JSON.stringify({ permissions: { deny: [deny] } }));
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const runtime: Runtime = {
+      whenSettled: async () => {}, tools: () => [], prompts: () => [],
+      resourceServers: () => [{ serverName: "fixture", resources: [] }],
+      getPrompt: async () => ({ messages: [] }), readResource: async () => ({ contents: [] }),
+      callTool: async () => ({ content: [] }), diagnostics: () => [], serverStates: () => [],
+      shutdown: async () => {},
+    };
+    const localPi = fakePi();
+    try {
+      picc(localPi.api as never, { mcpRuntime: runtime, onInitializationSettled: localPi.captureInitialization });
+      await localPi.waitForInitialization();
+      await localPi.fire("before_agent_start", { systemPrompt: "BASE" }, localPi.printCtx());
+      expect([...localPi.tools.keys()].filter((name) =>
+        name === "ListMcpResourcesTool" || name === "ReadMcpResourceTool"
+      )).toEqual(expected);
+    } finally {
+      await shutdownExtension(localPi);
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+
   it("registers once after retries, keeps the same proxy through recovery/exhaustion, and clears retrying status", async () => {
     const dir = makeTempDir("picc-remotereg-");
     const userDir = makeTempDir("picc-remotereg-user-");
@@ -646,6 +817,10 @@ describe("remote MCP stable main-session registration (fake runtime)", () => {
     const runtime: Runtime = {
       whenSettled: () => settled.promise,
       tools: () => catalog,
+      prompts: () => [],
+      resourceServers: () => [],
+      getPrompt: async () => { throw new Error("unreachable"); },
+      readResource: async () => { throw new Error("unreachable"); },
       diagnostics: () => [],
       serverStates: () => [{ name: "remote", transport: "http", state }],
       shutdown: async () => {},
@@ -732,6 +907,10 @@ describe("remote MCP stable main-session registration (fake runtime)", () => {
     const runtime: Runtime = {
       whenSettled: async () => {},
       tools: () => [],
+      prompts: () => [],
+      resourceServers: () => [],
+      getPrompt: async () => { throw new Error("unreachable"); },
+      readResource: async () => { throw new Error("unreachable"); },
       diagnostics: () => ["MCP server startup failed (authentication)."],
       serverStates: () => Array.from({ length: 20 }, (_, index) => ({
         name: `failed-${index}`,
