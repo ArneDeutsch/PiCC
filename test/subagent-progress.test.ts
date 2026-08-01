@@ -11,6 +11,7 @@ import {
   formatPresentationCount,
   formatUsageCompact,
   formatUsagePresentation,
+  progressActivityLine,
   renderProgressText,
   sanitizeDetailScalar,
   sanitizeLine,
@@ -279,6 +280,277 @@ describe("SubagentProgressCondenser", () => {
     const snap: ProgressSnapshot = { tail: ["a", "b"], activity: "running Read…" };
     expect(renderProgressText(snap)).toBe("a\nb\n… running Read…");
     expect(renderProgressText({ tail: [], activity: "" })).toBe("");
+  });
+});
+
+describe("SubagentProgressCondenser live activity", () => {
+  it("captures display tool names and primary arguments without changing legacy snapshots", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "WebSearch",
+      args: { description: "last", query: "second", command: "first" },
+    });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "web search", detail: "first" });
+    expect(c.liveActivityChanged()).toBe(true);
+    expect(c.snapshot()).toEqual({
+      tail: ["> WebSearch (first)"],
+      activity: "running WebSearch…",
+    });
+    expect(c.snapshot()).not.toHaveProperty("liveActivity");
+    expect(renderProgressText(c.snapshot())).toBe("> WebSearch (first)\n… running WebSearch…");
+    expect(progressActivityLine(c.snapshot())).toBe("running WebSearch…");
+  });
+
+  it.each([
+    ["command", "cmd"],
+    ["file_path", "file.ts"],
+    ["path", "dir"],
+    ["pattern", "needle"],
+    ["query", "question"],
+    ["url", "https://example.test"],
+    ["description", "task"],
+  ] as const)("uses the %s primary argument", (key, value) => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolCallId: key, toolName: "CustomXMLTool", args: { [key]: value } });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "custom xml tool", detail: value });
+  });
+
+  it("tracks parallel calls by identity and ignores streaming tool updates", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolCallId: "a", toolName: "Read", args: { path: "a.ts" } });
+    c.consume({ type: "tool_execution_start", toolCallId: "b", toolName: "Grep", args: { pattern: "needle" } });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "grep", detail: "needle" });
+    expect(c.consume({ type: "tool_execution_update", toolCallId: "b", partialResult: "noise" })).toBe(false);
+    expect(c.liveActivityChanged()).toBe(false);
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "grep", detail: "needle" });
+    c.consume({ type: "tool_execution_end", toolCallId: "a", toolName: "Read", result: "contents" });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "grep", detail: "needle" });
+    c.consume({ type: "tool_execution_end", toolCallId: "b", toolName: "Grep", result: "done" });
+    expect(c.liveActivity()).toEqual({ kind: "output", text: "done" });
+
+    const reveal = new SubagentProgressCondenser();
+    reveal.consume({ type: "tool_execution_start", toolCallId: "a", toolName: "Read", args: { path: "a.ts" } });
+    reveal.consume({ type: "tool_execution_start", toolCallId: "b", toolName: "Grep", args: { pattern: "needle" } });
+    reveal.consume({ type: "tool_execution_end", toolCallId: "b", toolName: "Grep", result: "done" });
+    expect(reveal.liveActivity()).toEqual({ kind: "tool", tool: "read", detail: "a.ts" });
+    reveal.consume({ type: "tool_execution_end", toolCallId: "a", toolName: "Read", result: "contents" });
+    expect(reveal.liveActivity()).toEqual({ kind: "output", text: "contents" });
+  });
+
+  it("correlates complete long-prefix and control-only tool-call IDs", () => {
+    const c = new SubagentProgressCondenser();
+    const prefix = "x".repeat(350);
+    const controlA = `${String.fromCharCode(0)}${String.fromCharCode(1)}`;
+    const controlB = `${String.fromCharCode(0)}${String.fromCharCode(2)}`;
+    c.consume({ type: "tool_execution_start", toolCallId: `${prefix}a`, toolName: "Read", args: { path: "a" } });
+    c.consume({ type: "tool_execution_start", toolCallId: `${prefix}b`, toolName: "Grep", args: { pattern: "b" } });
+    c.consume({ type: "tool_execution_end", toolCallId: `${prefix}a`, toolName: "Read", result: "a done" });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "grep", detail: "b" });
+    c.consume({ type: "tool_execution_end", toolCallId: `${prefix}b`, toolName: "Grep", result: "b done" });
+    expect(c.liveActivity()).toEqual({ kind: "output", text: "b done" });
+
+    c.consume({ type: "tool_execution_start", toolCallId: controlA, toolName: "Read", args: { path: "control-a" } });
+    c.consume({ type: "tool_execution_start", toolCallId: controlB, toolName: "Read", args: { path: "control-b" } });
+    c.consume({ type: "tool_execution_end", toolCallId: controlA, toolName: "Read", result: "first" });
+    expect(c.liveActivity()).toEqual({ kind: "tool", tool: "read", detail: "control-b" });
+    c.consume({ type: "tool_execution_end", toolCallId: controlB, toolName: "Read", result: "second" });
+    expect(c.liveActivity()).toEqual({ kind: "output", text: "second" });
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["oversized", "x".repeat(4_097)],
+  ] as const)("keeps %s tool-call identities uncertain until turn_end", (_label, toolCallId) => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolCallId, toolName: "Read", args: { path: "a" } });
+    c.consume({ type: "tool_execution_end", toolCallId, toolName: "Read", result: "done" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Tool activity in progress…" });
+    c.consume({ type: "turn_end", message: assistant("done") });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+  });
+
+  it("keeps bounded uncertainty for a 129th call until turn_end", () => {
+    const c = new SubagentProgressCondenser();
+    for (let i = 0; i < 129; i++) {
+      c.consume({ type: "tool_execution_start", toolCallId: `call-${i}`, toolName: "Read", args: { path: `${i}` } });
+    }
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Tool activity in progress…" });
+    for (let i = 0; i < 64; i++) {
+      c.consume({ type: "tool_execution_end", toolCallId: `call-${i}`, toolName: "Read", result: `${i}` });
+    }
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Tool activity in progress…" });
+    c.consume({ type: "turn_end", message: assistant("done") });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+  });
+
+  it("distinguishes bounded reasoning and assistant deltas without model-facing emissions", () => {
+    const c = new SubagentProgressCondenser();
+    const partial = { role: "assistant", content: [{ type: "thinking", thinking: "private analysis" }] };
+    const reasoningOnly = {
+      type: "message_update",
+      message: partial,
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "old line\ncurrent reasoning", partial },
+    };
+    expect(c.consume(reasoningOnly)).toBe(false);
+    expect(c.liveActivityChanged()).toBe(true);
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "current reasoning" });
+    const copy = c.liveActivity() as { kind: "reasoning"; text: string };
+    copy.text = "mutated";
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "current reasoning" });
+    expect(c.consume({ type: "irrelevant" })).toBe(false);
+    expect(c.liveActivityChanged()).toBe(false);
+
+    c.consume({
+      type: "message_update",
+      message: assistant("answer"),
+      assistantMessageEvent: { type: "text_delta", delta: "answer" },
+    });
+    expect(c.liveActivity()).toEqual({ kind: "assistant", text: "answer" });
+    expect((c.liveActivity() as { text: string }).text.length).toBeLessThanOrEqual(DETAIL_FIELD_MAX_LENGTH);
+  });
+
+  it("suppresses Pi-shaped redacted thinking start, delta, and end events", () => {
+    const c = new SubagentProgressCondenser();
+    const ordinary = { content: [{ type: "thinking", thinking: "visible" }] };
+    c.consume({
+      type: "message_update",
+      message: ordinary,
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "visible", partial: ordinary },
+    });
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "visible" });
+
+    const redacted = { content: [{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true }] };
+    for (const assistantMessageEvent of [
+      { type: "thinking_start", contentIndex: 0, partial: redacted },
+      { type: "thinking_delta", contentIndex: 0, delta: "[Reasoning redacted]", partial: redacted },
+      { type: "thinking_end", contentIndex: 0, content: "[Reasoning redacted]", partial: redacted },
+    ]) {
+      c.consume({ type: "message_update", message: redacted, assistantMessageEvent });
+      expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+      expect(JSON.stringify(c.liveActivity())).not.toContain("redacted");
+    }
+  });
+
+  it("defensively inspects fallback partial blocks", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "message_update",
+      message: { content: [] },
+      assistantMessageEvent: {
+        partial: { content: [{ type: "thinking", thinking: "safe\nnewest" }] },
+      },
+    });
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "newest" });
+  });
+
+  it("accumulates deltas and replaces the current logical line across split endings", () => {
+    const c = new SubagentProgressCondenser();
+    const partial = { content: [{ type: "thinking", thinking: "" }] };
+    const delta = (text: string) => c.consume({
+      type: "message_update",
+      message: partial,
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: text, partial },
+    });
+    delta("first");
+    delta(" line\r");
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "first line" });
+    delta("\nsecond");
+    delta(" line");
+    expect(c.liveActivity()).toEqual({ kind: "reasoning", text: "second line" });
+  });
+
+  it("bounds raw live inspection per delta and across fallback blocks", () => {
+    const c = new SubagentProgressCondenser();
+    const partial = { content: [{ type: "thinking", thinking: "" }] };
+    c.consume({
+      type: "message_update",
+      message: partial,
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 0,
+        delta: `${"x".repeat(4_096)}\nBEYOND_DELTA_BUDGET`,
+        partial,
+      },
+    });
+    expect(JSON.stringify(c.liveActivity())).not.toContain("BEYOND_DELTA_BUDGET");
+
+    c.consume({ type: "turn_start" });
+    c.consume({
+      type: "message_update",
+      message: { content: [] },
+      assistantMessageEvent: {
+        partial: {
+          content: [
+            { type: "thinking", thinking: " ".repeat(4_096) },
+            { type: "text", text: "BEYOND_FALLBACK_BUDGET" },
+          ],
+        },
+      },
+    });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Thinking…" });
+  });
+
+  it("uses truthful neutral and failed-tool statuses", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolCallId: "x", toolName: "Bash", args: { command: "false" } });
+    c.consume({ type: "tool_execution_end", toolCallId: "x", toolName: "Bash", result: "exit 1", isError: true });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Failed: bash — exit 1" });
+    c.consume({ type: "tool_execution_start", toolCallId: "y", toolName: "Read", args: {} });
+    c.consume({ type: "tool_execution_end", toolCallId: "y", toolName: "Read", result: "", isError: false });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+  });
+
+  it("keeps the Failed marker ahead of an oversized tool name", () => {
+    const c = new SubagentProgressCondenser();
+    const toolName = "HugeTool".repeat(1_000);
+    c.consume({ type: "tool_execution_start", toolCallId: "huge", toolName, args: {} });
+    c.consume({ type: "tool_execution_end", toolCallId: "huge", toolName, result: "oversized", isError: true });
+    const activity = c.liveActivity();
+    expect(activity?.kind).toBe("status");
+    expect((activity as { text: string }).text).toMatch(/^Failed:/u);
+  });
+
+  it("projects every retry and neutral lifecycle route into the live atom", () => {
+    const c = new SubagentProgressCondenser();
+    const cases = [
+      [{ type: "turn_start" }, "Thinking…"],
+      [{ type: "auto_retry_start", attempt: 2, maxAttempts: 3 }, "waiting: API retry 2/3"],
+      [{ type: "auto_retry_start" }, "waiting: API retry"],
+      [{ type: "auto_retry_end", success: true }, "retry succeeded; resuming…"],
+      [{ type: "auto_retry_end", success: false }, "retry failed"],
+      [{ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 2 }, "waiting: summary retry 1/2"],
+      [{ type: "summarization_retry_scheduled" }, "waiting: summary retry"],
+      [{ type: "summarization_retry_attempt_start" }, "retrying summary…"],
+      [{ type: "summarization_retry_finished" }, "summary retry finished"],
+    ] as const;
+    for (const [event, text] of cases) {
+      c.consume(event);
+      expect(c.liveActivity()).toEqual({ kind: "status", text });
+    }
+  });
+
+  it("bounds and sanitizes hostile activity inputs without throwing", () => {
+    const hostile = `${ESC}]0;pwn${BEL}${ESC}[31mred${ESC}[0m\nblue\uD800${"x".repeat(10_000)}`;
+    const c = new SubagentProgressCondenser();
+    expect(() => c.consume({
+      type: "tool_execution_start",
+      toolCallId: "hostile",
+      toolName: hostile,
+      args: new Proxy({}, { get() { throw new Error("hostile getter"); } }),
+    })).not.toThrow();
+    const activity = c.liveActivity()!;
+    for (const value of Object.values(activity)) {
+      if (typeof value !== "string") continue;
+      expect(value.length).toBeLessThanOrEqual(DETAIL_FIELD_MAX_LENGTH);
+      expect(value).not.toMatch(/[\r\n\uD800-\uDFFF]/u);
+      expect(value).not.toContain(ESC);
+      expect(value).not.toContain(BEL);
+    }
+    const proxy = new Proxy({}, { get() { throw new Error("hostile event"); } });
+    expect(() => c.consume(proxy)).not.toThrow();
+    expect(c.liveActivityChanged()).toBe(false);
   });
 });
 

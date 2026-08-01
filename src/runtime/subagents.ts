@@ -2558,18 +2558,13 @@ export class SubagentRuntime {
         else opts.abortSignal.addEventListener("abort", abortListener, { once: true });
       }
 
-      // Live progress: subscribe to the child session's event stream and
-      // condense it into a bounded, sanitized snapshot on every visible change.
-      // The dispatch-registry mirror is UNCONDITIONAL — this subscription is
-      // the panel's single live data source, so foreground (with or without an
-      // onUpdate sink), background, nested, and resumed dispatches all feed it;
-      // opts.onProgress additionally receives the same snapshot when supplied,
-      // exactly as before. Mirror before emit, so the record never lags a
-      // consumer-visible snapshot; structured detail travels only to the
-      // registry record, never inside model-facing emitted payloads.
-      // Event-stream only — NEVER poll session.messages (compaction inside
-      // prompt() rewrites that array mid-flight). Degrades to nothing when the
-      // session has no subscribe() (simple fakes, older SDKs).
+      // Project every child event independently into the legacy snapshot, structured
+      // detail log, and current live-activity atom. The registry mirrors all three for
+      // foreground, background, nested, and resumed dispatches; opts.onProgress receives
+      // snapshot changes only, preserving its model-facing cadence. Mirror before emit so
+      // the registry never lags a consumer-visible snapshot. Event-stream only — NEVER
+      // poll session.messages, which compaction can rewrite mid-flight. Sessions without
+      // subscribe() (simple fakes and older SDKs) degrade to no live projection.
       const dispatchRegistry = this.deps.subagentRegistry;
       if ((opts.onProgress || dispatchRegistry) && typeof session.subscribe === "function") {
         const emit = opts.onProgress;
@@ -2578,14 +2573,16 @@ export class SubagentRuntime {
           try {
             const snapshotChanged = condenser.consume(event);
             const detailChanged = condenser.detailChanged();
-            if (!snapshotChanged && !detailChanged) return;
+            const liveActivityChanged = condenser.liveActivityChanged();
+            if (!snapshotChanged && !detailChanged && !liveActivityChanged) return;
             const snapshot = snapshotChanged ? condenser.snapshot() : undefined;
             dispatchRegistry?.noteProgress(
               agentId,
               snapshot,
               detailChanged ? condenser.detailLog() : undefined,
+              liveActivityChanged ? { value: condenser.liveActivity() } : undefined,
             );
-            if (snapshot) emit?.(snapshot);
+            if (snapshotChanged) emit?.(snapshot!);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }

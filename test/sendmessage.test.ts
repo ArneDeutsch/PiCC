@@ -256,13 +256,20 @@ describe("SubagentRegistry — panel state fields", () => {
       text: "old live answer",
       fingerprint: assistantTextFingerprint(["old live answer"]),
     }];
-    r.noteProgress(id, { tail: ["old progress"], activity: "working…" }, details);
+    r.noteProgress(
+      id,
+      { tail: ["old progress"], activity: "working…" },
+      details,
+      { value: { kind: "assistant", text: "old live answer" } },
+    );
+    expect(r.get(id)!.liveActivity).toEqual({ kind: "assistant", text: "old live answer" });
     r.markSettled(id, {
       outcome: "completed",
       usage: { inputTokens: 12 },
       finalText: `${ESC}[31mthe answer${ESC}[0m\nline two`,
     });
     expect(r.get(id)!.finalText).toBe("the answer\nline two");
+    expect(r.get(id)!.liveActivity).toBeUndefined();
 
     r.markResuming(id);
     const resumed = r.get(id)!;
@@ -273,7 +280,7 @@ describe("SubagentRegistry — panel state fields", () => {
       transcriptPath: base.transcriptPath,
       state: "running",
     });
-    for (const field of ["finalText", "outcome", "usage", "progress", "detailLog", "settledAt"] as const) {
+    for (const field of ["finalText", "outcome", "usage", "progress", "detailLog", "liveActivity", "settledAt"] as const) {
       expect(resumed[field]).toBeUndefined();
     }
 
@@ -285,6 +292,7 @@ describe("SubagentRegistry — panel state fields", () => {
     expect(r.get(id)!.usage).toBeUndefined();
     expect(r.get(id)!.progress).toBeUndefined();
     expect(r.get(id)!.detailLog).toBeUndefined();
+    expect(r.get(id)!.liveActivity).toBeUndefined();
   });
 
   it("deep-copies structured detail entries when storing them", () => {
@@ -851,6 +859,11 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     expect(lifecycleRecord?.settlementDelivery).toBe("collected");
 
     // SendMessage resume → immediate ack, same ID, flipped back to running.
+    const resumedActivities: unknown[] = [];
+    registry.onChange(() => {
+      const activity = registry.get(agentId)?.liveActivity;
+      if (activity) resumedActivities.push({ ...activity });
+    });
     const sm = createSendMessageToolDefinition(runtime, {
       registry,
       backgroundTasks,
@@ -911,6 +924,8 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     // re-armed the record to "running" BEFORE the mirror's events fired (the
     // one ordering that keeps noteProgress's running-guard open on resume).
     expect(registry.get(agentId)!.progress?.tail.join("\n")).toContain("RESUME REPLY");
+    expect(resumedActivities).toContainEqual({ kind: "status", text: "Working…" });
+    expect(registry.get(agentId)!.liveActivity).toBeUndefined();
 
     // A SECOND createAgentSession happened, seeded from the reopened transcript —
     // prior context is available to the resumed run (SECURITY: from the reopened
