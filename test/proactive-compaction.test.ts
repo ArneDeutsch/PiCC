@@ -3453,7 +3453,12 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
    * the gate directly so `sessionManagerRef` is this context's, which decides whether the
    * headless recovery guidance names a persisted session or calls the session ephemeral.
    */
-  const armCheckpoint = async (ctx: any, id: string, queued?: string) => {
+  const armCheckpoint = async (
+    ctx: any,
+    id: string,
+    queued?: string,
+    checkpointAbortRequested = false,
+  ) => {
     await pi.fire("session_start", { reason: "new" }, ctx);
     mainCheckpointGate.assistantMessageEnded({
       role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
@@ -3462,15 +3467,109 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
     });
     const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: checkpointAbortRequested });
     mainCheckpointGate.turnEnded(ctx);
     if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
     const controller = mainCheckpointGate.currentController();
     expect(controller.snapshot()).toMatchObject({
-      phase: "awaiting-settlement", queuedInputs: queued === undefined ? 0 : 1,
+      phase: "awaiting-settlement",
+      checkpointAbortRequested,
+      queuedInputs: queued === undefined ? 0 : 1,
     });
     return { controller, generation: controller.snapshot().generation };
   };
+
+  it.each([
+    ["clean terminate", false],
+    ["mixed abort", true],
+  ] as const)(
+    "settles an awaiting %s checkpoint once when Pi persists its physical cutoff as aborted",
+    async (cutoff, checkpointAbortRequested) => {
+      let compactions = 0;
+      const terminal = {
+        role: "assistant",
+        content: [{ type: "text", text: `physical ${cutoff} checkpoint cutoff` }],
+        stopReason: "aborted",
+      };
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+        abort: () => undefined,
+        compact: (options: any) => {
+          compactions += 1;
+          queueMicrotask(() => options.onError(new Error("summary unavailable")));
+        },
+      });
+      const { controller } = await armCheckpoint(
+        ctx,
+        `persisted-${cutoff.replace(" ", "-")}-cutoff`,
+        undefined,
+        checkpointAbortRequested,
+      );
+      const logicalAuthority = mainCheckpointGate.captureLogicalRunStop();
+
+      await pi.fire("agent_settled", {}, ctx);
+
+      expect(compactions).toBe(1);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+      expect(logicalAuthority()).toBe(true);
+    },
+  );
+
+  it.each(["pending", "error"] as const)(
+    "rejects a genuine awaiting %s terminal",
+    async (stopReason) => {
+      let compactions = 0;
+      const terminal = {
+        role: "assistant",
+        content: [{ type: "text", text: `unsuccessful ${stopReason}` }],
+        stopReason,
+      };
+      const ctx = pi.printCtx({
+        mode: "json",
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+        abort: () => undefined,
+        compact: (options: any) => {
+          compactions += 1;
+          queueMicrotask(() => options.onError(new Error("unexpected compaction")));
+        },
+      });
+      const { controller, generation } = await armCheckpoint(ctx, `unsuccessful-${stopReason}`);
+      const barrier = controller.stableBarrier(generation);
+      const beforeEntries = pi.entries.length;
+      const logicalAuthority = mainCheckpointGate.captureLogicalRunStop();
+
+      await pi.fire("agent_settled", {}, ctx);
+
+      expect(compactions).toBe(0);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+      expect(controller.ordinaryInputDisposition()).toBe("reject-recoverable");
+      expect(controller.manualCompactionDisposition()).toBe("allow");
+      const recovery = controller.recoveryToken(generation);
+      expect(recovery).toBeDefined();
+      await expect(barrier).resolves.toBeUndefined();
+      const diagnostics = pi.entries.slice(beforeEntries).filter((entry) =>
+        entry.data.category === "checkpoint-exhausted");
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.data).toMatchObject({
+        generation, action: "manual-recovery", failureCategory: "operational",
+      });
+      await expect(pi.fire("input", {
+        text: `ordinary-after-${stopReason}`, source: "interactive", streamingBehavior: undefined,
+      }, ctx)).resolves.toEqual({ action: "handled" });
+      expect(logicalAuthority()).toBe(false);
+      expect(controller.recoverAfterManualCompaction(recovery!).recovered).toBe(true);
+    },
+  );
 
   interface EndingCase {
     /** Does this ending take the retained input away, or hold it for `/compact`? */

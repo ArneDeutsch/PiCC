@@ -3706,7 +3706,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("agent_settled", async (_event: any, ctx: any) => {
     checkpointContext = ctx;
     const terminalAssistant = latestAssistantMessage(ctx);
-    const unsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
+    const physicalUnsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
+    const checkpointSnapshot = mainCheckpointGate.currentController().snapshot();
+    // Pi persists either PiCC-owned pre-commit stop mechanism as aborted. The
+    // active awaiting generation still owns the authorized checkpoint settlement.
+    // `checkpointAbortRequested` only selects abort instead of terminate and is
+    // deliberately excluded from this exception's eligibility.
+    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "aborted" &&
+      activeMainResume === undefined && mainCheckpointGate.isActive() &&
+      checkpointSnapshot.phase === "awaiting-settlement";
+    const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
     if (unsuccessful && terminalAssistant.stopReason === "pending") {
       const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";
       try {
@@ -3726,9 +3735,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       physicalOperation.epoch === checkpointSessionEpoch &&
       physicalOperation.controller === boundaryController &&
       physicalOperation.generation === boundaryGeneration;
-    const stopped = await settleStoppedMainRun(unsuccessful ? "abandoned" : "superseded");
+    const stopped = await settleStoppedMainRun(physicalUnsuccessful ? "abandoned" : "superseded");
     const controller = mainCheckpointGate.currentController();
-    if (unsuccessful && mainCheckpointGate.consumeSettledStoppedResume(
+    if (physicalUnsuccessful && mainCheckpointGate.consumeSettledStoppedResume(
       controller, controller.snapshot().generation,
     )) {
       // The authoritative stop has joined and rotated its controller. The physical
@@ -3751,6 +3760,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // the existing abandonment path, which terminalizes instead of publishing success.
         resume.conclude("abandoned");
       } else {
+        if (resume === undefined && !mainCheckpointGate.isLogicalRunStopped() &&
+            terminalAssistant.stopReason !== "aborted" && snapshot.phase === "awaiting-settlement") {
+          controller.exhaustUnsuccessfulAwaitingSettlement(snapshot.generation);
+        }
         // Ordinary unsuccessful settlement still revokes callbacks captured by its run.
         mainCheckpointGate.logicalRunSettled();
       }

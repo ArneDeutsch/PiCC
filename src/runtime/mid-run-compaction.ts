@@ -443,6 +443,8 @@ export class MidRunCompactionController {
     const clean = !batch.malformed && states.length > 0 &&
       states.every((state) => state.finalized && state.owned && state.canTerminate);
     this.phase = "awaiting-settlement";
+    // This records only which physical stop PiCC selected; it is not logical failure
+    // evidence and deliberately cannot decide settlement-exception eligibility.
     this.checkpointAbortRequested = !clean;
     return { generation: this.generation, complete: true, stop: clean ? "terminate" : "abort" };
   }
@@ -547,6 +549,13 @@ export class MidRunCompactionController {
 
   settleMalformedAtHostBoundary(generation: number): boolean {
     if (generation !== this.generation || (this.phase !== "armed" && this.phase !== "stopping")) return false;
+    this.exhaust(generation, "operational");
+    return true;
+  }
+
+  exhaustUnsuccessfulAwaitingSettlement(generation: number): boolean {
+    if (generation !== this.generation || this.phase !== "awaiting-settlement" ||
+        this.committedGeneration === generation) return false;
     this.exhaust(generation, "operational");
     return true;
   }
