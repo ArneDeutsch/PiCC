@@ -40,7 +40,7 @@ const directoryLinkProbe = (() => {
 })();
 
 function makeTmp(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-"));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-")));
   tempDirs.push(dir);
   return dir;
 }

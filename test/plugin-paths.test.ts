@@ -19,7 +19,7 @@ import {
 const temporaryDirectories: string[] = [];
 
 function temporaryDirectory(prefix = "picc-plugin-paths-"): string {
-  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   temporaryDirectories.push(directory);
   return directory;
 }
