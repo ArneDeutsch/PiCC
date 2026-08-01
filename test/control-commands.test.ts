@@ -636,7 +636,7 @@ describe("pre-selection plugin discovery to first use", () => {
             "---", `name: ${skill}`, `description: ${skill} canary`, hooks, "---", body,
           ].filter(Boolean).join("\n"), "utf8");
         });
-        if (name === "hook-owner") hookRoot = installRoot;
+        if (name === "hook-owner") hookRoot = fs.realpathSync.native(installRoot);
       }
       const settingsPath = path.join(projectRoot, ".claude-user", "settings.json");
       const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;

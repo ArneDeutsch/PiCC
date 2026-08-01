@@ -70,12 +70,13 @@ beforeAll(() => {
     "--prefix", prefix,
     tarball,
     "--ignore-scripts",
+    "--prefer-offline",
     "--audit=false",
     "--fund=false",
-  ], { cwd: prefix, stdio: "pipe", timeout: 180_000 });
+  ], { cwd: prefix, stdio: "pipe", timeout: 300_000 });
   packageRoot = path.join(prefix, "node_modules", "picc");
   launcher = path.join(packageRoot, "bin", "picc.mjs");
-}, 240_000);
+}, 450_000);
 
 afterEach(cleanup);
 afterAll(() => {

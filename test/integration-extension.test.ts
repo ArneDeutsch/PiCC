@@ -1649,6 +1649,12 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
       };
       const mismatchRow = makeRow("edit-preview-mismatch", mismatchArgs);
       mismatchRow.setArgsComplete();
+      await waitUntil({
+        description: "the mismatched Edit preview to fail before execution",
+        predicate: () => plainRow(mismatchRow).includes("Could not find the exact text"),
+        describeObserved: () => plainRow(mismatchRow),
+        timeoutMs: 15_000,
+      });
       mismatchRow.markExecutionStarted();
       let mismatchMessage = "";
       try {
