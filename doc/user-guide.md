@@ -465,9 +465,10 @@ excludes; project configuration overrides user configuration):
   default is used (not the still-valid user value).
 
   For main sessions and PiCC-created subagents, final usage from a fresh successful assistant
-  response that requests tools can queue a checkpoint. The already-requested tool batch finishes
-  first; high displayed context while those tools run is safe deferral, not another provider turn or
-  a missed checkpoint. Before admitting another ordinary model request, PiCC samples usage again and
+  response that requests tools can queue a checkpoint. When PiCC reports that checkpoint as queued,
+  continued already-requested tool activity is safe deferral, not another provider turn or a missed
+  checkpoint; high displayed context by itself does not prove that a checkpoint is armed. Before
+  admitting another ordinary model request, PiCC samples usage again and
   blocks the ordinary request before provider transport if newly known threshold pressure requires a
   checkpoint. Only after the run and its complete tool batch settle may PiCC start one Pi compaction
   transaction and resume the same
