@@ -16,6 +16,7 @@ import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime } from "./helpers/fake-sdk.js";
 import { fakePi } from "./helpers/fake-pi.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { settlement } from "./helpers/async.js";
 
 interface ChildHarness {
   sdk: PiSdk;
@@ -33,6 +34,14 @@ interface ChildHarness {
   customMessages(): Array<{ customType: string; content: unknown }>;
   guardResults(): unknown[];
   providerRegistrations(): Array<{ name: string; config: Record<string, unknown> }>;
+  providerAttempts(): number;
+  admittedProviderRequests(): number;
+  fabricatedResponses(): number;
+  checkpointToolStarted(): Promise<void>;
+  releaseCheckpointTool(): void;
+  executeCheckpointTool(): Promise<Record<string, unknown>>;
+  providerBoundaryBlocked(): Promise<void>;
+  releaseProviderBlock(): void;
 }
 
 interface CheckpointSdkOptions {
@@ -48,6 +57,10 @@ interface CheckpointSdkOptions {
   cancelBeforeCompactLifecycle?: boolean;
   gateProactiveCompact?: boolean;
   rejectAfterCompactEvent?: "proactive" | "manual";
+  assistantUsage?: "high" | "low";
+  highAtProviderBoundary?: boolean;
+  holdCheckpointTool?: boolean;
+  holdAfterProviderBlock?: boolean;
 }
 
 function checkpointSdk({
@@ -63,6 +76,10 @@ function checkpointSdk({
   cancelBeforeCompactLifecycle = false,
   gateProactiveCompact = false,
   rejectAfterCompactEvent,
+  assistantUsage = "high",
+  highAtProviderBoundary = false,
+  holdCheckpointTool = false,
+  holdAfterProviderBlock = false,
 }: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -72,6 +89,9 @@ function checkpointSdk({
   let abortCalls = 0;
   let compactionAbortCalls = 0;
   let resumeCalls = 0;
+  let providerAttempts = 0;
+  let admittedProviderRequests = 0;
+  let fabricatedResponses = 0;
   const events: string[] = [];
   const customMessages: Array<{ customType: string; content: unknown }> = [];
   const guardResults: unknown[] = [];
@@ -79,9 +99,17 @@ function checkpointSdk({
   let releaseRecoveryCompact!: () => void;
   let markRecoveryCompactStarted!: () => void;
   let markCompactionAbortObserved!: () => void;
+  let markCheckpointToolStarted!: () => void;
+  let releaseCheckpointTool!: () => void;
+  let markProviderBoundaryBlocked!: () => void;
+  let releaseProviderBlock!: () => void;
   const recoveryCompactGate = new Promise<void>((resolve) => { releaseRecoveryCompact = resolve; });
   const recoveryCompactStarted = new Promise<void>((resolve) => { markRecoveryCompactStarted = resolve; });
   const compactionAbortObserved = new Promise<void>((resolve) => { markCompactionAbortObserved = resolve; });
+  const checkpointToolStarted = new Promise<void>((resolve) => { markCheckpointToolStarted = resolve; });
+  const checkpointToolGate = new Promise<void>((resolve) => { releaseCheckpointTool = resolve; });
+  const providerBoundaryBlocked = new Promise<void>((resolve) => { markProviderBoundaryBlocked = resolve; });
+  const providerBlockGate = new Promise<void>((resolve) => { releaseProviderBlock = resolve; });
 
   class Loader {
     constructor(readonly options: Record<string, unknown>) {}
@@ -119,16 +147,20 @@ function checkpointSdk({
         return results;
       };
       let activeResumeAborted = false;
+      let contextHigh = false;
+      let contextUsageKnown = true;
       const ctx = {
-        model: { api: "openai-responses" },
+        model: { api: "openai-responses", contextWindow: 1000 },
         mode: "json",
-        getContextUsage: () => compactions >= (reExhaustOnce
-          ? 4
-          : reExhaustWithRestorationFailure
-            ? 3
-            : failures >= 3 ? 2 : 1)
-          ? ({ percent: 10, tokens: 100, contextWindow: 1000 })
-          : ({ percent: 95, tokens: 950, contextWindow: 1000 }),
+        getContextUsage: () => !contextUsageKnown
+          ? undefined
+          : !contextHigh || compactions >= (reExhaustOnce
+            ? 4
+            : reExhaustWithRestorationFailure
+              ? 3
+              : failures >= 3 ? 2 : 1)
+            ? ({ percent: 10, tokens: 100, contextWindow: 1000 })
+            : ({ percent: 95, tokens: 950, contextWindow: 1000 }),
         hasPendingMessages: () => false,
         abort: () => {
           aborted = true;
@@ -141,7 +173,9 @@ function checkpointSdk({
       let compactionAborted = false;
       const runResumed = async (): Promise<void> => {
         await emit("turn_start", {}, ctx);
+        providerAttempts += 1;
         await emit("before_provider_request", {}, ctx);
+        if (!activeResumeAborted) admittedProviderRequests += 1;
         if (activateSkill) {
           await emit("tool_call", {
             toolName: "read", toolCallId: "post-compact-touch", input: { path: "sub/note.txt" },
@@ -165,6 +199,10 @@ function checkpointSdk({
         messages.push(assistant);
         await emit("message_end", { message: assistant }, ctx);
         await emit("turn_end", {}, ctx);
+        if (reExhaustOnce || reExhaustWithRestorationFailure) {
+          contextUsageKnown = true;
+          contextHigh = true;
+        }
         await emit("agent_settled", {}, ctx);
       };
       const session = {
@@ -174,7 +212,9 @@ function checkpointSdk({
           messages.push(user);
           await emit("message_start", { message: user }, ctx);
           await emit("turn_start", {}, ctx);
+          providerAttempts += 1;
           await emit("before_provider_request", {}, ctx);
+          if (!aborted) admittedProviderRequests += 1;
           if (activateSkill && creations > 1) {
             guardResults.push(...await emit("tool_call", {
               toolName: "WebFetch", toolCallId: "sibling-check", input: { url: "https://example.com" },
@@ -189,14 +229,24 @@ function checkpointSdk({
           const calls = mixedBatch
             ? ["CheckpointTool", "DeniedTool", "ErrorTool", "MalformedTool"]
             : activateSkill ? ["Skill"] : ["CheckpointTool"];
-          const assistant: PiSessionMessage = {
+          const assistant = {
             role: "assistant",
             content: calls.map((name, index) => ({
               type: "toolCall" as const, id: `call-${index + 1}`, name, arguments: {},
             })),
             stopReason: "toolUse",
-          };
+            usage: {
+              input: assistantUsage === "high" ? 950 : 100,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: assistantUsage === "high" ? 950 : 100,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          } as unknown as PiSessionMessage;
           messages.push(assistant);
+          contextHigh = false;
+          contextUsageKnown = !(assistantUsage === "high" && !highAtProviderBoundary);
           await emit("message_end", { message: assistant }, ctx);
           await Promise.all(calls.map(async (name, index) => {
             const tool = (options.customTools as Array<Record<string, unknown>>)
@@ -229,6 +279,27 @@ function checkpointSdk({
             }, ctx);
           }
           await emit("turn_end", {}, ctx);
+          if (highAtProviderBoundary) {
+            contextUsageKnown = true;
+            contextHigh = false;
+            await emit("turn_start", {}, ctx);
+            contextHigh = true;
+            for (let signal = 0; signal < 2; signal += 1) {
+              providerAttempts += 1;
+              await emit("before_provider_request", {}, ctx);
+              if (!aborted) admittedProviderRequests += 1;
+            }
+            markProviderBoundaryBlocked();
+            if (holdAfterProviderBlock) await providerBlockGate;
+            if (!aborted) {
+              fabricatedResponses += 1;
+              messages.push({
+                role: "assistant",
+                content: [{ type: "text", text: "unexpected ordinary response" }],
+                stopReason: "stop",
+              });
+            }
+          }
           await emit("agent_settled", {}, ctx);
         },
         async compact() {
@@ -262,6 +333,8 @@ function checkpointSdk({
           }
           events.push("compact-commit");
           await emit("session_compact", { compactionEntry: { summary: "summary" } }, ctx);
+          contextUsageKnown = true;
+          contextHigh = false;
           const manualRecoveryCompact = failures >= 3 && compactions === 2;
           if (rejectAfterCompactEvent === (manualRecoveryCompact ? "manual" : "proactive")) {
             throw new Error("compact rejected after committed event");
@@ -300,6 +373,7 @@ function checkpointSdk({
         abort() {
           aborted = true;
           abortCalls += 1;
+          releaseProviderBlock();
           if (resumed) activeResumeAborted = true;
         },
         abortCompaction() {
@@ -331,6 +405,18 @@ function checkpointSdk({
     customMessages: () => [...customMessages],
     guardResults: () => [...guardResults],
     providerRegistrations: () => [...providerRegistrations],
+    providerAttempts: () => providerAttempts,
+    admittedProviderRequests: () => admittedProviderRequests,
+    fabricatedResponses: () => fabricatedResponses,
+    checkpointToolStarted: () => checkpointToolStarted,
+    releaseCheckpointTool: () => releaseCheckpointTool(),
+    executeCheckpointTool: async () => {
+      markCheckpointToolStarted();
+      if (holdCheckpointTool) await checkpointToolGate;
+      return { content: [{ type: "text", text: "tool complete" }] };
+    },
+    providerBoundaryBlocked: () => providerBoundaryBlocked,
+    releaseProviderBlock: () => releaseProviderBlock(),
   };
 }
 
@@ -368,7 +454,7 @@ function runtimeFor(
       return [
       {
         name: "CheckpointTool",
-        async execute() { return { content: [{ type: "text", text: "tool complete" }] }; },
+        async execute() { return await harness.executeCheckpointTool(); },
       },
       {
         name: "DeniedTool",
@@ -388,6 +474,123 @@ function runtimeFor(
 }
 
 describe("subagent mid-run compaction", () => {
+  it("queues fresh assistant threshold pressure until the unresolved child tool settles", async () => {
+    const harness = checkpointSdk({ failures: 0, holdCheckpointTool: true });
+    const progress: string[] = [];
+    const running = runtimeFor(harness).dispatch({
+      subagentType: "reviewer",
+      prompt: "review",
+      depth: 1,
+      onProgress: (snapshot) => progress.push(snapshot.activity),
+    });
+    const toolStarted = harness.checkpointToolStarted();
+
+    let hasPrimaryFailure = false;
+    try {
+      await settlement(toolStarted, { description: "assistant-armed child tool to start while context usage stays unknown" });
+      await expect(toolStarted).resolves.toBeUndefined();
+      expect(progress).toContain("context checkpoint queued while the current tool cycle finishes");
+      expect(harness.compactCalls()).toBe(0);
+    } catch (error) {
+      hasPrimaryFailure = true;
+      throw error;
+    } finally {
+      harness.releaseCheckpointTool();
+      try {
+        await settlement(running, { description: "assistant-armed child dispatch cleanup after tool release" });
+      } catch (error) {
+        if (!hasPrimaryFailure) throw error;
+      }
+    }
+
+    await expect(running).resolves.toMatchObject({ outcome: "completed", finalMessage: "resumed final" });
+    expect(harness.compactCalls()).toBe(1);
+    expect(harness.resumeCalls()).toBe(1);
+  });
+
+  it("blocks a newly high child provider boundary once and compacts only at settlement", async () => {
+    const harness = checkpointSdk({
+      failures: 0,
+      assistantUsage: "low",
+      highAtProviderBoundary: true,
+      holdAfterProviderBlock: true,
+    });
+    const progress: string[] = [];
+    const running = runtimeFor(harness).dispatch({
+      subagentType: "reviewer",
+      prompt: "review",
+      depth: 1,
+      onProgress: (snapshot) => progress.push(snapshot.activity),
+    });
+    const providerBlocked = harness.providerBoundaryBlocked();
+
+    let hasPrimaryFailure = false;
+    try {
+      await settlement(providerBlocked, { description: "newly high child provider admission to block" });
+      await expect(providerBlocked).resolves.toBeUndefined();
+      expect(progress).toContain("context checkpoint queued, waiting for safe child settlement");
+      expect(harness.compactCalls()).toBe(0);
+      expect(harness.fabricatedResponses()).toBe(0);
+    } catch (error) {
+      hasPrimaryFailure = true;
+      throw error;
+    } finally {
+      harness.releaseProviderBlock();
+      try {
+        await settlement(running, { description: "provider-blocked child dispatch cleanup after gate release" });
+      } catch (error) {
+        if (!hasPrimaryFailure) throw error;
+      }
+    }
+
+    await expect(running).resolves.toMatchObject({ outcome: "completed", finalMessage: "resumed final" });
+    expect(harness.providerAttempts()).toBe(4);
+    expect(harness.admittedProviderRequests()).toBe(2);
+    expect(harness.fabricatedResponses()).toBe(0);
+    expect(harness.abortCalls()).toBe(1);
+    expect(harness.compactCalls()).toBe(1);
+    expect(harness.resumeCalls()).toBe(1);
+    expect(harness.sessionCreations()).toBe(1);
+  });
+
+  it("lets cancellation win after provider admission blocks and before physical child compaction", async () => {
+    const harness = checkpointSdk({
+      failures: 0,
+      assistantUsage: "low",
+      highAtProviderBoundary: true,
+      holdAfterProviderBlock: true,
+    });
+    const abort = new AbortController();
+    const running = runtimeFor(harness).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, abortSignal: abort.signal,
+    });
+    const providerBlocked = harness.providerBoundaryBlocked();
+
+    let hasPrimaryFailure = false;
+    try {
+      await settlement(providerBlocked, { description: "cancellable child provider admission to block" });
+      await expect(providerBlocked).resolves.toBeUndefined();
+      expect(harness.compactCalls()).toBe(0);
+      expect(harness.fabricatedResponses()).toBe(0);
+      abort.abort();
+    } catch (error) {
+      hasPrimaryFailure = true;
+      throw error;
+    } finally {
+      abort.abort();
+      harness.releaseProviderBlock();
+      try {
+        await settlement(running, { description: "cancelled provider-blocked child dispatch cleanup" });
+      } catch (error) {
+        if (!hasPrimaryFailure) throw error;
+      }
+    }
+
+    await expect(running).resolves.toMatchObject({ outcome: "aborted" });
+    expect(harness.compactCalls()).toBe(0);
+    expect(harness.resumeCalls()).toBe(0);
+  });
+
   it("physically aborts and joins a child scheduled retry without a late commit or continuation", async () => {
     const harness = checkpointSdk({ failures: 0, gateProactiveCompact: true });
     const abort = new AbortController();
@@ -691,7 +894,7 @@ describe("subagent mid-run compaction", () => {
 
     expect(result.outcome).toBe("failed");
     expect(progress).toEqual([
-      "checkpoint: checkpoint-armed",
+      "context checkpoint queued while the current tool cycle finishes",
       "checkpoint paused: recovery required",
     ]);
     expect(result.checkpointPaused).toBe(true);
