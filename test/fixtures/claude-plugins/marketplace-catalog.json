@@ -1,0 +1,28 @@
+{
+  "name": "official-marketplace",
+  "owner": { "name": "Example Maintainer" },
+  "allowCrossMarketplaceDependenciesOn": ["partner-marketplace"],
+  "metadata": { "pluginRoot": "./runtime" },
+  "plugins": [
+    {
+      "name": "sample-plugin",
+      "source": "./plugins/sample-plugin",
+      "version": "1.2.3",
+      "description": "A bounded local catalog observation.",
+      "strict": true,
+      "defaultEnabled": false,
+      "commands": ["./commands/sample.md"],
+      "dependencies": [
+        "core-plugin",
+        { "name": "shared-plugin", "version": "^2", "marketplace": "partner-marketplace" }
+      ],
+      "userConfig": { "theme": "dark" }
+    },
+    { "name": "current-plugin", "source": "./plugins/current-plugin" }
+  ],
+  "renames": {
+    "old-plugin": "middle-plugin",
+    "middle-plugin": "current-plugin",
+    "removed-plugin": null
+  }
+}

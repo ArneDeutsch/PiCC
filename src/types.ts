@@ -124,6 +124,182 @@ export interface PluginResolutionOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Marketplace observations
+// ---------------------------------------------------------------------------
+
+export type PluginMarketplaceRegistrationOrigin = "primary" | "seed" | "settings";
+
+export interface PluginMarketplaceProvenance {
+  scope: PluginInstallationScope;
+  sourcePath: string;
+  origin: PluginMarketplaceRegistrationOrigin;
+  order: number;
+}
+
+export type PluginMarketplaceRegistrationSource =
+  | { kind: "github"; repo: string; ref?: string }
+  | { kind: "git"; url: string; ref?: string }
+  | { kind: "url"; url: string }
+  | { kind: "directory" | "file"; path: string; localPath: string };
+
+export type PluginMarketplacePolicyDescriptor =
+  | PluginMarketplaceRegistrationSource
+  | { kind: "hostPattern"; hostPattern: string }
+  | { kind: "pathPattern"; pathPattern: string };
+
+export type PluginMarketplaceCatalogSource =
+  | { kind: "relative"; value: string }
+  | { kind: "github"; repo: string; ref?: string; sha?: string }
+  | { kind: "url"; url: string; ref?: string; sha?: string }
+  | { kind: "git-subdir"; url: string; path: string; ref?: string; sha?: string }
+  | { kind: "npm"; package: string; version?: string; registry?: string };
+
+export interface PluginMarketplaceFieldProvenance {
+  field: string;
+  sourcePath: string;
+  entryIndex?: number;
+  key?: string;
+  itemIndex?: number;
+}
+
+export interface PluginMarketplaceRegistration {
+  name: string;
+  source: PluginMarketplaceRegistrationSource;
+  sourceProvenance: PluginMarketplaceFieldProvenance;
+  provenance: PluginMarketplaceProvenance;
+  fixtureContract?: "fixture-derived-unverified";
+  catalogPath?: string;
+  selected: boolean;
+  validity: "valid" | "rejected";
+}
+
+export interface PluginMarketplaceDependency {
+  declaredName: string;
+  declaringIdentity: string;
+  targetIdentity: string;
+  marketplace: string;
+  version?: string;
+  versionStatus?: "syntax-unverified-not-resolved";
+  provenance: PluginMarketplaceFieldProvenance;
+  crossMarketplace: "same-marketplace" | "declared-allowed" | "declared-not-allowed" | "indeterminate-because-evidence-omitted";
+  posture: "declared-locally-observable-not-resolved";
+}
+
+export interface PluginMarketplaceSafeShape {
+  keys: readonly { key: string; type: "array" | "boolean" | "null" | "number" | "object" | "string" }[];
+  omitted: number;
+}
+
+export type PluginMarketplaceComponentDeclaration =
+  | {
+    kind: "path";
+    value: string;
+    provenance: PluginMarketplaceFieldProvenance;
+    posture: "declared-not-effective";
+  }
+  | {
+    kind: "object-shape";
+    shape: PluginMarketplaceSafeShape;
+    provenance: PluginMarketplaceFieldProvenance;
+    posture: "declared-not-effective";
+  };
+
+export type PluginMarketplaceComponentField = "commands" | "agents" | "skills" | "hooks" | "mcpServers" | "lspServers";
+export type PluginMarketplaceComponentMap = Partial<Record<PluginMarketplaceComponentField, readonly PluginMarketplaceComponentDeclaration[]>>;
+
+export interface PluginMarketplaceCatalogObservation {
+  marketplace: string;
+  catalogPath: string;
+  metadata?: { pluginRoot: string; provenance: PluginMarketplaceFieldProvenance; posture: "inert-lexical-effect-only" };
+  provenance: PluginMarketplaceProvenance;
+}
+
+export interface PluginMarketplaceCatalogEntry {
+  identity: string;
+  name: string;
+  marketplace: string;
+  source: PluginMarketplaceCatalogSource;
+  sourceEffect?: { availability: "locally-observable" | "unavailable-from-direct-url-catalog"; lexicalPath?: string; provenance: PluginMarketplaceFieldProvenance };
+  release?: { kind: "version" | "revision" | "source-sha"; value: string; provenance: PluginMarketplaceFieldProvenance; evidence?: "fixture-derived-unverified" };
+  version?: string;
+  revision?: string;
+  revisionEvidence?: "fixture-derived-unverified";
+  description?: string;
+  fieldProvenance: Readonly<Record<string, PluginMarketplaceFieldProvenance>>;
+  strict: boolean;
+  strictDeclaration: { value: boolean; presence: "explicit" | "default"; provenance: PluginMarketplaceFieldProvenance };
+  defaultEnabled: boolean;
+  defaultEnabledDeclaration: { value: boolean; presence: "explicit" | "default"; provenance: PluginMarketplaceFieldProvenance };
+  components: Readonly<PluginMarketplaceComponentMap>;
+  dependencies: PluginMarketplaceDependency[];
+  userConfig?: PluginMarketplaceSafeShape & { provenance: PluginMarketplaceFieldProvenance };
+  provenance: PluginMarketplaceProvenance & { catalogPath: string; entryIndex: number };
+  runtimeEffect: "declared-not-effective";
+}
+
+export interface PluginMarketplaceAllowlistObservation {
+  marketplace: string;
+  allowedMarketplace: string;
+  provenance: PluginMarketplaceFieldProvenance;
+}
+
+export interface PluginMarketplaceRename {
+  marketplace: string;
+  from: string;
+  declaredTarget: string | null;
+  currentIdentity: string | null;
+  status: "current" | "removed" | "cycle" | "dangling" | "indeterminate-because-evidence-omitted";
+  fieldProvenance: PluginMarketplaceFieldProvenance;
+  provenance: PluginMarketplaceProvenance & { catalogPath: string };
+  runtimeEffect: "declared-not-effective";
+}
+
+export interface PluginMarketplaceConflictObservation {
+  identity: string;
+  winner: PluginMarketplaceFieldProvenance;
+  loser: PluginMarketplaceFieldProvenance;
+  posture: "observed-conflict-not-effective";
+}
+
+export interface PluginMarketplacePolicyObservation {
+  kind: "strict" | "blocked";
+  descriptor?: PluginMarketplacePolicyDescriptor;
+  descriptorProvenance?: PluginMarketplaceFieldProvenance;
+  provenance: PluginMarketplaceProvenance;
+  validScope: boolean;
+  match: boolean | "indeterminate-because-evidence-omitted" | "indeterminate-unsupported-regex-subset" | "indeterminate-redacted-descriptor";
+  emptyLockdown?: boolean;
+  posture: "claude-lifecycle-observation-not-enforced";
+}
+
+export interface PluginMarketplaceState {
+  registrations: PluginMarketplaceRegistration[];
+  selectedRegistrations: PluginMarketplaceRegistration[];
+  catalogs: PluginMarketplaceCatalogObservation[];
+  entries: PluginMarketplaceCatalogEntry[];
+  dependencies: PluginMarketplaceDependency[];
+  allowlists: PluginMarketplaceAllowlistObservation[];
+  renames: PluginMarketplaceRename[];
+  policies: PluginMarketplacePolicyObservation[];
+  conflicts: PluginMarketplaceConflictObservation[];
+  diagnostics: Diagnostic[];
+  omissions: {
+    registrations: number;
+    selectedRegistrations: number;
+    entries: number;
+    components: number;
+    dependencies: number;
+    renames: number;
+    policies: number;
+    allowlists: number;
+    metadata: number;
+    userConfig: number;
+    conflicts: number;
+    diagnostics: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Frontmatter (generic parse result)
 // ---------------------------------------------------------------------------
 
@@ -372,6 +548,27 @@ export interface EffectivePluginEnablement {
   source: string;
 }
 
+export interface PluginMarketplaceSettingsDescriptorObservation {
+  descriptor?: PluginMarketplaceRegistrationSource | PluginMarketplacePolicyDescriptor;
+  /** Exact credential-free validated-field key; absent for rejected or indeterminate evidence. */
+  matchKey?: string;
+  validity: "valid" | "redacted" | "invalid";
+  indeterminate?: "credential-bearing-or-ambiguous" | "unsupported-regex-subset";
+}
+
+export interface PluginMarketplaceSettingsContribution {
+  scope: Scope;
+  sourcePath: string;
+  extraKnownMarketplaces?: Record<string, PluginMarketplaceSettingsDescriptorObservation>;
+  strictKnownMarketplaces?: PluginMarketplaceSettingsDescriptorObservation[];
+  blockedMarketplaces?: PluginMarketplaceSettingsDescriptorObservation[];
+}
+
+export interface PluginMarketplaceSettingsOmissions {
+  contributions: number;
+  declarations: number;
+}
+
 export interface ClaudeSettings {
   permissions: PermissionRules;
   hooks: HookConfig;
@@ -402,6 +599,9 @@ export interface ClaudeSettings {
   enabledPlugins: Record<string, boolean> | undefined;
   /** Effective exact qualified-ID values with their winning settings provenance. */
   effectivePluginEnablement?: Record<string, EffectivePluginEnablement>;
+  /** Marketplace declarations stay per-file so policy scope and provenance remain observable. */
+  pluginMarketplaceSettings?: PluginMarketplaceSettingsContribution[];
+  pluginMarketplaceSettingsOmissions?: PluginMarketplaceSettingsOmissions;
   /**
    * Scope-tagged MCP contributions, one entry per settings file that carries
    * any of the four MCP keys (never merged across scopes — the enablement gate

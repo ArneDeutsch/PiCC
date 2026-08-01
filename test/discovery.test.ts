@@ -71,6 +71,133 @@ function load(scopes: { userDir: string; projectRoot: string; absentManaged: str
   });
 }
 
+describe("marketplace settings observations", () => {
+  it("captures the three marketplace keys per source in ascending settings order", () => {
+    const scopes = makeScopes();
+    const userFile = path.join(scopes.userDir, "settings.json");
+    const projectFile = path.join(scopes.projectRoot, ".claude", "settings.json");
+    writeJson(userFile, {
+      extraKnownMarketplaces: { "user-marketplace": { source: { source: "github", repo: "example/user" } } },
+      blockedMarketplaces: [{ source: "github", repo: "example/blocked" }],
+    });
+    writeJson(projectFile, { strictKnownMarketplaces: [] });
+
+    const result = load(scopes);
+
+    expect(result.pluginMarketplaceSettings).toEqual([
+      {
+        scope: "user", sourcePath: userFile,
+        extraKnownMarketplaces: { "user-marketplace": { descriptor: { kind: "github", repo: "example/user" }, matchKey: '{"kind":"github","repo":"example/user"}', validity: "valid" } },
+        blockedMarketplaces: [{ descriptor: { kind: "github", repo: "example/blocked" }, matchKey: '{"kind":"github","repo":"example/blocked"}', validity: "valid" }],
+      },
+      { scope: "project", sourcePath: projectFile, strictKnownMarketplaces: [] },
+    ]);
+    expect(result.unknownKeys).toEqual([]);
+  });
+
+  it("serializes only bounded redacted descriptor evidence for extra, strict, and blocked settings", () => {
+    const scopes = makeScopes();
+    const canaries = ["extra-password", "strict-password", "blocked-password", "inline-command-canary"];
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      extraKnownMarketplaces: { extra: { source: { source: "url", url: `https://user:${canaries[0]}@example.test/catalog?command=${canaries[3]}#fragment` } } },
+      strictKnownMarketplaces: [{ source: "git", url: `https://user:${canaries[1]}@example.test/repo?token=x` }],
+      blockedMarketplaces: [{ source: "url", url: `https://user:${canaries[2]}@example.test/catalog#secret` }],
+    });
+
+    const result = load(scopes);
+    const serialized = JSON.stringify(result.pluginMarketplaceSettings);
+    for (const canary of canaries) expect(serialized).not.toContain(canary);
+    expect(result.pluginMarketplaceSettings?.[0]).toMatchObject({
+      extraKnownMarketplaces: { extra: { validity: "redacted", indeterminate: "credential-bearing-or-ambiguous" } },
+      strictKnownMarketplaces: [{ validity: "redacted", indeterminate: "credential-bearing-or-ambiguous" }],
+      blockedMarketplaces: [{ validity: "redacted", indeterminate: "credential-bearing-or-ambiguous" }],
+    });
+  });
+
+  it("redacts hostile project and local path text during shared normalization", () => {
+    const scopes = makeScopes();
+    const projectCanaries = ["project-absolute-canary", "project-traversal-canary", "project-uri-canary"];
+    const localCanaries = ["local-device-canary", "local-unc-canary"];
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { extraKnownMarketplaces: {
+      absolute: { source: { source: "directory", path: `/outside/${projectCanaries[0]}` } },
+      traversal: { source: { source: "file", path: `../${projectCanaries[1]}/marketplace.json` } },
+      uri: { source: { source: "directory", path: `https://user:${projectCanaries[2]}@example.test/x` } },
+    } });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), { extraKnownMarketplaces: {
+      device: { source: { source: "directory", path: `\\\\?\\C:\\${localCanaries[0]}` } },
+      unc: { source: { source: "file", path: `\\\\server\\${localCanaries[1]}\\marketplace.json` } },
+    } });
+
+    const result = load(scopes);
+    const serialized = JSON.stringify(result.pluginMarketplaceSettings);
+    for (const canary of [...projectCanaries, ...localCanaries]) expect(serialized).not.toContain(canary);
+    for (const contribution of result.pluginMarketplaceSettings ?? []) {
+      for (const observation of Object.values(contribution.extraKnownMarketplaces ?? {})) {
+        expect(observation).toMatchObject({ descriptor: { path: "<redacted-path>", localPath: "<redacted-path>" }, validity: "redacted" });
+      }
+    }
+  });
+
+  it("preserves user, project, nested, local, and managed source order and provenance", () => {
+    const scopes = makeScopes();
+    const nested = path.join(scopes.projectRoot, "packages", "child");
+    const managed = path.join(path.dirname(scopes.projectRoot), "managed.json");
+    writeJson(path.join(scopes.userDir, "settings.json"), { extraKnownMarketplaces: { user: { source: { source: "github", repo: "example/user" } } } });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { extraKnownMarketplaces: { project: { source: { source: "github", repo: "example/project" } } } });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), { blockedMarketplaces: [] });
+    writeJson(path.join(nested, ".claude", "settings.json"), { strictKnownMarketplaces: [] });
+    writeJson(path.join(nested, ".claude", "settings.local.json"), { extraKnownMarketplaces: { local: { source: { source: "github", repo: "example/local" } } } });
+    writeJson(managed, { blockedMarketplaces: [{ source: "github", repo: "example/blocked" }] });
+
+    const result = loadSettings({ cwd: nested, projectRoot: scopes.projectRoot, userDir: scopes.userDir, managedPaths: [managed] });
+
+    expect(result.pluginMarketplaceSettings?.map(({ scope, sourcePath }) => [scope, sourcePath])).toEqual([
+      ["user", path.join(scopes.userDir, "settings.json")],
+      ["project", path.join(scopes.projectRoot, ".claude", "settings.json")],
+      ["local", path.join(scopes.projectRoot, ".claude", "settings.local.json")],
+      ["project", path.join(nested, ".claude", "settings.json")],
+      ["local", path.join(nested, ".claude", "settings.local.json")],
+      ["managed", managed],
+    ]);
+  });
+
+  it("bounds marketplace declarations while preserving deterministic omission evidence", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      extraKnownMarketplaces: Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`market-${String(index).padStart(3, "0")}`, { source: { source: "github", repo: `example/package-${index}` } }])),
+      blockedMarketplaces: [{ source: "github", repo: "example/not-copied" }],
+    });
+    const result = load(scopes);
+    const contribution = result.pluginMarketplaceSettings?.[0];
+    expect(Object.keys(contribution?.extraKnownMarketplaces ?? {})).toHaveLength(256);
+    expect(contribution?.blockedMarketplaces).toEqual([]);
+    expect(result.pluginMarketplaceSettingsOmissions).toEqual({ contributions: 0, declarations: 2 });
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({ message: expect.stringContaining("declarations omitted") }));
+  });
+
+  it("bounds marketplace setting contributions across managed sources", () => {
+    const scopes = makeScopes();
+    const managed = Array.from({ length: 257 }, (_, index) => path.join(path.dirname(scopes.projectRoot), `managed-${index}.json`));
+    for (let index = 0; index < managed.length; index++) writeJson(managed[index]!, { strictKnownMarketplaces: [] });
+    const result = load(scopes, managed);
+    expect(result.pluginMarketplaceSettings).toHaveLength(256);
+    expect(result.pluginMarketplaceSettingsOmissions).toEqual({ contributions: 1, declarations: 0 });
+  });
+
+  it("diagnoses wrong top-level types without treating marketplace keys as unknown", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      extraKnownMarketplaces: [], strictKnownMarketplaces: {}, blockedMarketplaces: "no",
+    });
+
+    const result = load(scopes);
+
+    expect(result.pluginMarketplaceSettings).toEqual([]);
+    expect(result.unknownKeys).toEqual([]);
+    expect(result.diagnostics.filter((item) => item.message.includes("Marketplaces") || item.message.includes("marketplaces"))).toHaveLength(3);
+  });
+});
+
 function inertPolicyIo(
   files: Record<string, string | "<unreadable>">,
   dropIns: string[] = [],
