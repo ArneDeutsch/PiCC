@@ -56,6 +56,6 @@ jobs:
         run: npm ci
 
       # Drives the real Pi CLI with local model traffic and no subscription.
-      # Package installation may use npm; Python-dependent scenarios self-skip if absent.
+      # The packaged-launcher consumer install may access the npm registry.
       - name: End-to-end tests
         run: npm run test:e2e
