@@ -7,6 +7,7 @@ import {
   scalarSafeText,
   type ProgressSnapshot,
   type SubagentDetailEntry,
+  type SubagentLiveActivity,
 } from "./subagent-progress.js";
 
 export { AGENT_COLOR_NAMES, normalizeAgentColor } from "./agent-color.js";
@@ -188,13 +189,12 @@ export interface SubagentRegistryRecord {
    */
   color?: AgentColorName;
   /**
-   * Latest bounded live-progress snapshot, mirrored via `noteProgress` from
-   * EVERY dispatch's condenser subscription (foreground, background, nested,
-   * resumed) — the status panel's single live data source. Sanitized by the
-   * condenser at capture. `progress.usage` is the live accumulation; the
-   * settlement-time `usage` above wins where both exist.
+   * Latest bounded legacy progress snapshot mirrored from every dispatch.
+   * `progress.usage` is the live accumulation; settlement-time `usage` wins.
    */
   progress?: ProgressSnapshot;
+  /** Independent bounded current activity for live panel presentation. */
+  liveActivity?: SubagentLiveActivity;
   /**
    * Structured, typed live detail events for the selected-agent view. Entries
    * are display-only, sanitized and bounded by the condenser, then copied here
@@ -349,17 +349,16 @@ export class SubagentRegistry {
   }
 
   /**
-   * Mirror changed live display fields of a RUNNING dispatch onto its record.
-   * Snapshot and detail changes travel independently; the condenser has already
-   * sanitized and bounded every value. Ignored for
-   * unknown ids and settled records (a settled record's finalText/usage stay
-   * authoritative; dispatch unsubscribes its condenser before settling, so
-   * the guard only catches stale callers).
+   * Mirror independently changed runtime projections onto a running record.
+   * The condenser has already sanitized and bounded every value. The explicit
+   * activity envelope distinguishes no update from clearing the current atom.
+   * Unknown ids and settled records are ignored.
    */
   noteProgress(
     agentId: string,
     snapshot: ProgressSnapshot | undefined,
     detailLog?: SubagentDetailEntry[],
+    liveActivityUpdate?: { value: SubagentLiveActivity | undefined },
   ): void {
     const record = this.records.get(agentId);
     if (!record || record.state !== "running") return;
@@ -371,6 +370,11 @@ export class SubagentRegistry {
       };
     }
     if (detailLog) record.detailLog = detailLog.map((entry) => ({ ...entry }));
+    if (liveActivityUpdate) {
+      record.liveActivity = liveActivityUpdate.value
+        ? { ...liveActivityUpdate.value }
+        : undefined;
+    }
     this.notifyChange();
   }
 
@@ -416,6 +420,7 @@ export class SubagentRegistry {
     if (!record) return;
     record.state = "settled";
     record.session = undefined;
+    record.liveActivity = undefined;
     record.checkpointPaused = false;
     record.settledAt = Date.now();
     if (settled?.outcome !== undefined) record.outcome = settled.outcome;
@@ -460,6 +465,7 @@ export class SubagentRegistry {
     record.usage = undefined;
     record.progress = undefined;
     record.detailLog = undefined;
+    record.liveActivity = undefined;
     record.settledAt = undefined;
     this.notifyChange();
   }
