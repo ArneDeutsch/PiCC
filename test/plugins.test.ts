@@ -7,6 +7,7 @@ import type { EffectivePluginEnablement, NormalizedPluginInstallation } from "..
 import {
   loadPluginHooks,
   resolveInstalledPlugins,
+  resolvePluginProjectAnchors,
 } from "../src/claude/plugins.js";
 
 let tmpRoot: string;
@@ -125,6 +126,34 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     expect(result.plugins[0]!.dataDir).toContain("alpha-official");
   });
 
+  it("projects selected metadata from the resolver's single manifest read", () => {
+    const installation = record();
+    const manifestPath = path.join(installation.installPath, ".claude-plugin", "plugin.json");
+    write(manifestPath, JSON.stringify({
+      name: "alpha-runtime", description: "safe description", version: "2.0.0",
+      author: { name: "Maintainer", email: "secret@example.test" },
+      homepage: "https://example.test/plugin", unknownSecret: "do-not-retain",
+    }));
+    const original = fs.readFileSync;
+    let manifestReads = 0;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === manifestPath) manifestReads++;
+      return (original as (...values: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const result = resolve({ installations: [installation] });
+      expect(manifestReads).toBe(1);
+      expect(result.plugins[0]!.manifestProjection).toMatchObject({
+        manifestName: "alpha-runtime", description: "safe description", version: "2.0.0", author: "Maintainer",
+      });
+      expect(JSON.stringify(result.plugins[0]!.manifestProjection)).not.toContain("secret@example.test");
+      expect(JSON.stringify(result.plugins[0]!.manifestProjection)).not.toContain("do-not-retain");
+      expect(Object.isFrozen(result.plugins[0]!.manifestProjection)).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("represents false, missing, absent, unsupported, malformed, and unreadable state without loading", () => {
     const disabled = resolve({ enabled: { "alpha@official": false } });
     expect(disabled.outcomes[0]!.status).toBe("disabled");
@@ -229,12 +258,14 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
 
     projectRoot = worktree;
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("loaded");
+    expect(resolvePluginProjectAnchors(worktree)).toEqual({ projectRoot: fs.realpathSync.native(worktree), mainCheckout: fs.realpathSync.native(main) });
 
     const foreign = path.join(tmpRoot, "foreign");
     fs.mkdirSync(foreign);
     fs.copyFileSync(path.join(worktree, ".git"), path.join(foreign, ".git"));
     projectRoot = foreign;
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
+    expect(resolvePluginProjectAnchors(foreign).mainCheckout).toBeUndefined();
 
     const malformed = path.join(tmpRoot, "malformed-worktree");
     fs.mkdirSync(malformed);
@@ -406,7 +437,7 @@ describe("resolveInstalledPlugins — component declarations", () => {
     write(path.join(installation.installPath, "commands", "go.md"), "go");
     write(path.join(installation.installPath, "agents", "worker.md"), "---\ndescription: worker\n---\nprompt");
     const plugin = resolve({ installations: [installation] }).plugins[0]!;
-    expect(plugin.manifest).toEqual({});
+    expect(plugin.manifestProjection).toEqual({ keywords: [], components: [], omissions: { keywords: 0, components: 0, diagnostics: 0 } });
     expect(plugin.skillSources[0]!.source.kind).toBe("file");
     expect(plugin.commandSources).toHaveLength(1);
     expect(plugin.agentSources).toHaveLength(1);

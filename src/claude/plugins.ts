@@ -13,6 +13,7 @@ import type {
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
 import type { PluginAgentLoaderSource } from "./agents.js";
+import { projectPluginManifest, type SafePluginManifestProjection } from "./plugin-metadata.js";
 import {
   authorizePluginRoot,
   resolvePluginDataLocation,
@@ -40,7 +41,7 @@ export interface InstalledPlugin {
   projectPath?: string;
   root: string;
   dataDir: string;
-  manifest: Record<string, unknown>;
+  manifestProjection: SafePluginManifestProjection;
   skillSources: PluginSkillLoaderSource[];
   commandSources: PluginSkillLoaderSource[];
   agentSources: PluginAgentLoaderSource[];
@@ -131,42 +132,49 @@ function isContained(root: string, candidate: string): boolean {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-/** Resolve the main checkout only when Git's worktree admin directory links back to this checkout. */
-function linkedMainCheckout(projectRoot: string): string | undefined {
-  const dotGit = path.join(projectRoot, ".git");
-  let pointer: string;
+function structurallyValidCommonGitDirectory(gitDirectory: string): boolean {
   try {
-    if (!fs.statSync(dotGit).isFile()) return undefined;
-    pointer = fs.readFileSync(dotGit, "utf8").trim();
+    return path.basename(gitDirectory) === ".git" && fs.statSync(path.join(gitDirectory, "HEAD")).isFile() &&
+      fs.statSync(path.join(gitDirectory, "config")).isFile() && fs.statSync(path.join(gitDirectory, "objects")).isDirectory() &&
+      fs.statSync(path.join(gitDirectory, "refs")).isDirectory();
   } catch {
-    return undefined;
+    return false;
   }
-  const match = /^gitdir:\s*(.+)$/i.exec(pointer);
-  if (!match) return undefined;
-  const admin = canonicalDirectory(path.resolve(projectRoot, match[1]!));
-  if (!admin || path.basename(path.dirname(admin)) !== "worktrees") return undefined;
+}
+
+/** Canonicalize the project root; derive a distinct main checkout only from linked Git administration data. */
+export function resolvePluginProjectAnchors(projectRoot: string): { projectRoot?: string; mainCheckout?: string } {
+  const canonicalProject = canonicalDirectory(projectRoot);
+  if (canonicalProject === undefined) return {};
+  const dotGit = path.join(canonicalProject, ".git");
   try {
-    const backlink = fs.readFileSync(path.join(admin, "gitdir"), "utf8").trim();
-    if (fs.realpathSync.native(path.dirname(backlink)) !== fs.realpathSync.native(projectRoot) || path.basename(backlink) !== ".git") {
-      return undefined;
+    if (fs.statSync(dotGit).isDirectory()) {
+      const common = fs.realpathSync.native(dotGit);
+      return structurallyValidCommonGitDirectory(common) ? { projectRoot: canonicalProject, mainCheckout: canonicalProject } : { projectRoot: canonicalProject };
     }
+    if (!fs.statSync(dotGit).isFile()) return { projectRoot: canonicalProject };
+    const match = /^gitdir:\s*(.+)$/i.exec(fs.readFileSync(dotGit, "utf8").trim());
+    if (match === null) return { projectRoot: canonicalProject };
+    const admin = canonicalDirectory(path.resolve(canonicalProject, match[1]!));
+    if (admin === undefined || path.basename(path.dirname(admin)) !== "worktrees") return { projectRoot: canonicalProject };
+    const backlink = fs.readFileSync(path.join(admin, "gitdir"), "utf8").trim();
+    if (path.basename(backlink) !== ".git" || fs.realpathSync.native(path.dirname(backlink)) !== canonicalProject) return { projectRoot: canonicalProject };
     const common = fs.realpathSync.native(path.resolve(admin, fs.readFileSync(path.join(admin, "commondir"), "utf8").trim()));
-    if (path.basename(common) !== ".git") return undefined;
+    if (!structurallyValidCommonGitDirectory(common)) return { projectRoot: canonicalProject };
+    const worktrees = fs.realpathSync.native(path.join(common, "worktrees"));
+    if (fs.realpathSync.native(path.dirname(admin)) !== worktrees) return { projectRoot: canonicalProject };
     const main = fs.realpathSync.native(path.dirname(common));
-    if (fs.realpathSync.native(path.join(main, ".git")) !== common) return undefined;
-    return main;
+    return fs.realpathSync.native(path.join(main, ".git")) === common
+      ? { projectRoot: canonicalProject, mainCheckout: main }
+      : { projectRoot: canonicalProject };
   } catch {
-    return undefined;
+    return { projectRoot: canonicalProject };
   }
 }
 
 function projectIdentities(projectRoot: string): Set<string> {
-  const identities = new Set<string>();
-  const canonical = canonicalDirectory(projectRoot);
-  if (canonical) identities.add(canonical);
-  const main = linkedMainCheckout(projectRoot);
-  if (main) identities.add(main);
-  return identities;
+  const anchors = resolvePluginProjectAnchors(projectRoot);
+  return new Set([anchors.projectRoot, anchors.mainCheckout].filter((value): value is string => value !== undefined));
 }
 
 function applicable(record: NormalizedPluginInstallation, projects: ReadonlySet<string>): boolean {
@@ -231,7 +239,7 @@ function readBlocklist(
   return { blocked, status: "valid" };
 }
 
-function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): string[] {
+export function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): string[] {
   const candidates = [path.join(userDir, "plugins", "cache")];
   if (env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]) candidates.push(env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]);
   for (const seed of (env["CLAUDE_CODE_PLUGIN_SEED_DIR"] ?? "").split(path.delimiter)) {
@@ -377,6 +385,7 @@ function resolveComponents(options: {
   const manifestResult = readManifest(options.root);
   if (!manifestResult.ok) return { ok: false, diagnostics: [manifestResult.diagnostic] };
   const manifest = manifestResult.manifest;
+  const projectedManifest = projectPluginManifest(manifest);
   const pluginName = manifestResult.manifestPath ? manifest["name"] as string : options.lifecycleName;
   if (!COMPONENT_NAME.test(pluginName)) return {
     ok: false,
@@ -477,7 +486,7 @@ function resolveComponents(options: {
   }
   if (terminalDiagnostics.length > 0) return { ok: false, diagnostics: terminalDiagnostics.slice(0, 20) };
 
-  const diagnostics: Diagnostic[] = [];
+  const diagnostics: Diagnostic[] = projectedManifest.diagnostics;
   const plugin: InstalledPlugin = {
     pluginId: options.pluginId,
     name: pluginName,
@@ -487,7 +496,7 @@ function resolveComponents(options: {
     ...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
     root: options.root.canonicalPath,
     dataDir: data.value.lexicalPath,
-    manifest,
+    manifestProjection: projectedManifest.projection,
     skillSources,
     commandSources,
     agentSources,
