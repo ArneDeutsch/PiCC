@@ -4,6 +4,8 @@ import type { PluginResolutionStatus } from "../src/types.js";
 import {
   PLUGIN_INVENTORY_ARGV_USAGE,
   PLUGIN_INVENTORY_SLASH_USAGE,
+  formatPluginInventoryDisplayLocation,
+  sanitizePluginInventoryDisplayText,
   parsePluginInventoryArgv,
   parsePluginInventorySlash,
   projectPluginInventoryDoctor,
@@ -79,6 +81,19 @@ describe("plugin inventory operation grammar", () => {
     expect(parsePluginInventorySlash("/plugin details same@official")).toEqual({ kind: "operation", operation: { kind: "details", qualifiedIdentity: "same@official" } });
     expect(parsePluginInventoryArgv(["list"])).toEqual({ kind: "operation", operation: { kind: "list" } });
     expect(parsePluginInventoryArgv(["details", "same@official"])).toEqual({ kind: "operation", operation: { kind: "details", qualifiedIdentity: "same@official" } });
+    const canonicalMax = `${"p".repeat(190)}@${"m".repeat(65)}`;
+    expect(canonicalMax).toHaveLength(256);
+    expect(parsePluginInventorySlash(`/plugin details ${canonicalMax}`)).toEqual({ kind: "operation", operation: { kind: "details", qualifiedIdentity: canonicalMax } });
+    expect(parsePluginInventoryArgv(["details", canonicalMax])).toEqual({ kind: "operation", operation: { kind: "details", qualifiedIdentity: canonicalMax } });
+    const credentialShaped = ["password@official", "api_key@official"];
+    const state = snapshot([item(canonicalMax), ...credentialShaped.map((identity) => item(identity))]);
+    expect(renderPluginInventoryList(state)).toContain(`Plugin: ${canonicalMax}`);
+    expect(renderPluginInventoryDetails(state, canonicalMax)).toContain(`Plugin: ${canonicalMax}`);
+    for (const identity of credentialShaped) {
+      expect(parsePluginInventoryArgv(["details", identity])).toEqual({ kind: "operation", operation: { kind: "details", qualifiedIdentity: identity } });
+      expect(renderPluginInventoryList(state)).toContain(`Plugin: ${identity}`);
+      expect(renderPluginInventoryDetails(state, identity)).toContain(`Plugin: ${identity}`);
+    }
   });
 
   it("rejects missing, extra, unqualified, ambiguous, control, option, and mutation-looking forms without reflection", () => {
@@ -96,6 +111,19 @@ describe("plugin inventory operation grammar", () => {
     expect(parsePluginInventoryArgv(["details", "same/name@official"])).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
     expect(parsePluginInventorySlash("/plugin\vlist")).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
     expect(parsePluginInventorySlash("/plugin details $NAME")).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
+  });
+});
+
+describe("plugin inventory shared display safety", () => {
+  it("exports the fail-closed generic-text and structured-location policy for every human surface", () => {
+    expect(sanitizePluginInventoryDisplayText("ａｐｉ＿ｋｅｙ＝SECRET-COMPAT")).toBe("<redacted-field>");
+    expect(sanitizePluginInventoryDisplayText("Authorization Bearer SECRET-BEARER")).toBe("<redacted-field>");
+    expect(sanitizePluginInventoryDisplayText("https://user:pass@example.test/safe")).toBe("<redacted-url>");
+    expect(sanitizePluginInventoryDisplayText("https://example.test/%2561pi%252Ekey/SECRET-ENCODED")).toBe("<redacted-url>");
+    expect(sanitizePluginInventoryDisplayText("ordinary composed café")).toBe("ordinary composed café");
+    expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/plugins/safe" })).toBe("<project>/plugins/safe");
+    expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/./secret" })).toBe("<external>");
+    expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/../secret" })).toBe("<external>");
   });
 });
 

@@ -190,21 +190,31 @@ function stripUnsafe(value: string): string {
     .trim();
 }
 
-function text(value: string, maximum = MAX_LINE): string {
+/** Canonical fail-closed projection for generic untrusted inventory text. */
+export function sanitizePluginInventoryDisplayText(value: string, maximum = MAX_LINE): string {
   const safe = stripUnsafe(value);
   const points = Array.from(safe);
   return points.length <= maximum ? safe : `${points.slice(0, Math.max(0, maximum - 1)).join("")}…`;
+}
+
+function text(value: string, maximum = MAX_LINE): string {
+  return sanitizePluginInventoryDisplayText(value, maximum);
 }
 
 function qualified(value: string): string {
   return validQualifiedIdentity(value) ? value : "unknown@unknown";
 }
 
-function location(value: PluginInventoryLocation | undefined): string {
+/** Canonical allowlisted display for structured, already-anchored inventory locations. */
+export function formatPluginInventoryDisplayLocation(value: PluginInventoryLocation | undefined): string {
   if (value === undefined) return "not available";
   const match = /^<(?:project|main-checkout|claude-user|plugin-cache|plugin-data|marketplace-cache)>((?:\/[A-Za-z0-9._@+-]+)*)$/.exec(value.display);
   if (match === null || match[1]!.split("/").some((segment) => segment === "." || segment === "..")) return "<external>";
   return value.display;
+}
+
+function location(value: PluginInventoryLocation | undefined): string {
+  return formatPluginInventoryDisplayLocation(value);
 }
 
 function provenance(value: PluginInventoryProvenance | undefined): string {
