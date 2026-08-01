@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -215,16 +214,14 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
   });
 
-  it("applies a main-checkout project record to its genuine linked worktree but rejects copied foreign indirection", () => {
+  it("applies a main-checkout project record through verified linked-worktree metadata but rejects copied foreign indirection", () => {
     const main = path.join(tmpRoot, "main");
     const worktree = path.join(tmpRoot, "linked");
-    fs.mkdirSync(main);
-    execFileSync("git", ["init"], { cwd: main, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: main });
-    write(path.join(main, "tracked.txt"), "tracked");
-    execFileSync("git", ["add", "."], { cwd: main });
-    execFileSync("git", ["-c", "user.name=Test", "commit", "-m", "fixture"], { cwd: main, stdio: "ignore" });
-    execFileSync("git", ["worktree", "add", "-b", "linked-test", worktree], { cwd: main, stdio: "ignore" });
+    const admin = path.join(main, ".git", "worktrees", "linked");
+    fs.mkdirSync(worktree, { recursive: true });
+    write(path.join(worktree, ".git"), `gitdir: ${admin}`);
+    write(path.join(admin, "gitdir"), path.join(worktree, ".git"));
+    write(path.join(admin, "commondir"), "../..");
     const installation = record({ scope: "project", projectPath: main });
 
     projectRoot = worktree;
