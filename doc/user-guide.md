@@ -464,11 +464,17 @@ excludes; project configuration overrides user configuration):
   If both user and project scopes set this knob and the project value is malformed, the safe
   default is used (not the still-valid user value).
 
-  For main sessions and PiCC-created subagents, PiCC checks at a completed assistant/tool
-  cycle. The complete requested tool batch finishes first. Once the threshold is reached,
-  PiCC pauses ordinary model requests, starts one Pi compaction transaction, and resumes the same
-  logical work; completed results and queued input remain pending. Pi can automatically recover an
-  eligible transient summary transport failure inside that transaction. Summary retries stay
+  For main sessions and PiCC-created subagents, final usage from a fresh successful assistant
+  response that requests tools can queue a checkpoint. When PiCC reports that checkpoint as queued,
+  continued already-requested tool activity is safe deferral, not another provider turn or a missed
+  checkpoint; high displayed context by itself does not prove that a checkpoint is armed. Before
+  admitting another ordinary model request, PiCC samples usage again and
+  blocks the ordinary request before provider transport if newly known threshold pressure requires a
+  checkpoint. Only after the run and its complete tool batch settle may PiCC start one Pi compaction
+  transaction and resume the same
+  logical work; it never compacts across an unresolved provider response or tool batch. Completed
+  results and queued input remain pending. Pi can automatically recover an eligible transient summary
+  transport failure inside that transaction. Summary retries stay
   bounded by Pi's configured summarization retry policy; PiCC-created subagents use Pi's in-memory
   defaults. Cancelling a main
   checkpoint stops PiCC continuation but may wait for Pi's configured summary retries to settle;

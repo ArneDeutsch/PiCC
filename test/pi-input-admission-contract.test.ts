@@ -10,6 +10,7 @@ const CORE = ["bash", "read", "write", "edit", "grep", "find", "ls"] as const;
 let project: string;
 let previousCwd: string;
 let previousUserDir: string | undefined;
+let providerSourceId = 0;
 
 beforeAll(() => {
   previousCwd = process.cwd();
@@ -37,11 +38,14 @@ interface InstalledOptions {
   failCheckpoint?: boolean;
   failCoreRegistrationAt?: number;
   cleanup?: "throw" | "unverified";
+  abortBeforeProvider?: boolean;
+  useRealProviderStream?: boolean;
 }
 
 async function installedSession(options: InstalledOptions) {
   const sdk: any = await import("@earendil-works/pi-coding-agent");
   const ai: any = await import("@earendil-works/pi-ai");
+  const aiCompat: any = await import("@earendil-works/pi-ai/compat");
   let providerPrompts = 0;
   let hookCalls = 0;
   let sdkLoads = 0;
@@ -52,10 +56,8 @@ async function installedSession(options: InstalledOptions) {
   let extensionApi: any;
   let initialization: Promise<void> | undefined;
   const settingsManager = sdk.SettingsManager.inMemory();
-  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
-  modelRuntime.hasConfiguredAuth = () => true;
-  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
-  modelRuntime.streamSimple = (...args: any[]) => {
+  const providerSource = `picc-input-admission-${++providerSourceId}`;
+  const providerStream = (...args: any[]) => {
     providerPrompts += 1;
     if (firstProviderTools === undefined) {
       firstProviderTools = (args[1]?.tools ?? []).map((tool: { name?: unknown }) => String(tool.name));
@@ -65,7 +67,8 @@ async function installedSession(options: InstalledOptions) {
     const stream = ai.createAssistantMessageEventStream();
     const message = {
       role: "assistant", content: [{ type: "text", text: `answer-${providerPrompts}` }],
-      api: "openai-completions", provider: "contract", model: "admission",
+      api: options.useRealProviderStream ? "picc-admission-contract" : "openai-completions",
+      provider: options.useRealProviderStream ? "openai" : "contract", model: "admission",
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: "stop", timestamp: Date.now(),
@@ -76,8 +79,20 @@ async function installedSession(options: InstalledOptions) {
     });
     return stream;
   };
+  let providerRegistered = false;
+  if (options.useRealProviderStream) {
+    aiCompat.registerApiProvider({ api: "picc-admission-contract", stream: providerStream, streamSimple: providerStream }, providerSource);
+    providerRegistered = true;
+  }
+  try {
+  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+  modelRuntime.hasConfiguredAuth = () => true;
+  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
+  if (!options.useRealProviderStream) modelRuntime.streamSimple = providerStream;
   const model = {
-    id: "admission", name: "Admission Contract", api: "openai-completions", provider: "contract",
+    id: "admission", name: "Admission Contract",
+    api: options.useRealProviderStream ? "picc-admission-contract" : "openai-completions",
+    provider: options.useRealProviderStream ? "openai" : "contract",
     baseUrl: "http://127.0.0.1", reasoning: false, input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
   };
@@ -124,6 +139,9 @@ async function installedSession(options: InstalledOptions) {
             }
           },
         });
+        if (options.abortBeforeProvider) {
+          api.on("before_provider_request", (_event: unknown, ctx: { abort(): void }) => { ctx.abort(); });
+        }
       },
     }],
   });
@@ -149,10 +167,24 @@ async function installedSession(options: InstalledOptions) {
       registered: firstRegisteredTools,
     }),
     close: async () => {
-      await initialization;
-      session.dispose?.();
+      try {
+        await initialization;
+      } finally {
+        try {
+          session.dispose?.();
+        } finally {
+          if (providerRegistered) {
+            aiCompat.unregisterApiProviders(providerSource);
+            providerRegistered = false;
+          }
+        }
+      }
     },
   };
+  } catch (error) {
+    if (providerRegistered) aiCompat.unregisterApiProviders(providerSource);
+    throw error;
+  }
 }
 
 async function submit(installed: Awaited<ReturnType<typeof installedSession>>, mode: "tui" | "print" | "json" | "rpc", text: string, source: "interactive" | "rpc" | "extension" = mode === "rpc" ? "rpc" : "interactive") {
@@ -182,6 +214,20 @@ function malformedMessageValue(): Error {
 }
 
 describe("installed Pi AgentSession input admission", () => {
+  it("does not invoke the real provider stream after a synchronous before_provider_request abort", async () => {
+    const installed = await installedSession({
+      loadBuiltinSdk: () => import("@earendil-works/pi-coding-agent"),
+      abortBeforeProvider: true,
+      useRealProviderStream: true,
+    });
+    try {
+      await submit(installed, "print", "abort before provider transport");
+      expect(installed.counts()).toMatchObject({ providerPrompts: 0, hookCalls: 1 });
+    } finally {
+      await installed.close();
+    }
+  });
+
   it("holds slash-template task input across ordinary TUI, print, JSON, and RPC prompt modes, then initializes once", async () => {
     for (const mode of ["tui", "print", "json", "rpc"] as const) {
       const gate = deferred<any>();

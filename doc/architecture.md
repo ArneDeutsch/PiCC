@@ -292,9 +292,14 @@ where to start reading, not the extent of its cluster.
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
-  in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
-  stopping, one Pi-owned compaction transaction, queued-input reconciliation, resume, cancellation, and
-  exhaustion. Confirmed pre-commit operational or hook exhaustion remains recoverable in-session;
+  in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
+  tool-requesting assistant usage, queues threshold pressure while the requested tools finish, handles
+  complete batches at `turn_end`, and samples again at final provider admission. Newly known pressure
+  blocks that ordinary request before provider transport. `agent_settled` is the only boundary that
+  may start one physical Pi-owned compaction transaction if the checkpoint is still required, and only
+  after no provider response or tool batch remains unresolved; the controller then owns queued-input
+  reconciliation, resume, cancellation, and exhaustion. Confirmed pre-commit operational or hook
+  exhaustion remains recoverable in-session;
   any post-commit restoration, replay, or continuation-start failure is terminal for that session.
   If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
   confirm host quiescence: admission and recovery stay closed, and in-process controller replacement
@@ -439,12 +444,17 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    subagent by agent id or steers a running background one — never a user-stopped one; a panel stop
    is permanent.
 
-7. **Cycle boundary / compaction / shutdown.** After a complete assistant/tool cycle reaches
-   `proactiveCompactPercent`, the session-local controller stops another ordinary request, awaits
-   one `ctx.compact()` transaction (or the child SDK equivalent), lets Pi own eligible retries inside it, and resumes the same
-   logical run only after restoration and queued-input reconciliation. The controller permits its
-   own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
-   abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.
+7. **Cycle boundary / compaction / shutdown.** On supported model APIs, final usage from a fresh
+   successful assistant response that requests tools can queue threshold pressure while the requested
+   tools finish. `turn_end` handles the complete batch; immediately before any next ordinary provider
+   request, the controller samples again and blocks transport when newly known pressure arms the
+   checkpoint. `agent_settled` is the only boundary that may start one physical compaction transaction
+   if the checkpoint is still required, and only after provider and tool work is resolved. It then
+   awaits `ctx.compact()` (or the child SDK equivalent), lets Pi own eligible retries inside that one
+   transaction, and resumes the same logical run after restoration and queued-input
+   reconciliation. The controller permits its own summary request through the provider gate. Mixed,
+   blocked, malformed, or queued tool paths abort and settle before compaction; the settled sample
+   also remains a non-resuming fallback.
    `session_before_compact` / `session_compact` fire compact hooks and restore bounded
    SessionStart(compact) context followed by recent active skill bodies within PiCC's heuristic
    character budget; PostCompact output is diagnostic-only, and the system-prompt
