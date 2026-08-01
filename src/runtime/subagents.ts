@@ -2664,6 +2664,25 @@ export class SubagentRuntime {
             diagnostics,
           };
         }
+        if (last?.stopReason === "pending") {
+          settledOutcome = "failed";
+          settledFinalText = assistantTextSoFar(live);
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: settledFinalText,
+            agentId,
+            transcriptPath,
+            resumable: actualResumable,
+            truncated: false,
+            isFork,
+            agentName: agent.name,
+            worktreePath,
+            usage: captureUsage(),
+            error: "Agent ended with an incomplete pending assistant response.",
+            diagnostics,
+          };
+        }
         // A token-limit stop still completes, but never silently: the truncation
         // is marked on the final message (below) and in the diagnostics.
         truncated = last?.stopReason === "length";
