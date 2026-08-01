@@ -127,6 +127,7 @@ const MAX_INDENT_LEVELS = 6;
 const TYPE_RENDER_CAP = 60;
 const LABEL_RENDER_CAP = 160;
 const ACTIVITY_RENDER_CAP = DETAIL_FIELD_MAX_LENGTH;
+const ACTIVITY_BRANCH_INSET = "  ";
 const COLUMN_GAP = "  ";
 const DESCRIPTION_SEPARATOR = " · ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
@@ -229,6 +230,13 @@ function fitActivityText(text: string, width: number): string {
   }
 }
 
+function stripReasoningOuterBold(text: string): string {
+  let normalized = text;
+  if (normalized.startsWith("**")) normalized = normalized.slice(2);
+  if (normalized.endsWith("**")) normalized = normalized.slice(0, -2);
+  return normalized;
+}
+
 function activityValue(row: PanelRowView): PanelRowView["activity"] {
   try {
     const activity = row.activity;
@@ -258,10 +266,11 @@ function renderActivityLine(
   const markerSpace = fullGutterFits ? " ".repeat(visibleWidth(row.marker)) : "";
   const indent = fullGutterFits ? row.indent : "";
   const branch = "└ ";
-  const prefixPlain = `${markerSpace}${indent}${branch}`;
-  const prefix = `${markerSpace}${indent}${panelFg(opts.theme, "muted", branch)}` +
-    " ".repeat(Math.max(0, gutterWidth - visibleWidth(prefixPlain)));
-  const available = Math.max(1, opts.width - gutterWidth);
+  const activityGutterWidth = gutterWidth + visibleWidth(ACTIVITY_BRANCH_INSET);
+  const prefixPlain = `${markerSpace}${indent}${ACTIVITY_BRANCH_INSET}${branch}`;
+  const prefix = `${markerSpace}${indent}${ACTIVITY_BRANCH_INSET}${panelFg(opts.theme, "muted", branch)}` +
+    " ".repeat(Math.max(0, activityGutterWidth - visibleWidth(prefixPlain)));
+  const available = Math.max(1, opts.width - activityGutterWidth);
   const activity = activityValue(row.source);
 
   if (activity?.kind === "tool") {
@@ -280,11 +289,17 @@ function renderActivityLine(
   }
 
   const fallback = row.source.state === "waiting" ? "Waiting for capacity" : "Working…";
-  const text = activity
+  const sanitizedText = activity
     ? scalarSafeText(sanitizeLine(activity.text, ACTIVITY_RENDER_CAP)) || fallback
     : fallback;
+  const normalizedReasoning = activity?.kind === "reasoning"
+    ? stripReasoningOuterBold(sanitizedText)
+    : undefined;
+  const text = normalizedReasoning === undefined
+    ? sanitizedText
+    : normalizedReasoning || fallback;
   const fitted = fitActivityText(text, available);
-  if (activity?.kind === "reasoning") return `${prefix}${themedFgItalic(opts.theme, "muted", fitted)}`;
+  if (normalizedReasoning) return `${prefix}${themedFgItalic(opts.theme, "muted", fitted)}`;
   if (activity?.kind === "assistant" || activity?.kind === "output") {
     return `${prefix}${panelFg(opts.theme, "text", fitted)}`;
   }

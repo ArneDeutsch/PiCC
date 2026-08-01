@@ -687,6 +687,71 @@ describe("responsive panel table", () => {
     expect(after[2]).toContain("tooler");
   });
 
+  it("normalizes only exact reasoning bold edges after sanitization", () => {
+    const records = [
+      rec({ agentId: "completed", startedAt: 0, liveActivity: { kind: "reasoning", text: "**Planning inspection**" } }),
+      rec({ agentId: "opening", startedAt: 1, liveActivity: { kind: "reasoning", text: "**Streaming plan" } }),
+      rec({ agentId: "closing", startedAt: 2, liveActivity: { kind: "reasoning", text: "Streaming close**" } }),
+      rec({ agentId: "ordinary", startedAt: 3, liveActivity: { kind: "reasoning", text: "ordinary **internal** text" } }),
+      rec({ agentId: "assistant-stars", startedAt: 4, liveActivity: { kind: "assistant", text: "**assistant**" } }),
+      rec({ agentId: "output-stars", startedAt: 5, liveActivity: { kind: "output", text: "**output**" } }),
+      rec({ agentId: "status-stars", startedAt: 6, liveActivity: { kind: "status", text: "**status**" } }),
+      rec({ agentId: "tool-stars", startedAt: 7, liveActivity: { kind: "tool", tool: "**Read**", detail: "**file**" } }),
+    ];
+    const activities = renderSubagentPanel(view(makeModel({ t: 100 }), records), {
+      width: 100, entryChord: CHORD,
+    }).map(stripAnsi).filter((line) => line.includes("└ "))
+      .map((line) => line.slice(line.indexOf("└ ") + 2));
+
+    expect(activities).toEqual([
+      "Planning inspection",
+      "Streaming plan",
+      "Streaming close",
+      "ordinary **internal** text",
+      "**assistant**",
+      "**output**",
+      "**status**",
+      "**Read** **file**",
+    ]);
+
+    const fg = vi.fn((_color: string, text: string) => text);
+    const italic = vi.fn((text: string) => text);
+    const markerOnly = view(makeModel({ t: 100 }), [rec({
+      agentId: "marker-only", liveActivity: { kind: "reasoning", text: "**" },
+    })]);
+    const markerLines = renderSubagentPanel(markerOnly, {
+      width: 80, entryChord: CHORD, theme: { fg, italic },
+    }).map(stripAnsi);
+    expect(markerLines).toHaveLength(3);
+    expect(markerLines[1]).toBe("  └ Working…");
+    expect(markerLines.join("\n")).not.toContain("**");
+    expect(fg).toHaveBeenCalledWith("muted", "Working…");
+    expect(italic).not.toHaveBeenCalled();
+
+    const waitingMarkerOnly = view(makeModel({ t: 100 }), [rec({
+      agentId: "waiting-marker-only", admission: "waiting",
+    })]);
+    waitingMarkerOnly.rows[0]!.activity = { kind: "reasoning", text: "**" };
+    expect(stripAnsi(renderSubagentPanel(waitingMarkerOnly, {
+      width: 80, entryChord: CHORD,
+    })[1]!)).toBe("  └ Waiting for capacity");
+  });
+
+  it("places the fixed activity inset after passive and focused tree gutters", () => {
+    const passive = view(makeModel({ t: 100 }), [rec({
+      agentId: "passive", liveActivity: { kind: "status", text: "semantic" },
+    })]);
+    expect(stripAnsi(renderSubagentPanel(passive, { width: 80, entryChord: CHORD })[1]!))
+      .toBe("  └ semantic");
+
+    const focusedNested = view(makeModel({ t: 100 }), [rec({
+      agentId: "focused", liveActivity: { kind: "status", text: "semantic" },
+    })], { focused: true });
+    focusedNested.rows[0]!.treeDepth = 1;
+    expect(stripAnsi(renderSubagentPanel(focusedNested, { width: 80, entryChord: CHORD })[1]!))
+      .toBe("      └ semantic");
+  });
+
   it("aligns identity, description, elapsed, sparse usage, positive cache, and cost columns", () => {
     const lines = rowsOnly(renderSubagentPanel(mixedView(), { width: 180, entryChord: CHORD }));
     expect(lines).toHaveLength(3);
@@ -1094,7 +1159,7 @@ describe("panel aggregate, palette, and width safety", () => {
     })], { focused: true });
     focused.rows[0]!.treeDepth = 6;
     const minimum = renderSubagentPanel(focused, { width: PANEL_MIN_ROW_WIDTH, entryChord: CHORD }).map(stripAnsi);
-    expect(minimum[1]).toMatch(/^└ .+/u);
+    expect(minimum[1]).toMatch(/^  └ ./u);
     expect(visibleWidth(minimum[1]!)).toBeLessThanOrEqual(PANEL_MIN_ROW_WIDTH);
 
     const aggregate = renderSubagentPanel(activePanel, {
