@@ -93,6 +93,20 @@ export function themedBold(theme: unknown, text: string): string {
   return invokeTheme(theme, "bold", [text], text);
 }
 
+/** Safely compose `theme.fg(color, theme.italic(text))`; malformed styling fails open. */
+export function themedFgItalic(theme: unknown, color: string, text: string): string {
+  try {
+    const italic = Reflect.get(theme as object, "italic");
+    const fg = Reflect.get(theme as object, "fg");
+    if (typeof italic !== "function" || typeof fg !== "function") return text;
+    const italicText = safeSgrText(Reflect.apply(italic, theme, [text]), text);
+    if (italicText === undefined) return text;
+    return safeSgrText(Reflect.apply(fg, theme, [color, italicText]), text) ?? text;
+  } catch {
+    return text;
+  }
+}
+
 /** Append `text` wrapped to `width` visible columns (ANSI- and wide-char-aware). */
 export function pushWrapped(text: string, width: number, into: string[]): void {
   try {

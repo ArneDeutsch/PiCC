@@ -588,7 +588,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
-        /responsive status panel remains the waiting\/running surface/,
+        /status-panel observability is defined by feature\.background-agents/,
         /dispatched subagents do NOT recurse/,
       ],
       gap: [/PARTIAL residual/, /notice is next-turn/],
@@ -614,6 +614,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /unbound action fails open/,
         /At unusable widths, detail waits for widening; a resize prompt appears only when it fits/,
         /never adding a reference or duplicate row/,
+        /status-panel observability is defined by feature\.background-agents/,
       ],
       gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
       precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
@@ -623,6 +624,26 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
+  });
+
+  it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {
+    const owner = lookupCapability("feature.background-agents")?.note ?? "";
+    for (const clause of [
+      "stable PiCC-defined current-activity line until terminal settlement",
+      "tool/argument, reasoning, assistant/output, startup, work, retry, and waiting states",
+      "window counts at most eight agents rather than physical lines",
+      "widths below the explicit row minimum retain truthful aggregates without per-agent activity",
+      "drill-down that retains multiline history and richer detail",
+      "PiCC-chosen details, NOT parity",
+    ]) expect(owner, clause).toContain(clause);
+
+    for (const id of ["tool.Agent", "tool.TaskOutput"]) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).toContain("status-panel observability is defined by feature.background-agents");
+      expect(note, `${id} must not duplicate panel mechanics`).not.toMatch(
+        /eight-agent window|current-activity line|narrow.*aggregate|multiline history/u,
+      );
+    }
   });
 
   it("keeps the full state-aware policy only in tool.Agent and pins each consumer consequence", () => {
@@ -746,6 +767,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
+        /stable PiCC-defined current-activity line until terminal settlement/,
+        /tool\/argument, reasoning, assistant\/output, startup, work, retry, and waiting states/,
+        /window counts at most eight agents rather than physical lines/,
+        /widths below the explicit row minimum retain truthful aggregates without per-agent activity/,
+        /Lingering terminal agents return to one row/,
+        /drill-down.*retains multiline history and richer detail/,
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
       precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],

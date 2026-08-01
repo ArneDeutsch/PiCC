@@ -11,7 +11,7 @@ import {
   scalarSafeText,
   type SubagentDetailEntry,
 } from "./subagent-progress.js";
-import { clampLines, pushWrapped, themedFg } from "./render-util.js";
+import { clampLines, pushWrapped, themedFg, themedFgItalic } from "./render-util.js";
 import type { PanelRowView, PanelViewModel } from "./subagent-panel-model.js";
 import {
   guardSteer,
@@ -126,6 +126,7 @@ export interface PanelRenderOptions {
 const MAX_INDENT_LEVELS = 6;
 const TYPE_RENDER_CAP = 60;
 const LABEL_RENDER_CAP = 160;
+const ACTIVITY_RENDER_CAP = DETAIL_FIELD_MAX_LENGTH;
 const COLUMN_GAP = "  ";
 const DESCRIPTION_SEPARATOR = " · ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
@@ -217,6 +218,77 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
 
 function leftPad(text: string, width: number): string {
   return `${" ".repeat(Math.max(0, width - visibleWidth(text)))}${text}`;
+}
+
+function fitActivityText(text: string, width: number): string {
+  if (width <= 0) return "";
+  try {
+    return truncateToWidth(text, width, "…");
+  } catch {
+    return truncateToWidth(scalarSafeText(text), width, "…");
+  }
+}
+
+function activityValue(row: PanelRowView): PanelRowView["activity"] {
+  try {
+    const activity = row.activity;
+    if (!activity || typeof activity !== "object") return undefined;
+    if (activity.kind === "tool" && typeof activity.tool === "string") {
+      return typeof activity.detail === "string"
+        ? { kind: "tool", tool: activity.tool, detail: activity.detail }
+        : { kind: "tool", tool: activity.tool };
+    }
+    if (
+      (activity.kind === "reasoning" || activity.kind === "assistant" ||
+        activity.kind === "output" || activity.kind === "status") &&
+      typeof activity.text === "string"
+    ) return { kind: activity.kind, text: activity.text };
+  } catch {
+    // Hand-built/plugin views can be malformed; active line two remains present below.
+  }
+  return undefined;
+}
+
+function renderActivityLine(
+  row: PlainPanelRow,
+  opts: PanelRenderOptions,
+  fullGutterFits: boolean,
+  gutterWidth: number,
+): string {
+  const markerSpace = fullGutterFits ? " ".repeat(visibleWidth(row.marker)) : "";
+  const indent = fullGutterFits ? row.indent : "";
+  const branch = "└ ";
+  const prefixPlain = `${markerSpace}${indent}${branch}`;
+  const prefix = `${markerSpace}${indent}${panelFg(opts.theme, "muted", branch)}` +
+    " ".repeat(Math.max(0, gutterWidth - visibleWidth(prefixPlain)));
+  const available = Math.max(1, opts.width - gutterWidth);
+  const activity = activityValue(row.source);
+
+  if (activity?.kind === "tool") {
+    const tool = scalarSafeText(sanitizeLine(activity.tool, ACTIVITY_RENDER_CAP)) || "tool";
+    const detail = activity.detail === undefined
+      ? ""
+      : scalarSafeText(sanitizeLine(activity.detail, ACTIVITY_RENDER_CAP));
+    if (detail && available >= 3) {
+      const toolWidth = Math.min(visibleWidth(tool), Math.max(1, available - 2));
+      const fittedTool = fitActivityText(tool, toolWidth);
+      const detailWidth = Math.max(1, available - visibleWidth(fittedTool) - 1);
+      const fittedDetail = fitActivityText(detail, detailWidth);
+      return `${prefix}${panelFg(opts.theme, "text", fittedTool)} ${panelFg(opts.theme, "accent", fittedDetail)}`;
+    }
+    return `${prefix}${panelFg(opts.theme, "text", fitActivityText(tool, available))}`;
+  }
+
+  const fallback = row.source.state === "waiting" ? "Waiting for capacity" : "Working…";
+  const text = activity
+    ? scalarSafeText(sanitizeLine(activity.text, ACTIVITY_RENDER_CAP)) || fallback
+    : fallback;
+  const fitted = fitActivityText(text, available);
+  if (activity?.kind === "reasoning") return `${prefix}${themedFgItalic(opts.theme, "muted", fitted)}`;
+  if (activity?.kind === "assistant" || activity?.kind === "output") {
+    return `${prefix}${panelFg(opts.theme, "text", fitted)}`;
+  }
+  return `${prefix}${panelFg(opts.theme, "muted", fitted)}`;
 }
 
 function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string[] {
@@ -337,11 +409,14 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
 
   const lines: string[] = [];
   if (view.hiddenAbove > 0) lines.push(panelFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
-  lines.push(...renderedRows);
-  if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
-  if (view.waitingCount > 0) {
-    lines.push(panelFg(opts.theme, "muted", `${view.runningCount} running · ${view.waitingCount} waiting`));
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index]!;
+    lines.push(renderedRows[index]!);
+    if (row.source.state === "running" || row.source.state === "waiting") {
+      lines.push(renderActivityLine(row, opts, fullGutterFits, gutterWidth));
+    }
   }
+  if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
   const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);
   lines.push(panelFg(opts.theme, "muted", hint));
   return clampLines(lines, opts.width);
