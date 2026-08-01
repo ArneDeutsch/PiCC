@@ -146,22 +146,27 @@ describe("projectIdentities", () => {
 
   it("does not read non-regular metadata and rejects a non-regular opened descriptor", () => {
     const precheck = createLinkedMetadata("precheck");
-    const nonRegular = path.join(precheck.main, ".git", "worktrees", "precheck", "gitdir");
+    const nonRegular = fs.realpathSync.native(path.join(precheck.main, ".git", "worktrees", "precheck", "gitdir"));
+    const isNonRegular = (value: string): boolean => fs.realpathSync.native(value) === nonRegular;
     const openFiles = new Map<number, string>();
+    let nonRegularStatMatches = 0;
     let nonRegularOpens = 0;
     let nonRegularReads = 0;
     expect(projectIdentities(precheck.linked, {
-      stat: (value) => value === nonRegular
-        ? { isFile: () => false } as fs.Stats
-        : fs.statSync(value),
+      stat: (value) => {
+        if (!isNonRegular(value)) return fs.statSync(value);
+        nonRegularStatMatches += 1;
+        return { isFile: () => false } as fs.Stats;
+      },
       open: (value) => {
-        if (value === nonRegular) nonRegularOpens += 1;
+        if (isNonRegular(value)) nonRegularOpens += 1;
         const fd = fs.openSync(value, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
         openFiles.set(fd, value);
         return fd;
       },
       read: (fd, buffer, offset, length, position) => {
-        if (openFiles.get(fd) === nonRegular) nonRegularReads += 1;
+        const openFile = openFiles.get(fd);
+        if (openFile !== undefined && isNonRegular(openFile)) nonRegularReads += 1;
         return fs.readSync(fd, buffer, offset, length, position);
       },
       close: (fd) => {
@@ -169,7 +174,11 @@ describe("projectIdentities", () => {
         fs.closeSync(fd);
       },
     })).toEqual([fs.realpathSync.native(precheck.linked)]);
-    expect({ nonRegularOpens, nonRegularReads }).toEqual({ nonRegularOpens: 0, nonRegularReads: 0 });
+    expect({ nonRegularStatMatches, nonRegularOpens, nonRegularReads }).toEqual({
+      nonRegularStatMatches: 1,
+      nonRegularOpens: 0,
+      nonRegularReads: 0,
+    });
 
     const revalidation = createLinkedMetadata("revalidation");
     let reads = 0;
