@@ -697,26 +697,58 @@ describe("lifecycle wiring", () => {
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 
-  it("reports terminal main pending as incomplete without Stop continuation delivery", async () => {
-    const pendingPi = fakePi();
-    picc(pendingPi.api as never, { onInitializationSettled: pendingPi.captureInitialization });
-    await pendingPi.waitForInitialization();
+  it("reports terminal main pending by mode without successful status or Stop continuation", async () => {
     const pendingMessage = {
       role: "assistant",
       content: [{ type: "text", text: "partial response must not count as complete" }],
       stopReason: "pending",
     };
+    const savedExitCode = process.exitCode;
+    const savedConsoleError = console.error;
+    try {
+      for (const row of [
+        { label: "tui", mode: "tui", initialExitCode: undefined, expectedExitCode: undefined, notices: 1, stderr: 0, entries: 0 },
+        { label: "print", mode: "print", initialExitCode: undefined, expectedExitCode: 1, notices: 0, stderr: 1, entries: 0 },
+        { label: "json", mode: "json", initialExitCode: undefined, expectedExitCode: 1, notices: 0, stderr: 0, entries: 1 },
+        { label: "json checkpoint status", mode: "json", initialExitCode: 3, expectedExitCode: 3, notices: 0, stderr: 0, entries: 1 },
+        { label: "rpc", mode: "rpc", initialExitCode: undefined, expectedExitCode: undefined, notices: 0, stderr: 0, entries: 1 },
+      ] as const) {
+        const pendingPi = fakePi();
+        picc(pendingPi.api as never, { onInitializationSettled: pendingPi.captureInitialization });
+        await pendingPi.waitForInitialization();
+        const stderr: string[] = [];
+        console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+        process.exitCode = row.initialExitCode;
+        const ctx = row.mode === "tui"
+          ? pendingPi.tuiCtx()
+          : row.mode === "print"
+            ? pendingPi.printCtx()
+            : row.mode === "rpc"
+              ? pendingPi.rpcCtx()
+              : pendingPi.ctx({ mode: "json", hasUI: false });
+        ctx.sessionManager = { getBranch: () => [{ type: "message", message: pendingMessage }] };
 
-    await pendingPi.fire("agent_settled", {}, pendingPi.tuiCtx({
-      sessionManager: { getBranch: () => [{ type: "message", message: pendingMessage }] },
-    }));
+        await pendingPi.fire("agent_settled", {}, ctx);
 
-    expect(pendingPi.userMessages.filter((message) =>
-      String(message.content).includes("[Stop hook]"))).toHaveLength(0);
-    expect(pendingPi.notifications).toContainEqual(expect.objectContaining({
-      severity: "warning",
-      text: expect.stringContaining("ended incomplete (pending)"),
-    }));
+        expect(pendingPi.userMessages.filter((message) =>
+          String(message.content).includes("[Stop hook]")), row.label).toHaveLength(0);
+        expect(pendingPi.notifications, row.label).toHaveLength(row.notices);
+        if (row.notices) {
+          expect(pendingPi.notifications[0]).toMatchObject({
+            severity: "warning",
+            text: expect.stringContaining("ended incomplete (pending)"),
+          });
+        }
+        expect(stderr, row.label).toHaveLength(row.stderr);
+        if (row.stderr) expect(stderr[0]).toContain("ended incomplete (pending)");
+        expect(pendingPi.entries.filter((entry) =>
+          entry.customType === "picc-main-response-incomplete"), row.label).toHaveLength(row.entries);
+        expect(process.exitCode, row.label).toBe(row.expectedExitCode);
+      }
+    } finally {
+      console.error = savedConsoleError;
+      process.exitCode = savedExitCode;
+    }
   });
 
   it("resets blocked Stop iteration state when the session is replaced", async () => {

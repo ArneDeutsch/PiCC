@@ -3718,11 +3718,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
     if (unsuccessful && terminalAssistant.stopReason === "pending") {
       const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";
+      const mode = contextMode(ctx);
+      if ((mode === "print" || mode === "json") &&
+          (process.exitCode === undefined || process.exitCode === 0)) {
+        process.exitCode = 1;
+      }
       try {
-        const mode = contextMode(ctx);
         if (mode === "tui") ctx.ui?.notify?.(notice, "warning");
         else if (mode === "print") console.error(`PiCC: ${notice}`);
-        else pi.appendEntry("picc-main-response-incomplete", { stopReason: "pending", notice });
+        else if (mode === "json" || mode === "rpc") {
+          pi.appendEntry("picc-main-response-incomplete", { stopReason: "pending", notice });
+        }
       } catch { /* incomplete classification remains authoritative */ }
     }
     // A universal hook stop is the authoritative ending even when Pi reports an

@@ -236,6 +236,61 @@ function reopen(sdk: any, file: string): any {
   return sdk.SessionManager.open(file);
 }
 
+async function commitTreeSelectionThroughInteractiveMode(
+  sdk: any,
+  session: any,
+  sessionManager: any,
+  selectedId: string,
+): Promise<string[]> {
+  const ordering: string[] = [];
+  const originalAbort = session.abort.bind(session);
+  const originalNavigateTree = session.navigateTree.bind(session);
+  session.abort = async () => {
+    ordering.push("abort:start");
+    await originalAbort();
+    ordering.push("abort:end");
+  };
+  session.navigateTree = async (...args: unknown[]) => {
+    ordering.push("navigateTree");
+    return originalNavigateTree(...args);
+  };
+
+  let commitSelection: ((entryId: string) => Promise<void>) | undefined;
+  sdk.initTheme(undefined, false);
+  const settingsManager = {
+    getTreeFilterMode: () => "all",
+    getBranchSummarySkipPrompt: () => true,
+  };
+  const interactiveSession = new Proxy(session, {
+    get(target, property) {
+      if (property === "sessionManager") return sessionManager;
+      if (property === "settingsManager") return settingsManager;
+      return Reflect.get(target, property, target);
+    },
+  });
+  const interactive: any = Object.create(sdk.InteractiveMode.prototype);
+  Object.assign(interactive, {
+    runtimeHost: { session: interactiveSession },
+    ui: { terminal: { rows: 40 }, requestRender: () => {} },
+    defaultEditor: { onEscape: undefined },
+    editor: { getText: () => "", setText: () => {} },
+    chatContainer: { clear: () => {}, addChild: () => {} },
+    restoreQueuedMessagesToEditor: () => {},
+    showStatus: () => {},
+    renderInitialMessages: () => {},
+    flushCompactionQueue: async () => {},
+    showError: (error: unknown) => { throw error; },
+    showSelector: (create: (done: () => void) => { component: any }) => {
+      const { component } = create(() => {});
+      commitSelection = component.treeList.onSelect;
+    },
+  });
+  interactive.showTreeSelector();
+  if (!commitSelection) throw new Error("InteractiveMode did not expose the tree selector commit callback");
+  await commitSelection(selectedId);
+  return ordering;
+}
+
 describe("Pi 0.83 assembled session transition contract", () => {
   it("replaces an active PiCC session only after abort persistence and shutdown", async () => {
     const h = await assembledHarness();
@@ -318,10 +373,9 @@ describe("Pi 0.83 assembled session transition contract", () => {
       await h.responseEntered.promise;
       const authority = h.authorities.get(sessionPath)!;
       const staleStop = authority.gate.captureLogicalRunStop();
-      // Pi's committed interactive navigation path owns this exact abort-before-move order.
-      await session.abort();
-      await expect(session.navigateTree(selectedId)).resolves.toMatchObject({ cancelled: false });
+      const ordering = await commitTreeSelectionThroughInteractiveMode(h.sdk, session, manager, selectedId);
       await activePrompt;
+      expect(ordering).toEqual(["abort:start", "abort:end", "navigateTree"]);
 
       const reopened = reopen(h.sdk, sessionPath);
       const fullGraph = reopened.getEntries();
