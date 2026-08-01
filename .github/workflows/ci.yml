@@ -55,7 +55,7 @@ jobs:
       - name: Install
         run: npm ci
 
-      # Drives the real Pi CLI against a local mock OpenAI server — no network,
-      # no subscription. Python-dependent scenarios self-skip if python is absent.
+      # Drives the real Pi CLI with local model traffic and no subscription.
+      # Package installation may use npm; Python-dependent scenarios self-skip if absent.
       - name: End-to-end tests
         run: npm run test:e2e

@@ -42,7 +42,7 @@ const fileLinkProbe = (() => {
 })();
 
 beforeEach(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-"));
+  tmpRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-")));
   userDir = path.join(tmpRoot, "home", ".claude");
   projectRoot = path.join(tmpRoot, "project");
   fs.mkdirSync(path.join(userDir, "plugins", "cache"), { recursive: true });

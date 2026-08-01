@@ -54,6 +54,7 @@ function releaseTarball(): string {
 }
 
 beforeAll(() => {
+  if (!BASH_AVAILABLE) return;
   tarball = releaseTarball();
   const prefix = temporaryDirectory("picc-packaged-prefix-");
   fs.writeFileSync(path.join(prefix, "package.json"), JSON.stringify({
@@ -69,7 +70,6 @@ beforeAll(() => {
     "--prefix", prefix,
     tarball,
     "--ignore-scripts",
-    "--offline",
     "--audit=false",
     "--fund=false",
   ], { cwd: prefix, stdio: "pipe", timeout: 180_000 });
