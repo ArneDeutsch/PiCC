@@ -1636,7 +1636,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
-      case "checkpoint-armed": return "Pausing for proactive context compaction.";
+      case "checkpoint-armed": return event.source === "settled"
+        ? "Context checkpoint starting from the settled fallback."
+        : event.source === "assistant"
+          ? "Context checkpoint queued; waiting for requested tools and safe settlement."
+          : "Context checkpoint queued; waiting for safe settlement.";
       case "checkpoint-complete": return event.action === "settled-fallback"
         ? "Context compaction completed."
         : "Context compacted; reconnecting the paused work.";
@@ -2979,8 +2983,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
-  pi.on("message_end", (event: any) => {
-    mainCheckpointGate.assistantMessageEnded(event?.message);
+  pi.on("message_end", (event: any, ctx: any) => {
+    mainCheckpointGate.assistantMessageEnded(event?.message, ctx);
   });
 
   pi.on("message_start", (event: any) => {
@@ -3004,7 +3008,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("before_provider_request", async (_event: any, ctx: any) => {
-    await mainCheckpointGate.defensiveLatch(ctx);
+    await mainCheckpointGate.beforeProviderRequest(ctx);
   });
 
   pi.on("session_shutdown", async (event: any) => {

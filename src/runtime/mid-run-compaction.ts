@@ -1,6 +1,7 @@
 /** Session-local coordination for proactive mid-run context checkpoints. */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { calculateContextTokens } from "@earendil-works/pi-agent-core";
 import { isProactiveCompactionApi } from "../registry/capability-registry.js";
 import { toolResultHasGuardClipping } from "./guard.js";
 
@@ -23,7 +24,7 @@ export type CheckpointPhase =
 
 export type QueueDeliveryMode = "steer" | "followUp";
 export type QueueContent = string | readonly unknown[];
-export type CheckpointSource = "tool" | "settled";
+export type CheckpointSource = "tool" | "assistant" | "admission" | "settled";
 export type CancellationKind = "user" | "task-stop" | "shutdown" | "replacement";
 export type CompactionFailureCategory =
   | "operational"
@@ -69,6 +70,7 @@ export type CheckpointAction =
 export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
   generation: number;
+  source?: CheckpointSource;
   action?: CheckpointAction;
   failureCategory?: CompactionFailureCategory;
 }
@@ -367,7 +369,7 @@ export class MidRunCompactionController {
       return undefined;
     }
     this.generation += 1;
-    this.phase = source === "tool" ? "armed" : "awaiting-settlement";
+    this.phase = source === "tool" || source === "assistant" ? "armed" : "awaiting-settlement";
     this.activeBatch = undefined;
     this.checkpointAbortRequested = false;
     this.runAbort = new AbortController();
@@ -385,7 +387,7 @@ export class MidRunCompactionController {
     this.terminalFailure = undefined;
     this.terminalization = undefined;
     this.pendingHostStarts.clear();
-    this.emit("checkpoint-armed");
+    this.emit("checkpoint-armed", this.generation, { source });
     return this.generation;
   }
 
@@ -1102,7 +1104,7 @@ export class MidRunCompactionController {
   private emit(
     category: CheckpointDiagnosticCategory,
     generation = this.generation,
-    details: Pick<CheckpointProgress, "action" | "failureCategory"> = {},
+    details: Pick<CheckpointProgress, "source" | "action" | "failureCategory"> = {},
   ): void {
     try {
       this.options.progress?.({ category, generation, ...details });
@@ -1122,7 +1124,7 @@ export class MidRunCompactionController {
 }
 
 interface MainGateContext {
-  model?: { api?: string };
+  model?: { api?: string; contextWindow?: number };
   mode?: string;
   ui?: { getEditorText?: () => string; setEditorText?: (text: string) => void };
   getContextUsage?: () => ContextUsageShape | undefined;
@@ -1135,6 +1137,15 @@ interface MainBatchObservation {
   ids: string[];
   final: Map<string, { isError: boolean; truncated: boolean }>;
   successful: Map<string, { terminated: boolean; truncated: boolean }>;
+}
+
+interface ToolObservationAuthority {
+  controller: MidRunCompactionController;
+  epoch: object;
+  logicalRun: object;
+  batch: MainBatchObservation;
+  generation: number | undefined;
+  handle: ToolBatchHandle | undefined;
 }
 
 export interface CheckpointExecutionAdapter {
@@ -1153,6 +1164,22 @@ function toolCallIds(message: unknown): string[] {
     .filter((block): block is { type: "toolCall"; id: string } =>
       block?.type === "toolCall" && typeof block.id === "string")
     .map((block) => block.id);
+}
+
+function completedAssistantUsage(message: unknown, contextWindow: unknown): ContextUsageShape | undefined {
+  try {
+    if (!message || typeof message !== "object" ||
+        !Number.isFinite(contextWindow) || (contextWindow as number) <= 0) return undefined;
+    const stopReason = (message as { stopReason?: unknown }).stopReason;
+    if (stopReason !== "stop" && stopReason !== "length" && stopReason !== "toolUse") return undefined;
+    const usage = (message as { usage?: unknown }).usage;
+    if (!usage || typeof usage !== "object") return undefined;
+    const tokens = calculateContextTokens(usage as Parameters<typeof calculateContextTokens>[0]);
+    if (!Number.isFinite(tokens) || tokens <= 0) return undefined;
+    return { tokens, contextWindow: contextWindow as number, percent: tokens / (contextWindow as number) * 100 };
+  } catch {
+    return undefined;
+  }
 }
 
 function acceptedContent(text: string, images: readonly unknown[] | undefined): QueueContent {
@@ -1268,6 +1295,7 @@ export class MainSessionCheckpointGate {
   private controller: MidRunCompactionController;
   private execution: CheckpointExecutionAdapter | undefined;
   private generation: number | undefined;
+  private generationSource: CheckpointSource | undefined;
   private handle: ToolBatchHandle | undefined;
   private batch: MainBatchObservation = { run: {}, ids: [], final: new Map(), successful: new Map() };
   private abortIssued: { generation: number; run: object } | undefined;
@@ -1393,17 +1421,27 @@ export class MainSessionCheckpointGate {
     return {
       ...tool,
       async execute(this: unknown, ...args: unknown[]) {
+        const ctx = args[4] as MainGateContext | undefined;
+        if (ctx) gate.arm(ctx);
+        const authority = gate.captureToolObservationAuthority();
         const result = await Reflect.apply(execute, this, args) as unknown as Record<string, unknown>;
-        return gate.successfulTool(String(args[0] ?? ""), result, args[4] as MainGateContext | undefined);
+        if (!gate.toolObservationAuthorityMatches(authority)) return result;
+        return gate.successfulTool(String(args[0] ?? ""), result, ctx);
       },
     };
   }
 
-  assistantMessageEnded(message: unknown): void {
+  assistantMessageEnded(message: unknown, ctx?: MainGateContext): void {
     if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") return;
-    this.batch = { run: {}, ids: toolCallIds(message), final: new Map(), successful: new Map() };
+    const ids = toolCallIds(message);
+    if (this.generationSource === "assistant" && this.controller.snapshot().phase === "stopping" &&
+        ids.length === this.batch.ids.length && ids.every((id, index) => id === this.batch.ids[index])) return;
+    this.batch = { run: {}, ids, final: new Map(), successful: new Map() };
     this.handle = undefined;
     this.abortIssued = undefined;
+    if (ctx && ids.length > 0 && isProactiveCompactionApi(ctx.model?.api)) {
+      this.armWithUsage(completedAssistantUsage(message, ctx.model?.contextWindow), "assistant");
+    }
   }
 
   toolExecutionEnded(event: { toolCallId?: unknown; result?: unknown; isError?: unknown }): void {
@@ -1445,6 +1483,20 @@ export class MainSessionCheckpointGate {
     const disposition = this.controller.completeToolBatch(this.handle);
     if (disposition.stop === "abort") this.abortAfterBatch(ctx);
     return disposition;
+  }
+
+  async beforeProviderRequest(ctx: MainGateContext): Promise<void> {
+    this.resetCompletedGeneration();
+    if (!this.logicalRunStop && this.generation === undefined && isProactiveCompactionApi(ctx.model?.api)) {
+      let usage: ContextUsageShape | undefined;
+      try {
+        usage = ctx.getContextUsage?.();
+      } catch {
+        usage = undefined;
+      }
+      this.armWithUsage(usage, "admission");
+    }
+    await this.defensiveLatch(ctx);
   }
 
   async defensiveLatch(ctx: MainGateContext): Promise<void> {
@@ -1662,6 +1714,23 @@ export class MainSessionCheckpointGate {
     return shadow;
   }
 
+  private captureToolObservationAuthority(): ToolObservationAuthority {
+    return {
+      controller: this.controller,
+      epoch: this.sessionEpoch,
+      logicalRun: this.logicalRunIdentity,
+      batch: this.batch,
+      generation: this.generation,
+      handle: this.handle,
+    };
+  }
+
+  private toolObservationAuthorityMatches(authority: ToolObservationAuthority): boolean {
+    return authority.controller === this.controller && authority.epoch === this.sessionEpoch &&
+      authority.logicalRun === this.logicalRunIdentity && authority.batch === this.batch &&
+      authority.generation === this.generation && authority.handle === this.handle;
+  }
+
   private successfulTool(id: string, result: Record<string, unknown>, ctx: MainGateContext | undefined): Record<string, unknown> {
     if (ctx) this.arm(ctx);
     const truncated = toolResultHasGuardClipping(result);
@@ -1690,12 +1759,19 @@ export class MainSessionCheckpointGate {
     } catch {
       usage = undefined;
     }
-    const generation = this.controller.sample(usage, "tool");
-    if (generation !== undefined) {
-      this.generation = generation;
-      for (const accepted of this.acceptedBeforeArm.splice(0)) {
-        this.trackShadow(this.controller.shadowInput(generation, accepted.content, accepted.delivery), accepted);
-      }
+    this.armWithUsage(usage, "tool");
+  }
+
+  private armWithUsage(usage: ContextUsageShape | undefined, source: CheckpointSource): void {
+    if (this.logicalRunStop || this.generation !== undefined) return;
+    const generation = this.controller.sample(usage, source);
+    if (generation === undefined) return;
+    this.generation = generation;
+    this.generationSource = source;
+    for (const accepted of this.acceptedBeforeArm.splice(0)) {
+      this.trackShadow(this.controller.shadowInput(generation, accepted.content, accepted.delivery), accepted);
+    }
+    if (source === "tool" || source === "assistant") {
       this.beginBatch();
       if (this.ambiguousInput && this.handle) this.controller.invalidateToolBatch(this.handle);
     }
@@ -1709,6 +1785,7 @@ export class MainSessionCheckpointGate {
   private resetCompletedGeneration(): void {
     if (this.generation === undefined || this.controller.snapshot().phase !== "idle") return;
     this.generation = undefined;
+    this.generationSource = undefined;
     this.handle = undefined;
     this.abortIssued = undefined;
     this.trackedOccurrences = [];
@@ -1798,6 +1875,7 @@ export class MainSessionCheckpointGate {
     this.logicalRunStop = undefined;
     this.logicalRunIdentity = {};
     this.generation = undefined;
+    this.generationSource = undefined;
     this.handle = undefined;
     this.batch = { run: {}, ids: [], final: new Map(), successful: new Map() };
     this.abortIssued = undefined;

@@ -1,15 +1,17 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Type } from "typebox";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import picc from "../src/index.js";
 import { renderMainSessionTool } from "../src/runtime/main-session-tool-render.js";
-import { deferred } from "./helpers/async.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 
 const CORE = ["bash", "read", "write", "edit", "grep", "find", "ls"] as const;
 let project: string;
 let previousCwd: string;
 let previousUserDir: string | undefined;
+let providerSourceId = 0;
 
 beforeAll(() => {
   previousCwd = process.cwd();
@@ -37,11 +39,21 @@ interface InstalledOptions {
   failCheckpoint?: boolean;
   failCoreRegistrationAt?: number;
   cleanup?: "throw" | "unverified";
+  abortBeforeProvider?: boolean;
+  useRealProviderStream?: boolean;
+  messageForProvider?: (ordinal: number) => {
+    content: readonly unknown[];
+    usage?: Record<string, unknown>;
+    stopReason?: string;
+  };
+  heldTool?: Promise<Record<string, unknown>>;
+  observeMessageEnd?: (event: any, ctx: any, gate: any) => void;
 }
 
 async function installedSession(options: InstalledOptions) {
   const sdk: any = await import("@earendil-works/pi-coding-agent");
   const ai: any = await import("@earendil-works/pi-ai");
+  const aiCompat: any = await import("@earendil-works/pi-ai/compat");
   let providerPrompts = 0;
   let hookCalls = 0;
   let sdkLoads = 0;
@@ -50,12 +62,11 @@ async function installedSession(options: InstalledOptions) {
   let firstActiveTools: string[] | undefined;
   let firstRegisteredTools: string[] | undefined;
   let extensionApi: any;
+  let mainCheckpointGate: any;
   let initialization: Promise<void> | undefined;
   const settingsManager = sdk.SettingsManager.inMemory();
-  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
-  modelRuntime.hasConfiguredAuth = () => true;
-  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
-  modelRuntime.streamSimple = (...args: any[]) => {
+  const providerSource = `picc-input-admission-${++providerSourceId}`;
+  const providerStream = (...args: any[]) => {
     providerPrompts += 1;
     if (firstProviderTools === undefined) {
       firstProviderTools = (args[1]?.tools ?? []).map((tool: { name?: unknown }) => String(tool.name));
@@ -63,12 +74,14 @@ async function installedSession(options: InstalledOptions) {
       firstRegisteredTools = extensionApi.getAllTools().map((tool: { name?: unknown }) => String(tool.name));
     }
     const stream = ai.createAssistantMessageEventStream();
+    const configured = options.messageForProvider?.(providerPrompts);
     const message = {
-      role: "assistant", content: [{ type: "text", text: `answer-${providerPrompts}` }],
-      api: "openai-completions", provider: "contract", model: "admission",
-      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      role: "assistant", content: configured?.content ?? [{ type: "text", text: `answer-${providerPrompts}` }],
+      api: options.useRealProviderStream ? "picc-admission-contract" : "openai-completions",
+      provider: options.useRealProviderStream ? "openai" : "contract", model: "admission",
+      usage: configured?.usage ?? { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: "stop", timestamp: Date.now(),
+      stopReason: configured?.stopReason ?? "stop", timestamp: Date.now(),
     };
     queueMicrotask(() => {
       stream.push({ type: "start", partial: message });
@@ -76,8 +89,20 @@ async function installedSession(options: InstalledOptions) {
     });
     return stream;
   };
+  let providerRegistered = false;
+  if (options.useRealProviderStream) {
+    aiCompat.registerApiProvider({ api: "picc-admission-contract", stream: providerStream, streamSimple: providerStream }, providerSource);
+    providerRegistered = true;
+  }
+  try {
+  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+  modelRuntime.hasConfiguredAuth = () => true;
+  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
+  if (!options.useRealProviderStream) modelRuntime.streamSimple = providerStream;
   const model = {
-    id: "admission", name: "Admission Contract", api: "openai-completions", provider: "contract",
+    id: "admission", name: "Admission Contract",
+    api: options.useRealProviderStream ? "picc-admission-contract" : "openai-completions",
+    provider: options.useRealProviderStream ? "openai" : "contract",
     baseUrl: "http://127.0.0.1", reasoning: false, input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
   };
@@ -109,7 +134,8 @@ async function installedSession(options: InstalledOptions) {
             }) as typeof renderMainSessionTool,
           } : {}),
           onInitializationSettled: (completion) => { initialization = completion; },
-          onWired: ({ inputHooks, mainCheckpointGate }) => {
+          onWired: ({ inputHooks, mainCheckpointGate: wiredGate }) => {
+            mainCheckpointGate = wiredGate;
             const fire = inputHooks.fire.bind(inputHooks);
             inputHooks.fire = async (...args: any[]) => {
               if (args[0] === "UserPromptSubmit") hookCalls += 1;
@@ -124,6 +150,21 @@ async function installedSession(options: InstalledOptions) {
             }
           },
         });
+        if (options.heldTool) {
+          api.registerTool({
+            name: "contract_hold",
+            label: "Contract hold",
+            description: "In-process contract gate",
+            parameters: Type.Object({}),
+            execute: async () => options.heldTool,
+          });
+        }
+        if (options.observeMessageEnd) {
+          api.on("message_end", (event: any, ctx: any) => options.observeMessageEnd?.(event, ctx, mainCheckpointGate));
+        }
+        if (options.abortBeforeProvider) {
+          api.on("before_provider_request", (_event: unknown, ctx: { abort(): void }) => { ctx.abort(); });
+        }
       },
     }],
   });
@@ -142,6 +183,7 @@ async function installedSession(options: InstalledOptions) {
   return {
     session,
     extensionApi,
+    mainCheckpointGate,
     counts: () => ({ providerPrompts, hookCalls, sdkLoads, coreRegistrations }),
     firstProviderToolState: () => ({
       advertised: firstProviderTools,
@@ -149,10 +191,24 @@ async function installedSession(options: InstalledOptions) {
       registered: firstRegisteredTools,
     }),
     close: async () => {
-      await initialization;
-      session.dispose?.();
+      try {
+        await initialization;
+      } finally {
+        try {
+          session.dispose?.();
+        } finally {
+          if (providerRegistered) {
+            aiCompat.unregisterApiProviders(providerSource);
+            providerRegistered = false;
+          }
+        }
+      }
     },
   };
+  } catch (error) {
+    if (providerRegistered) aiCompat.unregisterApiProviders(providerSource);
+    throw error;
+  }
 }
 
 async function submit(installed: Awaited<ReturnType<typeof installedSession>>, mode: "tui" | "print" | "json" | "rpc", text: string, source: "interactive" | "rpc" | "extension" = mode === "rpc" ? "rpc" : "interactive") {
@@ -182,6 +238,74 @@ function malformedMessageValue(): Error {
 }
 
 describe("installed Pi AgentSession input admission", () => {
+  it("does not invoke the real provider stream after a synchronous before_provider_request abort", async () => {
+    const installed = await installedSession({
+      loadBuiltinSdk: () => import("@earendil-works/pi-coding-agent"),
+      abortBeforeProvider: true,
+      useRealProviderStream: true,
+    });
+    try {
+      await submit(installed, "print", "abort before provider transport");
+      expect(installed.counts()).toMatchObject({ providerPrompts: 0, hookCalls: 1 });
+    } finally {
+      await installed.close();
+    }
+  });
+
+  it("uses fresh assistant usage at the first post-compaction message_end before Pi persists it", async () => {
+    const toolRelease = deferred<Record<string, unknown>>();
+    let postCompaction = false;
+    let observation: { usage: any; snapshot: any; eventUsage: any } | undefined;
+    let installed: Awaited<ReturnType<typeof installedSession>> | undefined;
+    let prompt: Promise<void> | undefined;
+    try {
+      installed = await installedSession({
+        loadBuiltinSdk: () => import("@earendil-works/pi-coding-agent"),
+        heldTool: toolRelease.promise,
+        messageForProvider: () => {
+          if (!postCompaction) return { content: [{ type: "text", text: "ordinary response" }] };
+          postCompaction = false;
+          return {
+            content: [{ type: "toolCall", id: "post-compact-tool", name: "contract_hold", arguments: {} }],
+            stopReason: "toolUse",
+            usage: {
+              input: 90_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 90_000,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          };
+        },
+        observeMessageEnd: (event, ctx, gate) => {
+          if (event.message?.role !== "assistant" || event.message?.content?.[0]?.id !== "post-compact-tool") return;
+          observation = {
+            usage: ctx.getContextUsage(),
+            snapshot: gate.currentController().snapshot(),
+            eventUsage: event.message.usage,
+          };
+        },
+      });
+      await submit(installed, "print", "oldest turn summarized by compaction");
+      await submit(installed, "print", "history ".repeat(40_000));
+      await submit(installed, "print", "recent turn retained across compaction");
+      await installed.session.compact();
+      postCompaction = true;
+      prompt = submit(installed, "print", "first request after compaction");
+      await waitUntil({ description: "first post-compaction assistant message_end", predicate: () => observation !== undefined });
+
+      expect(observation?.usage).toMatchObject({ percent: null });
+      expect(observation?.eventUsage).toMatchObject({ input: 90_000, totalTokens: 90_000 });
+      expect(observation?.snapshot).toMatchObject({ generation: 1, phase: "stopping" });
+      await expect(installed.mainCheckpointGate.cancel("user")).resolves.toMatchObject({ cancelled: true });
+    } finally {
+      postCompaction = false;
+      toolRelease.resolve({ content: [], details: {} });
+      try {
+        if (prompt) await prompt;
+      } finally {
+        if (installed) await installed.close();
+      }
+    }
+  });
+
   it("holds slash-template task input across ordinary TUI, print, JSON, and RPC prompt modes, then initializes once", async () => {
     for (const mode of ["tui", "print", "json", "rpc"] as const) {
       const gate = deferred<any>();
