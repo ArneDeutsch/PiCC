@@ -56,6 +56,7 @@ jobs:
         run: npm ci
 
       # Drives the real Pi CLI with local model traffic and no subscription.
-      # The packaged-launcher consumer install may access the npm registry.
+      # The packaged consumer installs from a derived lock in hard-offline mode; package archives
+      # come from the npm cache populated by the preceding repository dependency installation.
       - name: End-to-end tests
         run: npm run test:e2e

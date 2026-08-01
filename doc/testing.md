@@ -2,10 +2,11 @@
 
 PiCC is tested in three layers, from isolated units up to the **real Pi CLI driven by a mock
 model**. The test lanes use no live model or subscription: model traffic is local/mock, and unit and
-integration run offline. The packaged-launcher e2e performs a normal npm-registry-backed consumer
-install with lifecycle scripts disabled. This doc is a decision guide: it tells you **which layer a
-new test belongs in and why**, how to run each lane, and the synchronization contracts that keep
-async tests deterministic.
+integration run offline. The packaged-launcher e2e performs a lock-driven, hard-offline consumer
+install with lifecycle scripts disabled; package archives come from the cache populated by the
+preceding repository dependency installation. This doc is a decision guide: it tells you **which
+layer a new test belongs in and why**, how to run each lane, and the synchronization contracts that
+keep async tests deterministic.
 
 ## Choosing a layer
 
@@ -205,8 +206,8 @@ The `test/e2e-*.test.ts` files are the highest-fidelity layer. Each **spawns the
 (`node dist/cli.js -e src/index.ts -p "<prompt>"`) in a materialized `examples/` fixture, pointed at
 a local **mock OpenAI-compatible model server** (`test/helpers/mock-openai.ts`) via a throwaway Pi
 agent dir. No live model or subscription is used, and model traffic stays local. The
-packaged-launcher e2e performs a normal npm-registry-backed consumer install with lifecycle scripts
-disabled.
+packaged-launcher e2e performs a lock-driven, hard-offline consumer install with lifecycle scripts
+disabled, using package archives cached by the preceding repository dependency installation.
 
 They share the process harness and request helpers in `test/helpers/e2e-live.ts`. Group scenarios by
 cost so subagent-heavy or compaction-heavy processes do not form one serial pole. Keeping the
@@ -336,8 +337,9 @@ asynchronous tests — there is no timing linter whose silence proves a test det
 ## Manual testing is the human's job
 
 The automated lanes use no live model or subscription; model traffic is local/mock, and unit and
-integration run offline. The packaged-launcher e2e's scripts-disabled consumer install uses the npm
-registry. Two things the suite cannot do:
+integration run offline. The packaged-launcher e2e's scripts-disabled consumer install is
+lock-driven and hard-offline, using package archives cached by the preceding repository dependency
+installation. Two things the suite cannot do:
 
 - **Validate a real ChatGPT/Codex subscription** — that needs an interactive `/login` OAuth flow and
   a paid account. The provider auth/transport it exercises is Pi's, not PiCC's, and it is the one
