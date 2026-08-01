@@ -875,9 +875,13 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // Config diagnostics can originate in hostile files. A finite classifier
   // keeps every known remedy distinct while bounding and redacting the report.
   const mcpCapability = lookupCapability("feature.mcp");
+  const mcpRuntimeEnabledCapability = lookupCapability("feature.mcp-runtime-enabled");
   if (mcpCapability) {
-    for (const evidence of new Set(mcp.diagnostics.map(mcpConfigDiagnosticEvidence))) {
-      addFinding(mcpCapability, evidence);
+    for (const diagnostic of mcp.diagnostics) {
+      const capability = diagnostic.includes("enabledMcpServers is unsupported")
+        ? mcpRuntimeEnabledCapability
+        : mcpCapability;
+      if (capability) addFinding(capability, mcpConfigDiagnosticEvidence(diagnostic));
     }
   }
 
@@ -983,12 +987,12 @@ function mcpSourceLabel(source: McpSourceClass): string {
 
 function mcpProfileStateHint(source: ClaudeProfileSource | undefined): string {
   switch (source) {
-    case "picc-override": return "$PICC_CLAUDE_USER_DIR/.claude.json";
-    case "claude-config": return "$CLAUDE_CONFIG_DIR/.claude.json";
-    case "explicit": return "the explicitly selected Claude user directory's .claude.json";
+    case "picc-override": return "the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR";
+    case "claude-config": return "the .claude.json inside the user profile directory selected by CLAUDE_CONFIG_DIR";
+    case "explicit": return "the .claude.json inside the explicitly selected Claude user profile directory";
     case "default":
     case undefined:
-      return "~/.claude.json";
+      return "the default native state file (~/.claude.json)";
   }
   const exhaustive: never = source;
   return exhaustive;
@@ -996,7 +1000,7 @@ function mcpProfileStateHint(source: ClaudeProfileSource | undefined): string {
 
 /** Fixed, path-redacted recovery text shared by startup, /mcp, and /doctor. */
 export function mcpFailClosedRecovery(mcp: ResolvedMcpConfig): string {
-  return `Repair ${mcpProfileStateHint(mcp.failClosedProfile)}, then run /reload or restart PiCC.`;
+  return `Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at ${mcpProfileStateHint(mcp.failClosedProfile)}. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.`;
 }
 
 function mcpNameList(
@@ -1207,7 +1211,7 @@ function mcpPostureLine(
         return `${identity}: pending approval${mcpInactiveTransportSuffix(server)}`;
       case "disabled":
         return server.inactiveReason === "native-runtime-disabled"
-          ? `${identity}: disabled${mcpInactiveTransportSuffix(server)} (native disabledMcpServers); remove the exact server name from native disabledMcpServers if trusted, then run /reload or restart PiCC`
+          ? `${identity}: disabled${mcpInactiveTransportSuffix(server)} (native disabledMcpServers); use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC`
           : `${identity}: disabled${mcpInactiveTransportSuffix(server)} (settings disabledMcpjsonServers)`;
       case "not-configured":
         return `${identity}: not configured${mcpInactiveTransportSuffix(server)}`;
@@ -1349,7 +1353,7 @@ function mcpStatusRow(
       return `- ${name}: pending approval${mcpInactiveTransportSuffix(server)}`;
     case "disabled":
       return "inactiveReason" in server && server.inactiveReason === "native-runtime-disabled"
-        ? `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — native disabledMcpServers; remove the exact server name there if trusted, then run /reload or restart PiCC`
+        ? `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC`
         : `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — settings disabledMcpjsonServers rejection`;
     case "not configured":
       return `- ${name}: not configured${mcpInactiveTransportSuffix(server)}`;

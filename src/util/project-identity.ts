@@ -98,6 +98,8 @@ function canonicalPath(value: string, io: ProjectIdentityFileSystem): string | u
   }
 }
 
+// Accept main-checkout family identity only when Git's worktree administration links reciprocally
+// to this checkout, preventing copied or foreign metadata from granting that identity.
 function linkedMainCheckout(projectRoot: string, io: ProjectIdentityFileSystem): string | undefined {
   const dotGit = path.join(projectRoot, ".git");
   try {

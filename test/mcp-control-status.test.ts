@@ -116,7 +116,7 @@ describe("renderMcpStatusReport", () => {
     const report = renderMcpStatusReport(native, []);
     expect(report).toContain('"local": enabled; runtime state unavailable [source: native local]');
     expect(report).toContain('"project": pending approval [source: .mcp.json]');
-    expect(report).toContain('"user": disabled — native disabledMcpServers; remove the exact server name there if trusted, then run /reload or restart PiCC [source: native user]');
+    expect(report).toContain('"user": disabled — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC [source: native user]');
     expect(report).toContain("the list does not authorize default-off runtime servers; the effective rows above determine actual status");
     expect(report).not.toContain("SOURCE_PATH_CANARY");
 
@@ -127,15 +127,15 @@ describe("renderMcpStatusReport", () => {
       failClosedProfile: "picc-override",
     }, []);
     expect(closed).toContain("fail closed because native Claude state is unusable");
-    expect(closed).toContain("Repair $PICC_CLAUDE_USER_DIR/.claude.json, then run /reload or restart PiCC");
+    expect(closed).toContain("Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.");
     expect(closed).not.toMatch(/SECRET_|\/private/u);
   });
   it.each([
-    ["default", "~/.claude.json"],
-    ["picc-override", "$PICC_CLAUDE_USER_DIR/.claude.json"],
-    ["claude-config", "$CLAUDE_CONFIG_DIR/.claude.json"],
-    ["explicit", "the explicitly selected Claude user directory's .claude.json"],
-  ] as const)("uses path-redacted %s fail-closed recovery on /mcp and /doctor", (profile, hint) => {
+    ["default", "the default native state file (~/.claude.json)"],
+    ["picc-override", "the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR"],
+    ["claude-config", "the .claude.json inside the user profile directory selected by CLAUDE_CONFIG_DIR"],
+    ["explicit", "the .claude.json inside the explicitly selected Claude user profile directory"],
+  ] as const)("uses shell-neutral, path-redacted %s fail-closed recovery on /mcp and /doctor", (profile, hint) => {
     const mcp: ResolvedMcpConfig = {
       servers: [],
       diagnostics: ["SECRET_COMMAND https://user:pass@example.test C:/resolved/private/.claude.json"],
@@ -143,8 +143,7 @@ describe("renderMcpStatusReport", () => {
       failClosedProfile: profile,
     };
     for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
-      expect(report).toContain(hint);
-      expect(report).toContain("run /reload or restart PiCC");
+      expect(report).toContain(`Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at ${hint}. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.`);
       expect(report).not.toMatch(/SECRET_COMMAND|user:pass|resolved\/private/u);
     }
   });
@@ -164,13 +163,17 @@ describe("renderMcpStatusReport", () => {
     const posture = report.split("\n").find((line) => line.startsWith("MCP servers:"))!;
     expect(posture).toContain('[native local]');
     expect(posture).toContain("native disabledMcpServers");
-    expect(posture).toContain("remove the exact server name");
+    expect(posture).toContain("use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted");
     expect(posture).toContain("configuration is unusable; check the MCP configuration and logs");
     expect(posture).toContain("check the server configuration and logs, then run /reload or restart PiCC");
     expect(posture).not.toMatch(/SECRET_|hunter2|\/private\/log|[\u0000-\u001f\u007f-\u009f]/u);
     expect(posture.length).toBeLessThanOrEqual(16_384);
     expect(posture).toMatch(/^MCP servers: "bad/u);
-    expect(report).toContain("Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC");
+    expect(report).toContain("- feature.mcp-runtime-enabled — the selected native project's `enabledMcpServers` list");
+    expect(report).toContain("evidence: Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC");
+    expect(buildCompatReport(project(mcp)).findings.some((finding) =>
+      finding.capability.id === "feature.mcp" && finding.evidence.includes("enabledMcpServers")
+    )).toBe(false);
     expect(report).not.toContain("SECRET_TOKEN");
   });
 

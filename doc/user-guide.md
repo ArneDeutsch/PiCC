@@ -164,7 +164,7 @@ On startup PiCC loads these Claude Code artifacts:
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
+| MCP servers | native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific approval and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -531,7 +531,8 @@ administration, so settings such as `GIT_DIR` cannot redirect those maintenance 
 
 | Variable | Effect |
 |---|---|
-| `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
+| `PICC_CLAUDE_USER_DIR` | Highest-priority user-profile directory override for user-scoped settings/artifacts, imported installed-plugin state/data, memory, and native state; project/managed contributions and supplementary authorized plugin roots remain |
+| `CLAUDE_CONFIG_DIR` | Same user-profile-backed scope as `PICC_CLAUDE_USER_DIR`, used when that higher-priority override is unset |
 | `PICC_GIT` | Absolute path to the Git executable for PiCC-owned source-update and worktree operations; overrides PATH discovery |
 | `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
@@ -580,6 +581,38 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
+**MCP server configuration and gates.** PiCC reads native Claude state without modifying it. The
+default profile uses user-scoped settings and artifacts under `~/.claude` with native MCP state in
+`~/.claude.json`. `PICC_CLAUDE_USER_DIR`, then `CLAUDE_CONFIG_DIR`, can select a different coherent
+user profile for user-scoped settings and artifacts, imported installed-plugin state and data,
+memory, and native state. Project and managed contributions plus supplementary authorized plugin
+roots remain in effect.
+
+Native definitions resolve as whole entries in local → project `.mcp.json` → user order; the PiCC
+settings `mcpServers` compatibility extension is lower priority, with its existing managed →
+untracked local → project → user ordering. Fields never merge across same-name definitions. Native
+user and local winners start without the project approval gate. Project `.mcp.json` and committed
+project-settings extension winners remain pending until approved as described below. An exact name
+in the selected native project's `disabledMcpServers` disables an authentic native or `.mcp.json`
+winner before expansion. `enabledMcpServers` is recognized and reported but cannot activate
+Claude's default-off built-ins. Native MCP management through Claude Code must target the same
+active user profile. When PiCC uses `PICC_CLAUDE_USER_DIR`, run Claude Code for that maintenance
+operation with `CLAUDE_CONFIG_DIR` pointing to the same directory; otherwise Claude Code may update
+a different profile.
+
+For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
+select the same record. A verified linked worktree also considers its main checkout identity. This
+is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
+
+A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
+present but unusable—for example unreadable, malformed, ambiguous, invalidly encoded, non-regular,
+or oversized—PiCC starts no MCP server and emits a bounded value-redacted warning. Back up the
+active user profile, then launch Claude Code with that same profile and use it to attempt recovery
+or regeneration of native state. If Claude Code cannot recover it, preserve the backup and seek
+support; do not manually edit or delete native state solely to bypass PiCC. Restart PiCC after
+recovery. Use `/mcp` or `/doctor` for safe diagnostics. These bounds and fail-closed rules apply to
+native state, not the older `.mcp.json` loader.
+
 **Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
 the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient
 environment that launches PiCC, not Claude `settings.env`:
@@ -617,10 +650,12 @@ remain untrusted, server-controlled model content.
 Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
 `.claude/settings.json`) are pending by default and never start until you approve them. Approve
 selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
-untracked `.claude/settings.local.json`. `enableAllProjectMcpServers` trusts current and future
-project servers; `disabledMcpjsonServers` declines named servers and wins over approval. Approvals in
-a git-tracked `settings.local.json` do not work; create approval content yourself rather than
-reusing project-supplied content.
+untracked `.claude/settings.local.json`. User approval settings live in `settings.json` inside the
+active user profile directory (`~/.claude/settings.json` by default, or inside the selected override
+directory). `enableAllProjectMcpServers` trusts current and future project servers;
+`disabledMcpjsonServers` declines named servers and wins over approval. Approvals in a git-tracked
+`settings.local.json` do not work; create approval content yourself rather than reusing
+project-supplied content.
 
 Approval is persisted by sanitized server name, not by a command, URL, or header fingerprint. A
 later project revision can change a same-name definition without another approval. Re-review project
@@ -698,7 +733,7 @@ behaviors worth knowing:
 | The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | Plugin policy is ignored or a weaker Windows policy did not apply | `/doctor` identifies the safe source class, not a concrete file or path. For `system-file` or `registry-hklm`, ask the administrator to inspect that class; for `system-drop-in`, ask the administrator to inspect every JSON drop-in. For `registry-hkcu` or `override`, inspect the corresponding user fallback or override input. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | A plugin root or component is rejected | Reinstall the plugin through Claude Code rather than moving files or treating an environment/catalog path as a substitute for the exact record. PiCC rejects declarations or content that are malformed, escaping, missing, unreadable, the wrong kind, or no longer resolve to the same contained target. After reinstalling, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
-| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user directory (`~/.claude` by default, or the `PICC_CLAUDE_USER_DIR` override), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. For ownership, writability, or wrong-directory-kind failures, repair the filesystem and retry the affected skill, hook, or agent action without reloading. If integrity or context must instead be reconciled or the plugin reinstalled through Claude Code, then use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. The affected execution did not occur. |
+| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user-profile directory (see "Environment variables" for profile selection), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. For ownership, writability, or wrong-directory-kind failures, repair the filesystem and retry the affected skill, hook, or agent action without reloading. If integrity or context must instead be reconciled or the plugin reinstalled through Claude Code, then use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. The affected execution did not occur. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
 

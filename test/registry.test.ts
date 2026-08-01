@@ -261,12 +261,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it.each<DisclosureContract>([
     { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
-    { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
+    { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/Authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/], gap: [/conservative PiCC policies/, /upstream canonicalization/, /malformed-whole-file semantics remain unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/State is never modified/] },
+    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact upstream matching.*remain unverified/], visibility: [/cannot edit the list/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -399,7 +401,6 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "feature.mcp-channels",
       "feature.mcp-managed-config",
       "feature.mcp-connectors",
-      "feature.mcp-claude-json-scopes",
       "feature.mcp-output-token-cap",
       "feature.mcp-idle-timeout",
       "feature.mcp-auto-background",
@@ -435,6 +436,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
+    const managedConfig = lookupCapability("feature.mcp-managed-config");
+    expect(managedConfig).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
+      expect(managedConfig?.note).toContain(source);
+    }
     for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
       expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
     }
@@ -2214,11 +2220,17 @@ describe("buildCompatReport", () => {
     ];
     const project = makeProject({ mcp: makeMcp({ diagnostics }) });
     const report = buildCompatReport(project);
+    const enabledFinding = report.findings.find(
+      (finding) => finding.capability.id === "feature.mcp-runtime-enabled",
+    );
+    expect(enabledFinding).toMatchObject({
+      evidence: "Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC; use the effective MCP rows to determine status.",
+      capability: { tier: "not-supported", safetyRelevant: false },
+    });
     const evidence = report.findings
       .filter((finding) => finding.capability.id === "feature.mcp")
       .map((finding) => finding.evidence);
     expect(evidence).toEqual([
-      "Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC; use the effective MCP rows to determine status.",
       "Project-scope MCP approval settings were ignored because a project cannot authorize itself; review definitions before approving exact trusted names from user-controlled settings.",
       "A tracked local MCP settings contribution was demoted to project scope, so any servers it contributes require independent user approval; review definitions before approving exact trusted names.",
       "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.",
@@ -2234,7 +2246,12 @@ describe("buildCompatReport", () => {
       "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.",
     ]);
     const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("- feature.mcp-runtime-enabled — the selected native project's `enabledMcpServers` list");
+    expect(doctor).toContain(enabledFinding!.evidence);
     for (const safe of evidence) expect(doctor).toContain(safe);
+    expect(report.findings.some((finding) =>
+      finding.capability.id === "feature.mcp" && finding.evidence.includes("enabledMcpServers")
+    )).toBe(false);
     expect(doctor).not.toMatch(/CANARY|PARSER_EXCERPT|CREDENTIAL|SOURCE_PATH|PROJECT_KEY|SERVER_COMMAND|SERVER_URL/u);
     expect(evidence.every((item) => item.length < 241)).toBe(true);
   });

@@ -655,7 +655,7 @@ describe("native Claude profile MCP wiring", () => {
         (candidate) => candidate.customType === "picc-control" && candidate.data?.command === "mcp",
       );
       expect(String(status?.data?.output)).toContain(
-        '"approved": disabled — native disabledMcpServers; remove the exact server name there if trusted, then run /reload or restart PiCC [source: .mcp.json]',
+        '"approved": disabled — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC [source: .mcp.json]',
       );
       expect(fs.readFileSync(nativePath)).toEqual(nativeBytes);
     } finally {
@@ -687,7 +687,7 @@ describe("native Claude profile MCP wiring", () => {
       expect(warning.mock.calls.filter(([line]) => String(line).includes("MCP loading is fail closed")))
         .toHaveLength(1);
       const warningText = warning.mock.calls.flat().join("\n");
-      expect(warningText).toContain("$PICC_CLAUDE_USER_DIR/.claude.json");
+      expect(warningText).toContain("Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.");
       expect(warningText).not.toContain(userDir);
       expect(warningText).not.toMatch(/malformed native state|CONFLICTING_NATIVE_CANARY/u);
       expect(fs.readFileSync(nativePath)).toEqual(malformedBytes);
