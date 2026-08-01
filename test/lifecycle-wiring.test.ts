@@ -697,6 +697,28 @@ describe("lifecycle wiring", () => {
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 
+  it("reports terminal main pending as incomplete without Stop continuation delivery", async () => {
+    const pendingPi = fakePi();
+    picc(pendingPi.api as never, { onInitializationSettled: pendingPi.captureInitialization });
+    await pendingPi.waitForInitialization();
+    const pendingMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "partial response must not count as complete" }],
+      stopReason: "pending",
+    };
+
+    await pendingPi.fire("agent_settled", {}, pendingPi.tuiCtx({
+      sessionManager: { getBranch: () => [{ type: "message", message: pendingMessage }] },
+    }));
+
+    expect(pendingPi.userMessages.filter((message) =>
+      String(message.content).includes("[Stop hook]"))).toHaveLength(0);
+    expect(pendingPi.notifications).toContainEqual(expect.objectContaining({
+      severity: "warning",
+      text: expect.stringContaining("ended incomplete (pending)"),
+    }));
+  });
+
   it("resets blocked Stop iteration state when the session is replaced", async () => {
     pi.userMessages.length = 0;
     for (let i = 0; i < 8; i++) await pi.fire("agent_settled", {}, pi.ctx());

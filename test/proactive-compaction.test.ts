@@ -2938,13 +2938,25 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       message: Record<string, unknown>,
     ) => {
       await mainCheckpointGate.startSession(sessionId);
+      let resumedMessageVisible = false;
+      let stopOnTerminalRead = false;
+      let stoppedResumeObserved = false;
       const ctx = pi.ctx({
         mode,
         hasUI: mode === "rpc",
         model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
         getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
         hasPendingMessages: () => false,
-        sessionManager: { getBranch: () => [{ type: "message", message }] },
+        sessionManager: { getBranch: () => {
+          if (stopOnTerminalRead && !stoppedResumeObserved) {
+            const stoppedController = mainCheckpointGate.currentController();
+            const stoppedGeneration = stoppedController.snapshot().generation;
+            stoppedResumeObserved = mainCheckpointGate.captureLogicalRunStop()();
+            expect(stoppedResumeObserved).toBe(true);
+            expect(mainCheckpointGate.stoppedRunWasResuming(stoppedController, stoppedGeneration)).toBe(true);
+          }
+          return resumedMessageVisible ? [{ type: "message", message }] : [];
+        } },
         compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
       });
       mainCheckpointGate.assistantMessageEnded({
@@ -2963,12 +2975,20 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         description: `${sessionId} resumed settlement`,
         predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
       });
-      await Promise.all([
-        pi.fire("agent_settled", {}, { ...ctx }),
-        pi.fire("agent_settled", {}, { ...ctx }),
-      ]);
-      await outer;
+      resumedMessageVisible = true;
+      stopOnTerminalRead = sessionId === "print-pending";
       await pi.fire("agent_settled", {}, { ...ctx });
+      await outer;
+      if (["pending", "error", "aborted"].includes(String(message.stopReason))) {
+        const controller = mainCheckpointGate.currentController();
+        expect(controller.snapshot()).toMatchObject({
+          phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+        });
+        expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+        expect(controller.manualCompactionDisposition()).toBe("unavailable");
+        expect(mainCheckpointGate.isLogicalRunStopped()).toBe(false);
+        if (sessionId === "print-pending") expect(stoppedResumeObserved).toBe(true);
+      }
     };
 
     const writes: string[] = [];
@@ -3003,6 +3023,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       await runResume("print-aborted", "print", {
         role: "assistant", content: [{ type: "text", text: "unsafe aborted" }], stopReason: "aborted",
       });
+      await runResume("print-pending", "print", {
+        role: "assistant", content: [{ type: "text", text: "unsafe incomplete pending" }], stopReason: "pending",
+      });
       await runResume("json-safe", "json", {
         role: "assistant", content: [{ type: "text", text: "machine result" }], stopReason: "stop",
       });
@@ -3011,7 +3034,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
 
     expect(writes).toEqual(["resumed one\nresumed two\n"]);
-    expect(writes.join("\n")).not.toMatch(/thinking|secret-sentinel|private|transcript/);
+    expect(writes.join("\n")).not.toMatch(/thinking|secret-sentinel|private|transcript|incomplete pending/);
     expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result"))
       .toHaveLength(1);
   });
@@ -4817,6 +4840,39 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("session_compact", {
       reason: "manual", compactionEntry: { summary: "later succeeded" },
     }, ctx);
+  });
+
+  it("consumes a stopped unsuccessful settlement before releasing native and logical-run authority", async () => {
+    await mainCheckpointGate.startSession("stopped-unsuccessful-native");
+    const terminal = {
+      role: "assistant",
+      content: [{ type: "text", text: "unsuccessful native boundary" }],
+      stopReason: "error",
+    };
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+      sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+    });
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx)).resolves.toBeUndefined();
+    const stoppedAuthority = mainCheckpointGate.captureLogicalRunStop();
+    expect(stoppedAuthority()).toBe(true);
+    await pi.fire("agent_settled", {}, ctx);
+    expect(mainCheckpointGate.isLogicalRunStopped()).toBe(false);
+    expect(stoppedAuthority()).toBe(false);
+    expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+    await expect(pi.fire("session_before_compact", {
+      reason: "manual", customInstructions: "native identity was released",
+    }, ctx)).resolves.toBeUndefined();
+    await pi.fire("session_compact", {
+      reason: "manual", compactionEntry: { summary: "successor operation" },
+    }, ctx);
+
+    await mainCheckpointGate.startSession("ordinary-unsuccessful-authority");
+    const ordinaryAuthority = mainCheckpointGate.captureLogicalRunStop();
+    await pi.fire("agent_settled", {}, ctx);
+    expect(ordinaryAuthority()).toBe(false);
+    expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
   });
 
   it("keeps manual ownership across stale native events and refuses native overlap", async () => {

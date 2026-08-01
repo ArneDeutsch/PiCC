@@ -1279,11 +1279,17 @@ export class MainSessionCheckpointGate {
   private logicalRunIdentity: object = {};
   private transition: Promise<void> = Promise.resolve();
   private resumeBarrier: { generation: number; promise: Promise<void> } | undefined;
+  private settledStoppedResume: {
+    controller: MidRunCompactionController;
+    epoch: object;
+    generation: number;
+  } | undefined;
   private logicalRunStop: {
     controller: MidRunCompactionController;
     epoch: object;
     generation: number;
     run: object;
+    wasResuming: boolean;
     join: Promise<void>;
   } | undefined;
 
@@ -1315,7 +1321,11 @@ export class MainSessionCheckpointGate {
           generation !== controller.snapshot().generation || this.logicalRunStop) return false;
       // Publish the latch before cancellation can re-enter lifecycle handlers. Hook
       // call sites must unwind immediately; agent_settled owns the eventual join.
-      const stopped = { controller, epoch, generation, run, join: Promise.resolve() };
+      const stopped = {
+        controller, epoch, generation, run,
+        wasResuming: controller.snapshot().phase === "resuming",
+        join: Promise.resolve(),
+      };
       this.logicalRunStop = stopped;
       const join = this.cancelCurrent("replacement");
       stopped.join = join;
@@ -1327,11 +1337,13 @@ export class MainSessionCheckpointGate {
   /** Rotate authority when a genuine user input has been accepted as the next run. */
   acceptedLogicalRun(): void {
     this.logicalRunIdentity = {};
+    this.settledStoppedResume = undefined;
   }
 
   /** Revoke run-scoped authority only at a true user-visible settlement. */
   logicalRunSettled(): void {
     this.logicalRunIdentity = {};
+    this.settledStoppedResume = undefined;
   }
 
   isLogicalRunStopped(): boolean {
@@ -1344,13 +1356,36 @@ export class MainSessionCheckpointGate {
       stopped.run === this.logicalRunIdentity && stopped.generation === generation;
   }
 
+  stoppedRunWasResuming(controller: MidRunCompactionController, generation: number): boolean {
+    const stopped = this.logicalRunStop;
+    return stopped?.controller === controller && stopped.epoch === this.sessionEpoch &&
+      stopped.generation === generation && stopped.wasResuming;
+  }
+
+  consumeSettledStoppedResume(controller: MidRunCompactionController, generation: number): boolean {
+    const stopped = this.settledStoppedResume;
+    if (stopped?.controller !== controller || stopped.epoch !== this.sessionEpoch || stopped.generation !== generation) {
+      return false;
+    }
+    this.settledStoppedResume = undefined;
+    return true;
+  }
+
   /** Join and consume a stop only from the host agent_settled boundary. */
   async settleLogicalRunStop(): Promise<boolean> {
     const stopped = this.logicalRunStop;
     if (!stopped) return false;
     await stopped.join;
     if (this.logicalRunStop !== stopped) return false;
+    const wasResuming = stopped.wasResuming;
     this.resetStoppedLogicalRun();
+    if (wasResuming) {
+      this.settledStoppedResume = {
+        controller: this.controller,
+        epoch: this.sessionEpoch,
+        generation: this.controller.snapshot().generation,
+      };
+    }
     return true;
   }
 
@@ -1796,6 +1831,7 @@ export class MainSessionCheckpointGate {
 
   private invalidateSessionState(): void {
     this.logicalRunStop = undefined;
+    this.settledStoppedResume = undefined;
     this.logicalRunIdentity = {};
     this.generation = undefined;
     this.handle = undefined;
