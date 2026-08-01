@@ -48,14 +48,14 @@ function makeServer(over: Record<string, unknown> & { name: string }): ResolvedM
     return {
       name: over.name,
       status: over.status as "pending-approval" | "disabled" | "skipped" | "not-configured",
-      source: ".mcp.json",
+      source: "project-mcpjson",
       transport: "stdio",
       diagnostics: [],
     };
   }
   return {
     status: "enabled",
-    source: ".mcp.json",
+    source: "project-mcpjson",
     transport: "stdio",
     command: process.execPath,
     args: [],
@@ -72,7 +72,7 @@ function makeRemoteServer(
   const { name, ...rest } = over;
   return {
     status: "enabled",
-    source: ".mcp.json",
+    source: "project-mcpjson",
     transport: "http",
     configuredType: "http",
     url: "https://REMOTE_URL_CANARY.example/mcp",

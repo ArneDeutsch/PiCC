@@ -3,12 +3,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { expandEnvVars } from "./settings.js";
 import { normalizeMcpServerBlock, type McpJsonResult, type RawMcpEntry } from "../claude/mcp-config.js";
+import type { ClaudeMcpStateResult } from "../claude/claude-mcp-state.js";
 import { resolveRemoteMcpFields } from "../claude/mcp-remote-config.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { sanitizedSubprocessEnv } from "../util/env.js";
 import type {
+  McpInactiveReason,
   McpServerStatus,
   McpSettingsEntry,
+  McpSourceClass,
   ResolvedMcpConfig,
   ResolvedMcpServer,
 } from "../types.js";
@@ -16,22 +19,15 @@ import type {
 /**
  * MCP precedence & enablement resolution — pure data, no processes.
  *
- * Combines the project `.mcp.json` with the scope-tagged `mcpServers` settings
- * captures into one {@link ResolvedMcpConfig}:
+ * Combines native local/user state, project `.mcp.json`, and scope-tagged
+ * settings-extension captures into one {@link ResolvedMcpConfig}.
  *
- * - Same server name in several sources: the WHOLE entry from the
- *   highest-precedence source wins — managed > local > project-settings >
- *   `.mcp.json` > user; fields are never merged across sources.
- * - Enablement gate: project-origin servers (`.mcp.json`, project-scope
- *   settings) are pending approval by default. `enableAllProjectMcpServers`
- *   and `enabledMcpjsonServers` are honored ONLY from user-authored scopes
- *   (local/user/managed); project-scope occurrences are ignored with a
- *   diagnostic. `disabledMcpjsonServers` is honored from every scope and
- *   always wins. List keys accumulate-and-dedupe across honored scopes
- *   (the `permissions.allow/deny` idiom); the boolean is nearest-wins.
- *   List membership compares SANITIZED names on both sides (Claude parity —
- *   see {@link sanitizeForListMatch}), so `"my_server"` in a list matches a
- *   server named `my.server`.
+ * Same-name candidates resolve as whole entries in this order: native local,
+ * `.mcp.json`, native user, then managed/local/project/user settings extension.
+ * Project-origin extension and `.mcp.json` winners retain the existing approval
+ * gate. Native runtime disablement is an exact-name final deny for authentic
+ * winners only; settings `*McpjsonServers` remain confined to `.mcp.json` and
+ * extension winners. Present unusable native state fails all MCP closed.
  * - Git-tracked local demotion (mandatory gate rule): a `settings.local.json`
  *   that is tracked in the project repository is attacker-committable, so its
  *   MCP contribution is treated as PROJECT scope (approvals ignored, servers
@@ -57,28 +53,42 @@ export interface ResolveMcpConfigOptions {
   mcpJson: McpJsonResult;
   /** Scope-tagged settings captures, in ascending-precedence file order. */
   mcpSettings: McpSettingsEntry[];
+  /** Inert native Claude snapshot; absence preserves the extension-only contract. */
+  nativeState?: ClaudeMcpStateResult;
+  /** Fixed profile provenance retained only for safe fail-closed repair guidance. */
+  nativeStateProfile?: import("../types.js").ClaudeProfileSource;
   env?: NodeJS.ProcessEnv;
   /** Test seam; defaults to a `git ls-files --error-unmatch` child call. */
   isGitTracked?: GitTrackedProbe;
 }
 
-/** Origin category of a candidate; "mcpjson" ranks between project and user. */
-type McpOrigin = "user" | "mcpjson" | "project" | "local" | "managed";
+type McpOrigin =
+  | "settings-user"
+  | "settings-project"
+  | "settings-local"
+  | "settings-managed"
+  | "native-user"
+  | "mcpjson"
+  | "native-local";
 
 const ORIGIN_RANK: Record<McpOrigin, number> = {
-  user: 0,
-  mcpjson: 1,
-  project: 2,
-  local: 3,
-  managed: 4,
+  "settings-user": 0,
+  "settings-project": 1,
+  "settings-local": 2,
+  "settings-managed": 3,
+  "native-user": 4,
+  mcpjson: 5,
+  "native-local": 6,
 };
 
 interface Candidate {
   entry: RawMcpEntry;
   origin: McpOrigin;
+  authentic: boolean;
+  projectApprovalRequired: boolean;
   /** Global discovery index; among equal ranks the later (nearer) file wins. */
   order: number;
-  source: string;
+  source: McpSourceClass;
 }
 
 /**
@@ -133,6 +143,16 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     diagnostics.push(neutralizeControlChars(message));
   };
   diagnostics.push(...opts.mcpJson.diagnostics);
+  const nativeState = opts.nativeState ?? { kind: "absent" as const, diagnostics: [] };
+  if (nativeState.kind === "unusable") {
+    return {
+      servers: [],
+      diagnostics: nativeState.diagnostics.map(neutralizeControlChars),
+      failClosed: "native-state-unusable",
+      ...(opts.nativeStateProfile === undefined ? {} : { failClosedProfile: opts.nativeStateProfile }),
+    };
+  }
+  if (nativeState.kind === "loaded") diagnostics.push(...nativeState.diagnostics.map(neutralizeControlChars));
 
   // --- Effective origin per settings entry (git-tracked local demotion) -----
   const entries = opts.mcpSettings.map((entry) => {
@@ -140,10 +160,10 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     let demoted = false;
     switch (entry.scope) {
       case "managed":
-        origin = "managed";
+        origin = "settings-managed";
         break;
       case "local": {
-        origin = "local";
+        origin = "settings-local";
         // Demotion only matters for keys the gate treats differently by scope.
         // A file contributing ONLY disabledMcpjsonServers (honored from every
         // scope) needs no probe and no diagnostic — demotion changes nothing.
@@ -161,20 +181,20 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
           tracked = undefined;
         }
         if (tracked === true) {
-          origin = "project";
+          origin = "settings-project";
           demoted = true;
           pushDiag(
             `"${entry.sourcePath}" is tracked by git, so a cloned repo could have authored it; ` +
-              `its MCP configuration is treated as project scope (approvals ignored, servers pending)`,
+              `its MCP configuration is treated as project scope (approvals ignored; any contributed servers are pending)`,
           );
         }
         break;
       }
       case "project":
-        origin = "project";
+        origin = "settings-project";
         break;
       default:
-        origin = "user";
+        origin = "settings-user";
         break;
     }
     return { entry, origin, demoted };
@@ -189,7 +209,7 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     for (const name of entry.disabledMcpjsonServers ?? []) {
       disabledNames.add(sanitizeForListMatch(name));
     }
-    const honored = origin === "local" || origin === "user" || origin === "managed";
+    const honored = origin === "settings-local" || origin === "settings-user" || origin === "settings-managed";
     if (!honored) {
       if (entry.enableAllProjectMcpServers !== undefined || entry.enabledMcpjsonServers !== undefined) {
         if (demoted) {
@@ -234,35 +254,93 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
       winners.set(candidate.entry.name, candidate);
     }
   };
+  if (nativeState.kind === "loaded") {
+    for (const entry of nativeState.user.servers) {
+      consider({
+        entry,
+        origin: "native-user",
+        authentic: true,
+        projectApprovalRequired: false,
+        order: order++,
+        source: "native-user",
+      });
+    }
+  }
   for (const entry of opts.mcpJson.servers) {
-    consider({ entry, origin: "mcpjson", order: order++, source: ".mcp.json" });
+    consider({
+      entry,
+      origin: "mcpjson",
+      authentic: true,
+      projectApprovalRequired: true,
+      order: order++,
+      source: "project-mcpjson",
+    });
   }
   for (const { entry, origin } of entries) {
     if (entry.servers === undefined) continue;
-    // Source names the PHYSICAL scope; a demoted local file keeps
-    // "settings:local" for display while gating as project origin.
-    const source = `settings:${entry.scope}`;
+    // Source reports the physical settings scope; a tracked local contribution
+    // stays settings-local for display even when gating demotes its origin.
+    const source: McpSourceClass = entry.scope === "managed"
+      ? "settings-managed"
+      : entry.scope === "local"
+        ? "settings-local"
+        : entry.scope === "project"
+          ? "settings-project"
+          : "settings-user";
     for (const raw of normalizeMcpServerBlock(entry.servers, source)) {
-      consider({ entry: raw, origin, order: order++, source });
+      consider({
+        entry: raw,
+        origin,
+        authentic: false,
+        projectApprovalRequired: origin === "settings-project",
+        order: order++,
+        source,
+      });
+    }
+  }
+  if (nativeState.kind === "loaded") {
+    for (const entry of nativeState.local.servers) {
+      consider({
+        entry,
+        origin: "native-local",
+        authentic: true,
+        projectApprovalRequired: false,
+        order: order++,
+        source: "native-local",
+      });
     }
   }
 
   // --- Status + enabled-only expansion per winning entry -------------------
   const servers: ResolvedMcpServer[] = [];
-  for (const { entry, origin, source } of winners.values()) {
+  for (const { entry, authentic, projectApprovalRequired, source } of winners.values()) {
     const perDiags = [...entry.diagnostics];
     let status: McpServerStatus;
+    let inactiveReason: McpInactiveReason | undefined;
     if (entry.skipped) {
       status = "skipped";
     } else if (entry.notConfigured) {
       status = "not-configured";
-    } else if (disabledNames.has(sanitizeForListMatch(entry.name))) {
+    } else if (
+      authentic &&
+      nativeState.kind === "loaded" &&
+      nativeState.disabledMcpServers.has(entry.name)
+    ) {
       status = "disabled";
-    } else if (origin === "mcpjson" || origin === "project") {
-      status =
-        enableAll === true || enabledNames.has(sanitizeForListMatch(entry.name))
-          ? "enabled"
-          : "pending-approval";
+      inactiveReason = "native-runtime-disabled";
+    } else if (
+      (!authentic || source === "project-mcpjson") &&
+      disabledNames.has(sanitizeForListMatch(entry.name))
+    ) {
+      status = "disabled";
+      inactiveReason = "mcpjson-rejected";
+    } else if (
+      projectApprovalRequired &&
+      enableAll !== true &&
+      !enabledNames.has(sanitizeForListMatch(entry.name))
+    ) {
+      status = "pending-approval";
+      inactiveReason = "mcpjson-unapproved";
     } else {
       status = "enabled";
     }
@@ -282,7 +360,13 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     // Inactive entries carry identity only: no raw templates, expanded values,
     // or fabricated fields can escape the resolver pipeline.
     if (status !== "enabled") {
-      servers.push({ ...common, ...transportIdentity, status, diagnostics: perDiags });
+      servers.push({
+        ...common,
+        ...transportIdentity,
+        status,
+        ...(inactiveReason === undefined ? {} : { inactiveReason }),
+        diagnostics: perDiags,
+      });
       continue;
     }
 

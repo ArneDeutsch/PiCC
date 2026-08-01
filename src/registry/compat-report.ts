@@ -8,6 +8,8 @@ import type {
   ClaudeProject,
   Diagnostic,
   HookConfig,
+  McpSourceClass,
+  ClaudeProfileSource,
   PluginResolutionOutcome,
   PluginResolutionStatus,
   PluginSharedStateCause,
@@ -737,8 +739,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // gate, plus EVERY server's stored diagnostics regardless of status (an
   // enabled server's unset-${VAR} warning or ignored-field notice is degraded
   // state too; a CLEAN enabled server stays posture-line data in /doctor,
-  // never a finding). Display hygiene: server NAMES and raw (pre-expansion)
-  // diagnostics only; expanded command/args/env values never reach a finding.
+  // never a finding). Display hygiene: server names are bounded and quoted;
+  // diagnostics are classified without reflecting configuration values.
   const mcp = project.mcp ?? EMPTY_MCP;
   const pendingNames = mcp.servers
     .filter((s) => s.status === "pending-approval")
@@ -796,9 +798,16 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       if (!server.diagnostics.includes(diagnostic)) continue;
       const capability = lookupCapability(capabilityId);
       if (capability) {
+        const limitation = capabilityId === "feature.mcp-oauth"
+          ? '"oauth" is a deferred feature in PiCC; ignored (server still runs)'
+          : capabilityId === "feature.mcp-server-always-load"
+            ? '"alwaysLoad" is a deferred feature in PiCC; ignored (server still runs)'
+            : capabilityId === "feature.mcp-server-role"
+              ? '"role" is a deferred feature in PiCC; ignored (server still runs)'
+              : 'field "url" is ignored on a stdio server';
         addFinding(
           capability,
-          mcpStatusScalar(diagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+          `MCP server ${quotedMcpName(server.name, MCP_STATUS_NAME_MAX)}: ${limitation}`,
         );
       }
     }
@@ -807,19 +816,34 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     const remainingDiagnostics = server.diagnostics.filter(
       (diagnostic) => !extractedDiagnostics.has(diagnostic),
     );
-    let evidence: string | undefined;
-    if (remainingDiagnostics.length > 0) {
-      // Most stored diagnostics already quote the server name; the resolver's
-      // unset-${VAR} warnings do not — prefix those so every finding names its
-      // server (never expanded values, the diagnostics are raw-only).
-      evidence = remainingDiagnostics.map((diagnostic) =>
-        diagnostic.includes(`"${server.name}"`)
-          ? diagnostic
-          : `MCP server "${server.name}": ${diagnostic}`,
-      ).join("; ");
-    } else if (server.diagnostics.length === 0 && server.status === "skipped") {
-      evidence = `MCP server "${server.name}" (${server.source}) skipped: invalid entry`;
+    const safeDiagnostic: string[] = [];
+    let hasUnclassifiedDiagnostic = false;
+    for (const diagnostic of remainingDiagnostics) {
+      const unset = diagnostic.match(/(?:environment variable "([A-Za-z_][A-Za-z0-9_]*)" is not set|references unset environment variable "([A-Za-z_][A-Za-z0-9_]*)")/u);
+      const unsetName = unset?.[1] ?? unset?.[2];
+      if (unsetName !== undefined) {
+        safeDiagnostic.push(`environment variable ${JSON.stringify(unsetName)} is not set and has no default`);
+        continue;
+      }
+      const unknown = diagnostic.match(/unknown field "([A-Za-z_][A-Za-z0-9_-]*)" ignored/u);
+      if (unknown) {
+        safeDiagnostic.push(`unknown field ${JSON.stringify(unknown[1])} ignored`);
+        continue;
+      }
+      if (/remote transport|WebSocket transport/u.test(diagnostic)) {
+        safeDiagnostic.push("remote transport configuration is unsupported or unusable");
+        continue;
+      }
+      hasUnclassifiedDiagnostic = true;
     }
+    if (hasUnclassifiedDiagnostic) {
+      safeDiagnostic.push("additional configuration issue detected; inspect the server definition, then run /reload or restart PiCC");
+    }
+    const evidence = remainingDiagnostics.length > 0
+      ? `MCP server ${quotedMcpName(server.name, MCP_STATUS_NAME_MAX)}: ${[...new Set(safeDiagnostic)].join("; ")}`
+      : server.diagnostics.length === 0 && server.status === "skipped"
+        ? `MCP server ${quotedMcpName(server.name, MCP_STATUS_NAME_MAX)} was skipped because its selected definition is invalid; repair it, then run /reload or restart PiCC`
+        : undefined;
     if (evidence === undefined) continue;
 
     const diagnosticText = remainingDiagnostics.join("\n");
@@ -848,12 +872,13 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       );
     }
   }
-  // Config-level diagnostics (malformed .mcp.json, ignored project-scope
-  // approvals, git-tracked settings.local.json demotion) carry their own
-  // remedy text — surface each verbatim under the umbrella MCP entry.
-  for (const diag of mcp.diagnostics) {
-    const cap = lookupCapability("feature.mcp");
-    if (cap) addFinding(cap, diag);
+  // Config diagnostics can originate in hostile files. A finite classifier
+  // keeps every known remedy distinct while bounding and redacting the report.
+  const mcpCapability = lookupCapability("feature.mcp");
+  if (mcpCapability) {
+    for (const evidence of new Set(mcp.diagnostics.map(mcpConfigDiagnosticEvidence))) {
+      addFinding(mcpCapability, evidence);
+    }
   }
 
   // De-duplicate findings (same capability + same evidence) and unassessed.
@@ -894,6 +919,84 @@ const MCP_POSTURE_DIAG_MAX_CHARS = 240;
 
 function quotedMcpName(name: string, max: number): string {
   return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
+}
+
+function mcpConfigDiagnosticEvidence(diagnostic: string): string {
+  if (diagnostic.includes("enabledMcpServers is unsupported")) {
+    return "Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC; use the effective MCP rows to determine status.";
+  }
+  if (/MCP approvals .*cannot work while .*tracked by git/u.test(diagnostic)) {
+    return "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.";
+  }
+  if (/tracked by git.*treated as project scope/u.test(diagnostic)) {
+    return "A tracked local MCP settings contribution was demoted to project scope, so any servers it contributes require independent user approval; review definitions before approving exact trusted names.";
+  }
+  if (/MCP approvals .*project-scope settings are ignored/u.test(diagnostic)) {
+    return "Project-scope MCP approval settings were ignored because a project cannot authorize itself; review definitions before approving exact trusted names from user-controlled settings.";
+  }
+  if (diagnostic.includes(".mcp.json is unreadable")) {
+    return "Project .mcp.json is unreadable; restore file access or remove it, then run /reload or restart PiCC.";
+  }
+  if (diagnostic.includes(".mcp.json is malformed JSON")) {
+    return "Project .mcp.json is malformed JSON; repair it as strict JSON, then run /reload or restart PiCC.";
+  }
+  if (diagnostic.includes('.mcp.json has no "mcpServers" key')) {
+    return "Project .mcp.json is missing its mcpServers block; add an object block or remove the file, then run /reload or restart PiCC.";
+  }
+  if (/\.mcp\.json (?:root is not an object|"mcpServers" is not an object)/u.test(diagnostic)) {
+    return "Project .mcp.json has the wrong object shape; make the root and mcpServers block objects, then run /reload or restart PiCC.";
+  }
+  if (/Native (?:user|local) MCP (?:server .* invalid|state contains an invalid server definition).*skipped/u.test(diagnostic)) {
+    return "A native MCP server entry was invalid or unsupported and was skipped; repair or remove that entry, then run /reload or restart PiCC.";
+  }
+  if (/Native (?:user|local) MCP (?:server .* ignored or adjusted|state contains adjusted server configuration)/u.test(diagnostic)) {
+    return "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.";
+  }
+  if (/(?:Native Claude|Active project) .*identity|ambiguous matching records/u.test(diagnostic)) {
+    return "Native Claude project identity could not be selected safely, so MCP is fail closed; reconcile the project records or path identity, then run /reload or restart PiCC.";
+  }
+  if (
+    diagnostic.includes("Matching native Claude project record has an invalid shape") ||
+    /Native Claude .*(?:invalid (?:object )?shape|not an object|structural limits|limit|oversized project key)/u.test(diagnostic)
+  ) {
+    return "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.";
+  }
+  if (/Native Claude state/u.test(diagnostic)) {
+    return "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.";
+  }
+  return "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.";
+}
+
+function mcpSourceLabel(source: McpSourceClass): string {
+  switch (source) {
+    case "native-local": return "native local";
+    case "project-mcpjson": return ".mcp.json";
+    case "native-user": return "native user";
+    case "settings-managed": return "settings managed extension";
+    case "settings-local": return "settings local extension";
+    case "settings-project": return "settings project extension";
+    case "settings-user": return "settings user extension";
+  }
+  const exhaustive: never = source;
+  return exhaustive;
+}
+
+function mcpProfileStateHint(source: ClaudeProfileSource | undefined): string {
+  switch (source) {
+    case "picc-override": return "$PICC_CLAUDE_USER_DIR/.claude.json";
+    case "claude-config": return "$CLAUDE_CONFIG_DIR/.claude.json";
+    case "explicit": return "the explicitly selected Claude user directory's .claude.json";
+    case "default":
+    case undefined:
+      return "~/.claude.json";
+  }
+  const exhaustive: never = source;
+  return exhaustive;
+}
+
+/** Fixed, path-redacted recovery text shared by startup, /mcp, and /doctor. */
+export function mcpFailClosedRecovery(mcp: ResolvedMcpConfig): string {
+  return `Repair ${mcpProfileStateHint(mcp.failClosedProfile)}, then run /reload or restart PiCC.`;
 }
 
 function mcpNameList(
@@ -1047,6 +1150,9 @@ function mcpPostureLine(
   mcp: ResolvedMcpConfig,
   liveStates: readonly McpServerLiveState[],
 ): string {
+  if (mcp.failClosed === "native-state-unusable") {
+    return `MCP: fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(mcp)}`;
+  }
   if (mcp.servers.length === 0) return "MCP: no servers configured.";
   const liveByName = new Map(liveStates.map((s) => [s.name, s]));
   const ordered = mcp.servers.length <= 32 ? mcp.servers : [...mcp.servers].sort((left, right) => {
@@ -1061,12 +1167,13 @@ function mcpPostureLine(
   const selected = ordered.slice(0, 32);
   const parts = selected.map((server) => {
     const status = server.status;
+    const identity = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
     switch (status) {
       case "enabled": {
         const live = liveByName.get(server.name);
         // Enabled but unknown to the runtime (states not supplied — e.g. a
         // report rendered without a running session): claim only enablement.
-        if (!live) return `${server.name}: enabled${mcpInactiveTransportSuffix(server)}`;
+        if (!live) return `${identity}: enabled${mcpInactiveTransportSuffix(server)}`;
         const liveTransport = live.transport ?? server.transport ?? "unknown";
         const transport = mcpTransportLabel(liveTransport);
         const attempts = live.attempt !== undefined && live.attemptLimit !== undefined
@@ -1074,38 +1181,38 @@ function mcpPostureLine(
           : "";
         if (liveTransport === "stdio") {
           if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
-            ? `${server.name}: connected (${mcpCapabilitySummary(live)})`
-            : `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
-          if (live.state === "connecting") return `${server.name}: connecting`;
+            ? `${identity}: connected (${mcpCapabilitySummary(live)})`
+            : `${identity}: connected (${live.toolCount ?? 0} tool(s))`;
+          if (live.state === "connecting") return `${identity}: connecting`;
           const failureDetail = live.initialToolDiscoveryFailed === true
             ? live.statusSummary ?? "Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC."
-            : live.diagnostic ?? "no diagnostic";
-          return `${server.name}: failed — ${boundPostureDiag(failureDetail)}`;
+            : live.statusSummary ?? "Connection failed; check the server configuration and logs, then run /reload or restart PiCC.";
+          return `${identity}: failed — ${boundPostureDiag(failureDetail)}`;
         }
         if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
-          ? `${server.name}: connected via ${transport} (${mcpCapabilitySummary(live)})`
-          : `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
-        if (live.state === "connecting") return `${server.name}: connecting via ${transport}${attempts}`;
-        if (live.state === "retrying") return `${server.name}: retrying via ${transport}${attempts}`;
+          ? `${identity}: connected via ${transport} (${mcpCapabilitySummary(live)})`
+          : `${identity}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connecting") return `${identity}: connecting via ${transport}${attempts}`;
+        if (live.state === "retrying") return `${identity}: retrying via ${transport}${attempts}`;
         if (live.state === "reconnecting") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
-          ? `${server.name}: reconnecting via ${transport}${attempts} (${mcpCapabilitySummary(live, true)})`
-          : `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
+          ? `${identity}: reconnecting via ${transport}${attempts} (${mcpCapabilitySummary(live, true)})`
+          : `${identity}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
         return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
-          ? `${server.name}: failed via ${transport} (${mcpCapabilitySummary(live, true)}) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`
-          : `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
+          ? `${identity}: failed via ${transport} (${mcpCapabilitySummary(live, true)}) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`
+          : `${identity}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
       }
       case "pending-approval":
         // No enable/decline hint here — the pending finding rendered below
         // carries the bounded guidance; repeating it would duplicate it.
-        return `${server.name}: pending approval${mcpInactiveTransportSuffix(server)}`;
+        return `${identity}: pending approval${mcpInactiveTransportSuffix(server)}`;
       case "disabled":
-        return `${server.name}: disabled${mcpInactiveTransportSuffix(server)} (disabledMcpjsonServers)`;
+        return server.inactiveReason === "native-runtime-disabled"
+          ? `${identity}: disabled${mcpInactiveTransportSuffix(server)} (native disabledMcpServers); remove the exact server name from native disabledMcpServers if trusted, then run /reload or restart PiCC`
+          : `${identity}: disabled${mcpInactiveTransportSuffix(server)} (settings disabledMcpjsonServers)`;
       case "not-configured":
-        return `${server.name}: not configured${mcpInactiveTransportSuffix(server)}`;
-      case "skipped": {
-        const reason = server.diagnostics[0];
-        return `${server.name}: skipped${mcpInactiveTransportSuffix(server)}${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
-      }
+        return `${identity}: not configured${mcpInactiveTransportSuffix(server)}`;
+      case "skipped":
+        return `${identity}: skipped${mcpInactiveTransportSuffix(server)} — configuration is unusable; check the MCP configuration and logs, then run /reload or restart PiCC`;
     }
     // Keep discovery status additions from silently rendering as undefined.
     const unhandledStatus: never = status;
@@ -1115,7 +1222,13 @@ function mcpPostureLine(
   const suffix = omitted > 0
     ? `; ${omitted} additional server name(s) omitted — inspect the MCP configuration for complete detail`
     : "";
-  return `MCP servers: ${parts.join("; ")}${suffix}.`;
+  const sources = selected.map(
+    (server) => `${quotedMcpName(server.name, MCP_STATUS_NAME_MAX)} [${mcpSourceLabel(server.source)}]`,
+  );
+  const line = `MCP servers: ${parts.join("; ")}${suffix}. Sources: ${sources.join(", ")}.`;
+  return line.length <= MCP_STATUS_REPORT_MAX
+    ? line
+    : `${line.slice(0, MCP_STATUS_REPORT_MAX - 1)}…`;
 }
 
 const MCP_STATUS_DETAIL_MAX = 32;
@@ -1235,7 +1348,9 @@ function mcpStatusRow(
     case "pending approval":
       return `- ${name}: pending approval${mcpInactiveTransportSuffix(server)}`;
     case "disabled":
-      return `- ${name}: disabled${mcpInactiveTransportSuffix(server)}`;
+      return "inactiveReason" in server && server.inactiveReason === "native-runtime-disabled"
+        ? `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — native disabledMcpServers; remove the exact server name there if trusted, then run /reload or restart PiCC`
+        : `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — settings disabledMcpjsonServers rejection`;
     case "not configured":
       return `- ${name}: not configured${mcpInactiveTransportSuffix(server)}`;
     case "skipped":
@@ -1278,9 +1393,11 @@ export function renderMcpStatusReport(
   const lines = ["MCP status (read-only)"];
   if (config.servers.length === 0) {
     lines.push(
-      config.diagnostics.length > 0
-        ? "No usable MCP servers were resolved."
-        : "No MCP servers are configured.",
+      config.failClosed === "native-state-unusable"
+        ? `MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`
+        : config.diagnostics.length > 0
+          ? "No usable MCP servers were resolved."
+          : "No MCP servers are configured.",
     );
   } else {
     lines.push(`Resolved server entries: ${config.servers.length}`);
@@ -1304,7 +1421,7 @@ export function renderMcpStatusReport(
       }).slice(0, detailCount);
   const selectedIndexes = new Set(selected.map((item) => item.index));
   for (const { server } of selected) {
-    lines.push(mcpStatusRow(server, liveByName.get(server.name)));
+    lines.push(`${mcpStatusRow(server, liveByName.get(server.name))} [source: ${mcpSourceLabel(server.source)}]`);
   }
 
   if (config.servers.length > detailCount) {
@@ -1327,6 +1444,12 @@ export function renderMcpStatusReport(
     config.servers.some((server) => server.diagnostics.length > 0)
   ) {
     lines.push("Some MCP configuration was malformed, ignored, or unusable; run /doctor for details.");
+  }
+
+  if (config.diagnostics.some((diagnostic) => diagnostic.includes("enabledMcpServers is unsupported"))) {
+    lines.push(
+      "Native enabledMcpServers was recognized, but the list does not authorize default-off runtime servers; the effective rows above determine actual status.",
+    );
   }
 
   const pending = config.servers.filter((server) => server.status === "pending-approval");

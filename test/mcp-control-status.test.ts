@@ -23,7 +23,7 @@ function server(
     return {
       name,
       status,
-      source: "/SOURCE_PATH_CANARY/settings.json",
+      source: "settings-user",
       transport: "stdio",
       diagnostics: [],
       ...overrides,
@@ -32,7 +32,7 @@ function server(
   return {
     name,
     status,
-    source: "/SOURCE_PATH_CANARY/settings.json",
+    source: "settings-user",
     transport: "stdio",
     command: "/COMMAND_CANARY/bin",
     args: ["ARG_CANARY"],
@@ -86,9 +86,9 @@ function project(mcp: ResolvedMcpConfig): ClaudeProject {
   };
 }
 
-function doctor(mcp: ResolvedMcpConfig): string {
+function doctor(mcp: ResolvedMcpConfig, live: McpServerLiveState[] = []): string {
   const loaded = project(mcp);
-  return renderDoctorReport(loaded, buildCompatReport(loaded));
+  return renderDoctorReport(loaded, buildCompatReport(loaded), undefined, undefined, live);
 }
 
 function detailRows(report: string): string[] {
@@ -107,6 +107,73 @@ const UNSAFE_CANARIES = [
 ];
 
 describe("renderMcpStatusReport", () => {
+  it("distinguishes safe native sources, runtime disablement, unsupported enablement, and fail-closed recovery", () => {
+    const native = config([
+      server("local", "enabled", { source: "native-local" }),
+      server("project", "pending-approval", { source: "project-mcpjson", inactiveReason: "mcpjson-unapproved" }),
+      server("user", "disabled", { source: "native-user", inactiveReason: "native-runtime-disabled" }),
+    ], ["Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled"]);
+    const report = renderMcpStatusReport(native, []);
+    expect(report).toContain('"local": enabled; runtime state unavailable [source: native local]');
+    expect(report).toContain('"project": pending approval [source: .mcp.json]');
+    expect(report).toContain('"user": disabled — native disabledMcpServers; remove the exact server name there if trusted, then run /reload or restart PiCC [source: native user]');
+    expect(report).toContain("the list does not authorize default-off runtime servers; the effective rows above determine actual status");
+    expect(report).not.toContain("SOURCE_PATH_CANARY");
+
+    const closed = renderMcpStatusReport({
+      servers: [],
+      diagnostics: ["SECRET_COMMAND SECRET_URL SECRET_HEADER /private/profile"],
+      failClosed: "native-state-unusable",
+      failClosedProfile: "picc-override",
+    }, []);
+    expect(closed).toContain("fail closed because native Claude state is unusable");
+    expect(closed).toContain("Repair $PICC_CLAUDE_USER_DIR/.claude.json, then run /reload or restart PiCC");
+    expect(closed).not.toMatch(/SECRET_|\/private/u);
+  });
+  it.each([
+    ["default", "~/.claude.json"],
+    ["picc-override", "$PICC_CLAUDE_USER_DIR/.claude.json"],
+    ["claude-config", "$CLAUDE_CONFIG_DIR/.claude.json"],
+    ["explicit", "the explicitly selected Claude user directory's .claude.json"],
+  ] as const)("uses path-redacted %s fail-closed recovery on /mcp and /doctor", (profile, hint) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [],
+      diagnostics: ["SECRET_COMMAND https://user:pass@example.test C:/resolved/private/.claude.json"],
+      failClosed: "native-state-unusable",
+      failClosedProfile: profile,
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain(hint);
+      expect(report).toContain("run /reload or restart PiCC");
+      expect(report).not.toMatch(/SECRET_COMMAND|user:pass|resolved\/private/u);
+    }
+  });
+
+  it("keeps /doctor native source, runtime gates, failures, and hostile names safe and actionable", () => {
+    const hostile = `bad\n\u001b]0;title\u0007${"x".repeat(500)}`;
+    const mcp = config([
+      server(hostile, "enabled", { source: "native-local" }),
+      server("runtime-off", "disabled", { source: "native-user", inactiveReason: "native-runtime-disabled" }),
+      server("unsupported", "skipped", { source: "project-mcpjson", diagnostics: ["SECRET_HEADER Bearer hunter2"] }),
+    ], ["Native Claude enabledMcpServers is unsupported; SECRET_TOKEN must not appear"]);
+    const report = doctor(mcp, [{
+      name: hostile,
+      state: "failed",
+      diagnostic: "SECRET_STDERR /private/log",
+    }]);
+    const posture = report.split("\n").find((line) => line.startsWith("MCP servers:"))!;
+    expect(posture).toContain('[native local]');
+    expect(posture).toContain("native disabledMcpServers");
+    expect(posture).toContain("remove the exact server name");
+    expect(posture).toContain("configuration is unusable; check the MCP configuration and logs");
+    expect(posture).toContain("check the server configuration and logs, then run /reload or restart PiCC");
+    expect(posture).not.toMatch(/SECRET_|hunter2|\/private\/log|[\u0000-\u001f\u007f-\u009f]/u);
+    expect(posture.length).toBeLessThanOrEqual(16_384);
+    expect(posture).toMatch(/^MCP servers: "bad/u);
+    expect(report).toContain("Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC");
+    expect(report).not.toContain("SECRET_TOKEN");
+  });
+
   it("covers every state in configured order and ignores duplicate or extra live states", () => {
     const mcp = config([
       server("enabled", "enabled"),
@@ -134,14 +201,14 @@ describe("renderMcpStatusReport", () => {
 
     const report = renderMcpStatusReport(mcp, live);
     expect(detailRows(report)).toEqual([
-      '- "enabled": enabled; runtime state unavailable',
-      '- "connecting": connecting',
-      '- "connected-zero": connected (0 tools)',
-      '- "connected-one": connected (1 tool)',
-      '- "failed": failed — Authentication failed safely.',
-      '- "pending": pending approval',
-      '- "disabled": disabled',
-      '- "skipped": skipped — configuration is unusable; run /doctor for details',
+      '- "enabled": enabled; runtime state unavailable [source: settings user extension]',
+      '- "connecting": connecting [source: settings user extension]',
+      '- "connected-zero": connected (0 tools) [source: settings user extension]',
+      '- "connected-one": connected (1 tool) [source: settings user extension]',
+      '- "failed": failed — Authentication failed safely. [source: settings user extension]',
+      '- "pending": pending approval [source: settings user extension]',
+      '- "disabled": disabled — settings disabledMcpjsonServers rejection [source: settings user extension]',
+      '- "skipped": skipped — configuration is unusable; run /doctor for details [source: settings user extension]',
     ]);
     expect(report).not.toContain("STDERR_CANARY");
     expect(report).not.toContain("extra");
@@ -195,7 +262,7 @@ describe("renderMcpStatusReport", () => {
       '"enabled": enabled via sse (deprecated; use http); runtime state unavailable',
     );
     expect(doctor(config([runtimeUnavailable]))).toContain(
-      "enabled: enabled via sse (deprecated; use http)",
+      '"enabled": enabled via sse (deprecated; use http)',
     );
     for (const status of ["pending-approval", "disabled", "not-configured", "skipped"] as const) {
       const entry = server(status, status, { transport: "sse", configuredType: "sse" });
@@ -235,6 +302,13 @@ describe("renderMcpStatusReport", () => {
       '"without-summary": failed — Connection failed; no safe summary is available; run /doctor for details.',
     );
     for (const canary of UNSAFE_CANARIES) expect(report).not.toContain(canary);
+    const doctorReport = doctor(config([server("without-summary", "enabled")]), [{
+      name: "without-summary",
+      state: "failed",
+      diagnostic: "DIAGNOSTIC_SECRET_CANARY /private/runtime/path",
+    }]);
+    expect(doctorReport).toContain("check the server configuration and logs, then run /reload or restart PiCC");
+    expect(doctorReport).not.toMatch(/DIAGNOSTIC_SECRET_CANARY|\/private\/runtime/u);
   });
 
   it("distinguishes unresolved diagnostic-bearing configuration from an empty configuration", () => {
@@ -270,7 +344,7 @@ describe("renderMcpStatusReport", () => {
     expect(report).not.toContain("CONFIG_SECRET_CANARY");
     for (const canary of UNSAFE_CANARIES) expect(report).not.toContain(canary);
     expect(doctor(config([server("skipped", "skipped", { diagnostics: ["DIAGNOSTIC_SECRET_CANARY"] })])))
-      .toContain("DIAGNOSTIC_SECRET_CANARY");
+      .not.toContain("DIAGNOSTIC_SECRET_CANARY");
   });
 
   it("replaces adjacent isolated surrogates while preserving valid astral characters", () => {
@@ -303,8 +377,8 @@ describe("renderMcpStatusReport", () => {
     expect(report).not.toMatch(/[\uD800-\uDFFF]/u);
     expect(report.length).toBeLessThan(500);
     expect(detailRows(report)[0]).toMatch(/^- ".*": failed —/u);
-    expect(detailRows(report)[0]?.length).toBeLessThanOrEqual(320);
-    expect(detailRows(report)[0]?.endsWith("…")).toBe(true);
+    expect(detailRows(report)[0]?.length).toBeLessThanOrEqual(340);
+    expect(detailRows(report)[0]).toContain("… [source: settings user extension]");
   });
 
   it("structurally quotes punctuation that attempts row-delimiter and guidance spoofing", () => {
@@ -318,7 +392,7 @@ describe("renderMcpStatusReport", () => {
       [],
     );
     expect(detailRows(report)).toEqual(
-      names.map((name) => `- ${JSON.stringify(name)}: disabled`),
+      names.map((name) => `- ${JSON.stringify(name)}: disabled — settings disabledMcpjsonServers rejection [source: settings user extension]`),
     );
   });
 
@@ -529,7 +603,7 @@ describe("MCP pending guidance", () => {
     expect(report).not.toContain("TRACKED_LOCAL_PATH_CANARY");
     const doctorReport = doctor(mcp);
     expect(doctorReport).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
-    expect(doctorReport).toContain("TRACKED_LOCAL_PATH_CANARY");
+    expect(doctorReport).not.toContain("TRACKED_LOCAL_PATH_CANARY");
   });
 });
 
@@ -567,8 +641,8 @@ describe("capability-aware MCP live reports", () => {
     expect(status).not.toContain("SERVER_SPEECH_CANARY");
 
     const doctor = renderDoctorReport(project(mcp), buildCompatReport(project(mcp)), undefined, undefined, live);
-    expect(doctor).toContain("prompt: connected (prompts: 2)");
-    expect(doctor).toContain("resource: connected (resources: 0)");
+    expect(doctor).toContain('"prompt": connected (prompts: 2)');
+    expect(doctor).toContain('"resource": connected (resources: 0)');
     expect(doctor).toContain("resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC");
     expect(doctor).toContain("prompts: 2 retained, resources: 1 retained");
     expect(doctor).toContain("Initial tools/list discovery failed; check the server configuration and logs, then run /reload or restart PiCC.");
