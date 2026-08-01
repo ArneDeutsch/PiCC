@@ -881,7 +881,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       const capability = diagnostic.includes("enabledMcpServers is unsupported")
         ? mcpRuntimeEnabledCapability
         : mcpCapability;
-      if (capability) addFinding(capability, mcpConfigDiagnosticEvidence(diagnostic));
+      if (capability) addFinding(capability, mcpConfigDiagnosticEvidence(diagnostic, mcp));
     }
   }
 
@@ -925,9 +925,9 @@ function quotedMcpName(name: string, max: number): string {
   return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
 }
 
-function mcpConfigDiagnosticEvidence(diagnostic: string): string {
+function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig): string {
   if (diagnostic.includes("enabledMcpServers is unsupported")) {
-    return "Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC; use the effective MCP rows to determine status.";
+    return "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability and the list cannot authorize default-off servers.";
   }
   if (/MCP approvals .*cannot work while .*tracked by git/u.test(diagnostic)) {
     return "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.";
@@ -957,16 +957,16 @@ function mcpConfigDiagnosticEvidence(diagnostic: string): string {
     return "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.";
   }
   if (/(?:Native Claude|Active project) .*identity|ambiguous matching records/u.test(diagnostic)) {
-    return "Native Claude project identity could not be selected safely, so MCP is fail closed; reconcile the project records or path identity, then run /reload or restart PiCC.";
+    return `Native Claude project identity could not be selected safely, so MCP is fail closed. ${mcpFailClosedRecovery(mcp)}`;
   }
   if (
     diagnostic.includes("Matching native Claude project record has an invalid shape") ||
     /Native Claude .*(?:invalid (?:object )?shape|not an object|structural limits|limit|oversized project key)/u.test(diagnostic)
   ) {
-    return "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.";
+    return `Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. ${mcpFailClosedRecovery(mcp)}`;
   }
   if (/Native Claude state/u.test(diagnostic)) {
-    return "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.";
+    return `Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed. ${mcpFailClosedRecovery(mcp)}`;
   }
   return "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.";
 }
@@ -1000,7 +1000,7 @@ function mcpProfileStateHint(source: ClaudeProfileSource | undefined): string {
 
 /** Fixed, path-redacted recovery text shared by startup, /mcp, and /doctor. */
 export function mcpFailClosedRecovery(mcp: ResolvedMcpConfig): string {
-  return `Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at ${mcpProfileStateHint(mcp.failClosedProfile)}. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.`;
+  return `Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use ${mcpProfileStateHint(mcp.failClosedProfile)} to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.`;
 }
 
 function mcpNameList(
@@ -1170,9 +1170,10 @@ function mcpPostureLine(
   });
   const selected = ordered.slice(0, 32);
   const parts = selected.map((server) => {
-    const status = server.status;
-    const identity = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
-    switch (status) {
+    const part = (() => {
+      const status = server.status;
+      const identity = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
+      switch (status) {
       case "enabled": {
         const live = liveByName.get(server.name);
         // Enabled but unknown to the runtime (states not supplied — e.g. a
@@ -1218,21 +1219,28 @@ function mcpPostureLine(
       case "skipped":
         return `${identity}: skipped${mcpInactiveTransportSuffix(server)} — configuration is unusable; check the MCP configuration and logs, then run /reload or restart PiCC`;
     }
-    // Keep discovery status additions from silently rendering as undefined.
-    const unhandledStatus: never = status;
-    return unhandledStatus;
+      // Keep discovery status additions from silently rendering as undefined.
+      const unhandledStatus: never = status;
+      return unhandledStatus;
+    })();
+    return `${part} [source: ${mcpSourceLabel(server.source)}]`;
   });
-  const omitted = mcp.servers.length - selected.length;
+  const prefix = "MCP servers: ";
+  const rendered: string[] = [];
+  for (const part of parts) {
+    const omitted = mcp.servers.length - rendered.length - 1;
+    const suffix = omitted > 0
+      ? `; ${omitted} additional server name(s) omitted — inspect the MCP configuration for complete detail`
+      : "";
+    const candidate = `${prefix}${[...rendered, part].join("; ")}${suffix}.`;
+    if (candidate.length > MCP_STATUS_REPORT_MAX) break;
+    rendered.push(part);
+  }
+  const omitted = mcp.servers.length - rendered.length;
   const suffix = omitted > 0
     ? `; ${omitted} additional server name(s) omitted — inspect the MCP configuration for complete detail`
     : "";
-  const sources = selected.map(
-    (server) => `${quotedMcpName(server.name, MCP_STATUS_NAME_MAX)} [${mcpSourceLabel(server.source)}]`,
-  );
-  const line = `MCP servers: ${parts.join("; ")}${suffix}. Sources: ${sources.join(", ")}.`;
-  return line.length <= MCP_STATUS_REPORT_MAX
-    ? line
-    : `${line.slice(0, MCP_STATUS_REPORT_MAX - 1)}…`;
+  return `${prefix}${rendered.join("; ")}${suffix}.`;
 }
 
 const MCP_STATUS_DETAIL_MAX = 32;
@@ -1394,12 +1402,18 @@ export function renderMcpStatusReport(
   liveStates: readonly McpServerLiveState[],
 ): string {
   const config = mcp ?? EMPTY_MCP;
+  const unsupportedEnablement = config.diagnostics.some(
+    (diagnostic) => diagnostic.includes("enabledMcpServers is unsupported"),
+  );
+  const otherConfigDiagnostics = config.diagnostics.some(
+    (diagnostic) => !diagnostic.includes("enabledMcpServers is unsupported"),
+  );
   const lines = ["MCP status (read-only)"];
   if (config.servers.length === 0) {
     lines.push(
       config.failClosed === "native-state-unusable"
         ? `MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`
-        : config.diagnostics.length > 0
+        : otherConfigDiagnostics
           ? "No usable MCP servers were resolved."
           : "No MCP servers are configured.",
     );
@@ -1444,15 +1458,17 @@ export function renderMcpStatusReport(
   }
 
   if (
-    config.diagnostics.length > 0 ||
+    otherConfigDiagnostics ||
     config.servers.some((server) => server.diagnostics.length > 0)
   ) {
     lines.push("Some MCP configuration was malformed, ignored, or unusable; run /doctor for details.");
   }
 
-  if (config.diagnostics.some((diagnostic) => diagnostic.includes("enabledMcpServers is unsupported"))) {
+  if (unsupportedEnablement) {
     lines.push(
-      "Native enabledMcpServers was recognized, but the list does not authorize default-off runtime servers; the effective rows above determine actual status.",
+      config.servers.length > 0
+        ? "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability; the list does not authorize default-off runtime servers. The resolved rows above determine actual status."
+        : "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability; the list does not authorize default-off runtime servers.",
     );
   }
 

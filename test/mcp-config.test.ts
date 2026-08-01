@@ -1216,6 +1216,53 @@ describe("loadClaudeProject — mcp assembly", () => {
     });
   }
 
+  it.each([
+    { route: "explicit userDir", select: "explicit", env: { PICC_CLAUDE_USER_DIR: "picc", CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "PICC_CLAUDE_USER_DIR", select: "picc", env: { PICC_CLAUDE_USER_DIR: "picc", CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "CLAUDE_CONFIG_DIR", select: "claude", env: { CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "default injected home", select: "default", env: {} },
+  ] as const)("loads native user MCP state from the $route profile only", ({ select, env }) => {
+    const root = makeTmp();
+    const home = path.join(root, "home");
+    const profiles = {
+      explicit: path.join(root, "explicit-profile"),
+      picc: path.join(root, "picc-profile"),
+      claude: path.join(root, "claude-profile"),
+      default: path.join(home, ".claude"),
+    } as const;
+    const injectedEnv: NodeJS.ProcessEnv = Object.fromEntries(
+      Object.entries(env).map(([key, profile]) => [key, profiles[profile as keyof typeof profiles]]),
+    );
+    const statePath = (profile: keyof typeof profiles): string => profile === "default"
+      ? path.join(home, ".claude.json")
+      : path.join(profiles[profile], ".claude.json");
+
+    for (const profile of Object.keys(profiles) as Array<keyof typeof profiles>) {
+      if (profile === select) continue;
+      writeJson(statePath(profile), { mcpServers: { [`canary-${profile}`]: { command: "CANARY" } } });
+    }
+    // The default profile uses the home sibling, never a contained state file.
+    writeJson(path.join(profiles.default, ".claude.json"), {
+      mcpServers: { "canary-default-contained": { command: "CANARY" } },
+    });
+    writeJson(statePath(select), { mcpServers: { selected: { command: "selected-command" } } });
+
+    const project = loadClaudeProject({
+      cwd: root,
+      ...(select === "explicit" ? { userDir: profiles.explicit } : {}),
+      env: injectedEnv,
+      homeDir: home,
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+    });
+    expect(server(project.mcp, "selected")).toMatchObject({
+      status: "enabled",
+      source: "native-user",
+      command: "selected-command",
+    });
+    expect(project.mcp.servers.map((item) => item.name)).toEqual(["selected"]);
+  });
+
   it("yields servers: [] (and no diagnostics) when no MCP config exists anywhere", () => {
     const root = makeTmp();
     const project = loadFrom(root);

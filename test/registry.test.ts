@@ -266,8 +266,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
     { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/], gap: [/conservative PiCC policies/, /upstream canonicalization/, /malformed-whole-file semantics remain unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/State is never modified/] },
-    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact upstream matching.*remain unverified/], visibility: [/cannot edit the list/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /private state shape.*remain inferred or unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/State is never modified/] },
+    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], visibility: [/cannot edit the list/] },
     { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
@@ -2190,7 +2190,7 @@ describe("buildCompatReport", () => {
 
     expect(findings).toHaveLength(1);
     expect(findings[0]?.evidence).toBe(
-      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.",
+      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
     );
     expect(findings[0]?.evidence).not.toContain(
       "MCP configuration has an additional redacted issue",
@@ -2224,7 +2224,7 @@ describe("buildCompatReport", () => {
       (finding) => finding.capability.id === "feature.mcp-runtime-enabled",
     );
     expect(enabledFinding).toMatchObject({
-      evidence: "Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC; use the effective MCP rows to determine status.",
+      evidence: "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability and the list cannot authorize default-off servers.",
       capability: { tier: "not-supported", safetyRelevant: false },
     });
     const evidence = report.findings
@@ -2238,9 +2238,9 @@ describe("buildCompatReport", () => {
       "Project .mcp.json is malformed JSON; repair it as strict JSON, then run /reload or restart PiCC.",
       "Project .mcp.json has the wrong object shape; make the root and mcpServers block objects, then run /reload or restart PiCC.",
       "Project .mcp.json is missing its mcpServers block; add an object block or remove the file, then run /reload or restart PiCC.",
-      "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.",
-      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed; repair the state through Claude Code, then run /reload or restart PiCC.",
-      "Native Claude project identity could not be selected safely, so MCP is fail closed; reconcile the project records or path identity, then run /reload or restart PiCC.",
+      "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "Native Claude project identity could not be selected safely, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
       "A native MCP server entry was invalid or unsupported and was skipped; repair or remove that entry, then run /reload or restart PiCC.",
       "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.",
       "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.",
@@ -2253,7 +2253,7 @@ describe("buildCompatReport", () => {
       finding.capability.id === "feature.mcp" && finding.evidence.includes("enabledMcpServers")
     )).toBe(false);
     expect(doctor).not.toMatch(/CANARY|PARSER_EXCERPT|CREDENTIAL|SOURCE_PATH|PROJECT_KEY|SERVER_COMMAND|SERVER_URL/u);
-    expect(evidence.every((item) => item.length < 241)).toBe(true);
+    expect(evidence.every((item) => item.length < 600)).toBe(true);
   });
 
   it("retains remote unset-variable guidance plus a redacted fallback for mixed unclassified detail", () => {

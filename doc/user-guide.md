@@ -153,7 +153,9 @@ cd /path/to/your-claude-project     # the one with CLAUDE.md and .claude/
 picc
 ```
 
-On startup PiCC loads these Claude Code artifacts:
+On startup PiCC loads these Claude Code artifacts. Paths beginning with `~/.claude` below are for
+the default user profile; see [Environment variables](#environment-variables) for the active
+user-profile base when an override is selected.
 
 | Artifact | Source |
 |---|---|
@@ -211,7 +213,7 @@ does no reload, and `/new` starts a session without reloading plugin state.
 > it only when you explicitly ask it to remember something (e.g. "remember to…"). This is a
 > deliberate divergence from Claude Code, which also writes proactively. To restore Claude-Code-style
 > eager writes, add an instruction like this to the project's `CLAUDE.md` — or, to opt in without
-> modifying the target project, to your user-scope `~/.claude/CLAUDE.md`:
+> modifying the target project, to the active user profile's `CLAUDE.md`:
 >
 > ```markdown
 > ## Memory
@@ -605,13 +607,12 @@ select the same record. A verified linked worktree also considers its main check
 is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
 
 A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
-present but unusable—for example unreadable, malformed, ambiguous, invalidly encoded, non-regular,
-or oversized—PiCC starts no MCP server and emits a bounded value-redacted warning. Back up the
-active user profile, then launch Claude Code with that same profile and use it to attempt recovery
-or regeneration of native state. If Claude Code cannot recover it, preserve the backup and seek
-support; do not manually edit or delete native state solely to bypass PiCC. Restart PiCC after
-recovery. Use `/mcp` or `/doctor` for safe diagnostics. These bounds and fail-closed rules apply to
-native state, not the older `.mcp.json` loader.
+present but unusable (for example, malformed or unreadable), PiCC starts no MCP server and emits a
+bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
+command: restore a known-good backup of the active profile or its native state. If no
+known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC
+after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
+These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
 
 **Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
 the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient

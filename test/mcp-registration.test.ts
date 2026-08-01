@@ -687,7 +687,7 @@ describe("native Claude profile MCP wiring", () => {
       expect(warning.mock.calls.filter(([line]) => String(line).includes("MCP loading is fail closed")))
         .toHaveLength(1);
       const warningText = warning.mock.calls.flat().join("\n");
-      expect(warningText).toContain("Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.");
+      expect(warningText).toContain("Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.");
       expect(warningText).not.toContain(userDir);
       expect(warningText).not.toMatch(/malformed native state|CONFLICTING_NATIVE_CANARY/u);
       expect(fs.readFileSync(nativePath)).toEqual(malformedBytes);

@@ -117,7 +117,7 @@ describe("renderMcpStatusReport", () => {
     expect(report).toContain('"local": enabled; runtime state unavailable [source: native local]');
     expect(report).toContain('"project": pending approval [source: .mcp.json]');
     expect(report).toContain('"user": disabled — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC [source: native user]');
-    expect(report).toContain("the list does not authorize default-off runtime servers; the effective rows above determine actual status");
+    expect(report).toContain("PiCC does not support this enablement capability; the list does not authorize default-off runtime servers. The resolved rows above determine actual status");
     expect(report).not.toContain("SOURCE_PATH_CANARY");
 
     const closed = renderMcpStatusReport({
@@ -127,9 +127,19 @@ describe("renderMcpStatusReport", () => {
       failClosedProfile: "picc-override",
     }, []);
     expect(closed).toContain("fail closed because native Claude state is unusable");
-    expect(closed).toContain("Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.");
+    expect(closed).toContain("Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.");
     expect(closed).not.toMatch(/SECRET_|\/private/u);
   });
+
+  it("reports enabledMcpServers-only state as unsupported rather than malformed or unusable", () => {
+    const report = renderMcpStatusReport(config([], [
+      "Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled",
+    ]), []);
+    expect(report).toContain("No MCP servers are configured.");
+    expect(report).toContain("PiCC does not support this enablement capability");
+    expect(report).not.toMatch(/effective rows above|resolved rows above|malformed|ignored|unusable/u);
+  });
+
   it.each([
     ["default", "the default native state file (~/.claude.json)"],
     ["picc-override", "the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR"],
@@ -143,7 +153,7 @@ describe("renderMcpStatusReport", () => {
       failClosedProfile: profile,
     };
     for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
-      expect(report).toContain(`Back up the active user profile, then use Claude Code with that same profile to attempt native-state recovery at ${hint}. If Claude Code cannot recover it, preserve the backup and seek support. Restart PiCC after recovery.`);
+      expect(report).toContain(`Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use ${hint} to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.`);
       expect(report).not.toMatch(/SECRET_COMMAND|user:pass|resolved\/private/u);
     }
   });
@@ -161,7 +171,10 @@ describe("renderMcpStatusReport", () => {
       diagnostic: "SECRET_STDERR /private/log",
     }]);
     const posture = report.split("\n").find((line) => line.startsWith("MCP servers:"))!;
-    expect(posture).toContain('[native local]');
+    expect(posture).toContain('[source: native local]');
+    expect(posture).toContain('[source: native user]');
+    expect(posture).toContain('[source: .mcp.json]');
+    expect(posture.match(/\[source:/gu)).toHaveLength(3);
     expect(posture).toContain("native disabledMcpServers");
     expect(posture).toContain("use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted");
     expect(posture).toContain("configuration is unusable; check the MCP configuration and logs");
@@ -169,8 +182,9 @@ describe("renderMcpStatusReport", () => {
     expect(posture).not.toMatch(/SECRET_|hunter2|\/private\/log|[\u0000-\u001f\u007f-\u009f]/u);
     expect(posture.length).toBeLessThanOrEqual(16_384);
     expect(posture).toMatch(/^MCP servers: "bad/u);
+    expect(posture).not.toContain("Sources:");
     expect(report).toContain("- feature.mcp-runtime-enabled — the selected native project's `enabledMcpServers` list");
-    expect(report).toContain("evidence: Native enabledMcpServers was recognized, but it cannot authorize default-off servers in PiCC");
+    expect(report).toContain("evidence: Native enabledMcpServers was recognized, but PiCC does not support this enablement capability");
     expect(buildCompatReport(project(mcp)).findings.some((finding) =>
       finding.capability.id === "feature.mcp" && finding.evidence.includes("enabledMcpServers")
     )).toBe(false);
@@ -453,6 +467,53 @@ describe("renderMcpStatusReport", () => {
     }
     expect(report).toContain("run /doctor for bounded details");
     expect(report).not.toContain("https://");
+  });
+
+  it("keeps character-budget omissions truthful without truncating status or inline source rows", () => {
+    const total = 40;
+    const servers = Array.from({ length: total }, (_, index) =>
+      server(`failed-${String(index).padStart(2, "0")}-${"n".repeat(140)}`, "enabled", {
+        source: "native-local",
+        transport: "http",
+      })
+    );
+    const live: McpServerLiveState[] = servers.map((entry) => ({
+      name: entry.name,
+      transport: "http",
+      state: "failed",
+      toolsAdvertised: true,
+      promptsAdvertised: true,
+      resourcesAdvertised: true,
+      toolDiscoveryError: "DIAGNOSTIC_SECRET_CANARY",
+      promptDiscoveryError: "SOURCE_PATH_CANARY",
+      resourceDiscoveryError: "STDERR_CANARY",
+      statusSummary: `Bounded safe failure summary ${"s".repeat(400)}`,
+    }));
+
+    const posture = doctor(config(servers), live).split("\n").find((line) => line.startsWith("MCP servers:"))!;
+    const renderedRows = posture.match(/: failed via http .*? \[source: native local\]/gu) ?? [];
+    const renderedNames = posture.match(/"failed-\d{2}-n+…"/gu) ?? [];
+    const sourceStarts = posture.match(/\[source:/gu) ?? [];
+    const omitted = Number(posture.match(/; (\d+) additional server name\(s\) omitted/u)?.[1]);
+    const failureSummary = `Bounded safe failure summary ${"s".repeat(400)}`;
+    const expectedRowEnding = ": failed via http (tools: advertised, discovery failed, prompts: advertised, discovery failed, resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC) — " +
+      `${failureSummary.slice(0, 240)}… [source: native local]`;
+
+    expect(posture.length).toBeLessThanOrEqual(16_384);
+    expect(renderedRows.length).toBeGreaterThan(0);
+    expect(renderedRows.length).toBeLessThan(32);
+    expect(renderedNames).toEqual(Array.from({ length: renderedRows.length }, (_, index) =>
+      `"failed-${String(index).padStart(2, "0")}-${"n".repeat(110)}…"`
+    ));
+    for (let index = 32; index < total; index += 1) {
+      expect(posture).not.toContain(`failed-${String(index).padStart(2, "0")}`);
+    }
+    for (const row of renderedRows) expect(row).toBe(expectedRowEnding);
+    expect(sourceStarts).toHaveLength(renderedRows.length);
+    expect(posture.match(/\[source: native local\]/gu)).toHaveLength(renderedRows.length);
+    expect(posture).toMatch(/additional server name\(s\) omitted — inspect the MCP configuration for complete detail\.$/u);
+    expect(omitted).toBe(total - renderedRows.length);
+    for (const canary of UNSAFE_CANARIES) expect(posture).not.toContain(canary);
   });
 
   it("groups omitted servers accurately by effective rendered state", () => {
