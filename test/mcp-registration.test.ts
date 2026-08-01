@@ -7,6 +7,7 @@ import picc, { type PiccTestSeam } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
+import { flattenProjectPath } from "../src/claude/memory.js";
 import {
   createMcpProcessFixture,
   processIsAlive,
@@ -98,11 +99,14 @@ function startGatedExtension(identity: string, serverMode: string): {
 
 const originalCwd = process.cwd();
 const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+const savedClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 
 afterAll(() => {
   process.chdir(originalCwd);
   if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
   else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+  if (savedClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = savedClaudeConfigDir;
   for (const dir of tempDirs) {
     try {
       // Retries are load-bearing on Windows: the extension load fire-and-forgets
@@ -547,6 +551,151 @@ describe("MCP startup status terminal cleanup (wired)", () => {
           }
         }
       }
+    }
+  }, 30_000);
+});
+
+describe("native Claude profile MCP wiring", () => {
+  it("uses one overridden profile, starts only the authentic winner, and fails closed without mutation", async () => {
+    const dir = makeTempDir("picc-native-profile-");
+    const userDir = makeTempDir("picc-native-profile-user-");
+    const conflictingDir = makeTempDir("picc-native-profile-conflict-");
+    const fixture = createMcpProcessFixture(makeTempDir("picc-native-profile-fx-"));
+    writeProjectFile(dir, "CLAUDE.md", "PROJECT-PROFILE-WIRING\n");
+    writeProjectFile(userDir, "CLAUDE.md", "SELECTED-USER-PROFILE\n");
+    writeProjectFile(conflictingDir, "CLAUDE.md", "CONFLICTING-CLAUDE-CONFIG-CANARY\n");
+    const selectedPluginId = "selected-profile-plugin@profile-market";
+    const conflictingPluginId = "conflicting-profile-plugin@profile-market";
+    const selectedPluginRoot = path.join(userDir, "plugins", "cache", "profile-market", "selected-profile-plugin", "1.0.0");
+    const conflictingPluginRoot = path.join(conflictingDir, "plugins", "cache", "profile-market", "conflicting-profile-plugin", "1.0.0");
+    for (const [root, name, canary] of [
+      [selectedPluginRoot, "selected-profile-plugin", "SELECTED-INSTALLED-PLUGIN-CANARY"],
+      [conflictingPluginRoot, "conflicting-profile-plugin", "CONFLICTING-INSTALLED-PLUGIN-CANARY"],
+    ] as const) {
+      writeProjectFile(root, ".claude-plugin/plugin.json", JSON.stringify({
+        name,
+        description: "Profile selection integration canary.",
+        version: "1.0.0",
+      }));
+      writeProjectFile(root, "skills/profile-skill/SKILL.md", `---\ndescription: ${canary}\n---\n${canary}\n`);
+    }
+    writeProjectFile(userDir, "plugins/installed_plugins.json", JSON.stringify({
+      version: 2,
+      plugins: { [selectedPluginId]: [{ scope: "user", installPath: selectedPluginRoot, version: "1.0.0" }] },
+    }));
+    writeProjectFile(conflictingDir, "plugins/installed_plugins.json", JSON.stringify({
+      version: 2,
+      plugins: { [conflictingPluginId]: [{ scope: "user", installPath: conflictingPluginRoot, version: "1.0.0" }] },
+    }));
+    const memoryRel = path.join("projects", flattenProjectPath(dir), "memory", "MEMORY.md");
+    writeProjectFile(userDir, memoryRel, "SELECTED-AUTO-MEMORY-CANARY\n");
+    writeProjectFile(conflictingDir, memoryRel, "CONFLICTING-AUTO-MEMORY-CANARY\n");
+    writeProjectFile(userDir, "settings.json", JSON.stringify({
+      enabledMcpjsonServers: ["approved"],
+      enabledPlugins: { [selectedPluginId]: true },
+      mcpServers: {
+        winner: {
+          command: fixture.nodeCommand,
+          args: [fixture.serverScript, "exit-early"],
+          env: fixture.env,
+        },
+      },
+    }));
+    writeProjectFile(conflictingDir, "settings.json", JSON.stringify({
+      enabledMcpjsonServers: [],
+      enabledPlugins: { [conflictingPluginId]: true },
+    }));
+    writeProjectFile(dir, ".mcp.json", JSON.stringify({
+      mcpServers: {
+        approved: {
+          command: fixture.nodeCommand,
+          args: [fixture.serverScript, "slow-tool"],
+          env: fixture.env,
+        },
+      },
+    }));
+    const nativePath = path.join(userDir, ".claude.json");
+    const nativeBytes = Buffer.from(JSON.stringify({
+      projects: {
+        [dir]: {
+          mcpServers: {
+            winner: {
+              command: fixture.nodeCommand,
+              args: [fixture.serverScript, "serve"],
+              env: fixture.env,
+            },
+          },
+          disabledMcpServers: ["approved"],
+        },
+      },
+    }));
+    fs.writeFileSync(nativePath, nativeBytes);
+    fs.writeFileSync(path.join(conflictingDir, ".claude.json"), JSON.stringify({
+      mcpServers: { canary: { command: "CONFLICTING_NATIVE_CANARY" } },
+    }));
+
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.env.CLAUDE_CONFIG_DIR = conflictingDir;
+    process.chdir(dir);
+    const pi = fakePi();
+    picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+    try {
+      await pi.waitForInitialization();
+      await pi.waitForTools(["mcp__winner__echo"]);
+      await fixture.waitFor(["serve.pid"], "native local winner to start");
+      expect(fixture.exists("slow-tool.pid")).toBe(false);
+      expect(fixture.exists("exit-early.pid")).toBe(false);
+      const prompt = await pi.fire("before_agent_start", { systemPrompt: "BASE" }, pi.printCtx());
+      expect(prompt?.systemPrompt).toContain("SELECTED-USER-PROFILE");
+      expect(prompt?.systemPrompt).toContain("SELECTED-INSTALLED-PLUGIN-CANARY");
+      expect(prompt?.systemPrompt).toContain("SELECTED-AUTO-MEMORY-CANARY");
+      expect(prompt?.systemPrompt).not.toMatch(/CONFLICTING-(?:CLAUDE-CONFIG|INSTALLED-PLUGIN|AUTO-MEMORY)-CANARY/u);
+      await pi.commands.get("mcp").handler("", pi.tuiCtx());
+      const status = [...pi.entries].reverse().find(
+        (candidate) => candidate.customType === "picc-control" && candidate.data?.command === "mcp",
+      );
+      expect(String(status?.data?.output)).toContain(
+        '"approved": disabled — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC [source: .mcp.json]',
+      );
+      expect(fs.readFileSync(nativePath)).toEqual(nativeBytes);
+    } finally {
+      await shutdownExtension(pi);
+      await fixture.cleanup();
+    }
+
+    const closedFixture = createMcpProcessFixture(makeTempDir("picc-native-closed-fx-"));
+    writeProjectFile(dir, ".mcp.json", JSON.stringify({
+      mcpServers: {
+        lower: {
+          command: closedFixture.nodeCommand,
+          args: [closedFixture.serverScript, "serve"],
+          env: closedFixture.env,
+        },
+      },
+    }));
+    writeProjectFile(userDir, "settings.json", JSON.stringify({ enabledMcpjsonServers: ["lower"] }));
+    const malformedBytes = Buffer.from("{ malformed native state");
+    fs.writeFileSync(nativePath, malformedBytes);
+    const warning = vi.spyOn(console, "error").mockImplementation(() => {});
+    const closedPi = fakePi();
+    picc(closedPi.api as never, { onInitializationSettled: closedPi.captureInitialization });
+    try {
+      await closedPi.waitForInitialization();
+      await closedPi.fire("before_agent_start", { systemPrompt: "BASE" }, closedPi.printCtx());
+      expect([...closedPi.tools.keys()].some((name) => name.startsWith("mcp__"))).toBe(false);
+      expect(closedFixture.publishedPids()).toEqual([]);
+      expect(warning.mock.calls.filter(([line]) => String(line).includes("MCP loading is fail closed")))
+        .toHaveLength(1);
+      const warningText = warning.mock.calls.flat().join("\n");
+      expect(warningText).toContain("Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.");
+      expect(warningText).not.toContain(userDir);
+      expect(warningText).not.toMatch(/malformed native state|CONFLICTING_NATIVE_CANARY/u);
+      expect(fs.readFileSync(nativePath)).toEqual(malformedBytes);
+    } finally {
+      warning.mockRestore();
+      await shutdownExtension(closedPi);
+      await closedFixture.cleanup();
+      process.chdir(originalCwd);
     }
   }, 30_000);
 });

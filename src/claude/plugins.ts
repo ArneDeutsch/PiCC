@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
+import { canonicalDirectory as resolveCanonicalDirectory, projectIdentities } from "../util/project-identity.js";
 import type { PluginAgentLoaderSource } from "./agents.js";
 import {
   authorizePluginRoot,
@@ -85,12 +86,8 @@ function compareText(left: string, right: string): number {
 }
 
 function canonicalDirectory(value: string): string | undefined {
-  try {
-    const canonical = fs.realpathSync.native(value);
-    return fs.statSync(canonical).isDirectory() ? canonical : undefined;
-  } catch {
-    return undefined;
-  }
+  const result = resolveCanonicalDirectory(value);
+  return result.kind === "canonical" ? result.path : undefined;
 }
 
 function sameFilesystemIdentity(left: string | undefined, right: string | undefined): boolean {
@@ -129,44 +126,6 @@ function compareInstallations(left: NormalizedPluginInstallation, right: Normali
 function isContained(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
-}
-
-/** Resolve the main checkout only when Git's worktree admin directory links back to this checkout. */
-function linkedMainCheckout(projectRoot: string): string | undefined {
-  const dotGit = path.join(projectRoot, ".git");
-  let pointer: string;
-  try {
-    if (!fs.statSync(dotGit).isFile()) return undefined;
-    pointer = fs.readFileSync(dotGit, "utf8").trim();
-  } catch {
-    return undefined;
-  }
-  const match = /^gitdir:\s*(.+)$/i.exec(pointer);
-  if (!match) return undefined;
-  const admin = canonicalDirectory(path.resolve(projectRoot, match[1]!));
-  if (!admin || path.basename(path.dirname(admin)) !== "worktrees") return undefined;
-  try {
-    const backlink = fs.readFileSync(path.join(admin, "gitdir"), "utf8").trim();
-    if (fs.realpathSync.native(path.dirname(backlink)) !== fs.realpathSync.native(projectRoot) || path.basename(backlink) !== ".git") {
-      return undefined;
-    }
-    const common = fs.realpathSync.native(path.resolve(admin, fs.readFileSync(path.join(admin, "commondir"), "utf8").trim()));
-    if (path.basename(common) !== ".git") return undefined;
-    const main = fs.realpathSync.native(path.dirname(common));
-    if (fs.realpathSync.native(path.join(main, ".git")) !== common) return undefined;
-    return main;
-  } catch {
-    return undefined;
-  }
-}
-
-function projectIdentities(projectRoot: string): Set<string> {
-  const identities = new Set<string>();
-  const canonical = canonicalDirectory(projectRoot);
-  if (canonical) identities.add(canonical);
-  const main = linkedMainCheckout(projectRoot);
-  if (main) identities.add(main);
-  return identities;
 }
 
 function applicable(record: NormalizedPluginInstallation, projects: ReadonlySet<string>): boolean {
@@ -513,7 +472,7 @@ export function resolveInstalledPlugins(options: {
   const outcomes: PluginResolutionOutcome[] = [];
   const diagnostics: Diagnostic[] = [];
   const provisional: ProvisionalPlugin[] = [];
-  const projects = projectIdentities(options.projectRoot);
+  const projects = new Set(projectIdentities(options.projectRoot));
   const cacheRoots = authorizedCacheRoots(options.userDir, options.env ?? process.env);
   const blocklist = readBlocklist(options.userDir, options.readBlocklistForTest);
   if (blocklist.diagnostic) diagnostics.push(blocklist.diagnostic);

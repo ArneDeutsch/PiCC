@@ -90,6 +90,7 @@ import {
   buildCompatReport,
   renderDoctorReport,
   renderMcpStatusReport,
+  mcpFailClosedRecovery,
   type CompatReport,
 } from "./registry/compat-report.js";
 import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -669,10 +670,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   let project: LoadedProject;
   try {
-    // PICC_CLAUDE_USER_DIR overrides ~/.claude (tests, multi-profile setups).
     project = loadClaudeProject({
       cwd: process.cwd(),
-      userDir: process.env.PICC_CLAUDE_USER_DIR || undefined,
       ...(testSeam?.managedSettingsPaths
         ? { managedSettingsPaths: testSeam.managedSettingsPaths }
         : {}),
@@ -684,6 +683,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Completeness floor: a broken project must never crash the harness.
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
     return;
+  }
+  if (project.mcp.failClosed === "native-state-unusable") {
+    console.error(
+      `PiCC: Native Claude MCP state is unusable, so MCP loading is fail closed. Run /mcp or /doctor. ${mcpFailClosedRecovery(project.mcp)}`,
+    );
   }
 
   const config = loadPiCCConfig(project.root);

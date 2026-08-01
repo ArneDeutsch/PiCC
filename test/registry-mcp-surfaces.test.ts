@@ -141,6 +141,22 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-sampling")).toContain("cannot ask PiCC to run model generations");
   });
 
+  it("pins native source boundaries and managed-policy exposure", () => {
+    const extension = note("setting.mcpServers");
+    expect(extension).toContain("Native runtime disablement applies only to authentic native/.mcp.json winners, never settings-extension winners");
+    expect(extension).toContain("managed settings extension > untracked settings.local.json extension > project settings extension > user settings extension");
+    expect(extension).toContain("all applicable inactive gates run before expansion");
+
+    expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({
+      tier: "not-supported",
+      safetyRelevant: true,
+    });
+    const managed = note("feature.mcp-managed-config");
+    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
+      expect(managed).toContain(source);
+    }
+  });
+
   it("distinguishes inherited resource tools from user-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
     expect(frontmatter).toContain("gated MCP tool proxies and conditional resource tools");
@@ -165,7 +181,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "setting.mcpServers": "These config leaves share PiCC's parsed server-entry path, whole-entry precedence, expansion behavior, partial tier, and configuration-file remedy.",
   "feature.mcp-websocket": "The WebSocket transport and its entry fields share PiCC's absent client transport, non-safety conclusion, and supported-transport remedy.",
   "feature.mcp-server-always-load": "The config field and its tool-loading effect are one ignored server field with the same startup/search deficit and do-not-rely remedy.",
-  "feature.mcp-claude-json-scopes": "Local and user ~/.claude.json scopes share the same absent loader, non-safety classification, and settings-file substitute.",
+  "feature.mcp-claude-json-scopes": "Native local, user, and scope-precedence leaves share one read-only loader, partial identity/recovery policy, and coherent user-profile-backed configuration.",
   "feature.mcp-cli-management": "These terminal management and import commands are all absent while file configuration remains the common PiCC remedy.",
     "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
   "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf share PiCC's immutable initial catalogs and the same non-safety remedy.",
@@ -196,12 +212,12 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
 };
 
 const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
-  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-remote-transports","setting.mcpServers"],
+  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-remote-transports","setting.mcpServers"],
   "feature.mcp-auto-background": ["feature.mcp-first-byte-timeout","feature.mcp-idle-timeout"],
   "feature.mcp-capability-discovery": ["feature.mcp","feature.mcp-model-failure-visibility","feature.mcp-prompts","feature.mcp-resources"],
   "feature.mcp-channels": ["feature.mcp","setting.allowedChannelPlugins","setting.channelsEnabled"],
   "feature.mcp-child-session-env": ["feature.mcp"],
-  "feature.mcp-claude-json-scopes": ["feature.mcp-connectors","setting.mcpServers"],
+  "feature.mcp-claude-json-scopes": ["feature.mcp","feature.mcp-connectors","feature.mcp-project-approval","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.mcpServers"],
   "feature.mcp-cli-invocation-controls": ["setting.disableSideloadFlags","setting.mcpServers"],
   "feature.mcp-cli-management": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","setting.mcpServers"],
   "feature.mcp-connect-timeout-ms": ["feature.mcp-first-byte-timeout","feature.mcp-server-always-load"],
@@ -219,7 +235,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-oauth": ["feature.mcp-connectors","feature.mcp-remote-transports"],
   "feature.mcp-output-token-cap": ["feature.mcp-max-result-size-chars","feature.tool-output-clip"],
   "feature.mcp-plugin-servers": ["feature.mcp","feature.plugins-content"],
-  "feature.mcp-project-approval": ["feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
+  "feature.mcp-project-approval": ["feature.mcp-claude-json-scopes","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
   "feature.mcp-prompts": ["feature.mcp-capability-discovery","feature.mcp-list-changed"],
   "feature.mcp-remote-transports": ["feature.mcp","feature.mcp-headers-helper","feature.mcp-oauth","feature.mcp-websocket"],
   "feature.mcp-requires-user-interaction": ["tool.mcp__*"],
@@ -228,7 +244,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-resources": ["feature.mcp-resource-subscriptions","feature.mcp-resource-templates","tool.ListMcpResourcesTool","tool.ReadMcpResourceTool"],
   "feature.mcp-root-schema-combinators": ["tool.mcp__*"],
   "feature.mcp-roots": ["feature.mcp"],
-  "feature.mcp-runtime-disabled": ["feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
+  "feature.mcp-runtime-disabled": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
   "feature.mcp-runtime-enabled": ["feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-disabled"],
   "feature.mcp-sampling": ["feature.mcp"],
   "feature.mcp-server-always-load": ["feature.mcp-connect-timeout-ms","feature.mcp-tool-search","tool.WaitForMcpServers"],
@@ -289,14 +305,14 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("config.always-load", "MCP reference", "Server alwaysLoad", "Scale with MCP tool search", "feature.mcp-server-always-load", "not-supported", false),
   s("config.shell-prefix", "MCP reference", "Stdio shell prefix", "Option 3: Add a local stdio server", "feature.mcp-shell-prefix", "not-supported", false),
   s("config.child-session-env", "MCP reference", "Child-session environment", "Option 3: Add a local stdio server", "feature.mcp-child-session-env", "not-supported"),
-  s("scope.local", "MCP reference", "Local scope", "Local scope", "feature.mcp-claude-json-scopes", "not-supported", false),
+  s("scope.local", "MCP reference", "Local scope", "Local scope", "feature.mcp-claude-json-scopes", "partial", false),
   s("scope.project", "MCP reference", "Project scope", "Project scope", "feature.mcp-project-approval", "partial", false),
-  s("scope.user", "MCP reference", "User scope", "User scope", "feature.mcp-claude-json-scopes", "not-supported", false),
-  s("scope.precedence", "MCP reference", "Scope precedence", "Scope hierarchy and precedence", "setting.mcpServers", "partial", false),
+  s("scope.user", "MCP reference", "User scope", "User scope", "feature.mcp-claude-json-scopes", "partial", false),
+  s("scope.precedence", "MCP reference", "Scope precedence", "Scope hierarchy and precedence", "feature.mcp-claude-json-scopes", "partial", false),
   s("approval.enable-all", "Settings reference", "enableAllProjectMcpServers", "Available settings", "setting.enableAllProjectMcpServers", "partial"),
   s("approval.enabled-list", "Settings reference", "enabledMcpjsonServers", "Available settings", "setting.enabledMcpjsonServers", "partial"),
   s("approval.disabled-list", "Settings reference", "disabledMcpjsonServers", "Available settings", "setting.disabledMcpjsonServers", "full"),
-  s("runtime.disabled", "MCP reference", "disabledMcpServers", "Disable a server without removing it", "feature.mcp-runtime-disabled", "not-supported", true),
+  s("runtime.disabled", "MCP reference", "disabledMcpServers", "Disable a server without removing it", "feature.mcp-runtime-disabled", "partial", true),
   s("runtime.enabled", "MCP reference", "enabledMcpServers", "Managing your servers", "feature.mcp-runtime-enabled", "not-supported", false),
   s("management.status", "MCP reference", "/mcp command", "Managing your servers", "feature.mcp-control-status", "partial"),
   s("management.list", "MCP reference", "claude mcp list", "Managing your servers", "feature.mcp-cli-management", "not-supported", false),
@@ -445,7 +461,7 @@ const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence
   "feature.mcp-capability-discovery": [{"quality":"documented","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"},{"quality":"unverified","source":"MCP reference — Scale with MCP tool search (cross-capability failure coupling is not specified)","reviewed":"2026-07-31"}],
   "feature.mcp-channels": [{"quality":"documented","source":"Claude Code channels \u2014 Enterprise controls","reviewed":"2026-07-31"},{"quality":"documented","source":"CLI reference \u2014 CLI flags","reviewed":"2026-07-31"}],
   "feature.mcp-child-session-env": [{"quality":"observed","source":"Claude Code 2.1.218 binary — observed stdio environment sanitization path"},{"quality":"documented","source":"MCP reference — Option 3: Add a local stdio server","reviewed":"2026-07-31"}],
-  "feature.mcp-claude-json-scopes": [{"quality":"documented","source":"MCP reference — Local scope","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — User scope","reviewed":"2026-07-31"}],
+  "feature.mcp-claude-json-scopes": [{"quality":"documented","source":"MCP reference — Local scope","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Scope hierarchy and precedence","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — User scope","reviewed":"2026-07-31"},{"quality":"documented","source":"Settings reference — Environment variables","reviewed":"2026-07-31"},{"quality":"inferred","source":"Private native state — physical .claude.json shape is not documented"}],
   "feature.mcp-cli-invocation-controls": [{"quality":"documented","source":"CLI reference \u2014 CLI flags","reviewed":"2026-07-31"}],
   "feature.mcp-cli-management": [{"quality":"documented","source":"MCP reference — Add MCP servers from JSON configuration","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Import MCP servers from Claude Desktop","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Installing MCP servers","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Managing your servers","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Project scope","reviewed":"2026-07-31"}],
   "feature.mcp-connect-timeout-ms": [{"quality":"observed","source":"Claude Code 2.1.218 binary — observed 5000 ms default on one connect path"},{"quality":"documented","source":"MCP reference — Push messages with channels","reviewed":"2026-07-31"}],
@@ -473,8 +489,8 @@ const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence
   "feature.mcp-resources": [{"quality":"documented","source":"MCP reference — Reference MCP resources","reviewed":"2026-07-31"}],
   "feature.mcp-root-schema-combinators": [{"quality":"documented","source":"MCP reference — Tool input schemas with a root-level combinator","reviewed":"2026-07-31"}],
   "feature.mcp-roots": [{"quality":"documented","source":"MCP reference \u2014 Option 3: Add a local stdio server","reviewed":"2026-07-31"}],
-  "feature.mcp-runtime-disabled": [{"quality":"documented","source":"MCP reference — Disable a server without removing it","reviewed":"2026-07-31"}],
-  "feature.mcp-runtime-enabled": [{"quality":"documented","source":"MCP reference — Managing your servers","reviewed":"2026-07-31"}],
+  "feature.mcp-runtime-disabled": [{"quality":"documented","source":"MCP reference — Disable a server without removing it","reviewed":"2026-07-31"},{"quality":"inferred","source":"Private native state — disabledMcpServers persistence and list interpretation are not documented"}],
+  "feature.mcp-runtime-enabled": [{"quality":"documented","source":"MCP reference — Managing your servers","reviewed":"2026-07-31"},{"quality":"inferred","source":"Private native state — enabledMcpServers persistence and list interpretation are not documented"}],
   "feature.mcp-sampling": [{"quality":"unverified","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"}],
   "feature.mcp-server-always-load": [{"quality":"documented","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"}],
   "feature.mcp-server-instructions": [{"quality":"documented","source":"MCP reference — Scale with MCP tool search","reviewed":"2026-07-31"}],
@@ -589,9 +605,9 @@ describe("dated Claude Code MCP surface audit", () => {
   it("pins the material safety and uncertainty decisions", () => {
     expect(lookupCapability("feature.mcp-requires-user-interaction")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
     expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    expect(lookupCapability("feature.mcp-runtime-disabled")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    expect(note("feature.mcp-runtime-disabled")).toContain("previously approved or configured server can run");
-    expect(note("feature.mcp-runtime-disabled")).toContain("independently disable the server through PiCC-supported configuration");
+    expect(lookupCapability("feature.mcp-runtime-disabled")).toMatchObject({ tier: "partial", safetyRelevant: true });
+    expect(note("feature.mcp-runtime-disabled")).toContain("final pre-expansion deny");
+    expect(note("feature.mcp-runtime-disabled")).toContain("does not disable settings-extension winners");
     expect(lookupCapability("feature.mcp-runtime-enabled")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(note("feature.mcp-model-failure-visibility")).toContain("only to humans through `/mcp`, `/doctor`");

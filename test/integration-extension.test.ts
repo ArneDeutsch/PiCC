@@ -1426,7 +1426,7 @@ describe("session lifecycle hooks", () => {
     // Always-present MCP posture line, fed by real discovery: the fixture's
     // unapproved server renders as pending, and the retired static
     // ".mcp.json present" wording must be gone.
-    expect(doctor).toContain("example-server: pending approval");
+    expect(doctor).toContain("\"example-server\": pending approval");
     // De-duplicated within /doctor: its posture line carries no enable/decline
     // hint because the pending finding below carries that report's guidance.
     // The dedicated /mcp report independently carries bounded guidance.
@@ -3227,9 +3227,9 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
           .filter((e) => e.customType === "picc-control")
           .map((e) => String(e.data?.output ?? ""))
           .join("\n");
-        expect(doctor).toContain("failing-server: failed");
-        // The diagnostic quotes the RAW command, never a resolved path.
-        expect(doctor).toContain("picc-no-such-command-t05");
+        expect(doctor).toContain("\"failing-server\": failed");
+        // Raw commands remain redacted from /doctor.
+        expect(doctor).not.toContain("picc-no-such-command-t05");
       } finally {
         errSpy.mockRestore();
         await p.fire("session_shutdown", { reason: "other" });

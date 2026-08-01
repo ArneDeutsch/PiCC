@@ -444,10 +444,26 @@ export type McpServerStatus =
   | "skipped"
   | "not-configured";
 
+export type McpSourceClass =
+  | "native-local"
+  | "project-mcpjson"
+  | "native-user"
+  | "settings-managed"
+  | "settings-local"
+  | "settings-project"
+  | "settings-user";
+
+export type ClaudeProfileSource = "explicit" | "picc-override" | "claude-config" | "default";
+
+export type McpInactiveReason =
+  | "mcpjson-unapproved"
+  | "mcpjson-rejected"
+  | "native-runtime-disabled";
+
 interface ResolvedMcpServerCommon {
   name: string;
-  /** Human-readable origin, e.g. ".mcp.json" | "settings:<scope>". */
-  source: string;
+  /** Resolver output uses a fixed source class, never a native state path or project identity. */
+  source: McpSourceClass;
   /** Per-server tool-call timeout, validated >= 1000 ms. */
   timeoutMs?: number;
   /** Safe per-server findings; expanded URL/header values never enter diagnostics. */
@@ -456,6 +472,7 @@ interface ResolvedMcpServerCommon {
 
 export interface InactiveResolvedMcpServer extends ResolvedMcpServerCommon {
   status: Exclude<McpServerStatus, "enabled">;
+  inactiveReason?: McpInactiveReason;
   /** Safe transport identity only; malformed or unknown shapes omit it. */
   transport?: "stdio" | "http" | "sse";
   /** Original remote type alias, safe to display. */
@@ -490,10 +507,14 @@ export type ResolvedMcpServer =
   | EnabledRemoteMcpServer;
 
 export interface ResolvedMcpConfig {
-  /** Every discovered server, all statuses. */
+  /** Every selected server, all statuses. */
   servers: ResolvedMcpServer[];
   /** Config-level findings (malformed file, ignored project-scope approvals). */
   diagnostics: string[];
+  /** Authoritative native state was present but unusable, so all MCP is inactive. */
+  failClosed?: "native-state-unusable";
+  /** Fixed provenance for safe fail-closed repair guidance; never a resolved path. */
+  failClosedProfile?: ClaudeProfileSource;
 }
 
 // ---------------------------------------------------------------------------

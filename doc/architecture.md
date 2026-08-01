@@ -106,11 +106,15 @@ hierarchies, and they are not the same set:
 recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
 than dropped.
 
-**MCP server config** is a third input: the project `.mcp.json` plus scope-tagged `mcpServers`
-blocks from the settings hierarchy, resolved here (`discovery/mcp.ts`) by whole-entry precedence
-and the enablement gate — project-origin servers stay pending until approved from a user-authored
-scope, and a git-tracked `settings.local.json` is demoted to project scope so a cloned repo can
-never self-approve.
+**MCP server config** is a third input: read-only native Claude user/project-local state, project
+`.mcp.json`, and the subordinate PiCC `mcpServers` settings extension. `discovery/claude-profile.ts`
+selects one coherent user profile, the native loader uses canonical project identities, and
+`discovery/mcp.ts` resolves whole entries in native local → `.mcp.json` → native user → settings
+extension order before any expansion. Project `.mcp.json` and project-origin extension servers stay
+pending until approved from a user-authored settings scope; native local/user definitions instead
+use native runtime disablement. A git-tracked `settings.local.json` is demoted to project scope so a
+cloned repo can never self-approve. Present-but-unusable authoritative native state fails MCP closed,
+while an absent native state file preserves the other inputs.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -123,16 +127,20 @@ artifact's *content*.
 ### `claude/` — parse each artifact format (loaders only, no runtime)
 
 One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
-with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json` and settings
-`mcpServers` blocks, `mcp-config.ts`), and installed-plugin content. `src/project.ts` — at
-the source root, *above* the loaders, importing both `discovery/` and `claude/` — orchestrates them
+with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json`, native Claude state,
+and settings `mcpServers` blocks; `mcp-config.ts` and `claude-mcp-state.ts`), and installed-plugin
+content. `src/project.ts` — at the source root, *above* the loaders, importing both `discovery/` and
+`claude/` — orchestrates them
 into one loaded project model. It sits outside this folder precisely because it depends on both:
 a loader knows one format and nothing else.
 
 Invariants across the folder:
 
-- **Loaders never throw.** Malformed input degrades to an empty value plus a diagnostic. A broken
-  project must never crash the harness: `src/index.ts` catches load failure and returns quietly.
+- **Loaders never throw.** Malformed ordinary input degrades to an empty value plus a diagnostic.
+  Authoritative native MCP state is the deliberate exception: absence is empty, but a present
+  unusable file returns an explicit fail-closed result so uncertainty cannot activate lower MCP
+  sources. A broken project must never crash the harness: `src/index.ts` catches load failure and
+  returns quietly.
 - **Progressive disclosure is a hard requirement, not an optimization.** Skill frontmatter is
   parsed; the body is **never** stored on the returned object and is re-read only on activation. A
   change that eagerly holds bodies defeats the whole design.

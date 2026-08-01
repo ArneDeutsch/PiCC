@@ -143,14 +143,14 @@ function makeMcpServer(
 ): ResolvedMcpServer {
   if (overrides.status !== "enabled") {
     return {
-      source: ".mcp.json",
+      source: "project-mcpjson",
       transport: "stdio",
       diagnostics: [],
       ...overrides,
     } as ResolvedMcpServer;
   }
   return {
-    source: ".mcp.json",
+    source: "project-mcpjson",
     transport: "stdio",
     command: "",
     args: [],
@@ -262,12 +262,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it.each<DisclosureContract>([
     { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
-    { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
+    { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/Authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /private state shape.*remain inferred or unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/State is never modified/] },
+    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], visibility: [/cannot edit the list/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -421,7 +423,6 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "feature.mcp-channels",
       "feature.mcp-managed-config",
       "feature.mcp-connectors",
-      "feature.mcp-claude-json-scopes",
       "feature.mcp-output-token-cap",
       "feature.mcp-idle-timeout",
       "feature.mcp-auto-background",
@@ -457,6 +458,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
+    const managedConfig = lookupCapability("feature.mcp-managed-config");
+    expect(managedConfig).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
+      expect(managedConfig?.note).toContain(source);
+    }
     for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
       expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
     }
@@ -2197,7 +2203,8 @@ describe("buildCompatReport", () => {
     expect(omission?.evidence).not.toContain("inactive-29");
     const doctor = renderDoctorReport(project, report);
     expect(doctor).toContain(omission!.evidence);
-    expect(doctor).toContain("config-level MCP diagnostic remains independently visible");
+    expect(doctor).toContain("MCP configuration has an additional redacted issue");
+    expect(doctor).not.toContain("config-level MCP diagnostic remains independently visible");
     expect(doctor).not.toContain("inactive-29");
     expect(doctor.length).toBeLessThan(20_000);
   });
@@ -2224,17 +2231,102 @@ describe("buildCompatReport", () => {
     expect(skipped.some((f) => f.evidence.includes('"broken"'))).toBe(true);
   });
 
-  it("config-level safe approval diagnostics surface verbatim", () => {
+  it("deduplicates the exact matching-record invalid-shape diagnostic into native repair guidance", () => {
+    const diagnostic = "Matching native Claude project record has an invalid shape";
+    const project = makeProject({ mcp: makeMcp({ diagnostics: [diagnostic, diagnostic] }) });
+    const findings = buildCompatReport(project).findings
+      .filter((finding) => finding.capability.id === "feature.mcp");
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.evidence).toBe(
+      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+    );
+    expect(findings[0]?.evidence).not.toContain(
+      "MCP configuration has an additional redacted issue",
+    );
+    expect(JSON.stringify(findings)).not.toContain(diagnostic);
+  });
+
+  it("classifies every known config-level diagnostic into distinct static redacted guidance", () => {
     const diagnostics = [
-      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope settings are ignored — a cloned repo must not self-approve. Independently review server definitions, then add only explicitly trusted server names to "enabledMcpjsonServers" in user settings (~/.claude/settings.json, or the configured user directory) or a clean untracked .claude/settings.local.json; never copy project-supplied mcpServers, approval keys, or blanket approval (.claude/settings.json)',
-      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in .claude/settings.local.json cannot work while the file is tracked by git. Approve only explicitly trusted server names with "enabledMcpjsonServers" in user settings (~/.claude/settings.json, or the configured user directory). Create a local file from scratch only after a reviewed repository change stops tracking or removes the path; do not reuse project-supplied MCP content',
+      "Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled",
+      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope settings are ignored — SOURCE_PATH_CANARY PROJECT_KEY_CANARY',
+      'C:/SOURCE_PATH_CANARY/settings.local.json is tracked by git, so a cloned repo could have authored it; its MCP configuration is treated as project scope (approvals ignored; any contributed servers are pending)',
+      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in C:/SOURCE_PATH_CANARY/settings.local.json cannot work while the file is tracked by git. COMMAND_CANARY',
+      ".mcp.json is unreadable; ignored SOURCE_PATH_CANARY",
+      ".mcp.json is malformed JSON (PARSER_EXCERPT_CANARY); ignored",
+      ".mcp.json root is not an object; ignored URL_CREDENTIAL_CANARY",
+      '.mcp.json "mcpServers" is not an object; ignored HEADER_CANARY',
+      '.mcp.json has no "mcpServers" key; ignored',
+      "Native Claude state could not be read SOURCE_PATH_CANARY",
+      "Native Claude local MCP state has an invalid object shape ENV_SECRET_CANARY",
+      "Matching native Claude project record has an invalid shape MATCHING_RECORD_CANARY",
+      "Active project identity could not be established PROJECT_KEY_CANARY",
+      'Native user MCP server "SERVER_COMMAND_CANARY" has an invalid or unsupported definition and was skipped',
+      'Native local MCP server "SERVER_URL_CANARY" has configuration PiCC ignored or adjusted; its definition was retained for later resolution',
+      "UNRECOGNIZED_CONFIG_DIAGNOSTIC CREDENTIAL_CANARY",
+      ".mcp.json is unreadable; ignored DUPLICATE_PATH_CANARY",
     ];
     const project = makeProject({ mcp: makeMcp({ diagnostics }) });
     const report = buildCompatReport(project);
-    const diags = report.findings.filter((f) => f.capability.id === "feature.mcp");
-    for (const diagnostic of diagnostics) {
-      expect(diags.some((f) => f.evidence.includes(diagnostic))).toBe(true);
-    }
+    const enabledFinding = report.findings.find(
+      (finding) => finding.capability.id === "feature.mcp-runtime-enabled",
+    );
+    expect(enabledFinding).toMatchObject({
+      evidence: "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability and the list cannot authorize default-off servers.",
+      capability: { tier: "not-supported", safetyRelevant: false },
+    });
+    const evidence = report.findings
+      .filter((finding) => finding.capability.id === "feature.mcp")
+      .map((finding) => finding.evidence);
+    expect(evidence).toEqual([
+      "Project-scope MCP approval settings were ignored because a project cannot authorize itself; review definitions before approving exact trusted names from user-controlled settings.",
+      "A tracked local MCP settings contribution was demoted to project scope, so any servers it contributes require independent user approval; review definitions before approving exact trusted names.",
+      "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.",
+      "Project .mcp.json is unreadable; restore file access or remove it, then run /reload or restart PiCC.",
+      "Project .mcp.json is malformed JSON; repair it as strict JSON, then run /reload or restart PiCC.",
+      "Project .mcp.json has the wrong object shape; make the root and mcpServers block objects, then run /reload or restart PiCC.",
+      "Project .mcp.json is missing its mcpServers block; add an object block or remove the file, then run /reload or restart PiCC.",
+      "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "Native Claude project identity could not be selected safely, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "A native MCP server entry was invalid or unsupported and was skipped; repair or remove that entry, then run /reload or restart PiCC.",
+      "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.",
+      "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.",
+    ]);
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("- feature.mcp-runtime-enabled — the selected native project's `enabledMcpServers` list");
+    expect(doctor).toContain(enabledFinding!.evidence);
+    for (const safe of evidence) expect(doctor).toContain(safe);
+    expect(report.findings.some((finding) =>
+      finding.capability.id === "feature.mcp" && finding.evidence.includes("enabledMcpServers")
+    )).toBe(false);
+    expect(doctor).not.toMatch(/CANARY|PARSER_EXCERPT|CREDENTIAL|SOURCE_PATH|PROJECT_KEY|SERVER_COMMAND|SERVER_URL/u);
+    expect(evidence.every((item) => item.length < 600)).toBe(true);
+  });
+
+  it("retains remote unset-variable guidance plus a redacted fallback for mixed unclassified detail", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [makeMcpServer({
+          name: "remote-mixed",
+          status: "enabled",
+          transport: "http",
+          diagnostics: [
+            'MCP server "remote-mixed" URL references unset environment variable "REMOTE_TOKEN"',
+            'unknown field "credential.value=SECRET_FIELD_CANARY" ignored; https://user:pass@example.test/mcp',
+          ],
+        })],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const finding = report.findings.find((item) => item.capability.id === "feature.mcp-remote-transports");
+    expect(finding?.evidence).toContain('environment variable "REMOTE_TOKEN" is not set and has no default');
+    expect(finding?.evidence).toContain("additional configuration issue detected");
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain('environment variable "REMOTE_TOKEN" is not set and has no default');
+    expect(doctor).toContain("additional configuration issue detected");
+    expect(doctor).not.toMatch(/SECRET_FIELD_CANARY|user:pass|credential\.value/u);
   });
 
   it("a working enabled server is never a finding (posture-line data instead)", () => {
@@ -2253,8 +2345,8 @@ describe("buildCompatReport", () => {
   });
 
   it("never leaks expanded command/args/env values into MCP findings", () => {
-    // Display hygiene: findings quote names and stored (raw/pre-expansion)
-    // diagnostics only — the EXPANDED fields must never reach a finding.
+    // Display hygiene: findings quote names and classify stored diagnostics;
+    // expanded fields and raw diagnostic values never reach a finding.
     const project = makeProject({
       mcp: makeMcp({
         servers: [
@@ -2448,9 +2540,9 @@ describe("MCP posture line in /doctor", () => {
       { name: "starting", transport: "http", state: "connecting" },
       { name: "down", transport: "http", state: "failed", diagnostic: "UNSAFE_DIAGNOSTIC_CANARY", statusSummary: "Safe permanent failure." },
     ]);
-    expect(doctor).toContain("up: connected (5 tool(s))");
-    expect(doctor).toContain("starting: connecting via http");
-    expect(doctor).toContain("down: failed via http (0 retained tool(s)) — Safe permanent failure.");
+    expect(doctor).toContain('"up": connected (5 tool(s))');
+    expect(doctor).toContain('"starting": connecting via http');
+    expect(doctor).toContain('"down": failed via http (0 retained tool(s)) — Safe permanent failure.');
     expect(doctor).not.toContain("UNSAFE_DIAGNOSTIC_CANARY");
   });
 
@@ -2487,7 +2579,7 @@ describe("MCP posture line in /doctor", () => {
       { name: "noisy", transport: "http", state: "failed", statusSummary: `safe ${"x".repeat(2000)}` },
     ]);
     const line = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
-    expect(line).toContain("noisy: failed");
+    expect(line).toContain('"noisy": failed');
     expect(line.length).toBeLessThan(600);
     expect(line).toContain("…");
   });
@@ -2507,9 +2599,9 @@ describe("MCP posture line in /doctor", () => {
       }),
     });
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("waiting: pending approval");
-    expect(doctor).toContain("declined: disabled (disabledMcpjsonServers)");
-    expect(doctor).toContain("remote: skipped — remote MCP transports");
+    expect(doctor).toContain('"waiting": pending approval');
+    expect(doctor).toContain('"declined": disabled (settings disabledMcpjsonServers)');
+    expect(doctor).toContain('"remote": skipped — configuration is unusable; check the MCP configuration and logs');
     // The posture line stays status-only; bounded least-authority approval and
     // decline guidance is available from both /mcp and the /doctor finding.
     const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
@@ -2525,8 +2617,8 @@ describe("MCP posture line in /doctor", () => {
       mcp: makeMcp({ servers: [makeMcpServer({ name: "unknown-state", status: "enabled" })] }),
     });
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("unknown-state: enabled");
-    expect(doctor).not.toContain("unknown-state: connected");
+    expect(doctor).toContain('"unknown-state": enabled');
+    expect(doctor).not.toContain('"unknown-state": connected');
   });
 });
 
