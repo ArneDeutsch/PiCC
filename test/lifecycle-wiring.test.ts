@@ -528,7 +528,7 @@ describe("lifecycle wiring", () => {
       process.chdir(fixture);
       process.env.PICC_CLAUDE_USER_DIR = userDir;
       const startupPi = fakePi();
-      startupPi.api.exec = async () => { throw new Error("Pi 0.82 pi.exec env path must not be used"); };
+      startupPi.api.exec = async () => { throw new Error("Pi's pi.exec env path must not be used"); };
       picc(startupPi.api as never, { onInitializationSettled: startupPi.captureInitialization });
       await startupPi.waitForInitialization();
       process.env.PICC_LAUNCHER_PID = "991";
@@ -729,7 +729,7 @@ describe("lifecycle wiring", () => {
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
 
-  it("maps Pi 0.82.0 session reasons to Claude SessionStart sources", async () => {
+  it("maps Pi session reasons to Claude SessionStart sources", async () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {

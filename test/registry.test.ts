@@ -881,7 +881,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const variable of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
       expect(bash?.note, variable).toContain(variable);
     }
-    expect(bash?.note).toContain("deliberately disables Pi 0.82");
+    expect(bash?.note).toContain("deliberately disables Pi's");
   });
 
   // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent

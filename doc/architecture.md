@@ -454,8 +454,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    failure closes the session and requires replacement. An unconfirmed-host ending is process-terminal:
    neither manual recovery nor in-process replacement is safe. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
-   at the logical settlement boundary, and `session_shutdown` joins checkpoint work and shuts down
-   the MCP servers before firing `SessionEnd`.
+   only at a successfully completed logical settlement boundary; logically unsuccessful outcomes
+   bypass ordinary Stop handling. `session_shutdown` joins checkpoint work and shuts down the MCP
+   servers before firing `SessionEnd`.
 
 ## Mechanical-fidelity decisions (load-bearing)
 
