@@ -101,11 +101,11 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see "Colors and themes"). The production install currently contains
-both PiCC's direct `pi-tui` dependency and Pi's nested copy. Structural components and stateless
-width helpers may cross that tested Pi 0.82 boundary; mutable singleton state and
-constructor-sensitive operations must resolve through `pi-tui-runtime.ts` from Pi's package
-context. Physical deduplication is optional, not assumed.
+argument **is** Pi's `Theme` (see "Colors and themes"). The supported package layout recorded in
+[`doc/pi-integration.md`](pi-integration.md) contains both PiCC's direct `pi-tui` dependency and Pi's
+nested copy. Structural components and stateless width helpers may cross that tested package
+boundary; mutable singleton state and constructor-sensitive operations must resolve through
+`pi-tui-runtime.ts` from Pi's package context. Physical deduplication is optional, not assumed.
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
@@ -378,7 +378,7 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 - **Custom transcript entries** — `pi.appendEntry(customType, data)` + `pi.registerEntryRenderer`
   (PiCC uses these for control-command output and appends checkpoint lifecycle records; entries do
   **not** enter LLM context). For custom *messages* that do participate, `pi.sendMessage` +
-  `pi.registerMessageRenderer`.
+  `pi.registerMessageRenderer`; its renderer receives `{ expanded: boolean; outputPad: number }`.
 - **CLI flags** — `pi.registerFlag(name, { type, default })` + `pi.getFlag(name)`.
 - **Terminal title** — `ctx.ui.setTitle(title)`.
 - **Autocomplete** — `ctx.ui.addAutocompleteProvider(factory)` stacks on the built-in provider.

@@ -5,6 +5,7 @@ import {
   createTaskOutputTool,
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
@@ -46,6 +47,74 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toMatch(API_DEATH);
     expect(result.error).toContain("429 rate limit exceeded");
     expect(result.finalMessage).toBe("");
+  });
+
+  it("fails closed on a terminal pending assistant response without retrying or reporting completion", async () => {
+    const h = fakeSdk({ replies: [{ text: "partial child output", stopReason: "pending" }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+
+    expect(result).toMatchObject({
+      ok: false,
+      outcome: "failed",
+      finalMessage: "partial child output",
+      error: "Agent ended with an incomplete pending assistant response.",
+    });
+    expect(result.terminalAssistantError).toBeUndefined();
+    expect(result.recoveryDisposition).toBeUndefined();
+    expect(h.promptCalls()).toBe(1);
+  });
+
+  it("retracts streamed content when the same response ends pending and final observation confirms it", () => {
+    const pending = {
+      role: "assistant",
+      content: [{ type: "text", text: "incomplete finding" }],
+      stopReason: "pending",
+    };
+    const progress = new SubagentRecoveryProgress([]);
+    progress.markObservationAvailable();
+    progress.consume({ type: "message_update", message: pending });
+    progress.consume({ type: "message_end", message: pending });
+    progress.observeMessages([pending]);
+    expect(progress.hasProgress()).toBe(false);
+  });
+
+  it("preserves streamed progress across an empty terminal error boundary and final history", () => {
+    const progress = new SubagentRecoveryProgress([]);
+    progress.markObservationAvailable();
+    progress.consume({
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "partial finding" }],
+        stopReason: "pending",
+      },
+    });
+    const terminalError = { role: "assistant", content: [], stopReason: "error" };
+    progress.consume({ type: "message_end", message: terminalError });
+    progress.observeMessages([terminalError]);
+    expect(progress.hasProgress()).toBe(true);
+  });
+
+  it.each([
+    ["an earlier completed assistant response", {
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "stop" },
+    }],
+    ["a started tool", { type: "tool_execution_start" }],
+  ])("preserves %s as progress across a later terminal pending response", (_name, earlierEvent) => {
+    const pending = {
+      role: "assistant",
+      content: [{ type: "text", text: "incomplete finding" }],
+      stopReason: "pending",
+    };
+    const progress = new SubagentRecoveryProgress([]);
+    progress.markObservationAvailable();
+    progress.consume(earlierEvent);
+    progress.consume({ type: "message_update", message: pending });
+    progress.consume({ type: "message_end", message: pending });
+    progress.observeMessages([pending]);
+    expect(progress.hasProgress()).toBe(true);
   });
 
   it("classifies transient zero-progress failures independently of usage", async () => {
@@ -533,6 +602,33 @@ describe("dispatch outcome classification", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toContain("aborted");
     expect(h.promptCalls()).toBe(1); // no continuation prompt after the abort
+  });
+
+  it("an external abort signal wins over a simultaneously terminal pending response", async () => {
+    const controller = new AbortController();
+    const h = fakeSdk({
+      onPrompt: (_text, session) => {
+        session.messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "incomplete finding" }],
+          stopReason: "pending",
+        });
+        controller.abort();
+      },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      abortSignal: controller.signal,
+    });
+
+    expect(result.outcome).toBe("aborted");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("aborted");
+    expect(result.error).not.toContain("pending assistant response");
+    expect(h.promptCalls()).toBe(1);
   });
 
   it("stopReason 'aborted' → outcome aborted, distinct from failed", async () => {

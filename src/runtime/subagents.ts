@@ -836,7 +836,7 @@ class ChildCheckpointCoordinator {
   extensionFactory() {
     const child = this;
     return (pi: { on(event: string, handler: (event: any, ctx: any) => unknown): void }) => {
-      pi.on("message_end", (event) => child.gate.assistantMessageEnded(event?.message));
+      pi.on("message_end", (event, ctx) => child.gate.assistantMessageEnded(event?.message, ctx));
       pi.on("message_start", (event) => child.gate.userMessageStarted(
         event?.message,
         event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
@@ -848,7 +848,7 @@ class ChildCheckpointCoordinator {
         await child.gate.defensiveLatch(ctx);
       });
       pi.on("before_provider_request", async (_event, ctx) => {
-        await child.gate.defensiveLatch(ctx);
+        await child.gate.beforeProviderRequest(ctx);
       });
       pi.on("agent_settled", async (_event, ctx) => child.settled(ctx));
       pi.on("session_before_compact", async (event) => child.beforeCompact(event));
@@ -1291,7 +1291,15 @@ class ChildCheckpointCoordinator {
       ? "checkpoint paused: recovery required"
       : event.category === "checkpoint-recovered"
         ? "checkpoint recovered: resuming"
-        : `checkpoint: ${event.category}`;
+        : event.category === "checkpoint-armed"
+          ? event.source === "assistant" || event.source === "tool"
+            ? "context checkpoint queued while the current tool cycle finishes"
+            : event.source === "admission"
+              ? "context checkpoint queued, waiting for safe child settlement"
+              : event.source === "settled"
+                ? "context checkpoint ready after the child run settled"
+                : "context checkpoint queued until the child reaches safe settlement"
+          : `checkpoint: ${event.category}`;
     this.emitProgress?.({ tail: [activity], activity });
     if (event.category === "checkpoint-exhausted") {
       this.diagnostics.push({ severity: "warning", message: this.failureMessage() });
@@ -2658,6 +2666,25 @@ export class SubagentRuntime {
             isFork,
             usage: captureUsage(),
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
+            diagnostics,
+          };
+        }
+        if (last?.stopReason === "pending") {
+          settledOutcome = "failed";
+          settledFinalText = assistantTextSoFar(live);
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: settledFinalText,
+            agentId,
+            transcriptPath,
+            resumable: actualResumable,
+            truncated: false,
+            isFork,
+            agentName: agent.name,
+            worktreePath,
+            usage: captureUsage(),
+            error: "Agent ended with an incomplete pending assistant response.",
             diagnostics,
           };
         }

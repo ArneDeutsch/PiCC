@@ -528,7 +528,7 @@ describe("lifecycle wiring", () => {
       process.chdir(fixture);
       process.env.PICC_CLAUDE_USER_DIR = userDir;
       const startupPi = fakePi();
-      startupPi.api.exec = async () => { throw new Error("Pi 0.82 pi.exec env path must not be used"); };
+      startupPi.api.exec = async () => { throw new Error("Pi's pi.exec env path must not be used"); };
       picc(startupPi.api as never, { onInitializationSettled: startupPi.captureInitialization });
       await startupPi.waitForInitialization();
       process.env.PICC_LAUNCHER_PID = "991";
@@ -697,6 +697,60 @@ describe("lifecycle wiring", () => {
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 
+  it("reports terminal main pending by mode without successful status or Stop continuation", async () => {
+    const pendingMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "partial response must not count as complete" }],
+      stopReason: "pending",
+    };
+    const savedExitCode = process.exitCode;
+    const savedConsoleError = console.error;
+    try {
+      for (const row of [
+        { label: "tui", mode: "tui", initialExitCode: undefined, expectedExitCode: undefined, notices: 1, stderr: 0, entries: 0 },
+        { label: "print", mode: "print", initialExitCode: undefined, expectedExitCode: 1, notices: 0, stderr: 1, entries: 0 },
+        { label: "json", mode: "json", initialExitCode: undefined, expectedExitCode: 1, notices: 0, stderr: 0, entries: 1 },
+        { label: "json checkpoint status", mode: "json", initialExitCode: 3, expectedExitCode: 3, notices: 0, stderr: 0, entries: 1 },
+        { label: "rpc", mode: "rpc", initialExitCode: undefined, expectedExitCode: undefined, notices: 0, stderr: 0, entries: 1 },
+      ] as const) {
+        const pendingPi = fakePi();
+        picc(pendingPi.api as never, { onInitializationSettled: pendingPi.captureInitialization });
+        await pendingPi.waitForInitialization();
+        const stderr: string[] = [];
+        console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+        process.exitCode = row.initialExitCode;
+        const ctx = row.mode === "tui"
+          ? pendingPi.tuiCtx()
+          : row.mode === "print"
+            ? pendingPi.printCtx()
+            : row.mode === "rpc"
+              ? pendingPi.rpcCtx()
+              : pendingPi.ctx({ mode: "json", hasUI: false });
+        ctx.sessionManager = { getBranch: () => [{ type: "message", message: pendingMessage }] };
+
+        await pendingPi.fire("agent_settled", {}, ctx);
+
+        expect(pendingPi.userMessages.filter((message) =>
+          String(message.content).includes("[Stop hook]")), row.label).toHaveLength(0);
+        expect(pendingPi.notifications, row.label).toHaveLength(row.notices);
+        if (row.notices) {
+          expect(pendingPi.notifications[0]).toMatchObject({
+            severity: "warning",
+            text: expect.stringContaining("ended incomplete (pending)"),
+          });
+        }
+        expect(stderr, row.label).toHaveLength(row.stderr);
+        if (row.stderr) expect(stderr[0]).toContain("ended incomplete (pending)");
+        expect(pendingPi.entries.filter((entry) =>
+          entry.customType === "picc-main-response-incomplete"), row.label).toHaveLength(row.entries);
+        expect(process.exitCode, row.label).toBe(row.expectedExitCode);
+      }
+    } finally {
+      console.error = savedConsoleError;
+      process.exitCode = savedExitCode;
+    }
+  });
+
   it("resets blocked Stop iteration state when the session is replaced", async () => {
     pi.userMessages.length = 0;
     for (let i = 0; i < 8; i++) await pi.fire("agent_settled", {}, pi.ctx());
@@ -707,7 +761,7 @@ describe("lifecycle wiring", () => {
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
 
-  it("maps Pi 0.82.0 session reasons to Claude SessionStart sources", async () => {
+  it("maps Pi session reasons to Claude SessionStart sources", async () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {

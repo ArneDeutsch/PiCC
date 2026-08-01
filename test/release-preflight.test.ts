@@ -18,10 +18,10 @@ const PI = [
 ];
 const temporary: string[] = [];
 function temp(prefix: string) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); temporary.push(dir); return dir;
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix))); temporary.push(dir); return dir;
 }
 function canonical(file: string) {
-  const real = fs.realpathSync(file);
+  const real = fs.realpathSync.native(file);
   return process.platform === "win32" ? real.toLowerCase() : real;
 }
 function fixture() {

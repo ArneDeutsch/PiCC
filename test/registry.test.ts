@@ -11,6 +11,7 @@ import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
+  PROACTIVE_COMPACTION_APIS,
   capabilityForToolName,
   lookupCapability,
 } from "../src/registry/capability-registry.js";
@@ -303,7 +304,28 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       parity: [/PiCC reliability hardening/, /NOT Claude Code transport\/retry parity/],
     });
-    const proactive = lookupCapability("feature.proactive-compaction-policy")?.note ?? "";
+    const proactiveCapability = lookupCapability("feature.proactive-compaction-policy");
+    const proactive = proactiveCapability?.note ?? "";
+    const supportedApis = [...PROACTIVE_COMPACTION_APIS]
+      .map((api, index, apis) => index === apis.length - 1 ? `and ${api}` : api)
+      .join(", ");
+    expect(proactiveCapability?.tier).toBe("partial");
+    expect(proactive).toContain(
+      `Admission is limited to main sessions and PiCC-created children using Pi's APIs: ${supportedApis}.`,
+    );
+    for (const boundary of [
+      /PiCC HARDENING/,
+      /Fresh successful tool-requesting assistant usage can queue/,
+      /already-requested tools finish/,
+      /turn_end handles the complete batch/,
+      /before_provider_request is the final idle-to-armed sample/,
+      /admission abort blocks ordinary provider transport/,
+      /agent_settled is the only boundary that may start one physical Pi compaction transaction if the checkpoint is still required/,
+      /only after no provider response or tool batch remains unresolved/,
+      /rather than verified Claude parity/,
+    ]) {
+      expect(proactive).toMatch(boundary);
+    }
     expect(proactive).toContain("feature.compaction-summary-recovery");
     expect(proactive).not.toMatch(
       /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
@@ -908,7 +930,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const variable of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
       expect(bash?.note, variable).toContain(variable);
     }
-    expect(bash?.note).toContain("deliberately disables Pi 0.82");
+    expect(bash?.note).toContain("deliberately disables Pi's");
   });
 
   // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent
