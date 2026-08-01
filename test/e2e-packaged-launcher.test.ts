@@ -83,7 +83,7 @@ afterAll(() => {
   for (const directory of tempDirs) {
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-});
+}, 120_000);
 
 describe("installed release tarball", () => {
   it.skipIf(!BASH_AVAILABLE)(
