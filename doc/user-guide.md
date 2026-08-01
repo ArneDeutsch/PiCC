@@ -153,7 +153,9 @@ cd /path/to/your-claude-project     # the one with CLAUDE.md and .claude/
 picc
 ```
 
-On startup PiCC loads these Claude Code artifacts:
+On startup PiCC loads these Claude Code artifacts. Paths beginning with `~/.claude` below are for
+the default user profile; see [Environment variables](#environment-variables) for the active
+user-profile base when an override is selected.
 
 | Artifact | Source |
 |---|---|
@@ -164,7 +166,7 @@ On startup PiCC loads these Claude Code artifacts:
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
+| MCP servers | native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific approval and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -211,7 +213,7 @@ does no reload, and `/new` starts a session without reloading plugin state.
 > it only when you explicitly ask it to remember something (e.g. "remember to…"). This is a
 > deliberate divergence from Claude Code, which also writes proactively. To restore Claude-Code-style
 > eager writes, add an instruction like this to the project's `CLAUDE.md` — or, to opt in without
-> modifying the target project, to your user-scope `~/.claude/CLAUDE.md`:
+> modifying the target project, to the active user profile's `CLAUDE.md`:
 >
 > ```markdown
 > ## Memory
@@ -276,16 +278,18 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
-  bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
-  `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
-  the type; other values do not. State and identity take priority as width narrows; the dispatch
-  description appears when space permits, and elapsed time and token usage appear only when known
-  and terminal width permits. Elapsed time runs
-  from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
-  at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
-  tree. Below the minimum useful identity-row width, per-agent rows become aggregate state glyphs.
-  Finished rows
+  no `TaskOutput` await needed. In row mode, each individually rendered active agent has an indented
+  status row and a stable second line for its current tool and primary argument, reasoning, assistant
+  or output text, or startup, work, retry, and capacity-waiting status. The second line updates in
+  place and disappears only when the agent completes, fails, stops, or is canceled. The status bubble is `◌`
+  while waiting for configured capacity, a spinner while running, `●` when done, `✗` when failed,
+  and `■` when stopped. Recognized `color:` frontmatter values tint the agent type; other values do
+  not. State and identity take priority as width narrows; the dispatch description appears when
+  space permits, and elapsed time and token usage appear only when known and terminal width permits.
+  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
+  time. The panel window contains at most eight agents, not eight physical lines; overflow markers
+  and `↑↓` navigation move it through the full tree. Below the minimum useful identity-row width,
+  per-agent rows and their activity lines become aggregate state glyphs. Finished rows
   linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
@@ -312,8 +316,9 @@ Every subagent is visible, both to you and to the coordinating model:
   text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
   admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
   line).
-- **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
-  detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
+- **Condensed transcript records.** Subagent output does not stream into the chat. The agent list
+  owns one bounded current-activity line; selected-agent detail owns multiline history and richer
+  live detail. Each depth-1 normal-path result replaces its pending call in the same
   tool row. A successful background acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That bounded record prioritizes the
@@ -464,11 +469,17 @@ excludes; project configuration overrides user configuration):
   If both user and project scopes set this knob and the project value is malformed, the safe
   default is used (not the still-valid user value).
 
-  For main sessions and PiCC-created subagents, PiCC checks at a completed assistant/tool
-  cycle. The complete requested tool batch finishes first. Once the threshold is reached,
-  PiCC pauses ordinary model requests, starts one Pi compaction transaction, and resumes the same
-  logical work; completed results and queued input remain pending. Pi can automatically recover an
-  eligible transient summary transport failure inside that transaction. Summary retries stay
+  For main sessions and PiCC-created subagents, final usage from a fresh successful assistant
+  response that requests tools can queue a checkpoint. When PiCC reports that checkpoint as queued,
+  continued already-requested tool activity is safe deferral, not another provider turn or a missed
+  checkpoint; high displayed context by itself does not prove that a checkpoint is armed. Before
+  admitting another ordinary model request, PiCC samples usage again and
+  blocks the ordinary request before provider transport if newly known threshold pressure requires a
+  checkpoint. Only after the run and its complete tool batch settle may PiCC start one Pi compaction
+  transaction and resume the same
+  logical work; it never compacts across an unresolved provider response or tool batch. Completed
+  results and queued input remain pending. Pi can automatically recover an eligible transient summary
+  transport failure inside that transaction. Summary retries stay
   bounded by Pi's configured summarization retry policy; PiCC-created subagents use Pi's in-memory
   defaults. Cancelling a main
   checkpoint stops PiCC continuation but may wait for Pi's configured summary retries to settle;
@@ -531,7 +542,8 @@ administration, so settings such as `GIT_DIR` cannot redirect those maintenance 
 
 | Variable | Effect |
 |---|---|
-| `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
+| `PICC_CLAUDE_USER_DIR` | Highest-priority user-profile directory override for user-scoped settings/artifacts, imported installed-plugin state/data, memory, and native state; project/managed contributions and supplementary authorized plugin roots remain |
+| `CLAUDE_CONFIG_DIR` | Same user-profile-backed scope as `PICC_CLAUDE_USER_DIR`, used when that higher-priority override is unset |
 | `PICC_GIT` | Absolute path to the Git executable for PiCC-owned source-update and worktree operations; overrides PATH discovery |
 | `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
@@ -580,6 +592,37 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
+**MCP server configuration and gates.** PiCC reads native Claude state without modifying it. The
+default profile uses user-scoped settings and artifacts under `~/.claude` with native MCP state in
+`~/.claude.json`. `PICC_CLAUDE_USER_DIR`, then `CLAUDE_CONFIG_DIR`, can select a different coherent
+user profile for user-scoped settings and artifacts, imported installed-plugin state and data,
+memory, and native state. Project and managed contributions plus supplementary authorized plugin
+roots remain in effect.
+
+Native definitions resolve as whole entries in local → project `.mcp.json` → user order; the PiCC
+settings `mcpServers` compatibility extension is lower priority, with its existing managed →
+untracked local → project → user ordering. Fields never merge across same-name definitions. Native
+user and local winners start without the project approval gate. Project `.mcp.json` and committed
+project-settings extension winners remain pending until approved as described below. An exact name
+in the selected native project's `disabledMcpServers` disables an authentic native or `.mcp.json`
+winner before expansion. `enabledMcpServers` is recognized and reported but cannot activate
+Claude's default-off built-ins. Native MCP management through Claude Code must target the same
+active user profile. When PiCC uses `PICC_CLAUDE_USER_DIR`, run Claude Code for that maintenance
+operation with `CLAUDE_CONFIG_DIR` pointing to the same directory; otherwise Claude Code may update
+a different profile.
+
+For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
+select the same record. A verified linked worktree also considers its main checkout identity. This
+is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
+
+A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
+present but unusable (for example, malformed or unreadable), PiCC starts no MCP server and emits a
+bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
+command: restore a known-good backup of the active profile or its native state. If no
+known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC
+after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
+These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
+
 **Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
 the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient
 environment that launches PiCC, not Claude `settings.env`:
@@ -617,10 +660,12 @@ remain untrusted, server-controlled model content.
 Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
 `.claude/settings.json`) are pending by default and never start until you approve them. Approve
 selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
-untracked `.claude/settings.local.json`. `enableAllProjectMcpServers` trusts current and future
-project servers; `disabledMcpjsonServers` declines named servers and wins over approval. Approvals in
-a git-tracked `settings.local.json` do not work; create approval content yourself rather than
-reusing project-supplied content.
+untracked `.claude/settings.local.json`. User approval settings live in `settings.json` inside the
+active user profile directory (`~/.claude/settings.json` by default, or inside the selected override
+directory). `enableAllProjectMcpServers` trusts current and future project servers;
+`disabledMcpjsonServers` declines named servers and wins over approval. Approvals in a git-tracked
+`settings.local.json` do not work; create approval content yourself rather than reusing
+project-supplied content.
 
 Approval is persisted by sanitized server name, not by a command, URL, or header fingerprint. A
 later project revision can change a same-name definition without another approval. Re-review project
@@ -698,7 +743,7 @@ behaviors worth knowing:
 | The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | Plugin policy is ignored or a weaker Windows policy did not apply | `/doctor` identifies the safe source class, not a concrete file or path. For `system-file` or `registry-hklm`, ask the administrator to inspect that class; for `system-drop-in`, ask the administrator to inspect every JSON drop-in. For `registry-hkcu` or `override`, inspect the corresponding user fallback or override input. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | A plugin root or component is rejected | Reinstall the plugin through Claude Code rather than moving files or treating an environment/catalog path as a substitute for the exact record. PiCC rejects declarations or content that are malformed, escaping, missing, unreadable, the wrong kind, or no longer resolve to the same contained target. After reinstalling, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
-| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user directory (`~/.claude` by default, or the `PICC_CLAUDE_USER_DIR` override), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. For ownership, writability, or wrong-directory-kind failures, repair the filesystem and retry the affected skill, hook, or agent action without reloading. If integrity or context must instead be reconciled or the plugin reinstalled through Claude Code, then use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. The affected execution did not occur. |
+| Plugin activation or agent start reports a persistent-data failure | The failure may name a qualified identity or only a manifest-visible component or agent namespace. Inspect the `plugins/data/` base in the active Claude user-profile directory (see "Environment variables" for profile selection), correlating the affected entry through enabled settings and Claude Code's installed-plugin view when needed. Diagnostics intentionally omit absolute paths. For ownership, writability, or wrong-directory-kind failures, repair the filesystem and retry the affected skill, hook, or agent action without reloading. If integrity or context must instead be reconciled or the plugin reinstalled through Claude Code, then use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. The affected execution did not occur. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
 

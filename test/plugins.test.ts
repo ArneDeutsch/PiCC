@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +6,6 @@ import type { EffectivePluginEnablement, NormalizedPluginInstallation } from "..
 import {
   loadPluginHooks,
   resolveInstalledPlugins,
-  resolvePluginProjectAnchors,
 } from "../src/claude/plugins.js";
 
 let tmpRoot: string;
@@ -43,7 +41,7 @@ const fileLinkProbe = (() => {
 })();
 
 beforeEach(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-"));
+  tmpRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-")));
   userDir = path.join(tmpRoot, "home", ".claude");
   projectRoot = path.join(tmpRoot, "project");
   fs.mkdirSync(path.join(userDir, "plugins", "cache"), { recursive: true });
@@ -244,28 +242,24 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
   });
 
-  it("applies a main-checkout project record to its genuine linked worktree but rejects copied foreign indirection", () => {
+  it("applies a main-checkout project record through verified linked-worktree metadata but rejects copied foreign indirection", () => {
     const main = path.join(tmpRoot, "main");
     const worktree = path.join(tmpRoot, "linked");
-    fs.mkdirSync(main);
-    execFileSync("git", ["init"], { cwd: main, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: main });
-    write(path.join(main, "tracked.txt"), "tracked");
-    execFileSync("git", ["add", "."], { cwd: main });
-    execFileSync("git", ["-c", "user.name=Test", "commit", "-m", "fixture"], { cwd: main, stdio: "ignore" });
-    execFileSync("git", ["worktree", "add", "-b", "linked-test", worktree], { cwd: main, stdio: "ignore" });
+    const admin = path.join(main, ".git", "worktrees", "linked");
+    fs.mkdirSync(worktree, { recursive: true });
+    write(path.join(worktree, ".git"), `gitdir: ${admin}`);
+    write(path.join(admin, "gitdir"), path.join(worktree, ".git"));
+    write(path.join(admin, "commondir"), "../..");
     const installation = record({ scope: "project", projectPath: main });
 
     projectRoot = worktree;
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("loaded");
-    expect(resolvePluginProjectAnchors(worktree)).toEqual({ projectRoot: fs.realpathSync.native(worktree), mainCheckout: fs.realpathSync.native(main) });
 
     const foreign = path.join(tmpRoot, "foreign");
     fs.mkdirSync(foreign);
     fs.copyFileSync(path.join(worktree, ".git"), path.join(foreign, ".git"));
     projectRoot = foreign;
     expect(resolve({ installations: [installation] }).outcomes[0]!.status).toBe("enabled-but-uninstalled");
-    expect(resolvePluginProjectAnchors(foreign).mainCheckout).toBeUndefined();
 
     const malformed = path.join(tmpRoot, "malformed-worktree");
     fs.mkdirSync(malformed);

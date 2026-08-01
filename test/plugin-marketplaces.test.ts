@@ -462,7 +462,7 @@ describe("loadPluginMarketplaceState", () => {
     expect(JSON.stringify(result)).not.toMatch(/raw-secret|user:secret|token=x/);
   });
 
-  it("resolves linked-worktree project sources from the validated main checkout and rejects forged linkage", () => {
+  it("anchors linked-worktree project sources to only a bounded, reciprocally verified main checkout", () => {
     const root = temporaryRoot();
     const main = path.join(root, "main");
     const worktree = path.join(root, "worktree");
@@ -479,6 +479,13 @@ describe("loadPluginMarketplaceState", () => {
 
     const valid = loadPluginMarketplaceState({ userDir: path.join(root, ".claude"), projectRoot: worktree, seedDirs: [], settings: contribution });
     expect(valid.selectedRegistrations[0]?.catalogPath).toBe(path.join(main, "vendor", ".claude-plugin", "marketplace.json"));
+
+    const pointer = `gitdir: ${admin}\n`;
+    fs.writeFileSync(path.join(worktree, ".git"), pointer + " ".repeat(16 * 1024 + 1));
+    const oversized = loadPluginMarketplaceState({ userDir: path.join(root, ".claude"), projectRoot: worktree, seedDirs: [], settings: contribution });
+    expect(oversized.selectedRegistrations).toEqual([]);
+    expect(oversized.registrations[0]?.validity).toBe("rejected");
+    fs.writeFileSync(path.join(worktree, ".git"), pointer);
 
     fs.writeFileSync(path.join(admin, "gitdir"), path.join(root, "forged", ".git"));
     const forged = loadPluginMarketplaceState({ userDir: path.join(root, ".claude"), projectRoot: worktree, seedDirs: [], settings: contribution });

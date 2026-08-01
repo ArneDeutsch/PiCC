@@ -106,11 +106,15 @@ hierarchies, and they are not the same set:
 recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
 than dropped.
 
-**MCP server config** is a third input: the project `.mcp.json` plus scope-tagged `mcpServers`
-blocks from the settings hierarchy, resolved here (`discovery/mcp.ts`) by whole-entry precedence
-and the enablement gate — project-origin servers stay pending until approved from a user-authored
-scope, and a git-tracked `settings.local.json` is demoted to project scope so a cloned repo can
-never self-approve.
+**MCP server config** is a third input: read-only native Claude user/project-local state, project
+`.mcp.json`, and the subordinate PiCC `mcpServers` settings extension. `discovery/claude-profile.ts`
+selects one coherent user profile, the native loader uses canonical project identities, and
+`discovery/mcp.ts` resolves whole entries in native local → `.mcp.json` → native user → settings
+extension order before any expansion. Project `.mcp.json` and project-origin extension servers stay
+pending until approved from a user-authored settings scope; native local/user definitions instead
+use native runtime disablement. A git-tracked `settings.local.json` is demoted to project scope so a
+cloned repo can never self-approve. Present-but-unusable authoritative native state fails MCP closed,
+while an absent native state file preserves the other inputs.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -123,16 +127,20 @@ artifact's *content*.
 ### `claude/` — parse each artifact format (loaders only, no runtime)
 
 One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
-with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json` and settings
-`mcpServers` blocks, `mcp-config.ts`), and installed-plugin content. `src/project.ts` — at
-the source root, *above* the loaders, importing both `discovery/` and `claude/` — orchestrates them
+with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json`, native Claude state,
+and settings `mcpServers` blocks; `mcp-config.ts` and `claude-mcp-state.ts`), and installed-plugin
+content. `src/project.ts` — at the source root, *above* the loaders, importing both `discovery/` and
+`claude/` — orchestrates them
 into one loaded project model. It sits outside this folder precisely because it depends on both:
 a loader knows one format and nothing else.
 
 Invariants across the folder:
 
-- **Loaders never throw.** Malformed input degrades to an empty value plus a diagnostic. A broken
-  project must never crash the harness: `src/index.ts` catches load failure and returns quietly.
+- **Loaders never throw.** Malformed ordinary input degrades to an empty value plus a diagnostic.
+  Authoritative native MCP state is the deliberate exception: absence is empty, but a present
+  unusable file returns an explicit fail-closed result so uncertainty cannot activate lower MCP
+  sources. A broken project must never crash the harness: `src/index.ts` catches load failure and
+  returns quietly.
 - **Progressive disclosure is a hard requirement, not an optimization.** Skill frontmatter is
   parsed; the body is **never** stored on the returned object and is re-read only on activation. A
   change that eagerly holds bodies defeats the whole design.
@@ -292,9 +300,14 @@ where to start reading, not the extent of its cluster.
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
-  in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
-  stopping, one Pi-owned compaction transaction, queued-input reconciliation, resume, cancellation, and
-  exhaustion. Confirmed pre-commit operational or hook exhaustion remains recoverable in-session;
+  in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
+  tool-requesting assistant usage, queues threshold pressure while the requested tools finish, handles
+  complete batches at `turn_end`, and samples again at final provider admission. Newly known pressure
+  blocks that ordinary request before provider transport. `agent_settled` is the only boundary that
+  may start one physical Pi-owned compaction transaction if the checkpoint is still required, and only
+  after no provider response or tool batch remains unresolved; the controller then owns queued-input
+  reconciliation, resume, cancellation, and exhaustion. Confirmed pre-commit operational or hook
+  exhaustion remains recoverable in-session;
   any post-commit restoration, replay, or continuation-start failure is terminal for that session.
   If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
   confirm host quiescence: admission and recovery stay closed, and in-process controller replacement
@@ -439,12 +452,17 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    subagent by agent id or steers a running background one — never a user-stopped one; a panel stop
    is permanent.
 
-7. **Cycle boundary / compaction / shutdown.** After a complete assistant/tool cycle reaches
-   `proactiveCompactPercent`, the session-local controller stops another ordinary request, awaits
-   one `ctx.compact()` transaction (or the child SDK equivalent), lets Pi own eligible retries inside it, and resumes the same
-   logical run only after restoration and queued-input reconciliation. The controller permits its
-   own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
-   abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.
+7. **Cycle boundary / compaction / shutdown.** On supported model APIs, final usage from a fresh
+   successful assistant response that requests tools can queue threshold pressure while the requested
+   tools finish. `turn_end` handles the complete batch; immediately before any next ordinary provider
+   request, the controller samples again and blocks transport when newly known pressure arms the
+   checkpoint. `agent_settled` is the only boundary that may start one physical compaction transaction
+   if the checkpoint is still required, and only after provider and tool work is resolved. It then
+   awaits `ctx.compact()` (or the child SDK equivalent), lets Pi own eligible retries inside that one
+   transaction, and resumes the same logical run after restoration and queued-input
+   reconciliation. The controller permits its own summary request through the provider gate. Mixed,
+   blocked, malformed, or queued tool paths abort and settle before compaction; the settled sample
+   also remains a non-resuming fallback.
    `session_before_compact` / `session_compact` fire compact hooks and restore bounded
    SessionStart(compact) context followed by recent active skill bodies within PiCC's heuristic
    character budget; PostCompact output is diagnostic-only, and the system-prompt
@@ -454,8 +472,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    failure closes the session and requires replacement. An unconfirmed-host ending is process-terminal:
    neither manual recovery nor in-process replacement is safe. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
-   at the logical settlement boundary, and `session_shutdown` joins checkpoint work and shuts down
-   the MCP servers before firing `SessionEnd`.
+   only at a successfully completed logical settlement boundary; logically unsuccessful outcomes
+   bypass ordinary Stop handling. `session_shutdown` joins checkpoint work and shuts down the MCP
+   servers before firing `SessionEnd`.
 
 ## Mechanical-fidelity decisions (load-bearing)
 

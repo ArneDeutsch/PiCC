@@ -54,7 +54,7 @@ export function useRealSessionManager(sm: RealSessionManager): void {
 export interface FakeReply {
   text?: string;
   /** Pi StopReason vocabulary; defaults to "stop". */
-  stopReason?: "stop" | "length" | "toolUse" | "error" | "aborted";
+  stopReason?: "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
   errorMessage?: string;
   /** Await this before replying — lets tests hold a prompt open (abort/concurrency). */
   gate?: Promise<void>;

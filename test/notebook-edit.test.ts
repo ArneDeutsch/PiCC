@@ -7,6 +7,7 @@ import { buildStockBuiltinTools, type BuiltinToolSdk } from "../src/runtime/buil
 import { CwdState } from "../src/runtime/cwd-state.js";
 import {
   NotebookSessionState,
+  canonicalNotebookPath,
   identifyNotebookHandle,
   inspectNotebookHandle,
   newestNotebookSessionSnapshot,
@@ -786,7 +787,7 @@ describe("NotebookEdit compatibility, failure, and filesystem matrix", () => {
       let calls = 0;
       const raw = `SECRET_OS_${seam}_${path.join(dir, "canonical-target")}`;
       const fileOps = seam === "resolve"
-        ? { resolve: async (value: string) => { if (++calls === 2) throw new Error(raw); return fs.realpathSync(value); } }
+        ? { resolve: async (value: string) => { if (++calls === 2) throw new Error(raw); return canonicalNotebookPath(value); } }
         : seam === "open"
           ? { open: async (...args: Parameters<typeof import("node:fs/promises").open>) => {
               if (++calls === 2) throw new Error(raw);
@@ -980,7 +981,7 @@ describe("NotebookEdit compatibility, failure, and filesystem matrix", () => {
         resolve: async (value) => {
           resolves++;
           if ((point === "before" && resolves === 1) || (point === "inside" && resolves === 2)) controller.abort();
-          return fs.realpathSync(value);
+          return canonicalNotebookPath(value);
         },
         inspect: async (...args) => {
           const result = await inspectNotebookHandle(...args);

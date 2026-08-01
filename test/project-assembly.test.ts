@@ -40,7 +40,7 @@ const directoryLinkProbe = (() => {
 })();
 
 function makeTmp(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-"));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-")));
   tempDirs.push(dir);
   return dir;
 }
@@ -208,6 +208,32 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.pluginInventory.lifetime).toBe("command");
     expect(project.pluginInventory.refreshGuidance).toBe("Captured for this command; run the command again to refresh.");
     expect(project.pluginInventory.refreshGuidance).not.toContain("/reload");
+  });
+
+  it("classifies the canonical active project and distinct main checkout in linked-worktree inventory", () => {
+    const base = makeTmp();
+    const main = path.join(base, "main");
+    const linked = path.join(base, "linked");
+    const userDir = path.join(base, "home", ".claude");
+    const admin = path.join(main, ".git", "worktrees", "linked");
+    fs.mkdirSync(linked, { recursive: true });
+    write(path.join(linked, ".git"), `gitdir: ${admin}`);
+    write(path.join(admin, "gitdir"), path.join(linked, ".git"));
+    write(path.join(admin, "commondir"), "../..");
+    makeMarketplacePlugin(userDir, "official", "alpha");
+    const statePath = path.join(userDir, "plugins", "installed_plugins.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      plugins: Record<string, Array<Record<string, unknown>>>;
+    };
+    Object.assign(state.plugins["alpha@official"]![0]!, { scope: "project", projectPath: main });
+    write(statePath, JSON.stringify(state));
+    write(path.join(linked, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+
+    const item = load(linked, userDir).pluginInventory.find("alpha@official")!;
+
+    expect(item.enablement?.source).toEqual({ kind: "project", display: "<project>/.claude/settings.json" });
+    expect(item.selectedInstallation?.project).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
+    expect(item.installations[0]?.projectLocation).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
   });
 
   it("keeps a locally cataloged plugin observational when no installed record exists", () => {

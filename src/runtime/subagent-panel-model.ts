@@ -1,3 +1,4 @@
+import type { SubagentLiveActivity } from "./subagent-progress.js";
 import type { SubagentRegistryRecord, SubagentUsage } from "./subagent-registry.js";
 
 /**
@@ -103,6 +104,8 @@ export interface PanelRowView {
   elapsedMs: number;
   /** Live-accumulated or settlement usage (settled wins); absent until known. */
   usage?: SubagentUsage;
+  /** Current activity for active rows only; copied from the registry or model fallback. */
+  activity?: SubagentLiveActivity;
   selected: boolean;
   /** Descendants hidden by the overflow window — the `(+N)` chip; 0 = none. */
   hiddenDescendants: number;
@@ -184,6 +187,31 @@ function expiryOf(
   if (endpoint === undefined) return undefined;
   const linger = state === "success" ? LINGER_SUCCESS_MS : LINGER_FAILURE_MS;
   return endpoint + linger;
+}
+
+/** Stable active-line activity, with capacity waiting authoritative over captured runtime state. */
+function activityOf(record: SubagentRegistryRecord, state: PanelRowState): SubagentLiveActivity | undefined {
+  if (state === "waiting") return { kind: "status", text: "Waiting for capacity" };
+  if (state !== "running") return undefined;
+  try {
+    const activity = record.liveActivity;
+    if (activity?.kind === "tool" && typeof activity.tool === "string") {
+      return typeof activity.detail === "string"
+        ? { kind: "tool", tool: activity.tool, detail: activity.detail }
+        : { kind: "tool", tool: activity.tool };
+    }
+    if (
+      activity &&
+      (activity.kind === "reasoning" || activity.kind === "assistant" ||
+        activity.kind === "output" || activity.kind === "status") &&
+      typeof activity.text === "string"
+    ) {
+      return { kind: activity.kind, text: activity.text };
+    }
+  } catch {
+    // Compatibility records may expose malformed activity; the stable line still gets a fallback.
+  }
+  return { kind: "status", text: record.progress === undefined ? "Starting agent…" : "Working…" };
 }
 
 /** Internal pre-window row: PanelRowView minus the window-dependent fields. */
@@ -282,6 +310,7 @@ export class SubagentPanelModel {
         flat.state === "running" || flat.state === "waiting"
           ? nowMs
           : (terminalAt(record, flat.state, flat.taskSettledAt) ?? record.startedAt);
+      const activity = activityOf(record, flat.state);
       rows.push({
         key: flat.key,
         keyId: flat.keyId,
@@ -294,6 +323,7 @@ export class SubagentPanelModel {
         color: record.color,
         elapsedMs: Math.max(0, elapsedEnd - record.startedAt),
         usage: record.state === "settled" ? (record.usage ?? record.progress?.usage) : record.progress?.usage,
+        ...(activity ? { activity } : {}),
         selected: selIndex === i,
         hiddenDescendants,
       });
@@ -344,9 +374,9 @@ export class SubagentPanelModel {
    * are always excluded; linger expiry applies only while unfocused (focus
    * freezes ALL removals). Tree: each visible record parents to its NEAREST
    * VISIBLE ancestor via the parentAgentId chain (an expired or dismissed
-   * parent's still-visible children re-root rather than dangle); siblings sort
-   * admitted-running before waiting before settled, then by startedAt and registration order
-   * (stable). Handles arbitrary depth; a parent cycle degrades to a root.
+   * parent's still-visible children re-root rather than dangle); active siblings preserve
+   * startedAt/registration order across waiting↔running transitions, ahead of settled siblings.
+   * Handles arbitrary depth; a parent cycle degrades to a root.
    */
   private flatten(input: PanelComputeInput): FlatRow[] {
     const nowMs = this.now();
@@ -408,7 +438,7 @@ export class SubagentPanelModel {
     }
     const byGroupOrder = (a: FlatRow & { order: number }, b: FlatRow & { order: number }) => {
       const rank = (state: PanelRowState): number =>
-        state === "running" ? 0 : state === "waiting" ? 1 : 2;
+        state === "running" || state === "waiting" ? 0 : 1;
       const stateRank = rank(a.state) - rank(b.state);
       if (stateRank !== 0) return stateRank;
       if (a.record.startedAt !== b.record.startedAt) return a.record.startedAt - b.record.startedAt;

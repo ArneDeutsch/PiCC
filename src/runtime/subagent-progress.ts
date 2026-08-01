@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { formatToolDisplayName } from "./tool-display.js";
 
 /**
  * Subagent live-progress condenser.
@@ -16,8 +17,9 @@ import { createHash } from "node:crypto";
  *     or a silent auto-retry wait - "waiting: API retry 2/3"), and
  *   - accumulated token `usage`, absent until the first usage-bearing event.
  *
- * Beside the snapshot, the condenser keeps a typed structured detail log.
- * It is capture-sanitized and hard-bounded and never enters model-facing progress.
+ * Beside the snapshot, the condenser keeps a typed structured detail log and
+ * an independent current-activity atom. Both are capture-sanitized, hard-bounded,
+ * and excluded from model-facing progress.
  *
  * SANITIZATION IS SECURITY, NOT COSMETICS: the tail replays subagent-controlled
  * text (its assistant output and - deliberately truncated - its tool results,
@@ -43,6 +45,14 @@ export interface SnapshotUsage {
   cacheWriteTokens?: number;
   costUsd?: number;
 }
+
+/** One bounded, sanitized description of a running subagent's current activity. */
+export type SubagentLiveActivity =
+  | { kind: "tool"; tool: string; detail?: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "assistant"; text: string }
+  | { kind: "output"; text: string }
+  | { kind: "status"; text: string };
 
 /** One bounded, sanitized event for the selected-agent detail view. */
 export type SubagentDetailEntry =
@@ -77,6 +87,8 @@ export const DETAIL_LOG_MAX_ENTRIES = 100;
 export const DETAIL_FIELD_MAX_LENGTH = 300;
 /** Maximum raw code units inspected when sanitizing a malformed detail scalar. */
 const DETAIL_RAW_INSPECTION_LIMIT = 4096;
+/** Active calls retained exactly; excess or unidentifiable calls stay explicitly uncertain. */
+const ACTIVE_TOOL_TRACKING_LIMIT = 128;
 /** Fixed work ceilings for a tool outcome, including payloads with no visible text. */
 export const TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT = 64;
 export const TOOL_OUTCOME_RAW_INSPECTION_LIMIT = 4096;
@@ -248,16 +260,17 @@ export function assistantTextFingerprint(parts: Iterable<unknown>): string {
 }
 
 function* messageTextParts(message: unknown): Iterable<unknown> {
-  const content = (message as { content?: unknown } | undefined)?.content;
+  const content = safeField(message, "content");
   if (typeof content === "string") {
     yield content;
     return;
   }
-  if (!Array.isArray(content)) return;
-  for (const block of content) {
-    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
-      yield (block as { text?: unknown }).text;
-    }
+  if (!safeArray(content)) return;
+  const rawLength = safeField(content, "length");
+  if (typeof rawLength !== "number" || !Number.isSafeInteger(rawLength) || rawLength < 0) return;
+  for (let i = 0; i < rawLength; i++) {
+    const block = safeField(content, i);
+    if (safeField(block, "type") === "text") yield safeField(block, "text");
   }
 }
 
@@ -469,6 +482,50 @@ function lastLegacyNonEmptyLine(parts: Iterable<unknown>, maxLen: number): Bound
   return result;
 }
 
+interface RawInspectionBudget {
+  inspected: number;
+}
+
+/** Newest logical line found within one shared raw-inspection budget. */
+function lastSafeNonEmptyLine(
+  value: unknown,
+  maxLen: number,
+  budget: RawInspectionBudget,
+): BoundedLine {
+  if (typeof value !== "string") return { found: false, value: "" };
+  let current = new BoundedScalarAccumulator(maxLen);
+  let currentFound = false;
+  let result: BoundedLine = { found: false, value: "" };
+  const emit = (): void => {
+    const text = current.value();
+    if (currentFound && text) result = { found: true, value: text };
+    current = new BoundedScalarAccumulator(maxLen);
+    currentFound = false;
+  };
+  for (const ch of value) {
+    if (budget.inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break;
+    budget.inspected += ch.length;
+    if (ch === "\n" || ch === "\r") {
+      emit();
+      continue;
+    }
+    if (!/\s/u.test(ch)) currentFound = true;
+    current.feed(ch, ch.codePointAt(0)!);
+  }
+  emit();
+  return result;
+}
+
+function indexedPartialBlock(metadata: unknown): unknown {
+  const index = safeField(metadata, "contentIndex");
+  if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 0) return undefined;
+  const content = safeField(safeField(metadata, "partial"), "content");
+  if (!safeArray(content)) return undefined;
+  const length = safeField(content, "length");
+  if (typeof length !== "number" || !Number.isSafeInteger(length) || index >= length) return undefined;
+  return safeField(content, index);
+}
+
 interface ToolOutcomePreview {
   found: boolean;
   snapshotLine: string;
@@ -525,17 +582,16 @@ function asNumber(value: unknown): number | undefined {
  * honest measured zeros and are kept (mirroring `usageFromStats`).
  */
 function messageUsage(message: unknown): SnapshotUsage | undefined {
-  const usage = (message as { usage?: unknown } | undefined)?.usage;
+  const usage = safeField(message, "usage");
   if (!usage || typeof usage !== "object") return undefined;
-  const u = usage as Record<string, unknown>;
-  const total = asNumber(u.totalTokens);
+  const total = asNumber(safeField(usage, "totalTokens"));
   if (total === undefined || total <= 0) return undefined;
-  const cost = asNumber((u.cost as Record<string, unknown> | undefined)?.total);
+  const cost = asNumber(safeField(safeField(usage, "cost"), "total"));
   return {
-    inputTokens: asNumber(u.input) ?? 0,
-    outputTokens: asNumber(u.output) ?? 0,
-    cacheReadTokens: asNumber(u.cacheRead) ?? 0,
-    cacheWriteTokens: asNumber(u.cacheWrite) ?? 0,
+    inputTokens: asNumber(safeField(usage, "input")) ?? 0,
+    outputTokens: asNumber(safeField(usage, "output")) ?? 0,
+    cacheReadTokens: asNumber(safeField(usage, "cacheRead")) ?? 0,
+    cacheWriteTokens: asNumber(safeField(usage, "cacheWrite")) ?? 0,
     costUsd: cost ?? 0,
   };
 }
@@ -555,9 +611,8 @@ function addUsage(a: SnapshotUsage | undefined, b: SnapshotUsage): SnapshotUsage
 /** A short, safe hint of a tool call's target (path/command/query), if any. */
 function argumentDetail(args: unknown): string | undefined {
   if (!args || typeof args !== "object") return undefined;
-  const a = args as Record<string, unknown>;
   for (const key of ["command", "file_path", "path", "pattern", "query", "url", "description"]) {
-    const detail = boundedScalar([a[key]]);
+    const detail = boundedScalar([safeField(args, key)]);
     if (detail) return detail;
   }
   return undefined;
@@ -565,9 +620,8 @@ function argumentDetail(args: unknown): string | undefined {
 
 function argHint(args: unknown, maxLen: number): string {
   if (!args || typeof args !== "object") return "";
-  const a = args as Record<string, unknown>;
   for (const key of ["command", "file_path", "path", "pattern", "query", "url", "description"]) {
-    const value = a[key];
+    const value = safeField(args, key);
     if (typeof value === "string" && /\S/u.test(value)) {
       return ` (${legacyScalar([value], Math.min(maxLen, 60))})`;
     }
@@ -575,17 +629,48 @@ function argHint(args: unknown, maxLen: number): string {
   return "";
 }
 
+interface ActiveTool {
+  readonly tool: string;
+  readonly detail?: string;
+}
+
+/** Stable identity without retaining raw provider IDs or correlating truncated display text. */
+function toolCallIdentity(rawId: unknown): string | undefined {
+  if (typeof rawId !== "string" || rawId.length === 0 || rawId.length > DETAIL_RAW_INSPECTION_LIMIT) {
+    return undefined;
+  }
+  return createHash("sha256").update(rawId, "utf16le").digest("hex");
+}
+
+function copiedLiveActivity(value: SubagentLiveActivity | undefined): SubagentLiveActivity | undefined {
+  return value ? { ...value } : undefined;
+}
+
+function sameLiveActivity(a: SubagentLiveActivity | undefined, b: SubagentLiveActivity | undefined): boolean {
+  if (a?.kind !== b?.kind) return false;
+  if (!a || !b) return a === b;
+  if (a.kind === "tool" || b.kind === "tool") {
+    return a.kind === "tool" && b.kind === "tool" && a.tool === b.tool && a.detail === b.detail;
+  }
+  return a.text === b.text;
+}
+
 /**
- * Folds a subagent's event stream into a bounded, sanitized {@link ProgressSnapshot}.
- * Pure and deterministic - no timers, no I/O. `consume()` returns whether the
- * VISIBLE snapshot changed, so the caller emits an `onUpdate` only on real
- * change (identical-snapshot dedupe is the throttle; the interactive UI further
- * coalesces renders on its own).
+ * Folds a subagent's event stream into independent legacy progress, structured
+ * detail, and current live-activity projections. Pure and deterministic: no
+ * timers or I/O. `consume()` reports only legacy {@link ProgressSnapshot}
+ * changes; callers read the other two change signals separately.
  */
 export class SubagentProgressCondenser {
   private readonly tail: string[] = [];
   private readonly detailLogBuffer: SubagentDetailEntry[] = [];
+  private readonly activeTools = new Map<string, ActiveTool>();
   private detailChangedOnLastConsume = false;
+  private liveActivityChangedOnLastConsume = false;
+  private currentLiveActivity: SubagentLiveActivity | undefined;
+  private streamedLine = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
+  private streamedKind: "reasoning" | "assistant" | undefined;
+  private untrackedToolActivity = false;
   private activity = "";
   /** Usage summed over COMPLETED turns; folded at each turn_end. */
   private settledUsage: SnapshotUsage | undefined;
@@ -607,125 +692,161 @@ export class SubagentProgressCondenser {
   }
 
   /**
-   * Consume one session event. Returns `true` iff the resulting snapshot
-   * differs from the last one (so the caller can skip redundant emissions).
-   * Unknown/irrelevant event types are ignored (no change).
+   * Consume one session event. Returns `true` iff the legacy snapshot changed;
+   * detail and live-activity changes have independent accessors. Unknown event
+   * types are ignored.
    */
   consume(event: unknown): boolean {
     this.detailChangedOnLastConsume = false;
-    const e = (event ?? {}) as { type?: string; [k: string]: unknown };
-    switch (e.type) {
+    this.liveActivityChangedOnLastConsume = false;
+    const type = safeField(event, "type");
+    const field = (key: PropertyKey): unknown => safeField(event, key);
+    switch (type) {
       case "turn_start":
         this.activity = "thinking…";
+        this.resetStream();
+        this.setLiveActivity({ kind: "status", text: "Thinking…" });
         break;
       case "auto_retry_start": {
-        const attempt = asNumber(e.attempt);
-        const max = asNumber(e.maxAttempts);
-        // Make the otherwise-silent backoff wait visible (the motivating gap).
-        this.activity =
-          attempt !== undefined && max !== undefined
-            ? `waiting: API retry ${attempt}/${max}`
-            : "waiting: API retry";
+        // Backoff is otherwise silent, so retain a visible, provider-detail-free wait state.
+        const attempt = asNumber(field("attempt"));
+        const max = asNumber(field("maxAttempts"));
+        this.activity = attempt !== undefined && max !== undefined
+          ? `waiting: API retry ${attempt}/${max}`
+          : "waiting: API retry";
         this.push(this.activity);
         this.pushDetail({ kind: "status", text: this.activity });
+        this.setLiveActivity({ kind: "status", text: this.activity });
         break;
       }
       case "auto_retry_end":
-        this.activity = e.success === true ? "retry succeeded; resuming…" : "retry failed";
+        this.activity = field("success") === true ? "retry succeeded; resuming…" : "retry failed";
         this.pushDetail({ kind: "status", text: this.activity });
+        this.setLiveActivity({ kind: "status", text: this.activity });
         break;
       case "summarization_retry_scheduled": {
-        const attempt = asNumber(e.attempt);
-        const max = asNumber(e.maxAttempts);
+        const attempt = asNumber(field("attempt"));
+        const max = asNumber(field("maxAttempts"));
         this.activity = attempt !== undefined && max !== undefined
           ? `waiting: summary retry ${attempt}/${max}`
           : "waiting: summary retry";
         this.push(this.activity);
         this.pushDetail({ kind: "status", text: this.activity });
+        this.setLiveActivity({ kind: "status", text: this.activity });
         break;
       }
       case "summarization_retry_attempt_start":
         this.activity = "retrying summary…";
         this.pushDetail({ kind: "status", text: this.activity });
+        this.setLiveActivity({ kind: "status", text: this.activity });
         break;
       case "summarization_retry_finished":
         this.activity = "summary retry finished";
         this.pushDetail({ kind: "status", text: this.activity });
+        this.setLiveActivity({ kind: "status", text: this.activity });
         break;
       case "tool_execution_start": {
-        // SECURITY: the tool name reaches the parent terminal (this activity line)
-        // AND the model-visible TaskOutput lastActivity, so sanitize it like every
-        // other activity source — live the moment MCP/project-named tools flow
-        // through the event stream. Its structured field has an independent cap.
-        const rawName = (typeof e.toolName === "string" && e.toolName) || "tool";
+        // Tool names cross both a terminal boundary and the model-facing legacy snapshot;
+        // sanitize them at capture, with an independent cap for structured fields.
+        const toolName = field("toolName");
+        const rawName = (typeof toolName === "string" && toolName) || "tool";
         const name = legacyScalar([rawName], this.maxLineLength) || "tool";
         const detailTool = boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH) || "tool";
         this.activity = `running ${name}…`;
-        this.push(`> ${name}${argHint(e.args, this.maxLineLength)}`);
-        const detail = argumentDetail(e.args);
-        this.pushDetail(
-          detail
-            ? { kind: "tool-call", tool: detailTool, detail }
-            : { kind: "tool-call", tool: detailTool },
-        );
+        this.push(`> ${name}${argHint(field("args"), this.maxLineLength)}`);
+        const detail = argumentDetail(field("args"));
+        this.pushDetail(detail
+          ? { kind: "tool-call", tool: detailTool, detail }
+          : { kind: "tool-call", tool: detailTool });
+
+        const displayTool = boundedScalar(
+          [formatToolDisplayName(boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH))],
+          DETAIL_FIELD_MAX_LENGTH,
+        ) || "tool";
+        const active = detail ? { tool: displayTool, detail } : { tool: displayTool };
+        const id = toolCallIdentity(field("toolCallId"));
+        if (id && (this.activeTools.has(id) || this.activeTools.size < ACTIVE_TOOL_TRACKING_LIMIT)) {
+          this.activeTools.delete(id);
+          this.activeTools.set(id, active);
+        } else {
+          // Never evict a still-active call or guess at a missing/oversized identity.
+          this.untrackedToolActivity = true;
+        }
+        this.refreshActiveToolActivity();
         break;
       }
       case "tool_execution_end": {
-        const rawName = (typeof e.toolName === "string" && e.toolName) || "tool";
-        const failed = e.isError === true;
-        const preview = toolOutcomePreview(rawName, e.result, failed, this.maxLineLength);
+        const toolName = field("toolName");
+        const rawName = (typeof toolName === "string" && toolName) || "tool";
+        const failed = field("isError") === true;
+        const preview = toolOutcomePreview(rawName, field("result"), failed, this.maxLineLength);
         if (failed || preview.found) this.pushPrepared(preview.snapshotLine);
         const tool = boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH) || "tool";
-        this.pushDetail(
-          preview.detail
-            ? { kind: "tool-outcome", tool, detail: preview.detail, failed }
-            : { kind: "tool-outcome", tool, failed },
-        );
+        this.pushDetail(preview.detail
+          ? { kind: "tool-outcome", tool, detail: preview.detail, failed }
+          : { kind: "tool-outcome", tool, failed });
         this.activity = "working…";
+
+        const id = toolCallIdentity(field("toolCallId"));
+        if (!id || !this.activeTools.delete(id)) this.untrackedToolActivity = true;
+        if (this.untrackedToolActivity || this.activeTools.size > 0) {
+          this.refreshActiveToolActivity();
+        } else if (failed) {
+          const displayTool = boundedScalar(
+            [formatToolDisplayName(boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH))],
+            DETAIL_FIELD_MAX_LENGTH,
+          ) || "tool";
+          // Keep failure semantics at the front, where the final atom cap cannot remove them.
+          const text = preview.detail ? `Failed: ${displayTool} — ${preview.detail}` : `Failed: ${displayTool}`;
+          this.setLiveActivity({ kind: "status", text });
+        } else if (preview.detail) {
+          this.setLiveActivity({ kind: "output", text: preview.detail });
+        } else {
+          this.setLiveActivity({ kind: "status", text: "Working…" });
+        }
         break;
       }
       case "message_update": {
-        // Streaming assistant text: update the ACTIVITY preview only (a single
-        // bounded line) - never grow the tail token-by-token (memory + spam).
-        const preview = lastLegacyNonEmptyLine(messageTextParts(e.message), this.maxLineLength);
+        // Stream into one bounded activity line, never the tail token by token: that
+        // would grow memory and spam updates. The live atom has its own inspection cap.
+        const message = field("message");
+        const preview = lastLegacyNonEmptyLine(messageTextParts(message), this.maxLineLength);
         if (preview.found) this.activity = preview.value;
-        const usage = messageUsage(e.message);
+        const usage = messageUsage(message);
         if (usage) this.streamingUsage = usage;
+        if (this.activeTools.size === 0 && !this.untrackedToolActivity) this.captureMessageActivity(event, message);
         break;
       }
       case "turn_end": {
-        const detailText = boundedScalar(messageTextParts(e.message));
+        const message = field("message");
+        const detailText = boundedScalar(messageTextParts(message));
         if (detailText) {
           this.pushDetail({
             kind: "assistant",
             text: detailText,
-            fingerprint: assistantTextFingerprint(messageTextParts(e.message)),
+            fingerprint: assistantTextFingerprint(messageTextParts(message)),
           });
         }
-        // Text blocks concatenate exactly as before, but logical lines are
-        // sanitized and pushed incrementally so no joined payload is allocated.
+        // Push logical lines incrementally: joining all blocks would allocate an
+        // attacker-sized copy, and neutralizing the footer avoids repeating the final line.
         scanLogicalLines(
-          messageTextParts(e.message),
+          messageTextParts(message),
           [this.maxLineLength],
           [],
           (legacy) => this.pushPrepared(legacy[0]!),
         );
-        // message_update leaves `activity` holding the final streamed line, which
-        // we just pushed into `tail` — showing it again as the "… <activity>"
-        // footer would duplicate it in the idle snapshot. Reset to a neutral idle label.
         this.activity = "working…";
-        // Usage accumulates by SUMMING each turn's own `AssistantMessage.usage`
-        // (per-LLM-call, never session-cumulative) at turn_end. Event-stream
-        // only: totals are never re-read from `session.messages`, so a
-        // compaction rewriting that array mid-run can neither double- nor
-        // un-count a billed call (a compaction's own summarization call counts
-        // iff it surfaces as a usage-bearing event). The turn_end message is
-        // the streamed message's final form — fold IT, falling back to the last
-        // streamed figure only when the final event lacks usage, and drop the
-        // in-flight value either way so nothing is counted twice.
-        const finalUsage = messageUsage(e.message) ?? this.streamingUsage;
+        // Each message reports cumulative usage for that one call. Fold its final
+        // value once at turn_end; never reread compactable session history or sum chunks.
+        const finalUsage = messageUsage(message) ?? this.streamingUsage;
         if (finalUsage) this.settledUsage = addUsage(this.settledUsage, finalUsage);
         this.streamingUsage = undefined;
+        this.resetStream();
+        // Pi's turn boundary is the reliable point at which ambiguous call identities
+        // can no longer denote running tools.
+        this.activeTools.clear();
+        this.untrackedToolActivity = false;
+        this.setLiveActivity({ kind: "status", text: "Working…" });
         break;
       }
       default:
@@ -750,6 +871,124 @@ export class SubagentProgressCondenser {
   /** Whether the most recent consume changed only-or-also the structured log. */
   detailChanged(): boolean {
     return this.detailChangedOnLastConsume;
+  }
+
+  /** Current bounded live activity, copied so callers cannot mutate condenser state. */
+  liveActivity(): SubagentLiveActivity | undefined {
+    return copiedLiveActivity(this.currentLiveActivity);
+  }
+
+  /** Whether the most recent consume changed the independent live-activity atom. */
+  liveActivityChanged(): boolean {
+    return this.liveActivityChangedOnLastConsume;
+  }
+
+  private setLiveActivity(value: SubagentLiveActivity): void {
+    const sanitized = value.kind === "tool"
+      ? {
+          kind: "tool" as const,
+          tool: sanitizeDetailScalar(value.tool) || "tool",
+          ...(value.detail ? { detail: sanitizeDetailScalar(value.detail) } : {}),
+        }
+      : { kind: value.kind, text: sanitizeDetailScalar(value.text) };
+    if (!sanitized.kind || (sanitized.kind !== "tool" && !sanitized.text)) return;
+    if (sameLiveActivity(this.currentLiveActivity, sanitized)) return;
+    this.currentLiveActivity = sanitized;
+    this.liveActivityChangedOnLastConsume = true;
+  }
+
+  private resetStream(): void {
+    this.streamedLine = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
+    this.streamedKind = undefined;
+  }
+
+  private refreshActiveToolActivity(): void {
+    if (this.untrackedToolActivity) {
+      this.setLiveActivity({ kind: "status", text: "Tool activity in progress…" });
+      return;
+    }
+    const remaining = [...this.activeTools.values()].at(-1);
+    if (remaining) this.setLiveActivity({ kind: "tool", ...remaining });
+  }
+
+  private captureMessageActivity(event: unknown, message: unknown): void {
+    const metadata = safeField(event, "assistantMessageEvent");
+    const eventType = safeField(metadata, "type");
+    const indexedBlock = indexedPartialBlock(metadata);
+    const indexedType = safeField(indexedBlock, "type");
+    const indexedIsRedactedThinking = indexedType === "thinking" && safeField(indexedBlock, "redacted") === true;
+
+    if (
+      indexedIsRedactedThinking &&
+      (eventType === "thinking_start" || eventType === "thinking_delta" || eventType === "thinking_end")
+    ) {
+      // Pi represents redaction as an ordinary thinking event whose indexed block
+      // contains a placeholder. Replace prior reasoning rather than exposing either.
+      this.resetStream();
+      this.setLiveActivity({ kind: "status", text: "Working…" });
+      return;
+    }
+
+    const kind = eventType === "thinking_delta"
+      ? "reasoning"
+      : eventType === "text_delta"
+        ? "assistant"
+        : undefined;
+    const delta = safeField(metadata, "delta");
+    if (kind && typeof delta === "string") {
+      // A thinking delta is trusted only after Pi's contentIndex resolves to the
+      // corresponding non-redacted block; malformed/interleaved metadata is ignored.
+      if (kind === "reasoning" && indexedType !== "thinking") return;
+      if (kind === "assistant" && indexedBlock !== undefined && indexedType !== "text") return;
+      if (this.streamedKind !== kind) {
+        this.streamedLine = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
+        this.streamedKind = kind;
+      }
+      let inspected = 0;
+      for (const ch of delta) {
+        if (inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break;
+        inspected += ch.length;
+        if (ch === "\n" || ch === "\r") {
+          const completed = this.streamedLine.value();
+          if (completed) this.setLiveActivity({ kind, text: completed });
+          this.streamedLine = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
+        } else {
+          this.streamedLine.feed(ch, ch.codePointAt(0)!);
+        }
+      }
+      const current = this.streamedLine.value();
+      if (current) this.setLiveActivity({ kind, text: current });
+      return;
+    }
+
+    // Recognized thinking lifecycle events are index-addressed. Do not reinterpret
+    // malformed ones through the compatibility fallback.
+    if (eventType === "thinking_start" || eventType === "thinking_end") return;
+
+    const partial = safeField(metadata, "partial");
+    const fallbackMessage = partial ?? message;
+    const content = safeField(fallbackMessage, "content");
+    if (!safeArray(content)) return;
+    const rawLength = safeField(content, "length");
+    if (typeof rawLength !== "number" || !Number.isSafeInteger(rawLength) || rawLength < 0) return;
+    const budget: RawInspectionBudget = { inspected: 0 };
+    let fallback: SubagentLiveActivity | undefined;
+    for (
+      let i = 0;
+      i < Math.min(rawLength, TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT) && budget.inspected < DETAIL_RAW_INSPECTION_LIMIT;
+      i++
+    ) {
+      const block = safeField(content, i);
+      const blockType = safeField(block, "type");
+      if (blockType === "thinking" && safeField(block, "redacted") !== true) {
+        const line = lastSafeNonEmptyLine(safeField(block, "thinking"), DETAIL_FIELD_MAX_LENGTH, budget);
+        if (line.found) fallback = { kind: "reasoning", text: line.value };
+      } else if (blockType === "text") {
+        const line = lastSafeNonEmptyLine(safeField(block, "text"), DETAIL_FIELD_MAX_LENGTH, budget);
+        if (line.found) fallback = { kind: "assistant", text: line.value };
+      }
+    }
+    if (fallback) this.setLiveActivity(fallback);
   }
 
   /** Settled turns + the in-flight figure; undefined until usage-bearing. */

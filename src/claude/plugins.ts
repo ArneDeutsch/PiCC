@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
+import { canonicalDirectory as resolveCanonicalDirectory, projectIdentities } from "../util/project-identity.js";
 import type { PluginAgentLoaderSource } from "./agents.js";
 import { projectPluginManifest, type SafePluginManifestProjection } from "./plugin-metadata.js";
 import {
@@ -86,12 +87,8 @@ function compareText(left: string, right: string): number {
 }
 
 function canonicalDirectory(value: string): string | undefined {
-  try {
-    const canonical = fs.realpathSync.native(value);
-    return fs.statSync(canonical).isDirectory() ? canonical : undefined;
-  } catch {
-    return undefined;
-  }
+  const result = resolveCanonicalDirectory(value);
+  return result.kind === "canonical" ? result.path : undefined;
 }
 
 function sameFilesystemIdentity(left: string | undefined, right: string | undefined): boolean {
@@ -130,51 +127,6 @@ function compareInstallations(left: NormalizedPluginInstallation, right: Normali
 function isContained(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
-}
-
-function structurallyValidCommonGitDirectory(gitDirectory: string): boolean {
-  try {
-    return path.basename(gitDirectory) === ".git" && fs.statSync(path.join(gitDirectory, "HEAD")).isFile() &&
-      fs.statSync(path.join(gitDirectory, "config")).isFile() && fs.statSync(path.join(gitDirectory, "objects")).isDirectory() &&
-      fs.statSync(path.join(gitDirectory, "refs")).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-/** Canonicalize the project root; derive a distinct main checkout only from linked Git administration data. */
-export function resolvePluginProjectAnchors(projectRoot: string): { projectRoot?: string; mainCheckout?: string } {
-  const canonicalProject = canonicalDirectory(projectRoot);
-  if (canonicalProject === undefined) return {};
-  const dotGit = path.join(canonicalProject, ".git");
-  try {
-    if (fs.statSync(dotGit).isDirectory()) {
-      const common = fs.realpathSync.native(dotGit);
-      return structurallyValidCommonGitDirectory(common) ? { projectRoot: canonicalProject, mainCheckout: canonicalProject } : { projectRoot: canonicalProject };
-    }
-    if (!fs.statSync(dotGit).isFile()) return { projectRoot: canonicalProject };
-    const match = /^gitdir:\s*(.+)$/i.exec(fs.readFileSync(dotGit, "utf8").trim());
-    if (match === null) return { projectRoot: canonicalProject };
-    const admin = canonicalDirectory(path.resolve(canonicalProject, match[1]!));
-    if (admin === undefined || path.basename(path.dirname(admin)) !== "worktrees") return { projectRoot: canonicalProject };
-    const backlink = fs.readFileSync(path.join(admin, "gitdir"), "utf8").trim();
-    if (path.basename(backlink) !== ".git" || fs.realpathSync.native(path.dirname(backlink)) !== canonicalProject) return { projectRoot: canonicalProject };
-    const common = fs.realpathSync.native(path.resolve(admin, fs.readFileSync(path.join(admin, "commondir"), "utf8").trim()));
-    if (!structurallyValidCommonGitDirectory(common)) return { projectRoot: canonicalProject };
-    const worktrees = fs.realpathSync.native(path.join(common, "worktrees"));
-    if (fs.realpathSync.native(path.dirname(admin)) !== worktrees) return { projectRoot: canonicalProject };
-    const main = fs.realpathSync.native(path.dirname(common));
-    return fs.realpathSync.native(path.join(main, ".git")) === common
-      ? { projectRoot: canonicalProject, mainCheckout: main }
-      : { projectRoot: canonicalProject };
-  } catch {
-    return { projectRoot: canonicalProject };
-  }
-}
-
-function projectIdentities(projectRoot: string): Set<string> {
-  const anchors = resolvePluginProjectAnchors(projectRoot);
-  return new Set([anchors.projectRoot, anchors.mainCheckout].filter((value): value is string => value !== undefined));
 }
 
 function applicable(record: NormalizedPluginInstallation, projects: ReadonlySet<string>): boolean {
@@ -522,7 +474,7 @@ export function resolveInstalledPlugins(options: {
   const outcomes: PluginResolutionOutcome[] = [];
   const diagnostics: Diagnostic[] = [];
   const provisional: ProvisionalPlugin[] = [];
-  const projects = projectIdentities(options.projectRoot);
+  const projects = new Set(projectIdentities(options.projectRoot));
   const cacheRoots = authorizedCacheRoots(options.userDir, options.env ?? process.env);
   const blocklist = readBlocklist(options.userDir, options.readBlocklistForTest);
   if (blocklist.diagnostic) diagnostics.push(blocklist.diagnostic);

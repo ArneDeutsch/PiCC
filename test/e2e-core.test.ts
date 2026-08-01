@@ -4,12 +4,15 @@ import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   allText,
+  BASH_AVAILABLE,
   CHECKPOINT_CONTEXT_WINDOW,
   CHECKPOINT_PI_SETTINGS,
   CHECKPOINT_USAGE,
   cliMissing,
   createE2ELive,
   findSessionFiles,
+  readJsonLines,
+  REPO_ROOT,
   systemText,
   toolResultText,
   TEST_TIMEOUT_MS,
@@ -68,6 +71,46 @@ function expectCanonicalWriteResult(
     ...(message.terminate === undefined ? {} : { terminate: true }),
   });
 }
+
+it.skipIf(cliMissing || !BASH_AVAILABLE)(
+  "e2e core: real Pi RPC bash traverses PiCC user_bash once per command",
+  async () => {
+    const childScript = [
+      'const fs=require("node:fs")',
+      'fs.appendFileSync("rpc-bash-marker.json",JSON.stringify({skip:process.env.PI_SKIP_VERSION_CHECK??null,launcher:process.env.PICC_LAUNCHER_PID??null})+"\\n")',
+    ].join(";");
+    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)}`;
+    const live = await startPi({
+      launcherPath: path.join(REPO_ROOT, "bin", "picc.mjs"),
+      script: [],
+      prompt: "unused",
+      modeArgs: ["--mode", "rpc"],
+    });
+    try {
+      const requestId = "rpc-picc-user-bash";
+      live.sendInput(JSON.stringify({ id: requestId, type: "bash", command }));
+      const response = await live.waitForOutput((record) =>
+        record.type === "response" && record.id === requestId, 30_000);
+      expect(response).toMatchObject({ id: requestId, command: "bash", success: true });
+      live.closeInput();
+      const result = await live.completion;
+
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.requests).toHaveLength(0);
+      const records = readJsonLines(result.stdout);
+      expect(records.filter((record) => record.type === "response" && record.id === requestId))
+        .toEqual([expect.objectContaining({ command: "bash", success: true })]);
+      const markerLines = fs.readFileSync(path.join(result.fixture, "rpc-bash-marker.json"), "utf8")
+        .trim().split(/\r?\n/u);
+      expect(markerLines).toHaveLength(1);
+      expect(JSON.parse(markerLines[0]!)).toEqual({ skip: null, launcher: null });
+    } finally {
+      live.closeInput();
+      await live.stop();
+    }
+  },
+  TEST_TIMEOUT_MS,
+);
 
 describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenAI model", () => {
   if (cliMissing) {

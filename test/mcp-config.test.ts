@@ -10,6 +10,7 @@ import {
 } from "../src/claude/mcp-config.js";
 import { resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
 import { loadClaudeProject } from "../src/project.js";
+import type { ClaudeMcpStateResult } from "../src/claude/claude-mcp-state.js";
 import type {
   EnabledStdioMcpServer,
   McpSettingsEntry,
@@ -60,17 +61,36 @@ function entry(scope: Scope, sourcePath: string, fields: Partial<McpSettingsEntr
   return { scope, sourcePath, ...fields };
 }
 
+function nativeState(options: {
+  user?: Record<string, unknown>;
+  local?: Record<string, unknown>;
+  disabled?: string[];
+  enabled?: string[];
+  diagnostics?: string[];
+} = {}): ClaudeMcpStateResult {
+  return {
+    kind: "loaded",
+    user: { source: "native-user", servers: normalizeMcpServerBlock(options.user ?? {}, "native user") },
+    local: { source: "native-local", servers: normalizeMcpServerBlock(options.local ?? {}, "native local") },
+    disabledMcpServers: new Set(options.disabled ?? []),
+    ...(options.enabled === undefined ? {} : { enabledMcpServers: options.enabled }),
+    diagnostics: options.diagnostics ?? [],
+  };
+}
+
 /** Resolution harness: injected env and probe so nothing leaks from the host. */
 function resolve(opts: {
   mcpJson?: McpJsonResult;
   entries?: McpSettingsEntry[];
   env?: NodeJS.ProcessEnv;
   probe?: GitTrackedProbe;
+  nativeState?: ClaudeMcpStateResult;
 }): ResolvedMcpConfig {
   return resolveMcpConfig({
     projectRoot: FAKE_ROOT,
     mcpJson: opts.mcpJson ?? EMPTY_MCP_JSON,
     mcpSettings: opts.entries ?? [],
+    ...(opts.nativeState === undefined ? {} : { nativeState: opts.nativeState }),
     env: opts.env ?? ({} as NodeJS.ProcessEnv),
     isGitTracked: opts.probe ?? (() => false),
   });
@@ -442,7 +462,7 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "u-srv")?.status).toBe("enabled");
     expect(server(cfg, "l-srv")?.status).toBe("enabled");
     expect(server(cfg, "m-srv")?.status).toBe("enabled");
-    expect(server(cfg, "u-srv")?.source).toBe("settings:user");
+    expect(server(cfg, "u-srv")?.source).toBe("settings-user");
   });
 
   it("matches disable-list entries through the name sanitizer (Claude parity)", () => {
@@ -517,7 +537,7 @@ describe("resolveMcpConfig — enablement gate", () => {
       entries: [entry("project", project, { servers: { "p-srv": { command: "p" } } })],
     });
     expect(server(cfg, "p-srv")?.status).toBe("pending-approval");
-    expect(server(cfg, "p-srv")?.source).toBe("settings:project");
+    expect(server(cfg, "p-srv")?.source).toBe("settings-project");
   });
 
   it("enables a project-settings-origin server via local-scope enabledMcpjsonServers", () => {
@@ -528,7 +548,7 @@ describe("resolveMcpConfig — enablement gate", () => {
       ],
     });
     expect(server(cfg, "p-srv")?.status).toBe("enabled");
-    expect(server(cfg, "p-srv")?.source).toBe("settings:project");
+    expect(server(cfg, "p-srv")?.source).toBe("settings-project");
   });
 
   it("accumulates-and-dedupes the list keys across honored scopes", () => {
@@ -636,7 +656,13 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
       entries: [entry("local", local, { servers: { "l-srv": { command: "l" } } })],
       probe: () => true,
     });
-    expect(server(cfg, "l-srv")?.status).toBe("pending-approval");
+    expect(server(cfg, "l-srv")).toMatchObject({
+      status: "pending-approval",
+      source: "settings-local",
+    });
+    const demotion = cfg.diagnostics.find((diagnostic) => diagnostic.includes("treated as project scope"));
+    expect(demotion).toContain("approvals ignored; any contributed servers are pending");
+    expect(demotion).not.toContain("approvals ignored, servers pending");
   });
 
   it("fails OPEN on probe failure (undefined): treated as untracked/user-authored", () => {
@@ -744,14 +770,14 @@ describe("resolveMcpConfig — source precedence", () => {
     });
   }
 
-  it("orders managed > local > project-settings > .mcp.json > user, whole entry", () => {
+  it("orders .mcp.json above every settings-extension scope, whole entry", () => {
     const all = ["user", "mcpjson", "project", "local", "managed"];
     const expected: Array<[string[], string, string]> = [
-      [all, "managed-cmd", "settings:managed"],
-      [["user", "mcpjson", "project", "local"], "local-cmd", "settings:local"],
-      [["user", "mcpjson", "project"], "project-cmd", "settings:project"],
-      [["user", "mcpjson"], "json-cmd", ".mcp.json"],
-      [["user"], "user-cmd", "settings:user"],
+      [all, "json-cmd", "project-mcpjson"],
+      [["user", "project", "local", "managed"], "managed-cmd", "settings-managed"],
+      [["user", "project", "local"], "local-cmd", "settings-local"],
+      [["user", "project"], "project-cmd", "settings-project"],
+      [["user"], "user-cmd", "settings-user"],
     ];
     for (const [sources, command, source] of expected) {
       const winner = server(resolveWith(sources), "srv");
@@ -761,19 +787,18 @@ describe("resolveMcpConfig — source precedence", () => {
     }
   });
 
-  it("never merges fields across sources: the winner's entry is taken whole", () => {
+  it("never merges fields across sources: a sparse .mcp.json winner replaces settings whole", () => {
     const cfg = resolve({
-      mcpJson: mcpJsonOf({
-        srv: { command: "json-cmd", args: ["--json"], env: { FROM_JSON: "1" }, timeout: 2000 },
-      }),
+      mcpJson: mcpJsonOf({ srv: { command: "json-cmd" } }),
       entries: [
-        // Higher precedence but sparser entry — its absence of args/env/timeout must win too.
-        entry("project", project, { servers: { srv: { command: "project-cmd" } } }),
+        entry("managed", managed, {
+          servers: { srv: { command: "managed-cmd", args: ["--managed"], env: { FROM_MANAGED: "1" }, timeout: 2000 } },
+        }),
         entry("user", `${user}.approval`, { enabledMcpjsonServers: ["srv"] }),
       ],
     });
     const winner = server(cfg, "srv")!;
-    expect(winner.command).toBe("project-cmd");
+    expect(winner.command).toBe("json-cmd");
     expect(winner.args).toEqual([]);
     expect(winner.env).toEqual({});
     expect(winner.timeoutMs).toBeUndefined();
@@ -801,10 +826,214 @@ describe("resolveMcpConfig — source precedence", () => {
         }),
       ],
     });
-    expect(server(cfg, "constructor")?.command).toBe("local-ctor");
-    expect(server(cfg, "constructor")?.status).toBe("enabled");
+    expect(server(cfg, "constructor")?.status).toBe("pending-approval");
+    expect(server(cfg, "constructor")?.source).toBe("project-mcpjson");
     expect(server(cfg, "toString")?.command).toBe("local-ts");
     expect(cfg.servers).toHaveLength(2);
+  });
+});
+
+describe("resolveMcpConfig — native Claude hierarchy and gates", () => {
+  const extensionEntries = [
+    entry("user", "/user", { servers: { srv: { command: "settings-user" } } }),
+    entry("project", "/project", { servers: { srv: { command: "settings-project" } } }),
+    entry("local", "/local", { servers: { srv: { command: "settings-local" } } }),
+    entry("managed", "/managed", { servers: { srv: { command: "settings-managed" } } }),
+    entry("user", "/approval", { enabledMcpjsonServers: ["srv"] }),
+  ];
+
+  it.each([
+    ["native local over .mcp.json", nativeState({ local: { srv: { command: "native-local" } } }), mcpJsonOf({ srv: { command: "json" } }), extensionEntries, "native-local", "native-local"],
+    [".mcp.json over native user", nativeState({ user: { srv: { command: "native-user" } } }), mcpJsonOf({ srv: { command: "json" } }), extensionEntries, "json", "project-mcpjson"],
+    ["native user over managed extension", nativeState({ user: { srv: { command: "native-user" } } }), EMPTY_MCP_JSON, extensionEntries, "native-user", "native-user"],
+    ["managed over local extension", { kind: "absent", diagnostics: [] } as ClaudeMcpStateResult, EMPTY_MCP_JSON, extensionEntries, "settings-managed", "settings-managed"],
+    ["local over project extension", { kind: "absent", diagnostics: [] } as ClaudeMcpStateResult, EMPTY_MCP_JSON, extensionEntries.slice(0, 3), "settings-local", "settings-local"],
+    ["project over user extension", { kind: "absent", diagnostics: [] } as ClaudeMcpStateResult, EMPTY_MCP_JSON, extensionEntries.slice(0, 2).concat(extensionEntries.slice(4)), "settings-project", "settings-project"],
+  ] as const)("selects %s", (_label, native, mcpJson, entries, command, source) => {
+    expect(server(resolve({ nativeState: native, mcpJson, entries: [...entries] }), "srv"))
+      .toMatchObject({ status: "enabled", command, source });
+  });
+
+  it("keeps sparse and invalid authentic winners whole while unrelated names survive", () => {
+    const sparse = resolve({
+      nativeState: nativeState({ local: { srv: { command: "local" }, other: { command: "other" } } }),
+      mcpJson: mcpJsonOf({ srv: { command: "json", args: ["loser"], env: { SECRET: "loser" } } }),
+      entries: extensionEntries,
+    });
+    expect(server(sparse, "srv")).toMatchObject({ command: "local", args: [], env: {} });
+    expect(server(sparse, "other")).toMatchObject({ command: "other", status: "enabled" });
+
+    const invalid = resolve({
+      nativeState: nativeState({ local: { srv: {} } }),
+      mcpJson: mcpJsonOf({ srv: { command: "must-not-run" } }),
+      entries: extensionEntries,
+    });
+    expect(server(invalid, "srv")?.status).toBe("skipped");
+    expect(JSON.stringify(server(invalid, "srv"))).not.toContain("must-not-run");
+  });
+
+  it("replaces the whole transport entry in both directions without inheriting secrets", () => {
+    const stdioWinner = resolve({
+      nativeState: nativeState({ local: { srv: { command: "native-command" } } }),
+      mcpJson: mcpJsonOf({
+        srv: { type: "http", url: "https://lower.example/${LOWER_URL}", headers: { Authorization: "${LOWER_HEADER}" } },
+      }),
+    });
+    expect(server(stdioWinner, "srv")).toMatchObject({
+      status: "enabled", source: "native-local", transport: "stdio", command: "native-command", args: [], env: {},
+    });
+    expect(JSON.stringify(server(stdioWinner, "srv"))).not.toMatch(/LOWER_|lower\.example|headers|url/u);
+
+    const remoteWinner = resolve({
+      nativeState: nativeState({
+        local: { srv: { type: "http", url: "https://native.example/mcp", headers: { "X-Winner": "safe" } } },
+        user: { srv: { command: "lower-command", args: ["LOWER_ARG"], env: { SECRET: "LOWER_SECRET" } } },
+      }),
+    });
+    expect(server(remoteWinner, "srv")).toMatchObject({
+      status: "enabled", source: "native-local", transport: "http", url: "https://native.example/mcp", headers: { "X-Winner": "safe" },
+    });
+    expect(JSON.stringify(server(remoteWinner, "srv"))).not.toMatch(/lower-command|LOWER_ARG|LOWER_SECRET|rawCommand/u);
+
+    const invalidWinner = resolve({
+      nativeState: nativeState({ local: { srv: { type: "http" } } }),
+      mcpJson: mcpJsonOf({ srv: { command: "lower-command", env: { SECRET: "LOWER_SECRET" } } }),
+    });
+    expect(server(invalidWinner, "srv")?.status).toBe("skipped");
+    expect(JSON.stringify(server(invalidWinner, "srv"))).not.toMatch(/lower-command|LOWER_SECRET|https?:|Authorization/u);
+  });
+
+  it("lets the nearer equal-rank project extension win", () => {
+    const cfg = resolve({ entries: [
+      entry("project", "/root", { servers: { srv: { command: "root" } } }),
+      entry("project", "/near", { servers: { srv: { command: "near" } } }),
+      entry("user", "/approval", { enabledMcpjsonServers: ["srv"] }),
+    ] });
+    expect(server(cfg, "srv")?.command).toBe("near");
+  });
+
+  it("applies exact native runtime disablement to every authentic winner but not the settings extension", () => {
+    for (const [label, native, mcpJson] of [
+      ["local", nativeState({ local: { exact: { command: "local" } }, disabled: ["exact"] }), EMPTY_MCP_JSON],
+      ["project", nativeState({ disabled: ["exact"] }), mcpJsonOf({ exact: { command: "json" } })],
+      ["user", nativeState({ user: { exact: { command: "user" } }, disabled: ["exact"] }), EMPTY_MCP_JSON],
+    ] as const) {
+      const cfg = resolve({ nativeState: native, mcpJson, entries: [entry("user", "/approval", { enabledMcpjsonServers: ["exact"] })] });
+      expect(server(cfg, "exact"), label).toMatchObject({ status: "disabled", inactiveReason: "native-runtime-disabled" });
+    }
+    const extension = resolve({
+      nativeState: nativeState({ disabled: ["exact", "my_server"] }),
+      entries: [entry("user", "/user", { servers: {
+        exact: { command: "extension" },
+        "my.server": { command: "not-exact" },
+      } })],
+    });
+    expect(server(extension, "exact")?.status).toBe("enabled");
+    expect(server(extension, "my.server")?.status).toBe("enabled");
+
+    const nearName = resolve({
+      nativeState: nativeState({
+        local: { "my.server": { command: "local" } },
+        disabled: ["my_server"],
+      }),
+      entries: [entry("user", "/settings", {
+        enabledMcpjsonServers: ["other"],
+        disabledMcpjsonServers: ["my_server"],
+      })],
+    });
+    expect(server(nearName, "my.server")).toMatchObject({ status: "enabled", source: "native-local" });
+
+    const extensionScopes = resolve({
+      nativeState: nativeState({ disabled: ["managed", "local", "project", "user"] }),
+      entries: [
+        entry("user", "/user", { servers: { user: { command: "user" } } }),
+        entry("project", "/project", { servers: { project: { command: "project" } } }),
+        entry("local", "/local", { servers: { local: { command: "local" } } }),
+        entry("managed", "/managed", { servers: { managed: { command: "managed" } } }),
+        entry("user", "/approval", { enabledMcpjsonServers: ["project"] }),
+      ],
+    });
+    expect(extensionScopes.servers.map((item) => [item.name, item.status])).toEqual([
+      ["user", "enabled"], ["project", "enabled"], ["local", "enabled"], ["managed", "enabled"],
+    ]);
+  });
+
+  it("makes native disabledMcpServers final for an unapproved authentic project winner", () => {
+    const cfg = resolve({
+      nativeState: nativeState({ disabled: ["blocked"] }),
+      mcpJson: mcpJsonOf({ blocked: { command: "must-not-run" } }),
+    });
+    expect(server(cfg, "blocked")).toMatchObject({
+      status: "disabled",
+      source: "project-mcpjson",
+      inactiveReason: "native-runtime-disabled",
+    });
+  });
+
+  it("keeps native runtime lists distinct from settings approvals and reports unsupported enablement once", () => {
+    const cfg = resolve({
+      nativeState: nativeState({
+        user: { user: { command: "user" } },
+        enabled: ["pending"],
+        diagnostics: ["Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled"],
+      }),
+      mcpJson: mcpJsonOf({ pending: { command: "pending" } }),
+      entries: [entry("user", "/settings", { disabledMcpjsonServers: ["user"] })],
+    });
+    expect(server(cfg, "pending")?.status).toBe("pending-approval");
+    expect(server(cfg, "user")?.status).toBe("enabled");
+    expect(cfg.diagnostics.filter((item) => item.includes("enabledMcpServers is unsupported"))).toHaveLength(1);
+  });
+
+  it("fails closed on unusable native state while absence preserves existing activation", () => {
+    const lower = [entry("user", "/user", { servers: { lower: { command: "lower" } } })];
+    expect(resolve({ nativeState: { kind: "absent", diagnostics: [] }, entries: lower }).servers)
+      .toHaveLength(1);
+    const closed = resolve({
+      nativeState: { kind: "unusable", diagnostics: ["Native Claude state is malformed JSON"] },
+      mcpJson: mcpJsonOf({ project: { command: "project" } }),
+      entries: lower,
+    });
+    expect(closed).toEqual({
+      servers: [],
+      diagnostics: ["Native Claude state is malformed JSON"],
+      failClosed: "native-state-unusable",
+    });
+  });
+
+  it("never expands losing, pending, disabled, skipped, or fail-closed definitions", () => {
+    const reads: PropertyKey[] = [];
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get(target, property, receiver) {
+        reads.push(property);
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const cfg = resolve({
+      nativeState: nativeState({
+        local: {
+          losing: { command: "winner" },
+          disabled: { command: "${DISABLED_CANARY}" },
+          skipped: {},
+        },
+        disabled: ["disabled"],
+      }),
+      mcpJson: mcpJsonOf({
+        losing: { command: "${LOSER_CANARY}" },
+        pending: { command: "${PENDING_CANARY}" },
+      }),
+      env,
+    });
+    expect(server(cfg, "losing")?.command).toBe("winner");
+    expect(reads).toEqual([]);
+
+    const failClosedReads: PropertyKey[] = [];
+    resolve({
+      nativeState: { kind: "unusable", diagnostics: ["bad state"] },
+      entries: [entry("user", "/user", { servers: { lower: { command: "${FAIL_CLOSED_CANARY}" } } })],
+      env: new Proxy({} as NodeJS.ProcessEnv, { get(_target, property) { failClosedReads.push(property); return undefined; } }),
+    });
+    expect(failClosedReads).toEqual([]);
   });
 });
 
@@ -987,6 +1216,53 @@ describe("loadClaudeProject — mcp assembly", () => {
     });
   }
 
+  it.each([
+    { route: "explicit userDir", select: "explicit", env: { PICC_CLAUDE_USER_DIR: "picc", CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "PICC_CLAUDE_USER_DIR", select: "picc", env: { PICC_CLAUDE_USER_DIR: "picc", CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "CLAUDE_CONFIG_DIR", select: "claude", env: { CLAUDE_CONFIG_DIR: "claude" } },
+    { route: "default injected home", select: "default", env: {} },
+  ] as const)("loads native user MCP state from the $route profile only", ({ select, env }) => {
+    const root = makeTmp();
+    const home = path.join(root, "home");
+    const profiles = {
+      explicit: path.join(root, "explicit-profile"),
+      picc: path.join(root, "picc-profile"),
+      claude: path.join(root, "claude-profile"),
+      default: path.join(home, ".claude"),
+    } as const;
+    const injectedEnv: NodeJS.ProcessEnv = Object.fromEntries(
+      Object.entries(env).map(([key, profile]) => [key, profiles[profile as keyof typeof profiles]]),
+    );
+    const statePath = (profile: keyof typeof profiles): string => profile === "default"
+      ? path.join(home, ".claude.json")
+      : path.join(profiles[profile], ".claude.json");
+
+    for (const profile of Object.keys(profiles) as Array<keyof typeof profiles>) {
+      if (profile === select) continue;
+      writeJson(statePath(profile), { mcpServers: { [`canary-${profile}`]: { command: "CANARY" } } });
+    }
+    // The default profile uses the home sibling, never a contained state file.
+    writeJson(path.join(profiles.default, ".claude.json"), {
+      mcpServers: { "canary-default-contained": { command: "CANARY" } },
+    });
+    writeJson(statePath(select), { mcpServers: { selected: { command: "selected-command" } } });
+
+    const project = loadClaudeProject({
+      cwd: root,
+      ...(select === "explicit" ? { userDir: profiles.explicit } : {}),
+      env: injectedEnv,
+      homeDir: home,
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+    });
+    expect(server(project.mcp, "selected")).toMatchObject({
+      status: "enabled",
+      source: "native-user",
+      command: "selected-command",
+    });
+    expect(project.mcp.servers.map((item) => item.name)).toEqual(["selected"]);
+  });
+
   it("yields servers: [] (and no diagnostics) when no MCP config exists anywhere", () => {
     const root = makeTmp();
     const project = loadFrom(root);
@@ -1039,7 +1315,7 @@ describe("loadClaudeProject — mcp assembly", () => {
     const project = loadFrom(root);
     const github = server(project.mcp, "github");
     expect(github?.status).toBe("enabled");
-    expect(github?.source).toBe(".mcp.json");
+    expect(github?.source).toBe("project-mcpjson");
     expect(github?.args).toEqual(["serve"]);
   });
 

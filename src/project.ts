@@ -1,11 +1,12 @@
-import os from "node:os";
 import path from "node:path";
 import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, HookHandler, PluginRuntimeContext, ResolvedMcpConfig } from "./types.js";
 import { SUPPORTED_HOOK_EVENTS } from "./types.js";
 import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discovery/locations.js";
 import { loadSettings } from "./discovery/settings.js";
 import { resolveMcpConfig } from "./discovery/mcp.js";
+import { resolveClaudeProfile } from "./discovery/claude-profile.js";
 import { loadMcpJson } from "./claude/mcp-config.js";
+import { loadClaudeMcpState } from "./claude/claude-mcp-state.js";
 import { loadPluginSkills, loadSkills } from "./claude/skills.js";
 import { loadAgents, loadPluginAgents } from "./claude/agents.js";
 import { loadRules } from "./claude/rules.js";
@@ -21,9 +22,9 @@ import {
   authorizedCacheRoots,
   loadPluginHooks,
   resolveInstalledPlugins,
-  resolvePluginProjectAnchors,
   type InstalledPlugin,
 } from "./claude/plugins.js";
+import { projectIdentities } from "./util/project-identity.js";
 import type { PluginResolutionOutcome } from "./types.js";
 
 /**
@@ -47,6 +48,9 @@ export interface LoadedProject extends ClaudeProject {
 export function loadClaudeProject(opts: {
   cwd: string;
   userDir?: string;
+  /** Injected profile policy inputs; production defaults to process state. */
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
   /** Override managed/policy settings file locations (used by tests). */
   managedSettingsPaths?: string[];
   /** Override managed/policy artifact base directories (used by tests). */
@@ -55,7 +59,12 @@ export function loadClaudeProject(opts: {
 }): LoadedProject {
   const diagnostics: Diagnostic[] = [];
   const cwd = path.resolve(opts.cwd);
-  const userDir = opts.userDir ?? path.join(os.homedir(), ".claude");
+  const profile = resolveClaudeProfile({
+    ...(opts.userDir === undefined ? {} : { userDir: opts.userDir }),
+    ...(opts.env === undefined ? {} : { env: opts.env }),
+    ...(opts.homeDir === undefined ? {} : { homeDir: opts.homeDir }),
+  });
+  const userDir = profile.userDir;
   const root = resolveProjectRoot(cwd);
 
   const settings = loadSettings({
@@ -196,13 +205,19 @@ export function loadClaudeProject(opts: {
   // Auto memory, read side: undefined when disabled by setting or env.
   const autoMemory = loadAutoMemory(root, userDir, settings);
 
-  // MCP config discovery: `.mcp.json` + scope-tagged settings captures,
-  // resolved through precedence and the enablement gate. Pure data — server
-  // processes are the runtime's job.
+  // MCP discovery resolves the inert native snapshot, `.mcp.json`, and
+  // scope-tagged settings captures before the runtime can create clients.
+  const nativeMcpState = loadClaudeMcpState({
+    statePath: profile.nativeStatePath,
+    projectRoot: root,
+  });
   const mcp = resolveMcpConfig({
     projectRoot: root,
     mcpJson: loadMcpJson(root),
     mcpSettings: settings.mcpSettings ?? [],
+    nativeState: nativeMcpState,
+    nativeStateProfile: profile.source,
+    ...(opts.env === undefined ? {} : { env: opts.env }),
   });
 
   const hookConfigs: HookConfig[] = [settings.hooks];
@@ -267,11 +282,13 @@ export function loadClaudeProject(opts: {
     }
   }
 
-  const inventoryAnchors = resolvePluginProjectAnchors(root);
+  const inventoryIdentities = projectIdentities(root);
+  const inventoryProjectRoot = inventoryIdentities.at(-1) ?? root;
+  const inventoryMainCheckout = inventoryIdentities.length > 1 ? inventoryIdentities[0] : undefined;
   const pluginInventory = buildPluginInventorySnapshot({
     lifetime: opts.pluginInventoryLifetime ?? "session",
-    projectRoot: inventoryAnchors.projectRoot ?? root,
-    ...(inventoryAnchors.mainCheckout === undefined ? {} : { mainCheckout: inventoryAnchors.mainCheckout }),
+    projectRoot: inventoryProjectRoot,
+    ...(inventoryMainCheckout === undefined ? {} : { mainCheckout: inventoryMainCheckout }),
     userDir,
     installedStateStatus: installedState.status,
     installedObservations: installedState.observations,

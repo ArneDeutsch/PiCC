@@ -19,6 +19,7 @@ import type {
   AgentSession,
   AgentSessionEvent,
   AgentSessionEventListener,
+  MessageRenderOptions,
   NewSessionOptions,
   SessionStats,
   ToolDefinition,
@@ -32,8 +33,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 // Exact StopReason vocabulary — a missing or extra member fails to compile.
-// PiCC's outcome classification keys off "error" / "aborted" / "length".
+// PiCC's outcome classification keys off "pending" / "error" / "aborted" / "length".
 export const stopReasonVocabulary: Record<StopReason, true> = {
+  pending: true,
   stop: true,
   length: true,
   toolUse: true,
@@ -49,6 +51,8 @@ export const stopReasonRequired: undefined extends AssistantMessage["stopReason"
 // ...and errorMessage is an optional string carrying the terminal failure text.
 export const errorMessageOptional: AssistantMessage["errorMessage"] = undefined;
 export const errorMessageString: AssistantMessage["errorMessage"] = "terminal failure";
+export const rawStopReasonOptional: AssistantMessage["rawStopReason"] = undefined;
+export const rawStopReasonString: AssistantMessage["rawStopReason"] = "provider-specific-terminal";
 export const retryClassifierArg: Parameters<typeof isRetryableAssistantError>[0] = {} as AssistantMessage;
 export const retryClassifierResult: ReturnType<typeof isRetryableAssistantError> = true;
 export const overflowClassifierArgs: Parameters<typeof isContextOverflow> = [{} as AssistantMessage, 100_000];
@@ -67,6 +71,7 @@ export const executeSignalOptional: Parameters<Exec>[2] = undefined;
 // default padded, state-background shell so PiCC can own foreground glyph framing.
 // A Pi change that removes the field or the "self" member fails to compile here.
 export const renderShellSelf: NonNullable<ToolDefinition["renderShell"]> = "self";
+export const messageRendererOutputPad: MessageRenderOptions["outputPad"] = 1;
 
 // --- subagent transcript persistence surface ---
 

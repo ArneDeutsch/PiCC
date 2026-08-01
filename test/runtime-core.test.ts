@@ -2386,8 +2386,8 @@ describe("Subagent live progress", () => {
     text: "done",
     events: [
       { type: "turn_start", turnIndex: 0 },
-      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
-      { type: "tool_execution_end", toolName: "Grep", result: "match", isError: false },
+      { type: "tool_execution_start", toolCallId: "grep-1", toolName: "Grep", args: { pattern: "foo" } },
+      { type: "tool_execution_end", toolCallId: "grep-1", toolName: "Grep", result: "match", isError: false },
       {
         type: "turn_end",
         message: { role: "assistant", content: [{ type: "text", text: "final line" }] },
@@ -2456,6 +2456,34 @@ describe("Subagent live progress", () => {
     ]);
   });
 
+  it("mirrors a live-only reasoning event through onChange without another onProgress emission", async () => {
+    const sub = new SubagentRegistry();
+    const seen: unknown[] = [];
+    sub.onChange(() => {
+      const activity = sub.list()[0]?.liveActivity;
+      if (activity) seen.push({ ...activity });
+    });
+    const partial = { role: "assistant", content: [{ type: "thinking", thinking: "checking seam" }] };
+    const { sdk } = fakeSdk({ replies: [{
+      text: "done",
+      events: [{
+        type: "message_update",
+        message: partial,
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "checking seam", partial },
+      }],
+    }] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const snapshots: ProgressSnapshot[] = [];
+    await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (snapshot) => snapshots.push(snapshot),
+    });
+    expect(snapshots).toEqual([]);
+    expect(seen).toContainEqual({ kind: "reasoning", text: "checking seam" });
+  });
+
   it("a foreground dispatch with NO onProgress sink still mirrors live progress onto the registry record", async () => {
     // The panel's single-live-data-source contract: the registry mirror rides
     // dispatch's own condenser subscription, not the tool's onUpdate wiring.
@@ -2493,6 +2521,11 @@ describe("Subagent live progress", () => {
 
   it("a nested (depth 2) dispatch mirrors live progress onto its registry record too", async () => {
     const sub = new SubagentRegistry();
+    const seen: unknown[] = [];
+    sub.onChange(() => {
+      const activity = sub.list()[0]?.liveActivity;
+      if (activity) seen.push({ ...activity });
+    });
     const { sdk } = fakeSdk({ replies: [streamReply] });
     const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 2 });
@@ -2501,6 +2534,7 @@ describe("Subagent live progress", () => {
     expect(rec.depth).toBe(2);
     expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
     expect(rec.detailLog?.some((entry) => entry.kind === "tool-call" && entry.tool === "Grep")).toBe(true);
+    expect(seen).toContainEqual({ kind: "tool", tool: "grep", detail: "foo" });
   });
 
   it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {

@@ -1426,7 +1426,7 @@ describe("session lifecycle hooks", () => {
     // Always-present MCP posture line, fed by real discovery: the fixture's
     // unapproved server renders as pending, and the retired static
     // ".mcp.json present" wording must be gone.
-    expect(doctor).toContain("example-server: pending approval");
+    expect(doctor).toContain("\"example-server\": pending approval");
     // De-duplicated within /doctor: its posture line carries no enable/decline
     // hint because the pending finding below carries that report's guidance.
     // The dedicated /mcp report independently carries bounded guidance.
@@ -1649,6 +1649,12 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
       };
       const mismatchRow = makeRow("edit-preview-mismatch", mismatchArgs);
       mismatchRow.setArgsComplete();
+      await waitUntil({
+        description: "the mismatched Edit preview to fail before execution",
+        predicate: () => plainRow(mismatchRow).includes("Could not find the exact text"),
+        describeObserved: () => plainRow(mismatchRow),
+        timeoutMs: 15_000,
+      });
       mismatchRow.markExecutionStarted();
       let mismatchMessage = "";
       try {
@@ -2925,18 +2931,21 @@ describe("child worktree stops through the production extension assembly", () =>
           const messages: PiSessionMessage[] = [];
           const listeners = new Set<(event: unknown) => void>();
           let aborted = false;
+          let thresholdPhase = false;
           const ctx = {
             mode: "json",
-            model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-            getContextUsage: () => creation === 1
+            model: { provider: "openai", id: "gpt-test", api: "openai-responses", contextWindow: 1000 },
+            getContextUsage: () => thresholdPhase
               ? ({ tokens: 950, contextWindow: 1000, percent: 95 })
               : ({ tokens: 100, contextWindow: 1000, percent: 10 }),
             hasPendingMessages: () => false,
             abort: () => { aborted = true; childAborts += 1; },
           };
-          const recordProviderIfAdmitted = async () => {
+          const recordProviderIfAdmitted = async (): Promise<boolean> => {
             await emit("before_provider_request", {}, ctx);
-            if (!aborted) ordinaryProviderRequests += 1;
+            if (aborted) return false;
+            ordinaryProviderRequests += 1;
+            return true;
           };
           const session = {
             messages,
@@ -2947,7 +2956,10 @@ describe("child worktree stops through the production extension assembly", () =>
             async prompt(text: string) {
               messages.push({ role: "user", content: text });
               await emit("turn_start", {}, ctx);
-              await recordProviderIfAdmitted();
+              if (!await recordProviderIfAdmitted()) {
+                await emit("agent_settled", {}, ctx);
+                return;
+              }
               const calls = [
                 { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
                 { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
@@ -2955,6 +2967,14 @@ describe("child worktree stops through the production extension assembly", () =>
               const assistant = {
                 role: "assistant",
                 stopReason: "toolUse",
+                usage: {
+                  input: 100,
+                  output: 0,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  totalTokens: 100,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                },
                 content: calls.map((call) => ({
                   type: "toolCall", id: call.id, name: call.name, arguments: call.args,
                 })),
@@ -2981,13 +3001,13 @@ describe("child worktree stops through the production extension assembly", () =>
               const continuationsBefore = continuations;
               await emit("turn_end", {}, ctx);
               if (continuations === continuationsBefore) {
-                await recordProviderIfAdmitted();
-                messages.push({
-                  role: "assistant",
-                  content: [],
-                  stopReason: aborted ? "aborted" : "stop",
-                  ...(aborted ? { errorMessage: "Aborted" } : {}),
-                });
+                thresholdPhase = false;
+                await emit("turn_start", {}, ctx);
+                thresholdPhase = creation === 1;
+                const admitted = await recordProviderIfAdmitted();
+                if (admitted) {
+                  messages.push({ role: "assistant", content: [], stopReason: "stop" });
+                }
                 await emit("agent_settled", {}, ctx);
               }
             },
@@ -3009,7 +3029,7 @@ describe("child worktree stops through the production extension assembly", () =>
               continuations += 1;
               aborted = false;
               await emit("turn_start", {}, ctx);
-              await recordProviderIfAdmitted();
+              if (!await recordProviderIfAdmitted()) return;
               messages.push({
                 role: "assistant",
                 content: [{ type: "text", text: "continued" }],
@@ -3043,7 +3063,7 @@ describe("child worktree stops through the production extension assembly", () =>
           subagent_type: "general-purpose",
           prompt: "stopped threshold child run",
           run_in_background: false,
-        })).rejects.toThrow(/aborted before completing/);
+        })).rejects.toThrow(/stopped by a universal hook/);
         expect(fs.readFileSync(markerPath, "utf8")).toBe("stopped");
         expect(compactions).toBe(0);
         expect(continuations).toBe(0);
@@ -3207,9 +3227,9 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
           .filter((e) => e.customType === "picc-control")
           .map((e) => String(e.data?.output ?? ""))
           .join("\n");
-        expect(doctor).toContain("failing-server: failed");
-        // The diagnostic quotes the RAW command, never a resolved path.
-        expect(doctor).toContain("picc-no-such-command-t05");
+        expect(doctor).toContain("\"failing-server\": failed");
+        // Raw commands remain redacted from /doctor.
+        expect(doctor).not.toContain("picc-no-such-command-t05");
       } finally {
         errSpy.mockRestore();
         await p.fire("session_shutdown", { reason: "other" });

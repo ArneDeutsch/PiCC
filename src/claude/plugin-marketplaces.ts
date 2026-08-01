@@ -23,6 +23,7 @@ import type {
   Scope,
 } from "../types.js";
 import { stripBom } from "../util/fs.js";
+import { canonicalDirectory, projectIdentities } from "../util/project-identity.js";
 import {
   extractMarketplaceSourceHost,
   isSafeMarketplaceGitLocation,
@@ -202,56 +203,15 @@ function nativeAbsolute(value: string): boolean {
   return value.startsWith("/") && !value.startsWith("//") && !value.startsWith("/\\");
 }
 
-function canonicalDirectory(value: string): string | undefined {
-  try {
-    const canonical = fs.realpathSync.native(value);
-    return fs.statSync(canonical).isDirectory() ? canonical : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function structurallyValidCommonGitDirectory(gitDirectory: string): boolean {
-  try {
-    return path.basename(gitDirectory) === ".git" && fs.statSync(path.join(gitDirectory, "HEAD")).isFile() &&
-      fs.statSync(path.join(gitDirectory, "config")).isFile() && fs.statSync(path.join(gitDirectory, "objects")).isDirectory() &&
-      fs.statSync(path.join(gitDirectory, "refs")).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function mainCheckout(projectRoot: string): string | undefined {
-  const canonicalProject = canonicalDirectory(projectRoot);
-  if (canonicalProject === undefined) return undefined;
-  const dotGit = path.join(canonicalProject, ".git");
-  try {
-    if (fs.statSync(dotGit).isDirectory()) {
-      const canonicalGit = fs.realpathSync.native(dotGit);
-      return structurallyValidCommonGitDirectory(canonicalGit) ? canonicalProject : undefined;
-    }
-    if (!fs.statSync(dotGit).isFile()) return undefined;
-    const match = /^gitdir:\s*(.+)$/i.exec(fs.readFileSync(dotGit, "utf8").trim());
-    if (match === null) return undefined;
-    const admin = canonicalDirectory(path.resolve(canonicalProject, match[1]!));
-    if (admin === undefined || path.basename(path.dirname(admin)) !== "worktrees") return undefined;
-    const backlink = fs.readFileSync(path.join(admin, "gitdir"), "utf8").trim();
-    if (path.basename(backlink) !== ".git" || fs.realpathSync.native(path.dirname(backlink)) !== canonicalProject) return undefined;
-    const common = fs.realpathSync.native(path.resolve(admin, fs.readFileSync(path.join(admin, "commondir"), "utf8").trim()));
-    if (!structurallyValidCommonGitDirectory(common)) return undefined;
-    const expectedAdminParent = fs.realpathSync.native(path.join(common, "worktrees"));
-    if (fs.realpathSync.native(path.dirname(admin)) !== expectedAdminParent || path.dirname(admin) === admin) return undefined;
-    const main = fs.realpathSync.native(path.dirname(common));
-    return fs.realpathSync.native(path.join(main, ".git")) === common ? main : undefined;
-  } catch {
-    return undefined;
-  }
+function canonicalDirectoryPath(value: string): string | undefined {
+  const result = canonicalDirectory(value);
+  return result.kind === "canonical" ? result.path : undefined;
 }
 
 function validateRoot(value: string): ValidatedMarketplaceRoot | undefined {
   if (!nativeAbsolute(value) || value.length > MAX_STRING || /[\u0000-\u001f]/.test(value)) return undefined;
   const lexicalPath = path.normalize(value);
-  const canonicalPath = canonicalDirectory(lexicalPath);
+  const canonicalPath = canonicalDirectoryPath(lexicalPath);
   return canonicalPath === undefined ? undefined : { lexicalPath, canonicalPath, [marketplaceRootBrand]: true };
 }
 
@@ -385,7 +345,7 @@ function resolveSettingsRoot(source: PluginMarketplaceRegistrationSource, scope:
   if (declared === undefined || source.kind === "file") return undefined;
   if (scope === "project" || scope === "local") {
     if (!portableRelative(declared) || anchor === undefined) return undefined;
-    const anchorCanonical = canonicalDirectory(anchor);
+    const anchorCanonical = canonicalDirectoryPath(anchor);
     if (anchorCanonical === undefined) return undefined;
     const candidate = path.resolve(anchorCanonical, declared.replaceAll("/", path.sep).replaceAll("\\", path.sep));
     const root = validateRoot(candidate);
@@ -401,7 +361,7 @@ function resolveSettingsFile(source: PluginMarketplaceRegistrationSource, scope:
   let containmentRoot: string;
   if (scope === "project" || scope === "local") {
     if (!portableRelative(declared) || anchor === undefined) return undefined;
-    const canonicalAnchor = canonicalDirectory(anchor);
+    const canonicalAnchor = canonicalDirectoryPath(anchor);
     if (canonicalAnchor === undefined) return undefined;
     containmentRoot = canonicalAnchor;
     lexical = path.resolve(canonicalAnchor, declared.replaceAll("/", path.sep).replaceAll("\\", path.sep));
@@ -753,7 +713,7 @@ export function loadPluginMarketplaceState(options: LoadPluginMarketplaceStateOp
   }
   if (configuredSeeds.length > MAX_SEED_ROOTS) report("Additional plugin seed directories omitted after the safe limit");
 
-  const anchor = mainCheckout(options.projectRoot);
+  const anchor = projectIdentities(options.projectRoot)[0];
   for (const contribution of options.settings?.pluginMarketplaceSettings ?? []) {
     if (contribution.extraKnownMarketplaces === undefined) continue;
     for (const key of Object.keys(contribution.extraKnownMarketplaces).sort(compare)) {
