@@ -1128,9 +1128,269 @@ describe("MainSessionCheckpointGate", () => {
     role: "assistant",
     content: ids.map((id) => ({ type: "toolCall", id, name: "probe", arguments: {} })),
   });
+  const completedAssistant = (ids: string[], tokens = 900, stopReason = "toolUse") => ({
+    ...assistant(...ids),
+    stopReason,
+    usage: {
+      input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: tokens,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  });
   const armForReconciliation = (gate: MainSessionCheckpointGate, ctx: Record<string, unknown>) => {
     gate.turnEnded({ ...ctx, hasPendingMessages: () => false });
   };
+
+  it("keeps duplicate assistant delivery on one generation and batch through tool termination and settlement compaction", async () => {
+    const { controller, gate } = setup();
+    const toolRelease = deferred<Record<string, unknown>>();
+    const order: string[] = [];
+    let compactions = 0;
+    let aborts = 0;
+    let runningTool: Promise<Record<string, unknown>> | undefined;
+    gate.attachExecution({
+      compact: async () => { compactions += 1; order.push("compact"); return { ok: true }; },
+      resume: () => ({
+        settled: Promise.resolve(),
+        replay: async () => ({ delivered: true }),
+        cancelAndJoin: async () => undefined,
+      }),
+    });
+    const ctx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
+      hasPendingMessages: () => false,
+      abort: () => { aborts += 1; },
+    };
+    const message = completedAssistant(["held"]);
+    try {
+      gate.assistantMessageEnded(message, ctx);
+      const generation = controller.snapshot().generation;
+      expect(controller.snapshot().phase).toBe("stopping");
+
+      const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => toolRelease.promise });
+      let toolSettled = false;
+      runningTool = wrapped.execute("held", {}, undefined, undefined, ctx)
+        .then((result: Record<string, unknown>) => { toolSettled = true; order.push("tool"); return result; });
+      await Promise.resolve();
+      gate.assistantMessageEnded(message, ctx);
+      expect(controller.snapshot()).toMatchObject({ generation, phase: "stopping" });
+      expect(toolSettled).toBe(false);
+      expect({ aborts, compactions }).toEqual({ aborts: 0, compactions: 0 });
+
+      toolRelease.resolve({ content: [], details: {} });
+      const result = await runningTool!;
+      expect(result.terminate).toBe(true);
+      gate.toolExecutionEnded({ toolCallId: "held", result, isError: false });
+      expect(gate.turnEnded(ctx)?.stop).toBe("terminate");
+      expect(gate.settlementGeneration(ctx)).toBe(generation);
+      await controller.checkpoint(generation);
+      expect(order).toEqual(["tool", "compact"]);
+      expect(compactions).toBe(1);
+      expect(controller.snapshot().phase).toBe("idle");
+    } finally {
+      toolRelease.resolve({ content: [], details: {} });
+      if (runningTool) await runningTool;
+    }
+  });
+
+  it("ignores a wrapped tool result that settles after session replacement", async () => {
+    const { gate } = setup();
+    const toolRelease = deferred<Record<string, unknown>>();
+    let oldTool: Promise<Record<string, unknown>> | undefined;
+    let successorCompactions = 0;
+    let successorAborts = 0;
+    const oldCtx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
+    };
+    try {
+      gate.assistantMessageEnded(completedAssistant(["old-tool"]), oldCtx);
+      const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => toolRelease.promise });
+      oldTool = wrapped.execute("old-tool", {}, undefined, undefined, oldCtx);
+      await Promise.resolve();
+
+      const replacement = gate.startSession("successor");
+      await settlement(replacement, { description: "session replacement without waiting for the old tool" });
+      await expect(replacement).resolves.toBeUndefined();
+      gate.attachExecution({ compact: async () => { successorCompactions += 1; return { ok: true }; } });
+      toolRelease.resolve({ content: [{ type: "text", text: "old result" }], details: {} });
+      await expect(oldTool).resolves.toEqual({
+        content: [{ type: "text", text: "old result" }], details: {},
+      });
+
+      const successorCtx = {
+        model: { api: "openai-responses", contextWindow: 1000 },
+        getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+        abort: () => { successorAborts += 1; },
+      };
+      expect(gate.currentController().snapshot()).toMatchObject({ generation: 0, phase: "idle", admission: "open" });
+      expect(gate.settlementGeneration(successorCtx)).toBeUndefined();
+      expect({ successorAborts, successorCompactions }).toEqual({ successorAborts: 0, successorCompactions: 0 });
+    } finally {
+      toolRelease.resolve({ content: [], details: {} });
+      if (oldTool) await oldTool;
+    }
+  });
+
+  it("keeps high-usage text-only responses on the settled non-resuming fallback", async () => {
+    const { controller, gate } = setup();
+    let compactions = 0;
+    let resumes = 0;
+    gate.attachExecution({
+      compact: async () => { compactions += 1; return { ok: true }; },
+      resume: () => { resumes += 1; throw new Error("fallback must not resume"); },
+    });
+    const ctx = {
+      model: { api: "openai-completions", contextWindow: 1000 },
+      getContextUsage: () => usage,
+    };
+    gate.assistantMessageEnded(completedAssistant([], 950, "stop"), ctx);
+    expect(controller.snapshot().phase).toBe("idle");
+    const generation = gate.settlementGeneration(ctx)!;
+    await controller.checkpoint(generation);
+    expect({ compactions, resumes }).toEqual({ compactions: 1, resumes: 0 });
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it.each(["user", "shutdown"] as const)(
+    "cancels an assistant-armed unresolved tool safely for %s cancellation",
+    async (kind) => {
+      const { controller, gate } = setup();
+      const toolRelease = deferred<Record<string, unknown>>();
+      let aborts = 0;
+      let compactions = 0;
+      const ctx = {
+        model: { api: "openai-responses", contextWindow: 1000 },
+        getContextUsage: () => ({ ...usage, percent: null }),
+        abort: () => { aborts += 1; },
+      };
+      gate.attachExecution({ compact: async () => { compactions += 1; return { ok: true }; } });
+      gate.assistantMessageEnded(completedAssistant(["held"]), ctx);
+      const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => toolRelease.promise });
+      const runningTool = wrapped.execute("held", {}, undefined, undefined, ctx);
+      try {
+        await expect(gate.cancel(kind)).resolves.toMatchObject({ cancelled: true });
+        expect(controller.snapshot().phase).toBe("cancelled");
+        expect({ aborts, compactions }).toEqual({ aborts: 0, compactions: 0 });
+      } finally {
+        toolRelease.resolve({ content: [], details: {} });
+        await expect(runningTool).resolves.toMatchObject({ content: [] });
+      }
+    },
+  );
+
+  it("blocks a newly high idle provider admission once, then resumes through settlement-owned compaction", async () => {
+    const { controller, gate } = setup();
+    let aborts = 0;
+    let compactions = 0;
+    let resumes = 0;
+    gate.attachExecution({
+      compact: async () => { compactions += 1; return { ok: true }; },
+      resume: () => {
+        resumes += 1;
+        return {
+          settled: Promise.resolve(),
+          replay: async () => ({ delivered: true }),
+          cancelAndJoin: async () => undefined,
+        };
+      },
+    });
+    let percent = 10;
+    const ctx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: percent * 10, contextWindow: 1000, percent }),
+      abort: () => { aborts += 1; },
+    };
+    gate.assistantMessageEnded(completedAssistant([], 100, "stop"), ctx);
+    expect(gate.settlementGeneration(ctx)).toBeUndefined();
+    percent = 90;
+    await gate.beforeProviderRequest(ctx);
+    expect(controller.snapshot()).toMatchObject({ phase: "awaiting-settlement", admission: "checkpoint-only" });
+    expect(aborts).toBe(1);
+    await gate.beforeProviderRequest(ctx);
+    expect(aborts).toBe(1);
+    const generation = gate.settlementGeneration(ctx)!;
+    await controller.checkpoint(generation);
+    expect({ compactions, resumes }).toEqual({ compactions: 1, resumes: 1 });
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it.each(["error", "aborted"] as const)("rejects high assistant usage from a %s completion", (stopReason) => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(completedAssistant(["tool"], 950, stopReason), {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
+    });
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it("admits a controller-owned summary request and cancels an admission checkpoint without starting compaction", async () => {
+    const first = setup();
+    const compactRelease = deferred<CompactionAttemptResult>();
+    let firstAborts = 0;
+    const ctx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => usage,
+      abort: () => { firstAborts += 1; },
+    };
+    first.gate.attachExecution({
+      compact: async () => compactRelease.promise,
+      resume: () => ({ settled: Promise.resolve(), replay: async () => ({ delivered: true }), cancelAndJoin: async () => undefined }),
+    });
+    let checkpoint: Promise<void> | undefined;
+    try {
+      await first.gate.beforeProviderRequest(ctx);
+      const generation = first.gate.settlementGeneration(ctx)!;
+      checkpoint = first.controller.checkpoint(generation);
+      await waitUntil({ description: "admission checkpoint compaction", predicate: () => first.controller.snapshot().phase === "compacting" });
+      const summary = first.controller.beginCompactionSummary(generation)!;
+      await first.gate.beforeProviderRequest(ctx);
+      expect(firstAborts).toBe(1);
+      first.controller.endCompactionSummary(summary);
+      compactRelease.resolve({ ok: true });
+      await checkpoint;
+    } finally {
+      compactRelease.resolve({ ok: true });
+      if (checkpoint) await checkpoint;
+    }
+
+    const second = setup();
+    let secondAborts = 0;
+    let secondCompactions = 0;
+    const cancelCtx = { ...ctx, abort: () => { secondAborts += 1; } };
+    second.gate.attachExecution({ compact: async () => { secondCompactions += 1; return { ok: true }; } });
+    await second.gate.beforeProviderRequest(cancelCtx);
+    await expect(second.gate.cancel("user")).resolves.toMatchObject({ cancelled: true });
+    expect({ secondAborts, secondCompactions }).toEqual({ secondAborts: 1, secondCompactions: 0 });
+  });
+
+  it.each([
+    ["below threshold", "openai-responses", 899, { tokens: 899, contextWindow: 1000, percent: 89.9 }],
+    ["unknown usage", "openai-responses", 0, { tokens: null, contextWindow: 1000, percent: null }],
+    ["unsupported API", "custom-api", 950, { tokens: 950, contextWindow: 1000, percent: 95 }],
+  ] as const)("does not arm at assistant or admission sampling for %s", async (_label, api, tokens, admissionUsage) => {
+    const { controller, gate } = setup();
+    let aborts = 0;
+    const ctx = {
+      model: { api, contextWindow: 1000 },
+      getContextUsage: () => admissionUsage,
+      abort: () => { aborts += 1; },
+    };
+    gate.assistantMessageEnded(completedAssistant(["tool"], tokens), ctx);
+    await gate.beforeProviderRequest(ctx);
+    expect(controller.snapshot().phase).toBe("idle");
+    expect(aborts).toBe(0);
+  });
+
+  it("does not treat an assistant-side percentage imitation as fresh usage proof", () => {
+    const { controller, gate } = setup();
+    const message = { ...assistant("tool"), stopReason: "toolUse", usage: { percent: 99 } };
+    gate.assistantMessageEnded(message, {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
+    });
+    expect(controller.snapshot().phase).toBe("idle");
+  });
 
   it.each(["armed", "stopping"] as const)(
     "makes a %s phase total only under the explicit production host-settlement contract",
@@ -2456,6 +2716,54 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
   });
 
+  it("wires fresh assistant usage and final provider admission through the registered main handlers", async () => {
+    pi.entries.length = 0;
+    let aborts = 0;
+    let percent: number | null = null;
+    const ctx = pi.rpcCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({
+        tokens: percent === null ? null : percent * 10, contextWindow: 1000, percent,
+      }),
+      abort: () => { aborts += 1; },
+    });
+    await pi.fire("session_start", { reason: "new" }, ctx);
+    await pi.fire("message_end", {
+      message: {
+        role: "assistant", stopReason: "toolUse",
+        usage: {
+          input: 900, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 900,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        content: [{ type: "toolCall", id: "wired-tool", name: "Skill", arguments: {} }],
+      },
+    }, ctx);
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("stopping");
+    expect(aborts).toBe(0);
+    const armed = pi.entries.find((entry) => entry.data.category === "checkpoint-armed");
+    expect(armed?.data.notice).toMatch(/queued.*safe settlement/i);
+    expect(String(armed?.data.notice)).not.toMatch(/compacting|compaction (?:has )?started/i);
+
+    await mainCheckpointGate.startSession("registered-provider-admission-boundary");
+    percent = 90;
+    await pi.fire("before_provider_request", {}, ctx);
+    expect(aborts).toBe(1);
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("awaiting-settlement");
+    const admissionArmed = pi.entries.filter((entry) => entry.data.category === "checkpoint-armed").at(-1);
+    expect(admissionArmed?.data.notice).toMatch(/queued.*waiting for safe settlement/i);
+    expect(String(admissionArmed?.data.notice)).not.toMatch(/starting|settled fallback/i);
+    await pi.fire("before_provider_request", {}, ctx);
+    expect(aborts).toBe(1);
+
+    await mainCheckpointGate.startSession("registered-settled-wording");
+    pi.entries.length = 0;
+    expect(mainCheckpointGate.settlementGeneration(ctx)).toBe(1);
+    const settledArmed = pi.entries.find((entry) => entry.data.category === "checkpoint-armed");
+    expect(settledArmed?.data.notice).toMatch(/starting.*settled fallback/i);
+    expect(String(settledArmed?.data.notice)).not.toMatch(/queued|waiting/i);
+    await mainCheckpointGate.startSession("registered-observation-boundaries-complete");
+  });
+
   it("gates clean and fallback cycles through the actual registered lifecycle handlers", async () => {
     const highUsage = () => ({ tokens: 900, contextWindow: 1000, percent: 90 });
     const assistant = (...ids: string[]) => ({
@@ -2938,13 +3246,25 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       message: Record<string, unknown>,
     ) => {
       await mainCheckpointGate.startSession(sessionId);
+      let resumedMessageVisible = false;
+      let stopOnTerminalRead = false;
+      let stoppedResumeObserved = false;
       const ctx = pi.ctx({
         mode,
         hasUI: mode === "rpc",
         model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
         getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
         hasPendingMessages: () => false,
-        sessionManager: { getBranch: () => [{ type: "message", message }] },
+        sessionManager: { getBranch: () => {
+          if (stopOnTerminalRead && !stoppedResumeObserved) {
+            const stoppedController = mainCheckpointGate.currentController();
+            const stoppedGeneration = stoppedController.snapshot().generation;
+            stoppedResumeObserved = mainCheckpointGate.captureLogicalRunStop()();
+            expect(stoppedResumeObserved).toBe(true);
+            expect(mainCheckpointGate.stoppedRunWasResuming(stoppedController, stoppedGeneration)).toBe(true);
+          }
+          return resumedMessageVisible ? [{ type: "message", message }] : [];
+        } },
         compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
       });
       mainCheckpointGate.assistantMessageEnded({
@@ -2963,12 +3283,20 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         description: `${sessionId} resumed settlement`,
         predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
       });
-      await Promise.all([
-        pi.fire("agent_settled", {}, { ...ctx }),
-        pi.fire("agent_settled", {}, { ...ctx }),
-      ]);
-      await outer;
+      resumedMessageVisible = true;
+      stopOnTerminalRead = sessionId === "print-pending";
       await pi.fire("agent_settled", {}, { ...ctx });
+      await outer;
+      if (["pending", "error", "aborted"].includes(String(message.stopReason))) {
+        const controller = mainCheckpointGate.currentController();
+        expect(controller.snapshot()).toMatchObject({
+          phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+        });
+        expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+        expect(controller.manualCompactionDisposition()).toBe("unavailable");
+        expect(mainCheckpointGate.isLogicalRunStopped()).toBe(false);
+        if (sessionId === "print-pending") expect(stoppedResumeObserved).toBe(true);
+      }
     };
 
     const writes: string[] = [];
@@ -3003,6 +3331,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       await runResume("print-aborted", "print", {
         role: "assistant", content: [{ type: "text", text: "unsafe aborted" }], stopReason: "aborted",
       });
+      await runResume("print-pending", "print", {
+        role: "assistant", content: [{ type: "text", text: "unsafe incomplete pending" }], stopReason: "pending",
+      });
       await runResume("json-safe", "json", {
         role: "assistant", content: [{ type: "text", text: "machine result" }], stopReason: "stop",
       });
@@ -3011,7 +3342,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
 
     expect(writes).toEqual(["resumed one\nresumed two\n"]);
-    expect(writes.join("\n")).not.toMatch(/thinking|secret-sentinel|private|transcript/);
+    expect(writes.join("\n")).not.toMatch(/thinking|secret-sentinel|private|transcript|incomplete pending/);
     expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result"))
       .toHaveLength(1);
   });
@@ -3430,7 +3761,12 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
    * the gate directly so `sessionManagerRef` is this context's, which decides whether the
    * headless recovery guidance names a persisted session or calls the session ephemeral.
    */
-  const armCheckpoint = async (ctx: any, id: string, queued?: string) => {
+  const armCheckpoint = async (
+    ctx: any,
+    id: string,
+    queued?: string,
+    checkpointAbortRequested = false,
+  ) => {
     await pi.fire("session_start", { reason: "new" }, ctx);
     mainCheckpointGate.assistantMessageEnded({
       role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
@@ -3439,15 +3775,109 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
     });
     const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: checkpointAbortRequested });
     mainCheckpointGate.turnEnded(ctx);
     if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
     const controller = mainCheckpointGate.currentController();
     expect(controller.snapshot()).toMatchObject({
-      phase: "awaiting-settlement", queuedInputs: queued === undefined ? 0 : 1,
+      phase: "awaiting-settlement",
+      checkpointAbortRequested,
+      queuedInputs: queued === undefined ? 0 : 1,
     });
     return { controller, generation: controller.snapshot().generation };
   };
+
+  it.each([
+    ["clean terminate", false],
+    ["mixed abort", true],
+  ] as const)(
+    "settles an awaiting %s checkpoint once when Pi persists its physical cutoff as aborted",
+    async (cutoff, checkpointAbortRequested) => {
+      let compactions = 0;
+      const terminal = {
+        role: "assistant",
+        content: [{ type: "text", text: `physical ${cutoff} checkpoint cutoff` }],
+        stopReason: "aborted",
+      };
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+        abort: () => undefined,
+        compact: (options: any) => {
+          compactions += 1;
+          queueMicrotask(() => options.onError(new Error("summary unavailable")));
+        },
+      });
+      const { controller } = await armCheckpoint(
+        ctx,
+        `persisted-${cutoff.replace(" ", "-")}-cutoff`,
+        undefined,
+        checkpointAbortRequested,
+      );
+      const logicalAuthority = mainCheckpointGate.captureLogicalRunStop();
+
+      await pi.fire("agent_settled", {}, ctx);
+
+      expect(compactions).toBe(1);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+      expect(logicalAuthority()).toBe(true);
+    },
+  );
+
+  it.each(["pending", "error"] as const)(
+    "rejects a genuine awaiting %s terminal",
+    async (stopReason) => {
+      let compactions = 0;
+      const terminal = {
+        role: "assistant",
+        content: [{ type: "text", text: `unsuccessful ${stopReason}` }],
+        stopReason,
+      };
+      const ctx = pi.printCtx({
+        mode: "json",
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+        abort: () => undefined,
+        compact: (options: any) => {
+          compactions += 1;
+          queueMicrotask(() => options.onError(new Error("unexpected compaction")));
+        },
+      });
+      const { controller, generation } = await armCheckpoint(ctx, `unsuccessful-${stopReason}`);
+      const barrier = controller.stableBarrier(generation);
+      const beforeEntries = pi.entries.length;
+      const logicalAuthority = mainCheckpointGate.captureLogicalRunStop();
+
+      await pi.fire("agent_settled", {}, ctx);
+
+      expect(compactions).toBe(0);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+      expect(controller.ordinaryInputDisposition()).toBe("reject-recoverable");
+      expect(controller.manualCompactionDisposition()).toBe("allow");
+      const recovery = controller.recoveryToken(generation);
+      expect(recovery).toBeDefined();
+      await expect(barrier).resolves.toBeUndefined();
+      const diagnostics = pi.entries.slice(beforeEntries).filter((entry) =>
+        entry.data.category === "checkpoint-exhausted");
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.data).toMatchObject({
+        generation, action: "manual-recovery", failureCategory: "operational",
+      });
+      await expect(pi.fire("input", {
+        text: `ordinary-after-${stopReason}`, source: "interactive", streamingBehavior: undefined,
+      }, ctx)).resolves.toEqual({ action: "handled" });
+      expect(logicalAuthority()).toBe(false);
+      expect(controller.recoverAfterManualCompaction(recovery!).recovered).toBe(true);
+    },
+  );
 
   interface EndingCase {
     /** Does this ending take the retained input away, or hold it for `/compact`? */
@@ -4817,6 +5247,39 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("session_compact", {
       reason: "manual", compactionEntry: { summary: "later succeeded" },
     }, ctx);
+  });
+
+  it("consumes a stopped unsuccessful settlement before releasing native and logical-run authority", async () => {
+    await mainCheckpointGate.startSession("stopped-unsuccessful-native");
+    const terminal = {
+      role: "assistant",
+      content: [{ type: "text", text: "unsuccessful native boundary" }],
+      stopReason: "error",
+    };
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+      sessionManager: { getBranch: () => [{ type: "message", message: terminal }] },
+    });
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx)).resolves.toBeUndefined();
+    const stoppedAuthority = mainCheckpointGate.captureLogicalRunStop();
+    expect(stoppedAuthority()).toBe(true);
+    await pi.fire("agent_settled", {}, ctx);
+    expect(mainCheckpointGate.isLogicalRunStopped()).toBe(false);
+    expect(stoppedAuthority()).toBe(false);
+    expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+    await expect(pi.fire("session_before_compact", {
+      reason: "manual", customInstructions: "native identity was released",
+    }, ctx)).resolves.toBeUndefined();
+    await pi.fire("session_compact", {
+      reason: "manual", compactionEntry: { summary: "successor operation" },
+    }, ctx);
+
+    await mainCheckpointGate.startSession("ordinary-unsuccessful-authority");
+    const ordinaryAuthority = mainCheckpointGate.captureLogicalRunStop();
+    await pi.fire("agent_settled", {}, ctx);
+    expect(ordinaryAuthority()).toBe(false);
+    expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
   });
 
   it("keeps manual ownership across stale native events and refuses native overlap", async () => {

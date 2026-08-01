@@ -11,6 +11,7 @@ import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
+  PROACTIVE_COMPACTION_APIS,
   capabilityForToolName,
   lookupCapability,
 } from "../src/registry/capability-registry.js";
@@ -305,7 +306,28 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ],
       parity: [/PiCC reliability hardening/, /NOT Claude Code transport\/retry parity/],
     });
-    const proactive = lookupCapability("feature.proactive-compaction-policy")?.note ?? "";
+    const proactiveCapability = lookupCapability("feature.proactive-compaction-policy");
+    const proactive = proactiveCapability?.note ?? "";
+    const supportedApis = [...PROACTIVE_COMPACTION_APIS]
+      .map((api, index, apis) => index === apis.length - 1 ? `and ${api}` : api)
+      .join(", ");
+    expect(proactiveCapability?.tier).toBe("partial");
+    expect(proactive).toContain(
+      `Admission is limited to main sessions and PiCC-created children using Pi's APIs: ${supportedApis}.`,
+    );
+    for (const boundary of [
+      /PiCC HARDENING/,
+      /Fresh successful tool-requesting assistant usage can queue/,
+      /already-requested tools finish/,
+      /turn_end handles the complete batch/,
+      /before_provider_request is the final idle-to-armed sample/,
+      /admission abort blocks ordinary provider transport/,
+      /agent_settled is the only boundary that may start one physical Pi compaction transaction if the checkpoint is still required/,
+      /only after no provider response or tool batch remains unresolved/,
+      /rather than verified Claude parity/,
+    ]) {
+      expect(proactive).toMatch(boundary);
+    }
     expect(proactive).toContain("feature.compaction-summary-recovery");
     expect(proactive).not.toMatch(
       /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
@@ -594,7 +616,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
-        /responsive status panel remains the waiting\/running surface/,
+        /status-panel observability is defined by feature\.background-agents/,
         /dispatched subagents do NOT recurse/,
       ],
       gap: [/PARTIAL residual/, /notice is next-turn/],
@@ -620,6 +642,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /unbound action fails open/,
         /At unusable widths, detail waits for widening; a resize prompt appears only when it fits/,
         /never adding a reference or duplicate row/,
+        /status-panel observability is defined by feature\.background-agents/,
       ],
       gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
       precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
@@ -629,6 +652,26 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
+  });
+
+  it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {
+    const owner = lookupCapability("feature.background-agents")?.note ?? "";
+    for (const clause of [
+      "stable PiCC-defined current-activity line until terminal settlement",
+      "tool/argument, reasoning, assistant/output, startup, work, retry, and waiting states",
+      "window counts at most eight agents rather than physical lines",
+      "widths below the explicit row minimum retain truthful aggregates without per-agent activity",
+      "drill-down that retains multiline history and richer detail",
+      "PiCC-chosen details, NOT parity",
+    ]) expect(owner, clause).toContain(clause);
+
+    for (const id of ["tool.Agent", "tool.TaskOutput"]) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).toContain("status-panel observability is defined by feature.background-agents");
+      expect(note, `${id} must not duplicate panel mechanics`).not.toMatch(
+        /eight-agent window|current-activity line|narrow.*aggregate|multiline history/u,
+      );
+    }
   });
 
   it("keeps the full state-aware policy only in tool.Agent and pins each consumer consequence", () => {
@@ -752,6 +795,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
+        /stable PiCC-defined current-activity line until terminal settlement/,
+        /tool\/argument, reasoning, assistant\/output, startup, work, retry, and waiting states/,
+        /window counts at most eight agents rather than physical lines/,
+        /widths below the explicit row minimum retain truthful aggregates without per-agent activity/,
+        /Lingering terminal agents return to one row/,
+        /drill-down.*retains multiline history and richer detail/,
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
       precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
@@ -887,7 +936,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const variable of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
       expect(bash?.note, variable).toContain(variable);
     }
-    expect(bash?.note).toContain("deliberately disables Pi 0.82");
+    expect(bash?.note).toContain("deliberately disables Pi's");
   });
 
   // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent

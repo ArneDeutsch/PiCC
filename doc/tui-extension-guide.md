@@ -101,11 +101,11 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see "Colors and themes"). The production install currently contains
-both PiCC's direct `pi-tui` dependency and Pi's nested copy. Structural components and stateless
-width helpers may cross that tested Pi 0.82 boundary; mutable singleton state and
-constructor-sensitive operations must resolve through `pi-tui-runtime.ts` from Pi's package
-context. Physical deduplication is optional, not assumed.
+argument **is** Pi's `Theme` (see "Colors and themes"). The supported package layout recorded in
+[`doc/pi-integration.md`](pi-integration.md) contains both PiCC's direct `pi-tui` dependency and Pi's
+nested copy. Structural components and stateless width helpers may cross that tested package
+boundary; mutable singleton state and constructor-sensitive operations must resolve through
+`pi-tui-runtime.ts` from Pi's package context. Physical deduplication is optional, not assumed.
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
@@ -321,9 +321,10 @@ Several dedicated hooks — all low-risk:
 - **`ctx.ui.setStatus(key, text)`** — footer status line (see "Persistent panes and chrome").
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
   true })`. **PiCC already does this** for subagent lifecycle status, ordinary API retries, and
-  sanitized summary-retry activity (`src/runtime/subagent-progress.ts` → `subagent-render.ts`);
-  bounded structured live detail lives
-  in the selected-agent view, not list or tool rows. Copy the pattern for any long tool.
+  sanitized summary-retry activity (`src/runtime/subagent-progress.ts` → `subagent-render.ts`).
+  In row mode, each individually rendered active agent shows one bounded structured current-activity
+  line; the eight-agent window still counts agents, and the narrow aggregate has no per-agent line.
+  The selected-agent view owns long or multiline history and detail. Copy the pattern for any long tool.
 - **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome"); the subagent
   status panel (`src/runtime/subagent-panel-widget.ts`) is the shipped example, including the
   interval-owned-by-the-component lifecycle.
@@ -377,7 +378,7 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 - **Custom transcript entries** — `pi.appendEntry(customType, data)` + `pi.registerEntryRenderer`
   (PiCC uses these for control-command output and appends checkpoint lifecycle records; entries do
   **not** enter LLM context). For custom *messages* that do participate, `pi.sendMessage` +
-  `pi.registerMessageRenderer`.
+  `pi.registerMessageRenderer`; its renderer receives `{ expanded: boolean; outputPad: number }`.
 - **CLI flags** — `pi.registerFlag(name, { type, default })` + `pi.getFlag(name)`.
 - **Terminal title** — `ctx.ui.setTitle(title)`.
 - **Autocomplete** — `ctx.ui.addAutocompleteProvider(factory)` stacks on the built-in provider.

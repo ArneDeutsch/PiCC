@@ -98,7 +98,9 @@ npm run update:pi -- <stable-exact-version>
 ```
 
 The helper runs one exact, scripts-disabled npm transaction using your normal npm configuration,
-then validates the four direct Pi package manifests. If it fails, inspect or restore `package.json` and
+then validates the four direct Pi package manifests. Inspect Pi's package metadata for directly pinned
+companion dependencies such as TypeBox and align those separately when required; they are not members
+of the same-version four-package suite. If the helper fails, inspect or restore `package.json` and
 `package-lock.json` with Git and run `npm ci`. It does not make compatibility decisions: adapt PiCC
 semantics and documentation, run `npm run verify:all`, then submit the result as a human-reviewed
 pull request. Never couple Pi release detection or adoption to automatic merging or publication.

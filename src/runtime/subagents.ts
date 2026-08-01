@@ -836,7 +836,7 @@ class ChildCheckpointCoordinator {
   extensionFactory() {
     const child = this;
     return (pi: { on(event: string, handler: (event: any, ctx: any) => unknown): void }) => {
-      pi.on("message_end", (event) => child.gate.assistantMessageEnded(event?.message));
+      pi.on("message_end", (event, ctx) => child.gate.assistantMessageEnded(event?.message, ctx));
       pi.on("message_start", (event) => child.gate.userMessageStarted(
         event?.message,
         event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
@@ -848,7 +848,7 @@ class ChildCheckpointCoordinator {
         await child.gate.defensiveLatch(ctx);
       });
       pi.on("before_provider_request", async (_event, ctx) => {
-        await child.gate.defensiveLatch(ctx);
+        await child.gate.beforeProviderRequest(ctx);
       });
       pi.on("agent_settled", async (_event, ctx) => child.settled(ctx));
       pi.on("session_before_compact", async (event) => child.beforeCompact(event));
@@ -1291,7 +1291,15 @@ class ChildCheckpointCoordinator {
       ? "checkpoint paused: recovery required"
       : event.category === "checkpoint-recovered"
         ? "checkpoint recovered: resuming"
-        : `checkpoint: ${event.category}`;
+        : event.category === "checkpoint-armed"
+          ? event.source === "assistant" || event.source === "tool"
+            ? "context checkpoint queued while the current tool cycle finishes"
+            : event.source === "admission"
+              ? "context checkpoint queued, waiting for safe child settlement"
+              : event.source === "settled"
+                ? "context checkpoint ready after the child run settled"
+                : "context checkpoint queued until the child reaches safe settlement"
+          : `checkpoint: ${event.category}`;
     this.emitProgress?.({ tail: [activity], activity });
     if (event.category === "checkpoint-exhausted") {
       this.diagnostics.push({ severity: "warning", message: this.failureMessage() });
@@ -2558,18 +2566,13 @@ export class SubagentRuntime {
         else opts.abortSignal.addEventListener("abort", abortListener, { once: true });
       }
 
-      // Live progress: subscribe to the child session's event stream and
-      // condense it into a bounded, sanitized snapshot on every visible change.
-      // The dispatch-registry mirror is UNCONDITIONAL — this subscription is
-      // the panel's single live data source, so foreground (with or without an
-      // onUpdate sink), background, nested, and resumed dispatches all feed it;
-      // opts.onProgress additionally receives the same snapshot when supplied,
-      // exactly as before. Mirror before emit, so the record never lags a
-      // consumer-visible snapshot; structured detail travels only to the
-      // registry record, never inside model-facing emitted payloads.
-      // Event-stream only — NEVER poll session.messages (compaction inside
-      // prompt() rewrites that array mid-flight). Degrades to nothing when the
-      // session has no subscribe() (simple fakes, older SDKs).
+      // Project every child event independently into the legacy snapshot, structured
+      // detail log, and current live-activity atom. The registry mirrors all three for
+      // foreground, background, nested, and resumed dispatches; opts.onProgress receives
+      // snapshot changes only, preserving its model-facing cadence. Mirror before emit so
+      // the registry never lags a consumer-visible snapshot. Event-stream only — NEVER
+      // poll session.messages, which compaction can rewrite mid-flight. Sessions without
+      // subscribe() (simple fakes and older SDKs) degrade to no live projection.
       const dispatchRegistry = this.deps.subagentRegistry;
       if ((opts.onProgress || dispatchRegistry) && typeof session.subscribe === "function") {
         const emit = opts.onProgress;
@@ -2578,14 +2581,16 @@ export class SubagentRuntime {
           try {
             const snapshotChanged = condenser.consume(event);
             const detailChanged = condenser.detailChanged();
-            if (!snapshotChanged && !detailChanged) return;
+            const liveActivityChanged = condenser.liveActivityChanged();
+            if (!snapshotChanged && !detailChanged && !liveActivityChanged) return;
             const snapshot = snapshotChanged ? condenser.snapshot() : undefined;
             dispatchRegistry?.noteProgress(
               agentId,
               snapshot,
               detailChanged ? condenser.detailLog() : undefined,
+              liveActivityChanged ? { value: condenser.liveActivity() } : undefined,
             );
-            if (snapshot) emit?.(snapshot);
+            if (snapshotChanged) emit?.(snapshot!);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }
@@ -2661,6 +2666,25 @@ export class SubagentRuntime {
             isFork,
             usage: captureUsage(),
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
+            diagnostics,
+          };
+        }
+        if (last?.stopReason === "pending") {
+          settledOutcome = "failed";
+          settledFinalText = assistantTextSoFar(live);
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: settledFinalText,
+            agentId,
+            transcriptPath,
+            resumable: actualResumable,
+            truncated: false,
+            isFork,
+            agentName: agent.name,
+            worktreePath,
+            usage: captureUsage(),
+            error: "Agent ended with an incomplete pending assistant response.",
             diagnostics,
           };
         }

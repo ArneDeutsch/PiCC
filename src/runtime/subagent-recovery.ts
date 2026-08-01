@@ -66,14 +66,15 @@ function hasModelContent(content: unknown): boolean {
 
 function messageShowsProgress(message: MessageLike): boolean {
   if (message.role === "toolResult") return true;
-  if (message.role !== "assistant") return false;
+  if (message.role !== "assistant" || message.stopReason === "pending") return false;
   if (hasModelContent(message.content)) return true;
   return message.stopReason !== "error" && message.stopReason !== "aborted";
 }
 
-/** Records structural progress monotonically; incomplete observation separately prevents a zero-progress conclusion. */
+/** Separates durable progress from streamed assistant content that a terminal pending boundary can retract. */
 export class SubagentRecoveryProgress {
-  private progressed = false;
+  private durableProgress = false;
+  private provisionalAssistantProgress = false;
   private observationComplete = false;
   private readonly initialMessageCount: number;
 
@@ -91,27 +92,36 @@ export class SubagentRecoveryProgress {
   }
 
   consume(event: unknown): void {
-    if (this.progressed || typeof event !== "object" || event === null) return;
+    if (typeof event !== "object" || event === null) return;
     const candidate = event as { type?: unknown; message?: unknown };
     if (candidate.type === "tool_execution_start") {
-      this.progressed = true;
+      this.durableProgress = true;
       return;
     }
     if (typeof candidate.message !== "object" || candidate.message === null) return;
     const message = candidate.message as MessageLike;
     if (candidate.type === "message_update") {
-      if (message.role === "assistant" && hasModelContent(message.content)) this.progressed = true;
-    } else if (candidate.type === "message_end" && messageShowsProgress(message)) {
-      this.progressed = true;
+      if (message.role === "assistant" && hasModelContent(message.content)) {
+        this.provisionalAssistantProgress = true;
+      }
+    } else if (candidate.type === "message_end") {
+      if (message.role === "assistant" && message.stopReason === "pending") {
+        this.provisionalAssistantProgress = false;
+      }
+      if (messageShowsProgress(message)) this.durableProgress = true;
     }
   }
 
   observeMessages(messages: readonly MessageLike[]): void {
-    if (this.progressed) return;
-    if (messages.slice(this.initialMessageCount).some(messageShowsProgress)) this.progressed = true;
+    const observed = messages.slice(this.initialMessageCount);
+    const last = observed[observed.length - 1];
+    if (last?.role === "assistant" && last.stopReason === "pending") {
+      this.provisionalAssistantProgress = false;
+    }
+    if (observed.some(messageShowsProgress)) this.durableProgress = true;
   }
 
   hasProgress(): boolean {
-    return this.progressed || !this.observationComplete;
+    return this.durableProgress || this.provisionalAssistantProgress || !this.observationComplete;
   }
 }

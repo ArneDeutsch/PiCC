@@ -3497,11 +3497,16 @@ describe("BackgroundTaskRegistry.markUserStopped", () => {
 // ---------------------------------------------------------------------------
 
 describe("SubagentRegistry live mirror + onChange", () => {
-  it("background dispatch mirrors progress, structured detail, and live usage onto the dispatch registry record and keeps the task record in sync", async () => {
+  it("background dispatch mirrors independent live activity without adding it to task progress", async () => {
     const sub = new SubagentRegistry();
     const bg = new BackgroundTaskRegistry();
+    const runningActivities: unknown[] = [];
+    sub.onChange(() => {
+      const record = sub.list()[0];
+      if (record?.state === "running" && record.liveActivity) runningActivities.push({ ...record.liveActivity });
+    });
     const events = [
-      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
+      { type: "tool_execution_start", toolCallId: "grep-1", toolName: "Grep", args: { pattern: "foo" } },
       {
         type: "turn_end",
         message: {
@@ -3540,6 +3545,9 @@ describe("SubagentRegistry live mirror + onChange", () => {
     const rec = sub.get(String(started.details.agentId))!;
     expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
     expect(rec.detailLog?.some((entry) => entry.kind === "tool-call" && entry.tool === "Grep")).toBe(true);
+    expect(runningActivities).toContainEqual({ kind: "tool", tool: "grep", detail: "foo" });
+    expect(rec.liveActivity).toBeUndefined();
+    expect(bg.get(taskId)?.progress).not.toHaveProperty("liveActivity");
     const live = {
       inputTokens: 10,
       outputTokens: 5,
@@ -3574,37 +3582,45 @@ describe("SubagentRegistry live mirror + onChange", () => {
       text: "full line",
       fingerprint: assistantTextFingerprint(["full line"]),
     }];
-    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, detail);
+    const activity = { kind: "tool" as const, tool: "read", detail: "a.ts" };
+    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, detail, { value: activity });
     expect(fires).toBe(2);
     expect(sub.get(id)?.detailLog).toEqual(detail);
+    activity.tool = "mutated";
+    expect(sub.get(id)?.liveActivity).toEqual({ kind: "tool", tool: "read", detail: "a.ts" });
+    sub.noteProgress(id, undefined, undefined, { value: undefined });
+    expect(fires).toBe(3);
+    expect(sub.get(id)?.liveActivity).toBeUndefined();
     // A snapshot-only note keeps the prior structured detail.
     sub.noteProgress(id, { tail: ["line", "next"], activity: "working…" });
-    expect(fires).toBe(3);
-    expect(sub.get(id)?.detailLog).toEqual(detail);
-    sub.markSettled(id, { outcome: "completed" });
     expect(fires).toBe(4);
+    expect(sub.get(id)?.detailLog).toEqual(detail);
+    sub.noteProgress(id, undefined, undefined, { value: { kind: "status", text: "Working…" } });
+    sub.markSettled(id, { outcome: "completed" });
+    expect(fires).toBe(6);
+    expect(sub.get(id)?.liveActivity).toBeUndefined();
     // Settled: noteProgress is a silent no-op — the settled record stays authoritative.
     sub.noteProgress(id, { tail: ["late"], activity: "x" });
     expect(sub.get(id)?.progress?.tail).toEqual(["line", "next"]);
-    expect(fires).toBe(4);
-    sub.markResuming(id);
-    expect(fires).toBe(5);
-    sub.markSettled(id);
     expect(fires).toBe(6);
-    sub.markUserStopped(id);
+    sub.markResuming(id);
     expect(fires).toBe(7);
+    sub.markSettled(id);
+    expect(fires).toBe(8);
+    sub.markUserStopped(id);
+    expect(fires).toBe(9);
     // The user-stop veto makes markResuming a silent no-op.
     sub.markResuming(id);
-    expect(fires).toBe(7);
+    expect(fires).toBe(9);
     // consumeSettledNotice mutates only the delivery gate — deliberately silent
     // (nothing rendered reads it; t04's repaint loop trusts this exact fire-set).
     sub.consumeSettledNotice(id);
-    expect(fires).toBe(7);
+    expect(fires).toBe(9);
     // Unknown ids never fire.
     sub.markSettled("agent-bbbbbbbbbbbb");
     sub.noteProgress("agent-bbbbbbbbbbbb", { tail: [], activity: "" });
     sub.markUserStopped("agent-bbbbbbbbbbbb");
-    expect(fires).toBe(7);
+    expect(fires).toBe(9);
     unsub();
     sub.register({
       agentId: "agent-cccccccccccc",
@@ -3614,7 +3630,7 @@ describe("SubagentRegistry live mirror + onChange", () => {
       resumable: false,
       oneShot: false,
     });
-    expect(fires).toBe(7);
+    expect(fires).toBe(9);
   });
 
   it("a throwing onChange listener neither breaks the mutation nor starves other listeners", () => {

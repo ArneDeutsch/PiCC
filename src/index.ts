@@ -1640,7 +1640,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
-      case "checkpoint-armed": return "Pausing for proactive context compaction.";
+      case "checkpoint-armed": return event.source === "settled"
+        ? "Context checkpoint starting from the settled fallback."
+        : event.source === "assistant"
+          ? "Context checkpoint queued; waiting for requested tools and safe settlement."
+          : "Context checkpoint queued; waiting for safe settlement.";
       case "checkpoint-complete": return event.action === "settled-fallback"
         ? "Context compaction completed."
         : "Context compacted; reconnecting the paused work.";
@@ -2983,8 +2987,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
-  pi.on("message_end", (event: any) => {
-    mainCheckpointGate.assistantMessageEnded(event?.message);
+  pi.on("message_end", (event: any, ctx: any) => {
+    mainCheckpointGate.assistantMessageEnded(event?.message, ctx);
   });
 
   pi.on("message_start", (event: any) => {
@@ -3008,7 +3012,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("before_provider_request", async (_event: any, ctx: any) => {
-    await mainCheckpointGate.defensiveLatch(ctx);
+    await mainCheckpointGate.beforeProviderRequest(ctx);
   });
 
   pi.on("session_shutdown", async (event: any) => {
@@ -3562,25 +3566,31 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     | { settled: true }
     | { settled: false; continuationAdmitted: boolean };
 
+  const latestAssistantMessage = (ctx: any): any | undefined => {
+    try {
+      // agent_settled carries no messages, so use the active selected branch.
+      // getEntries() is only the fallback for doubles without branch selection.
+      const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i];
+        if (entry?.type === "message" && entry.message?.role === "assistant") return entry.message;
+      }
+    } catch {
+      /* malformed optional session inspection is treated as unavailable */
+    }
+    return undefined;
+  };
+
   const runStopHook = async (ctx: any): Promise<StopHookOutcome> => {
     try {
       let lastAssistantMessage: string | undefined;
       try {
-        // agent_settled carries no messages, so derive Claude's
-        // last_assistant_message from Pi's active session branch.
-        // getEntries() is only the fallback for doubles without branch selection.
-        const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
-        for (let i = entries.length - 1; i >= 0; i--) {
-          const entry = entries[i];
-          if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
-          const content = entry.message.content;
-          lastAssistantMessage = typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("")
-              : undefined;
-          break;
-        }
+        const content = latestAssistantMessage(ctx)?.content;
+        lastAssistantMessage = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("")
+            : undefined;
       } catch {
         /* optional Stop payload field */
       }
@@ -3659,7 +3669,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const entry = [...entries].reverse().find((candidate) =>
       candidate?.type === "message" && candidate.message?.role === "assistant");
     const message = entry?.message;
-    if (!message || message.stopReason === "error" || message.stopReason === "aborted") return;
+    if (!message || message.stopReason === "pending" || message.stopReason === "error" || message.stopReason === "aborted") return;
     const blocks = Array.isArray(message.content)
       ? message.content.filter((part: any) => part?.type === "text" && typeof part.text === "string")
       : [];
@@ -3683,7 +3693,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     await writing;
   };
 
-  const settleStoppedMainRun = async (): Promise<boolean> => {
+  const settleStoppedMainRun = async (matchingResumeConclusion: ResumeConclusion = "superseded"): Promise<boolean> => {
     if (!mainCheckpointGate.isLogicalRunStopped()) return false;
     const controller = mainCheckpointGate.currentController();
     const generation = controller.snapshot().generation;
@@ -3693,8 +3703,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         resume.token.generation === generation) {
       // cancelAndJoin waits for this exact physical run's settlement. Release it
       // before joining cancellation so agent_settled never waits on itself. The
-      // universal stop below owns the terminal, so this conclusion claims nothing.
-      resume.conclude("superseded");
+      // The stop owns ordinary cancellation. An unsuccessful resumed physical run
+      // is already post-commit, so it must retain the resume owner's terminal path.
+      resume.conclude(matchingResumeConclusion);
     }
     await mainCheckpointGate.settleLogicalRunStop();
     return true;
@@ -3702,17 +3713,75 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("agent_settled", async (_event: any, ctx: any) => {
     checkpointContext = ctx;
-    if (await settleStoppedMainRun()) return;
-    const controller = mainCheckpointGate.currentController();
+    const terminalAssistant = latestAssistantMessage(ctx);
+    const physicalUnsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
+    const checkpointSnapshot = mainCheckpointGate.currentController().snapshot();
+    // Pi persists either PiCC-owned pre-commit stop mechanism as aborted. The
+    // active awaiting generation still owns the authorized checkpoint settlement.
+    // `checkpointAbortRequested` only selects abort instead of terminate and is
+    // deliberately excluded from this exception's eligibility.
+    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "aborted" &&
+      activeMainResume === undefined && mainCheckpointGate.isActive() &&
+      checkpointSnapshot.phase === "awaiting-settlement";
+    const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
+    if (unsuccessful && terminalAssistant.stopReason === "pending") {
+      const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";
+      const mode = contextMode(ctx);
+      if ((mode === "print" || mode === "json") &&
+          (process.exitCode === undefined || process.exitCode === 0)) {
+        process.exitCode = 1;
+      }
+      try {
+        if (mode === "tui") ctx.ui?.notify?.(notice, "warning");
+        else if (mode === "print") console.error(`PiCC: ${notice}`);
+        else if (mode === "json" || mode === "rpc") {
+          pi.appendEntry("picc-main-response-incomplete", { stopReason: "pending", notice });
+        }
+      } catch { /* incomplete classification remains authoritative */ }
+    }
+    // A universal hook stop is the authoritative ending even when Pi reports an
+    // unsuccessful assistant terminal at the same boundary. Snapshot any matching
+    // physical identity first, consume the stop, then release only that identity.
+    const boundaryController = mainCheckpointGate.currentController();
+    const boundaryGeneration = boundaryController.snapshot().generation;
     const physicalOperation = activeCompactionOperation;
-    if (physicalOperation?.origin === "pi-native-auto" &&
-        physicalOperation.epoch === checkpointSessionEpoch &&
-        physicalOperation.controller === controller &&
-        physicalOperation.generation === controller.snapshot().generation &&
-        activeCompactionOperation === physicalOperation) {
+    const matchingNativeOperation = physicalOperation?.origin === "pi-native-auto" &&
+      physicalOperation.epoch === checkpointSessionEpoch &&
+      physicalOperation.controller === boundaryController &&
+      physicalOperation.generation === boundaryGeneration;
+    const stopped = await settleStoppedMainRun(physicalUnsuccessful ? "abandoned" : "superseded");
+    const controller = mainCheckpointGate.currentController();
+    if (physicalUnsuccessful && mainCheckpointGate.consumeSettledStoppedResume(
+      controller, controller.snapshot().generation,
+    )) {
+      // The authoritative stop has joined and rotated its controller. The physical
+      // resumed terminal is nevertheless post-commit and closes that successor.
+      await controller.failAfterCommittedSummary(controller.snapshot().generation);
+    }
+    if (matchingNativeOperation && activeCompactionOperation === physicalOperation) {
       // Pi publishes no failure event for a native operation. A later true settlement
       // is its definitive boundary; release only the identity observed here.
       activeCompactionOperation = undefined;
+    }
+    if (stopped) return;
+    if (unsuccessful) {
+      const snapshot = controller.snapshot();
+      const resume = activeMainResume;
+      if (resume && resume.epoch === checkpointSessionEpoch &&
+          resume.generation === snapshot.generation && resume.token.generation === snapshot.generation &&
+          snapshot.phase === "resuming") {
+        // Resumed work is post-commit. An unsuccessful physical terminal must use
+        // the existing abandonment path, which terminalizes instead of publishing success.
+        resume.conclude("abandoned");
+      } else {
+        if (resume === undefined && !mainCheckpointGate.isLogicalRunStopped() &&
+            terminalAssistant.stopReason !== "aborted" && snapshot.phase === "awaiting-settlement") {
+          controller.exhaustUnsuccessfulAwaitingSettlement(snapshot.generation);
+        }
+        // Ordinary unsuccessful settlement still revokes callbacks captured by its run.
+        mainCheckpointGate.logicalRunSettled();
+      }
+      return;
     }
     const resume = activeMainResume;
     if (resume?.generation === controller.snapshot().generation &&

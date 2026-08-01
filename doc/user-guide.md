@@ -278,16 +278,18 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
-  bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
-  `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
-  the type; other values do not. State and identity take priority as width narrows; the dispatch
-  description appears when space permits, and elapsed time and token usage appear only when known
-  and terminal width permits. Elapsed time runs
-  from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
-  at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
-  tree. Below the minimum useful identity-row width, per-agent rows become aggregate state glyphs.
-  Finished rows
+  no `TaskOutput` await needed. In row mode, each individually rendered active agent has an indented
+  status row and a stable second line for its current tool and primary argument, reasoning, assistant
+  or output text, or startup, work, retry, and capacity-waiting status. The second line updates in
+  place and disappears only when the agent completes, fails, stops, or is canceled. The status bubble is `◌`
+  while waiting for configured capacity, a spinner while running, `●` when done, `✗` when failed,
+  and `■` when stopped. Recognized `color:` frontmatter values tint the agent type; other values do
+  not. State and identity take priority as width narrows; the dispatch description appears when
+  space permits, and elapsed time and token usage appear only when known and terminal width permits.
+  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
+  time. The panel window contains at most eight agents, not eight physical lines; overflow markers
+  and `↑↓` navigation move it through the full tree. Below the minimum useful identity-row width,
+  per-agent rows and their activity lines become aggregate state glyphs. Finished rows
   linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
@@ -314,8 +316,9 @@ Every subagent is visible, both to you and to the coordinating model:
   text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
   admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
   line).
-- **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
-  detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
+- **Condensed transcript records.** Subagent output does not stream into the chat. The agent list
+  owns one bounded current-activity line; selected-agent detail owns multiline history and richer
+  live detail. Each depth-1 normal-path result replaces its pending call in the same
   tool row. A successful background acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That bounded record prioritizes the
@@ -466,11 +469,17 @@ excludes; project configuration overrides user configuration):
   If both user and project scopes set this knob and the project value is malformed, the safe
   default is used (not the still-valid user value).
 
-  For main sessions and PiCC-created subagents, PiCC checks at a completed assistant/tool
-  cycle. The complete requested tool batch finishes first. Once the threshold is reached,
-  PiCC pauses ordinary model requests, starts one Pi compaction transaction, and resumes the same
-  logical work; completed results and queued input remain pending. Pi can automatically recover an
-  eligible transient summary transport failure inside that transaction. Summary retries stay
+  For main sessions and PiCC-created subagents, final usage from a fresh successful assistant
+  response that requests tools can queue a checkpoint. When PiCC reports that checkpoint as queued,
+  continued already-requested tool activity is safe deferral, not another provider turn or a missed
+  checkpoint; high displayed context by itself does not prove that a checkpoint is armed. Before
+  admitting another ordinary model request, PiCC samples usage again and
+  blocks the ordinary request before provider transport if newly known threshold pressure requires a
+  checkpoint. Only after the run and its complete tool batch settle may PiCC start one Pi compaction
+  transaction and resume the same
+  logical work; it never compacts across an unresolved provider response or tool batch. Completed
+  results and queued input remain pending. Pi can automatically recover an eligible transient summary
+  transport failure inside that transaction. Summary retries stay
   bounded by Pi's configured summarization retry policy; PiCC-created subagents use Pi's in-memory
   defaults. Cancelling a main
   checkpoint stops PiCC continuation but may wait for Pi's configured summary retries to settle;

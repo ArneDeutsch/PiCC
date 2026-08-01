@@ -27,6 +27,7 @@ const expectedIntegrationTestFiles = [
   "test/mcp-registration.test.ts",
   "test/mcp-subagents.test.ts",
   "test/notebook-read-dispatch.test.ts",
+  "test/session-replacement-pi-contract.test.ts",
   "test/slashcommand-fork.test.ts",
 ] as const;
 
