@@ -615,6 +615,25 @@ describe("normalizeMcpSchema", () => {
     expect(result.diagnostic).toContain("compile probe");
   });
 
+  it("validates an untrusted nullable-array schema at PiCC's compile boundary", async () => {
+    const { Compile } = await import("typebox/compile");
+    const result = normalizeMcpSchema({
+      type: "object",
+      properties: {
+        tags: { type: ["array", "null"], items: { type: "string" } },
+      },
+      required: ["tags"],
+      additionalProperties: false,
+    }, label);
+    const validator = Compile(result.schema as never);
+
+    expect(result.diagnostic).toBeUndefined();
+    expect(validator.Check({ tags: null })).toBe(true);
+    expect(validator.Check({ tags: ["one", "two"] })).toBe(true);
+    expect(validator.Check({ tags: ["one", 2] })).toBe(false);
+    expect(validator.Check({ tags: 2 })).toBe(false);
+  });
+
   it("the permissive fallback itself survives the validator's Compile", async () => {
     const { Compile } = await import("typebox/compile");
     const result = normalizeMcpSchema(["not-a-schema"], label);

@@ -124,7 +124,7 @@ export function makeBuiltinBashOptions(deps: BuiltinToolDeps): {
 } {
   return {
     ...(deps.shellPath ? { shellPath: deps.shellPath } : {}),
-    // Pi 0.82+ must not project the ambient session environment into Bash.
+    // PiCC must not let Pi project the ambient session environment into Bash.
     exposeSessionEnvironment: false,
     spawnHook: ({ command, cwd, env }) => ({
       command,

@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import {
@@ -117,7 +117,7 @@ describe("mock wire request classification", () => {
   });
 });
 
-describe("pi 0.82.0 API contract", () => {
+describe("pi 0.83.0 API contract", () => {
   it("exports the transient assistant classifier while context overflow remains a separate category", () => {
     const message = (errorMessage: string): AssistantMessage => ({
       role: "assistant",
@@ -144,7 +144,45 @@ describe("pi 0.82.0 API contract", () => {
     expect(isContextOverflow(overflow, 100_000)).toBe(true);
   });
 
-  it("declares and resolves the four direct Pi 0.82.0 packages", () => {
+  it("maps an unknown OpenAI-compatible terminal reason to a loud error while retaining the raw reason", async () => {
+    const { streamSimple } = await import("@earendil-works/pi-ai/api/openai-completions");
+    const body = [
+      `data: ${JSON.stringify({
+        id: "contract-response",
+        model: "contract-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "provider_mystery" }],
+      })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    const injectedFetch = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const result = await streamSimple({
+      id: "contract-model",
+      name: "Contract Model",
+      api: "openai-completions",
+      provider: "contract",
+      baseUrl: "https://example.invalid/v1",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 100_000,
+      maxTokens: 4_096,
+    }, { systemPrompt: "contract", messages: [] }, {
+      apiKey: "contract-key",
+      fetch: injectedFetch,
+    }).result();
+
+    expect(injectedFetch).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      stopReason: "error",
+      rawStopReason: "provider_mystery",
+    });
+    expect(result.errorMessage).toBe("Provider finish_reason: provider_mystery");
+  });
+
+  it("declares and resolves the four direct Pi 0.83.0 packages", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
@@ -152,10 +190,10 @@ describe("pi 0.82.0 API contract", () => {
     };
 
     expect(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, manifest.dependencies[name]])))
-      .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.82.0"])));
+      .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.83.0"])));
     expect(manifest.engines.node).toBe(">=22.19.0");
     expect(validatePiSuite({ packageRoot: root }))
-      .toMatchObject({ ok: true, version: "0.82.0" });
+      .toMatchObject({ ok: true, version: "0.83.0" });
 
     for (const name of PI_SUITE_PACKAGES) {
       const installed = JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")) as {
@@ -165,9 +203,33 @@ describe("pi 0.82.0 API contract", () => {
       };
       expect(installed, name).toMatchObject({
         name,
-        version: "0.82.0",
+        version: "0.83.0",
         engines: { node: ">=22.19.0" },
       });
+    }
+  });
+
+  it("aligns direct and coding-agent-context TypeBox 1.3.7 and compiles a real PiCC tool schema", async () => {
+    const directRequire = createRequire(import.meta.url);
+    const codingAgentRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const contexts = [directRequire, codingAgentRequire];
+    const schema = createAgentToolDefinition({} as SubagentRuntime, { depth: 0 }).parameters;
+    const sample = {
+      subagent_type: "general-purpose",
+      prompt: "Inspect the runtime contract.",
+      run_in_background: false,
+    };
+
+    for (const contextRequire of contexts) {
+      const typeboxEntry = contextRequire.resolve("typebox");
+      const manifest = JSON.parse(
+        readFileSync(join(dirname(typeboxEntry), "..", "package.json"), "utf8"),
+      ) as { version: string };
+      const compileModule = await import(pathToFileURL(contextRequire.resolve("typebox/compile")).href) as {
+        Compile(schema: unknown): { Check(value: unknown): boolean };
+      };
+      expect(manifest.version).toBe("1.3.7");
+      expect(compileModule.Compile(schema).Check(sample)).toBe(true);
     }
   });
 
@@ -190,11 +252,11 @@ describe("pi 0.82.0 API contract", () => {
     }) as typeof fetch;
     try {
       process.env.PI_SKIP_VERSION_CHECK = "1";
-      await expect(versionCheck.checkForNewPiVersion("0.82.0")).resolves.toBeUndefined();
+      await expect(versionCheck.checkForNewPiVersion("0.83.0")).resolves.toBeUndefined();
       expect(requests).toBe(0);
 
       delete process.env.PI_SKIP_VERSION_CHECK;
-      await expect(versionCheck.checkForNewPiVersion("0.82.0")).resolves.toMatchObject({ version: "999.0.0" });
+      await expect(versionCheck.checkForNewPiVersion("0.83.0")).resolves.toMatchObject({ version: "999.0.0" });
       expect(requests).toBe(1);
     } finally {
       globalThis.fetch = previousFetch;
@@ -1388,24 +1450,31 @@ describe("Codex standalone-summary transport contract", () => {
     }
   });
 
-  it("delegates the original summary UUID and unrelated scalar while overriding only transport and retries", async () => {
+  it("preserves injected fetch through ordinary and forced-SSE summary delegation", async () => {
     const delegated = vi.fn(() => createAssistantMessageEventStream());
+    const injectedFetch = vi.fn(async () => new Response()) as typeof fetch;
     vi.resetModules();
     vi.doMock("@earendil-works/pi-ai/compat", () => ({
       openAICodexResponsesApi: () => ({ streamSimple: delegated }),
     }));
     try {
       const isolated = await import("../src/runtime/codex-abort-guard.js");
+      const ordinaryContext = { systemPrompt: "ordinary", messages: [] };
+      const ordinaryOptions = { apiKey, sessionId: "ordinary-fetch", fetch: injectedFetch };
+      isolated.codexAbortGuardStreamSimple(model, ordinaryContext, ordinaryOptions);
+
       const context = summaryContext({ tools: [] });
       const sessionId = freshUuidV7();
-      const options = summaryOptions({ sessionId, temperature: 0.37 });
+      const options = summaryOptions({ sessionId, temperature: 0.37, fetch: injectedFetch });
       isolated.codexAbortGuardStreamSimple(model, context, options);
 
-      expect(delegated).toHaveBeenCalledOnce();
-      expect(delegated).toHaveBeenCalledWith(model, context, {
+      expect(delegated).toHaveBeenCalledTimes(2);
+      expect(delegated).toHaveBeenNthCalledWith(1, model, ordinaryContext, ordinaryOptions);
+      expect(delegated).toHaveBeenNthCalledWith(2, model, context, {
         ...options,
         sessionId,
         temperature: 0.37,
+        fetch: injectedFetch,
         transport: "sse",
         maxRetries: 0,
       });
