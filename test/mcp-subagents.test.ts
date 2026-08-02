@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { PermissionEngine } from "../src/engine/permissions.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -303,8 +304,11 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
       expect(backgroundNames).not.toContain("ReadMcpResourceTool");
       expect(backgroundNames).toContain("mcp__remote__echo");
 
+      const parent = SessionManager.create(dir, dir, { id: "mcp-parent" });
+      parent.appendMessage({ role: "user", content: "parent" } as never);
+      parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
       await pi.fire("session_start", {}, pi.ctx({
-        sessionManager: { getSessionFile: () => path.join(dir, "parent.jsonl") },
+        sessionManager: { getSessionFile: () => parent.getSessionFile() },
       }));
       await pi.tools.get("Agent").execute("dispatch-fork-foreground", {
         subagent_type: "fork", prompt: "fork foreground", run_in_background: false,

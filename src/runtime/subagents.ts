@@ -38,7 +38,8 @@ import {
   FORK_DEGRADE_PREFIX,
   isAgentId,
   mintAgentId,
-  subagentSessionDir,
+  prepareSubagentTranscriptCollection,
+  type PrepareSubagentTranscriptCollectionResult,
 } from "../util/subagent-transcripts.js";
 import {
   renderProgressText,
@@ -207,6 +208,8 @@ export interface SubagentRuntimeDeps {
    * derived from it; without it, dispatch degrades to in-memory.
    */
   getMainSessionFile?: () => string | undefined;
+  /** Test-only seam; production validates and marks ownership before either persistence factory runs. */
+  prepareTranscriptCollection?: (mainSessionFile: string) => PrepareSubagentTranscriptCollectionResult;
   worktrees?: WorktreeManagerLike;
   maxDepth: number;
   concurrency: number;
@@ -1706,13 +1709,13 @@ export class SubagentRuntime {
         // the dispatch cwd is passed in at the call site.
         const forkSdkRef = forkSdk!;
         const forkMainFileRef = forkMainFile;
-        attemptForkSession = (cwd: string) =>
-          forkSdkRef.forkSessionManager!(
+        attemptForkSession = (cwd: string) => {
+          const prepared = (this.deps.prepareTranscriptCollection ?? prepareSubagentTranscriptCollection)(
             forkMainFileRef,
-            cwd,
-            subagentSessionDir(forkMainFileRef),
-            agentId,
           );
+          if (!prepared.ok) throw new Error(prepared.diagnostic.message);
+          return forkSdkRef.forkSessionManager!(forkMainFileRef, cwd, prepared.directory, agentId);
+        };
       }
 
       if (isFork) {
@@ -2452,14 +2455,20 @@ export class SubagentRuntime {
         }
       } else if (mainSessionFile && sdk.persistedSessionManager) {
         try {
-          const persisted = sdk.persistedSessionManager(
-            cwd,
-            subagentSessionDir(mainSessionFile),
-            agentId,
+          const prepared = (this.deps.prepareTranscriptCollection ?? prepareSubagentTranscriptCollection)(
+            mainSessionFile,
           );
-          transcriptPath = persisted.getSessionFile() ?? undefined;
-          sessionManager = persisted;
-          resumable = !oneShot && transcriptPath !== undefined;
+          if (!prepared.ok) {
+            diagnostics.push(prepared.diagnostic, {
+              severity: "warning",
+              message: "subagent transcript persistence was skipped; this run is in-memory and non-resumable. Repair or make the ownership marker readable before retrying",
+            });
+          } else {
+            const persisted = sdk.persistedSessionManager(cwd, prepared.directory, agentId);
+            transcriptPath = persisted.getSessionFile() ?? undefined;
+            sessionManager = persisted;
+            resumable = !oneShot && transcriptPath !== undefined;
+          }
         } catch (err) {
           diagnostics.push({
             severity: "warning",
