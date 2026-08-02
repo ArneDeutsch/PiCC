@@ -22,6 +22,25 @@ function fail(message) {
   process.exitCode = 1;
 }
 
+function runtimeFailure(selection, installationKind) {
+  if (installationKind === "source") return `PiCC: ${selection.reason}`;
+  const state = selection.category === "missing" ? "missing" : selection.category === "version-mismatch" ? "version-incoherent" : "damaged";
+  return `PiCC: The installed PiCC runtime is ${state}. TypeScript source was not used. Run \`picc update\`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.`;
+}
+
+function runtimeStatus(selection, installationKind) {
+  if (selection.ok) {
+    if (selection.mode === "compiled") return "Runtime compiled (verified)";
+    return `Runtime source fallback (${selection.notice.category}): ${selection.notice.message}`;
+  }
+  return `Runtime unavailable (${selection.category}): ${runtimeFailure(selection, installationKind).slice("PiCC: ".length)}`;
+}
+
+async function selectRuntime(packageRoot, installationKind) {
+  const runtime = await import("./picc-runtime.mjs");
+  return runtime.selectPiccRuntime({ packageRoot, installationKind });
+}
+
 async function main() {
   try {
     const admin = await import("./picc-admin.mjs");
@@ -31,6 +50,7 @@ async function main() {
     const packageRoot = admin.findPackageRoot(import.meta.url);
     const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
     if (manifest?.name !== "picc" || !admin.parseStableExactVersion(manifest.version)) throw new Error("invalid manifest");
+    const installationKind = admin.classifyInstallation({ packageRoot });
     const argv = process.argv.slice(2);
     const first = argv[0];
 
@@ -42,7 +62,15 @@ async function main() {
     if (first === "--version" || first === "-v") {
       if (argv.length !== 1) return fail(USAGE_ERROR);
       const suite = admin.validatePiSuite({ packageRoot });
-      console.log(`PiCC ${manifest.version}\nEmbedded Pi ${suite.ok ? suite.version : "unavailable/incoherent"}\nInstall ${admin.classifyInstallation({ packageRoot })}`);
+      let status;
+      try {
+        status = runtimeStatus(await selectRuntime(packageRoot, installationKind), installationKind);
+      } catch {
+        status = installationKind === "source"
+          ? "Runtime unavailable (launcher): Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC."
+          : "Runtime unavailable (launcher): TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.";
+      }
+      console.log(`PiCC ${manifest.version}\nEmbedded Pi ${suite.ok ? suite.version : "unavailable/incoherent"}\nInstall ${installationKind}\n${status}`);
       return;
     }
     if (first === "update") {
@@ -75,19 +103,30 @@ async function main() {
       return;
     }
 
+    let selection;
+    try {
+      selection = await selectRuntime(packageRoot, installationKind);
+    } catch {
+      return fail(installationKind === "source"
+        ? "PiCC: runtime selection is unavailable. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC."
+        : "PiCC: runtime selection is unavailable. TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.");
+    }
+    if (!selection.ok) return fail(runtimeFailure(selection, installationKind));
+    if (selection.notice) console.error(selection.notice.message);
+
     const resolution = admin.resolvePiCli(packageRoot);
     if (!resolution.ok) return fail(`PiCC: ${resolution.reason}`);
     let extension;
     try {
-      extension = admin.canonicalPath(path.join(packageRoot, "picc", "index.ts"));
+      extension = admin.canonicalPath(path.join(packageRoot, ...selection.entries.extensionPath.split("/")));
       if (!admin.isPathInside(extension, packageRoot) || !fs.statSync(extension).isFile()) throw new Error();
     } catch { return fail(INITIALIZATION_FAILED); }
-    const child = spawn(process.execPath, [resolution.cli, "-e", extension, ...argv], {
+    const child = spawn(process.execPath, ["--enable-source-maps", resolution.cli, "-e", extension, ...argv], {
       stdio: "inherit",
       env: {
         ...process.env,
         PICC_LAUNCHER_PID: String(process.pid),
-        PICC_INSTALL_KIND: admin.classifyInstallation({ packageRoot }),
+        PICC_INSTALL_KIND: installationKind,
         PICC_VERSION: manifest.version,
         PI_SKIP_VERSION_CHECK: "1",
       },
