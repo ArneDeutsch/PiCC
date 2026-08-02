@@ -177,6 +177,60 @@ describe("loadClaudeMcpState scope selection", () => {
     ]);
   });
 
+  it("prefers the exact family-identity record regardless of project-record order", () => {
+    const exact = localKey();
+    const alias = path.join(root, "alias");
+    const exactRecord = {
+      mcpServers: { zeta: { command: "z" }, alpha: { command: "a" } },
+      disabledMcpServers: ["zeta", "alpha"],
+      enabledMcpServers: ["right", "left"],
+    };
+    const aliasRecord = {
+      mcpServers: { alpha: { command: "a" }, zeta: { command: "z" } },
+      disabledMcpServers: ["alpha", "zeta"],
+      enabledMcpServers: ["left", "right"],
+    };
+
+    for (const entries of [
+      [[alias, aliasRecord], [exact, exactRecord]],
+      [[exact, exactRecord], [alias, aliasRecord]],
+    ] as const) {
+      write({ projects: Object.fromEntries(entries) });
+      const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: exact }) });
+      expect(result.local.servers.map((server) => server.name)).toEqual(["zeta", "alpha"]);
+      expect([...result.disabledMcpServers]).toEqual(["zeta", "alpha"]);
+      expect(result.enabledMcpServers).toEqual(["right", "left"]);
+    }
+  });
+
+  it("uses an ordinal lexical-key fallback regardless of project-record order", () => {
+    const family = localKey();
+    const lexicalFirst = path.join(root, "alias-a");
+    const lexicalLast = path.join(root, "alias-z");
+    expect(lexicalFirst < lexicalLast).toBe(true);
+    const firstRecord = {
+      mcpServers: { zeta: { command: "z" }, alpha: { command: "a" } },
+      disabledMcpServers: ["zeta", "alpha"],
+      enabledMcpServers: ["right", "left"],
+    };
+    const lastRecord = {
+      mcpServers: { alpha: { command: "a" }, zeta: { command: "z" } },
+      disabledMcpServers: ["alpha", "zeta"],
+      enabledMcpServers: ["left", "right"],
+    };
+
+    for (const entries of [
+      [[lexicalLast, lastRecord], [lexicalFirst, firstRecord]],
+      [[lexicalFirst, firstRecord], [lexicalLast, lastRecord]],
+    ] as const) {
+      write({ projects: Object.fromEntries(entries) });
+      const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: family }) });
+      expect(result.local.servers.map((server) => server.name)).toEqual(["zeta", "alpha"]);
+      expect([...result.disabledMcpServers]).toEqual(["zeta", "alpha"]);
+      expect(result.enabledMcpServers).toEqual(["right", "left"]);
+    }
+  });
+
   it("treats missing and empty disabled lists as equivalent but enabled-list presence as significant", () => {
     const alias = path.join(root, "alias");
     write({ projects: { [localKey()]: {}, [alias]: { mcpServers: {}, disabledMcpServers: [] } } });
@@ -212,6 +266,11 @@ describe("loadClaudeMcpState scope selection", () => {
   it("rejects every malformed alias shape after valid state and when both aliases are identically malformed", () => {
     const alias = path.join(root, "alias");
     const malformedCases: Array<{ valid: unknown; malformed: unknown; diagnostic: string }> = [
+      {
+        valid: {},
+        malformed: "not-an-object",
+        diagnostic: "Matching native Claude project record has an invalid shape",
+      },
       {
         valid: { mcpServers: {} },
         malformed: { mcpServers: [] },

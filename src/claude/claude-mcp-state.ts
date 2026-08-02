@@ -359,7 +359,7 @@ export function loadClaudeMcpState(options: LoadClaudeMcpStateOptions): ClaudeMc
   }
   const userBlock = userPreflight.block;
 
-  const matchingRecords: unknown[] = [];
+  const matchingRecords: Array<{ key: string; record: unknown }> = [];
   if (Object.hasOwn(root, "projects")) {
     if (!isRecord(root.projects)) return unusable("Native Claude project state has an invalid shape");
     const records = Object.entries(root.projects);
@@ -387,34 +387,45 @@ export function loadClaudeMcpState(options: LoadClaudeMcpStateOptions): ClaudeMc
       if (canonical.kind === "indeterminate") {
         return unusable("Native Claude project identity could not be determined safely");
       }
-      if (canonical.kind === "canonical" && canonical.path === familyIdentity) matchingRecords.push(record);
+      if (canonical.kind === "canonical" && canonical.path === familyIdentity) {
+        matchingRecords.push({ key: candidate, record });
+      }
     }
   }
 
-  let selected: LocalMcpProjection | undefined;
-  for (const record of matchingRecords) {
-    const projected = localMcpProjection(record);
+  const projectedMatches: Array<{ key: string; projection: LocalMcpProjection }> = [];
+  let comparison: LocalMcpProjection | undefined;
+  for (const match of matchingRecords) {
+    const projected = localMcpProjection(match.record);
     if (!projected.ok) return unusable(projected.diagnostic);
-    if (selected === undefined) {
-      selected = projected.projection;
-    } else if (!equivalentLocalMcp(selected, projected.projection)) {
+    if (comparison !== undefined && !equivalentLocalMcp(comparison, projected.projection)) {
       return unusable("Native Claude project MCP state has conflicting matching records");
     }
+    comparison ??= projected.projection;
+    projectedMatches.push({ key: match.key, projection: projected.projection });
   }
-  selected ??= { block: Object.create(null), disabled: [] };
+
+  let selected = projectedMatches.find((match) => match.key === familyIdentity);
+  for (const match of projectedMatches) {
+    if (selected === undefined || (selected.key !== familyIdentity && match.key < selected.key)) selected = match;
+  }
+  const selectedProjection: LocalMcpProjection = selected?.projection ?? {
+    block: Object.create(null) as Record<string, unknown>,
+    disabled: [],
+  };
 
   const diagnostics: string[] = [];
-  if (selected.enabled !== undefined) {
+  if (selectedProjection.enabled !== undefined) {
     diagnostics.push("Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled");
   }
   const user = safeNormalize(userBlock, "native-user", diagnostics);
-  const local = safeNormalize(selected.block, "native-local", diagnostics);
+  const local = safeNormalize(selectedProjection.block, "native-local", diagnostics);
   return {
     kind: "loaded",
     user: { source: "native-user", servers: user },
     local: { source: "native-local", servers: local },
-    disabledMcpServers: new Set(selected.disabled),
-    ...(selected.enabled === undefined ? {} : { enabledMcpServers: selected.enabled }),
+    disabledMcpServers: new Set(selectedProjection.disabled),
+    ...(selectedProjection.enabled === undefined ? {} : { enabledMcpServers: selectedProjection.enabled }),
     diagnostics: diagnostics.slice(0, CLAUDE_MCP_STATE_LIMITS.diagnostics),
   };
 }

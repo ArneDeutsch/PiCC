@@ -633,10 +633,11 @@ a different profile.
 For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
 select the same project. A verified linked worktree also considers its main checkout identity.
 Multiple canonical aliases, including Windows drive-letter case variants, require no profile repair
-when their complete bounded raw MCP projections agree under PiCC's conservative comparison. The
-raw MCP server block and runtime-control lists are compared; explicit `enabledMcpServers` presence
-remains significant even for an empty list. Conflicting projections or invalid matching
-project-record, MCP-block, or runtime-list shapes remain unusable and fail all MCP loading closed.
+when their complete bounded MCP projections agree under PiCC's conservative comparison. Raw MCP
+server blocks are compared structurally, while runtime-control lists are validated and deduplicated
+as name sets; explicit `enabledMcpServers` presence remains significant even for an empty list.
+Conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes remain
+unusable and fail all MCP loading closed.
 This is a conservative PiCC identity and conflict policy, not a claim about Claude Code's exact
 behavior for canonical-equivalent records.
 
