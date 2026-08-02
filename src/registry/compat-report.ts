@@ -956,9 +956,13 @@ const MCP_NOTICE_NAME_MAX = 40;
 
 /** Bound on a per-server diagnostic quoted on the /doctor posture line. */
 const MCP_POSTURE_DIAG_MAX_CHARS = 240;
+const MCP_BIDI_FORMATTING_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 
 function quotedMcpName(name: string, max: number): string {
-  return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
+  const bidiSafe = name.replace(MCP_BIDI_FORMATTING_CONTROLS, (control) =>
+    `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+  );
+  return JSON.stringify(mcpStatusScalar(bidiSafe, max) || "(unnamed)");
 }
 
 function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig): string {
@@ -1249,7 +1253,7 @@ function mcpPolicySummary(mcp: ResolvedMcpConfig): string | undefined {
     case "active-rules": return `${heading}: active rules.`;
     case "managed-only": return `${heading}: managed-only; only managed allow contributions remain effective.`;
     case "exclusive": return `Managed MCP policy: exclusive administrator server set is active${mcp.policyOrdinarySourcesSuppressed === true ? "; ordinary sources were suppressed" : ""}.`;
-    case "exclusive-empty": return "Managed MCP policy: exclusive administrator server set is empty; all MCP is disabled.";
+    case "exclusive-empty": return "Managed MCP policy: exclusive administrator server set is empty; all MCP is disabled. If access is expected, request an administrator policy change.";
     case "fail-closed": return `${heading}: fail closed; no candidate can start. ${mcpPolicyRepair(mcp.policyAuthority)}`;
   }
 }

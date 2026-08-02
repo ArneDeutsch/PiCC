@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { buildMcpStartupNotice } from "../src/index.js";
 import {
   buildCompatReport,
   renderDoctorReport,
@@ -413,6 +414,36 @@ describe("renderMcpStatusReport", () => {
     );
   });
 
+  it("escapes bidi formatting controls in blocked names before trusted startup and report suffixes", () => {
+    const blockedName = `managed"\\\u202Ereorder\u2066-${"x".repeat(160)}`;
+    const escapeBidi = (text: string): string =>
+      text.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, (control) =>
+        `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+      );
+    const noticeQuoted = JSON.stringify(escapeBidi(`${blockedName.slice(0, 39)}…`));
+    const reportSafeName = escapeBidi(blockedName);
+    const reportQuoted = JSON.stringify(`${reportSafeName.slice(0, 120)}…`);
+    const mcp = config([server(blockedName, "blocked", {
+      source: "managed-mcp",
+      inactiveReason: "policy-denied",
+    })]);
+
+    const notice = buildMcpStartupNotice(mcp, undefined);
+    expect(notice).toContain(`MCP policy blocked 1 server(s): ${noticeQuoted}; run /mcp or /doctor`);
+    expect(notice).toContain("\\\\u202E");
+    expect(notice).toContain("\\\\u2066");
+
+    const reports = [renderMcpStatusReport(mcp, []), doctor(mcp)];
+    for (const report of reports) {
+      expect(report).toContain(`${reportQuoted}: blocked`);
+      expect(report).toContain("\\\\u202E");
+      expect(report).toContain("\\\\u2066");
+    }
+    for (const output of [notice, ...reports]) {
+      expect(output).not.toMatch(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u);
+    }
+  });
+
   it.each([31, 32, 33, 5000])(
     "details at most 32 of %i servers and stays within the aggregate ceiling",
     (count) => {
@@ -687,6 +718,9 @@ describe("managed MCP policy status foundation", () => {
     };
     for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
       expect(report).toContain(expected);
+      if (policyPosture === "exclusive-empty") {
+        expect(report).toContain("If access is expected, request an administrator policy change.");
+      }
       expect(report).not.toMatch(/COMMAND_CANARY|ARG_CANARY|ENV_CANARY|RAW_COMMAND_CANARY/u);
     }
     if (["exclusive", "exclusive-empty", "fail-closed"].includes(policyPosture)) {

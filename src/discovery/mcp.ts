@@ -27,12 +27,13 @@ import type {
  * Combines native local/user state, project `.mcp.json`, and scope-tagged
  * settings-extension captures into one {@link ResolvedMcpConfig}.
  *
- * Same-name candidates resolve as whole entries in this order: native local,
- * `.mcp.json`, native user, then managed/local/project/user settings extension.
- * Project-origin extension and `.mcp.json` winners retain the existing approval
- * gate. Native runtime disablement is an exact-name final deny for authentic
- * winners only; settings `*McpjsonServers` remain confined to `.mcp.json` and
- * extension winners. Present unusable native state fails all MCP closed.
+ * Ordinary same-name candidates resolve as whole entries in this order: native
+ * local, `.mcp.json`, native user, then managed/local/project/user settings
+ * extension. Project-origin extension and `.mcp.json` winners retain the existing
+ * approval gate. Native runtime disablement is an exact-name final deny for
+ * authentic ordinary winners only; settings `*McpjsonServers` remain confined to
+ * `.mcp.json` and extension winners. Present unusable native state fails ordinary
+ * MCP closed; standalone exclusive managed input bypasses ordinary/native loading.
  * - Git-tracked local demotion (mandatory gate rule): a `settings.local.json`
  *   that is tracked in the project repository is attacker-committable, so its
  *   MCP contribution is treated as PROJECT scope (approvals ignored, servers

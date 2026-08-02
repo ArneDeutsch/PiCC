@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -80,6 +80,18 @@ function makeRemoteServer(
     diagnostics: [],
     ...rest,
     name,
+  };
+}
+
+function makeBlockedServer(name: string, transport: "stdio" | "http"): ResolvedMcpServer {
+  return {
+    name,
+    status: "blocked",
+    source: "settings-user",
+    transport,
+    ...(transport === "http" ? { configuredType: "http" as const } : {}),
+    inactiveReason: "policy-denied",
+    diagnostics: [],
   };
 }
 
@@ -290,6 +302,45 @@ describe("MCP timeout policy", () => {
 // ---------------------------------------------------------------------------
 
 describe("McpRuntime zero-enabled path", () => {
+  it("does no SDK, transport, listener, timer, retry, or shutdown work for a policy-blocked snapshot", async () => {
+    let sdkLoads = 0;
+    let remoteLoads = 0;
+    let timeoutRaces = 0;
+    const exitListeners = process.listenerCount("exit");
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const timeoutCalls = timeoutSpy.mock.calls.length;
+    const runtime = McpRuntime.start(
+      {
+        ...makeConfig(
+          makeBlockedServer("blocked-stdio", "stdio"),
+          makeBlockedServer("blocked-remote", "http"),
+        ),
+        policyPosture: "active-rules",
+        policyAuthority: "administrator-controlled",
+      },
+      makeDeps({
+        loadSdk: async () => { sdkLoads += 1; throw new Error("blocked stdio reached SDK loading"); },
+        loadRemoteClient: async () => { remoteLoads += 1; throw new Error("blocked remote reached client loading"); },
+        raceWithTimeout: async () => { timeoutRaces += 1; throw new Error("blocked server reached timeout/retry work"); },
+      }),
+    );
+    try {
+      expect(runtime.serverStates()).toEqual([]);
+      expect(runtime.tools()).toEqual([]);
+      await runtime.whenSettled();
+      expect({ sdkLoads, remoteLoads, timeoutRaces }).toEqual({ sdkLoads: 0, remoteLoads: 0, timeoutRaces: 0 });
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+      expect(timeoutSpy.mock.calls).toHaveLength(timeoutCalls);
+      await runtime.shutdown();
+      await runtime.shutdown();
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+      expect(timeoutSpy.mock.calls).toHaveLength(timeoutCalls);
+    } finally {
+      timeoutSpy.mockRestore();
+      await runtime.shutdown();
+    }
+  });
+
   it("spawns nothing and settles immediately when no server is enabled", async () => {
     const config = makeConfig(
       makeServer({ name: "pending", status: "pending-approval" }),
