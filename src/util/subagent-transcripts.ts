@@ -70,7 +70,7 @@ export interface PrepareSubagentTranscriptCollectionFs {
 }
 
 const realPreparationFs: PrepareSubagentTranscriptCollectionFs = {
-  realpath: fs.realpathSync,
+  realpath: (file) => fs.realpathSync.native(file),
   lstat: fs.lstatSync,
   mkdir: (directory) => fs.mkdirSync(directory),
   open: fs.openSync,
@@ -103,7 +103,7 @@ export function hashCanonicalPath(canonical: string): string {
 
 export function canonicalCwdHash(
   cwd: string,
-  realpath: (value: string) => string = fs.realpathSync,
+  realpath: (value: string) => string = fs.realpathSync.native,
 ): string {
   return hashCanonicalPath(realpath(cwd));
 }
@@ -173,7 +173,7 @@ export function serializeSubagentTranscriptOwnership(
 export function ownershipFor(
   parentBasename: string,
   cwd: string,
-  realpath: (value: string) => string = fs.realpathSync,
+  realpath: (value: string) => string = fs.realpathSync.native,
 ): SubagentTranscriptOwnership {
   return subagentTranscriptOwnership(parentBasename, canonicalCwdHash(cwd, realpath));
 }

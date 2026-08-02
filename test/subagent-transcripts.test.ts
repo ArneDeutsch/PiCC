@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentTrailerLine,
   isAgentId,
@@ -302,6 +302,22 @@ describe("collection ownership admission", () => {
       expect(fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
     }
   });
+  it("uses the native synchronous canonical-path authority by default", () => {
+    const sessions = tempSessionsDir();
+    const cwd = fs.mkdtempSync(path.join(sessions, "cwd-native-"));
+    const parent = SessionManager.create(cwd, sessions, { id: "main-native-realpath" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const parentFile = parent.getSessionFile()!;
+    const nativeRealpath = vi.spyOn(fs.realpathSync, "native");
+    try {
+      expect(prepareSubagentTranscriptCollection(parentFile).ok).toBe(true);
+      expect(nativeRealpath).toHaveBeenCalledWith(cwd);
+    } finally {
+      nativeRealpath.mockRestore();
+    }
+  });
+
   it("bounds parent-header and marker reads at the descriptor operation", () => {
     const sessions = tempSessionsDir();
     const parent = SessionManager.create(sessions, sessions, { id: "main-bounded" });
