@@ -19,6 +19,8 @@ import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { modelSupportsImages } from "../util/model.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
+import { projectPluginInventoryDoctor, type PluginInventoryDoctorProjection } from "../runtime/plugin-inventory-text.js";
+import type { PluginInventorySnapshot } from "../plugin-inventory.js";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
@@ -52,8 +54,10 @@ export interface CompatReport {
   safetyFindings: CompatFinding[];
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
-  /** Normalized installed-plugin selection posture; never reconstructed from disk. */
+  /** Legacy normalized posture for project models predating the inventory seam. */
   pluginPosture?: PluginPosture;
+  /** Structured projection of the immutable captured plugin inventory. */
+  pluginInventory?: PluginInventoryDoctorProjection;
   /** Bounded point-of-use plugin failures known not to have executed. */
   pluginRuntimeFindings?: string[];
   /** Distinct runtime findings omitted after the retained cap. */
@@ -348,8 +352,12 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   const assembled = project as ClaudeProject & {
     pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
     mergedHooks?: HookConfig;
+    pluginInventory?: PluginInventorySnapshot;
   };
-  const normalizedPluginOutcomes = Array.isArray(assembled.pluginResolutionOutcomes)
+  const pluginInventory = assembled.pluginInventory === undefined
+    ? undefined
+    : projectPluginInventoryDoctor(assembled.pluginInventory);
+  const normalizedPluginOutcomes = pluginInventory === undefined && Array.isArray(assembled.pluginResolutionOutcomes)
     ? assembled.pluginResolutionOutcomes
     : [];
   const pluginPosture = buildPluginPosture(normalizedPluginOutcomes);
@@ -388,11 +396,36 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
   }
 
+  const inventoryCapability = lookupCapability("feature.plugins-inventory");
+  if (pluginInventory !== undefined) {
+    if (inventoryCapability) {
+      const omittedDiagnostics = pluginInventory.omitted.diagnostics.capture + pluginInventory.omitted.diagnostics.projection;
+      if (omittedDiagnostics > 0) addFinding(inventoryCapability, `${omittedDiagnostics} additional captured plugin diagnostic(s) omitted.`);
+      for (const omission of pluginInventory.captureOmissions) {
+        addFinding(inventoryCapability, `${omission.count} captured plugin inventory value(s) omitted on ${omission.axis}.`);
+      }
+    }
+    for (const evidence of pluginInventory.capabilityEvidence) {
+      const capability = lookupCapability(evidence.capabilityId);
+      const component = evidence.component === undefined ? "" : ` component ${JSON.stringify(evidence.component)}`;
+      const rendered = `${evidence.qualifiedIdentity}${component}: ${evidence.observation}`;
+      if (capability) addFinding(capability, rendered);
+      else unassessed.push(`plugin capability ${JSON.stringify(evidence.capabilityId)} (${evidence.qualifiedIdentity})`);
+    }
+    const omittedEvidence = pluginInventory.omitted.capabilityEvidence.capture + pluginInventory.omitted.capabilityEvidence.projection;
+    if (omittedEvidence > 0 && inventoryCapability) addFinding(inventoryCapability, `${omittedEvidence} additional captured plugin capability observation(s) omitted.`);
+    const policyCapability = lookupCapability("feature.managed-policy");
+    if (policyCapability) for (const evidence of pluginInventory.managedPolicyEvidence) {
+      const impact = evidence.impact === "source-ignored" ? "this source was ignored" : "weaker policy was suppressed";
+      addFinding(policyCapability, `${evidence.sourceLabel} was ${evidence.condition}; ${impact}. ${evidence.guidance}, then ${evidence.refreshGuidance}.`);
+    }
+  }
+
   const enablementCapability = lookupCapability("feature.plugins-enablement");
   const managedPolicyCapability = lookupCapability("feature.managed-policy");
   for (const diagnostic of settings.diagnostics) {
     if (
-      managedPolicyCapability &&
+      pluginInventory === undefined && managedPolicyCapability &&
       (diagnostic.category === "managed-policy-malformed" ||
         diagnostic.category === "managed-policy-unreadable")
     ) {
@@ -406,7 +439,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       continue;
     }
     const diagnosticMessage = typeof diagnostic.message === "string" ? diagnostic.message : "";
-    if (enablementCapability && /enabledPlugins|plugin identity/i.test(diagnosticMessage)) {
+    if (pluginInventory === undefined && enablementCapability && /enabledPlugins|plugin identity/i.test(diagnosticMessage)) {
       const reason = /literal boolean/i.test(diagnosticMessage)
         ? "a non-boolean enablement value was ignored"
         : /not an object/i.test(diagnosticMessage)
@@ -576,7 +609,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   const addPluginHookUnassessed = (evidence: string) => {
     collectPluginHookCandidate({ kind: "unassessed", evidence }, `unassessed|${evidence}`, false);
   };
-  if (assembled.mergedHooks && typeof assembled.mergedHooks === "object") {
+  if (pluginInventory === undefined && assembled.mergedHooks && typeof assembled.mergedHooks === "object") {
     for (const [event, matchers] of Object.entries(assembled.mergedHooks)) {
       if (!Array.isArray(matchers)) continue;
       for (const matcher of matchers) {
@@ -658,7 +691,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   let strippedAgentFindingCount = 0;
   let strippedAgentFindingsOmitted = 0;
   for (const agent of project.agents) {
-    if (agent.source.scope === "plugin" && agent.source.pluginId) {
+    if (pluginInventory === undefined && agent.source.scope === "plugin" && agent.source.pluginId) {
       const pluginId = safePluginIdentity(agent.source.pluginId);
       const component = mcpStatusScalar(agent.name, 128) || "unnamed agent";
       for (const field of ["hooks", "mcpServers", "permissionMode"] as const) {
@@ -902,6 +935,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     safetyFindings: deduped.filter((f) => f.capability.safetyRelevant === true),
     unassessed: [...new Set(unassessed)],
     ...(pluginPosture !== undefined ? { pluginPosture } : {}),
+    ...(pluginInventory !== undefined ? { pluginInventory } : {}),
     ...(mcpPendingNotice !== undefined ? { mcpPendingNotice } : {}),
   };
 }
@@ -1601,6 +1635,29 @@ function pluginPostureLine(posture: PluginPosture | undefined): string {
   return `Plugin selection: ${parts.join(", ")}.`;
 }
 
+function pluginInventoryLines(inventory: PluginInventoryDoctorProjection | undefined): string[] {
+  if (inventory === undefined) return [];
+  const { counts } = inventory;
+  const lines = [
+    `Plugin inventory (captured snapshot): known: ${counts.known}, installed: ${counts.installed}, enabled: ${counts.enabled}, loaded: ${counts.loaded}, cataloged: ${counts.cataloged}, attention: ${counts.attention}.`,
+  ];
+  const countOmissions = inventory.captureOmissions.filter((value) => /^(?:snapshot\.(?:items|installations|catalog-declarations)|loader\.installed\.records|loader\.marketplace\.entries)$/u.test(value.axis));
+  if (countOmissions.length > 0) lines.push(`  Capture omissions may make these retained counts incomplete: ${countOmissions.map((value) => `${value.axis}=${value.count}`).join(", ")}.`);
+  lines.push("Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+  for (const diagnostic of inventory.diagnostics) {
+    const owner = diagnostic.qualifiedIdentity ?? "global";
+    const status = diagnostic.status === undefined ? "" : ` [${diagnostic.status}]`;
+    const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
+    lines.push(`  - ${owner}${status}: ${diagnostic.message}.${action}`);
+  }
+  const diagnosticOmissions = inventory.omitted.diagnostics.capture + inventory.omitted.diagnostics.projection;
+  if (diagnosticOmissions > 0) lines.push(`  - ${diagnosticOmissions} additional captured diagnostic(s) omitted.`);
+  const capabilityOmissions = inventory.omitted.capabilityEvidence.capture + inventory.omitted.capabilityEvidence.projection;
+  if (capabilityOmissions > 0) lines.push(`  - ${capabilityOmissions} additional captured capability observation(s) omitted.`);
+  if (inventory.omitted.managedPolicyEvidence.projection > 0) lines.push(`  - ${inventory.omitted.managedPolicyEvidence.projection} additional managed-policy observation(s) omitted.`);
+  return lines;
+}
+
 function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: unknown): string {
   const api = activeModel && typeof activeModel === "object"
     ? (activeModel as { api?: unknown }).api
@@ -1645,7 +1702,7 @@ export function renderDoctorReport(
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
     mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
-    pluginPostureLine(report.pluginPosture),
+    ...(report.pluginInventory === undefined ? [pluginPostureLine(report.pluginPosture)] : pluginInventoryLines(report.pluginInventory)),
     ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",
   ];

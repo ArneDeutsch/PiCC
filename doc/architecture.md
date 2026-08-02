@@ -180,6 +180,26 @@ and is retained for compatibility reporting without retroactively changing assem
 diagnostics and retained runtime failures flow to the compatibility report; no diagnostic pass
 rescans plugin storage.
 
+After plugin assembly finalizes shared-registry dedupe, overrides, whole-plugin rejection, and
+retained executable hook registrations, `src/project.ts` builds one root-level immutable inventory
+snapshot. Its per-plugin join is keyed only by qualified identity across installed-state
+observations, enablement, selected records, final runtime outcomes, and capability evidence.
+Marketplace registrations and managed policy remain global observations; qualified catalog entries
+join a plugin only as inert declarations. Metadata for a selected plugin comes from the exact
+manifest object already read for selection; observational metadata for unselected records uses a
+separate bounded, contained read capability and cannot authorize execution.
+
+The snapshot is observational, never an execution input. Catalog declarations can describe
+components, dependencies, and renames for inventory, but never authorize a root, merge content,
+resolve dependencies, rewrite settings, or start unsupported components. Session `/plugin` views,
+startup diagnostics, and `/doctor` consume the same fixed snapshot for the extension lifetime;
+launcher inventory commands build one command-scoped snapshot without normal runtime startup.
+Consumers produce bounded, redacted projections without rereading plugin state. Post-capture
+point-of-use refusals remain separate live evidence. Refreshing a session snapshot requires canonical
+`/reload` in the interactive TUI or a full PiCC relaunch. Construction and viewing perform no
+marketplace refresh or acquisition, settings or registry writes, plugin process startup, hook
+execution, usage mutation, or prompt-cache invalidation.
+
 ### `engine/` — the deterministic enforcement primitives
 
 - **`permissions.ts`** — the permission-matcher grammar (`Bash(git *)`, `Read/Edit(glob)`,

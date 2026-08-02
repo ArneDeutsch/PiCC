@@ -308,6 +308,7 @@ export function loadClaudeProject(opts: {
     installedObservationDiagnostics: installedState.observationDiagnostics,
     installedObservationOmissions: { ...installedState.observationOmissions },
     metadataReadCapability: createPluginMetadataReadCapability(authorizedCacheRoots(userDir, process.env)),
+    enablementDiagnostics: settings.diagnostics,
     marketplaceState,
     enablement: settings.effectivePluginEnablement ?? {},
     outcomes: pluginResolutionOutcomes,

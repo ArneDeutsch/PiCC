@@ -147,6 +147,26 @@ describe("buildPluginInventorySnapshot", () => {
     expect(() => (snapshot.items as unknown as unknown[]).push({})).toThrow();
   });
 
+  it("classifies enabledPlugins diagnostics into fixed immutable evidence", () => {
+    const { projectRoot, userDir } = fixture();
+    const snapshot = buildPluginInventorySnapshot({
+      projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [],
+      enablementDiagnostics: [
+        { severity: "warning", message: 'Setting "enabledPlugins" is not an object; ignored', source: path.join(userDir, "SECRET-settings.json") },
+        { severity: "warning", message: 'Invalid plugin identity in "enabledPlugins" ignored', source: "SECRET-invalid-source" },
+        { severity: "warning", message: 'Plugin "safe@market" in "enabledPlugins" must be a literal boolean; ignored', source: "SECRET-value-source" },
+        { severity: "warning", message: "unrelated SECRET diagnostic" },
+      ],
+    });
+    expect(snapshot.diagnostics).toEqual([
+      { severity: "warning", category: "enabled-plugins-not-object", message: "The enabledPlugins declaration was not an object and was ignored" },
+      { severity: "warning", category: "enabled-plugins-invalid-identity", message: "An invalid qualified plugin identity in enabledPlugins was ignored" },
+      { severity: "warning", category: "enabled-plugins-non-boolean", message: "A non-boolean enabledPlugins value was ignored" },
+    ]);
+    expect(JSON.stringify(snapshot.diagnostics)).not.toMatch(/SECRET|safe@market/u);
+    expect(Object.isFrozen(snapshot.diagnostics[0])).toBe(true);
+  });
+
   it("never probes an observational root outside independently eligible cache bases", () => {
     const { base, userDir } = fixture();
     const cache = path.join(userDir, "plugins", "cache"); const outside = path.join(base, "outside");

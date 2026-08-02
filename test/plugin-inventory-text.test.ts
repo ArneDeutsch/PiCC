@@ -363,8 +363,8 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.qualifiedIdentities).toContain("same@m1");
     expect(projection.omissions).toEqual({ identities: 2, managedPolicyEvidence: 0, captureEvidence: [] });
     expect(projection.managedPolicyEvidence).toEqual([
-      { category: "managed-policy-malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format" },
-      { category: "managed-policy-unreadable", sourceClass: "registry-hklm", sourceLabel: "machine registry policy", impact: "weaker-policy-suppressed", guidance: "Ask an administrator to correct access to the policy source" },
+      { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
+      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "registry-hklm", sourceLabel: "machine registry policy", impact: "weaker-policy-suppressed", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
     ]);
     expect(projection.text).toContain("Run /doctor for details");
     expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
@@ -373,7 +373,7 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.text).not.toContain("raw administrator path");
   });
 
-  it("caps managed policy per impact so both consequences survive and keeps capture omissions separate", () => {
+  it("caps startup managed policy per impact so both consequences survive and keeps capture omissions separate", () => {
     const diagnostics = (["source-ignored", "weaker-policy-suppressed"] as const).flatMap((impact) =>
       (["system-file", "system-drop-in", "registry-hklm"] as const).flatMap((sourceClass) =>
         (["managed-policy-malformed", "managed-policy-unreadable"] as const).map((category) => ({ severity: "error" as const, message: "hidden", category, sourceClass, impact }))));
@@ -399,8 +399,35 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.counts).toEqual({ known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1 });
     expect(projection.diagnostics).toContainEqual(expect.objectContaining({ qualifiedIdentity: "same@two", status: "blocked" }));
     expect(projection.capabilityEvidence).toEqual([{ capabilityId: "feature.plugins-agents", qualifiedIdentity: "same@one", component: "agents", observation: "Plugin agent field hooks was stripped before runtime construction" }]);
-    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source" }]);
+    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" }]);
     expect(projection.snapshotBoundary).toContain("captured for this session");
+  });
+
+  it("projects every safe policy source and impact for doctor without raw paths while startup stays administrator-only", () => {
+    const sources = [
+      ["system-file", "system policy file", "Ask an administrator"],
+      ["system-drop-in", "system policy drop-in", "Ask an administrator"],
+      ["registry-hklm", "machine registry policy", "Ask an administrator"],
+      ["registry-hkcu", "user registry policy", "Correct"],
+      ["override", "managed-policy override", "Correct"],
+    ] as const;
+    const diagnostics = sources.flatMap(([sourceClass]) => ([
+      { severity: "error" as const, message: `C:/RAW/${sourceClass}`, category: "managed-policy-malformed" as const, sourceClass, impact: "source-ignored" as const },
+      { severity: "error" as const, message: `/RAW/${sourceClass}`, category: "managed-policy-unreadable" as const, sourceClass, impact: "weaker-policy-suppressed" as const },
+    ]));
+
+    const doctor = projectPluginInventoryDoctor(snapshot([], { diagnostics }));
+    expect(doctor.managedPolicyEvidence).toHaveLength(10);
+    for (const [sourceClass, sourceLabel, actor] of sources) {
+      for (const impact of ["source-ignored", "weaker-policy-suppressed"] as const) {
+        expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact, guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("canonical /reload") }));
+      }
+    }
+    expect(JSON.stringify(doctor)).not.toMatch(/C:\/RAW|\/RAW\//u);
+
+    const startup = projectPluginInventoryStartup(snapshot([], { diagnostics }));
+    expect(startup.managedPolicyEvidence.map((value) => value.sourceClass)).not.toContain("registry-hkcu");
+    expect(startup.managedPolicyEvidence.map((value) => value.sourceClass)).not.toContain("override");
   });
 
   it("preserves exact long capability and qualified IDs and gives structured actionable failure guidance", () => {
@@ -425,6 +452,6 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.diagnostics).toHaveLength(64);
     expect(projection.capabilityEvidence).toHaveLength(128);
     expect(projection.captureOmissions).toEqual([{ axis: "snapshot.capability-evidence", count: 5 }, { axis: "snapshot.diagnostics", count: 4 }, { axis: "snapshot.policies", count: 6 }]);
-    expect(projection.omitted).toEqual({ diagnostics: { capture: 4, projection: 18 }, capabilityEvidence: { capture: 5, projection: 2 }, managedPolicyEvidence: { projection: 6 } });
+    expect(projection.omitted).toEqual({ diagnostics: { capture: 4, projection: 6 }, capabilityEvidence: { capture: 5, projection: 2 }, managedPolicyEvidence: { projection: 0 } });
   });
 });

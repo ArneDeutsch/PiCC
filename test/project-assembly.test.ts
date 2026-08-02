@@ -6,6 +6,7 @@ import { HookRunner } from "../src/engine/hook-runner.js";
 import { loadSkillBody } from "../src/claude/skills.js";
 import { projectPluginAgentRuntime, substitutePluginRuntimeText } from "../src/index.js";
 import { findByName, loadClaudeProject } from "../src/project.js";
+import { buildCompatReport, renderDoctorReport } from "../src/registry/compat-report.js";
 import {
   buildSystemPromptSuffix,
   createTierChangeReporter,
@@ -136,6 +137,51 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.pluginInventory.find("beta@official")).toMatchObject({ outcome: { status: "disabled" } });
     expect(project.pluginInventory.find("beta@official")!.selectedInstallation).toBeUndefined();
     expect(Object.isFrozen(project.pluginInventory)).toBe(true);
+  });
+
+  it("captures safely classified invalid enabledPlugins evidence from real settings assembly", () => {
+    const { repo, userDir } = makeBase();
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: [] }));
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "SECRET-BAD-IDENTITY": true, "safe@official": "RAW-SECRET-VALUE" } }));
+
+    const project = load(repo, userDir);
+    expect(project.pluginInventory.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: "enabled-plugins-not-object", message: "The enabledPlugins declaration was not an object and was ignored" }),
+      expect.objectContaining({ category: "enabled-plugins-invalid-identity", message: "An invalid qualified plugin identity in enabledPlugins was ignored" }),
+      expect.objectContaining({ category: "enabled-plugins-non-boolean", message: "A non-boolean enabledPlugins value was ignored" }),
+    ]));
+    const captured = JSON.stringify(project.pluginInventory.diagnostics);
+    for (const rejected of ["SECRET-BAD-IDENTITY", "safe@official", "RAW-SECRET-VALUE", userDir, repo]) expect(captured).not.toContain(rejected);
+  });
+
+  it("does not reread observational metadata while building or rendering doctor after capture", () => {
+    const { repo, userDir } = makeBase();
+    const root = makeMarketplacePlugin(userDir, "official", "alpha");
+    const manifest = path.join(root, ".claude-plugin", "plugin.json");
+    write(manifest, JSON.stringify({ name: "alpha", description: "captured description" }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": false } }));
+    const originalOpen = fs.openSync;
+    let manifestReads = 0;
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((filePath: fs.PathLike, ...args: unknown[]) => {
+      if (path.resolve(String(filePath)) === path.resolve(manifest)) manifestReads += 1;
+      return (originalOpen as (...values: unknown[]) => number)(filePath, ...args);
+    }) as typeof fs.openSync);
+    try {
+      const project = load(repo, userDir);
+      const readsAfterCapture = manifestReads;
+      expect(readsAfterCapture).toBeGreaterThan(0);
+      expect(project.pluginInventory.find("alpha@official")?.installations[0]?.metadata?.description).toBe("captured description");
+      fs.rmSync(manifest);
+
+      const report = buildCompatReport(project);
+      const doctor = renderDoctorReport(project, report);
+      expect(project.pluginInventory.find("alpha@official")?.installations[0]?.metadata?.description).toBe("captured description");
+      expect(report.pluginInventory?.counts.known).toBe(1);
+      expect(doctor).toContain("known: 1");
+      expect(manifestReads).toBe(readsAfterCapture);
+    } finally {
+      open.mockRestore();
+    }
   });
 
   it("builds capability evidence only after plugin agent and hook validation", () => {

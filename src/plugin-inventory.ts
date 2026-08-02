@@ -14,7 +14,8 @@ export const PLUGIN_INVENTORY_COMMAND_BOUNDARY = "Captured for this command; run
 
 type ComponentKind = "skills" | "commands" | "agents" | "hooks" | "mcpServers" | "lspServers";
 export interface PluginInventoryLocation { readonly kind: "project" | "main-checkout" | "claude-user" | "plugin-cache" | "plugin-data" | "marketplace-cache" | "external"; readonly display: string }
-export interface PluginInventoryDiagnostic { readonly severity: Diagnostic["severity"]; readonly message: string; readonly category?: Diagnostic["category"]; readonly sourceClass?: Diagnostic["sourceClass"]; readonly impact?: Diagnostic["impact"] }
+export type PluginInventoryDiagnosticCategory = NonNullable<Diagnostic["category"]> | "enabled-plugins-not-object" | "enabled-plugins-invalid-identity" | "enabled-plugins-non-boolean";
+export interface PluginInventoryDiagnostic { readonly severity: Diagnostic["severity"]; readonly message: string; readonly category?: PluginInventoryDiagnosticCategory; readonly sourceClass?: Diagnostic["sourceClass"]; readonly impact?: Diagnostic["impact"] }
 export interface PluginInventoryProvenance {
   readonly source: PluginInventoryLocation;
   readonly scope?: string;
@@ -91,6 +92,7 @@ export interface BuildPluginInventorySnapshotOptions {
   lifetime?: "session" | "command"; capturedAt?: string; projectRoot: string; mainCheckout?: string; userDir: string;
   installedStateStatus: PluginInstalledStateStatus; installedObservations: readonly InstalledPluginObservation[]; installedObservationDiagnostics?: readonly Diagnostic[];
   installedObservationOmissions?: Readonly<Record<string, number>>; metadataReadCapability?: PluginMetadataReadCapability;
+  enablementDiagnostics?: readonly Diagnostic[];
   marketplaceState: PluginMarketplaceState; enablement: Readonly<Record<string, EffectivePluginEnablement>>; outcomes: readonly PluginResolutionOutcome[];
   selectedPlugins: readonly InstalledPlugin[]; finalLoadedComponents?: Readonly<Record<string, FinalLoadedPluginComponents>>;
   diagnostics?: readonly Diagnostic[]; capabilityEvidence?: readonly PluginInventoryCapabilityEvidence[];
@@ -121,6 +123,12 @@ function location(value: string | undefined, options: BuildPluginInventorySnapsh
 }
 function identity(value: string): { lifecycleName: string; marketplaceName: string } { const at = value.lastIndexOf("@"); return { lifecycleName: safeToken(value.slice(0, at), "unknown"), marketplaceName: safeToken(value.slice(at + 1), "unknown") }; }
 function diag(value: Diagnostic): PluginInventoryDiagnostic { const managed = value.category !== undefined; return Object.freeze({ severity: value.severity, message: managed ? "Managed plugin policy evidence affected startup" : boundedText(value.message, 512), ...(value.category === undefined ? {} : { category: value.category }), ...(value.sourceClass === undefined ? {} : { sourceClass: value.sourceClass }), ...(value.impact === undefined ? {} : { impact: value.impact }) }); }
+function enablementDiagnostic(value: Diagnostic): PluginInventoryDiagnostic | undefined {
+  if (value.message === 'Setting "enabledPlugins" is not an object; ignored') return Object.freeze({ severity: value.severity, category: "enabled-plugins-not-object" as const, message: "The enabledPlugins declaration was not an object and was ignored" });
+  if (value.message === 'Invalid plugin identity in "enabledPlugins" ignored') return Object.freeze({ severity: value.severity, category: "enabled-plugins-invalid-identity" as const, message: "An invalid qualified plugin identity in enabledPlugins was ignored" });
+  if (/^Plugin ".*" in "enabledPlugins" must be a literal boolean; ignored$/u.test(value.message)) return Object.freeze({ severity: value.severity, category: "enabled-plugins-non-boolean" as const, message: "A non-boolean enabledPlugins value was ignored" });
+  return undefined;
+}
 type ProvenanceEvidence = { sourcePath: string; field?: string; entryIndex?: number; itemIndex?: number; key?: string };
 function safeIndex(value: number | undefined): number | undefined { return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined; }
 function provenance(value: ProvenanceEvidence | PluginMarketplaceProvenance, options: BuildPluginInventorySnapshotOptions, context?: PluginMarketplaceProvenance): PluginInventoryProvenance {
@@ -219,7 +227,9 @@ export function buildPluginInventorySnapshot(options: BuildPluginInventorySnapsh
   const allowlistObservations = cap(options.marketplaceState.allowlists, LIMIT.declarations, omissions, "snapshot.allowlists").map((value) => Object.freeze({ marketplace: safeToken(value.marketplace, "unknown"), allowedMarketplace: safeToken(value.allowedMarketplace, "unknown"), provenance: provenance(value.provenance, options, provenanceContext(value.provenance)), posture: "declared-not-effective" as const }));
   const conflictObservations = cap(options.marketplaceState.conflicts, LIMIT.declarations, omissions, "snapshot.conflicts").map((value) => Object.freeze({ identity: safeToken(value.identity, "unknown@unknown"), winner: provenance(value.winner, options, provenanceContext(value.winner)), loser: provenance(value.loser, options, provenanceContext(value.loser)), posture: value.posture }));
   const policyObservations = cap(options.marketplaceState.policies, LIMIT.policies, omissions, "snapshot.policies").map((value) => Object.freeze({ kind: value.kind, ...(value.descriptor === undefined ? {} : { descriptor: sourceProjection(value.descriptor) }), ...(value.descriptorProvenance === undefined ? {} : { descriptorProvenance: provenance(value.descriptorProvenance, options, value.provenance) }), match: value.match, validScope: value.validScope, emptyLockdown: value.emptyLockdown === true, posture: value.posture, provenance: provenance(value.provenance, options) }));
-  const globalDiagnostics = cap([...(options.installedObservationDiagnostics ?? []), ...options.marketplaceState.diagnostics, ...(options.diagnostics ?? [])], LIMIT.diagnostics, omissions, "snapshot.diagnostics").map(diag);
+  const classifiedEnablementDiagnostics = (options.enablementDiagnostics ?? []).map(enablementDiagnostic).filter((value): value is PluginInventoryDiagnostic => value !== undefined);
+  const ordinaryGlobalDiagnostics = [...(options.installedObservationDiagnostics ?? []), ...options.marketplaceState.diagnostics, ...(options.diagnostics ?? [])].map(diag);
+  const globalDiagnostics = cap([...classifiedEnablementDiagnostics, ...ordinaryGlobalDiagnostics], LIMIT.diagnostics, omissions, "snapshot.diagnostics");
   const componentEvidence: PluginInventoryCapabilityEvidence[] = items.flatMap((item) => item.components.filter((value) => value.origin === "final-runtime" && value.supportTier !== "full").map((value) => ({ capabilityId: value.capabilityId, qualifiedIdentity: item.qualifiedIdentity, component: value.kind, observation: `Final loaded component support is ${value.supportTier}` })));
   const seen = new Set<string>(); const evidenceValues: PluginInventoryCapabilityEvidence[] = [];
   for (const value of [...(options.capabilityEvidence ?? []), ...componentEvidence]) { const rawCapability = safeToken(value.capabilityId, "unassessed"); const assessed = lookupCapability(rawCapability) !== undefined; const capabilityId = rawCapability; const qualifiedIdentity = safeToken(value.qualifiedIdentity, "unknown@unknown"); const componentName = value.component === undefined ? undefined : safeToken(value.component, "unknown-component"); const observation = safeEvidenceObservation(value.observation, assessed); const key = `${capabilityId}\0${qualifiedIdentity}\0${componentName ?? ""}\0${observation}`; if (seen.has(key)) { addOmission(omissions, "snapshot.duplicate-evidence", 1); continue; } seen.add(key); evidenceValues.push(Object.freeze({ capabilityId, qualifiedIdentity, ...(componentName === undefined ? {} : { component: componentName }), observation })); }
