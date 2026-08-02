@@ -3547,6 +3547,58 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(pi.statusCalls.filter((call) => call.key === "picc-checkpoint" && call.text !== undefined)).toEqual([]);
   });
 
+  it("keeps TUI preparation failure presentation-only while resumed work settles", async () => {
+    let percent = 90;
+    let notifyAttempts = 0;
+    const ctx: any = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: percent * 10, contextWindow: 1000, percent }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      abort: () => undefined,
+    });
+    ctx.ui.notify = () => {
+      notifyAttempts += 1;
+      throw new Error("renderer unavailable");
+    };
+    await pi.fire("session_start", { reason: "startup" }, ctx);
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    pi.notifications.length = 0;
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const { outer } = await driveResumeToResuming("tui-throwing-preparation", ctx);
+      percent = 10;
+      await pi.fire("agent_settled", {}, ctx);
+      await outer;
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    expect(notifyAttempts).toBe(1);
+    expect(errors).toEqual([]);
+    expect(pi.messages.filter((entry) =>
+      entry.message.customType === "picc-checkpoint-continuation")).toEqual([
+      {
+        message: {
+          customType: "picc-checkpoint-continuation",
+          content: "Continue the paused work.",
+          display: false,
+        },
+        options: { triggerTurn: true },
+      },
+    ]);
+    expect(mainCheckpointGate.currentController().snapshot())
+      .toMatchObject({ phase: "idle", admission: "open" });
+    expect(mainCheckpointGate.currentController().ordinaryInputDisposition()).toBe("accept");
+    expect(pi.notifications).toEqual([]);
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact")).toEqual([]);
+  });
+
   it.each(["print", "json", "rpc"] as const)(
     "preserves the exact resumed success contract in %s mode",
     async (mode) => {
@@ -5141,6 +5193,94 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       },
     ]);
     expect(pi.messages.some((message) => message.message.customType === "picc-proactive-compact")).toBe(false);
+  });
+
+  it("keeps exceptional and recovery presentation persistence outside checkpoint authority", async () => {
+    pi.entries.length = 0;
+    pi.notifications.length = 0;
+    pi.editorText = "existing draft";
+    const presentationAttempts: Array<{ notice: string; severity: string }> = [];
+    const originalAppendEntry = pi.api.appendEntry as (customType: string, data: any) => void;
+    pi.api.appendEntry = (customType: string, data: any) => {
+      if (customType === "picc-proactive-compact") {
+        presentationAttempts.push(data);
+        throw new Error("presentation persistence unavailable");
+      }
+      originalAppendEntry(customType, data);
+    };
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      compact: (options: any) => queueMicrotask(() => options.onError(new Error("offline"))),
+    });
+    try {
+      const { controller, generation } = await armCheckpoint(
+        ctx,
+        "throwing-exceptional-presentation",
+        "restore me",
+      );
+      await pi.fire("agent_settled", {}, ctx);
+
+      expect(controller.snapshot()).toMatchObject({
+        generation,
+        phase: "exhausted",
+        admission: "recoverable-rejection",
+        failureCategory: "operational",
+      });
+      expect(controller.manualCompactionDisposition()).toBe("allow");
+      expect(controller.recoveryToken(generation)).toBeDefined();
+
+      await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+      await pi.fire("session_compact", {
+        reason: "manual", compactionEntry: { summary: "manual" },
+      }, ctx);
+
+      expect(controller.snapshot()).toMatchObject({ generation, phase: "idle", admission: "open" });
+      expect(controller.ordinaryInputDisposition()).toBe("accept");
+      expect(controller.recoveryToken(generation)).toBeUndefined();
+      expect(pi.editorText).toBe("restore me\nexisting draft");
+      expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact")).toEqual([]);
+      expect(pi.messages.some((message) =>
+        message.message.customType === "picc-proactive-compact")).toBe(false);
+      expect(errors).toEqual([]);
+      expect(presentationAttempts).toEqual([
+        {
+          notice: "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.",
+          severity: "error",
+        },
+        {
+          notice: "Manual compaction recovered the paused session; explicitly continue when ready.",
+          severity: "info",
+        },
+        {
+          notice: "1 queued input was not replayed; 1 text input was restored.",
+          severity: "info",
+        },
+      ]);
+      expect(pi.notifications).toEqual([
+        { text: "Context checkpoint queued; waiting for safe settlement.", severity: "info" },
+      ]);
+      expect(pi.entries.filter((entry) =>
+        entry.customType === "picc-checkpoint-lifecycle" &&
+        entry.data.category === "checkpoint-input-recovery").map((entry) => entry.data)).toEqual([
+        {
+          category: "checkpoint-input-recovery",
+          count: 1,
+          restoredTextCount: 1,
+          unrepresentableCount: 0,
+          action: "review-restored-text",
+          notice: "1 queued input was not replayed; 1 text input was restored.",
+        },
+      ]);
+    } finally {
+      errorSpy.mockRestore();
+      pi.api.appendEntry = originalAppendEntry;
+    }
   });
 
   it.each(["print", "json", "rpc"] as const)(

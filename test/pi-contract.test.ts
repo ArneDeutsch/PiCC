@@ -846,7 +846,9 @@ describe("pi 0.83.0 API contract", () => {
     );
 
     expect(source).toMatch(/case "compaction_start":[\s\S]*?showStatusIndicator\(new CompactionStatusIndicator\(this\.ui, event\.reason\)\)/);
-    expect(source).toMatch(/case "compaction_end":[\s\S]*?clearStatusIndicator\("compaction"\)[\s\S]*?rebuildChatFromMessages\(\)/);
+    expect(source).toMatch(
+      /case "compaction_end": \{[\s\S]*?this\.clearStatusIndicator\("compaction"\);[\s\S]*?else if \(event\.result\) \{\s*this\.chatContainer\.clear\(\);\s*this\.rebuildChatFromMessages\(\);\s*this\.addMessageToChat\(createCompactionSummaryMessage\(event\.result\.summary, event\.result\.tokensBefore, new Date\(\)\.toISOString\(\)\)\);/,
+    );
   });
 
   it("keeps custom entries rebuild-visible after compaction but outside model context", () => {
@@ -872,7 +874,9 @@ describe("pi 0.83.0 API contract", () => {
       fileURLToPath(new URL("./modes/interactive/interactive-mode.js", mainUrl.slice(0, distIdx) + "/dist/")),
       "utf8",
     );
-    expect(source).toMatch(/rebuildChatFromMessages\(\) \{[\s\S]*?renderSessionEntries\(this\.sessionManager\.buildContextEntries\(\)\)/);
+    expect(source).toMatch(
+      /rebuildChatFromMessages\(\) \{\s*this\.chatContainer\.clear\(\);\s*this\.renderSessionEntries\(this\.sessionManager\.buildContextEntries\(\)\);\s*\}/,
+    );
     expect(source).toMatch(/renderSessionEntries\(entries[\s\S]*?entry\.type === "custom"[\s\S]*?return \[entry\]/);
   });
 
