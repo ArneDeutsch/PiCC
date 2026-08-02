@@ -296,19 +296,19 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. In row mode, each individually rendered active agent has an indented
-  status row and a stable second line for its current tool and primary argument, reasoning, assistant
-  or output text, or startup, work, retry, and capacity-waiting status. The second line updates in
-  place and disappears only when the agent completes, fails, stops, or is canceled. The status bubble is `◌`
-  while waiting for configured capacity, a spinner while running, `●` when done, `✗` when failed,
-  and `■` when stopped. Recognized `color:` frontmatter values tint the agent type; other values do
-  not. State and identity take priority as width narrows; the dispatch description appears when
-  space permits, and elapsed time and token usage appear only when known and terminal width permits.
-  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
-  time. The panel window contains at most eight agents, not eight physical lines; overflow markers
-  and `↑↓` navigation move it through the full tree. Below the minimum useful identity-row width,
-  per-agent rows and their activity lines become aggregate state glyphs. Finished rows
-  linger briefly — ~10 s
+  no `TaskOutput` await needed. Each individually rendered active agent uses one physical status row.
+  When row space permits, a muted separator precedes a bounded current-activity fragment after the
+  dispatch description, or after identity when there is no distinct description. In the normal theme,
+  the activity text is muted italic. As available row space changes, the fragment may be truncated
+  with an ellipsis or omitted together with its separator. It remains current throughout the active
+  state, while terminal rows omit it. The status bubble is `◌` while waiting for configured capacity,
+  a spinner while running, `●` when done, `✗` when failed, and `■` when stopped. Recognized `color:`
+  frontmatter values tint the agent type; other values do not. State and identity take priority as
+  width changes; the dispatch description appears when space permits, and elapsed time and token usage
+  appear only when known and terminal width permits. Elapsed time runs from dispatch acceptance until
+  completion or stop, so it includes any queue time. A bounded panel window uses overflow markers and
+  `↑↓` navigation to move through the full tree. At widths too narrow for individual rows, the panel
+  retains aggregate state glyphs without per-agent activity. Finished rows linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
@@ -334,10 +334,9 @@ Every subagent is visible, both to you and to the coordinating model:
   text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
   admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
   line).
-- **Condensed transcript records.** Subagent output does not stream into the chat. The agent list
-  owns one bounded current-activity line; selected-agent detail owns multiline history and richer
-  live detail. Each depth-1 normal-path result replaces its pending call in the same
-  tool row. A successful background acceptance is transient in human chat rather than a durable row;
+- **Condensed transcript records.** Subagent output does not stream into the chat. Each depth-1
+  normal-path result replaces its pending call in the same tool row. A successful background
+  acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That bounded record prioritizes the
   outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an

@@ -620,7 +620,7 @@ describe("overflow windowing", () => {
 describe("responsive panel table", () => {
   const ASSISTANT_CANARY = "ASSISTANT_STREAM_CANARY";
   const rowsOnly = (lines: string[]) => lines.filter((line) =>
-    !line.includes("agent panel") && !line.includes("└ ")
+    !line.includes("agent panel")
   );
 
   function mixedView(widthRows = 8): PanelViewModel {
@@ -646,7 +646,7 @@ describe("responsive panel table", () => {
     ] });
   }
 
-  it("renders stable semantic activity lines and preserves active block positions across admission", () => {
+  it("renders every active activity kind inline as one muted italic row", () => {
     const clock = { t: 100 };
     const model = makeModel(clock);
     const records = [
@@ -662,29 +662,32 @@ describe("responsive panel table", () => {
     const before = renderSubagentPanel(view(model, records), {
       width: 100, entryChord: CHORD, theme: { fg, italic },
     });
-    const plainBefore = before.map(stripAnsi);
-    expect(plainBefore.filter((line) => line.includes("└ "))).toHaveLength(records.length);
-    expect(plainBefore.join("\n")).toContain("└ Waiting for capacity");
-    expect(plainBefore.join("\n")).toContain("└ Read src/index.ts");
-    expect(plainBefore.join("\n")).toContain(ASSISTANT_CANARY);
-    expect(fg).toHaveBeenCalledWith("text", "Read");
-    expect(fg).toHaveBeenCalledWith("accent", "src/index.ts");
-    expect(fg).toHaveBeenCalledWith("text", ASSISTANT_CANARY);
-    expect(fg).toHaveBeenCalledWith("text", "command output");
-    expect(fg).toHaveBeenCalledWith("muted", "waiting: API retry 2/3");
-    expect(italic).toHaveBeenCalledWith("checking invariants");
-    const focusedActivity = renderSubagentPanel(view(model, records, { focused: true }), {
-      width: 100, entryChord: CHORD,
-    }).map(stripAnsi).filter((line) => line.includes("└ ")).map((line) => line.slice(line.indexOf("└ ")));
-    const passiveActivity = plainBefore.filter((line) => line.includes("└ ")).map((line) => line.slice(line.indexOf("└ ")));
-    expect(focusedActivity).toEqual(passiveActivity);
+    const plainRows = before.slice(0, records.length).map(stripAnsi);
+    expect(before).toHaveLength(records.length + 1);
+    expect(plainRows[0]).toContain("waiter [waiting] · Waiting for capacity");
+    expect(plainRows[1]).toContain("tooler · Read src/index.ts");
+    expect(plainRows.join("\n")).toContain(ASSISTANT_CANARY);
+    const activities = [...new Set([
+      "Waiting for capacity", "Read src/index.ts", "checking invariants",
+      ASSISTANT_CANARY, "command output", "waiting: API retry 2/3",
+    ])];
+    for (const activity of activities) {
+      expect(italic).toHaveBeenCalledWith(activity);
+      expect(fg.mock.calls.some(([slot, text]) =>
+        slot === "muted" && stripAnsi(String(text)) === activity
+      )).toBe(true);
+      expect(fg.mock.calls.some(([slot, text]) =>
+        (slot === "text" || slot === "accent") && stripAnsi(String(text)).includes(activity)
+      )).toBe(false);
+    }
+    expect(fg).toHaveBeenCalledWith("muted", " · ");
+    expect(italic).not.toHaveBeenCalledWith(" · ");
 
     records[0] = rec({ agentId: "wait", agentName: "waiter", admission: "admitted", startedAt: 0, progress: { tail: [], activity: "" } });
     const after = renderSubagentPanel(view(model, records), { width: 100, entryChord: CHORD }).map(stripAnsi);
-    expect(after).toHaveLength(plainBefore.length);
-    expect(after[0]).toContain("waiter");
-    expect(after[1]).toContain("Working…");
-    expect(after[2]).toContain("tooler");
+    expect(after).toHaveLength(before.length);
+    expect(after[0]).toContain("waiter · Working…");
+    expect(after[1]).toContain("tooler · Read src/index.ts");
   });
 
   it("normalizes only exact reasoning bold edges after sanitization", () => {
@@ -700,8 +703,8 @@ describe("responsive panel table", () => {
     ];
     const activities = renderSubagentPanel(view(makeModel({ t: 100 }), records), {
       width: 100, entryChord: CHORD,
-    }).map(stripAnsi).filter((line) => line.includes("└ "))
-      .map((line) => line.slice(line.indexOf("└ ") + 2));
+    }).slice(0, records.length).map(stripAnsi)
+      .map((line) => line.slice(line.lastIndexOf(" · ") + 3).replace(/\s+\d+s$/u, ""));
 
     expect(activities).toEqual([
       "Planning inspection",
@@ -722,11 +725,11 @@ describe("responsive panel table", () => {
     const markerLines = renderSubagentPanel(markerOnly, {
       width: 80, entryChord: CHORD, theme: { fg, italic },
     }).map(stripAnsi);
-    expect(markerLines).toHaveLength(3);
-    expect(markerLines[1]).toBe("  └ Working…");
+    expect(markerLines).toHaveLength(2);
+    expect(markerLines[0]).toContain(" · Working…");
     expect(markerLines.join("\n")).not.toContain("**");
-    expect(fg).toHaveBeenCalledWith("muted", "Working…");
-    expect(italic).not.toHaveBeenCalled();
+    expect(fg).toHaveBeenCalledWith("muted", expect.stringContaining("Working…"));
+    expect(italic).toHaveBeenCalledWith("Working…");
 
     const waitingMarkerOnly = view(makeModel({ t: 100 }), [rec({
       agentId: "waiting-marker-only", admission: "waiting",
@@ -734,22 +737,27 @@ describe("responsive panel table", () => {
     waitingMarkerOnly.rows[0]!.activity = { kind: "reasoning", text: "**" };
     expect(stripAnsi(renderSubagentPanel(waitingMarkerOnly, {
       width: 80, entryChord: CHORD,
-    })[1]!)).toBe("  └ Waiting for capacity");
+    })[0]!)).toContain(" · Waiting for capacity");
   });
 
-  it("places the fixed activity inset after passive and focused tree gutters", () => {
+  it("places inline activity after passive and focused tree identity", () => {
     const passive = view(makeModel({ t: 100 }), [rec({
       agentId: "passive", liveActivity: { kind: "status", text: "semantic" },
     })]);
-    expect(stripAnsi(renderSubagentPanel(passive, { width: 80, entryChord: CHORD })[1]!))
-      .toBe("  └ semantic");
+    const passiveLines = renderSubagentPanel(passive, { width: 80, entryChord: CHORD });
+    expect(passiveLines).toHaveLength(2);
+    expect(stripAnsi(passiveLines[0]!)).toContain("coder · semantic");
 
     const focusedNested = view(makeModel({ t: 100 }), [rec({
       agentId: "focused", liveActivity: { kind: "status", text: "semantic" },
     })], { focused: true });
     focusedNested.rows[0]!.treeDepth = 1;
-    expect(stripAnsi(renderSubagentPanel(focusedNested, { width: 80, entryChord: CHORD })[1]!))
-      .toBe("      └ semantic");
+    const focusedLines = renderSubagentPanel(focusedNested, { width: 80, entryChord: CHORD });
+    expect(focusedLines).toHaveLength(2);
+    expect(stripAnsi(focusedLines[0]!)).toContain("⠋ coder · semantic");
+    expect(stripAnsi(focusedLines[0]!).indexOf("⠋")).toBeGreaterThan(
+      stripAnsi(passiveLines[0]!).indexOf("⠋"),
+    );
   });
 
   it("aligns identity, description, elapsed, sparse usage, positive cache, and cost columns", () => {
@@ -938,17 +946,17 @@ describe("responsive panel table", () => {
     expect(themed).not.toContain("$1.082095");
   });
 
-  it("determines a long fallback before display caps and renders one identity without accent or separator", () => {
+  it("determines a long fallback before display caps and renders activity after one identity", () => {
     const fg = vi.fn((_slot: string, text: string) => text);
     const longIdentity = `custom-${"identity".repeat(30)}`;
     const panel = view(makeModel({ t: 1000 }), [rec({ agentId: "fallback", agentName: longIdentity })]);
     const row = renderSubagentPanel(panel, { width: 180, entryChord: CHORD, theme: { fg } })[0]!;
     expect(row.match(/custom/gu)).toHaveLength(1);
-    expect(row).not.toContain(" · ");
+    expect(row).toContain(" · Starting agent…");
     expect(fg.mock.calls.filter(([slot]) => slot === "accent")).toEqual([["accent", PANEL_RUNNING_FRAMES[0]]]);
   });
 
-  it("keeps a shared description column aligned without a visible separator on fallback rows", () => {
+  it("keeps a shared description column aligned while fallback rows use it for activity", () => {
     const fg = vi.fn((_slot: string, text: string) => text);
     const panel = view(makeModel({ t: 12_000 }), [
       rec({ agentId: "described", agentName: "coder", description: "real dispatch" }),
@@ -959,9 +967,10 @@ describe("responsive panel table", () => {
     })).slice(0, 2);
     expect(rows[0]).toContain("coder");
     expect(rows[0]).toContain(" · real dispatch");
-    expect(rows[1]).not.toContain(" · ");
+    expect(rows[1]).toContain("reviewer · Starting agent…");
     expect(rows[0]!.indexOf("12s")).toBe(rows[1]!.indexOf("10s"));
-    expect(fg.mock.calls.filter(([slot, text]) => slot === "muted" && text === " · ")).toHaveLength(1);
+    expect(fg.mock.calls.filter(([slot, text]) => slot === "muted" && text === " · ").length)
+      .toBeGreaterThanOrEqual(3);
     expect(fg).toHaveBeenCalledWith("accent", "real dispatch");
   });
 
@@ -1033,6 +1042,155 @@ describe("responsive panel table", () => {
     expect(lines[0]).toContain("❯");
     expect(lines[0]).toContain("(+1)");
     expect(lines[1]!.indexOf(PANEL_RUNNING_FRAMES[0]!)).toBeGreaterThan(lines[0]!.indexOf(PANEL_RUNNING_FRAMES[0]!));
+  });
+
+  it("reserves spare identity-cell width for activity only when no distinct description is hidden", () => {
+    const panel = view(makeModel({ t: 1000 }), [
+      rec({
+        agentId: "described", agentName: "bot", description: "ship",
+        liveActivity: { kind: "status", text: "go" },
+      }),
+      rec({
+        agentId: "identity-only", agentName: "bot", startedAt: 1,
+        liveActivity: { kind: "status", text: "go" },
+      }),
+    ]);
+    const rows = rowsOnly(renderSubagentPanel(panel, {
+      width: 10, entryChord: CHORD,
+    })).slice(0, 2).map(stripAnsi);
+
+    expect(rows[0]).not.toContain("ship");
+    expect(rows[0]).not.toContain("go");
+    expect(rows[0]).not.toContain(" · ");
+    expect(rows[1]).toContain("bot · go");
+    expect(rows.map(visibleWidth)).toEqual([10, 10]);
+  });
+
+  it.each([
+    ["identity", undefined, 15, 1],
+    ["description", "ship", 22, 2],
+  ] as const)("emits activity only at the exact separator-plus-one boundary after %s", (
+    _case, description, boundaryWidth, activitySeparators,
+  ) => {
+    const panel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "boundary", agentName: "coder", description,
+      liveActivity: { kind: "status", text: "ACTIVITY" },
+    })]);
+    const rowAt = (width: number) => stripAnsi(renderSubagentPanel(panel, {
+      width, entryChord: CHORD,
+    })[0] ?? "");
+    const below = rowAt(boundaryWidth - 1);
+    const exact = rowAt(boundaryWidth);
+    expect(below.match(/ · /gu)?.length ?? 0).toBe(activitySeparators - 1);
+    expect(below).not.toContain("ACTIVITY");
+    expect(exact.match(/ · /gu)?.length ?? 0).toBe(activitySeparators);
+    expect(exact).toMatch(/ · …/u);
+    expect(exact).toContain("1s");
+    expect(visibleWidth(exact)).toBe(boundaryWidth);
+  });
+
+  it("truncates activity per row without changing another row's narrative or telemetry", () => {
+    const render = (firstActivity: string) => rowsOnly(renderSubagentPanel(
+      view(makeModel({ t: 12_000 }), [
+        rec({ agentId: "first", agentName: "coder", description: "first dispatch", liveActivity: { kind: "status", text: firstActivity } }),
+        rec({ agentId: "second", agentName: "reviewer", description: "second dispatch", startedAt: 2_000, liveActivity: { kind: "tool", tool: "Read", detail: "src/b.ts" }, progress: { tail: [], activity: "", usage: { inputTokens: 7 } } }),
+      ]),
+      { width: 72, entryChord: CHORD },
+    )).map(stripAnsi);
+    const short = render("brief");
+    const oversized = render("x".repeat(1000));
+    expect(oversized[1]).toBe(short[1]);
+    expect(short[1]).toContain("second dispatch · Read src/b.ts");
+    expect(short[1]).toContain("in 7");
+    expect(oversized[0]).toContain("first dispatch · ");
+    expect(oversized[0]).toMatch(/ · x+…/u);
+    expect(oversized[0]).toContain("12s");
+    expect(visibleWidth(oversized[0]!)).toBeLessThanOrEqual(72);
+  });
+
+  it("styles joined-emoji tool activity as one exact muted italic fragment", () => {
+    const activity = "Read 👨‍👩‍👧‍👦";
+    const panel = view(makeModel({ t: 100 }), [rec({
+      agentId: "emoji", liveActivity: { kind: "tool", tool: "Read", detail: "👨‍👩‍👧‍👦" },
+    })]);
+    const fg = vi.fn((color: string, text: string) => `${ESC}[${color === "muted" ? "90" : "36"}m${text}${ESC}[39m`);
+    const italic = vi.fn((text: string) => `${ESC}[3m${text}${ESC}[23m`);
+    const valid = renderSubagentPanel(panel, { width: 80, entryChord: CHORD, theme: { fg, italic } })[0]!;
+    expect(valid).toContain(`${ESC}[90m${ESC}[3m${activity}${ESC}[23m${ESC}[39m`);
+    expect(stripAnsi(valid)).toContain(` · ${activity}`);
+    expect(fg.mock.calls.some(([slot, text]) =>
+      (slot === "text" || slot === "accent") && String(text).includes("Read")
+    )).toBe(false);
+
+    const rejected = renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD,
+      theme: { fg: (_color: string, text: string) => `${ESC}[90m${text}`, italic },
+    })[0]!;
+    expect(rejected).not.toContain(ESC);
+    expect(rejected).toContain(activity);
+
+    const injected = "\u200Binjected";
+    const plain = renderSubagentPanel(panel, { width: 80, entryChord: CHORD })[0]!;
+    const balancedInjection = renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD,
+      theme: {
+        fg: (_color: string, text: string) => text,
+        italic: (text: string) => `${ESC}[3m${text}${injected}${ESC}[23m`,
+      },
+    })[0]!;
+    expect(balancedInjection).toBe(plain);
+    expect(balancedInjection).toContain(` · ${activity}`);
+    expect(balancedInjection).not.toContain(injected);
+    expect(balancedInjection).not.toContain(ESC);
+  });
+
+  it("suppresses stale activity when a hand-built row transitions to terminal", () => {
+    const row: PanelViewModel["rows"][number] = {
+      key: { kind: "agent", agentId: "transition" },
+      keyId: "agent:transition",
+      agentId: "transition",
+      treeDepth: 0,
+      state: "running",
+      agentType: "coder",
+      label: "dispatch",
+      elapsedMs: 100,
+      activity: { kind: "status", text: "still working" },
+      selected: false,
+      hiddenDescendants: 0,
+    };
+    const panel: PanelViewModel = {
+      rows: [row], totalRows: 1, hiddenAbove: 0, hiddenBelow: 0, focused: false,
+      runningCount: 1, waitingCount: 0, failedCount: 0, stoppedCount: 0,
+      completedCount: 0, settledCount: 0, empty: false,
+    };
+    const active = stripAnsi(renderSubagentPanel(panel, { width: 80, entryChord: CHORD })[0]!);
+    expect(active).toContain("dispatch · still working");
+    expect(active.match(/ · /gu)).toHaveLength(2);
+
+    row.state = "success";
+    expect(row.activity).toEqual({ kind: "status", text: "still working" });
+    const terminal = stripAnsi(renderSubagentPanel(panel, { width: 80, entryChord: CHORD })[0]!);
+    expect(terminal).toContain("dispatch");
+    expect(terminal.match(/ · /gu)).toHaveLength(1);
+    expect(terminal).not.toContain("still working");
+  });
+
+  it("falls back for throwing, revoked, and malformed nested activity getters", () => {
+    const panels = ["throwing", "revoked", "nested"].map((agentId) =>
+      view(makeModel({ t: 100 }), [rec({ agentId })]));
+    Object.defineProperty(panels[0]!.rows[0]!, "activity", {
+      get(): never { throw new Error("hostile activity"); },
+    });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    (panels[1]!.rows[0] as unknown as { activity: unknown }).activity = revoked.proxy;
+    (panels[2]!.rows[0] as unknown as { activity: unknown }).activity = {
+      kind: "tool", tool: "Read", get detail(): never { throw new Error("hostile detail"); },
+    };
+    for (const panel of panels) {
+      const row = stripAnsi(renderSubagentPanel(panel, { width: 60, entryChord: CHORD })[0]!);
+      expect(row).toContain(" · Working…");
+    }
   });
 });
 
@@ -1141,7 +1299,8 @@ describe("panel aggregate, palette, and width safety", () => {
     const activeLines = renderSubagentPanel(activePanel, { width: 80, entryChord: CHORD }).map(stripAnsi);
     const body = activeLines.filter((line) => !line.includes("agent panel") && !line.startsWith("… "));
     expect(activePanel.rows).toHaveLength(MAX_PANEL_ROWS);
-    expect(body).toHaveLength(MAX_PANEL_ROWS * 2);
+    expect(body).toHaveLength(MAX_PANEL_ROWS);
+    expect(body.every((line) => line.includes(" · working "))).toBe(true);
     expect(activeLines).toContain(panelMoreBelow(1));
 
     const terminalPanel = view(makeModel({ t: 100 }), [
@@ -1159,8 +1318,8 @@ describe("panel aggregate, palette, and width safety", () => {
     })], { focused: true });
     focused.rows[0]!.treeDepth = 6;
     const minimum = renderSubagentPanel(focused, { width: PANEL_MIN_ROW_WIDTH, entryChord: CHORD }).map(stripAnsi);
-    expect(minimum[1]).toMatch(/^  └ ./u);
-    expect(visibleWidth(minimum[1]!)).toBeLessThanOrEqual(PANEL_MIN_ROW_WIDTH);
+    expect(minimum[0]).not.toContain(" · ");
+    expect(visibleWidth(minimum[0]!)).toBeLessThanOrEqual(PANEL_MIN_ROW_WIDTH);
 
     const aggregate = renderSubagentPanel(activePanel, {
       width: PANEL_MIN_ROW_WIDTH - 1, entryChord: CHORD,
@@ -1186,14 +1345,13 @@ describe("panel aggregate, palette, and width safety", () => {
     ];
     for (const width of [PANEL_MIN_ROW_WIDTH, 80]) {
       const baseline = renderSubagentPanel(panel, { width, entryChord: CHORD }).map(stripAnsi);
-      expect(baseline).toHaveLength(3);
-      expect(baseline.filter((line) => line.includes("└ "))).toHaveLength(1);
-      if (width === 80) expect(baseline[1]).toContain(path);
+      expect(baseline).toHaveLength(2);
+      if (width === PANEL_MIN_ROW_WIDTH) expect(baseline[0]).not.toContain(" · ");
+      if (width === 80) expect(baseline[0]).toContain(path);
       for (const theme of themes) {
         const lines = renderSubagentPanel(panel, { width, entryChord: CHORD, theme });
-        expect(lines).toHaveLength(3);
+        expect(lines).toHaveLength(2);
         expect(lines.map(stripAnsi)).toEqual(baseline);
-        expect(lines.filter((line) => stripAnsi(line).includes("└ "))).toHaveLength(1);
         for (const line of lines) {
           expect(visibleWidth(line)).toBeLessThanOrEqual(width);
           const plain = stripAnsi(line);
@@ -1214,11 +1372,13 @@ describe("panel aggregate, palette, and width safety", () => {
       italic: (value: string) => `${ESC}[3m${value}${ESC}[23m`,
     };
     const lines = renderSubagentPanel(panel, { width: 80, entryChord: CHORD, theme });
-    expect(lines[1]).toContain(`${ESC}[90m${ESC}[3m${text}${ESC}[23m${ESC}[39m`);
-    expect(stripAnsi(lines[1]!)).toContain(`└ ${text}`);
+    expect(lines[0]).toContain(`${ESC}[90m${ESC}[3m${text}${ESC}[23m${ESC}[39m`);
+    expect(stripAnsi(lines[0]!)).toContain(` · ${text}`);
 
     (panel.rows[0] as unknown as { activity: unknown }).activity = { kind: "unknown", text: "bad" };
-    expect(stripAnsi(renderSubagentPanel(panel, { width: 20, entryChord: CHORD })[1]!)).toContain("Working…");
+    const malformed = stripAnsi(renderSubagentPanel(panel, { width: 20, entryChord: CHORD })[0]!);
+    expect(malformed).toContain("Wor…");
+    expect(malformed).not.toContain("bad");
   });
 
   it("fails hostile reasoning theme composition open to the sanitized themeless line", () => {
@@ -1242,15 +1402,14 @@ describe("panel aggregate, palette, and width safety", () => {
       ["unbalanced outer fg output", { fg: (_color: string, value: string) => `${ESC}[90m${value}`, italic: validItalic }],
     ];
 
-    expect(baselineLines).toHaveLength(3);
-    expect(baseline.filter((line) => line.includes("└ "))).toHaveLength(1);
+    expect(baselineLines).toHaveLength(2);
+    expect(baseline[0]).toMatch(/ · think +safely/u);
     for (const [label, theme] of themes) {
       const lines = renderSubagentPanel(panel, { width, entryChord: CHORD, theme });
       const plain = lines.map(stripAnsi);
       expect(plain, label).toEqual(baseline);
-      expect(lines[1], label).toBe(baselineLines[1]);
+      expect(lines[0], label).toBe(baselineLines[0]);
       expect(lines, label).toHaveLength(baselineLines.length);
-      expect(plain.filter((line) => line.includes("└ ")), label).toHaveLength(1);
       for (const line of lines) {
         expect(visibleWidth(line), label).toBeLessThanOrEqual(width);
         const stripped = stripAnsi(line);

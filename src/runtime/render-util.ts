@@ -29,7 +29,7 @@ function safeSgrText(value: unknown, requested: string): string | undefined {
   for (const match of value.matchAll(SGR_RE)) {
     const index = match.index;
     const literal = value.slice(cursor, index);
-    if (/[\p{Cc}\p{Cf}]/u.test(literal)) return undefined;
+    if (/\p{Cc}/u.test(literal)) return undefined;
     plain += literal;
     const raw = match[1] ?? "";
     const codes = (raw === "" ? [0] : raw.split(";").map(Number));
@@ -67,7 +67,7 @@ function safeSgrText(value: unknown, requested: string): string | undefined {
     cursor = index + match[0].length;
   }
   const tail = value.slice(cursor);
-  if (/[\p{Cc}\p{Cf}]/u.test(tail)) return undefined;
+  if (/\p{Cc}/u.test(tail)) return undefined;
   plain += tail;
   if (plain !== requested || active.size > 0) return undefined;
   return value;

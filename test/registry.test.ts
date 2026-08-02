@@ -711,13 +711,46 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
+  const duplicatedPanelMechanics = [
+    /\binline[- ](?:current[- ])?activity(?: fragment)?\b|\bcurrent[- ]activity fragment[^.]{0,60}\binline\b/iu,
+    /\b(?:one|single) physical (?:status )?row\b|\bone[- ]row (?:status )?layout\b/iu,
+    /\bbounded (?:sanitized )?current[- ]activity(?: fragment)?\b/iu,
+    /(?=[^.]{0,160}(?:current[- ]activity|activity fragment))(?=[^.]{0,160}(?:responsiv(?:e|ely)|(?:row )?(?:space|width) (?:changes|narrows)))(?=[^.]{0,160}(?:shorten(?:ed|ing|s)?|truncat(?:e|ed|es|ion)|disappear(?:s|ance)?|om(?:it(?:ted|s)?|ission)))[^.]{1,160}/iu,
+    /(?=[^.]{0,140}\bterminal (?:status )?rows?\b)(?=[^.]{0,140}(?:current[- ]activity|activity fragment))(?=[^.]{0,140}\b(?:omit(?:ted|s)?|omission)\b)[^.]{1,140}/iu,
+    /\bbounded (?:agent )?window\b/iu,
+    /(?:narrow widths?|widths? too narrow)[^.]{0,100}(?:truthful )?aggregates?\b/iu,
+    /(?:drill-down|detail(?: view)?)[^.]{0,100}\bmultiline (?:activity )?history\b|\bmultiline (?:activity )?history[^.]{0,100}(?:drill-down|detail(?: view)?)/iu,
+  ];
+
+  function duplicatesPanelMechanics(note: string): boolean {
+    return duplicatedPanelMechanics.some((pattern) => pattern.test(note));
+  }
+
+  it.each([
+    ["inline/current-activity fragment", "The panel puts the current-activity fragment inline beside identity."],
+    ["one physical row/one-row layout", "Each running agent uses a one-row status layout."],
+    ["bounded sanitized current activity", "Each row includes a bounded sanitized current activity fragment."],
+    ["responsive shortening with separator wording", "The current activity responsively shortens or is omitted with its separator."],
+    ["responsive disappearance without separator wording", "The activity fragment disappears responsively as row width narrows."],
+    ["terminal omission", "Terminal rows omit the current-activity fragment."],
+    ["bounded windowing", "A bounded agent window remains navigable."],
+    ["narrow aggregate fallback", "At narrow widths truthful aggregates replace individual rows."],
+    ["multiline/detail history", "The detail view retains multiline activity history."],
+  ])("detects duplicated panel mechanic: %s", (_category, canary) => {
+    expect(duplicatesPanelMechanics(canary)).toBe(true);
+  });
+
   it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {
     const owner = lookupCapability("feature.background-agents")?.note ?? "";
     for (const clause of [
-      "stable PiCC-defined current-activity line until terminal settlement",
-      "tool/argument, reasoning, assistant/output, startup, work, retry, and waiting states",
-      "window counts at most eight agents rather than physical lines",
-      "widths below the explicit row minimum retain truthful aggregates without per-agent activity",
+      "inline layout is PiCC-defined presentation rather than verified Claude Code presentation parity",
+      "every individually rendered running or capacity-waiting agent uses one physical status row",
+      "bounded sanitized current-activity fragment",
+      "As available row space changes",
+      "truncated with an ellipsis or omitted together with its separator",
+      "terminal rows omit it",
+      "bounded agent window remains navigable across overflow",
+      "At widths too narrow for individual rows, truthful aggregates remain without per-agent activity",
       "drill-down that retains multiline history and richer detail",
       "PiCC-chosen details, NOT parity",
     ]) expect(owner, clause).toContain(clause);
@@ -725,9 +758,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const id of ["tool.Agent", "tool.TaskOutput"]) {
       const note = lookupCapability(id)?.note ?? "";
       expect(note, id).toContain("status-panel observability is defined by feature.background-agents");
-      expect(note, `${id} must not duplicate panel mechanics`).not.toMatch(
-        /eight-agent window|current-activity line|narrow.*aggregate|multiline history/u,
-      );
+      expect(duplicatesPanelMechanics(note), `${id} must not duplicate panel mechanics`).toBe(false);
     }
   });
 
@@ -852,11 +883,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
-        /stable PiCC-defined current-activity line until terminal settlement/,
-        /tool\/argument, reasoning, assistant\/output, startup, work, retry, and waiting states/,
-        /window counts at most eight agents rather than physical lines/,
-        /widths below the explicit row minimum retain truthful aggregates without per-agent activity/,
-        /Lingering terminal agents return to one row/,
+        /inline layout.*PiCC-defined presentation.*one physical status row/s,
+        /bounded sanitized current-activity fragment.*available row space.*truncated with an ellipsis.*omitted together with its separator/s,
+        /terminal rows omit.*bounded agent window.*overflow/s,
+        /widths too narrow for individual rows.*truthful aggregates.*without per-agent activity/s,
         /drill-down.*retains multiline history and richer detail/,
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
