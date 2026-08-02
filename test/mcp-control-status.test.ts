@@ -916,7 +916,8 @@ describe("managed MCP policy status foundation", () => {
 
   it("renders bounded redacted failure evidence consistently for malformed, unreadable, omitted, and compiler uncertainty", () => {
     const policyFailures = [
-      { kind: "malformed", sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { kind: "malformed", sourceClass: "standalone-mcp", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { kind: "unreadable", sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
       { kind: "unreadable", sourceClass: "registry-hkcu", authority: "user-controlled", remediation: "repair-user-policy" },
       { kind: "omitted", sourceClass: "override", authority: "mixed", remediation: "repair-mixed-policy" },
     ] as const;
@@ -929,7 +930,8 @@ describe("managed MCP policy status foundation", () => {
       policyObservations: ["compiler-uncertainty-fail-closed"],
     };
     for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
-      expect(report).toContain("administrator system file was malformed");
+      expect(report).toContain("standalone managed MCP file was malformed");
+      expect(report).toContain("managed-settings system file was unreadable");
       expect(report).toContain("user registry fallback was unreadable");
       expect(report).toContain("managed-settings override was omitted");
       expect(report).toContain("policy compilation was uncertain");

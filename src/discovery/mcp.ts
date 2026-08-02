@@ -143,7 +143,7 @@ function defaultGitTrackedProbe(filePath: string, projectRoot: string): boolean 
     const realFile = fs.realpathSync.native(filePath);
     const realRoot = fs.realpathSync.native(projectRoot);
     const rel = path.relative(realRoot, realFile);
-    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return undefined;
     const result = spawnSync(
       "git",
       ["-C", realRoot, "ls-files", "--error-unmatch", "--", rel.split(path.sep).join("/")],
@@ -203,7 +203,7 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
         kind: managedMcp.reason === "malformed" || managedMcp.reason === "wrong-root" || managedMcp.reason === "invalid-encoding"
           ? "malformed"
           : managedMcp.reason === "oversized" ? "omitted" : "unreadable",
-        sourceClass: "system-file",
+        sourceClass: "standalone-mcp",
         authority: "administrator-controlled",
         remediation: "repair-administrator-policy",
       }

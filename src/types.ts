@@ -33,6 +33,7 @@ export interface SourceRef {
 }
 
 export type ManagedPolicySourceClass =
+  | "standalone-mcp"
   | "system-file"
   | "system-drop-in"
   | "registry-hklm"

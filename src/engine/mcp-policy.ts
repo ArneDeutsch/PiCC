@@ -97,7 +97,7 @@ type RuleResult =
   | { readonly state: "over-limit" };
 
 const FAILURE_KINDS = new Set(["malformed", "unreadable", "omitted"]);
-const SOURCE_CLASSES = new Set(["system-file", "system-drop-in", "registry-hklm", "registry-hkcu", "override"]);
+const SOURCE_CLASSES = new Set(["standalone-mcp", "system-file", "system-drop-in", "registry-hklm", "registry-hkcu", "override"]);
 const AUTHORITIES = new Set(["user-controlled", "administrator-controlled", "mixed"]);
 const REMEDIATIONS = new Set(["repair-user-policy", "repair-administrator-policy", "repair-mixed-policy"]);
 
@@ -498,6 +498,12 @@ function parseCandidateUrl(value: string): UrlIdentity | undefined {
   if (hasAmbiguousUrlSyntax(value) || value.includes("*")) return undefined;
   const match = /^(https?):\/\/([^/]+)(\/[^]*)?$/u.exec(value);
   if (!match || hasDotSegment(match[3])) return undefined;
+  try {
+    const serialized = new URL(value);
+    if (match[3] !== undefined && serialized.pathname !== match[3]) return undefined;
+  } catch {
+    return undefined;
+  }
   const split = splitAuthority(match[2]!, false);
   return split ? { scheme: match[1]!, ...split, ...(match[3] === undefined ? {} : { path: match[3] }) } : undefined;
 }

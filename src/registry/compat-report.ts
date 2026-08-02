@@ -1273,7 +1273,8 @@ function mcpPolicyFailureSummary(mcp: ResolvedMcpConfig): string | undefined {
     omitted: "omitted",
   };
   const sourceLabels: Readonly<Record<McpPolicySourceFailure["sourceClass"], string>> = {
-    "system-file": "administrator system file",
+    "standalone-mcp": "standalone managed MCP file",
+    "system-file": "managed-settings system file",
     "system-drop-in": "administrator system drop-in",
     "registry-hklm": "administrator machine registry",
     "registry-hkcu": "user registry fallback",

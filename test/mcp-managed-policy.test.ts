@@ -587,6 +587,18 @@ describe("managed MCP policy compiler and evaluator", () => {
     expect(decision({ settings: allow }, remote({ url: "https://secure.example:0443/x" })).reason).toBe("allow-miss");
   });
 
+  it("blocks raw paths whose WHATWG serialization differs from encoded deny intent", () => {
+    for (const [encoded, raw] of [["%20", " "], ["%22", '"'], ["%7B", "{"]] as const) {
+      const settings = [entry("managed", 1, {
+        deniedMcpServers: [{ serverUrl: `https://example.com/private${encoded}path` }],
+      })];
+      const result = decision({ settings }, remote({ url: `https://example.com/private${raw}path` }));
+      expect(result, raw).toMatchObject({ status: "blocked", reason: "candidate-invalid" });
+      expect(result.observations, raw).toContain("identity-ambiguity-blocked");
+    }
+    expect(decision({}, remote({ url: "https://example.com/ordinary-path" })).status).toBe("allowed");
+  });
+
   it("authorizes stdio name fallback and SSE URL rules with misses", () => {
     const stdioNames = [entry("managed", 1, { allowedMcpServers: [{ serverName: "tools" }] })];
     expect(decision({ settings: stdioNames }, stdio()).status).toBe("allowed");

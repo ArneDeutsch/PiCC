@@ -716,6 +716,33 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(project.mcp.diagnostics.some((d) => d.includes("tracked by git"))).toBe(true);
   });
 
+  it.skipIf(!gitAvailable)("default probe: a tracked nested child beginning with dots is contained and demoted", () => {
+    const root = makeTmp();
+    const nested = path.join(root, "..app");
+    const localFile = path.join(nested, ".claude", "settings.local.json");
+    spawnSync("git", ["init", "-q"], { cwd: root, stdio: "ignore" });
+    writeJson(localFile, {
+      enableAllProjectMcpServers: true,
+      mcpServers: { nested: { command: "nested" } },
+    });
+    const relativeLocal = path.relative(root, localFile).split(path.sep).join("/");
+    spawnSync("git", ["add", "-f", "--", relativeLocal], { cwd: root, stdio: "ignore" });
+
+    const project = loadClaudeProject({
+      cwd: nested,
+      userDir: path.join(root, "no-such-home", ".claude"),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+    });
+    expect(server(project.mcp, "nested")).toMatchObject({
+      status: "pending-approval",
+      source: "settings-local",
+    });
+    expect(project.mcp.servers.some((candidate) => candidate.status === "enabled")).toBe(false);
+    expect(project.mcp.diagnostics.some((diagnostic) =>
+      diagnostic.includes("tracked by git") && diagnostic.includes("treated as project scope"))).toBe(true);
+  });
+
   it.skipIf(!gitAvailable)("default probe: a tracked case-variant Settings.local.json is still demoted", () => {
     const root = makeTmp();
     // The bypass only exists where the filesystem case-folds (Windows/macOS):
@@ -1402,7 +1429,7 @@ describe("resolveMcpConfig — managed policy admission", () => {
     expect(cfg.servers).toEqual([]);
     expect(cfg.policyFailures).toContainEqual({
       kind,
-      sourceClass: "system-file",
+      sourceClass: "standalone-mcp",
       authority: "administrator-controlled",
       remediation: "repair-administrator-policy",
     });
@@ -1691,35 +1718,39 @@ describe("loadClaudeProject — mcp assembly", () => {
     expect(project.mcp.policyObservations).toContain("source-failure-fail-closed");
   });
 
-  it.each([
-    {
-      label: "invalid non-managed deny projection",
-      prepare: (root: string) => {
-        const userDir = path.join(root, "user");
-        writeJson(path.join(userDir, "settings.json"), { deniedMcpServers: "invalid" });
-        return {
-          userDir,
-          env: {} as NodeJS.ProcessEnv,
-          observations: ["invalid-non-managed-projection", "restrictive-material-omitted"] as const,
-        };
-      },
-    },
-    {
-      label: "over-limit environment compiler uncertainty",
-      prepare: (root: string) => ({
-        userDir: path.join(root, "user"),
-        env: Object.fromEntries(Array.from({ length: MCP_POLICY_LIMITS.environmentEntries + 1 }, (_, index) => [`ENV_${index}`, "x"])),
-        observations: ["compiler-uncertainty-fail-closed"] as const,
-      }),
-    },
-  ])("uses the prepared compiler result to skip ordinary loaders for $label", ({ prepare }) => {
+  it("rejects an invalid ordinary policy file without projecting policy or suppressing ordinary loaders", () => {
     const root = makeTmp();
-    const prepared = prepare(root);
+    const userDir = path.join(root, "user");
+    writeJson(path.join(userDir, "settings.json"), {
+      allowedMcpServers: [{ serverName: "ordinary" }],
+      deniedMcpServers: "invalid",
+    });
     let calls = 0;
     const project = loadClaudeProject({
       cwd: root,
-      userDir: prepared.userDir,
-      env: prepared.env,
+      userDir,
+      env: {},
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { calls += 1; return { kind: "absent", diagnostics: [] }; },
+        loadProjectMcpJson: () => { calls += 1; return mcpJsonOf({ ordinary: { command: "ordinary" } }); },
+      },
+    });
+    expect(calls).toBe(2);
+    expect(project.mcp.policyPosture).toBe("absent");
+    expect(server(project.mcp, "ordinary")?.status).toBe("pending-approval");
+    expect(project.mcp.policyObservations).not.toContain("invalid-non-managed-projection");
+  });
+
+  it("uses over-limit environment compiler uncertainty to skip ordinary loaders", () => {
+    const root = makeTmp();
+    let calls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      env: Object.fromEntries(Array.from({ length: MCP_POLICY_LIMITS.environmentEntries + 1 }, (_, index) => [`ENV_${index}`, "x"])),
       managedSettingsPaths: [],
       managedArtifactDirs: [],
       managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
@@ -1730,9 +1761,7 @@ describe("loadClaudeProject — mcp assembly", () => {
     });
     expect(calls).toBe(0);
     expect(project.mcp).toMatchObject({ policyPosture: "fail-closed", servers: [] });
-    for (const observation of prepared.observations) {
-      expect(project.mcp.policyObservations).toContain(observation);
-    }
+    expect(project.mcp.policyObservations).toContain("compiler-uncertainty-fail-closed");
   });
 
   it("skips ordinary loaders when bounded policy collection signals restrictive omission", () => {

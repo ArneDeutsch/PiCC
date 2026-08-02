@@ -1128,15 +1128,30 @@ describe("MCP policy settings projection", () => {
         writeJson(filePath, { model: "must-not-apply", [key]: value });
         const settings = load(scopes);
         expect(settings.model, `${scope}:${key}`).toBeUndefined();
-        expect(settings.mcpPolicySettings, `${scope}:${key}`).toEqual([expect.objectContaining({
-          scope, sourcePath: filePath, order: 0, valid: false,
-        })]);
+        expect(settings.mcpPolicySettings, `${scope}:${key}`).toEqual([]);
         expect(settings.diagnostics).toContainEqual(expect.objectContaining({
           severity: "error", message: `Setting "${key}" is invalid; settings file skipped`, source: filePath,
         }));
         expect(settings.unknownKeys).toEqual([]);
       }
     }
+  });
+
+  it("retains zero ordinary projection while preserving an independent managed contribution", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      allowedMcpServers: [{ serverName: "must-not-authorize" }, { malformed: true }],
+      deniedMcpServers: [{ serverName: "must-not-restrict" }],
+    });
+    const managedPath = path.join(makeTmp(), "managed.json");
+    writeJson(managedPath, { deniedMcpServers: [{ serverName: "managed-only" }] });
+
+    const settings = load(scopes, [managedPath]);
+    expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({
+      scope: "managed",
+      sourcePath: managedPath,
+      deniedMcpServers: [{ serverName: "managed-only" }],
+    })]);
   });
 
   it("retains managed whole-field presence, strips malformed list entries, and preserves source order", () => {
@@ -1187,7 +1202,7 @@ describe("MCP policy settings projection", () => {
         writeJson(filePath, { model: "must-not-apply", [key]: [{ serverName: "valid" }, { extra: "malformed" }] });
         const settings = load(scopes);
         expect(settings.model, `${scope}:${key}`).toBeUndefined();
-        expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({ scope, valid: false })]);
+        expect(settings.mcpPolicySettings).toEqual([]);
       }
     }
 
@@ -1218,7 +1233,7 @@ describe("MCP policy settings projection", () => {
       });
       const settings = load(scopes);
       expect(settings.model).toBeUndefined();
-      expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({ valid: false })]);
+      expect(settings.mcpPolicySettings).toEqual([]);
 
       writeJson(filePath, {
         model: "applies",

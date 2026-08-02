@@ -642,8 +642,9 @@ known-good backup is available, preserve the profile and seek appropriate suppor
 after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
 These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
 
-**Managed MCP policy.** A valid platform-fixed `managed-mcp.json` is exclusive: a populated file
-suppresses ordinary sources and an empty server set disables MCP. Its fixed path is
+**Managed MCP policy.** A platform-fixed `managed-mcp.json` has the minimal valid root shape
+`{ "mcpServers": { ... } }` and is exclusive: a populated map suppresses ordinary sources, while an
+empty map disables MCP. Its fixed path is
 `C:\Program Files\ClaudeCode\managed-mcp.json` on Windows,
 `/Library/Application Support/ClaudeCode/managed-mcp.json` on macOS, and
 `/etc/claude-code/managed-mcp.json` on Linux; it is distinct from `managed-settings.json`. Managed
@@ -772,6 +773,7 @@ behaviors worth knowing:
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | MCP pending-approval notice at every startup | Review the pending servers and choose approval or decline under [MCP server settings](#6-security--permission-posture). Use `/mcp` for bounded status and settings guidance, or `/doctor` for broader compatibility findings. |
+| Managed MCP policy is fail closed or a repaired policy is not taking effect | Use `/mcp` or `/doctor` to inspect the reported authority, compiler observations, and any redacted source label. For the standalone managed MCP file, ask the administrator to repair the platform-fixed `managed-mcp.json`; for the managed-settings system file, system drop-in, or machine registry, ask the administrator to repair that source; for user-controlled authority, repair or recover the reported user-controlled policy input. Then use `/reload` or restart PiCC; `/new` does not reload policy. |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the session was persisted and its process exited, reopen that exact session before `/compact`; a one-shot ephemeral print/JSON session cannot be reopened, so start a replacement session and resend retained input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from client/request history, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; outside the TUI, exit status **3** does report that a main-session checkpoint gave up. |
 | `picc -p` exited with status **3** | A main-session checkpoint gave up: PiCC paused the work for context compaction and it never resumed, so stdout is a partial answer. Read the `PiCC: ` line on stderr — or the `picc-checkpoint-lifecycle` entries under `--mode json`/RPC — for which ending it was and what to resend. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |

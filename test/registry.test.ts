@@ -520,7 +520,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "complete command-vector matching is exact and case-sensitive",
       "deny URL matching canonicalizes default ports",
       "invalid managed deny values as dropped",
-      "fails closed when a non-managed or bounded-source failure may have lost restrictive deny material",
+      "schema-invalid ordinary settings files are rejected with zero policy projection",
+      "fails closed when bounded-source or restrictive-projection loss may have omitted deny material",
     ]) expect(denied?.note, phrase).toContain(phrase);
 
     const managedOnly = lookupCapability("setting.allowManagedMcpServersOnly");
@@ -569,12 +570,17 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       return next < 0 ? text.slice(start) : text.slice(start, start + heading.length + next);
     };
 
+    const readme = readDoc("../README.md");
+    const capabilitySection = section(readme, "## What it does");
+    expect(capabilitySection).toMatch(/MCP servers[\s\S]*standalone managed[\s\S]*central policy admission[\s\S]*\[capability matrix\]\(doc\/supported-features\.md\)/);
+
     const guide = readDoc("../doc/user-guide.md");
     const runSection = section(guide, "## 4. Run a Claude Code project");
     expect(runSection).toMatch(/MCP servers[\s\S]*standalone `managed-mcp\.json`[\s\S]*native Claude user\/project-local state/);
     const securitySection = section(guide, "## 6. Security & permission posture");
     for (const predicate of [
       /Managed MCP policy/,
+      /minimal valid root shape[\s\S]*`\{ "mcpServers": \{ \.\.\. \} \}`[\s\S]*empty map disables MCP/,
       /managed-mcp\.json` on Windows[\s\S]*macOS[\s\S]*Linux/,
       /distinct from `managed-settings\.json`/,
       /source uncertainty may have lost[\s\S]*restrictive material/,
@@ -585,6 +591,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       /authority-specific remediation[\s\S]*ask an administrator/,
       /\[capability matrix\]\(supported-features\.md\)/,
     ]) expect(securitySection).toMatch(predicate);
+    const troubleshooting = section(guide, "## 9. Troubleshooting");
+    expect(troubleshooting).toMatch(/Managed MCP policy is fail closed[\s\S]*standalone managed MCP file[\s\S]*`managed-mcp\.json`[\s\S]*managed-settings system file, system drop-in, or machine registry[\s\S]*user-controlled policy input/);
+    expect(troubleshooting).toMatch(/Then use `\/reload` or restart PiCC; `\/new` does not reload policy/);
 
     const architecture = readDoc("../doc/architecture.md");
     const discoverySection = section(architecture, "### `discovery/` — where artifacts live, and precedence");

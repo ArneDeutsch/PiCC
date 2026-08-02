@@ -675,7 +675,7 @@ function projectMcpPolicyFields(
     }
   }
   projected.valid = managed || valid;
-  appendMcpPolicySetting(out, projected);
+  if (managed || valid) appendMcpPolicySetting(out, projected);
   return managed || valid;
 }
 
