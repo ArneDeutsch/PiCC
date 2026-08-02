@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
 import { renderMainSessionTool } from "../src/runtime/main-session-tool-render.js";
-import { WorktreeManager } from "../src/runtime/worktrees.js";
-import { deferred } from "./helpers/async.js";
+import { WorktreeManager, type WorktreeReapResult } from "../src/runtime/worktrees.js";
+import type { SubagentTranscriptReapResult } from "../src/runtime/subagent-transcript-retention.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 
 /**
@@ -20,6 +21,54 @@ let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
 const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+
+function transcriptResult(
+  overrides: Partial<SubagentTranscriptReapResult> = {},
+): SubagentTranscriptReapResult {
+  return {
+    removedTranscriptFiles: 0,
+    removedCollections: 0,
+    retainedEntries: 0,
+    failureCounts: { race: 0, permission: 0, busy: 0, "ownership-uncertain": 0, "other-io": 0 },
+    diagnosticsTruncated: false,
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+function worktreeResult(overrides: Partial<WorktreeReapResult> = {}): WorktreeReapResult {
+  return {
+    reaped: [],
+    retainedWorktrees: 0,
+    failureCounts: { "settings-blocked": 0, "git-authority": 0, permission: 0, busy: 0, "other-io": 0 },
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+function persistedManager(file: string, cwd = dir, sessionDir = path.dirname(file)) {
+  return {
+    getEntries: () => [],
+    getSessionFile: () => file,
+    getCwd: () => cwd,
+    getSessionDir: () => sessionDir,
+  };
+}
+
+function piccWithoutProjectHooks(api: unknown, seam: NonNullable<Parameters<typeof picc>[1]>): void {
+  const settingsFile = path.join(process.cwd(), ".claude", "settings.json");
+  const original = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : undefined;
+  if (original !== undefined) {
+    const settings = JSON.parse(original) as Record<string, unknown>;
+    settings.hooks = {};
+    fs.writeFileSync(settingsFile, JSON.stringify(settings));
+  }
+  try {
+    picc(api as never, seam);
+  } finally {
+    if (original !== undefined) fs.writeFileSync(settingsFile, original);
+  }
+}
 
 function installProjectRootGitCanary(projectRoot: string): string {
   const canary = path.join(projectRoot, process.platform === "win32" ? "git.exe" : "git");
@@ -457,6 +506,506 @@ describe("lifecycle wiring", () => {
       reapGate.resolve();
       WorktreeManager.prototype.reapOrphans = originalReapOrphans;
       await initialization;
+    }
+  });
+
+  it("schedules exact startup transcript cleanup after touch without delaying session start and exposes a dynamic join", async () => {
+    const wired = fakePi();
+    const touch = deferred<void>();
+    const reap = deferred<SubagentTranscriptReapResult>();
+    const calls: unknown[] = [];
+    const touches: string[] = [];
+    let join!: () => Promise<void>;
+    let heartbeatUnref = false;
+    const activeFile = path.join(dir, "custom-sessions", "2026-01-01T00-00-00-000Z_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl");
+    const customDir = path.dirname(activeFile);
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      onRetentionJobsSettled: (value) => { join = value; },
+      retention: {
+        touchMainTranscript: async (file) => { touches.push(file); await touch.promise; },
+        reapSubagentTranscripts: async (options) => { calls.push(options); return reap.promise; },
+        setInterval: (() => ({ unref: () => { heartbeatUnref = true; } })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+
+    let startSettled = false;
+    const start = wired.fire("session_start", { reason: "startup" }, wired.printCtx({
+      sessionManager: persistedManager(activeFile, dir, customDir),
+    })).then(() => { startSettled = true; });
+    await start;
+    expect(startSettled).toBe(true);
+    expect(touches).toEqual([activeFile]);
+    expect(heartbeatUnref).toBe(true);
+    expect(calls).toEqual([]);
+
+    touch.resolve();
+    await waitUntil({ predicate: () => calls.length === 1, description: "transcript reaper to start after touch" });
+    expect(calls).toEqual([{
+      sessionDirectory: customDir,
+      activeMainSessionFile: activeFile,
+      activeMainCwd: dir,
+      maxAgeDays: 30,
+      cleanupAllowed: true,
+    }]);
+    let joined = false;
+    const joining = join().then(() => { joined = true; });
+    await Promise.resolve();
+    expect(joined).toBe(false);
+    reap.resolve(transcriptResult());
+    await joining;
+    expect(joined).toBe(true);
+  });
+
+  it("passes the complete default persisted-manager identity to the startup reaper", async () => {
+    const wired = fakePi();
+    const calls: unknown[] = [];
+    const activeFile = path.join(dir, "2026-01-01T00-00-00-000Z_11111111-2222-4333-8444-555555555555.jsonl");
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      retention: {
+        touchMainTranscript: async () => undefined,
+        reapSubagentTranscripts: async (options) => { calls.push(options); return transcriptResult(); },
+        setInterval: (() => ({ unref: () => undefined })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+    await wired.fire("session_start", { reason: "startup" }, wired.printCtx({
+      sessionManager: persistedManager(activeFile, dir, dir),
+    }));
+    await waitUntil({ predicate: () => calls.length === 1, description: "default-directory transcript reaper" });
+    expect(calls).toEqual([{
+      sessionDirectory: dir,
+      activeMainSessionFile: activeFile,
+      activeMainCwd: dir,
+      maxAgeDays: 30,
+      cleanupAllowed: true,
+    }]);
+  });
+
+  it.each(["absent file", "absent cwd", "absent directory", "throwing file", "throwing cwd", "throwing directory"] as const)("permanently skips cleanup after an %s initial getter", async (identity) => {
+    const wired = fakePi();
+    const calls: unknown[] = [];
+    let join!: () => Promise<void>;
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      onRetentionJobsSettled: (value) => { join = value; },
+      retention: {
+        touchMainTranscript: async () => undefined,
+        reapSubagentTranscripts: async (options) => { calls.push(options); return transcriptResult(); },
+        setInterval: (() => ({ unref: () => undefined })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+    const getter = (name: "file" | "cwd" | "directory", value: string) => identity === `absent ${name}`
+      ? undefined
+      : identity === `throwing ${name}`
+        ? () => { throw new Error(`${name} unavailable`); }
+        : () => value;
+    const firstManager = {
+      getEntries: () => [],
+      getSessionFile: getter("file", path.join(dir, "initial.jsonl")),
+      getCwd: getter("cwd", dir),
+      getSessionDir: getter("directory", dir),
+    };
+    await expect(wired.fire("session_start", { reason: "startup" }, wired.printCtx({ sessionManager: firstManager })))
+      .resolves.toBeUndefined();
+    for (const reason of ["new", "resume", "reload", "switch"]) {
+      await wired.fire("session_start", { reason }, wired.printCtx({
+        sessionManager: persistedManager(path.join(dir, `later-${reason}.jsonl`), dir, dir),
+      }));
+    }
+    expect(calls).toEqual([]);
+    await join();
+  });
+
+  it("keeps an eligible cleanup one-shot and replacement shutdowns non-blocking", async () => {
+    const wired = fakePi();
+    const cleanup = deferred<SubagentTranscriptReapResult>();
+    const calls: unknown[] = [];
+    let join!: () => Promise<void>;
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      onRetentionJobsSettled: (value) => { join = value; },
+      retention: {
+        touchMainTranscript: async () => undefined,
+        reapSubagentTranscripts: async (options) => { calls.push(options); return cleanup.promise; },
+        setInterval: (() => ({ unref: () => undefined })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+    await wired.fire("session_start", { reason: "startup" }, wired.printCtx({
+      sessionManager: persistedManager(path.join(dir, "initial.jsonl"), dir, dir),
+    }));
+    for (const reason of ["new", "resume", "reload", "switch"]) {
+      await wired.fire("session_start", { reason }, wired.printCtx({
+        sessionManager: persistedManager(path.join(dir, `later-${reason}.jsonl`), dir, dir),
+      }));
+    }
+    expect(calls).toHaveLength(1);
+    for (const reason of ["new", "resume", "fork", "reload"]) {
+      await expect(wired.fire("session_shutdown", { reason })).resolves.toBeUndefined();
+    }
+    cleanup.resolve(transcriptResult());
+    await join();
+  });
+
+  it("refreshes each accepted persisted switch immediately and on exact unref'ed hourly handles", async () => {
+    const wired = fakePi();
+    const touches: string[] = [];
+    const timers: Array<{ callback: () => void; delayMs: number; cleared: boolean; unrefCount: number }> = [];
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      retention: {
+        touchMainTranscript: async (file) => { touches.push(file); },
+        reapSubagentTranscripts: async () => transcriptResult(),
+        setInterval: ((callback: () => void, delayMs: number) => {
+          const timer = { callback, delayMs, cleared: false, unrefCount: 0 };
+          timers.push(timer);
+          return { unref: () => { timer.unrefCount++; }, timer } as any;
+        }) as any,
+        clearInterval: ((handle: any) => { handle.timer.cleared = true; }) as any,
+      },
+    });
+    await wired.waitForInitialization();
+    const first = path.join(dir, "first.jsonl");
+    const second = path.join(dir, "second.jsonl");
+    await wired.fire("session_start", { reason: "startup" }, wired.printCtx({ sessionManager: persistedManager(first) }));
+    await Promise.resolve();
+    expect(touches).toEqual([first]);
+    expect(timers).toMatchObject([{ delayMs: 3_600_000, cleared: false, unrefCount: 1 }]);
+
+    await wired.fire("session_start", { reason: "switch" }, wired.printCtx({ sessionManager: persistedManager(second) }));
+    await Promise.resolve();
+    expect(touches).toEqual([first, second]);
+    expect(timers[0]!.cleared).toBe(true);
+    expect(timers[1]).toMatchObject({ delayMs: 3_600_000, cleared: false, unrefCount: 1 });
+    timers[1]!.callback();
+    await Promise.resolve();
+    expect(touches).toEqual([first, second, second]);
+
+    await wired.fire("session_start", { reason: "switch" }, wired.printCtx({
+      sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    }));
+    await Promise.resolve();
+    expect(touches).toEqual([first, second, second]);
+    expect(timers[1]!.cleared).toBe(true);
+    expect(timers).toHaveLength(2);
+
+    const latest = path.join(dir, "latest.jsonl");
+    await wired.fire("session_start", { reason: "switch" }, wired.printCtx({ sessionManager: persistedManager(latest) }));
+    await Promise.resolve();
+    expect(touches.at(-1)).toBe(latest);
+    expect(timers[2]).toMatchObject({ delayMs: 3_600_000, cleared: false, unrefCount: 1 });
+    await wired.fire("session_shutdown", { reason: "quit" });
+    expect(timers[2]!.cleared).toBe(true);
+  });
+
+  it("keeps exact active exclusion when touch fails and terminal quit alone joins cleanup/reporting", async () => {
+    const wired = fakePi();
+    const cleanup = deferred<SubagentTranscriptReapResult>();
+    const calls: any[] = [];
+    const activeFile = path.join(dir, "active.jsonl");
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      retention: {
+        touchMainTranscript: async () => { throw Object.assign(new Error("locked"), { code: "EACCES" }); },
+        reapSubagentTranscripts: async (options) => { calls.push(options); return cleanup.promise; },
+        setInterval: (() => ({ unref: () => undefined })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+    await wired.fire("session_start", { reason: "startup" }, wired.printCtx({
+      sessionManager: persistedManager(activeFile),
+    }));
+    await waitUntil({ predicate: () => calls.length === 1, description: "reaper to start after failed touch" });
+    expect(calls[0]?.activeMainSessionFile).toBe(activeFile);
+
+    await expect(wired.fire("session_shutdown", { reason: "new" })).resolves.toBeUndefined();
+    let quitSettled = false;
+    const quit = wired.fire("session_shutdown", { reason: "quit" }).then(() => { quitSettled = true; });
+    await Promise.resolve();
+    expect(quitSettled).toBe(false);
+    cleanup.resolve(transcriptResult());
+    await quit;
+    expect(quitSettled).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "removal-only",
+      worktree: worktreeResult({ reaped: ["hidden-worktree-path"] }),
+      transcript: transcriptResult({ removedTranscriptFiles: 3, removedCollections: 1 }),
+      severity: "info",
+      include: ["removed 1 orphaned worktree(s), 3 transcript file(s), and 1 transcript collection(s)", "retained 0 worktree(s) and 0 transcript item(s)"],
+      exclude: ["Run /doctor", "changed concurrently", "restart PiCC"],
+    },
+    {
+      name: "race-only",
+      worktree: worktreeResult(),
+      transcript: transcriptResult({
+        failureCounts: { race: 2, permission: 0, busy: 0, "ownership-uncertain": 0, "other-io": 0 },
+        diagnostics: [{ severity: "warning", message: "RAW_DIAGNOSTIC /private/race" }],
+      }),
+      severity: "info",
+      include: ["2 transcript cleanup target(s) changed concurrently; no action is needed"],
+      exclude: ["restart PiCC", "Run /doctor"],
+    },
+    {
+      name: "diagnostic-only",
+      worktree: worktreeResult({ diagnostics: [{ severity: "warning", message: "RAW_DIAGNOSTIC /private/worktree" }] }),
+      transcript: transcriptResult(),
+      severity: "warning",
+      include: ["1 additional cleanup issue(s) had no structured category", "Run /doctor", "inspect storage access"],
+      exclude: ["changed concurrently", "transcript storage"],
+    },
+    ...([
+      ["transcript permission", "permission", "2 transcript item(s) could not be accessed", "Repair transcript ownership and permissions"],
+      ["transcript busy", "busy", "2 transcript item(s) were locked or busy", "Close applications using them"],
+      ["transcript ownership uncertainty", "ownership-uncertain", "Ownership could not be verified for 2 transcript item(s)", "Reconcile transcript ownership"],
+      ["transcript other I/O", "other-io", "2 transcript item(s) had another I/O failure", "repair transcript storage"],
+    ] as const).map(([name, category, cause, remedy]) => ({
+      name: `truncated ${name}`,
+      worktree: worktreeResult(),
+      transcript: transcriptResult({
+        failureCounts: { race: 0, permission: 0, busy: 0, "ownership-uncertain": 0, "other-io": 0, [category]: 2 },
+        diagnosticsTruncated: true,
+      }),
+      severity: "warning",
+      include: [cause, remedy, "restart PiCC", "Some transcript cleanup detail was omitted"],
+      exclude: ["changed concurrently", "RAW_DIAGNOSTIC"],
+    })),
+    ...([
+      ["worktree permission", "permission", "2 worktree item(s) could not be accessed", "Repair worktree ownership and permissions"],
+      ["worktree busy", "busy", "2 worktree item(s) were locked or busy", "Close applications using them"],
+      ["worktree other I/O", "other-io", "2 worktree item(s) had another I/O failure", "repair worktree storage"],
+      ["settings-blocked worktree", "settings-blocked", "Settings prevented 2 worktree cleanup attempt(s)", "repair settings"],
+      ["Git authority", "git-authority", "Git authority was unavailable for 2 worktree cleanup attempt(s)", "Restore repository Git access"],
+    ] as const).map(([name, category, cause, remedy]) => ({
+      name,
+      worktree: worktreeResult({
+        failureCounts: { "settings-blocked": 0, "git-authority": 0, permission: 0, busy: 0, "other-io": 0, [category]: 2 },
+      }),
+      transcript: transcriptResult(),
+      severity: "warning",
+      include: [cause, remedy, "restart PiCC"],
+      exclude: ["changed concurrently", "Some transcript cleanup detail was omitted"],
+    })),
+    {
+      name: "retained-only uncertainty",
+      worktree: worktreeResult({ retainedWorktrees: 2 }),
+      transcript: transcriptResult({ retainedEntries: 4 }),
+      severity: "warning",
+      include: ["retained 2 worktree(s) and 4 transcript item(s)", "Retained items need review", "verify their age and ownership"],
+      exclude: ["changed concurrently", "another I/O failure"],
+    },
+    {
+      name: "blocked policy",
+      blocked: true,
+      worktree: worktreeResult({ failureCounts: { "settings-blocked": 1, "git-authority": 0, permission: 0, busy: 0, "other-io": 0 } }),
+      transcript: transcriptResult(),
+      severity: "warning",
+      include: ["cleanup is paused at 30 days", "settings.json has an invalid cleanup period", "No retention deletion was attempted", "Run /doctor", "restart PiCC"],
+      exclude: ["invalid-period", "settings diagnostics"],
+    },
+    {
+      name: "mixed success",
+      worktree: worktreeResult({ reaped: ["hidden-worktree-path"], retainedWorktrees: 1 }),
+      transcript: transcriptResult({
+        removedTranscriptFiles: 2,
+        removedCollections: 1,
+        retainedEntries: 3,
+        failureCounts: { race: 1, permission: 1, busy: 0, "ownership-uncertain": 0, "other-io": 0 },
+      }),
+      severity: "warning",
+      include: [
+        "removed 1 orphaned worktree(s), 2 transcript file(s), and 1 transcript collection(s)",
+        "retained 1 worktree(s) and 3 transcript item(s)",
+        "1 transcript cleanup target(s) changed concurrently",
+        "1 transcript item(s) could not be accessed",
+        "Retained items need review",
+      ],
+      exclude: ["Some transcript cleanup detail was omitted", "another I/O failure"],
+    },
+    {
+      name: "rejected transcript reaper",
+      rejectTranscript: true,
+      worktree: worktreeResult(),
+      transcript: transcriptResult(),
+      severity: "warning",
+      include: ["1 transcript item(s) had another I/O failure", "Run /doctor", "repair transcript storage"],
+      exclude: ["REAPER_REJECTION_CANARY", "changed concurrently"],
+    },
+  ])("presents $name as one bounded operator notice on TUI and stderr", async (scenario) => {
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    const originalError = console.error;
+    const previousCwd = process.cwd();
+    const blockedDir = scenario.blocked ? fs.mkdtempSync(path.join(os.tmpdir(), "picc-retention-table-blocked-")) : undefined;
+    if (blockedDir) {
+      fs.mkdirSync(path.join(blockedDir, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(blockedDir, "CLAUDE.md"), "blocked retention fixture\n");
+      fs.writeFileSync(path.join(blockedDir, ".claude", "settings.json"), JSON.stringify({ cleanupPeriodDays: 0 }));
+    }
+    try {
+      if (blockedDir) process.chdir(blockedDir);
+      WorktreeManager.prototype.reapOrphans = async () => scenario.worktree;
+      for (const mode of ["tui", "print"] as const) {
+        const wired = fakePi();
+        const stderr: string[] = [];
+        console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+        let join!: () => Promise<void>;
+        piccWithoutProjectHooks(wired.api, {
+          onInitializationSettled: wired.captureInitialization,
+          onRetentionJobsSettled: (value) => { join = value; },
+          retention: {
+            touchMainTranscript: async () => undefined,
+            reapSubagentTranscripts: async () => {
+              if (scenario.rejectTranscript) throw new Error("REAPER_REJECTION_CANARY /private/transcripts");
+              return scenario.transcript;
+            },
+            setInterval: (() => ({ unref: () => undefined })) as any,
+            clearInterval: () => undefined,
+          },
+        });
+        await wired.waitForInitialization();
+        const activeRoot = blockedDir ?? dir;
+        const ctx = mode === "tui" ? wired.tuiCtx() : wired.printCtx();
+        await wired.fire("session_start", { reason: "startup" }, {
+          ...ctx,
+          sessionManager: persistedManager(path.join(activeRoot, "active.jsonl"), activeRoot, activeRoot),
+        });
+        await join();
+        const tuiNotices = wired.notifications.filter((item) => item.text.startsWith("Retention cleanup"));
+        const stderrNotices = stderr.filter((line) => line.startsWith("PiCC: Retention cleanup"));
+        expect(mode === "tui" ? tuiNotices : stderrNotices).toHaveLength(1);
+        expect(mode === "tui" ? stderrNotices : tuiNotices).toHaveLength(0);
+        const notice = mode === "tui" ? tuiNotices[0]!.text : stderrNotices[0]!.slice("PiCC: ".length);
+        expect(notice).toContain(scenario.blocked ? "Retention cleanup is paused" : "Retention cleanup (30 days)");
+        expect(notice).toContain(scenario.blocked ? "No retention deletion was attempted" : "retained ");
+        for (const expected of scenario.include) expect(notice).toContain(expected);
+        for (const absent of scenario.exclude) expect(notice).not.toContain(absent);
+        expect(notice).not.toMatch(/(?:RAW_DIAGNOSTIC|REAPER_REJECTION_CANARY|\/private\/|[A-Z-]+=[0-9])/u);
+        if (mode === "tui") expect(tuiNotices[0]!.severity).toBe(scenario.severity);
+      }
+    } finally {
+      console.error = originalError;
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+      process.chdir(previousCwd);
+      if (blockedDir) fs.rmSync(blockedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports blocked settings from structured blockers and passes fail-closed admission to both cleaners", async () => {
+    const previousCwd = process.cwd();
+    const blockedDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-retention-blocked-"));
+    fs.mkdirSync(path.join(blockedDir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(blockedDir, "CLAUDE.md"), "blocked retention fixture\n");
+    fs.writeFileSync(path.join(blockedDir, ".claude", "settings.json"), JSON.stringify({ cleanupPeriodDays: 0 }));
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    const stderr: string[] = [];
+    const originalError = console.error;
+    let worktreeAdmission: boolean | undefined;
+    WorktreeManager.prototype.reapOrphans = async function () {
+      worktreeAdmission = (this as any).retentionCleanupAllowed;
+      return worktreeResult({
+        failureCounts: { "settings-blocked": 1, "git-authority": 0, permission: 0, busy: 0, "other-io": 0 },
+        diagnostics: [{ severity: "warning", message: "RAW_BLOCKED_DIAGNOSTIC_CANARY" }],
+      });
+    };
+    try {
+      process.chdir(blockedDir);
+      console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+      const wired = fakePi();
+      let transcriptAdmission: boolean | undefined;
+      let join!: () => Promise<void>;
+      piccWithoutProjectHooks(wired.api, {
+        onInitializationSettled: wired.captureInitialization,
+        onRetentionJobsSettled: (value) => { join = value; },
+        retention: {
+          touchMainTranscript: async () => undefined,
+          reapSubagentTranscripts: async (options) => {
+            transcriptAdmission = options.cleanupAllowed;
+            return transcriptResult();
+          },
+          setInterval: (() => ({ unref: () => undefined })) as any,
+          clearInterval: () => undefined,
+        },
+      });
+      await wired.waitForInitialization();
+      await wired.fire("session_start", { reason: "startup" }, wired.printCtx({
+        sessionManager: persistedManager(path.join(blockedDir, "active.jsonl"), blockedDir, blockedDir),
+      }));
+      await join();
+      const report = stderr.find((line) => line.includes("Retention cleanup is paused")) ?? "";
+      expect(worktreeAdmission).toBe(false);
+      expect(transcriptAdmission).toBe(false);
+      expect(report).toContain("No retention deletion was attempted");
+      expect(report).toContain("settings.json has an invalid cleanup period");
+      expect(report).toContain("Run /doctor");
+      expect(report).toContain("repair the reported settings source");
+      expect(report).not.toContain("RAW_BLOCKED_DIAGNOSTIC_CANARY");
+    } finally {
+      console.error = originalError;
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+      process.chdir(previousCwd);
+      fs.rmSync(blockedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a healthy no-op quiet and contains notification failure", async () => {
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    WorktreeManager.prototype.reapOrphans = async () => worktreeResult();
+    const originalError = console.error;
+    const stderr: string[] = [];
+    try {
+      console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+      const quiet = fakePi();
+      let quietJoin!: () => Promise<void>;
+      piccWithoutProjectHooks(quiet.api, {
+        onInitializationSettled: quiet.captureInitialization,
+        onRetentionJobsSettled: (value) => { quietJoin = value; },
+        retention: {
+          touchMainTranscript: async () => undefined,
+          reapSubagentTranscripts: async () => transcriptResult(),
+          setInterval: (() => ({ unref: () => undefined })) as any,
+          clearInterval: () => undefined,
+        },
+      });
+      await quiet.waitForInitialization();
+      await quiet.fire("session_start", { reason: "startup" }, quiet.printCtx({
+        sessionManager: persistedManager(path.join(dir, "quiet.jsonl")),
+      }));
+      await quietJoin();
+      expect(stderr.filter((line) => line.includes("Retention cleanup"))).toEqual([]);
+
+      WorktreeManager.prototype.reapOrphans = async () => worktreeResult({ reaped: ["one"] });
+      const throwing = fakePi();
+      let throwingJoin!: () => Promise<void>;
+      piccWithoutProjectHooks(throwing.api, {
+        onInitializationSettled: throwing.captureInitialization,
+        onRetentionJobsSettled: (value) => { throwingJoin = value; },
+        retention: {
+          touchMainTranscript: async () => undefined,
+          reapSubagentTranscripts: async () => transcriptResult(),
+          setInterval: (() => ({ unref: () => undefined })) as any,
+          clearInterval: () => undefined,
+        },
+      });
+      await throwing.waitForInitialization();
+      const ctx = throwing.tuiCtx({ sessionManager: persistedManager(path.join(dir, "throwing.jsonl")) });
+      (ctx.ui as any).notify = () => { throw new Error("presentation failed"); };
+      await expect(throwing.fire("session_start", { reason: "startup" }, ctx)).resolves.toBeUndefined();
+      await expect(throwingJoin()).resolves.toBeUndefined();
+      await expect(throwing.fire("session_shutdown", { reason: "quit" })).resolves.toBeUndefined();
+    } finally {
+      console.error = originalError;
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
     }
   });
 
