@@ -1044,6 +1044,28 @@ describe("responsive panel table", () => {
     expect(lines[1]!.indexOf(PANEL_RUNNING_FRAMES[0]!)).toBeGreaterThan(lines[0]!.indexOf(PANEL_RUNNING_FRAMES[0]!));
   });
 
+  it("reserves spare identity-cell width for activity only when no distinct description is hidden", () => {
+    const panel = view(makeModel({ t: 1000 }), [
+      rec({
+        agentId: "described", agentName: "bot", description: "ship",
+        liveActivity: { kind: "status", text: "go" },
+      }),
+      rec({
+        agentId: "identity-only", agentName: "bot", startedAt: 1,
+        liveActivity: { kind: "status", text: "go" },
+      }),
+    ]);
+    const rows = rowsOnly(renderSubagentPanel(panel, {
+      width: 10, entryChord: CHORD,
+    })).slice(0, 2).map(stripAnsi);
+
+    expect(rows[0]).not.toContain("ship");
+    expect(rows[0]).not.toContain("go");
+    expect(rows[0]).not.toContain(" · ");
+    expect(rows[1]).toContain("bot · go");
+    expect(rows.map(visibleWidth)).toEqual([10, 10]);
+  });
+
   it.each([
     ["identity", undefined, 15, 1],
     ["description", "ship", 22, 2],

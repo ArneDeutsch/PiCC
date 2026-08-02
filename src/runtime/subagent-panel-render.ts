@@ -399,7 +399,9 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
         line += " ".repeat(Math.max(0, available - visibleWidth(activity)));
       }
     } else {
-      const activity = renderInlineActivity(row.activity, identityRemaining, opts);
+      const activity = row.description
+        ? ""
+        : renderInlineActivity(row.activity, identityRemaining, opts);
       line += activity;
       line += " ".repeat(Math.max(0, identityRemaining - visibleWidth(activity)));
       if (active.size > 0) {

@@ -334,11 +334,9 @@ Every subagent is visible, both to you and to the coordinating model:
   text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
   admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
   line).
-- **Condensed transcript records.** Subagent output does not stream into the chat. Each active
-  agent's status row owns one bounded current-activity fragment; selected-agent detail owns multiline
-  history and richer live detail. Each depth-1 normal-path result replaces its pending call in the
-  same tool row. A successful background acceptance is transient in human chat rather than a
-  durable row;
+- **Condensed transcript records.** Subagent output does not stream into the chat. Each depth-1
+  normal-path result replaces its pending call in the same tool row. A successful background
+  acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That bounded record prioritizes the
   outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an
