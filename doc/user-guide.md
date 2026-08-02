@@ -203,11 +203,29 @@ fallback read only when no administrator source is present. The system file is
 `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, and
 `/etc/claude-code/managed-settings.json` on Linux; each drop-in directory is beside that file.
 
-`/plugin` and `/reload-plugins` are reserved, non-mutating guidance commands; `/plugins` is PiCC's
-reserved convenience alias with the same behavior. Manage installation and enablement in Claude
-Code, then run the canonical `/reload` in the interactive TUI to reload the whole extension,
-including installed plugin state, or exit PiCC completely and relaunch it. `/reload-plugins` itself
-does no reload, and `/new` starts a session without reloading plugin state.
+The interactive TUI's `/plugin` opens read-only **Discover**, **Installed**, **Marketplaces**, and
+**Errors** views with local filtering and details. Discover and Marketplaces show only registrations
+and catalog declarations already available locally; they do not refresh or acquire anything.
+`/plugin list` prints the bounded inventory, `/plugin details name@marketplace` selects one exact
+qualified identity, and `/plugins` is PiCC's exact-list alias. Use the qualified identity shown by
+the list when the same plugin name occurs in multiple marketplaces.
+
+These session commands and `/doctor` share the snapshot captured during extension loading. Viewing
+or filtering it does not reread files, run plugin components or hooks, rebuild prompt state, or
+change settings. After changing plugin state outside PiCC, run canonical `/reload` in the
+interactive TUI, or exit and relaunch PiCC to refresh. `/new` does not reload the snapshot, and
+`/reload-plugins` remains guidance only and performs no reload.
+
+Standalone `picc plugin list` and `picc plugin details name@marketplace` inspect the current
+working directory's target project. Each builds one fresh command-scoped snapshot without normal Pi
+extension, MCP, hook, or plugin-runtime startup, using the active Claude profile in this order:
+`PICC_CLAUDE_USER_DIR`, `CLAUDE_CONFIG_DIR`, then the default profile. Lifecycle repair must target
+that same profile. Their bounded text is for inspection, not a stable JSON automation contract.
+Every inventory surface is read-only: installation, update, enablement changes, removal, marketplace
+mutation or refresh,
+dependency resolution, rename migration, strict-overlay execution, and unsupported component
+execution remain unavailable. See the generated [capability matrix](supported-features.md) for exact
+support limits.
 
 > **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
 > it only when you explicitly ask it to remember something (e.g. "remember to…"). This is a
@@ -377,7 +395,8 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and settle advertised tool, prompt, and resource catalogs or time out. See [MCP server settings](#6-security--permission-posture) |
-| `/plugin`, `/plugins`, `/reload-plugins` | Reserved plugin-management guidance; see [Installed plugins](#installed-plugins) |
+| `/plugin`, `/plugin list`, `/plugin details name@marketplace`, `/plugins` | Read-only captured plugin inventory; see [Installed plugins](#installed-plugins) |
+| `/reload-plugins` | Non-mutating guidance to use canonical `/reload` or relaunch; performs no reload |
 | `/picc-update` | In a direct `picc` launch, show fixed installation-aware exit-and-update guidance; never mutates the running installation. External Pi hosting does not register it |
 | `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
@@ -738,8 +757,8 @@ behaviors worth knowing:
 | `picc -p` exited with status **3** | A main-session checkpoint gave up: PiCC paused the work for context compaction and it never resumed, so stdout is a partial answer. Read the `PiCC: ` line on stderr — or the `picc-checkpoint-lifecycle` entries under `--mode json`/RPC — for which ending it was and what to resend. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
-| Unexpected skills/agents from plugins | `/doctor` shows aggregate plugin posture and actionable failures, not every clean loaded identity. Review the qualified entries across your `enabledPlugins` sources and Claude Code's installed-plugin view or listing; only a literal `true` plus a matching exact imported record can load content. |
-| An enabled plugin is reported as uninstalled or its installed state is rejected | Follow `/doctor`'s aggregate cause. Relative to the active Claude user directory, fix access/permissions for `plugins/installed_plugins.json` when unreadable or repair/regenerate it through Claude Code when malformed. For an unsupported format, update PiCC or contact PiCC support. Only an actually missing exact record calls for installing the qualified plugin or disabling its setting. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC; `/new` does not reload state. |
+| Unexpected skills/agents from plugins | Use `/plugin list` for qualified identities, `/plugin details name@marketplace` for captured declarations and runtime posture, and `/doctor` for actionable compatibility findings. Healthy identities stay out of doctor diagnostics. Only literal `true` enablement plus a matching exact imported record can load content. |
+| An enabled plugin is reported as uninstalled or its installed state is rejected | Inspect the exact qualified identity in `/plugin details`. Relative to the active Claude user directory, fix access/permissions for `plugins/installed_plugins.json` when unreadable or repair/regenerate it through Claude Code when malformed. For an unsupported format, update PiCC or contact PiCC support. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC; `/new` does not reload the session snapshot. |
 | The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | Plugin policy is ignored or a weaker Windows policy did not apply | `/doctor` identifies the safe source class, not a concrete file or path. For `system-file` or `registry-hklm`, ask the administrator to inspect that class; for `system-drop-in`, ask the administrator to inspect every JSON drop-in. For `registry-hkcu` or `override`, inspect the corresponding user fallback or override input. After repair, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |
 | A plugin root or component is rejected | Reinstall the plugin through Claude Code rather than moving files or treating an environment/catalog path as a substitute for the exact record. PiCC rejects declarations or content that are malformed, escaping, missing, unreadable, the wrong kind, or no longer resolve to the same contained target. After reinstalling, use canonical `/reload` in the interactive TUI or exit and relaunch PiCC. |

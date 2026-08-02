@@ -42,7 +42,7 @@ RemoteSigned`. Details per shell/OS in the guide.
 
 Once published, `npm install --global picc` gives you the same `picc` command without a source
 checkout.
-PiCC ships as TypeScript source that Pi loads via jiti — there is no build step.
+PiCC ships as TypeScript source loaded through jiti — there is no release build step.
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
@@ -71,8 +71,8 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   approval and disablement; see the [capability matrix](doc/supported-features.md) for exact limits.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
-- **Plugins** — enabled plugins require matching exact imported installed-state records; see the
-  [capability matrix](doc/supported-features.md) for current limits.
+- **Plugins** — read-only local inventory and diagnostics accompany exact installed-state loading;
+  see [Installed plugins](doc/user-guide.md#installed-plugins).
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a
   non-vision model; notebooks can be edited cell-by-cell with `NotebookEdit`; a genuinely unsupported

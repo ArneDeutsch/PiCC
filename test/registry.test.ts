@@ -26,6 +26,7 @@ import { loadSettings } from "../src/discovery/settings.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
 import { renderNotebook } from "../src/runtime/notebook-render.js";
+import type { PluginInventoryItem, PluginInventorySnapshot } from "../src/plugin-inventory.js";
 import type {
   ClaudeAgent,
   ClaudeProject,
@@ -119,6 +120,45 @@ function makeAgent(overrides: Partial<ClaudeAgent> = {}): ClaudeAgent {
     source: SOURCE,
     unknownKeys: [],
     diagnostics: [],
+    ...overrides,
+  };
+}
+
+function makeInventoryItem(qualifiedIdentity: string, overrides: Partial<PluginInventoryItem> = {}): PluginInventoryItem {
+  const separator = qualifiedIdentity.lastIndexOf("@");
+  return {
+    qualifiedIdentity,
+    lifecycleName: qualifiedIdentity.slice(0, separator),
+    marketplaceName: qualifiedIdentity.slice(separator + 1),
+    catalogPresence: false,
+    installations: [],
+    catalogDeclarations: [],
+    dependencies: [],
+    renames: [],
+    components: [],
+    executionRisk: [],
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+function makeInventory(items: readonly PluginInventoryItem[], overrides: Partial<PluginInventorySnapshot> = {}): PluginInventorySnapshot {
+  const values = [...items];
+  return {
+    capturedAt: "2026-01-01T00:00:00.000Z",
+    lifetime: "session",
+    refreshGuidance: "caller-provided wording must not be trusted",
+    installedStateStatus: "valid",
+    items: values,
+    marketplaces: [],
+    marketplaceCatalogs: [],
+    allowlistObservations: [],
+    conflictObservations: [],
+    policyObservations: [],
+    diagnostics: [],
+    capabilityEvidence: [],
+    omissions: {},
+    find: (identity) => values.find((value) => value.qualifiedIdentity === identity),
     ...overrides,
   };
 }
@@ -474,7 +514,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure({
       id: "feature.plugins-installed-selection",
       tier: "partial",
-      core: [/read-only exact-version selection/, /qualified name@marketplace/, /load no fallback content/],
+      core: [/read-only exact-version runtime selection/, /separate declaration observation/, /qualified name@marketplace/, /load no fallback content/],
       gap: [/undocumented/, /not PiCC's permanent API/],
       parity: [/FIXTURE-DERIVED/, /Captured Claude installed-state v2/, /PiCC-defined/],
     });
@@ -482,11 +522,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       id: "feature.plugins-enablement",
       tier: "partial",
       core: [/literal booleans only/, /source-aware key-wise precedence/],
-      gap: [/defaultEnabled is unsupported/, /cannot establish development or bundled-root trust/],
+      gap: [/defaultEnabled.*unsupported/, /strict-overlay execution/, /lifecycle policy enforcement/, /cannot establish development or bundled-root trust/],
     });
     const umbrella = lookupCapability("feature.plugins-content");
     expect(umbrella).toMatchObject({ tier: "partial" });
-    for (const phrase of ["selected installed-plugin skills, commands, agents, and hooks", "fixture-derived", "development roots remain inert", "marketplace component overlays/strict", "feature.mcp-plugin-servers"]) {
+    for (const phrase of ["selected installed-plugin skills, commands, agents, and hooks", "fixture-derived", "catalog roots remain inert", "strict marketplace overlays", "unsupported component execution", "feature.mcp-plugin-servers"]) {
       expect(umbrella?.note).toContain(phrase);
     }
     const enablementNote = lookupCapability("setting.enabledPlugins")?.note ?? "";
@@ -528,28 +568,26 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const hooks = lookupCapability("feature.plugins-hooks")?.note ?? "";
     for (const phrase of ["command and argument fields alone", "canonical authorized root", "matcher, condition, URL, and arbitrary raw fields remain literal"]) expect(hooks).toContain(phrase);
     const metadata = lookupCapability("feature.plugins-manifest-metadata")?.note ?? "";
-    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible component namespace", "manifestless content uses the validated installed lifecycle name", "skills, commands, agents, and hooks", "Only wrong-typed values for those four component fields", "broader recognized metadata schema validation is unsupported", "defaultEnabled", "marketplace-entry component overlays", "marketplace strict"]) expect(metadata).toContain(phrase);
+    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible runtime component namespace", "manifestless content uses the validated installed lifecycle name", "bounded same-read projection", "name, description, version, author, homepage, repository, license, keywords, dependencies", "supported or unsupported component declaration shapes", "Skills, commands, agents, and hooks declarations can affect runtime only after selection and validation", "manifest dependencies remain unresolved inventory evidence", "renames remain catalog-only inert declarations", "Broader recognized metadata validation", "defaultEnabled execution", "marketplace strict overlays", "settings rewrite are unsupported"]) expect(metadata).toContain(phrase);
     expect(lookupCapability("feature.plugins-development-trust")).toMatchObject({ tier: "not-supported" });
     expect(lookupCapability("feature.plugins-development-trust")?.note).toContain("repository-bundled");
-    for (const [id, command] of [
-      ["feature.plugins-command-plugin", "/plugin"],
-      ["feature.plugins-command-plugins", "/plugins"],
-      ["feature.plugins-command-reload", "/reload-plugins"],
-    ] as const) {
-      expect(lookupCapability(id)?.tier, id).toBe("degraded-noop");
-      expect(lookupCapability(id)?.note, id).toContain(command);
-      expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
-      expect(lookupCapability(id)?.note, id).toContain("whole extension including installed plugin state");
-      expect(lookupCapability(id)?.note, id).toContain("no lifecycle mutation");
+    expect(lookupCapability("feature.plugins-command-plugin")).toMatchObject({ tier: "partial" });
+    for (const phrase of ["PiCC-defined read-only four-view session inventory", "Discover, Installed, Marketplaces, and Errors", "list/details", "No install, update, enable, disable, uninstall", "stable JSON automation contract"]) {
+      expect(lookupCapability("feature.plugins-command-plugin")?.note).toContain(phrase);
     }
-    expect(lookupCapability("feature.plugins-command-plugins")?.note).toContain("PiCC-defined reserved alias");
+    expect(lookupCapability("feature.plugins-command-plugins")).toMatchObject({ tier: "partial" });
+    for (const phrase of ["PiCC-defined exact-list alias", "same captured read-only session snapshot", "not Claude parity", "no lifecycle mutation", "no stable JSON automation contract"]) {
+      expect(lookupCapability("feature.plugins-command-plugins")?.note).toContain(phrase);
+    }
+    expect(lookupCapability("feature.plugins-command-reload")).toMatchObject({ tier: "degraded-noop" });
     expect(lookupCapability("feature.plugins-command-reload")?.note).toContain("performs no reload");
+    expect(lookupCapability("feature.plugins-command-reload")?.note).toContain("canonical interactive /reload");
     for (const [id, phrase] of [
       ["feature.plugin-install", "installation is not implemented"],
       ["feature.plugin-update", "update is not implemented"],
       ["feature.plugin-uninstall", "uninstall is not implemented"],
-      ["feature.plugin-marketplace", "marketplace discovery"],
-      ["feature.plugins-other-components", "LSP, workflows, themes, monitors, channels"],
+      ["feature.plugin-marketplace", "marketplace add, update, remove, refresh"],
+      ["feature.plugins-other-components", "LSP, workflows, output styles, top-level and experimental themes and monitors, channels"],
     ] as const) {
       expect(lookupCapability(id)?.tier, id).toBe("not-supported");
       expect(lookupCapability(id)?.note, id).toContain(phrase);
@@ -558,7 +596,26 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
       expect(lookupCapability(id)?.note, id).toContain("or relaunch PiCC");
     }
+    expect(lookupCapability("feature.plugins-other-components")?.note).toContain("bounded shape-only inventory evidence");
     expect(lookupCapability("feature.plugins-other-components")?.note).toContain("feature.mcp-plugin-servers");
+
+    for (const id of ["feature.plugins-inventory", "feature.plugins-launcher-inventory", "feature.plugins-marketplace-observation"] as const) {
+      expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
+    }
+    const inventory = lookupCapability("feature.plugins-inventory")?.note ?? "";
+    for (const phrase of ["bounded read-only snapshot", "by qualified identity", "marketplace registrations and policy stay global", "selected-manifest and catalog dependencies retain distinct unresolved provenance", "renames remain catalog-only inert declarations", "Session UI/text/doctor consumers share one immutable capture", "command consumers build one fresh snapshot", "No disk reread", "stable JSON automation contract", "exact Claude rendering parity"]) expect(inventory).toContain(phrase);
+    const launcher = lookupCapability("feature.plugins-launcher-inventory")?.note ?? "";
+    for (const phrase of ["picc plugin list", "picc plugin details <qualified-name>", "one fresh command-scoped", "avoid normal Pi extension, hook, MCP, and plugin-runtime startup", "not stable JSON automation"]) expect(launcher).toContain(phrase);
+    const marketplace = lookupCapability("feature.plugins-marketplace-observation")?.note ?? "";
+    for (const phrase of ["local-only observation", "fixture-derived known_marketplaces.json serialization", "supported and unsupported component shapes", "dependencies", "renames", "Catalogs are inventory-only and never authorize content", "no network refresh", "dependency resolution", "rename migration", "strict-overlay execution"]) expect(marketplace).toContain(phrase);
+    for (const id of ["setting.extraKnownMarketplaces", "setting.strictKnownMarketplaces", "setting.blockedMarketplaces"] as const) {
+      expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
+      expect(lookupCapability(id)?.note, id).toContain("read-only observation");
+      expect(lookupCapability(id)?.note, id).toMatch(/lifecycle enforcement|Blocking is observational only/);
+    }
+    const lifecycle = lookupCapability("feature.plugin-marketplace");
+    expect(lifecycle).toMatchObject({ tier: "not-supported" });
+    for (const phrase of ["add, update, remove, refresh", "network acquisition", "lifecycle mutation", "observation-only"]) expect(lifecycle?.note).toContain(phrase);
   });
 
   it("qualifies plugin-agent global fields and implemented managed-policy sources and merge", () => {
@@ -1052,6 +1109,69 @@ describe("buildCompatReport", () => {
     expect(report.findings).toEqual([]);
     expect(report.safetyFindings).toEqual([]);
     expect(report.unassessed).toEqual([]);
+  });
+
+  it("derives plugin counts, qualified diagnostics, omissions, and capability findings only from the captured snapshot", () => {
+    const inventory = makeInventory([
+      makeInventoryItem("healthy@official", {
+        installations: [{ validity: "valid", selected: true, diagnostics: [], problems: [] }],
+        enablement: { enabled: true, scope: "project", source: { kind: "project", display: "<project>/.claude/settings.json" } },
+        outcome: { status: "loaded", sharedStateCauses: [] },
+      }),
+      makeInventoryItem("broken@community", {
+        catalogPresence: true,
+        enablement: { enabled: true, scope: "user", source: { kind: "claude-user", display: "<claude-user>/settings.json" } },
+        outcome: { status: "enabled-but-uninstalled", sharedStateCauses: [] },
+        diagnostics: [{ severity: "warning", message: "C:/SECRET/token=RAW must not survive" }, { severity: "warning", message: "Repair the captured declaration" }],
+      }),
+    ], {
+      diagnostics: [
+        { severity: "warning", category: "enabled-plugins-non-boolean", message: "A non-boolean enabledPlugins value was ignored" },
+        { severity: "error", category: "managed-policy-malformed", sourceClass: "override", impact: "source-ignored", message: "C:/RAW/POLICY" },
+      ],
+      capabilityEvidence: [
+        { capabilityId: "feature.plugins-content", qualifiedIdentity: "broken@community", component: "commands", observation: "Final loaded component support is partial" },
+        { capabilityId: "feature.plugins-other-components", qualifiedIdentity: "broken@community", component: "channels", observation: "Selected manifest declares an unsupported plugin component" },
+        { capabilityId: "feature.hook-handler.prompt", qualifiedIdentity: "broken@community", component: "hooks", observation: "Plugin hook handler support is degraded-noop" },
+        { capabilityId: "agent.frontmatter.hooks", qualifiedIdentity: "broken@community", component: "worker", observation: "Plugin agent field hooks was stripped before runtime construction" },
+        { capabilityId: "feature.future-plugin-capability", qualifiedIdentity: "broken@community", observation: "Capability observation is unassessed because its registry entry is absent" },
+      ],
+      omissions: { "loader.installed.diagnostics": 3, "snapshot.evidence": 2, "snapshot.items": 4 },
+    });
+    const project = {
+      ...makeProject({ settings: makeSettings({ diagnostics: [{ severity: "warning", message: "enabledPlugins STALE@settings must be a literal boolean" }] }) }),
+      pluginInventory: inventory,
+      pluginResolutionOutcomes: [{ pluginId: "STALE@outcomes", status: "rejected", diagnostics: [] }],
+      mergedHooks: { Notification: [{ hooks: [{ type: "prompt", pluginId: "STALE@hooks", raw: {} }] }] },
+    } as unknown as ClaudeProject;
+
+    const report = buildCompatReport(project);
+    expect(report.pluginInventory?.counts).toEqual({ known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1 });
+    expect(report.pluginInventory?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ qualifiedIdentity: "broken@community", status: "enabled-but-uninstalled", nextCommand: "/plugin details broken@community" }),
+    ]));
+    for (const id of ["feature.plugins-content", "feature.plugins-other-components", "feature.hook-handler.prompt", "agent.frontmatter.hooks"]) {
+      expect([...report.findings, ...report.safetyFindings].some((finding) => finding.capability.id === id), id).toBe(true);
+    }
+    expect(report.unassessed).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
+    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin diagnostic(s) omitted"))).toBe(false);
+    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin capability observation(s) omitted"))).toBe(false);
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1");
+    expect(doctor).toContain("broken@community");
+    expect(doctor).toContain("Selected manifest declares an unsupported plugin component");
+    expect(doctor).toContain("<redacted-field>");
+    expect(doctor).toContain("A non-boolean enabledPlugins value was ignored");
+    expect(doctor).toContain("managed-policy override was malformed; this source was ignored. Correct the managed-policy override format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
+    expect(doctor).toContain("Capture omissions may make these retained counts incomplete: snapshot.items=4.");
+    expect(doctor).toContain("Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+    expect(doctor).toContain("Repair boundary: PiCC inventory is read-only; repair plugin state, declarations, or policy outside this command.");
+    expect(doctor).toContain("Refresh: Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+    expect(doctor.match(/Repair the captured declaration/gu)).toHaveLength(1);
+    expect(doctor.match(/3 additional captured diagnostic\(s\) omitted/gu)).toHaveLength(1);
+    expect(doctor.match(/2 additional captured capability observation\(s\) omitted/gu)).toHaveLength(1);
+    expect(doctor).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
+    for (const absent of ["healthy@official", "STALE@outcomes", "STALE@hooks", "STALE@settings", "C:/SECRET", "C:/RAW/POLICY", "token=RAW", "caller-provided wording"]) expect(doctor).not.toContain(absent);
   });
 
   it("flags permissions.ask rules as a safety finding", () => {

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { Diagnostic, HookOutcome, HookPayload, PluginResolutionOutcome, PluginRuntimeContext, ToolCallDescriptor } from "./types.js";
+import type { Diagnostic, HookOutcome, HookPayload, PluginRuntimeContext, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
@@ -113,6 +113,15 @@ import {
 } from "./runtime/mcp-resources.js";
 import { boundedMcpErrorText } from "./runtime/mcp-content.js";
 import { clampLines, pushColored, sanitizeDisplayText } from "./runtime/render-util.js";
+import {
+  parsePluginInventorySlash,
+  PLUGIN_INVENTORY_SLASH_USAGE,
+  projectPluginInventoryStartup,
+  renderPluginInventoryList,
+  renderPluginInventoryOperation,
+  sanitizePluginInventoryDisplayText,
+} from "./runtime/plugin-inventory-text.js";
+import { openPluginInventory } from "./runtime/plugin-inventory-focus.js";
 import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
@@ -361,8 +370,6 @@ export interface PiccTestSeam {
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
   checkpointDeadlinePolicy?: HostDeadlinePolicy;
-  /** TEST-ONLY future-producer outcomes; in-process only and unreachable from project files/environment. */
-  pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -458,7 +465,6 @@ export async function writeFdFully(
   }
 }
 
-const PLUGIN_STARTUP_ID_CAP = 5;
 const PLUGIN_CONTROL_NAMES = new Set(["plugin", "plugins", "reload-plugins"]);
 const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
 const PLUGIN_RECONCILE_RECOVERY = `Reconcile or reinstall the plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}`;
@@ -590,47 +596,6 @@ function createBoundedTuiDiagnosticSurface(fingerprintCap = 20): (
   };
 }
 
-export function renderPluginStartupNotice(
-  outcomes: readonly PluginResolutionOutcome[] | undefined,
-  diagnostics: readonly Diagnostic[],
-): string | undefined {
-  const lines: string[] = [];
-  const failed = (outcomes ?? []).filter((outcome) =>
-    outcome.status !== "loaded" && outcome.status !== "disabled",
-  );
-  if (failed.length > 0) {
-    const ids = [...new Set(failed.map((outcome) => sanitizeLine(outcome.pluginId, 128)))]
-      .slice(0, PLUGIN_STARTUP_ID_CAP);
-    const omitted = new Set(failed.map((outcome) => sanitizeLine(outcome.pluginId, 128))).size - ids.length;
-    lines.push(
-      `Enabled plugin content did not load and no fallback content was used: ${ids.join(", ")}` +
-        (omitted > 0 ? `, and ${omitted} more` : "") +
-        ". Run /doctor for details.",
-    );
-  }
-
-  const administratorPolicyClasses = new Set(["system-file", "system-drop-in", "registry-hklm"]);
-  const policyDiagnostics = diagnostics.filter((diagnostic) =>
-    (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") &&
-    (diagnostic.impact === "source-ignored" || diagnostic.impact === "weaker-policy-suppressed") &&
-    diagnostic.sourceClass !== undefined && administratorPolicyClasses.has(diagnostic.sourceClass),
-  );
-  for (const impact of ["source-ignored", "weaker-policy-suppressed"] as const) {
-    const policyClasses = [...new Set(policyDiagnostics
-      .filter((diagnostic) => diagnostic.impact === impact)
-      .map((diagnostic) => sanitizeLine(diagnostic.sourceClass!, 80)))]
-      .slice(0, 3);
-    if (policyClasses.length === 0) continue;
-    const consequence = impact === "weaker-policy-suppressed"
-      ? "weaker policy was suppressed and plugin enablement may differ"
-      : "that administrator source was ignored and plugin enablement may differ";
-    lines.push(
-      `Administrator plugin policy was malformed or unreadable (${policyClasses.join(", ")}); ${consequence}. Repair policy, then ${PLUGIN_REFRESH_ACTION}.`,
-    );
-  }
-  return lines.length > 0 ? lines.join("\n") : undefined;
-}
-
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const routeMainSessionTool = testSeam?.renderMainSessionTool ?? renderMainSessionTool;
   const surfaceTypedForkTuiDiagnostics = createBoundedTuiDiagnosticSurface();
@@ -740,6 +705,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   };
   let compat: CompatReport = { findings: [], safetyFindings: [], unassessed: [] };
+  let pluginStartupNoticePresented = false;
   const pluginContexts = project.pluginContexts;
   const RUNTIME_FINDING_RETAIN_CAP = 20;
   const RUNTIME_FINDING_FINGERPRINT_CAP = 25;
@@ -2933,17 +2899,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           }
         }
       }
-      if (event.reason === "startup") {
-        const resolutionOutcomes = testSeam?.pluginResolutionOutcomes ?? (project as LoadedProject & {
-          pluginResolutionOutcomes?: readonly PluginResolutionOutcome[];
-        }).pluginResolutionOutcomes;
-        const pluginNotice = renderPluginStartupNotice(
-          resolutionOutcomes,
-          [...project.diagnostics, ...project.settings.diagnostics],
-        );
+      if (event.reason === "startup" && !pluginStartupNoticePresented) {
+        const projection = projectPluginInventoryStartup(project.pluginInventory);
+        const captureEvidenceOmitted = projection.omissions.captureEvidence
+          .some((omission) => omission.count > 0);
+        const omissionCue = projection.omissions.identities > 0 ||
+          projection.omissions.managedPolicyEvidence > 0 || captureEvidenceOmitted
+          ? "This startup notice is abbreviated."
+          : undefined;
+        const pluginNotice = [projection.text, omissionCue].filter((line): line is string => line !== undefined).join("\n");
         if (pluginNotice) {
-          if (ctx.mode === "tui") ctx.ui?.notify?.(pluginNotice, "warning");
-          else console.error(`PiCC: ${pluginNotice}`);
+          pluginStartupNoticePresented = true;
+          try {
+            if (ctx.mode === "tui") ctx.ui?.notify?.(pluginNotice, "warning");
+            else console.error(`PiCC: ${pluginNotice}`);
+          } catch { /* startup diagnostics cannot change session lifecycle */ }
         }
       }
       const sessionStartSource = event.reason === "new"
@@ -4364,17 +4334,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   type ControlCommandEntry = {
     description: string;
-    render: (args: string, ctx: any) => string | Promise<string>;
+    render: (args: string, ctx: any) => string | undefined | Promise<string | undefined>;
   };
 
   const MCP_ARGUMENT_RESPONSE =
     "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
   const CONTROL_ERROR_RESPONSE =
     "PiCC could not produce that control-command report. No action occurred; try again or run /doctor.";
-  const PLUGIN_GUIDANCE =
-    "Plugin lifecycle management is unavailable in PiCC; no changes were made. Manage installation and enablement in Claude Code, then run the canonical /reload in the interactive TUI to reload the whole extension, including installed plugin state, or exit and relaunch PiCC. /doctor reports currently available compatibility and retained plugin-runtime failure findings; /new does not reload plugin state.";
-  const PLUGINS_ALIAS_GUIDANCE =
-    `/plugins is a PiCC-defined convenience alias. ${PLUGIN_GUIDANCE}`;
   const PLUGIN_RELOAD_GUIDANCE =
     "/reload-plugins did no reload and made no changes. Manage installation and enablement in Claude Code, then run the canonical /reload in the interactive TUI to reload the whole extension, including installed plugin state, or exit and relaunch PiCC. /doctor reports currently available compatibility and retained plugin-runtime failure findings; /new does not reload plugin state.";
 
@@ -4400,12 +4366,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       render: async () => renderUsageReport(),
     }],
     ["plugin", {
-      description: "PiCC: non-mutating plugin lifecycle guidance",
-      render: async () => PLUGIN_GUIDANCE,
+      description: "PiCC: inspect the read-only plugin inventory",
+      render: async (args, ctx) => renderPluginControl(args, ctx),
     }],
     ["plugins", {
-      description: "PiCC: plugin lifecycle guidance (convenience alias)",
-      render: async () => PLUGINS_ALIAS_GUIDANCE,
+      description: "PiCC: list the read-only plugin inventory (exact alias)",
+      render: async (args, ctx) => /^[ \t]*$/.test(args)
+        ? withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))
+        : pluginReadOnlyUsage(ctx),
     }],
     ["reload-plugins", {
       description: "PiCC: non-mutating plugin reload guidance",
@@ -4443,12 +4411,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   function parseControlCommandInput(text: string): { name: string; args: string } | undefined {
-    const trimmed = text.trim();
-    const match = /^\/([A-Za-z0-9][\w-]*)(?=[ \t]|$)/.exec(trimmed);
-    if (!match) return undefined;
-    const name = match[1]!.toLowerCase();
-    if (!controlCommands.has(name)) return undefined;
-    return { name, args: trimmed.slice(match[0].length).replace(/^[ \t]+/, "") };
+    const match = /^[ \t]*\/([A-Za-z0-9][\w-]*)(?=[ \t]|$)/.exec(text);
+    if (match) {
+      const name = match[1]!.toLowerCase();
+      if (!controlCommands.has(name)) return undefined;
+      return { name, args: text.slice(match[0].length).replace(/^[ \t]+/, "") };
+    }
+
+    // Pi's registered-command router and generic String trimming can disagree on
+    // vertical/control whitespace. Reserve only the exact plugin tokens here;
+    // near-prefix, namespaced, and non-ASCII lookalike tokens remain non-owned.
+    const malformedPlugin = /^[\p{White_Space}\p{Cc}\p{Cf}]*\/([Pp][Ll][Uu][Gg][Ii][Nn](?:[Ss])?|[Rr][Ee][Ll][Oo][Aa][Dd]-[Pp][Ll][Uu][Gg][Ii][Nn][Ss])(?=$|[\p{White_Space}\p{Cc}\p{Cf}])/u.exec(text);
+    if (!malformedPlugin) return undefined;
+    const token = malformedPlugin[1]!;
+    return {
+      name: token.length === 6 ? "plugin" : token.length === 7 ? "plugins" : "reload-plugins",
+      args: `\v${text.slice(malformedPlugin[0].length)}`,
+    };
   }
 
   function parseAdmittedPiBuiltin(text: string): string | undefined {
@@ -4469,6 +4448,48 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (write) await write(output);
     else if (testSeam) console.log(output);
     else await writeFdFully(process.stdout.fd, Buffer.from(`${output}\n`, "utf8"));
+  }
+
+  function pluginRuntimeOverlay(): string | undefined {
+    const findings = compat.pluginRuntimeFindings ?? [];
+    if (findings.length === 0 && !compat.pluginRuntimeFindingsOmitted && !compat.pluginRuntimeFindingsOmittedAtLeast) return undefined;
+    const retained = findings.slice(0, 10).map((finding) => `- ${sanitizePluginInventoryDisplayText(finding, 240)}`);
+    const omitted = Math.max(0, findings.length - retained.length) + (compat.pluginRuntimeFindingsOmitted ?? 0);
+    return [
+      "Runtime refusals observed after snapshot capture (display overlay only):",
+      ...retained,
+      ...(omitted > 0 || compat.pluginRuntimeFindingsOmittedAtLeast ? [`- ${compat.pluginRuntimeFindingsOmittedAtLeast ? "at least " : ""}${omitted} additional finding(s) not shown`] : []),
+    ].join("\n");
+  }
+
+  function withPluginRuntimeOverlay(output: string): string {
+    const overlay = pluginRuntimeOverlay();
+    return overlay === undefined ? output : `${output}\n\n${overlay}`;
+  }
+
+  function pluginReadOnlyUsage(_ctx: any): string {
+    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. Manage plugin installation and enablement in Claude Code. After managing plugins, run the canonical /reload in the interactive TUI or exit and relaunch PiCC.`;
+  }
+
+  async function renderPluginControl(args: string, ctx: any): Promise<string | undefined> {
+    if (/^[ \t]*$/.test(args)) {
+      if (ctx?.mode !== "tui") return withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory));
+      const overlay = pluginRuntimeOverlay();
+      if (overlay !== undefined) {
+        try { ctx.ui?.notify?.(overlay, "warning"); } catch { /* overlay is additive */ }
+      }
+      const opened = await openPluginInventory(project.pluginInventory, ctx);
+      if (opened.opened) return undefined;
+      const warning = opened.reason === "unavailable"
+        ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only list instead."
+        : "Interactive plugin inventory could not open; showing the bounded read-only list instead.";
+      try { ctx.ui?.notify?.(warning, "warning"); } catch { /* text fallback remains authoritative */ }
+      return `${warning}\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))}`;
+    }
+    const parsed = parsePluginInventorySlash(`/plugin ${args}`);
+    return parsed.kind === "usage"
+      ? pluginReadOnlyUsage(ctx)
+      : withPluginRuntimeOverlay(renderPluginInventoryOperation(project.pluginInventory, parsed.operation));
   }
 
   async function appendControlOutput(name: string, output: string, ctx: any): Promise<void> {
@@ -4508,7 +4529,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!command) return;
     try {
       const output = await command.render(args, ctx);
-      await appendControlOutput(name, output, ctx);
+      if (output !== undefined) await appendControlOutput(name, output, ctx);
     } catch {
       // Recognition is final: processing and presentation faults cannot release
       // the original slash input to hooks, skills, or provider context.

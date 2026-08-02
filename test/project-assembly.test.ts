@@ -6,6 +6,7 @@ import { HookRunner } from "../src/engine/hook-runner.js";
 import { loadSkillBody } from "../src/claude/skills.js";
 import { projectPluginAgentRuntime, substitutePluginRuntimeText } from "../src/index.js";
 import { findByName, loadClaudeProject } from "../src/project.js";
+import { buildCompatReport, renderDoctorReport } from "../src/registry/compat-report.js";
 import {
   buildSystemPromptSuffix,
   createTierChangeReporter,
@@ -46,6 +47,7 @@ function makeTmp(): string {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()!;
     try {
@@ -111,7 +113,8 @@ function makeMarketplacePlugin(userDir: string, marketplace: string, name: strin
 describe("loadClaudeProject — imported installed-state enablement", () => {
   it("loads only explicitly enabled installed records from authorized cache roots (skills, agents, hooks)", () => {
     const { repo, userDir } = makeBase();
-    makeMarketplacePlugin(userDir, "official", "alpha");
+    const alphaRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    write(path.join(alphaRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", version: 7 }));
     makeMarketplacePlugin(userDir, "official", "beta");
     write(
       path.join(userDir, "settings.json"),
@@ -132,6 +135,206 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.skills.some((s) => s.name.includes("beta"))).toBe(false);
     expect(project.agents.some((a) => a.name.includes("beta"))).toBe(false);
     expect(hookCommands).not.toContain("beta-hook");
+    expect(project.pluginInventory.find("alpha@official")).toMatchObject({ outcome: { status: "loaded" }, manifestNamespace: "alpha" });
+    expect(project.pluginInventory.find("alpha@official")!.diagnostics.filter((item) => item.message.includes("metadata field version"))).toHaveLength(1);
+    expect(project.pluginInventory.find("beta@official")).toMatchObject({ outcome: { status: "disabled" } });
+    expect(project.pluginInventory.find("beta@official")!.selectedInstallation).toBeUndefined();
+    expect(Object.isFrozen(project.pluginInventory)).toBe(true);
+  });
+
+  it("uses one injected environment for marketplace discovery, installed selection, and metadata authorization", () => {
+    const { base, repo, userDir } = makeBase();
+    const cache = path.join(base, "injected-cache");
+    const seed = path.join(base, "injected-seed");
+    const statePath = path.join(userDir, "plugins", "installed_plugins.json");
+    const ambientCache = path.join(base, "ambient-cache");
+    const ambientSeed = path.join(base, "ambient-seed");
+    const alpha = path.join(cache, "official", "alpha", "1.0.0");
+    const beta = path.join(cache, "official", "beta", "1.0.0");
+    const ambient = path.join(ambientCache, "official", "ambient", "1.0.0");
+    write(path.join(alpha, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha" }));
+    write(path.join(beta, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "beta", description: "observed through injected cache" }));
+    write(path.join(ambient, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "ambient", description: "must not be authorized" }));
+    write(statePath, JSON.stringify({ version: 2, plugins: {
+      "alpha@official": [{ scope: "user", installPath: alpha, version: "1.0.0" }],
+      "beta@official": [{ scope: "user", installPath: beta, version: "1.0.0" }],
+      "ambient@official": [{ scope: "user", installPath: ambient, version: "1.0.0" }],
+    } }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true, "beta@official": false, "ambient@official": true } }));
+    write(path.join(seed, "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "example/catalog" } } }));
+    write(path.join(seed, "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [{ name: "catalog-only", source: "./catalog-only" }] }));
+    write(path.join(ambientSeed, "known_marketplaces.json"), JSON.stringify({ ambient: { source: { source: "github", repo: "example/ambient" } } }));
+    write(path.join(ambientSeed, "ambient", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "ambient", owner: { name: "Example" }, plugins: [{ name: "ambient-catalog", source: "./ambient" }] }));
+    vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", ambientCache);
+    vi.stubEnv("CLAUDE_CODE_PLUGIN_SEED_DIR", ambientSeed);
+
+    const project = loadClaudeProject({
+      cwd: repo, userDir, env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: cache, CLAUDE_CODE_PLUGIN_SEED_DIR: seed },
+      managedSettingsPaths: [], managedArtifactDirs: [],
+    });
+
+    expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["alpha@official"]);
+    expect(project.pluginInventory.find("beta@official")?.installations[0]?.metadata?.description).toBe("observed through injected cache");
+    expect(project.pluginInventory.find("catalog-only@official")?.catalogPresence).toBe(true);
+    expect(project.pluginInventory.find("ambient@official")).toMatchObject({ outcome: { status: "rejected" }, installations: [expect.not.objectContaining({ metadata: expect.anything() })] });
+    expect(project.pluginInventory.find("ambient-catalog@ambient")).toBeUndefined();
+  });
+
+  it("captures safely classified invalid enabledPlugins evidence from real settings assembly", () => {
+    const { repo, userDir } = makeBase();
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: [] }));
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "SECRET-BAD-IDENTITY": true, "safe@official": "RAW-SECRET-VALUE" } }));
+
+    const project = load(repo, userDir);
+    expect(project.pluginInventory.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: "enabled-plugins-not-object", message: "The enabledPlugins declaration was not an object and was ignored" }),
+      expect.objectContaining({ category: "enabled-plugins-invalid-identity", message: "An invalid qualified plugin identity in enabledPlugins was ignored" }),
+      expect.objectContaining({ category: "enabled-plugins-non-boolean", message: "A non-boolean enabledPlugins value was ignored" }),
+    ]));
+    const captured = JSON.stringify(project.pluginInventory.diagnostics);
+    for (const rejected of ["SECRET-BAD-IDENTITY", "safe@official", "RAW-SECRET-VALUE", userDir, repo]) expect(captured).not.toContain(rejected);
+  });
+
+  it("does not reread observational metadata while building or rendering doctor after capture", () => {
+    const { repo, userDir } = makeBase();
+    const root = makeMarketplacePlugin(userDir, "official", "alpha");
+    const manifest = path.join(root, ".claude-plugin", "plugin.json");
+    write(manifest, JSON.stringify({ name: "alpha", description: "captured description" }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": false } }));
+    const originalOpen = fs.openSync;
+    let manifestReads = 0;
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((filePath: fs.PathLike, ...args: unknown[]) => {
+      if (path.resolve(String(filePath)) === path.resolve(manifest)) manifestReads += 1;
+      return (originalOpen as (...values: unknown[]) => number)(filePath, ...args);
+    }) as typeof fs.openSync);
+    try {
+      const project = load(repo, userDir);
+      const readsAfterCapture = manifestReads;
+      expect(readsAfterCapture).toBeGreaterThan(0);
+      expect(project.pluginInventory.find("alpha@official")?.installations[0]?.metadata?.description).toBe("captured description");
+      fs.rmSync(manifest);
+
+      const report = buildCompatReport(project);
+      const doctor = renderDoctorReport(project, report);
+      expect(project.pluginInventory.find("alpha@official")?.installations[0]?.metadata?.description).toBe("captured description");
+      expect(report.pluginInventory?.counts.known).toBe(1);
+      expect(doctor).toContain("known: 1");
+      expect(manifestReads).toBe(readsAfterCapture);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it("builds capability evidence only after plugin agent and hook validation", () => {
+    const { repo, userDir } = makeBase();
+    const root = makeMarketplacePlugin(userDir, "official", "alpha");
+    write(path.join(root, "agents", "alpha-agent.md"), "---\nname: alpha-agent\ndescription: alpha\npermissionMode: bypassPermissions\nhooks: {}\nmcpServers: {}\n---\nprompt");
+    write(path.join(root, "hooks", "hooks.json"), JSON.stringify({
+      FuturePluginEvent: [{ hooks: [{ type: "prompt", prompt: "ignored" }, { type: "future-handler" }] }],
+      Notification: [{ hooks: [{ type: "command", command: "echo never" }] }],
+      PreToolUse: [
+        { hooks: [
+          { type: "command", command: "echo safe" }, { type: "command", command: "echo safe" }, { type: "command", command: "" }, { type: "command", command: "   " },
+          { type: "http", url: "https://example.test/hook" }, { type: "http", url: "https://example.test/hook" }, { type: "http", url: "not a url" },
+          { type: "agent" }, { type: "mcp_tool" },
+        ] },
+        { matcher: "Read", if: "Read(src/**)", hooks: [{ type: "command", command: "echo safe" }] },
+        { matcher: "Write", if: "Read(src/**)", hooks: [{ type: "command", command: "echo safe" }] },
+        { matcher: "Write", if: "Edit(src/**)", hooks: [{ type: "command", command: "echo safe" }] },
+      ],
+      SessionStart: [{ hooks: [{ type: "mcp_tool" }] }],
+    }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+
+    const project = load(repo, userDir);
+
+    expect(project.pluginInventory.capabilityEvidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "agent.frontmatter.permissionMode" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "agent.frontmatter.hooks" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "agent.frontmatter.mcpServers" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "hook.event.FuturePluginEvent", observation: "Plugin hook event is unassessed because its capability registry entry is absent" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "hook.event.Notification", observation: "Plugin hook event support is degraded-noop" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.prompt", observation: "Plugin hook handler support is degraded-noop" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.http", observation: "Plugin hook handler support is partial" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.agent", observation: "Plugin hook handler support is degraded-noop" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.mcp_tool-blocking-enforcement", component: "PreToolUse" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.mcp_tool", component: "SessionStart" }),
+      expect.objectContaining({ qualifiedIdentity: "alpha@official", capabilityId: "feature.hook-handler.future-handler", observation: "Capability observation is unassessed because its registry entry is absent" }),
+    ]));
+    expect(project.pluginInventory.capabilityEvidence.some((item) => item.capabilityId === "feature.hook-handler.command")).toBe(false);
+    expect(project.pluginInventory.find("alpha@official")!.components.filter((item) => item.origin === "final-runtime")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "skills", count: 1, countSemantics: "finalized-registrations" }),
+      expect.objectContaining({ kind: "agents", count: 1, countSemantics: "finalized-registrations" }),
+      expect.objectContaining({ kind: "hooks", count: 7, countSemantics: "retained-executable-registrations" }),
+    ]));
+  });
+
+  it("derives final component counts from post-dedupe registries and skill overrides", () => {
+    const { repo, userDir } = makeBase(); const alpha = makeMarketplacePlugin(userDir, "official", "alpha"); const beta = makeMarketplacePlugin(userDir, "official", "beta");
+    for (const root of [alpha, beta]) write(path.join(root, "hooks", "hooks.json"), JSON.stringify({ PreToolUse: [{ hooks: [{ type: "command", command: "echo shared" }] }] }));
+    write(path.join(repo, ".claude", "skills", "project-alpha", "SKILL.md"), "---\nname: alpha:alpha-skill\ndescription: project wins\n---\nbody");
+    write(path.join(repo, ".claude", "skills", "project-run", "SKILL.md"), "---\nname: alpha:run\ndescription: project wins\n---\nbody");
+    write(path.join(repo, ".claude", "agents", "project-alpha.md"), "---\nname: alpha:alpha-agent\ndescription: project wins\n---\nprompt");
+    write(path.join(alpha, "commands", "run.md"), "overridden plugin command");
+    write(path.join(alpha, "commands", "retained.md"), "retained plugin command");
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true, "beta@official": true }, skillOverrides: { "beta:beta-skill": "off" } }));
+    const project = load(repo, userDir);
+    expect(project.pluginInventory.find("alpha@official")!.components.filter((item) => item.origin === "final-runtime")).toEqual([
+      expect.objectContaining({ kind: "commands", count: 1, countSemantics: "finalized-registrations" }),
+      expect.objectContaining({ kind: "hooks", count: 1, countSemantics: "retained-executable-registrations" }),
+    ]);
+    expect(project.pluginInventory.find("beta@official")!.components.filter((item) => item.origin === "final-runtime")).toEqual([
+      expect.objectContaining({ kind: "agents", count: 1, countSemantics: "finalized-registrations" }),
+      expect.objectContaining({ kind: "hooks", count: 1, countSemantics: "retained-executable-registrations" }),
+    ]);
+  });
+
+  it("uses command-scoped inventory guidance through the integrated construction seam", () => {
+    const { repo, userDir } = makeBase();
+    const project = loadClaudeProject({ cwd: repo, userDir, managedSettingsPaths: [], managedArtifactDirs: [], pluginInventoryLifetime: "command" });
+    expect(project.pluginInventory.lifetime).toBe("command");
+    expect(project.pluginInventory.refreshGuidance).toBe("Captured for this command; run the command again to refresh.");
+    expect(project.pluginInventory.refreshGuidance).not.toContain("/reload");
+  });
+
+  it("classifies the canonical active project and distinct main checkout in linked-worktree inventory", () => {
+    const base = makeTmp();
+    const main = path.join(base, "main");
+    const linked = path.join(base, "linked");
+    const userDir = path.join(base, "home", ".claude");
+    const admin = path.join(main, ".git", "worktrees", "linked");
+    fs.mkdirSync(linked, { recursive: true });
+    write(path.join(linked, ".git"), `gitdir: ${admin}`);
+    write(path.join(admin, "gitdir"), path.join(linked, ".git"));
+    write(path.join(admin, "commondir"), "../..");
+    makeMarketplacePlugin(userDir, "official", "alpha");
+    const statePath = path.join(userDir, "plugins", "installed_plugins.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      plugins: Record<string, Array<Record<string, unknown>>>;
+    };
+    Object.assign(state.plugins["alpha@official"]![0]!, { scope: "project", projectPath: main });
+    write(statePath, JSON.stringify(state));
+    write(path.join(linked, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+
+    const item = load(linked, userDir).pluginInventory.find("alpha@official")!;
+
+    expect(item.enablement?.source).toEqual({ kind: "project", display: "<project>/.claude/settings.json" });
+    expect(item.selectedInstallation?.project).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
+    expect(item.installations[0]?.projectLocation).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
+  });
+
+  it("keeps a locally cataloged plugin observational when no installed record exists", () => {
+    const { repo, userDir } = makeBase();
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "owner/catalog" } } }));
+    write(path.join(userDir, "plugins", "marketplaces", "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Owner" }, plugins: [{ name: "catalog-only", source: { source: "github", repo: "owner/plugin" }, agents: "./agents" }] }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "catalog-only@official": true } }));
+
+    const project = load(repo, userDir);
+
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.size).toBe(0);
+    expect(project.pluginInventory.find("catalog-only@official")).toMatchObject({ catalogPresence: true, outcome: { status: "enabled-but-uninstalled" } });
+    expect(project.pluginInventory.find("catalog-only@official")!.components).toContainEqual(expect.objectContaining({ kind: "agents", origin: "catalog" }));
   });
 
   it("loads no installed content when enabledPlugins is absent", () => {
@@ -321,6 +524,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
     for (let index = 0; index < 25; index++) {
       write(path.join(alphaRoot, "skills", `malformed-${index}`, "SKILL.md"), `malformed body ${index}`);
     }
+    write(path.join(alphaRoot, "agents", "alpha-agent.md"), "---\nname: alpha-agent\ndescription: alpha\npermissionMode: bypassPermissions\n---\nprompt");
     write(path.join(userDir, "settings.json"), JSON.stringify({
       enabledPlugins: { "alpha@official": true, "beta@official": true },
     }));
@@ -342,9 +546,10 @@ describe("loadClaudeProject — installed hook provenance", () => {
       expect(outcome.context).toBeUndefined();
       expect(outcome.sources).toBeUndefined();
       expect(project.diagnostics.filter((item) => item.message.includes("no description"))).toHaveLength(25);
-      expect(outcome.diagnostics).toHaveLength(3);
+      expect(outcome.diagnostics).toHaveLength(4);
       expect(outcome.diagnostics.map((item) => item.message)).toEqual(expect.arrayContaining([
         "Installed plugin skill/command loader reported malformed content",
+        "Installed plugin agent loader reported a loader warning",
         "Installed plugin hook source loader reported unreadable content",
         "Installed plugin components could not be loaded safely; all contributions were rejected",
       ]));
@@ -354,6 +559,12 @@ describe("loadClaudeProject — installed hook provenance", () => {
       expect(JSON.stringify(outcome.diagnostics)).not.toContain(hookPath);
       expect(JSON.stringify(outcome.diagnostics)).not.toContain("private close-to-use path");
       expect(project.plugins.map((item) => item.pluginId)).toEqual(["beta@official"]);
+      expect(project.pluginInventory.find("alpha@official")).toMatchObject({
+        outcome: { status: "rejected" },
+        selectedInstallation: { scope: "user", root: { kind: "plugin-cache" } },
+      });
+      expect(project.pluginInventory.find("alpha@official")!.components.filter((item) => item.origin === "final-runtime")).toEqual([]);
+      expect(project.pluginInventory.capabilityEvidence.some((item) => item.qualifiedIdentity === "alpha@official" && item.capabilityId === "agent.frontmatter.permissionMode")).toBe(false);
       expect(project.skills.some((item) => item.source.pluginId === "alpha@official")).toBe(false);
       expect(project.agents.some((item) => item.source.pluginId === "alpha@official")).toBe(false);
       expect(JSON.stringify(project.mergedHooks)).not.toContain("alpha-hook");

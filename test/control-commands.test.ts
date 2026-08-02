@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -47,8 +48,8 @@ function reset() {
   pi.entries.length = 0;
 }
 
-function controlEntry(command: string) {
-  return pi.entries.find((e) => e.customType === "picc-control" && e.data?.command === command);
+function controlEntry(command: string, owner: FakePi = pi) {
+  return owner.entries.find((e) => e.customType === "picc-control" && e.data?.command === command);
 }
 
 function installPluginFixture(
@@ -489,6 +490,7 @@ describe("reserved plugin-management commands", () => {
       const agentDir = path.join(projectRoot, ".claude", "agents");
       fs.mkdirSync(agentDir, { recursive: true });
       fs.writeFileSync(path.join(agentDir, "skill-runner.md"), "---\nname: skill-runner\ndescription: subagent skill test\n---\nRun skills.\n", "utf8");
+      installPluginFixture(projectRoot, "same@market", "same", () => undefined);
       for (const name of ["plugin", "plugins", "reload-plugins"]) {
         for (const skillName of [`owner-${name}:${name}`, `other-${name}:${name}`]) {
           const skillDir = path.join(projectRoot, ".claude", "skills", skillName.replace(":", "-"));
@@ -508,47 +510,114 @@ describe("reserved plugin-management commands", () => {
         ["json", () => fresh.ctx({ mode: "json", hasUI: false })],
         ["rpc", () => fresh.rpcCtx()],
       ] as const;
-      const fixedOutputs = new Map<string, string>();
-      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
-        for (const [mode, makeCtx] of admissionModes) {
-          fresh.messages.length = 0;
+      for (const [mode, makeCtx] of admissionModes) {
+        for (const [name, command] of [
+          ["plugin", "/PlUgIn list"],
+          ["plugins", "/PlUgInS"],
+          ["reload-plugins", "/ReLoAd-PlUgInS"],
+        ] as const) {
           fresh.entries.length = 0;
-          const mixed = name === "reload-plugins" ? "ReLoAd-PlUgInS" : name === "plugins" ? "PlUgInS" : "PlUgIn";
-          const secret = `SECRET-${name}-${mode}`;
-          expect(await fresh.fire("input", {
-            text: `  /${mixed}   ${secret}  `,
-            source: mode === "tui" ? "interactive" : mode,
-          }, makeCtx())).toEqual({ action: "handled" });
-          const output = String(fresh.entries.find((entry) => entry.data?.command === name)?.data?.output ?? "");
-          expect(output).not.toContain(secret);
-          expect(JSON.stringify(fresh.messages)).not.toContain("MUST-NOT-EGRESS");
-          const prior = fixedOutputs.get(name);
-          if (prior === undefined) fixedOutputs.set(name, output);
-          else expect(output).toBe(prior);
+          const customBaseline = fresh.customs.length;
+          expect(await fresh.fire("input", { text: command, source: mode }, makeCtx())).toEqual({ action: "handled" });
+          const output = String(controlEntry(name, fresh)?.data?.output ?? "");
+          if (name === "reload-plugins") expect(output).toContain("/reload-plugins did no reload");
+          else {
+            expect(output).toContain("Plugin inventory (read-only)");
+            expect(output).toContain("captured for this session");
+          }
+          expect(fresh.customs).toHaveLength(customBaseline);
         }
       }
 
-      for (const name of ["plugin", "plugins"] as const) {
-        const output = fixedOutputs.get(name) ?? "";
-        expect(output).toContain("Claude Code");
-        expect(output).toContain("canonical /reload in the interactive TUI");
-        expect(output).toContain("whole extension, including installed plugin state");
-        expect(output).toContain("or exit and relaunch");
-        expect(output).toContain("/new does not reload plugin state");
-        expect(output).toContain("no changes were made");
+      const bareOutputs: string[] = [];
+      for (const [mode, makeCtx] of admissionModes.filter(([mode]) => mode !== "tui")) {
+        fresh.entries.length = 0;
+        const customBaseline = fresh.customs.length;
+        expect(await fresh.fire("input", { text: "/plugin list", source: mode }, makeCtx())).toEqual({ action: "handled" });
+        const explicit = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        expect(explicit).toContain("Plugin: same@market");
+        fresh.entries.length = 0;
+        expect(await fresh.fire("input", { text: "/plugin", source: mode }, makeCtx())).toEqual({ action: "handled" });
+        const bare = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        bareOutputs.push(bare);
+        expect(bare).toBe(explicit);
+        expect(fresh.customs).toHaveLength(customBaseline);
       }
-      const reloadOutput = fixedOutputs.get("reload-plugins") ?? "";
+      expect(new Set(bareOutputs).size).toBe(1);
+      expect(bareOutputs[0]).toContain("Plugin inventory (read-only)");
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(sdk.promptCalls()).toBe(0);
+
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugins").handler("", fresh.printCtx());
+      const alias = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
+      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(alias);
+
+      for (const invalid of ["install same@market", "details same", "details --force", "list extra", "--help"]) {
+        fresh.entries.length = 0;
+        expect(await fresh.fire("input", { text: `/plugin ${invalid}`, source: "rpc" }, fresh.rpcCtx()))
+          .toEqual({ action: "handled" });
+        const usage = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        expect(usage).toContain("Read-only usage: /plugin list | /plugin details <plugin@marketplace>");
+        expect(usage).toContain("No changes were made");
+        expect(usage).toContain("Manage plugin installation and enablement in Claude Code.");
+        expect(usage).toContain("canonical /reload in the interactive TUI or exit and relaunch PiCC");
+        expect(usage).not.toContain(invalid);
+      }
+
+      fresh.entries.length = 0;
+      expect(await fresh.fire("input", { text: "/plugins extra", source: "json" }, fresh.ctx({ mode: "json", hasUI: false })))
+        .toEqual({ action: "handled" });
+      expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toContain("No changes were made");
+
+      for (const [malformed, command, marker] of [
+        ["/plugin\v", "plugin", "Read-only usage:"],
+        ["/plugin\vlist", "plugin", "Read-only usage:"],
+        ["/plugins\v", "plugins", "Read-only usage:"],
+        ["/plugins\vlist", "plugins", "Read-only usage:"],
+        ["\u0001/plugin list", "plugin", "Read-only usage:"],
+        ["/reload-plugins\v", "reload-plugins", "/reload-plugins did no reload"],
+        ["/ReLoAd-PlUgInS\vSECRET-MALFORMED-TAIL", "reload-plugins", "/reload-plugins did no reload"],
+      ] as const) {
+        fresh.entries.length = 0;
+        expect(await fresh.fire("input", { text: malformed, source: "rpc" }, fresh.rpcCtx()))
+          .toEqual({ action: "handled" });
+        const output = String(controlEntry(command, fresh)?.data?.output ?? "");
+        expect(output).toContain(marker);
+        expect(output).not.toContain("Plugin inventory (read-only)");
+        expect(output).not.toMatch(/[\u0001\v]|SECRET-MALFORMED-TAIL/u);
+      }
+      for (const [command, args, marker] of [
+        ["plugin", "\v", "Read-only usage:"],
+        ["plugin", "\vlist", "Read-only usage:"],
+        ["plugins", "\v", "Read-only usage:"],
+        ["plugins", "\vlist", "Read-only usage:"],
+        ["reload-plugins", "\v", "/reload-plugins did no reload"],
+        ["reload-plugins", "\vSECRET-MALFORMED-TAIL", "/reload-plugins did no reload"],
+      ] as const) {
+        fresh.entries.length = 0;
+        await fresh.commands.get(command).handler(args, fresh.rpcCtx());
+        const output = String(controlEntry(command, fresh)?.data?.output ?? "");
+        expect(output).toContain(marker);
+        expect(output).not.toContain("SECRET-MALFORMED-TAIL");
+      }
+      expect(hookFixture!.spawnedChildren()).toHaveLength(0);
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(sdk.promptCalls()).toBe(0);
+
+      fresh.entries.length = 0;
+      await fresh.commands.get("reload-plugins").handler("SECRET-ARG-MUST-NOT-REFLECT", fresh.tuiCtx());
+      const reloadOutput = String(controlEntry("reload-plugins", fresh)?.data?.output ?? "");
       expect(reloadOutput).toContain("/reload-plugins did no reload");
       expect(reloadOutput).toContain("canonical /reload in the interactive TUI");
       expect(reloadOutput).toContain("whole extension, including installed plugin state");
       expect(reloadOutput).toContain("or exit and relaunch");
-
-      for (const name of ["plugin", "plugins", "reload-plugins"] as const) {
-        await fresh.commands.get(name).handler("SECRET-ARG-MUST-NOT-REFLECT", fresh.tuiCtx());
-        const direct = [...fresh.entries].reverse().find((entry) => entry.data?.command === name)?.data?.output;
-        expect(direct).toBe(fresh.entries.find((entry) => entry.data?.command === name)?.data?.output);
-        expect(String(direct)).not.toContain("SECRET-ARG-MUST-NOT-REFLECT");
-      }
+      expect(reloadOutput).not.toContain("SECRET-ARG-MUST-NOT-REFLECT");
+      expect(JSON.stringify(fresh.messages)).not.toContain("MUST-NOT-EGRESS");
 
       const slash = fresh.tools.get("SlashCommand");
       const skill = fresh.tools.get("Skill");
@@ -579,9 +648,14 @@ describe("reserved plugin-management commands", () => {
       }
 
       expect(hookFixture!.spawnedChildren()).toHaveLength(0);
-      const nearPrefix = await fresh.fire("input", { text: "/pluginx", source: "rpc" }, fresh.rpcCtx());
-      expect(nearPrefix).toMatchObject({ action: "transform" });
-      expect(nearPrefix.text).toContain("/pluginx");
+      for (const nonOwned of [
+        "/pluginx", "/plugin:skill", "/plugin\u017f", "/plug\u0131n", "/plugins\u0430",
+        "/reload-pluginsx", "/reload-plugins:skill", "/reload-plugin\u017f",
+      ]) {
+        const nearPrefix = await fresh.fire("input", { text: nonOwned, source: "rpc" }, fresh.rpcCtx());
+        expect(nearPrefix).toMatchObject({ action: "transform" });
+        expect(nearPrefix.text).toContain(nonOwned);
+      }
     } finally {
       await hookFixture?.cleanup("reserved-submit");
       cleanupFixture(root);
@@ -607,6 +681,208 @@ describe("reserved plugin-management commands", () => {
         await expect(subagentSkill.execute!("sub-absent", { name })).rejects.toThrow("reserved plugin-management name");
       }
     } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("keeps qualified same-name identities distinct and opens/closes the TUI without a transcript row", async () => {
+    const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
+      installPluginFixture(projectRoot, "same@market-a", "same", () => undefined);
+      installPluginFixture(projectRoot, "same@market-b", "same", () => undefined);
+    });
+    try {
+      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
+      const list = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      expect(list).toContain("Plugin: same@market-a");
+      expect(list).toContain("Plugin: same@market-b");
+
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("details same@market-b", fresh.rpcCtx());
+      const details = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      expect(details).toContain("Plugin: same@market-b");
+      expect(details).not.toContain("Plugin: same@market-a");
+
+      fresh.entries.length = 0;
+      const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
+      await Promise.resolve();
+      const custom = fresh.customs.at(-1)!;
+      await custom.ready;
+      custom.input("\u001b[C");
+      expect(custom.render(72).join("\n")).toContain("same@market-a");
+      custom.input("\u001b[B");
+      custom.input("\r");
+      expect(custom.render(72).join("\n")).toContain("same@market-b");
+      custom.input("\u001b");
+      custom.input("\u001b");
+      await opening;
+      expect(fresh.entries).toEqual([]);
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("uses a bounded list fallback when interactive opening is unavailable or rejected", async () => {
+    const { fresh, root } = await freshControlPi();
+    try {
+      for (const ui of [
+        { notify: () => undefined },
+        { notify: () => undefined, custom: async () => { throw new Error("CUSTOM_OPEN_CANARY"); } },
+      ]) {
+        fresh.entries.length = 0;
+        expect(await fresh.fire("input", { text: "/plugin", source: "interactive" }, fresh.tuiCtx({ ui })))
+          .toEqual({ action: "handled" });
+        const output = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        expect(output).toMatch(/Interactive plugin inventory (?:is unavailable in this TUI|could not open)/);
+        expect(output).toContain("Plugin inventory (read-only)");
+        expect(output).not.toMatch(/CUSTOM_OPEN_CANARY|open-failed/);
+      }
+    } finally {
+      cleanupFixture(root);
+    }
+  });
+
+  it("keeps mutation rejection final when transcript append and text stdout presentation both fail", async () => {
+    const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+    const { fresh, root } = await freshControlPi({
+      sdk: sdk.sdk,
+      mcpControl: { writeText: () => { throw new Error("STDOUT_PLUGIN_CANARY"); } },
+    });
+    const append = fresh.api.appendEntry;
+    try {
+      fresh.api.appendEntry = () => { throw new Error("APPEND_PLUGIN_CANARY"); };
+      expect(await fresh.fire("input", { text: "/plugin install SECRET_MUTATION", source: "print" }, fresh.printCtx()))
+        .toEqual({ action: "handled" });
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(sdk.promptCalls()).toBe(0);
+      expect(JSON.stringify(fresh.entries)).not.toMatch(/SECRET_MUTATION|(?:APPEND|STDOUT)_PLUGIN_CANARY/);
+    } finally {
+      fresh.api.appendEntry = append;
+      cleanupFixture(root);
+    }
+  });
+
+  it("keeps one attached snapshot and model-visible state unchanged while backing files change and the manager navigates", async () => {
+    const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+    let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
+    const runtimeCalls: string[] = [];
+    const inertMcp = {
+      whenSettled: async () => { runtimeCalls.push("settle"); }, tools: () => { runtimeCalls.push("tools"); return []; },
+      prompts: () => { runtimeCalls.push("prompts"); return []; }, resourceServers: () => { runtimeCalls.push("resources"); return []; },
+      callTool: async () => { runtimeCalls.push("callTool"); throw new Error("not called"); },
+      getPrompt: async () => { runtimeCalls.push("getPrompt"); throw new Error("not called"); },
+      readResource: async () => { runtimeCalls.push("readResource"); throw new Error("not called"); },
+      diagnostics: () => [], serverStates: () => [], shutdown: async () => { runtimeCalls.push("shutdown"); },
+    };
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk, mcpRuntime: inertMcp }, (projectRoot) => {
+      hookFixture = createHookProcessFixture(projectRoot);
+      installPluginFixture(projectRoot, "locked@market", "locked", (installRoot) => {
+        const skillDir = path.join(installRoot, "skills", "snapshot-witness");
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: snapshot-witness\ndescription: DISTINCTIVE_CAPTURED_PLUGIN_RESOURCE\n---\nDISTINCTIVE_LAZY_PLUGIN_BODY\n",
+          "utf8",
+        );
+      });
+      fs.writeFileSync(path.join(projectRoot, "CLAUDE.md"), "DISTINCTIVE_CAPTURED_PROJECT_CONTEXT\n", "utf8");
+      const resourceSkillDir = path.join(projectRoot, ".claude", "skills", "captured-resource");
+      fs.mkdirSync(resourceSkillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(resourceSkillDir, "SKILL.md"),
+        "---\nname: captured-resource\ndescription: DISTINCTIVE_CAPTURED_PROMPT_RESOURCE\n---\nDISTINCTIVE_LAZY_PROJECT_BODY\n",
+        "utf8",
+      );
+      fs.writeFileSync(path.join(projectRoot, ".claude", "settings.json"), JSON.stringify({
+        env: hookFixture!.env,
+        hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: hookFixture!.command, args: ["complete", "inventory-hook"] }] }] },
+      }), "utf8");
+    });
+    try {
+      const beforePrompt = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
+      expect(JSON.stringify(beforePrompt)).toContain("DISTINCTIVE_CAPTURED_PROJECT_CONTEXT");
+      expect(JSON.stringify(beforePrompt)).toContain("DISTINCTIVE_CAPTURED_PLUGIN_RESOURCE");
+      expect(JSON.stringify(beforePrompt)).toContain("DISTINCTIVE_CAPTURED_PROMPT_RESOURCE");
+      expect(JSON.stringify(beforePrompt)).not.toMatch(/DISTINCTIVE_LAZY_(?:PLUGIN|PROJECT)_BODY/);
+      const resourcesBefore = await fresh.fire("resources_discover", { reason: "startup" }, fresh.printCtx());
+      const readPromptResourceEvidence = () => (resourcesBefore.promptPaths as string[]).flatMap((promptRoot) =>
+        fs.readdirSync(promptRoot, { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+          .map((entry) => fs.readFileSync(path.join(entry.parentPath, entry.name), "utf8")),
+      ).join("\n");
+      const promptResourceEvidence = readPromptResourceEvidence();
+      expect(promptResourceEvidence).toContain("DISTINCTIVE_CAPTURED_PROMPT_RESOURCE");
+      expect(promptResourceEvidence).not.toMatch(/DISTINCTIVE_LAZY_(?:PLUGIN|PROJECT)_BODY/);
+      const runtimeBaseline = [...runtimeCalls];
+      const providerBaseline = fresh.providerRegistrations.length;
+      const tree = (directory: string): string[] => fs.readdirSync(directory, { recursive: true, withFileTypes: true })
+        .map((entry) => `${entry.isDirectory() ? "d" : "f"}:${path.relative(directory, path.join(entry.parentPath, entry.name)).replaceAll("\\", "/")}${entry.isFile() ? `:${fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")}` : ""}`)
+        .sort();
+      const fetchTrap = vi.fn(() => { throw new Error("inventory network access forbidden"); });
+      vi.stubGlobal("fetch", fetchTrap);
+      const connectTrap = vi.spyOn(net, "connect").mockImplementation((() => { throw new Error("inventory socket access forbidden"); }) as typeof net.connect);
+      const createConnectionTrap = vi.spyOn(net, "createConnection").mockImplementation((() => { throw new Error("inventory socket access forbidden"); }) as typeof net.createConnection);
+      const projectBefore = tree(root);
+      const profileBefore = tree(path.join(root, ".claude-user"));
+      try {
+      const compactBaseline = fresh.compactCalls.length;
+      const customBaseline = fresh.customs.length;
+      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
+      const listBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
+      const detailsBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      expect(tree(root)).toEqual(projectBefore);
+      expect(tree(path.join(root, ".claude-user"))).toEqual(profileBefore);
+
+      fs.rmSync(path.join(root, ".claude-user", "plugins"), { recursive: true, force: true });
+      fs.rmSync(path.join(root, ".claude-user", "settings.json"), { force: true });
+      const projectAfterBackingChange = tree(root);
+      const profileAfterBackingChange = tree(path.join(root, ".claude-user"));
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
+      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(listBefore);
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
+      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(detailsBefore);
+
+      fresh.entries.length = 0;
+      const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
+      await Promise.resolve();
+      const custom = fresh.customs.at(-1)!;
+      await custom.ready;
+      custom.input("\u001b[C");
+      expect(custom.render(72).join("\n")).toContain("locked@market");
+      custom.input("\u001b[D");
+      custom.input("\u001b");
+      await opening;
+      expect(fresh.customs).toHaveLength(customBaseline + 1);
+      const afterPrompt = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
+      expect(afterPrompt).toEqual(beforePrompt);
+      expect(readPromptResourceEvidence()).toBe(promptResourceEvidence);
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(fresh.modelSets).toEqual([]);
+      expect(fresh.thinkingLevels).toEqual([]);
+      expect(sdk.promptCalls()).toBe(0);
+      expect(runtimeCalls).toEqual(runtimeBaseline);
+      expect(fresh.providerRegistrations).toHaveLength(providerBaseline);
+      expect(fresh.compactCalls).toHaveLength(compactBaseline);
+      expect(hookFixture!.spawnedChildren()).toHaveLength(0);
+      expect(tree(root)).toEqual(projectAfterBackingChange);
+      expect(tree(path.join(root, ".claude-user"))).toEqual(profileAfterBackingChange);
+      expect(fetchTrap).not.toHaveBeenCalled();
+      expect(connectTrap).not.toHaveBeenCalled();
+      expect(createConnectionTrap).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+        connectTrap.mockRestore();
+        createConnectionTrap.mockRestore();
+      }
+    } finally {
+      await hookFixture?.cleanup("inventory-hook");
       cleanupFixture(root);
     }
   });
@@ -679,33 +955,88 @@ describe("pre-selection plugin discovery to first use", () => {
 });
 
 describe("plugin startup warning wiring", () => {
-  it("warns once at TUI startup and stderr in headless startup, while non-startup and valid outcomes stay quiet", async () => {
-    const failed = [{ pluginId: "missing@market", status: "enabled-but-uninstalled" as const, diagnostics: [] }];
-    const tui = await freshControlPi({ pluginResolutionOutcomes: failed });
-    const headless = await freshControlPi({ pluginResolutionOutcomes: failed });
-    const valid = await freshControlPi({ pluginResolutionOutcomes: [
-      { pluginId: "loaded@market", status: "loaded", diagnostics: [] },
-      { pluginId: "disabled@market", status: "disabled", diagnostics: [] },
-    ] });
+  it("uses the snapshot once per session mode, preserves same-name qualified identities, and redacts raw diagnostics", async () => {
+    const missingSetup = (root: string) => {
+      const userDir = path.join(root, ".claude-user");
+      fs.mkdirSync(userDir, { recursive: true });
+      fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({
+        enabledPlugins: { "same@market-a": true, "same@market-b": true },
+      }), "utf8");
+    };
+    const omissionSetup = (root: string) => {
+      const pluginDir = path.join(root, ".claude-user", "plugins");
+      fs.mkdirSync(pluginDir, { recursive: true });
+      fs.writeFileSync(path.join(pluginDir, "known_marketplaces.json"), JSON.stringify(Object.fromEntries(
+        Array.from({ length: 300 }, (_, index) => [
+          index === 299 ? "SECRET_RAW_DIAGNOSTIC_PATH_C:/private/plugin-state" : `malformed-${index}`,
+          { source: { source: "directory" } },
+        ]),
+      )), "utf8");
+    };
+    const tui = await freshControlPi(undefined, missingSetup);
+    const headless = await freshControlPi(undefined, missingSetup);
+    const throwing = await freshControlPi(undefined, missingSetup);
+    let throwingNotifyCalls = 0;
+    const omitted = await freshControlPi(undefined, omissionSetup);
+    const quiet = await freshControlPi();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await tui.fresh.fire("session_start", { reason: "startup" }, tui.fresh.tuiCtx());
-      expect(tui.fresh.notifications.filter((item) => item.text.includes("missing@market"))).toHaveLength(1);
-      tui.fresh.notifications.length = 0;
       await tui.fresh.fire("session_start", { reason: "new" }, tui.fresh.tuiCtx());
       await tui.fresh.fire("session_start", { reason: "reload" }, tui.fresh.tuiCtx());
-      expect(tui.fresh.notifications.filter((item) => item.text.includes("missing@market"))).toHaveLength(0);
+      expect(tui.fresh.notifications).toHaveLength(0);
+      await tui.fresh.fire("session_start", { reason: "startup" }, tui.fresh.tuiCtx());
+      await tui.fresh.fire("session_start", { reason: "startup" }, tui.fresh.tuiCtx());
+      await tui.fresh.fire("session_start", { reason: "new" }, tui.fresh.tuiCtx());
+      await tui.fresh.fire("session_start", { reason: "reload" }, tui.fresh.tuiCtx());
+      const notices = tui.fresh.notifications.filter((item) => item.text.includes("needs attention"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text.match(/same@market-a/g)).toHaveLength(1);
+      expect(notices[0]!.text.match(/same@market-b/g)).toHaveLength(1);
+      expect(notices[0]!.text).toContain("Run /doctor for details");
+      expect(notices[0]!.text).not.toMatch(/installed_plugins|\.claude-user|SECRET_RAW_DIAGNOSTIC_PATH|C:\/private/i);
+
+      await omitted.fresh.fire("session_start", { reason: "startup" }, omitted.fresh.tuiCtx());
+      await omitted.fresh.fire("session_start", { reason: "startup" }, omitted.fresh.tuiCtx());
+      const omissionNotices = omitted.fresh.notifications.filter((item) => item.text.includes("This startup notice is abbreviated"));
+      expect(omissionNotices).toHaveLength(1);
+      expect(omissionNotices[0]!.text.split("\n").at(-1)).toBe("This startup notice is abbreviated.");
+      expect(omissionNotices[0]!.text).not.toMatch(/\/plugin list|\/doctor|all omission|omission counts|complete inventory|recovery/i);
+      expect(omissionNotices[0]!.text).not.toMatch(/malformed-299|SECRET_RAW_DIAGNOSTIC_PATH|C:\/private/i);
+      await omitted.fresh.commands.get("plugin").handler("list", omitted.fresh.tuiCtx());
+      const omittedList = String(controlEntry("plugin", omitted.fresh)?.data?.output ?? "");
+      expect(omittedList).toContain("Snapshot-capture evidence omissions:");
+      expect(omittedList).toContain("loader.marketplace.diagnostics=172");
+      expect(omittedList).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
+      expect(omissionNotices[0]!.text).not.toContain("loader.marketplace.diagnostics");
+      expect(omissionNotices[0]!.text).not.toContain("loader.marketplace.diagnostics=172");
+      expect(omissionNotices[0]!.text).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH_C:/private/plugin-state");
+      expect(omissionNotices[0]!.text).not.toContain("Snapshot-capture evidence omissions");
 
       await headless.fresh.fire("session_start", { reason: "startup" }, headless.fresh.printCtx());
-      expect(error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("missing@market"))).toHaveLength(1);
+      await headless.fresh.fire("session_start", { reason: "startup" }, headless.fresh.printCtx());
+      const stderr = error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("needs attention"));
+      expect(stderr).toHaveLength(1);
+      expect(stderr[0]).toContain("same@market-a");
+      expect(stderr[0]).toContain("same@market-b");
+      expect(stderr[0]).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
 
-      await valid.fresh.fire("session_start", { reason: "startup" }, valid.fresh.tuiCtx());
-      expect(valid.fresh.notifications.some((item) => item.text.includes("plugin content did not load"))).toBe(false);
+      const notificationFault = throwing.fresh.tuiCtx({
+        ui: { notify: () => { throwingNotifyCalls += 1; throw new Error("SECRET_NOTIFICATION_EXCEPTION_CANARY"); } },
+      });
+      await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
+      await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
+      expect(throwingNotifyCalls).toBe(1);
+      expect(error.mock.calls.flat().join("\n")).not.toContain("SECRET_NOTIFICATION_EXCEPTION_CANARY");
+
+      await quiet.fresh.fire("session_start", { reason: "startup" }, quiet.fresh.tuiCtx());
+      expect(quiet.fresh.notifications.some((item) => item.text.includes("needs attention"))).toBe(false);
     } finally {
       error.mockRestore();
       cleanupFixture(tui.root);
       cleanupFixture(headless.root);
-      cleanupFixture(valid.root);
+      cleanupFixture(throwing.root);
+      cleanupFixture(omitted.root);
+      cleanupFixture(quiet.root);
     }
   });
 });
@@ -762,6 +1093,13 @@ describe("plugin activation runtime failures", () => {
       expect(report).toContain("Plugin runtime failures (execution did not occur):");
       expect(report.match(/broken-plugin-skill/g)?.length).toBe(1);
       expect(report).not.toContain("Unassessed (unknown at baseline");
+
+      fresh.entries.length = 0;
+      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
+      const inventory = String(fresh.entries.at(-1)?.data?.output ?? "");
+      expect(inventory).toContain("Plugin: broken-owner@market");
+      expect(inventory).toContain("runtime: loaded");
+      expect(inventory).toContain("Runtime refusals observed after snapshot capture (display overlay only):");
     } finally {
       cleanupFixture(root);
     }
@@ -793,7 +1131,6 @@ describe("plugin activation runtime failures", () => {
       expect(report).not.toContain("at least 2");
       expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
       expect(report).not.toContain("Reconcile or reinstall the plugin");
-      expect(report).not.toContain("canonical /reload");
       expect(report).toContain("execution did not occur");
 
       for (let index = 22; index < 26; index++) {
@@ -848,7 +1185,6 @@ describe("plugin activation runtime failures", () => {
       const report = String(fresh.entries.at(-1)?.data?.output ?? "");
       expect(report).toContain("Agent \"broken-agent-owner:broken-agent\" did not start");
       expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
-      expect(report).not.toContain("canonical /reload");
       expect(report).not.toContain("trusted context");
     } finally {
       cleanupFixture(root);

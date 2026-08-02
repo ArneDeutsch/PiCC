@@ -2,13 +2,18 @@
 
 const HELP = `Usage: picc [Pi options]
        picc update [--check|--help]
+       picc plugin list
+       picc plugin details <plugin@marketplace>
 
 PiCC options:
   -h, --help       Show this help
   -v, --version    Show PiCC and embedded Pi versions
-  update           Update or repair PiCC`;
+  update           Update or repair PiCC
+  plugin list      List the locally captured plugin inventory (read-only)
+  plugin details   Show one qualified plugin identity (read-only)`;
 const USAGE_ERROR = "PiCC: invalid arguments. Run `picc --help` for usage.";
 const UPDATER_UNAVAILABLE = "PiCC: updater unavailable in this build. Reinstall PiCC or update from its source checkout.";
+const PLUGIN_INVENTORY_UNAVAILABLE = "PiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.";
 const INITIALIZATION_FAILED = "PiCC: launcher initialization failed. Reinstall PiCC from a package or source checkout.";
 const SPAWN_FAILED = "PiCC: could not start the embedded Pi runtime. Run `picc update` or reinstall PiCC.";
 
@@ -55,6 +60,18 @@ async function main() {
         const result = await run({ action: argv[1] === "--check" ? "check" : argv[1] === "--help" ? "help" : "update" });
         if (Number.isInteger(result)) process.exitCode = result;
       } catch { fail(UPDATER_UNAVAILABLE); }
+      return;
+    }
+    if (first === "plugin") {
+      let adapterPath;
+      try {
+        adapterPath = admin.canonicalPath(path.join(packageRoot, "bin", "picc-plugin.mjs"));
+        if (!fs.statSync(adapterPath).isFile() || !admin.isPathInside(adapterPath, packageRoot)) throw new Error();
+        const loaded = await import(url.pathToFileURL(adapterPath).href);
+        if (typeof loaded.runPackagedPluginCommand !== "function") throw new Error();
+        const result = await loaded.runPackagedPluginCommand({ packageRoot, argv: argv.slice(1) });
+        process.exitCode = Number.isInteger(result) ? result : 1;
+      } catch { fail(PLUGIN_INVENTORY_UNAVAILABLE); }
       return;
     }
 

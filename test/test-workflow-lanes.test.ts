@@ -75,8 +75,17 @@ describe("test workflow lanes", () => {
     expect(scripts.test).toBe("vitest run --project unit");
     expect(scripts["test:unit"]).toBe("vitest run --project unit");
     expect(scripts["test:integration"]).toBe("vitest run --project integration");
+    expect(scripts["test:e2e:source"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    );
+    expect(scripts["test:packaged"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
+    );
     expect(scripts["test:e2e"]).toBe(
-      "node scripts/check-real-pi.mjs && vitest run --project e2e",
+      "npm run test:e2e:source && npm run test:packaged",
+    );
+    expect(scripts["test:source"]).toBe(
+      "npm run test:unit && npm run test:integration && npm run test:e2e:source",
     );
     expect(scripts["test:all"]).toBe(
       "npm run test:unit && npm run test:integration && npm run test:e2e",
@@ -120,13 +129,20 @@ describe("test workflow lanes", () => {
     expect(hook).not.toContain("npm install` / `npm ci");
   });
 
-  it("runs unit and integration separately on every CI matrix leg and e2e on both OSes", () => {
+  it("runs unit and integration separately and serializes both e2e products in one OS-matrix job", () => {
     const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/ci.yml"), "utf8")) as {
       jobs: Record<string, {
         strategy: { matrix: { os: string[]; node?: number[] } };
-        steps: Array<{ name?: string; run?: string }>;
+        steps: Array<{
+          name?: string;
+          run?: string;
+          uses?: string;
+          with?: { cache?: string; "node-version"?: number };
+          env?: Record<string, string>;
+        }>;
       }>;
     };
+    expect(Object.keys(workflow.jobs)).toEqual(["test", "e2e"]);
     const matrixJob = workflow.jobs.test!;
     const e2eJob = workflow.jobs.e2e!;
 
@@ -140,6 +156,21 @@ describe("test workflow lanes", () => {
         { name: "Offline integration tests", run: "npm run test:integration" },
       ]);
     expect(e2eJob.strategy.matrix.os).toEqual(["ubuntu-latest", "windows-latest"]);
-    expect(e2eJob.steps.some((step) => step.run === "npm run test:e2e")).toBe(true);
+    expect(e2eJob.steps.filter((step) => step.run?.startsWith("npm run test:")))
+      .toEqual([
+        { name: "Source end-to-end tests", run: "npm run test:e2e:source" },
+        {
+          name: "Packaged end-to-end tests",
+          env: {
+            TEMP: "${{ runner.temp }}",
+            TMP: "${{ runner.temp }}",
+            TMPDIR: "${{ runner.temp }}",
+          },
+          run: "npm run test:packaged",
+        },
+      ]);
+    expect(e2eJob.steps.filter((step) => step.run === "npm ci")).toHaveLength(1);
+    expect(e2eJob.steps.filter((step) => step.uses?.startsWith("actions/setup-node@")))
+      .toEqual([expect.objectContaining({ with: { "node-version": 22, cache: "npm" } })]);
   });
 });

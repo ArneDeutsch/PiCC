@@ -1,6 +1,11 @@
 import path from "node:path";
 import { isFile, readTextSafe } from "../util/fs.js";
 import {
+  isDocumentedMarketplaceName,
+  normalizeMarketplacePolicyDescriptor,
+  normalizeMarketplaceRegistrationRecord,
+} from "../util/plugin-marketplace-descriptor.js";
+import {
   createPluginDiagnosticReporter,
   discoverManagedPolicy,
   isQualifiedPluginId,
@@ -15,6 +20,7 @@ import type {
   HookHandlerType,
   HookMatcherEntry,
   McpSettingsEntry,
+  PluginMarketplaceSettingsContribution,
   Scope,
 } from "../types.js";
 
@@ -76,6 +82,8 @@ function createDefaultSettings(): ClaudeSettings {
     subagentConcurrency: 10,
     enabledPlugins: undefined,
     effectivePluginEnablement: {},
+    pluginMarketplaceSettings: [],
+    pluginMarketplaceSettingsOmissions: { contributions: 0, declarations: 0 },
     mcpSettings: [],
     unknownKeys: [],
     deferredKeys: [],
@@ -541,6 +549,42 @@ function mcpEntryFor(out: ClaudeSettings, scope: Scope, source: string): McpSett
   return entry;
 }
 
+const MAX_MARKETPLACE_SETTINGS_CONTRIBUTIONS = 256;
+const MAX_MARKETPLACE_SETTINGS_DECLARATIONS = 256;
+
+function marketplaceDeclarationCount(out: ClaudeSettings): number {
+  return (out.pluginMarketplaceSettings ?? []).reduce((count, contribution) =>
+    count + Object.keys(contribution.extraKnownMarketplaces ?? {}).length +
+    (contribution.strictKnownMarketplaces?.length ?? 0) + (contribution.blockedMarketplaces?.length ?? 0), 0);
+}
+
+function reportMarketplaceOmission(out: ClaudeSettings, kind: "contributions" | "declarations", source: string): void {
+  const omissions = (out.pluginMarketplaceSettingsOmissions ??= { contributions: 0, declarations: 0 });
+  omissions[kind]++;
+  if (omissions[kind] === 1) out.diagnostics.push({
+    severity: "warning",
+    message: `Additional plugin marketplace settings ${kind} omitted after the aggregate safe limit`,
+    source,
+  });
+}
+
+function marketplaceEntryFor(
+  out: ClaudeSettings,
+  scope: Scope,
+  source: string,
+): PluginMarketplaceSettingsContribution | undefined {
+  const list = (out.pluginMarketplaceSettings ??= []);
+  const last = list.at(-1);
+  if (last !== undefined && last.scope === scope && last.sourcePath === source) return last;
+  if (list.length >= MAX_MARKETPLACE_SETTINGS_CONTRIBUTIONS) {
+    reportMarketplaceOmission(out, "contributions", source);
+    return undefined;
+  }
+  const entry: PluginMarketplaceSettingsContribution = { scope, sourcePath: source };
+  list.push(entry);
+  return entry;
+}
+
 /** Apply one parsed settings file onto the accumulating result (called in ascending precedence). */
 function applySettingsFile(
   raw: Record<string, unknown>,
@@ -734,6 +778,63 @@ function applySettingsFile(
       case "subagents":
         applySubagents(value, scope, source, out);
         break;
+      case "extraKnownMarketplaces": {
+        if (!isPlainObject(value)) {
+          out.diagnostics.push({
+            severity: "warning",
+            message: 'Setting "extraKnownMarketplaces" is not an object; ignored',
+            source,
+          });
+          break;
+        }
+        const entry = marketplaceEntryFor(out, scope, source);
+        if (entry === undefined) break;
+        const declarations: NonNullable<PluginMarketplaceSettingsContribution["extraKnownMarketplaces"]> = Object.create(null);
+        let remaining = Math.max(0, MAX_MARKETPLACE_SETTINGS_DECLARATIONS - marketplaceDeclarationCount(out));
+        let invalidNameIndex = 0;
+        for (const name of Object.keys(value).sort()) {
+          if (remaining-- <= 0) {
+            reportMarketplaceOmission(out, "declarations", source);
+            continue;
+          }
+          const normalized = normalizeMarketplaceRegistrationRecord(value[name], scope);
+          const validName = isDocumentedMarketplaceName(name);
+          const observation = validName ? normalized : { validity: "invalid" as const };
+          declarations[validName ? name : `<invalid-marketplace-${invalidNameIndex++}>`] = observation;
+          if (!validName || observation.validity !== "valid") out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "extraKnownMarketplaces.${validName ? name : "<redacted-invalid-name>"}" has an invalid name or a malformed, unsafe, or indeterminate descriptor; retained as inert evidence`,
+            source,
+          });
+        }
+        entry.extraKnownMarketplaces = declarations;
+        break;
+      }
+      case "strictKnownMarketplaces":
+      case "blockedMarketplaces": {
+        if (!Array.isArray(value)) {
+          out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "${key}" is not an array; ignored`,
+            source,
+          });
+          break;
+        }
+        const entry = marketplaceEntryFor(out, scope, source);
+        if (entry === undefined) break;
+        const remaining = Math.max(0, MAX_MARKETPLACE_SETTINGS_DECLARATIONS - marketplaceDeclarationCount(out));
+        entry[key] = value.slice(0, remaining).map((raw, index) => {
+          const observation = normalizeMarketplacePolicyDescriptor(raw);
+          if (observation.validity !== "valid") out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "${key}[${index}]" has a malformed, unsafe, or unsupported descriptor; retained as inert evidence`,
+            source,
+          });
+          return observation;
+        });
+        for (let index = remaining; index < value.length; index++) reportMarketplaceOmission(out, "declarations", source);
+        break;
+      }
       case "mcpServers": {
         if (!isPlainObject(value)) {
           out.diagnostics.push({

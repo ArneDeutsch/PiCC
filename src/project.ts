@@ -1,9 +1,11 @@
 import path from "node:path";
-import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, ResolvedMcpConfig } from "./types.js";
+import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, HookHandler, PluginRuntimeContext, ResolvedMcpConfig } from "./types.js";
+import { SUPPORTED_HOOK_EVENTS } from "./types.js";
 import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discovery/locations.js";
 import { loadSettings } from "./discovery/settings.js";
 import { resolveMcpConfig } from "./discovery/mcp.js";
 import { resolveClaudeProfile } from "./discovery/claude-profile.js";
+import type { ManagedRegistryAdapter } from "./discovery/managed-policy.js";
 import { loadMcpJson } from "./claude/mcp-config.js";
 import { loadClaudeMcpState } from "./claude/claude-mcp-state.js";
 import { loadPluginSkills, loadSkills } from "./claude/skills.js";
@@ -13,12 +15,18 @@ import { loadClaudeMdHierarchy } from "./claude/claude-md.js";
 import { loadAutoMemory, type MemorySnapshot } from "./claude/memory.js";
 import { parseHookConfig, mergeHookConfigs } from "./claude/hooks.js";
 import { loadPluginInstalledState } from "./claude/plugin-installed-state.js";
+import { loadPluginMarketplaceState } from "./claude/plugin-marketplaces.js";
+import { createPluginMetadataReadCapability } from "./claude/plugin-metadata.js";
+import { buildPluginInventorySnapshot, type PluginInventoryCapabilityEvidence, type PluginInventorySnapshot } from "./plugin-inventory.js";
+import { lookupCapability } from "./registry/capability-registry.js";
 import {
+  authorizedCacheRoots,
   loadPluginHooks,
   resolveInstalledPlugins,
   type InstalledPlugin,
 } from "./claude/plugins.js";
-import type { PluginResolutionOutcome, PluginRuntimeContext } from "./types.js";
+import { projectIdentities } from "./util/project-identity.js";
+import type { PluginResolutionOutcome } from "./types.js";
 
 /**
  * Assemble the full Claude-artifact model of a project: settings with
@@ -33,6 +41,7 @@ export interface LoadedProject extends ClaudeProject {
   plugins: InstalledPlugin[];
   pluginResolutionOutcomes: PluginResolutionOutcome[];
   pluginContexts: ReadonlyMap<string, PluginRuntimeContext>;
+  pluginInventory: PluginInventorySnapshot;
   /** Auto memory: dir + truncated MEMORY.md; undefined when disabled. */
   autoMemory?: MemorySnapshot;
 }
@@ -45,10 +54,16 @@ export function loadClaudeProject(opts: {
   homeDir?: string;
   /** Override managed/policy settings file locations (used by tests). */
   managedSettingsPaths?: string[];
+  /** Override only the Windows managed-policy registry read boundary. */
+  managedPolicyRegistry?: ManagedRegistryAdapter;
+  /** Override managed-policy platform selection (used by deterministic command tests). */
+  managedPolicyPlatform?: NodeJS.Platform;
   /** Override managed/policy artifact base directories (used by tests). */
   managedArtifactDirs?: string[];
+  pluginInventoryLifetime?: "session" | "command";
 }): LoadedProject {
   const diagnostics: Diagnostic[] = [];
+  const env = opts.env ?? process.env;
   const cwd = path.resolve(opts.cwd);
   const profile = resolveClaudeProfile({
     ...(opts.userDir === undefined ? {} : { userDir: opts.userDir }),
@@ -63,6 +78,14 @@ export function loadClaudeProject(opts: {
     projectRoot: root,
     userDir,
     managedPaths: opts.managedSettingsPaths,
+    ...(opts.managedPolicyRegistry === undefined && opts.managedPolicyPlatform === undefined
+      ? {}
+      : {
+          managedPolicy: {
+            ...(opts.managedPolicyRegistry === undefined ? {} : { registry: opts.managedPolicyRegistry }),
+            ...(opts.managedPolicyPlatform === undefined ? {} : { platform: opts.managedPolicyPlatform }),
+          },
+        }),
   });
   const dirs = discoverArtifactDirs({
     cwd,
@@ -74,15 +97,24 @@ export function loadClaudeProject(opts: {
   diagnostics.push(...settings.diagnostics);
   const installedState = loadPluginInstalledState(userDir);
   diagnostics.push(...installedState.diagnostics);
+  const marketplaceState = loadPluginMarketplaceState({
+    userDir,
+    projectRoot: root,
+    settings,
+    env,
+  });
+  diagnostics.push(...marketplaceState.diagnostics);
   const pluginResult = resolveInstalledPlugins({
     userDir,
     projectRoot: root,
     enablement: settings.effectivePluginEnablement ?? {},
     installations: installedState.installations,
     installedStateStatus: installedState.status,
+    env,
   });
   diagnostics.push(...pluginResult.diagnostics);
-  let plugins = pluginResult.plugins;
+  const selectedPlugins = pluginResult.plugins;
+  let plugins = selectedPlugins;
   const pluginResolutionOutcomes = [...pluginResult.outcomes];
 
   // Project/user artifacts retain precedence. Installed plugin contributions are
@@ -96,11 +128,23 @@ export function loadClaudeProject(opts: {
   const loadedPluginSkills = new Map<string, ClaudeSkill[]>();
   const loadedPluginAgents = new Map<string, typeof agents>();
   const loadedPluginHooks = new Map<string, ReturnType<typeof loadPluginHooks>>();
+  const inventoryCapabilityEvidence: PluginInventoryCapabilityEvidence[] = [];
+  type FinalLoadedPluginComponents = { skills: number; commands: number; agents: number; hooks: number };
+  const finalLoadedComponents: Record<string, FinalLoadedPluginComponents> = {};
   const rejectedAtLoad = new Set<string>();
   for (const plugin of plugins) {
     const outcome = pluginResolutionOutcomes.find((item) => item.pluginId === plugin.pluginId)!;
     const pluginSkills = loadPluginSkills(plugin.skillSources, plugin.commandSources);
     const pluginAgents = loadPluginAgents(plugin.agentSources);
+    const stagedAgentEvidence: PluginInventoryCapabilityEvidence[] = [];
+    for (const agent of pluginAgents.agents) for (const field of ["hooks", "mcpServers", "permissionMode"] as const) {
+      if (agent.diagnostics.some((entry) => entry.message.includes(`field "${field}"`))) stagedAgentEvidence.push({
+        capabilityId: `agent.frontmatter.${field}`,
+        qualifiedIdentity: plugin.pluginId,
+        component: agent.name,
+        observation: `Plugin agent field ${field} was stripped before runtime construction`,
+      });
+    }
     const pluginHooks = loadPluginHooks(plugin);
     const loaderEvidence = [
       ...safeLoaderEvidence("skill/command", pluginSkills.diagnostics),
@@ -134,9 +178,11 @@ export function loadClaudeProject(opts: {
     }
     outcome.diagnostics = boundedOutcomeDiagnostics(outcome.diagnostics, loaderEvidence);
 
+    inventoryCapabilityEvidence.push(...stagedAgentEvidence);
     loadedPluginSkills.set(plugin.pluginId, namespacePluginContent(pluginSkills.skills, plugin.name));
     loadedPluginAgents.set(plugin.pluginId, namespacePluginContent(pluginAgents.agents, plugin.name));
     loadedPluginHooks.set(plugin.pluginId, pluginHooks);
+    finalLoadedComponents[plugin.pluginId] = { skills: 0, commands: 0, agents: 0, hooks: 0 };
   }
   if (rejectedAtLoad.size > 0) {
     plugins = plugins.filter((plugin) => !rejectedAtLoad.has(plugin.pluginId));
@@ -196,6 +242,28 @@ export function loadClaudeProject(opts: {
     if (Object.keys(rawHooks.config).length) {
       const parsed = parseHookConfig(rawHooks.config, `plugin:${plugin.pluginId}`, { pluginId: plugin.pluginId });
       diagnostics.push(...parsed.diagnostics);
+      for (const [event, entries] of Object.entries(parsed.config)) {
+        const eventCapabilityId = `hook.event.${event}`;
+        const eventCapability = lookupCapability(eventCapabilityId);
+        if (eventCapability === undefined || eventCapability.tier !== "full") inventoryCapabilityEvidence.push({
+          capabilityId: eventCapabilityId,
+          qualifiedIdentity: plugin.pluginId,
+          component: event,
+          observation: eventCapability === undefined ? "Plugin hook event is unassessed because its capability registry entry is absent" : `Plugin hook event support is ${eventCapability.tier}`,
+        });
+        for (const entry of entries) for (const handler of entry.hooks) {
+          if (handler.type === "command") continue;
+          const blockingMcp = handler.type === "mcp_tool" && ["PreToolUse", "PermissionRequest", "UserPromptSubmit", "Stop", "SubagentStop", "WorktreeCreate"].includes(event);
+          const capabilityId = blockingMcp ? "feature.hook-handler.mcp_tool-blocking-enforcement" : `feature.hook-handler.${handler.type}`;
+          const capability = lookupCapability(capabilityId);
+          inventoryCapabilityEvidence.push({
+            capabilityId,
+            qualifiedIdentity: plugin.pluginId,
+            component: event,
+            observation: capability === undefined ? "Plugin hook handler is unassessed" : `Plugin hook handler support is ${capability.tier}`,
+          });
+        }
+      }
       const outcome = pluginResolutionOutcomes.find((item) => item.pluginId === plugin.pluginId)!;
       outcome.diagnostics = boundedOutcomeDiagnostics(
         outcome.diagnostics,
@@ -204,6 +272,54 @@ export function loadClaudeProject(opts: {
       hookConfigs.push(parsed.config);
     }
   }
+
+  const mergedHooks = mergeHookConfigs(...hookConfigs);
+  for (const pluginId of Object.keys(finalLoadedComponents)) finalLoadedComponents[pluginId] = { skills: 0, commands: 0, agents: 0, hooks: 0 };
+  const incrementFinal = (pluginId: string | undefined, field: keyof FinalLoadedPluginComponents): void => {
+    if (pluginId === undefined || finalLoadedComponents[pluginId] === undefined) return;
+    finalLoadedComponents[pluginId] = { ...finalLoadedComponents[pluginId], [field]: finalLoadedComponents[pluginId][field] + 1 };
+  };
+  for (const skill of skills) incrementFinal(skill.source.pluginId, skill.legacyCommand ? "commands" : "skills");
+  for (const agent of agents) incrementFinal(agent.source.pluginId, "agents");
+  const finalPluginContexts = new Map(plugins.map((plugin) => [plugin.pluginId, plugin.context]));
+  for (const [event, entries] of Object.entries(mergedHooks)) {
+    if (!(SUPPORTED_HOOK_EVENTS as readonly string[]).includes(event)) continue;
+    const seenHandlers = new Set<string>();
+    for (const entry of entries) for (const handler of entry.hooks) {
+      if (!runtimeValidInventoryHandler(handler)) continue;
+      const key = JSON.stringify([
+        entry.matcher ?? null,
+        entry.if ?? null,
+        inventoryHookDedupKey(handler, finalPluginContexts.get(handler.pluginId ?? "")),
+      ]);
+      if (seenHandlers.has(key)) continue;
+      seenHandlers.add(key);
+      incrementFinal(handler.pluginId, "hooks");
+    }
+  }
+
+  const inventoryIdentities = projectIdentities(root);
+  const inventoryProjectRoot = inventoryIdentities.at(-1) ?? root;
+  const inventoryMainCheckout = inventoryIdentities.length > 1 ? inventoryIdentities[0] : undefined;
+  const pluginInventory = buildPluginInventorySnapshot({
+    lifetime: opts.pluginInventoryLifetime ?? "session",
+    projectRoot: inventoryProjectRoot,
+    ...(inventoryMainCheckout === undefined ? {} : { mainCheckout: inventoryMainCheckout }),
+    userDir,
+    installedStateStatus: installedState.status,
+    installedObservations: installedState.observations,
+    installedObservationDiagnostics: installedState.observationDiagnostics,
+    installedObservationOmissions: { ...installedState.observationOmissions },
+    metadataReadCapability: createPluginMetadataReadCapability(authorizedCacheRoots(userDir, env)),
+    enablementDiagnostics: settings.diagnostics,
+    marketplaceState,
+    enablement: settings.effectivePluginEnablement ?? {},
+    outcomes: pluginResolutionOutcomes,
+    selectedPlugins,
+    finalLoadedComponents,
+    diagnostics: [...installedState.diagnostics, ...diagnostics.filter((entry) => entry.category !== undefined)],
+    capabilityEvidence: inventoryCapabilityEvidence,
+  });
 
   return {
     root,
@@ -216,10 +332,11 @@ export function loadClaudeProject(opts: {
     claudeMd: claudeMdResult.files,
     mcp,
     diagnostics,
-    mergedHooks: mergeHookConfigs(...hookConfigs),
+    mergedHooks,
     plugins,
     pluginResolutionOutcomes,
     pluginContexts: new Map(plugins.map((plugin) => [plugin.pluginId, plugin.context])),
+    pluginInventory,
     autoMemory,
   };
 }
@@ -239,6 +356,19 @@ function safeLoaderEvidence(component: string, entries: readonly Diagnostic[]): 
       : "a loader warning";
     return { severity: entry.severity, message: `Installed plugin ${component} loader reported ${reason}` };
   });
+}
+
+function runtimeValidInventoryHandler(handler: HookHandler): boolean {
+  if (handler.type === "command") return typeof handler.command === "string" && handler.command.length > 0;
+  return handler.type === "http" && typeof handler.url === "string" && handler.url.length > 0;
+}
+
+/** Mirrors the hook runner's per-event execution identity without becoming an execution seam. */
+function inventoryHookDedupKey(handler: HookHandler, context: PluginRuntimeContext | undefined): string {
+  return JSON.stringify([
+    handler.pluginId ?? null, context?.root ?? null, context?.dataDir ?? null, context?.projectDir ?? null,
+    handler.type, handler.command ?? null, handler.args ?? null, handler.shell ?? null, handler.url ?? null,
+  ]);
 }
 
 function boundedOutcomeDiagnostics(

@@ -21,8 +21,8 @@ plus unit) before every commit.
 
 ## Develop
 
-The harness is TypeScript loaded by Pi via jiti — there is **no build step**. Run it against any
-Claude Code project from inside that project's directory:
+The TypeScript source is loaded at runtime through the pinned jiti loader — there is **no build
+step**. Run it against any Claude Code project from inside that project's directory:
 
 ```bash
 node <path-to-PiCC>/bin/picc.mjs
@@ -170,8 +170,8 @@ Deliberately out of scope — each for a reason, not from neglect:
   [capability matrix](doc/supported-features.md) records the exact limits and tiers.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
-- **Plugin installation / marketplace.** PiCC loads installed plugins' *content*; it does not
-  install them.
+- **Plugin lifecycle / network acquisition.** PiCC observes local plugin and marketplace state and
+  loads eligible installed content; it does not install, update, remove, refresh, or acquire it.
 - **Fan-out / subscription economics.** How much parallelism a subscription tolerates is the
   project author's concern, not the harness's.
 - **Console UX parity — recognizable, not identical.** We render the Claude-specific concepts that

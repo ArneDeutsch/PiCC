@@ -97,7 +97,10 @@ npm run typecheck:all    # both of the above
 npm test                 # unit lane (same as test:unit)
 npm run test:unit        # isolated and mixed unit-owned files
 npm run test:integration # offline whole-extension integration lane
-npm run test:e2e         # installed-Pi preflight, then the real-Pi e2e lane
+npm run test:source      # unit, integration, then source-only real-Pi e2e
+npm run test:e2e         # source real-Pi e2e, then the packaged-product e2e
+npm run test:e2e:source  # installed-Pi preflight, then source-only real-Pi e2e
+npm run test:packaged    # installed-Pi preflight, then the exact packaged-product e2e
 npm run test:all         # unit, then integration, then e2e
 npm run verify           # routine gate: typecheck:all, then unit
 npm run verify:all       # complete gate: typecheck:all, then all three lanes
@@ -112,10 +115,11 @@ small runners; the cap is the contention lever, not raised timeouts. `test:cover
 in-process projects and cannot measure the real-Pi child process; it is a guidance signal with no
 thresholds.
 
-CI type-checks with `typecheck:all` and runs unit, integration, and e2e as separate lanes across
-Windows/Linux. Contributors who opt in with `npm run hooks:install` get the routine `verify`
-(typecheck plus unit) pre-commit gate. Use `verify` for ordinary task work and `verify:all` for final
-integration and releases.
+CI type-checks with `typecheck:all` and runs unit, integration, and e2e across Windows/Linux. The
+e2e OS-matrix job runs source e2e before packaged e2e after one dependency installation; only the
+packaged step routes temporary I/O through the trusted runner temp directory. Contributors who opt
+in with `npm run hooks:install` get the routine `verify` (typecheck plus unit) pre-commit gate. Use
+`verify` for ordinary task work and `verify:all` for final integration and releases.
 
 For a focused inner loop, pass an exact file through its executable owning lane. The lookup is
 executable: `e2e-*` files belong to e2e; files in `integrationTestFiles` belong to integration; every
@@ -125,10 +129,12 @@ wrong owning lane.
 ```bash
 npm run test:unit -- test/permissions.test.ts
 npm run test:integration -- test/integration-extension.test.ts
-npm run test:e2e -- test/e2e-core.test.ts
+npm run test:e2e:source -- test/e2e-core.test.ts
 ```
 
-The focused e2e form retains the lane's installed-Pi preflight. To select one test, pass an anchored
+Use `test:e2e:source` for focused source-e2e files so the canonical composed lane does not also run
+the packaged witness. The focused form retains the lane's installed-Pi preflight. To select one test,
+pass an anchored
 regular expression containing the full Vitest name, including its `describe` ancestry:
 
 ```bash
@@ -140,9 +146,9 @@ Vitest's `-t` is a regular-expression filter, so an unanchored leaf name is not 
 The runner is [vitest](https://vitest.dev). Tests are TypeScript run through `tsx`/vitest — there
 is no build step to run first. The e2e layer needs Pi's compiled CLI at
 `node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm ci` provides it.
-`test:e2e` fails before Vitest with reinstall/version guidance when that CLI is missing, preventing
-CI and complete local verification from silently skipping the real-Pi lane. Direct Vitest runs may
-still skip the E2E files gracefully, which is useful for narrow development commands.
+Both direct e2e scripts fail before Vitest with reinstall/version guidance when that CLI is missing,
+preventing CI and complete local verification from silently skipping either real-Pi lane. Direct
+Vitest runs may still skip the E2E files gracefully, which is useful for narrow development commands.
 
 ## Layer 1 — unit tests (per subsystem)
 

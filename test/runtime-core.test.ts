@@ -40,7 +40,6 @@ import piccExtension, {
   pluginRuntimeContextForSource,
   preparePluginDataDir,
   projectPluginAgentRuntime,
-  renderPluginStartupNotice,
   substitutePluginRuntimeText,
 } from "../src/index.js";
 import { fakePi } from "./helpers/fake-pi.js";
@@ -129,79 +128,6 @@ function baseSettings(): ClaudeSettings {
     diagnostics: [],
   };
 }
-
-describe("plugin startup notice", () => {
-  it("is quiet for loaded/disabled outcomes and valid or absent policy", () => {
-    expect(renderPluginStartupNotice([
-      { pluginId: "loaded@market", status: "loaded", diagnostics: [] },
-      { pluginId: "off@market", status: "disabled", diagnostics: [] },
-    ], [])).toBeUndefined();
-  });
-
-  it("tables every failure status and deduplicates bounded identities and policy classes", () => {
-    const failureStatuses = ["enabled-but-uninstalled", "unsupported", "ambiguous", "blocked", "malformed", "rejected"] as const;
-    for (const status of failureStatuses) {
-      const notice = renderPluginStartupNotice([
-        { pluginId: `same-${status}@market`, status, diagnostics: [] },
-        { pluginId: `same-${status}@market`, status, diagnostics: [] },
-      ], []);
-      expect(notice?.match(new RegExp(`same-${status}@market`, "g"))).toHaveLength(1);
-    }
-    const policy = renderPluginStartupNotice(undefined, [
-      { severity: "warning", message: "x", category: "managed-policy-malformed", sourceClass: "system-file", impact: "weaker-policy-suppressed" },
-      { severity: "warning", message: "y", category: "managed-policy-unreadable", sourceClass: "system-file", impact: "weaker-policy-suppressed" },
-    ]);
-    expect(policy?.match(/system-file/g)).toHaveLength(1);
-    expect(policy!.length).toBeLessThan(400);
-  });
-
-  it("reports a source-ignored system administrator policy without claiming weaker suppression", () => {
-    const notice = renderPluginStartupNotice(undefined, [{
-      severity: "warning",
-      message: "raw administrator detail",
-      category: "managed-policy-malformed",
-      sourceClass: "system-drop-in",
-      impact: "source-ignored",
-    }]);
-    expect(notice).toContain("system-drop-in");
-    expect(notice).toContain("that administrator source was ignored");
-    expect(notice).not.toContain("weaker policy was suppressed");
-    expect(notice).not.toContain("raw administrator detail");
-  });
-
-  it.each(["registry-hkcu", "override"] as const)("does not call %s an administrator startup failure", (sourceClass) => {
-    expect(renderPluginStartupNotice(undefined, [{
-      severity: "warning",
-      message: "user-owned source detail",
-      category: "managed-policy-unreadable",
-      sourceClass,
-      impact: "source-ignored",
-    }])).toBeUndefined();
-  });
-
-  it("bounds and sanitizes enabled failures and reports administrator policy suppression", () => {
-    const outcomes = Array.from({ length: 7 }, (_, index) => ({
-      pluginId: `bad-${index}\u001b[31m@market`,
-      status: "rejected" as const,
-      diagnostics: [],
-    }));
-    const notice = renderPluginStartupNotice(outcomes, [{
-      severity: "warning",
-      message: "raw path and content must not appear",
-      category: "managed-policy-malformed",
-      sourceClass: "system-file",
-      impact: "weaker-policy-suppressed",
-    }]);
-    expect(notice).toContain("no fallback content was used");
-    expect(notice).toContain("and 2 more");
-    expect(notice).not.toContain("\u001b");
-    expect(notice).toContain("system-file");
-    expect(notice).toContain("weaker policy was suppressed");
-    expect(notice).toContain("Repair policy, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
-    expect(notice).not.toContain("/new");
-    expect(notice).not.toContain("raw path and content");
-  });
-});
 
 describe("bounded plugin runtime warnings", () => {
   it("deduplicates below the cap and emits one generic warning after saturation", () => {

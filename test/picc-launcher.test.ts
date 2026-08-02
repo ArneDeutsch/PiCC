@@ -2,7 +2,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
+import type { ManagedRegistryAdapter } from "../src/discovery/managed-policy.js";
 import {
   PI_SUITE_PACKAGES,
   canonicalPath,
@@ -16,6 +19,10 @@ import {
 const repoRoot = path.resolve(".");
 const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
 const launcherSource = path.join(repoRoot, "bin", "picc.mjs");
+const pluginAdapterSource = path.join(repoRoot, "bin", "picc-plugin.mjs");
+const windowsRegistryWarning = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
+const inventoryIncompleteWarning = (classes: string, actions = "repair") => `PiCC plugin inventory may be incomplete (${classes}). ${actions.includes("format") ? "Update PiCC or report the unsupported plugin-state format. " : ""}${actions.includes("repair") ? "Repair the malformed or unreadable Claude plugin state outside PiCC. " : ""}Run PiCC interactively in the same project and profile, then use \`/doctor\` for details.`;
+const inventoryPolicyWarning = process.platform === "win32" ? `${windowsRegistryWarning}\n` : "";
 const tempDirs: string[] = [];
 
 function temp(prefix: string): string {
@@ -66,6 +73,68 @@ function makePackage(options: {
 function installLauncher(root: string): void {
   write(path.join(root, "bin", "picc-admin.mjs"), fs.readFileSync(adminSource, "utf8"));
   write(path.join(root, "bin", "picc.mjs"), fs.readFileSync(launcherSource, "utf8"));
+  write(path.join(root, "bin", "picc-plugin.mjs"), fs.readFileSync(pluginAdapterSource, "utf8"));
+}
+
+function runSourcePluginWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv) {
+  const childEnv = { ...process.env };
+  delete childEnv.PICC_CLAUDE_USER_DIR;
+  delete childEnv.CLAUDE_CONFIG_DIR;
+  Object.assign(childEnv, env);
+  if (process.platform === "win32") {
+    const preload = path.join(temp("picc-managed-policy-isolation-"), "isolate.cjs");
+    write(preload, `
+const fs = require("node:fs");
+const denied = value => typeof value === "string" && value.toLowerCase().startsWith("c:\\\\program files\\\\claudecode");
+const missing = value => Object.assign(new Error("test-isolated managed policy"), { code: "ENOENT", path: value });
+for (const name of ["statSync", "readFileSync", "readdirSync"]) {
+  const original = fs[name];
+  fs[name] = function(value, ...rest) { if (denied(value)) throw missing(value); return original.call(this, value, ...rest); };
+}
+require("node:module").syncBuiltinESMExports();
+`);
+    childEnv.NODE_OPTIONS = `${childEnv.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
+  }
+  return spawnSync(process.execPath, [launcherSource, "plugin", ...args], {
+    cwd,
+    encoding: "utf8",
+    env: childEnv,
+  });
+}
+
+function runSourcePlugin(cwd: string, userDir: string, args: string[], env: NodeJS.ProcessEnv = {}) {
+  return runSourcePluginWithEnv(cwd, args, { ...env, PICC_CLAUDE_USER_DIR: userDir });
+}
+
+function copyJiti(target: string): void {
+  const manifest = canonicalPath(fileURLToPath(import.meta.resolve("jiti/package.json")));
+  fs.cpSync(path.dirname(manifest), target, { recursive: true });
+}
+
+function inventoryFixture(): { project: string; userDir: string } {
+  const root = temp("picc-plugin-command-");
+  const project = path.join(root, "project");
+  const userDir = path.join(root, "profile");
+  fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+  fs.mkdirSync(userDir, { recursive: true });
+  return { project, userDir };
+}
+
+const absentRegistry: ManagedRegistryAdapter = { readSettings: () => ({ status: "absent" }) };
+
+function runPluginInProcess(
+  cwd: string,
+  args: string[],
+  options: PluginInventoryCliOptions,
+  registry: ManagedRegistryAdapter | null = absentRegistry,
+) {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const code = runPluginInventoryCli(args, {
+    log: (message) => stdout.push(message),
+    error: (message) => stderr.push(message),
+  }, registry === null ? undefined : registry, { cwd, platform: "linux", ...options });
+  return { code, stdout, stderr };
 }
 
 describe("direct Pi package validation", () => {
@@ -279,5 +348,382 @@ process.exit(23);
     expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
     expect(launched).toMatchObject({ kind: "source", version: "0.1.0" });
     expect(launched.parent).toMatch(/^[1-9]\d*$/);
+  });
+
+  it("routes plugin argv before Pi resolution and reports an unavailable packaged entrypoint safely", () => {
+    const root = makePackage({ withCli: false });
+    installLauncher(root);
+    const piCanary = path.join(root, "pi-started");
+    write(
+      path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+      `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(piCanary)}, "started");`,
+    );
+
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugin", "list"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.trim()).toBe("PiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.");
+    expect(fs.existsSync(piCanary)).toBe(false);
+  });
+
+  it("loads valid local or hoisted jiti while rejected local shadows never execute", () => {
+    const localRoot = makePackage();
+    installLauncher(localRoot);
+    const localManifestPath = path.join(localRoot, "package.json");
+    const localManifest = JSON.parse(fs.readFileSync(localManifestPath, "utf8")) as { dependencies: Record<string, string> };
+    localManifest.dependencies.jiti = "2.7.0";
+    write(localManifestPath, JSON.stringify(localManifest));
+    write(path.join(localRoot, "src", "plugin-inventory-cli.ts"), "export const runPluginInventoryCli = () => 0;\n");
+    copyJiti(path.join(localRoot, "node_modules", "jiti"));
+    const local = spawnSync(process.execPath, [path.join(localRoot, "bin", "picc.mjs"), "plugin", "list"], {
+      cwd: localRoot, encoding: "utf8",
+    });
+    expect(local).toMatchObject({ status: 0, stdout: "", stderr: "" });
+
+    const prefix = temp("picc-plugin-loader-");
+    const root = path.join(prefix, "node_modules", "picc");
+    makePackage({ root, source: false, withCli: false });
+    installLauncher(root);
+    const manifestPath = path.join(root, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { dependencies: Record<string, string> };
+    manifest.dependencies.jiti = "2.7.0";
+    write(manifestPath, JSON.stringify(manifest));
+    write(path.join(root, "src", "plugin-inventory-cli.ts"), "export const runPluginInventoryCli = () => 0;\n");
+    copyJiti(path.join(prefix, "node_modules", "jiti"));
+
+    const logical = path.join(root, "node_modules", "jiti");
+    const outside = temp("picc-plugin-loader-escape-");
+    const escapedCanary = path.join(outside, "executed");
+    write(path.join(outside, "package.json"), JSON.stringify({
+      name: "jiti", version: "2.7.0", type: "module",
+      exports: { "./static": "./canary.mjs", "./package.json": "./package.json" },
+    }));
+    write(path.join(outside, "canary.mjs"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(escapedCanary)}, "executed"); export function createJiti() { return {}; }\n`);
+    fs.rmSync(logical, { recursive: true, force: true });
+    fs.symlinkSync(outside, logical, process.platform === "win32" ? "junction" : "dir");
+
+    const escaped = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugin", "list"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(escaped).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(fs.existsSync(escapedCanary)).toBe(false);
+
+    fs.rmSync(logical, { recursive: true, force: true });
+    const rejectedCanary = path.join(logical, "executed");
+    write(path.join(logical, "package.json"), JSON.stringify({
+      name: "jiti-shadow", version: "9.9.9", type: "module",
+      exports: { "./static": "./canary.mjs", "./package.json": "./package.json" },
+    }));
+    write(path.join(logical, "canary.mjs"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(rejectedCanary)}, "executed"); export function createJiti() { return {}; }\n`);
+    const rejected = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugin", "list"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(rejected).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(fs.existsSync(rejectedCanary)).toBe(false);
+  });
+
+  it("runs command semantics and fresh snapshots in process through the shared grammar", () => {
+    const { project, userDir } = inventoryFixture();
+    const env = { PICC_CLAUDE_USER_DIR: userDir };
+    write(path.join(userDir, "settings.json"), JSON.stringify({
+      enabledPlugins: { "same@market-a": true, "same@market-b": true },
+    }));
+
+    const list = runPluginInProcess(project, ["list"], { env });
+    expect(list).toMatchObject({ code: 0, stderr: [] });
+    expect(list.stdout.join("\n")).toContain("Snapshot: captured for this command");
+    expect(list.stdout.join("\n")).toContain("Plugin: same@market-a");
+    expect(list.stdout.join("\n")).toContain("Plugin: same@market-b");
+
+    const details = runPluginInProcess(project, ["details", "same@market-b"], { env });
+    expect(details).toMatchObject({ code: 0, stderr: [] });
+    expect(details.stdout.join("\n")).toContain("Plugin: same@market-b");
+    expect(details.stdout.join("\n")).not.toContain("Plugin: same@market-a");
+
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "later@market": true } }));
+    const later = runPluginInProcess(project, ["list"], { env });
+    expect(later.stdout.join("\n")).toContain("Plugin: later@market");
+    expect(later.stdout.join("\n")).not.toContain("Plugin: same@market-a");
+
+    for (const args of [[], ["LIST"], ["details"], ["details", "bare"], ["list", "extra"], ["details", "later@market", "extra"]]) {
+      const result = runPluginInProcess(project, args, { env });
+      expect(result).toEqual({
+        code: 2,
+        stdout: [],
+        stderr: ["Read-only usage: picc plugin list | picc plugin details <plugin@marketplace> (example: picc plugin details formatter@official). Run picc plugin list to copy an exact qualified identity."],
+      });
+    }
+
+    const unknown = runPluginInProcess(project, ["details", "missing@market"], { env });
+    expect(unknown).toEqual({
+      code: 1,
+      stdout: [],
+      stderr: ["PiCC plugin not found: missing@market. The bounded launcher list can omit catalog-only identities. Run `picc plugin list` to copy a listed qualified identity, or run PiCC interactively in the same project and profile and use the literal `/plugin` filter."],
+    });
+  });
+
+  it("uses source-specific path-free profile errors and preserves resolver precedence", () => {
+    const { project, userDir } = inventoryFixture();
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "picc@market": true } }));
+    const configProfile = path.join(temp("picc-config-profile-"), "profile");
+    write(path.join(configProfile, "settings.json"), JSON.stringify({ enabledPlugins: { "config@market": true } }));
+    const defaultHome = temp("picc-default-home-");
+    write(path.join(defaultHome, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "default@market": true } }));
+
+    const precedence = runPluginInProcess(project, ["list"], {
+      env: { PICC_CLAUDE_USER_DIR: userDir, CLAUDE_CONFIG_DIR: configProfile },
+      homeDir: defaultHome,
+    });
+    expect(precedence.stdout.join("\n")).toContain("Plugin: picc@market");
+    expect(precedence.stdout.join("\n")).not.toContain("Plugin: config@market");
+
+    const configured = runPluginInProcess(project, ["list"], {
+      env: { CLAUDE_CONFIG_DIR: configProfile }, homeDir: defaultHome,
+    });
+    expect(configured.stdout.join("\n")).toContain("Plugin: config@market");
+
+    const defaulted = runPluginInProcess(project, ["list"], { env: {}, homeDir: defaultHome });
+    expect(defaulted.stdout.join("\n")).toContain("Plugin: default@market");
+
+    const unreadablePicc = path.join(temp("picc-profile-file-"), "private-picc");
+    const unreadableConfig = path.join(temp("picc-profile-file-"), "private-config");
+    const unreadableDefaultHome = temp("picc-profile-file-");
+    write(unreadablePicc, "not a directory");
+    write(unreadableConfig, "not a directory");
+    write(path.join(unreadableDefaultHome, ".claude"), "not a directory");
+
+    const cases = [
+      [
+        { env: { PICC_CLAUDE_USER_DIR: unreadablePicc, CLAUDE_CONFIG_DIR: configProfile }, homeDir: defaultHome },
+        "PiCC plugin inventory could not read the Claude profile. Check PICC_CLAUDE_USER_DIR and permissions.",
+      ],
+      [
+        { env: { CLAUDE_CONFIG_DIR: unreadableConfig }, homeDir: defaultHome },
+        "PiCC plugin inventory could not read the Claude profile. Check CLAUDE_CONFIG_DIR and permissions.",
+      ],
+      [
+        { env: {}, homeDir: unreadableDefaultHome },
+        "PiCC plugin inventory could not read the Claude profile. Check default Claude profile permissions or set PICC_CLAUDE_USER_DIR.",
+      ],
+    ] as const;
+    for (const [options, message] of cases) {
+      const result = runPluginInProcess(project, ["list"], options);
+      expect(result).toEqual({ code: 1, stdout: [], stderr: [message] });
+      expect(message).not.toContain(unreadablePicc);
+      expect(message).not.toContain(unreadableConfig);
+      expect(message).not.toContain(unreadableDefaultHome);
+    }
+  });
+
+  it("separates malformed inventory from the default Windows registry limitation", () => {
+    const { project, userDir } = inventoryFixture();
+    const options = { env: { PICC_CLAUDE_USER_DIR: userDir } };
+
+    const healthyWindows = runPluginInProcess(project, ["list"], { ...options, platform: "win32" }, null);
+    expect(healthyWindows).toMatchObject({ code: 0, stderr: [windowsRegistryWarning] });
+
+    const customUnavailable: ManagedRegistryAdapter = { readSettings: () => ({ status: "unreadable" }) };
+    const injected = runPluginInProcess(project, ["list"], { ...options, platform: "win32" }, customUnavailable);
+    expect(injected).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("managed policy state")] });
+    expect(injected.stderr).not.toContain(windowsRegistryWarning);
+
+    write(path.join(userDir, "plugins", "installed_plugins.json"), "{ malformed");
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
+    const malformed = runPluginInProcess(project, ["list"], options);
+    expect(malformed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state")] });
+
+    write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 999, plugins: {} }));
+    fs.rmSync(path.join(userDir, "plugins", "known_marketplaces.json"));
+    const unsupported = runPluginInProcess(project, ["list"], options);
+    expect(unsupported).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state", "format")] });
+    expect(unsupported.stderr.join("\n")).not.toMatch(/repair the malformed|999/iu);
+
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
+    const mixed = runPluginInProcess(project, ["list"], options);
+    expect(mixed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state", "format repair")] });
+    expect(mixed.stderr.join("\n")).not.toContain("999");
+  });
+
+  it("classifies an unavailable cwd separately from profile failures", () => {
+    const missing = path.join(temp("picc-missing-cwd-"), "removed");
+    const result = runPluginInProcess(missing, ["list"], { env: {} });
+    expect(result).toEqual({
+      code: 1,
+      stdout: [],
+      stderr: ["PiCC plugin inventory could not access the target project directory. Run from an accessible target project directory."],
+    });
+  });
+
+  it("captures injected managed policy while unavailable Windows registry evidence stays process-free", () => {
+    const { project, userDir } = inventoryFixture();
+    const cli = pathToFileURL(path.join(repoRoot, "src", "plugin-inventory-cli.ts")).href;
+    const processCanary = path.join(path.dirname(project), "managed-process-canary");
+    const script = `
+import fs from "node:fs";
+import child from "node:child_process";
+for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) {
+  child[name] = () => { fs.writeFileSync(${JSON.stringify(processCanary)}, name); throw new Error("child process forbidden"); };
+}
+const { syncBuiltinESMExports } = await import("node:module");
+syncBuiltinESMExports();
+const { createJiti } = await import("jiti/static");
+const jiti = createJiti(import.meta.url, { fsCache: false, moduleCache: false, tsconfigPaths: false, tryNative: false });
+const loaded = await jiti.import(${JSON.stringify(cli)});
+const systemFile = ${JSON.stringify(String.raw`C:\Program Files\ClaudeCode\managed-settings.json`)}.toLowerCase();
+const dropInDir = ${JSON.stringify(String.raw`C:\Program Files\ClaudeCode\managed-settings.d`)}.toLowerCase();
+const originalStatSync = fs.statSync;
+const originalReadFileSync = fs.readFileSync;
+const originalReaddirSync = fs.readdirSync;
+const missing = value => Object.assign(new Error("test-isolated managed policy"), { code: "ENOENT", path: value });
+fs.statSync = function(value, ...rest) {
+  const normalized = String(value).toLowerCase();
+  if (normalized === systemFile) return { isFile: () => true };
+  if (normalized.startsWith(${JSON.stringify(String.raw`C:\Program Files\ClaudeCode`).toLowerCase()})) throw missing(value);
+  return originalStatSync.call(this, value, ...rest);
+};
+fs.readFileSync = function(value, ...rest) {
+  if (String(value).toLowerCase() === systemFile) return JSON.stringify({ enabledPlugins: { "file-policy@managed": true } });
+  return originalReadFileSync.call(this, value, ...rest);
+};
+fs.readdirSync = function(value, ...rest) {
+  if (String(value).toLowerCase() === dropInDir) throw missing(value);
+  return originalReaddirSync.call(this, value, ...rest);
+};
+syncBuiltinESMExports();
+Object.defineProperty(process, "platform", { value: "win32" });
+process.chdir(${JSON.stringify(project)});
+process.env.PICC_CLAUDE_USER_DIR = ${JSON.stringify(userDir)};
+const run = registry => {
+  const messages = { stdout: [], stderr: [] };
+  const code = loaded.runPluginInventoryCli(["list"], { log: value => messages.stdout.push(value), error: value => messages.stderr.push(value) }, registry);
+  return { code, messages };
+};
+const unavailable = run(undefined);
+const hives = [];
+const managed = run({ readSettings(hive) { hives.push(hive); return { status: "present", json: JSON.stringify({ enabledPlugins: { "policy@managed": true } }) }; } });
+console.log(JSON.stringify({ unavailable, managed, hives }));
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: repoRoot, encoding: "utf8",
+    });
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    const observed = JSON.parse(result.stdout) as {
+      unavailable: { code: number; messages: { stdout: string[]; stderr: string[] } };
+      managed: { code: number; messages: { stdout: string[]; stderr: string[] } };
+      hives: string[];
+    };
+    expect(observed.unavailable).toMatchObject({
+      code: 0,
+      messages: { stderr: [windowsRegistryWarning] },
+    });
+    expect(observed.unavailable.messages.stdout.join("\n")).toContain("Plugin: file-policy@managed");
+    expect(observed.managed).toMatchObject({ code: 0, messages: { stderr: [] } });
+    expect(observed.managed.messages.stdout.join("\n")).toContain("Plugin: file-policy@managed");
+    expect(observed.managed.messages.stdout.join("\n")).toContain("Plugin: policy@managed");
+    expect(observed.hives).toEqual(["HKLM"]);
+    expect(fs.existsSync(processCanary)).toBe(false);
+  });
+
+  it("ignores a target-project tsconfig and never calls child-process or shell APIs", () => {
+    const { project, userDir } = inventoryFixture();
+    const tsconfigCanary = path.join(path.dirname(project), "tsconfig-canary");
+    const cacheCanary = path.join(path.dirname(project), "jiti-cache");
+    const processCanary = path.join(path.dirname(project), "process-canary");
+    const redirect = path.join(project, "redirect-yaml.ts");
+    write(redirect, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(tsconfigCanary)}, "executed"); export const parse = () => ({});\n`);
+    write(path.join(project, "tsconfig.json"), JSON.stringify({
+      compilerOptions: { baseUrl: ".", paths: { yaml: ["./redirect-yaml.ts"] } },
+    }));
+    const preload = path.join(path.dirname(project), "deny-process.cjs");
+    write(preload, `
+const fs = require("node:fs");
+const child = require("node:child_process");
+for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) {
+  child[name] = () => { fs.writeFileSync(${JSON.stringify(processCanary)}, name); throw new Error("child process forbidden"); };
+}
+require("node:module").syncBuiltinESMExports();
+`);
+
+    const result = runSourcePlugin(project, userDir, ["list"], {
+      JITI_FS_CACHE: cacheCanary,
+      NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(inventoryPolicyWarning);
+    expect(result.stdout).toContain("No plugins are known in this snapshot.");
+    expect(fs.existsSync(tsconfigCanary)).toBe(false);
+    expect(fs.existsSync(cacheCanary)).toBe(false);
+    expect(fs.existsSync(processCanary)).toBe(false);
+  });
+
+  it("does not activate extensions, hooks, components, shells, or persistent plugin data", () => {
+    const { project, userDir } = inventoryFixture();
+    const marker = path.join(path.dirname(project), "execution-canary");
+    const pluginRoot = path.join(userDir, "plugins", "cache", "market", "hostile", "1.0.0");
+    write(path.join(userDir, "settings.json"), JSON.stringify({
+      enabledPlugins: { "hostile@market": true },
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'hook')`] }] }] },
+    }));
+    write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({
+      version: 2,
+      plugins: { "hostile@market": [{ scope: "user", installPath: pluginRoot, version: "1.0.0" }] },
+    }));
+    write(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({
+      name: "hostile",
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'plugin-hook')`] }] }] },
+      mcpServers: { canary: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'mcp')`] } },
+    }));
+
+    const before = fs.readdirSync(project).sort();
+    const result = runSourcePlugin(project, userDir, ["details", "hostile@market"]);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(inventoryPolicyWarning);
+    expect(result.stdout).toContain("Plugin: hostile@market");
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(fs.existsSync(path.join(userDir, "plugins", "data"))).toBe(false);
+    expect(fs.existsSync(path.join(project, ".claude", ".picc"))).toBe(false);
+    expect(fs.existsSync(path.join(project, ".git", "info", "exclude"))).toBe(false);
+    expect(fs.readdirSync(project).sort()).toEqual(before);
+  });
+
+  it("preserves update and version administration while forwarding the near-collision plugins token", () => {
+    const root = makePackage();
+    installLauncher(root);
+    const updateCanary = path.join(root, "update.json");
+    const piCanary = path.join(root, "pi.json");
+    write(path.join(root, "bin", "picc-update.mjs"), `import fs from "node:fs"; export async function runUpdate(value) { fs.writeFileSync(${JSON.stringify(updateCanary)}, JSON.stringify(value)); return 0; }\n`);
+    const cli = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+    write(cli, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(piCanary)}, JSON.stringify(process.argv.slice(2)));\n`);
+
+    const update = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "update", "--check"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(update).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(updateCanary, "utf8"))).toEqual({ action: "check" });
+
+    const version = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--version"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(version).toMatchObject({ status: 0, stderr: "" });
+    expect(version.stdout).toBe("PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\n");
+
+    const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(plugins).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
+      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",
+    ]);
+  });
+
+  it("lists both read-only commands in help without changing help routing", () => {
+    const result = spawnSync(process.execPath, [launcherSource, "--help"], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("picc plugin list");
+    expect(result.stdout).toContain("picc plugin details <plugin@marketplace>");
+    expect(result.stdout).not.toMatch(/JSON|live.refresh/iu);
   });
 });

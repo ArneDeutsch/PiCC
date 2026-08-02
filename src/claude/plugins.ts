@@ -14,6 +14,7 @@ import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
 import { canonicalDirectory as resolveCanonicalDirectory, projectIdentities } from "../util/project-identity.js";
 import type { PluginAgentLoaderSource } from "./agents.js";
+import { projectPluginManifest, type SafePluginManifestProjection } from "./plugin-metadata.js";
 import {
   authorizePluginRoot,
   resolvePluginDataLocation,
@@ -41,7 +42,7 @@ export interface InstalledPlugin {
   projectPath?: string;
   root: string;
   dataDir: string;
-  manifest: Record<string, unknown>;
+  manifestProjection: SafePluginManifestProjection;
   skillSources: PluginSkillLoaderSource[];
   commandSources: PluginSkillLoaderSource[];
   agentSources: PluginAgentLoaderSource[];
@@ -190,7 +191,7 @@ function readBlocklist(
   return { blocked, status: "valid" };
 }
 
-function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): string[] {
+export function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): string[] {
   const candidates = [path.join(userDir, "plugins", "cache")];
   if (env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]) candidates.push(env["CLAUDE_CODE_PLUGIN_CACHE_DIR"]);
   for (const seed of (env["CLAUDE_CODE_PLUGIN_SEED_DIR"] ?? "").split(path.delimiter)) {
@@ -336,6 +337,7 @@ function resolveComponents(options: {
   const manifestResult = readManifest(options.root);
   if (!manifestResult.ok) return { ok: false, diagnostics: [manifestResult.diagnostic] };
   const manifest = manifestResult.manifest;
+  const projectedManifest = projectPluginManifest(manifest);
   const pluginName = manifestResult.manifestPath ? manifest["name"] as string : options.lifecycleName;
   if (!COMPONENT_NAME.test(pluginName)) return {
     ok: false,
@@ -436,7 +438,7 @@ function resolveComponents(options: {
   }
   if (terminalDiagnostics.length > 0) return { ok: false, diagnostics: terminalDiagnostics.slice(0, 20) };
 
-  const diagnostics: Diagnostic[] = [];
+  const diagnostics: Diagnostic[] = projectedManifest.diagnostics;
   const plugin: InstalledPlugin = {
     pluginId: options.pluginId,
     name: pluginName,
@@ -446,7 +448,7 @@ function resolveComponents(options: {
     ...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
     root: options.root.canonicalPath,
     dataDir: data.value.lexicalPath,
-    manifest,
+    manifestProjection: projectedManifest.projection,
     skillSources,
     commandSources,
     agentSources,
