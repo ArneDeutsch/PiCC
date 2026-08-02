@@ -276,6 +276,15 @@ where to start reading, not the extent of its cluster.
   `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
   registry).
 
+  `subagent-transcript-retention.ts` owns bounded cleanup of persisted child collections, and
+  `src/index.ts` starts it asynchronously from the first session lifecycle. A fresh verified parent
+  retains its whole collection; a stale verified parent admits recognized children only with no
+  conflicting ownership marker, while parentless cleanup requires the collection's matching PiCC
+  ownership marker. The startup collection is excluded exactly, and activation plus an hourly
+  refresh keeps an existing active parent fresh on a best-effort basis. Malformed, unreadable, or
+  mismatched ownership evidence, changed authority, and I/O failures preserve data and flow to one
+  bounded notice rather than blocking startup.
+
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
   `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with shared width/theme helpers in
   `render-util.ts` and validated agent presentation colors in `agent-color.ts`) — the

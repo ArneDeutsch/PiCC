@@ -840,19 +840,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const ownershipUncertain = transcript?.failureCounts["ownership-uncertain"] ?? 0;
       if (ownershipUncertain > 0) details.push(`Ownership could not be verified for ${ownershipUncertain} transcript item(s), so they were preserved. Reconcile transcript ownership, then restart PiCC.`);
       const transcriptIo = transcript?.failureCounts["other-io"] ?? 0;
-      if (transcriptIo > 0) details.push(`${transcriptIo} transcript item(s) had another I/O failure. Run /doctor, repair transcript storage, then restart PiCC.`);
+      if (transcriptIo > 0) details.push(`${transcriptIo} transcript item(s) had another I/O failure. Check session transcript storage access, then restart PiCC.`);
       const worktreeIo = worktree.failureCounts["other-io"];
-      if (worktreeIo > 0) details.push(`${worktreeIo} worktree item(s) had another I/O failure. Run /doctor, repair worktree storage, then restart PiCC.`);
+      if (worktreeIo > 0) details.push(`${worktreeIo} worktree item(s) had another I/O failure. Check project-owned worktree storage access, then restart PiCC.`);
       const settingsBlocked = worktree.failureCounts["settings-blocked"];
       if (settingsBlocked > 0) details.push(`Settings prevented ${settingsBlocked} worktree cleanup attempt(s). Run /doctor, repair settings, then restart PiCC.`);
       const gitAuthority = worktree.failureCounts["git-authority"];
       if (gitAuthority > 0) details.push(`Git authority was unavailable for ${gitAuthority} worktree cleanup attempt(s). Restore repository Git access, then restart PiCC.`);
       if (retainedWorktrees > 0 || retainedTranscripts > 0) {
-        details.push("Retained items need review. Run /doctor, verify their age and ownership, then restart PiCC after repairs.");
+        details.push("Retained items need review. Use the counts and categories in this notice to check session transcript storage or project-owned worktree storage, then restart PiCC after repairs.");
       }
       const uncategorizedDiagnostics = diagnosticCount > 0 && failureCount === 0;
       if (uncategorizedDiagnostics) {
-        details.push(`${diagnosticCount} additional cleanup issue(s) had no structured category. Run /doctor, inspect storage access, then restart PiCC.`);
+        details.push(`${diagnosticCount} additional cleanup issue(s) had no structured category. Check session transcript storage and project-owned worktree storage access, then restart PiCC.`);
       }
       if (transcript?.diagnosticsTruncated) details.push("Some transcript cleanup detail was omitted from this bounded notice.");
       text = `Retention cleanup (${cleanupPeriodDays} days): removed ${removedWorktrees} orphaned worktree(s), ${removedTranscriptFiles} transcript file(s), and ${removedCollections} transcript collection(s); retained ${retainedWorktrees} worktree(s) and ${retainedTranscripts} transcript item(s). ${details.join(" ")}`.trim();

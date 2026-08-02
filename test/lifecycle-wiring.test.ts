@@ -762,14 +762,14 @@ describe("lifecycle wiring", () => {
       worktree: worktreeResult({ diagnostics: [{ severity: "warning", message: "RAW_DIAGNOSTIC /private/worktree" }] }),
       transcript: transcriptResult(),
       severity: "warning",
-      include: ["1 additional cleanup issue(s) had no structured category", "Run /doctor", "inspect storage access"],
-      exclude: ["changed concurrently", "transcript storage"],
+      include: ["1 additional cleanup issue(s) had no structured category", "Check session transcript storage and project-owned worktree storage access"],
+      exclude: ["changed concurrently", "Run /doctor"],
     },
     ...([
       ["transcript permission", "permission", "2 transcript item(s) could not be accessed", "Repair transcript ownership and permissions"],
       ["transcript busy", "busy", "2 transcript item(s) were locked or busy", "Close applications using them"],
       ["transcript ownership uncertainty", "ownership-uncertain", "Ownership could not be verified for 2 transcript item(s)", "Reconcile transcript ownership"],
-      ["transcript other I/O", "other-io", "2 transcript item(s) had another I/O failure", "repair transcript storage"],
+      ["transcript other I/O", "other-io", "2 transcript item(s) had another I/O failure", "Check session transcript storage access"],
     ] as const).map(([name, category, cause, remedy]) => ({
       name: `truncated ${name}`,
       worktree: worktreeResult(),
@@ -779,12 +779,12 @@ describe("lifecycle wiring", () => {
       }),
       severity: "warning",
       include: [cause, remedy, "restart PiCC", "Some transcript cleanup detail was omitted"],
-      exclude: ["changed concurrently", "RAW_DIAGNOSTIC"],
+      exclude: ["changed concurrently", "RAW_DIAGNOSTIC", "Run /doctor"],
     })),
     ...([
       ["worktree permission", "permission", "2 worktree item(s) could not be accessed", "Repair worktree ownership and permissions"],
       ["worktree busy", "busy", "2 worktree item(s) were locked or busy", "Close applications using them"],
-      ["worktree other I/O", "other-io", "2 worktree item(s) had another I/O failure", "repair worktree storage"],
+      ["worktree other I/O", "other-io", "2 worktree item(s) had another I/O failure", "Check project-owned worktree storage access"],
       ["settings-blocked worktree", "settings-blocked", "Settings prevented 2 worktree cleanup attempt(s)", "repair settings"],
       ["Git authority", "git-authority", "Git authority was unavailable for 2 worktree cleanup attempt(s)", "Restore repository Git access"],
     ] as const).map(([name, category, cause, remedy]) => ({
@@ -795,15 +795,19 @@ describe("lifecycle wiring", () => {
       transcript: transcriptResult(),
       severity: "warning",
       include: [cause, remedy, "restart PiCC"],
-      exclude: ["changed concurrently", "Some transcript cleanup detail was omitted"],
+      exclude: [
+        "changed concurrently",
+        "Some transcript cleanup detail was omitted",
+        ...(category === "settings-blocked" ? [] : ["Run /doctor"]),
+      ],
     })),
     {
       name: "retained-only uncertainty",
       worktree: worktreeResult({ retainedWorktrees: 2 }),
       transcript: transcriptResult({ retainedEntries: 4 }),
       severity: "warning",
-      include: ["retained 2 worktree(s) and 4 transcript item(s)", "Retained items need review", "verify their age and ownership"],
-      exclude: ["changed concurrently", "another I/O failure"],
+      include: ["retained 2 worktree(s) and 4 transcript item(s)", "Retained items need review", "counts and categories in this notice", "check session transcript storage or project-owned worktree storage"],
+      exclude: ["changed concurrently", "another I/O failure", "Run /doctor", "verify their age and ownership"],
     },
     {
       name: "blocked policy",
@@ -831,7 +835,7 @@ describe("lifecycle wiring", () => {
         "1 transcript item(s) could not be accessed",
         "Retained items need review",
       ],
-      exclude: ["Some transcript cleanup detail was omitted", "another I/O failure"],
+      exclude: ["Some transcript cleanup detail was omitted", "another I/O failure", "Run /doctor", "verify their age and ownership"],
     },
     {
       name: "rejected transcript reaper",
@@ -839,8 +843,8 @@ describe("lifecycle wiring", () => {
       worktree: worktreeResult(),
       transcript: transcriptResult(),
       severity: "warning",
-      include: ["1 transcript item(s) had another I/O failure", "Run /doctor", "repair transcript storage"],
-      exclude: ["REAPER_REJECTION_CANARY", "changed concurrently"],
+      include: ["1 transcript item(s) had another I/O failure", "Check session transcript storage access"],
+      exclude: ["REAPER_REJECTION_CANARY", "changed concurrently", "Run /doctor"],
     },
   ])("presents $name as one bounded operator notice on TUI and stderr", async (scenario) => {
     const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
