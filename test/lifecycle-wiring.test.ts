@@ -586,6 +586,141 @@ describe("lifecycle wiring", () => {
     }]);
   });
 
+  it("refreshes pre-start replacements without consuming the eligible startup cleanup or presentation", async () => {
+    const wired = fakePi();
+    const calls: unknown[] = [];
+    const touches: string[] = [];
+    piccWithoutProjectHooks(wired.api, {
+      onInitializationSettled: wired.captureInitialization,
+      retention: {
+        touchMainTranscript: async (file) => { touches.push(file); },
+        reapSubagentTranscripts: async (options) => {
+          calls.push(options);
+          return transcriptResult({
+            retainedEntries: 1,
+            failureCounts: { race: 0, permission: 1, busy: 0, "ownership-uncertain": 0, "other-io": 0 },
+          });
+        },
+        setInterval: (() => ({ unref: () => undefined })) as any,
+        clearInterval: () => undefined,
+      },
+    });
+    await wired.waitForInitialization();
+
+    const beforeNew = path.join(dir, "before-new.jsonl");
+    const beforeReload = path.join(dir, "before-reload.jsonl");
+    await wired.fire("session_start", { reason: "new" }, wired.tuiCtx({ sessionManager: persistedManager(beforeNew) }));
+    await wired.fire("session_start", { reason: "reload" }, wired.tuiCtx({ sessionManager: persistedManager(beforeReload) }));
+    await Promise.resolve();
+    expect(touches).toEqual([beforeNew, beforeReload]);
+    expect(calls).toEqual([]);
+    expect(wired.notifications).toEqual([]);
+
+    const startupFile = path.join(dir, "actual-startup.jsonl");
+    await wired.fire("session_start", { reason: "startup" }, wired.tuiCtx({ sessionManager: persistedManager(startupFile) }));
+    await waitUntil({
+      predicate: () => calls.length === 1 && wired.notifications.length === 1,
+      description: "actual startup retention cleanup and presentation",
+    });
+    expect(touches).toEqual([beforeNew, beforeReload, startupFile]);
+    expect(calls).toEqual([{
+      sessionDirectory: dir,
+      activeMainSessionFile: startupFile,
+      activeMainCwd: dir,
+      maxAgeDays: 30,
+      cleanupAllowed: true,
+    }]);
+    expect(wired.notifications[0]).toMatchObject({
+      severity: "warning",
+      text: expect.stringContaining("1 transcript item(s) could not be accessed"),
+    });
+
+    await wired.fire("session_start", { reason: "startup" }, wired.tuiCtx({ sessionManager: persistedManager(path.join(dir, "duplicate-startup.jsonl")) }));
+    await wired.fire("session_start", { reason: "new" }, wired.tuiCtx({ sessionManager: persistedManager(path.join(dir, "after-new.jsonl")) }));
+    await Promise.resolve();
+    expect(calls).toHaveLength(1);
+    expect(wired.notifications).toHaveLength(1);
+  });
+
+  it("presents actionable worktree cleanup after an identity-ineligible startup without running transcript cleanup", async () => {
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    WorktreeManager.prototype.reapOrphans = async () => worktreeResult({ reaped: ["hidden-worktree-path"] });
+    try {
+      const wired = fakePi();
+      const transcriptCalls: unknown[] = [];
+      let join!: () => Promise<void>;
+      piccWithoutProjectHooks(wired.api, {
+        onInitializationSettled: wired.captureInitialization,
+        onRetentionJobsSettled: (value) => { join = value; },
+        retention: {
+          touchMainTranscript: async () => undefined,
+          reapSubagentTranscripts: async (options) => { transcriptCalls.push(options); return transcriptResult(); },
+          setInterval: (() => ({ unref: () => undefined })) as any,
+          clearInterval: () => undefined,
+        },
+      });
+      await wired.waitForInitialization();
+      await wired.fire("session_start", { reason: "startup" }, wired.tuiCtx({
+        sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+      }));
+      await join();
+
+      expect(transcriptCalls).toEqual([]);
+      const notices = wired.notifications.filter((item) => item.text.startsWith("Retention cleanup"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({
+        severity: "info",
+        text: expect.stringContaining("removed 1 orphaned worktree(s)"),
+      });
+    } finally {
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+    }
+  });
+
+  it("presents blocked retention posture after an identity-ineligible startup without running transcript cleanup", async () => {
+    const previousCwd = process.cwd();
+    const blockedDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-retention-ineligible-blocked-"));
+    fs.mkdirSync(path.join(blockedDir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(blockedDir, "CLAUDE.md"), "blocked retention fixture\n");
+    fs.writeFileSync(path.join(blockedDir, ".claude", "settings.json"), JSON.stringify({ cleanupPeriodDays: 0 }));
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    WorktreeManager.prototype.reapOrphans = async () => worktreeResult({
+      failureCounts: { "settings-blocked": 1, "git-authority": 0, permission: 0, busy: 0, "other-io": 0 },
+    });
+    try {
+      process.chdir(blockedDir);
+      const wired = fakePi();
+      const transcriptCalls: unknown[] = [];
+      let join!: () => Promise<void>;
+      piccWithoutProjectHooks(wired.api, {
+        onInitializationSettled: wired.captureInitialization,
+        onRetentionJobsSettled: (value) => { join = value; },
+        retention: {
+          touchMainTranscript: async () => undefined,
+          reapSubagentTranscripts: async (options) => { transcriptCalls.push(options); return transcriptResult(); },
+          setInterval: (() => ({ unref: () => undefined })) as any,
+          clearInterval: () => undefined,
+        },
+      });
+      await wired.waitForInitialization();
+      await wired.fire("session_start", { reason: "startup" }, wired.tuiCtx({
+        sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+      }));
+      await join();
+
+      expect(transcriptCalls).toEqual([]);
+      const notices = wired.notifications.filter((item) => item.text.startsWith("Retention cleanup"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ severity: "warning" });
+      expect(notices[0]!.text).toContain("Retention cleanup is paused");
+      expect(notices[0]!.text).toContain("No retention deletion was attempted");
+    } finally {
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+      process.chdir(previousCwd);
+      fs.rmSync(blockedDir, { recursive: true, force: true });
+    }
+  });
+
   it.each(["absent file", "absent cwd", "absent directory", "throwing file", "throwing cwd", "throwing directory"] as const)("permanently skips cleanup after an %s initial getter", async (identity) => {
     const wired = fakePi();
     const calls: unknown[] = [];

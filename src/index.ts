@@ -882,10 +882,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (retentionPresentation) jobs.push(retentionPresentation);
     await Promise.allSettled(jobs);
   };
-  const sessionRetentionStarted = (ctx: any): void => {
+  const sessionRetentionStarted = (ctx: any, reason: unknown): void => {
     sessionManagerRef = ctx?.sessionManager;
     const immediateRefresh = refreshAndArmRetentionHeartbeat();
-    if (transcriptStartupDecided) return;
+    if (reason !== "startup" || transcriptStartupDecided) return;
     transcriptStartupDecided = true;
     retentionStartupContext = ctx;
     const manager = sessionManagerRef;
@@ -897,7 +897,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       activeMainCwd = manager?.getCwd?.();
       sessionDirectory = manager?.getSessionDir?.();
     } catch {
-      // The first session decides startup eligibility permanently; later replacements never retry it.
+      // The startup session decides transcript cleanup eligibility permanently; replacements never retry it.
     }
     if (
       typeof activeMainSessionFile === "string" && activeMainSessionFile.length > 0 &&
@@ -1015,7 +1015,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     },
     diagnostics: [],
   });
-  // Startup housekeeping remains detached; its structured outcome is retained for one bounded report.
+  // Activation-time orphan-worktree cleanup stays detached, retaining its result for one startup report.
   const orphanReaping = worktrees.reapOrphans().catch(emptyWorktreeFailure);
   void orphanReaping;
   testSeam?.onRetentionJobsSettled?.(joinScheduledRetentionJobs);
@@ -3073,8 +3073,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       branch = undefined;
     }
     installMainNotebookState(branch);
-    // Retention work is scheduled, never awaited, from the trusted session identity boundary.
-    sessionRetentionStarted(ctx);
+    // Every start refreshes and replaces the heartbeat; only an actual startup may schedule transcript reaping.
+    sessionRetentionStarted(ctx, event.reason);
     // A session being installed has a live runner behind it — before the outgoing
     // controller hands back what it could not deliver, which is the first thing that has
     // to reach the reader's editor. Pi never starts a session after a `quit` teardown, so
