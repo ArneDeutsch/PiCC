@@ -64,6 +64,9 @@ jobs:
       - name: Test exact packaged product
         env:
           PICC_TEST_TARBALL: ${{ steps.pack.outputs.tarball }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: npm run test:packaged
       - name: Upload verified release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -204,8 +204,14 @@ describe("release workflow", () => {
     expect(manifest.scripts.preversion).toBe("npm run verify:all");
     expect(manifest.scripts.version).toBeUndefined();
     expect(manifest.scripts.prepublishOnly).toBe("npm run verify:all");
+    expect(manifest.scripts["test:e2e:source"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    );
+    expect(manifest.scripts["test:e2e"]).toBe(
+      "npm run test:e2e:source && npm run test:packaged",
+    );
     expect(manifest.scripts["test:source"]).toBe(
-      "npm run test:unit && npm run test:integration && node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+      "npm run test:unit && npm run test:integration && npm run test:e2e:source",
     );
     expect(manifest.scripts["test:packaged"]).toBe(
       "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
@@ -231,7 +237,12 @@ describe("release workflow", () => {
     });
 
     const packaged = packageSteps.find((step) => step.name === "Test exact packaged product");
-    expect(packaged.env.PICC_TEST_TARBALL).toBe("${{ steps.pack.outputs.tarball }}");
+    expect(packaged.env).toEqual({
+      PICC_TEST_TARBALL: "${{ steps.pack.outputs.tarball }}",
+      TEMP: "${{ runner.temp }}",
+      TMP: "${{ runner.temp }}",
+      TMPDIR: "${{ runner.temp }}",
+    });
     const upload = packageSteps.find((step) => step.name === "Upload verified release artifact");
     const download = publishSteps.find((step) => step.name === "Download verified release artifact");
     expect(upload.uses).toMatch(/^actions\/upload-artifact@[a-f0-9]{40}$/);

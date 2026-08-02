@@ -19,7 +19,7 @@ function output(result: ReturnType<typeof spawnSync>): string {
 }
 
 describe("real-Pi package preflight", () => {
-  it("fails before the E2E lane with actionable guidance when the CLI is absent", () => {
+  it("fails before the direct source E2E lane with actionable guidance when the CLI is absent", () => {
     const direct = spawnSync(
       process.execPath,
       [checkScript, "--root", missingRoot],
@@ -56,7 +56,7 @@ describe("real-Pi package preflight", () => {
       expect(fs.statSync(installedCli).isFile()).toBe(true);
       const authoritative = spawnSync(
         process.execPath,
-        [npmExecPath, "run", "test:e2e"],
+        [npmExecPath, "run", "test:e2e:source"],
         {
           cwd: repoRoot,
           encoding: "utf8",
