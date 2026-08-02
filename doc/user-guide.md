@@ -630,8 +630,15 @@ operation with `CLAUDE_CONFIG_DIR` pointing to the same directory; otherwise Cla
 a different profile.
 
 For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
-select the same record. A verified linked worktree also considers its main checkout identity. This
-is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
+select the same project. A verified linked worktree also considers its main checkout identity.
+Multiple canonical aliases, including Windows drive-letter case variants, require no profile repair
+when their complete bounded MCP projections agree under PiCC's conservative comparison. Raw MCP
+server blocks are compared structurally, while runtime-control lists are validated and deduplicated
+as name sets; explicit `enabledMcpServers` presence remains significant even for an empty list.
+Conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes remain
+unusable and fail all MCP loading closed.
+This is a conservative PiCC identity and conflict policy, not a claim about Claude Code's exact
+behavior for canonical-equivalent records.
 
 A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
 present but unusable (for example, malformed or unreadable), PiCC starts no MCP server and emits a
