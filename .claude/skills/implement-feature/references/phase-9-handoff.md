@@ -73,12 +73,13 @@ writes and tell the user.
         `git fetch origin feature/<feature-slug> && git switch feature/<feature-slug>`.
         Use these repo-local commands only; never hand out an absolute checkout path (it
         leaks the OS username — Rule 6).
-     2. **Setup (once per fresh checkout).** Node ≥ 22.19; run `npm install
-        --ignore-scripts` at the checkout root (where `package.json` is) — do this
-        **before** you `cd` into any fixture in the next step. There is **no build step**
-        — picc runs straight from the TypeScript source. If setup was skipped you'll see
-        `could not find the Pi CLI (@earendil-works/pi-coding-agent)`; the fix is that
-        `npm install`.
+     2. **Setup (once per fresh checkout).** Node ≥ 22.19; run `npm ci
+        --ignore-scripts`, then `npm run build`, at the checkout root (where
+        `package.json` is) — do both **before** you `cd` into any fixture in the next
+        step. This installs the locked dependencies without lifecycle scripts and builds
+        the checkout's verified compiled runtime. If setup was skipped, launch may report
+        a missing Pi CLI or an unavailable, missing, or stale runtime; return to the
+        checkout root and rerun both commands.
      3. **Pick the target by change type — launch picc from the root of whichever
         project's `.claude/` corpus you changed.** picc runs against the current directory
         (cwd *is* the project; there is no target-dir argument), so the launch form

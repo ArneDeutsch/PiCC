@@ -9,27 +9,37 @@ unchanged on GPT/Codex models. This guide covers the essentials.
 git clone https://github.com/ArneDeutsch/PiCC.git
 cd PiCC
 npm ci
+npm run build
 ```
 
 Requirements: Node ≥ 22.19 (Pi's bundled undici 8.x does not run on Node 20) and git. On
 Windows, install Git for Windows; PiCC resolves its Git Bash installation automatically — see
 [`doc/user-guide.md`](doc/user-guide.md).
 
+`npm run build` compiles `src/` into the verified JavaScript runtime and emits external source maps.
 Installing dependencies does not change the checkout's Git configuration. To opt into the bundled
 pre-commit hook, run `npm run hooks:install`; it runs the routine `npm run verify` gate (typecheck
 plus unit) before every commit.
 
 ## Develop
 
-The TypeScript source is loaded at runtime through the pinned jiti loader — there is **no build
-step**. Run it against any Claude Code project from inside that project's directory:
+Author in `src/`. The checkout launcher uses the verified JavaScript runtime when it matches the
+current source and package inputs. If that runtime is missing or stale, it visibly falls back to the
+TypeScript development path; a damaged runtime fails closed. To force the explicit source path,
+host it through an external Pi:
 
 ```bash
 node <path-to-PiCC>/bin/picc.mjs
-# or: pi -e <path-to-PiCC>/src/index.ts
+# explicit source development:
+pi -e <path-to-PiCC>/src/index.ts
 ```
 
-`PICC_DEBUG=1` traces load/skill/routing decisions to stderr.
+After source changes, run `npm run build`. The build publishes JavaScript and external source maps
+as one verified runtime, so source-oriented stacks are available without promising identical stack
+formatting on every host. A launcher-selected compiled runtime pins its verified generation for the
+process, so `/reload` does not switch to a new build; exit and relaunch to exercise it. Source-hosted
+reload remains source-hosted and may observe source edits under Pi's semantics. `PICC_DEBUG=1`
+traces load/skill/routing decisions to stderr.
 
 The dev loop:
 
@@ -117,11 +127,14 @@ git push origin HEAD --follow-tags
 
 `npm version` runs the complete verification gate before it updates `package.json` and
 `package-lock.json`, commits them, and creates the matching `v<version>` tag. The workflow first
-packs once, verifies and tests that exact tarball, and uploads it as a short-lived workflow artifact.
-For a tag, a separate `npm-publish` environment job downloads and rehashes those same bytes before
-handing them to the GitHub Release and npm publication steps. A manual workflow run stops after the
-first job and retains the verified candidate artifact for seven days; it cannot access the npm
-credential or publish a release.
+runs the build-free source verification lanes. It then admits the source and tag, builds once,
+verifies that runtime, packs once, inspects and tests that exact tarball, and uploads it
+as a short-lived workflow artifact. This **build once → verify → pack once → publish one artifact**
+invariant forbids rebuilding or repacking between verification and publication. For a tag, a
+separate `npm-publish` environment job downloads and rehashes those same bytes before handing them
+to the GitHub Release and npm publication steps. A manual workflow run stops after the first job and
+retains the verified candidate artifact for seven days; it cannot access the npm credential or
+publish a release.
 
 The repository must define an `npm-publish` environment whose `NPM_TOKEN` exists only as an
 environment secret and whose deployment rule allows tags matching `v*`. On public repositories,
@@ -185,8 +198,12 @@ Deliberately out of scope — each for a reason, not from neglect:
 - Keep changes focused; match the surrounding code style.
 - Add or update tests for behavior changes at the cheapest sufficient layer; reserve end-to-end
   scenarios for boundaries that require the real Pi CLI or agent loop.
-- Run `npm run verify:all` before opening the PR. CI runs unit, offline integration, and e2e
-  lanes on Windows and Linux — unit and integration on Node 22 and 24, e2e on Node 22.
+- Run `npm run verify:all` before opening the PR. CI runs build-free unit and offline integration
+  on Windows and Linux with Node 22 and 24. Its Node 22 e2e job on both OSes builds and packs the
+  candidate checkout product once. The compiled lane exercises that checkout runtime; the isolated
+  source-fallback witness copies the seeded product, drifts its own checkout, and intentionally
+  rebuilds that copy during its reload check. Only the scripts-disabled packaged witness consumes
+  the exact tarball bytes.
 - Note any capability-registry or documentation updates in the PR description.
 
 ### Manual verification

@@ -12,14 +12,31 @@
 
 ## 1. How PiCC attaches to Pi
 
-Pi extensions are TS modules (loaded via jiti, no compilation) exporting
-`default function (pi: ExtensionAPI)` (async allowed; awaited before startup completes).
-PiCC is **one extension bundle** with an entry `src/index.ts` that registers everything.
+Pi extensions may be TypeScript modules loaded through Pi's loader or ordinary JavaScript modules;
+they export `default function (pi: ExtensionAPI)` (async allowed; awaited before startup completes).
+PiCC is **one extension bundle** authored and composed at `src/index.ts`, but the installed product
+attaches through verified JavaScript.
 
 Launch modes we support:
-- `pi -e <path-to-PiCC>/src/index.ts` in the target project (dev/test).
-- `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
-- A `picc` launcher that owns PiCC administration routing, validates one coherent installed Pi suite, then runs its coding-agent CLI with the extension preloaded. Resolution starts from PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose `dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`.
+- `pi -e <path-to-PiCC>/src/index.ts` in the target project (explicit source development), or that
+  path in Pi's `extensions` settings for persistent source hosting.
+- A source-checkout `picc` launcher, which selects source-matched compiled JavaScript when available
+  and otherwise discloses the permitted TypeScript fallback. A damaged runtime is not a fallback.
+- An installed `picc` launcher, which verifies the package-matched runtime before giving Pi the
+  `picc/index.js` wrapper and never falls back to retained TypeScript. Standalone plugin inventory
+  uses the same selection and compiled verification without starting the normal extension runtime.
+
+The launcher also owns PiCC administration routing and validates one coherent installed Pi suite
+before running its coding-agent CLI with the extension preloaded. Pi CLI resolution starts from
+PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose
+`dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`. The wrapper's
+`picc/` path deliberately preserves Pi's visible **`picc`** extension label for initial load and
+reload.
+
+The PiCC launcher fixes the selected representation for the process. For a compiled selection, the
+wrapper verifies and pins one generation, so Pi's `/reload` cannot adopt a new build before exit and
+relaunch. Source fallback and explicit external-Pi hosting remain source-hosted and may observe
+source edits under Pi's reload semantics; they do not promise compiled-generation pinning.
 
 The launcher sets `PI_SKIP_VERSION_CHECK=1` only for its adjacent embedded-Pi startup and supplies a
 parent-PID/install-kind/PiCC-version tuple. PiCC accepts that tuple only when it matches the direct

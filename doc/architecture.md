@@ -18,7 +18,8 @@ in see [`doc/testing.md`](testing.md).
 │  TUI · session persistence · built-in tools (read/write/edit/bash/  │
 │  grep/find/ls) · extension event bus                                │
 └───────────────▲──────────────────────────────── loads as extension ─┘
-                │ default export picc(pi)  (src/index.ts)
+                │ default export picc(pi)  (installed: picc/index.js;
+                │                           explicit source: src/index.ts)
 ┌───────────────┴─────────────────────────────────────────────────────┐
 │  PiCC (this repo) — one Pi extension bundle                          │
 │                                                                      │
@@ -35,12 +36,23 @@ in see [`doc/testing.md`](testing.md).
 
 ### The Pi ⇄ PiCC boundary
 
-PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as a single
-extension whose entry is `src/index.ts`; the pinned, tested dependency graph is recorded in
+PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as one extension
+bundle. `src/index.ts` remains the TypeScript authoring and implementation composition root. The
+installed Pi boundary instead receives `picc/index.js`, a stable wrapper that verifies product
+identity before importing the generated `dist/index.js`; explicit source development may give Pi
+`src/index.ts` directly. The pinned, tested dependency graph is recorded in
 [`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
 supplies Claude Code compatibility and **never** reimplements auth, the provider layer, or the TUI
 shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend
 the seam instead.
+
+Source and generated JavaScript are two representations of one product. The PiCC launcher selects
+the representation and verifies any compiled runtime before extension load: installed mode therefore
+fails closed rather than reaching retained TypeScript, while a source checkout may disclose a
+development fallback. A
+compiled selection pins its verified generation for the process, so Pi's `/reload` cannot adopt a
+new build. Source-hosted reload remains source-hosted and may observe source edits under Pi's reload
+semantics.
 
 The carve-out: PiCC does render **its own** tool rows, built on Pi's `pi-tui` primitives — that is
 what `tool-shell.ts` and `subagent-render.ts` are. Rendering a surface PiCC owns is in scope;
@@ -415,8 +427,12 @@ Single-consumer logic stays with its consumer.
 
 The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
-1. **Extension load.** The process env is made UTF-8-safe, then `loadClaudeProject()` assembles the
-   project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
+1. **Extension load.** Before this implementation root runs, an installed or checkout-compiled
+   wrapper verifies and pins the compiled runtime generation; a source-checkout launcher instead may
+   have emitted its TypeScript-fallback notice. Explicit external-Pi source hosting performs neither
+   launcher selection nor compiled-generation verification. The process env is then made UTF-8-safe,
+   and `loadClaudeProject()` assembles the project model. `CwdState`,
+   `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
    multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime`
    (enabled MCP servers begin connecting in the background, non-blocking) are constructed. All
    Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard

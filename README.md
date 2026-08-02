@@ -34,15 +34,16 @@ picc
 # work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
 
-`npm run setup` installs the locked dependencies and globally links this checkout. It requires a
-writable npm global prefix; the user guide gives a no-global-link alternative. Windows notes: Git
-Bash (from Git for Windows) must be installed; if PowerShell blocks the
-`picc` script shim, use `picc.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
-RemoteSigned`. Details per shell/OS in the guide.
+`npm run setup` installs the locked dependencies, builds and verifies the runtime for this
+checkout, then globally links it. It requires a writable npm global prefix; the user guide gives a
+no-global-link alternative. Windows notes: Git Bash (from Git for Windows) must be installed; if
+PowerShell blocks the `picc` script shim, use `picc.cmd` or
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Details per shell/OS in the guide.
 
 Once published, `npm install --global picc` gives you the same `picc` command without a source
-checkout.
-PiCC ships as TypeScript source loaded through jiti — there is no release build step.
+checkout. Published installations run verified JavaScript and fail with owner-aware repair guidance
+instead of falling back to TypeScript. Source checkouts retain an explicit development fallback;
+see [Install and runtime selection](doc/user-guide.md#2-install).
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
@@ -110,7 +111,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 npm run typecheck:all    # strict TS over src + tests
 npm test                 # unit lane (same as test:unit)
 npm run test:integration # offline whole-extension integration lane
-npm run test:e2e         # real Pi CLI against a mock model
+npm run test:e2e         # packaged, compiled real-Pi, and source-fallback witnesses
 npm run test:all         # unit + integration + e2e
 npm run gen:capabilities # regenerate doc/supported-features.md from the registry
 ```
