@@ -92,6 +92,9 @@ import {
  * (skills parse the final message — often locked YAML — directly; hard contract).
  */
 
+export const TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE =
+  "Preserve or back up any existing transcript data and collections. Never edit or delete an ownership marker by hand. Start a new main session before retrying future persisted subagents, and review old transcript data separately.";
+
 /** Structural interface for the WorktreeManager (avoids import-order coupling). */
 export interface WorktreeManagerLike {
   enter(opts: { name?: string; path?: string }): Promise<{
@@ -1603,6 +1606,7 @@ export class SubagentRuntime {
     // never a resume, so the cwd known at interception equals the dispatch cwd passed
     // here. Undefined ⇒ nothing to fork (degraded at interception, or not a fork).
     let attemptForkSession: ((cwd: string) => PiSessionManagerLike) | undefined;
+    let forkOwnershipAdmissionFailed = false;
     // The developer-/model-facing degrade reason + tone (calm `info` for a chosen/
     // expected opt-out, `warning` for a genuine can't-do). Surfaced as a fork-
     // specific notice — never the generic unknown-type warning, never silent. The
@@ -1713,7 +1717,10 @@ export class SubagentRuntime {
           const prepared = (this.deps.prepareTranscriptCollection ?? prepareSubagentTranscriptCollection)(
             forkMainFileRef,
           );
-          if (!prepared.ok) throw new Error(prepared.diagnostic.message);
+          if (!prepared.ok) {
+            forkOwnershipAdmissionFailed = true;
+            throw new Error(prepared.diagnostic.message);
+          }
           return forkSdkRef.forkSessionManager!(forkMainFileRef, cwd, prepared.directory, agentId);
         };
       }
@@ -2180,10 +2187,14 @@ export class SubagentRuntime {
           agent = resolveAgent(builtins, "general-purpose") ?? agent;
           emitForkDegrade(
             "warning",
-            `forking the parent session failed`,
-            `forking the parent session failed (${capErrorText(
-              (err as Error)?.message ?? String(err),
-            )})`,
+            forkOwnershipAdmissionFailed
+              ? `transcript ownership could not be verified. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`
+              : `forking the parent session failed`,
+            forkOwnershipAdmissionFailed
+              ? `forking the parent session failed because transcript ownership could not be verified. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`
+              : `forking the parent session failed (${capErrorText(
+                (err as Error)?.message ?? String(err),
+              )})`,
           );
         }
       }
@@ -2461,7 +2472,7 @@ export class SubagentRuntime {
           if (!prepared.ok) {
             diagnostics.push(prepared.diagnostic, {
               severity: "warning",
-              message: "subagent transcript persistence was skipped; this run is in-memory and non-resumable. Repair or make the ownership marker readable before retrying",
+              message: `subagent transcript persistence was skipped; this run is in-memory and non-resumable. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`,
             });
           } else {
             const persisted = sdk.persistedSessionManager(cwd, prepared.directory, agentId);

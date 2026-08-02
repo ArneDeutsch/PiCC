@@ -26,6 +26,7 @@ import {
 } from "./runtime/subagent-transcript-retention.js";
 import {
   SubagentRuntime,
+  TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
   presentDispatchResult,
@@ -838,7 +839,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const worktreeBusy = worktree.failureCounts.busy;
       if (worktreeBusy > 0) details.push(`${worktreeBusy} worktree item(s) were locked or busy. Close applications using them, then restart PiCC.`);
       const ownershipUncertain = transcript?.failureCounts["ownership-uncertain"] ?? 0;
-      if (ownershipUncertain > 0) details.push(`Ownership could not be verified for ${ownershipUncertain} transcript item(s), so they were preserved. Reconcile transcript ownership, then restart PiCC.`);
+      if (ownershipUncertain > 0) details.push(`Ownership could not be verified for ${ownershipUncertain} transcript item(s), so affected data remains untouched. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`);
       const transcriptIo = transcript?.failureCounts["other-io"] ?? 0;
       if (transcriptIo > 0) details.push(`${transcriptIo} transcript item(s) had another I/O failure. Check session transcript storage access, then restart PiCC.`);
       const worktreeIo = worktree.failureCounts["other-io"];
@@ -848,7 +849,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const gitAuthority = worktree.failureCounts["git-authority"];
       if (gitAuthority > 0) details.push(`Git authority was unavailable for ${gitAuthority} worktree cleanup attempt(s). Restore repository Git access, then restart PiCC.`);
       if (retainedWorktrees > 0 || retainedTranscripts > 0) {
-        details.push("Retained items need review. Use the counts and categories in this notice to check session transcript storage or project-owned worktree storage, then restart PiCC after repairs.");
+        details.push("Retained items remain untouched. Use the counts and categories in this notice to review them.");
       }
       const uncategorizedDiagnostics = diagnosticCount > 0 && failureCount === 0;
       if (uncategorizedDiagnostics) {

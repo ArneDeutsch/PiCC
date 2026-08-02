@@ -13,6 +13,7 @@ import {
   subagentSessionDir,
 } from "../src/util/subagent-transcripts.js";
 import {
+  TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
   type PiSdk,
@@ -36,7 +37,7 @@ import {
 useRealSessionManager(SessionManager);
 
 /**
- * Persisted subagent transcripts + agent IDs: every dispatch leaves a
+ * Persisted subagent transcripts + agent IDs: every successfully persisted dispatch leaves a
  * JSONL transcript discoverable from the main session via the hardened
  * resolver; the coordinator receives the agent ID in model-readable text; the
  * dispose→reopen round-trip is proven on the REAL Pi SessionManager.
@@ -177,7 +178,7 @@ describe("agent IDs and the hardened transcript resolver", () => {
 });
 
 describe("collection ownership admission", () => {
-  it("gates ordinary persistence before its factory and degrades with repair guidance", async () => {
+  it("gates ordinary persistence before its factory and degrades with recovery guidance", async () => {
     const sessions = tempSessionsDir();
     const parent = SessionManager.create(sessions, sessions, { id: "main-order" });
     parent.appendMessage({ role: "user", content: "parent" } as never);
@@ -195,7 +196,7 @@ describe("collection ownership admission", () => {
     };
     const runtime = makeSubagentRuntime([makeAgent()], sdk, {
       getMainSessionFile: () => parentFile,
-      prepareTranscriptCollection: prepareSubagentTranscriptCollection,
+      prepareTranscriptCollection: undefined,
     });
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
     expect(result.ok).toBe(true);
@@ -203,6 +204,19 @@ describe("collection ownership admission", () => {
   });
 
   it("refuses every unsafe marker state before the ordinary persistence factory", async () => {
+    const assertSafeOwnershipRecovery = (message: string | undefined) => {
+      expect(message).toContain(TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE);
+      expect(message).not.toMatch(
+        /repair|readable (?:ownership )?marker|ownership marker.{0,20}readable|reconcile (?:transcript )?ownership|restart PiCC/i,
+      );
+      const messageWithoutSafeGuidance = message?.replace(TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE, "");
+      expect(messageWithoutSafeGuidance).not.toMatch(
+        /(?:edit|delete|remove).{0,60}ownership marker|ownership marker.{0,60}(?:edit|delete|remove)|(?:delete|remove|clean|discard).{0,60}(?:transcript|collection|data)|(?:transcript|collection|data).{0,60}(?:delete|remove|clean|discard)/i,
+      );
+      expect(message).not.toMatch(
+        /new (?:main )?session.{0,80}(?:cleans?|deletes?|removes?|discards?)/i,
+      );
+    };
     const cases = ["malformed", "oversized", "unreadable", "mismatch", "linked", "EEXIST"] as const;
     for (const kind of cases) {
       const sessions = tempSessionsDir();
@@ -258,10 +272,11 @@ describe("collection ownership admission", () => {
       expect(factoryCalls).toBe(0);
       expect(fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
       expect(fs.readFileSync(marker, "utf8")).toBe(markerAfterAdmission);
-      expect(result.diagnostics.some((diagnostic) =>
+      const ordinaryDiagnostic = result.diagnostics.find((diagnostic) =>
         diagnostic.message.includes("persistence was skipped") &&
-        diagnostic.message.includes("in-memory and non-resumable") &&
-        diagnostic.message.includes("marker readable before retrying"), kind)).toBe(true);
+        diagnostic.message.includes("in-memory and non-resumable"));
+      expect(ordinaryDiagnostic, kind).toBeDefined();
+      assertSafeOwnershipRecovery(ordinaryDiagnostic?.message);
 
       const forkHandle = fakeSdk({ replies: ["fresh"] });
       let forkFactoryCalls = 0;
@@ -280,8 +295,10 @@ describe("collection ownership admission", () => {
       expect(forkResult.ok).toBe(true);
       expect(forkResult.isFork).toBe(false);
       expect(forkFactoryCalls).toBe(0);
-      expect(forkResult.diagnostics.some((diagnostic) =>
-        diagnostic.message.startsWith("fork ran with fresh context:")), kind).toBe(true);
+      const forkDiagnostic = forkResult.diagnostics.find((diagnostic) =>
+        diagnostic.message.startsWith("fork ran with fresh context:"));
+      expect(forkDiagnostic, kind).toBeDefined();
+      assertSafeOwnershipRecovery(forkDiagnostic?.message);
       expect(fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
     }
   });
@@ -616,7 +633,7 @@ describe("fork inheritance on the REAL Pi SessionManager", () => {
     };
     const runtime = makeSubagentRuntime([], sdk, {
       getMainSessionFile: () => parentFile,
-      prepareTranscriptCollection: prepareSubagentTranscriptCollection,
+      prepareTranscriptCollection: undefined,
     });
     const result = await runtime.dispatch({ subagentType: "fork", prompt: "continue", depth: 1 });
 

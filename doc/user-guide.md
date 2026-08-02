@@ -379,7 +379,10 @@ parent. An absent marker does not conflict in this parent-backed legacy case; an
 malformed, or mismatched marker preserves the collection. If the parent is gone, PiCC ages
 recognized files individually only when the collection has PiCC's matching ownership marker,
 retaining fresh files and removing an empty collection. An unreadable, malformed, or mismatched
-parent also preserves the collection, as do markerless legacy orphans.
+parent also preserves the collection, as do markerless legacy orphans. When ownership is ambiguous,
+PiCC leaves existing transcript data untouched. Preserve or back up that data, and never edit or
+delete an ownership marker by hand. Start a new main session for future persisted subagents and
+review the old data separately; the new session does not clean the old data.
 
 For transcripts, PiCC scans only the default or custom session directory supplied by the active Pi
 session manager; it never crawls global Pi data. Orphan-worktree cleanup separately scans the

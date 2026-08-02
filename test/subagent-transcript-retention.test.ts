@@ -189,10 +189,32 @@ describe("owned subagent transcript retention", () => {
     expect(fs.existsSync(f.childFile)).toBe(true);
   });
 
-  it("keeps exact-case canonical ownership identities distinct", () => {
-    expect(hashCanonicalPath("C:\\Projects\\CaseSensitive")).not.toBe(
-      hashCanonicalPath("C:\\projects\\casesensitive"),
-    );
+  it("preserves an orphan when its marker differs only by Windows-shaped canonical cwd case", async () => {
+    const f = fixture();
+    touch(f.childFile, OLD);
+    fs.unlinkSync(f.mainFile);
+    const marker = path.join(f.collection, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER);
+    const ownership = JSON.parse(fs.readFileSync(marker, "utf8")) as { cwdHash: string };
+    const preservedCase = "C:\\Projects\\CaseSensitive";
+    ownership.cwdHash = hashCanonicalPath("C:\\projects\\casesensitive");
+    fs.writeFileSync(marker, `${JSON.stringify(ownership)}\n`, "utf8");
+
+    const result = await reapSubagentTranscripts({
+      sessionDirectory: f.root,
+      activeMainSessionFile: f.activeFile,
+      activeMainCwd: f.cwd,
+      maxAgeDays: 30,
+      cleanupAllowed: true,
+      nowMs: NOW,
+      fs: {
+        realpath: async (file) => file === f.cwd ? preservedCase : fs.promises.realpath(file),
+      },
+    });
+
+    expect(result.failureCounts["ownership-uncertain"]).toBe(1);
+    expect(result).toMatchObject({ removedTranscriptFiles: 0, removedCollections: 0 });
+    expect(fs.existsSync(f.childFile)).toBe(true);
+    expect(fs.existsSync(f.collection)).toBe(true);
   });
 
   it("canonicalizes a non-vacuous active root alias through the root authority", async () => {

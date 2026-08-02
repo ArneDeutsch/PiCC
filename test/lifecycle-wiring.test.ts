@@ -768,7 +768,7 @@ describe("lifecycle wiring", () => {
     ...([
       ["transcript permission", "permission", "2 transcript item(s) could not be accessed", "Repair transcript ownership and permissions"],
       ["transcript busy", "busy", "2 transcript item(s) were locked or busy", "Close applications using them"],
-      ["transcript ownership uncertainty", "ownership-uncertain", "Ownership could not be verified for 2 transcript item(s)", "Reconcile transcript ownership"],
+      ["transcript ownership uncertainty", "ownership-uncertain", "Ownership could not be verified for 2 transcript item(s)", "Preserve or back up any existing transcript data and collections. Never edit or delete an ownership marker by hand. Start a new main session before retrying future persisted subagents, and review old transcript data separately"],
       ["transcript other I/O", "other-io", "2 transcript item(s) had another I/O failure", "Check session transcript storage access"],
     ] as const).map(([name, category, cause, remedy]) => ({
       name: `truncated ${name}`,
@@ -778,7 +778,12 @@ describe("lifecycle wiring", () => {
         diagnosticsTruncated: true,
       }),
       severity: "warning",
-      include: [cause, remedy, "restart PiCC", "Some transcript cleanup detail was omitted"],
+      include: [
+        cause,
+        remedy,
+        ...(category === "ownership-uncertain" ? [] : ["restart PiCC"]),
+        "Some transcript cleanup detail was omitted",
+      ],
       exclude: ["changed concurrently", "RAW_DIAGNOSTIC", "Run /doctor"],
     })),
     ...([
@@ -806,8 +811,34 @@ describe("lifecycle wiring", () => {
       worktree: worktreeResult({ retainedWorktrees: 2 }),
       transcript: transcriptResult({ retainedEntries: 4 }),
       severity: "warning",
-      include: ["retained 2 worktree(s) and 4 transcript item(s)", "Retained items need review", "counts and categories in this notice", "check session transcript storage or project-owned worktree storage"],
-      exclude: ["changed concurrently", "another I/O failure", "Run /doctor", "verify their age and ownership"],
+      include: ["retained 2 worktree(s) and 4 transcript item(s)", "Retained items remain untouched", "Use the counts and categories in this notice to review them"],
+      exclude: ["changed concurrently", "another I/O failure", "Run /doctor", "verify their age and ownership", "restart PiCC", "after repairs"],
+    },
+    {
+      name: "ownership uncertainty with retained entries",
+      worktree: worktreeResult(),
+      transcript: transcriptResult({
+        retainedEntries: 3,
+        failureCounts: { race: 0, permission: 0, busy: 0, "ownership-uncertain": 2, "other-io": 0 },
+      }),
+      severity: "warning",
+      include: [
+        "retained 0 worktree(s) and 3 transcript item(s)",
+        "affected data remains untouched",
+        "Never edit or delete an ownership marker by hand",
+        "Start a new main session before retrying future persisted subagents",
+        "review old transcript data separately",
+        "Retained items remain untouched",
+        "Use the counts and categories in this notice to review them",
+      ],
+      exclude: [
+        "Reconcile transcript ownership",
+        "Retained items need review",
+        "then restart PiCC after repairs",
+        "Repair or make the ownership marker readable",
+        "restart PiCC",
+        "new main session cleans",
+      ],
     },
     {
       name: "blocked policy",
@@ -833,7 +864,7 @@ describe("lifecycle wiring", () => {
         "retained 1 worktree(s) and 3 transcript item(s)",
         "1 transcript cleanup target(s) changed concurrently",
         "1 transcript item(s) could not be accessed",
-        "Retained items need review",
+        "Retained items remain untouched",
       ],
       exclude: ["Some transcript cleanup detail was omitted", "another I/O failure", "Run /doctor", "verify their age and ownership"],
     },
