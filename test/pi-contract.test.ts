@@ -836,6 +836,50 @@ describe("pi 0.83.0 API contract", () => {
     }
   });
 
+  it("installs and clears Pi's native compaction indicator around the physical transaction", () => {
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const source = readFileSync(
+      fileURLToPath(new URL("./modes/interactive/interactive-mode.js", mainUrl.slice(0, distIdx) + "/dist/")),
+      "utf8",
+    );
+
+    expect(source).toMatch(/case "compaction_start":[\s\S]*?showStatusIndicator\(new CompactionStatusIndicator\(this\.ui, event\.reason\)\)/);
+    expect(source).toMatch(
+      /case "compaction_end": \{[\s\S]*?this\.clearStatusIndicator\("compaction"\);[\s\S]*?else if \(event\.result\) \{\s*this\.chatContainer\.clear\(\);\s*this\.rebuildChatFromMessages\(\);\s*this\.addMessageToChat\(createCompactionSummaryMessage\(event\.result\.summary, event\.result\.tokensBefore, new Date\(\)\.toISOString\(\)\)\);/,
+    );
+  });
+
+  it("keeps custom entries rebuild-visible after compaction but outside model context", () => {
+    const session = SessionManager.inMemory(process.cwd());
+    const firstKept = session.appendMessage({ role: "user", content: "kept user turn" } as never);
+    session.appendCompaction("bounded summary", firstKept, 1_000);
+    session.appendCustomEntry("picc-proactive-compact", {
+      notice: "model-inert-checkpoint-presentation-sentinel",
+      severity: "info",
+    });
+
+    expect(session.buildContextEntries()).toContainEqual(expect.objectContaining({
+      type: "custom",
+      customType: "picc-proactive-compact",
+      data: expect.objectContaining({ notice: "model-inert-checkpoint-presentation-sentinel" }),
+    }));
+    expect(JSON.stringify(session.buildSessionContext().messages))
+      .not.toContain("model-inert-checkpoint-presentation-sentinel");
+
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    const source = readFileSync(
+      fileURLToPath(new URL("./modes/interactive/interactive-mode.js", mainUrl.slice(0, distIdx) + "/dist/")),
+      "utf8",
+    );
+    expect(source).toMatch(
+      /rebuildChatFromMessages\(\) \{\s*this\.chatContainer\.clear\(\);\s*this\.renderSessionEntries\(this\.sessionManager\.buildContextEntries\(\)\);\s*\}/,
+    );
+    expect(source).toMatch(/renderSessionEntries\(entries[\s\S]*?entry\.type === "custom"[\s\S]*?return \[entry\]/);
+  });
+
   it("SessionManager.forkFrom copies custom entries from the source transcript", () => {
     const dir = mkdtempSync(join(tmpdir(), "picc-session-fork-contract-"));
     try {

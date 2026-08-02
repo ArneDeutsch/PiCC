@@ -127,9 +127,9 @@ const MAX_INDENT_LEVELS = 6;
 const TYPE_RENDER_CAP = 60;
 const LABEL_RENDER_CAP = 160;
 const ACTIVITY_RENDER_CAP = DETAIL_FIELD_MAX_LENGTH;
-const ACTIVITY_BRANCH_INSET = "  ";
 const COLUMN_GAP = "  ";
 const DESCRIPTION_SEPARATOR = " · ";
+const ACTIVITY_SEPARATOR = " · ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
 const MIN_USEFUL_DESCRIPTION_WIDTH = 3;
 /** Smallest ordinary row: state glyph + space + a useful identity fragment. */
@@ -162,6 +162,7 @@ interface PlainPanelRow {
   status: string;
   chip: string;
   description: string;
+  activity: string;
   metrics: Record<MetricKey, string | undefined>;
 }
 
@@ -206,6 +207,7 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
     status: row.state === "waiting" ? " [waiting]" : "",
     chip: row.hiddenDescendants > 0 ? ` (+${row.hiddenDescendants})` : "",
     description: comparableLabel && comparableLabel !== comparableIdentity ? comparableLabel : "",
+    activity: prepareActivityText(row),
     metrics: {
       elapsed: formatElapsed(row.elapsedMs),
       input: input === undefined ? undefined : `in ${input}`,
@@ -252,58 +254,36 @@ function activityValue(row: PanelRowView): PanelRowView["activity"] {
       typeof activity.text === "string"
     ) return { kind: activity.kind, text: activity.text };
   } catch {
-    // Hand-built/plugin views can be malformed; active line two remains present below.
+    // Hand-built/plugin views can be malformed; active rows still receive a safe fallback.
   }
   return undefined;
 }
 
-function renderActivityLine(
-  row: PlainPanelRow,
-  opts: PanelRenderOptions,
-  fullGutterFits: boolean,
-  gutterWidth: number,
-): string {
-  const markerSpace = fullGutterFits ? " ".repeat(visibleWidth(row.marker)) : "";
-  const indent = fullGutterFits ? row.indent : "";
-  const branch = "└ ";
-  const activityGutterWidth = gutterWidth + visibleWidth(ACTIVITY_BRANCH_INSET);
-  const prefixPlain = `${markerSpace}${indent}${ACTIVITY_BRANCH_INSET}${branch}`;
-  const prefix = `${markerSpace}${indent}${ACTIVITY_BRANCH_INSET}${panelFg(opts.theme, "muted", branch)}` +
-    " ".repeat(Math.max(0, activityGutterWidth - visibleWidth(prefixPlain)));
-  const available = Math.max(1, opts.width - activityGutterWidth);
-  const activity = activityValue(row.source);
-
+function prepareActivityText(row: PanelRowView): string {
+  if (row.state !== "running" && row.state !== "waiting") return "";
+  if (row.state === "waiting") return "Waiting for capacity";
+  const activity = activityValue(row);
   if (activity?.kind === "tool") {
     const tool = scalarSafeText(sanitizeLine(activity.tool, ACTIVITY_RENDER_CAP)) || "tool";
     const detail = activity.detail === undefined
       ? ""
       : scalarSafeText(sanitizeLine(activity.detail, ACTIVITY_RENDER_CAP));
-    if (detail && available >= 3) {
-      const toolWidth = Math.min(visibleWidth(tool), Math.max(1, available - 2));
-      const fittedTool = fitActivityText(tool, toolWidth);
-      const detailWidth = Math.max(1, available - visibleWidth(fittedTool) - 1);
-      const fittedDetail = fitActivityText(detail, detailWidth);
-      return `${prefix}${panelFg(opts.theme, "text", fittedTool)} ${panelFg(opts.theme, "accent", fittedDetail)}`;
-    }
-    return `${prefix}${panelFg(opts.theme, "text", fitActivityText(tool, available))}`;
+    return detail ? `${tool} ${detail}` : tool;
   }
 
-  const fallback = row.source.state === "waiting" ? "Waiting for capacity" : "Working…";
+  const fallback = "Working…";
   const sanitizedText = activity
     ? scalarSafeText(sanitizeLine(activity.text, ACTIVITY_RENDER_CAP)) || fallback
     : fallback;
-  const normalizedReasoning = activity?.kind === "reasoning"
-    ? stripReasoningOuterBold(sanitizedText)
-    : undefined;
-  const text = normalizedReasoning === undefined
-    ? sanitizedText
-    : normalizedReasoning || fallback;
-  const fitted = fitActivityText(text, available);
-  if (normalizedReasoning) return `${prefix}${themedFgItalic(opts.theme, "muted", fitted)}`;
-  if (activity?.kind === "assistant" || activity?.kind === "output") {
-    return `${prefix}${panelFg(opts.theme, "text", fitted)}`;
-  }
-  return `${prefix}${panelFg(opts.theme, "muted", fitted)}`;
+  if (activity?.kind !== "reasoning") return sanitizedText;
+  return stripReasoningOuterBold(sanitizedText) || fallback;
+}
+
+function renderInlineActivity(activity: string, width: number, opts: PanelRenderOptions): string {
+  const separatorWidth = visibleWidth(ACTIVITY_SEPARATOR);
+  if (!activity || width < separatorWidth + 1) return "";
+  return panelFg(opts.theme, "muted", ACTIVITY_SEPARATOR) +
+    themedFgItalic(opts.theme, "muted", fitActivityText(activity, width - separatorWidth));
 }
 
 function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string[] {
@@ -401,18 +381,32 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     let line = `${marker}${indent}${glyph} ${gutterPad}`;
     line += opts.theme ? tintAgentColor(row.source.color, fittedIdentity) : fittedIdentity;
     line += panelFg(opts.theme, "muted", suffix);
-    line += " ".repeat(Math.max(0, identityWidth - visibleWidth(identityPlain)));
+    const identityRemaining = Math.max(0, identityWidth - visibleWidth(identityPlain));
     if (hasDescriptionCell) {
+      line += " ".repeat(identityRemaining);
       const description = truncateToWidth(row.description, descriptionWidth, "…");
       if (description) {
         line += panelFg(opts.theme, "muted", DESCRIPTION_SEPARATOR);
         line += panelFg(opts.theme, "accent", description);
-        line += " ".repeat(Math.max(0, descriptionWidth - visibleWidth(description)));
+        const remaining = Math.max(0, descriptionWidth - visibleWidth(description));
+        const activity = renderInlineActivity(row.activity, remaining, opts);
+        line += activity;
+        line += " ".repeat(Math.max(0, remaining - visibleWidth(activity)));
       } else {
-        line += " ".repeat(descriptionSeparatorWidth + descriptionWidth);
+        const available = descriptionSeparatorWidth + descriptionWidth;
+        const activity = renderInlineActivity(row.activity, available, opts);
+        line += activity;
+        line += " ".repeat(Math.max(0, available - visibleWidth(activity)));
       }
-    } else if (active.size > 0) {
-      line += " ".repeat(Math.max(0, availableLeft - gutterWidth - identityWidth));
+    } else {
+      const activity = row.description
+        ? ""
+        : renderInlineActivity(row.activity, identityRemaining, opts);
+      line += activity;
+      line += " ".repeat(Math.max(0, identityRemaining - visibleWidth(activity)));
+      if (active.size > 0) {
+        line += " ".repeat(Math.max(0, availableLeft - gutterWidth - identityWidth));
+      }
     }
     for (const key of METRIC_ORDER) {
       if (!active.has(key)) continue;
@@ -425,11 +419,7 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   const lines: string[] = [];
   if (view.hiddenAbove > 0) lines.push(panelFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
   for (let index = 0; index < rows.length; index++) {
-    const row = rows[index]!;
     lines.push(renderedRows[index]!);
-    if (row.source.state === "running" || row.source.state === "waiting") {
-      lines.push(renderActivityLine(row, opts, fullGutterFits, gutterWidth));
-    }
   }
   if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
   const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);

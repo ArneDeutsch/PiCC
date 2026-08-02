@@ -307,7 +307,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
     { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /private state shape.*remain inferred or unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/State is never modified/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /bounded individual server definitions retain skip-or-adjust handling/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent record semantics.*remain inferred or unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/not verified Claude behavior for multiple canonical-equivalent project records/, /State is never modified/] },
     { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], visibility: [/cannot edit the list/] },
     { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
@@ -711,13 +711,46 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
+  const duplicatedPanelMechanics = [
+    /\binline[- ](?:current[- ])?activity(?: fragment)?\b|\bcurrent[- ]activity fragment[^.]{0,60}\binline\b/iu,
+    /\b(?:one|single) physical (?:status )?row\b|\bone[- ]row (?:status )?layout\b/iu,
+    /\bbounded (?:sanitized )?current[- ]activity(?: fragment)?\b/iu,
+    /(?=[^.]{0,160}(?:current[- ]activity|activity fragment))(?=[^.]{0,160}(?:responsiv(?:e|ely)|(?:row )?(?:space|width) (?:changes|narrows)))(?=[^.]{0,160}(?:shorten(?:ed|ing|s)?|truncat(?:e|ed|es|ion)|disappear(?:s|ance)?|om(?:it(?:ted|s)?|ission)))[^.]{1,160}/iu,
+    /(?=[^.]{0,140}\bterminal (?:status )?rows?\b)(?=[^.]{0,140}(?:current[- ]activity|activity fragment))(?=[^.]{0,140}\b(?:omit(?:ted|s)?|omission)\b)[^.]{1,140}/iu,
+    /\bbounded (?:agent )?window\b/iu,
+    /(?:narrow widths?|widths? too narrow)[^.]{0,100}(?:truthful )?aggregates?\b/iu,
+    /(?:drill-down|detail(?: view)?)[^.]{0,100}\bmultiline (?:activity )?history\b|\bmultiline (?:activity )?history[^.]{0,100}(?:drill-down|detail(?: view)?)/iu,
+  ];
+
+  function duplicatesPanelMechanics(note: string): boolean {
+    return duplicatedPanelMechanics.some((pattern) => pattern.test(note));
+  }
+
+  it.each([
+    ["inline/current-activity fragment", "The panel puts the current-activity fragment inline beside identity."],
+    ["one physical row/one-row layout", "Each running agent uses a one-row status layout."],
+    ["bounded sanitized current activity", "Each row includes a bounded sanitized current activity fragment."],
+    ["responsive shortening with separator wording", "The current activity responsively shortens or is omitted with its separator."],
+    ["responsive disappearance without separator wording", "The activity fragment disappears responsively as row width narrows."],
+    ["terminal omission", "Terminal rows omit the current-activity fragment."],
+    ["bounded windowing", "A bounded agent window remains navigable."],
+    ["narrow aggregate fallback", "At narrow widths truthful aggregates replace individual rows."],
+    ["multiline/detail history", "The detail view retains multiline activity history."],
+  ])("detects duplicated panel mechanic: %s", (_category, canary) => {
+    expect(duplicatesPanelMechanics(canary)).toBe(true);
+  });
+
   it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {
     const owner = lookupCapability("feature.background-agents")?.note ?? "";
     for (const clause of [
-      "stable PiCC-defined current-activity line until terminal settlement",
-      "tool/argument, reasoning, assistant/output, startup, work, retry, and waiting states",
-      "window counts at most eight agents rather than physical lines",
-      "widths below the explicit row minimum retain truthful aggregates without per-agent activity",
+      "inline layout is PiCC-defined presentation rather than verified Claude Code presentation parity",
+      "every individually rendered running or capacity-waiting agent uses one physical status row",
+      "bounded sanitized current-activity fragment",
+      "As available row space changes",
+      "truncated with an ellipsis or omitted together with its separator",
+      "terminal rows omit it",
+      "bounded agent window remains navigable across overflow",
+      "At widths too narrow for individual rows, truthful aggregates remain without per-agent activity",
       "drill-down that retains multiline history and richer detail",
       "PiCC-chosen details, NOT parity",
     ]) expect(owner, clause).toContain(clause);
@@ -725,9 +758,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const id of ["tool.Agent", "tool.TaskOutput"]) {
       const note = lookupCapability(id)?.note ?? "";
       expect(note, id).toContain("status-panel observability is defined by feature.background-agents");
-      expect(note, `${id} must not duplicate panel mechanics`).not.toMatch(
-        /eight-agent window|current-activity line|narrow.*aggregate|multiline history/u,
-      );
+      expect(duplicatesPanelMechanics(note), `${id} must not duplicate panel mechanics`).toBe(false);
     }
   });
 
@@ -852,11 +883,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /default notice box/,
         /panel tree/,
         /parent's transcript/,
-        /stable PiCC-defined current-activity line until terminal settlement/,
-        /tool\/argument, reasoning, assistant\/output, startup, work, retry, and waiting states/,
-        /window counts at most eight agents rather than physical lines/,
-        /widths below the explicit row minimum retain truthful aggregates without per-agent activity/,
-        /Lingering terminal agents return to one row/,
+        /inline layout.*PiCC-defined presentation.*one physical status row/s,
+        /bounded sanitized current-activity fragment.*available row space.*truncated with an ellipsis.*omitted together with its separator/s,
+        /terminal rows omit.*bounded agent window.*overflow/s,
+        /widths too narrow for individual rows.*truthful aggregates.*without per-agent activity/s,
         /drill-down.*retains multiline history and richer detail/,
       ],
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
@@ -2367,6 +2397,29 @@ describe("buildCompatReport", () => {
     expect(JSON.stringify(findings)).not.toContain(diagnostic);
   });
 
+  it("uses conflict guidance only for the exact fixed diagnostic and redacts lookalikes", () => {
+    const diagnostic = "Native Claude project MCP state has conflicting matching records";
+    const exactProject = makeProject({ mcp: makeMcp({ diagnostics: [diagnostic] }) });
+    const exactEvidence = buildCompatReport(exactProject).findings
+      .filter((finding) => finding.capability.id === "feature.mcp")
+      .map((finding) => finding.evidence);
+    expect(exactEvidence).toEqual([
+      "Canonical-equivalent native Claude project records disagree on MCP server or runtime-control state, so all MCP loading is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+    ]);
+
+    const lookalike = `SECRET_CANARY_PREFIX ${diagnostic} SECRET_CANARY_SUFFIX`;
+    const lookalikeProject = makeProject({ mcp: makeMcp({ diagnostics: [lookalike] }) });
+    const lookalikeReport = buildCompatReport(lookalikeProject);
+    const lookalikeEvidence = lookalikeReport.findings
+      .filter((finding) => finding.capability.id === "feature.mcp")
+      .map((finding) => finding.evidence);
+    expect(lookalikeEvidence).toEqual([
+      "MCP configuration has an additional redacted issue; inspect the active profile and project MCP configuration, then run /reload or restart PiCC.",
+    ]);
+    expect(lookalikeEvidence.join(" ")).not.toContain("Canonical-equivalent");
+    expect(renderDoctorReport(lookalikeProject, lookalikeReport)).not.toMatch(/SECRET_CANARY/u);
+  });
+
   it("classifies every known config-level diagnostic into distinct static redacted guidance", () => {
     const diagnostics = [
       "Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled",
@@ -2381,6 +2434,7 @@ describe("buildCompatReport", () => {
       "Native Claude state could not be read SOURCE_PATH_CANARY",
       "Native Claude local MCP state has an invalid object shape ENV_SECRET_CANARY",
       "Matching native Claude project record has an invalid shape MATCHING_RECORD_CANARY",
+      "Native Claude project MCP state has conflicting matching records",
       "Active project identity could not be established PROJECT_KEY_CANARY",
       'Native user MCP server "SERVER_COMMAND_CANARY" has an invalid or unsupported definition and was skipped',
       'Native local MCP server "SERVER_URL_CANARY" has configuration PiCC ignored or adjusted; its definition was retained for later resolution',
@@ -2409,6 +2463,7 @@ describe("buildCompatReport", () => {
       "Project .mcp.json is missing its mcpServers block; add an object block or remove the file, then run /reload or restart PiCC.",
       "Native Claude MCP state is unreadable, malformed, or otherwise unusable, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
       "Native Claude MCP state has an invalid or unsupported shape, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
+      "Canonical-equivalent native Claude project records disagree on MCP server or runtime-control state, so all MCP loading is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
       "Native Claude project identity could not be selected safely, so MCP is fail closed. Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the default native state file (~/.claude.json) to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.",
       "A native MCP server entry was invalid or unsupported and was skipped; repair or remove that entry, then run /reload or restart PiCC.",
       "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.",
