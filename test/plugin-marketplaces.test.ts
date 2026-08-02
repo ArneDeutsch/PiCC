@@ -30,7 +30,7 @@ const symlinkAvailable = (() => {
 })();
 
 function temporaryRoot(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-marketplaces-"));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-marketplaces-")));
   temporaryDirectories.push(root);
   return root;
 }
