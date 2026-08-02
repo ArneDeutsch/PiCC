@@ -1865,6 +1865,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try { pi.appendEntry("picc-checkpoint-lifecycle", data); } catch { /* presentation only */ }
   };
 
+  type CheckpointPresentationSeverity = "info" | "warning" | "error";
+
+  const appendCheckpointPresentation = (
+    ctx: any,
+    notice: string,
+    severity: CheckpointPresentationSeverity,
+  ): void => {
+    if (checkpointSurface(ctx) !== "tui") return;
+    try {
+      pi.appendEntry("picc-proactive-compact", {
+        notice: sanitizeDisplayText(notice, 2_000, true),
+        severity,
+      });
+    } catch { /* presentation only */ }
+  };
+
   /**
    * What a cancelled checkpoint can still do for the reader, decided once. Two refusals ask
    * this — an ordinary prompt and a `/compact` — and when they derived it separately they
@@ -1944,11 +1960,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           restoredTextCount = representable.length;
         }
         guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed; ${restoredTextCount} text input${restoredTextCount === 1 ? " was" : "s were"} restored${representable.length > restoredTextCount || unrepresentable ? "; remaining input must be resent" : ""}.`;
-        ctx.ui?.notify?.(guidance, representable.length > restoredTextCount || unrepresentable ? "warning" : "info");
       } catch {
         restoredTextCount = 0;
         guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
       }
+      appendCheckpointPresentation(
+        ctx,
+        guidance,
+        representable.length > restoredTextCount || unrepresentable ? "warning" : "info",
+      );
     } else if (surface === "print" || surface === "stderr") {
       console.error(`PiCC: ${guidance}`);
     }
@@ -2047,16 +2067,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const text = headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
     if (surface === "tui") {
       try {
-        ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
-        if (event.category === "checkpoint-exhausted") ctx.ui?.notify?.(text, "error");
-        // A terminal cancellation used to leave only a status line, which the next status
-        // write overwrites — an ending the reader can miss entirely is not announced.
-        // `restart-process` is an error rather than a warning: nothing in this session
-        // works afterwards.
-        if (event.category === "checkpoint-cancelled") {
-          ctx.ui?.notify?.(text, event.action === "restart-process" ? "error" : "warning");
+        if (event.category === "checkpoint-armed") {
+          ctx.ui?.notify?.(text, "info");
+        } else if (event.category === "checkpoint-exhausted") {
+          appendCheckpointPresentation(ctx, text, "error");
+        } else if (event.category === "checkpoint-cancelled") {
+          // Terminal cancellation needs a visible chat outcome. `restart-process` is an
+          // error because the session is unusable.
+          appendCheckpointPresentation(ctx, text, event.action === "restart-process" ? "error" : "warning");
+        } else if (event.category === "checkpoint-recovered") {
+          appendCheckpointPresentation(ctx, text, "info");
         }
-        if (event.category === "checkpoint-recovered") ctx.ui?.notify?.(text, "info");
       } catch {
         // Presentation cannot own checkpoint state.
       }
@@ -2286,8 +2307,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           resume.replayCompleted = true;
           openProvider();
           const text = "Context compacted; resumed the paused work.";
-          if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", text);
-          else if (ctx?.mode === "print") console.error(`PiCC: ${text}`);
+          if (ctx?.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx?.mode === "json" || ctx?.mode === "rpc") {
             appendCheckpointEntry({
               category: "checkpoint-resumed",
@@ -4071,7 +4091,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
         resume.conclude("completed");
         mainCheckpointGate.logicalRunSettled();
-        if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
         // Pi clears run-active before this callback. Finish N first, then let this same
         // physical settlement sample exactly one fallback successor without a second Stop.
         const successorController = mainCheckpointGate.currentController();
@@ -4332,7 +4351,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
         if (recovered.recovered) {
-          publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);
+          const recoveryMode = contextMode(checkpointContext);
+          if (recoveryMode === "print" || recoveryMode === "json" || recoveryMode === "rpc") {
+            publishCheckpoint({
+              category: "checkpoint-recovered",
+              generation,
+              action: "manual-recovery",
+            }, checkpointContext);
+          }
           reportRejectedShadows(recovered.rejected, checkpointContext);
         }
       }
@@ -4544,9 +4570,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.registerEntryRenderer("picc-control", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent(`/${entry.data?.command ?? "picc"}`, entry.data?.output ?? "", theme),
   );
-  pi.registerEntryRenderer("picc-proactive-compact", (entry: any, _opts: any, theme: any) =>
-    controlOutputComponent("PiCC proactive compaction", entry.data?.notice ?? "", theme),
-  );
+  pi.registerEntryRenderer("picc-proactive-compact", (entry: any, _opts: any, theme: any) => {
+    const notice = sanitizeDisplayText(String(entry?.data?.notice ?? ""), 2_000, true);
+    const severity = entry?.data?.severity;
+    const color = severity === "warning" || severity === "error" ? severity : "dim";
+    return {
+      render(width: number): string[] {
+        const lines: string[] = [];
+        pushColored(theme, color, notice, width, lines);
+        return clampLines(lines, width);
+      },
+    };
+  });
   // Settlement notices render as the collapsed-expandable subagent completion
   // record (same shape as the tool renderers'), so a never-awaited background
   // settlement still leaves exactly one expandable record in the transcript.
