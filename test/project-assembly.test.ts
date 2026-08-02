@@ -47,6 +47,7 @@ function makeTmp(): string {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()!;
     try {
@@ -112,7 +113,8 @@ function makeMarketplacePlugin(userDir: string, marketplace: string, name: strin
 describe("loadClaudeProject — imported installed-state enablement", () => {
   it("loads only explicitly enabled installed records from authorized cache roots (skills, agents, hooks)", () => {
     const { repo, userDir } = makeBase();
-    makeMarketplacePlugin(userDir, "official", "alpha");
+    const alphaRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    write(path.join(alphaRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha", version: 7 }));
     makeMarketplacePlugin(userDir, "official", "beta");
     write(
       path.join(userDir, "settings.json"),
@@ -134,9 +136,48 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.agents.some((a) => a.name.includes("beta"))).toBe(false);
     expect(hookCommands).not.toContain("beta-hook");
     expect(project.pluginInventory.find("alpha@official")).toMatchObject({ outcome: { status: "loaded" }, manifestNamespace: "alpha" });
+    expect(project.pluginInventory.find("alpha@official")!.diagnostics.filter((item) => item.message.includes("metadata field version"))).toHaveLength(1);
     expect(project.pluginInventory.find("beta@official")).toMatchObject({ outcome: { status: "disabled" } });
     expect(project.pluginInventory.find("beta@official")!.selectedInstallation).toBeUndefined();
     expect(Object.isFrozen(project.pluginInventory)).toBe(true);
+  });
+
+  it("uses one injected environment for marketplace discovery, installed selection, and metadata authorization", () => {
+    const { base, repo, userDir } = makeBase();
+    const cache = path.join(base, "injected-cache");
+    const seed = path.join(base, "injected-seed");
+    const statePath = path.join(userDir, "plugins", "installed_plugins.json");
+    const ambientCache = path.join(base, "ambient-cache");
+    const ambientSeed = path.join(base, "ambient-seed");
+    const alpha = path.join(cache, "official", "alpha", "1.0.0");
+    const beta = path.join(cache, "official", "beta", "1.0.0");
+    const ambient = path.join(ambientCache, "official", "ambient", "1.0.0");
+    write(path.join(alpha, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "alpha" }));
+    write(path.join(beta, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "beta", description: "observed through injected cache" }));
+    write(path.join(ambient, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "ambient", description: "must not be authorized" }));
+    write(statePath, JSON.stringify({ version: 2, plugins: {
+      "alpha@official": [{ scope: "user", installPath: alpha, version: "1.0.0" }],
+      "beta@official": [{ scope: "user", installPath: beta, version: "1.0.0" }],
+      "ambient@official": [{ scope: "user", installPath: ambient, version: "1.0.0" }],
+    } }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true, "beta@official": false, "ambient@official": true } }));
+    write(path.join(seed, "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "example/catalog" } } }));
+    write(path.join(seed, "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [{ name: "catalog-only", source: "./catalog-only" }] }));
+    write(path.join(ambientSeed, "known_marketplaces.json"), JSON.stringify({ ambient: { source: { source: "github", repo: "example/ambient" } } }));
+    write(path.join(ambientSeed, "ambient", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "ambient", owner: { name: "Example" }, plugins: [{ name: "ambient-catalog", source: "./ambient" }] }));
+    vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", ambientCache);
+    vi.stubEnv("CLAUDE_CODE_PLUGIN_SEED_DIR", ambientSeed);
+
+    const project = loadClaudeProject({
+      cwd: repo, userDir, env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: cache, CLAUDE_CODE_PLUGIN_SEED_DIR: seed },
+      managedSettingsPaths: [], managedArtifactDirs: [],
+    });
+
+    expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["alpha@official"]);
+    expect(project.pluginInventory.find("beta@official")?.installations[0]?.metadata?.description).toBe("observed through injected cache");
+    expect(project.pluginInventory.find("catalog-only@official")?.catalogPresence).toBe(true);
+    expect(project.pluginInventory.find("ambient@official")).toMatchObject({ outcome: { status: "rejected" }, installations: [expect.not.objectContaining({ metadata: expect.anything() })] });
+    expect(project.pluginInventory.find("ambient-catalog@ambient")).toBeUndefined();
   });
 
   it("captures safely classified invalid enabledPlugins evidence from real settings assembly", () => {

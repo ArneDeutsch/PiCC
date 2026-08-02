@@ -14,6 +14,7 @@ import {
   renderPluginInventoryList,
   renderPluginInventoryOperation,
 } from "../src/runtime/plugin-inventory-text.js";
+import { formatPluginInventoryStructuredSource } from "../src/runtime/plugin-inventory-display.js";
 
 function item(qualifiedIdentity: string, overrides: Partial<PluginInventoryItem> = {}): PluginInventoryItem {
   const separator = qualifiedIdentity.lastIndexOf("@");
@@ -124,6 +125,12 @@ describe("plugin inventory shared display safety", () => {
     expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/plugins/safe" })).toBe("<project>/plugins/safe");
     expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/./secret" })).toBe("<external>");
     expect(formatPluginInventoryDisplayLocation({ kind: "project", display: "<project>/../secret" })).toBe("<external>");
+    expect(formatPluginInventoryStructuredSource({ kind: "github", repo: "owner/repo", url: "https://example.test/source?token=hidden", secret: "SECRET" })).toBe("kind=github, repo=owner/repo, url=https://example.test/source");
+    expect(formatPluginInventoryStructuredSource({ kind: "github\u001b[31m", repo: "../private", url: "https://user:pass@example.test/source" })).toBe("kind=github, repo=<redacted>, url=<redacted>");
+    expect(formatPluginInventoryStructuredSource({ kind: "relative", value: "./plugins/safe-name" })).toBe("kind=relative, value=plugins/safe-name");
+    for (const hostile of ["././nested", "plugins/./nested", "plugins/../private", "/rooted", "C:/rooted", "~/rooted", "plugins\\private", "token=secret", "plugins/\u0001private", "plugins/token"]) {
+      expect(formatPluginInventoryStructuredSource({ value: hostile }), hostile).toBe("value=<redacted>");
+    }
   });
 });
 
@@ -138,10 +145,10 @@ describe("plugin inventory deterministic text", () => {
     expect(rendered).toContain("Plugin: same@one\n  installed: 1 valid\n  enabled: no\n  runtime: disabled\n  catalog: not known");
     expect(rendered).toContain("Plugin: same@two\n  installed: none\n  enabled: yes\n  runtime: enabled-but-uninstalled\n  catalog: known");
     expect(rendered).toContain("Plugin: loaded@market\n  installed: 1 valid, 1 invalid\n  enabled: not declared\n  runtime: loaded\n  catalog: not known");
-    expect(rendered.indexOf("same@one")).toBeLessThan(rendered.indexOf("same@two"));
+    expect(rendered.indexOf("same@two")).toBeLessThan(rendered.indexOf("same@one"));
+    expect(rendered.indexOf("loaded@market")).toBeLessThan(rendered.indexOf("same@one"));
     expect(rendered).toContain("captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh");
-    expect(renderPluginInventoryList(snapshot([], { lifetime: "command" }))).toContain("captured for this command");
-    expect(renderPluginInventoryList(snapshot([], { lifetime: "command" }))).not.toContain("refresh");
+    expect(renderPluginInventoryList(snapshot([], { lifetime: "command" }))).toContain("captured for this command; rerun this command to refresh");
   });
 
   it("renders every captured resolution state without deriving one axis from another", () => {
@@ -169,9 +176,10 @@ describe("plugin inventory deterministic text", () => {
       executionRisk: ["code"],
       components: [
         { origin: "selected-manifest", kind: "agents", count: 2, countSemantics: "selected-manifest-declarations", declaration: "paths", capabilityId: "feature.plugins-agents", supportTier: "partial", executionRisk: "code" },
+        { origin: "selected-manifest", kind: "workflows", count: 1, countSemantics: "selected-manifest-declarations", declaration: "shape", capabilityId: "feature.plugins-other-components", supportTier: "not-supported", executionRisk: "unsupported-runtime", provenance: { source: { kind: "plugin-cache", display: "<plugin-cache>/official/alpha/1.2.3/.claude-plugin/plugin.json" }, field: "workflows" } },
         { origin: "final-runtime", kind: "agents", count: 1, countSemantics: "finalized-registrations", posture: "final-loaded", declaration: "default-layout", capabilityId: "feature.plugins-agents", supportTier: "partial", executionRisk: "code" },
       ],
-      dependencies: [{ targetIdentity: "dep@official", version: "^1", posture: "declared-locally-observable-not-resolved", crossMarketplace: "same-marketplace", provenance: { source: { kind: "marketplace-cache", display: "<marketplace-cache>/official/catalog.json" } } }],
+      dependencies: [{ origin: "catalog", targetIdentity: "dep@official", version: "^1", posture: "declared-locally-observable-not-resolved", crossMarketplace: "same-marketplace", provenance: { source: { kind: "marketplace-cache", display: "<marketplace-cache>/official/catalog.json" } } }],
       renames: [{ from: "old-alpha", target: "alpha", status: "current", posture: "declared-not-effective", provenance: { source: { kind: "marketplace-cache", display: "<marketplace-cache>/official/catalog.json" } } }],
       diagnostics: [{ severity: "warning", message: "one component was unsupported" }],
     });
@@ -180,11 +188,16 @@ describe("plugin inventory deterministic text", () => {
     expect(rendered).toContain("Plugin: alpha@official");
     expect(rendered).toContain("selected-manifest/agents: count=2; semantics=selected-manifest-declarations");
     expect(rendered).toContain("final-runtime/agents: count=1; semantics=finalized-registrations");
+    expect(rendered).toContain("selected-manifest/workflows: count=1; semantics=selected-manifest-declarations");
+    expect(rendered).toContain("support=not-supported; capability=feature.plugins-other-components");
+    expect(rendered).toContain("provenance=source=<plugin-cache>/official/alpha/1.2.3/.claude-plugin/plugin.json, field=workflows");
+    expect(rendered).toContain("origin=catalog");
+    expect(rendered).toContain("qualification=same-marketplace");
     expect(rendered).toContain("Dependencies (declared only; resolution is not performed)");
     expect(rendered).toContain("Renames (declared only; migration is not performed)");
     expect(rendered).toContain("<plugin-cache>/official/alpha/1.2.3");
     expect(rendered).toContain("Selected project location: <project>/packages/alpha");
-    expect(rendered).toContain("source=<redacted-field>");
+    expect(rendered).toContain("source=kind=git, url=https://example.test/catalog");
     expect(rendered).toContain("version=2.0");
     expect(rendered).toContain("revision=abc");
     expect(rendered).toContain("description=catalog description");
@@ -439,7 +452,39 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(session.diagnostics[0]).toMatchObject({ qualifiedIdentity: identity, status: "rejected", nextCommand: `/plugin details ${identity}`, repairBoundary: expect.stringContaining("read-only"), refreshGuidance: expect.stringContaining("/reload") });
     const command = projectPluginInventoryDoctor(snapshot([item(identity, { outcome: { status: "blocked", sharedStateCauses: [] } })], { lifetime: "command" }));
     expect(command.diagnostics[0]).toMatchObject({ status: "blocked", nextCommand: `picc plugin details ${identity}` });
-    expect(command.diagnostics[0]).not.toHaveProperty("refreshGuidance");
+    expect(command.diagnostics[0]).toMatchObject({ refreshGuidance: "rerun this command to refresh" });
+  });
+
+  it("counts unique attention identities from outcomes, diagnostics, components, and limited capability evidence", () => {
+    const projection = projectPluginInventoryDoctor(snapshot([
+      item("failed@market", { outcome: { status: "blocked", sharedStateCauses: [] } }),
+      item("warned@market", { diagnostics: [{ severity: "warning", message: "warning" }] }),
+      item("limited@market", { components: [{ origin: "selected-manifest", kind: "channels", count: 1, countSemantics: "selected-manifest-declarations", capabilityId: "feature.plugins-other-components", supportTier: "not-supported", executionRisk: "unsupported-runtime" }] }),
+      item("evidence@market"),
+    ], { capabilityEvidence: [{ capabilityId: "feature.plugins-content", qualifiedIdentity: "evidence@market", supportTier: "partial", observation: "Final loaded component support is partial" }] }));
+    expect(projection.counts.attention).toBe(4);
+    expect(projection.counts.attention).not.toBe(0);
+  });
+
+  it("deduplicates actionable diagnostics while retaining the read-only repair and refresh contract", () => {
+    const duplicate = { severity: "warning" as const, message: "repair this declaration" };
+    const projection = projectPluginInventoryDoctor(snapshot([item("p@market", { diagnostics: [duplicate, duplicate] })]));
+    expect(projection.diagnostics).toEqual([expect.objectContaining({
+      qualifiedIdentity: "p@market",
+      message: "repair this declaration",
+      nextCommand: "/plugin details p@market",
+      repairBoundary: expect.stringContaining("read-only"),
+      refreshGuidance: expect.stringContaining("canonical /reload"),
+    })]);
+    expect(projection.omitted.diagnostics.projection).toBe(0);
+  });
+
+  it("does not count exact duplicate capability evidence as omission or loss", () => {
+    const evidence = { capabilityId: "feature.plugins-content", qualifiedIdentity: "p@market", component: "commands", supportTier: "partial" as const, observation: "Final loaded component support is partial" };
+    const projection = projectPluginInventoryDoctor(snapshot([item("p@market")], { capabilityEvidence: [evidence, evidence] }));
+    expect(projection.capabilityEvidence).toEqual([evidence]);
+    expect(projection.omitted.capabilityEvidence.projection).toBe(0);
+    expect(projection.captureOmissions.some((value) => value.axis.includes("duplicate"))).toBe(false);
   });
 
   it("combines upstream capture and local projection omissions without conflating managed policy", () => {

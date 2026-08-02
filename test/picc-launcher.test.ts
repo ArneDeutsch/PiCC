@@ -21,7 +21,7 @@ const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
 const launcherSource = path.join(repoRoot, "bin", "picc.mjs");
 const pluginAdapterSource = path.join(repoRoot, "bin", "picc-plugin.mjs");
 const windowsRegistryWarning = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
-const inventoryIncompleteWarning = "PiCC plugin inventory may be incomplete. Repair malformed or unreadable Claude plugin state.";
+const inventoryIncompleteWarning = (classes: string, actions = "repair") => `PiCC plugin inventory may be incomplete (${classes}). ${actions.includes("format") ? "Update PiCC or report the unsupported plugin-state format. " : ""}${actions.includes("repair") ? "Repair the malformed or unreadable Claude plugin state outside PiCC. " : ""}Run PiCC interactively in the same project and profile, then use \`/doctor\` for details.`;
 const inventoryPolicyWarning = process.platform === "win32" ? `${windowsRegistryWarning}\n` : "";
 const tempDirs: string[] = [];
 
@@ -460,7 +460,7 @@ process.exit(23);
     expect(unknown).toEqual({
       code: 1,
       stdout: [],
-      stderr: ["PiCC plugin not found: missing@market. Run `picc plugin list` to copy an exact qualified identity."],
+      stderr: ["PiCC plugin not found: missing@market. The bounded launcher list can omit catalog-only identities. Run `picc plugin list` to copy a listed qualified identity, or run PiCC interactively in the same project and profile and use the literal `/plugin` filter."],
     });
   });
 
@@ -526,13 +526,24 @@ process.exit(23);
 
     const customUnavailable: ManagedRegistryAdapter = { readSettings: () => ({ status: "unreadable" }) };
     const injected = runPluginInProcess(project, ["list"], { ...options, platform: "win32" }, customUnavailable);
-    expect(injected).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning] });
+    expect(injected).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("managed policy state")] });
     expect(injected.stderr).not.toContain(windowsRegistryWarning);
 
     write(path.join(userDir, "plugins", "installed_plugins.json"), "{ malformed");
     write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
     const malformed = runPluginInProcess(project, ["list"], options);
-    expect(malformed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning] });
+    expect(malformed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state")] });
+
+    write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 999, plugins: {} }));
+    fs.rmSync(path.join(userDir, "plugins", "known_marketplaces.json"));
+    const unsupported = runPluginInProcess(project, ["list"], options);
+    expect(unsupported).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state", "format")] });
+    expect(unsupported.stderr.join("\n")).not.toMatch(/repair the malformed|999/iu);
+
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
+    const mixed = runPluginInProcess(project, ["list"], options);
+    expect(mixed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state", "format repair")] });
+    expect(mixed.stderr.join("\n")).not.toContain("999");
   });
 
   it("classifies an unavailable cwd separately from profile failures", () => {

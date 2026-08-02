@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -489,6 +490,7 @@ describe("reserved plugin-management commands", () => {
       const agentDir = path.join(projectRoot, ".claude", "agents");
       fs.mkdirSync(agentDir, { recursive: true });
       fs.writeFileSync(path.join(agentDir, "skill-runner.md"), "---\nname: skill-runner\ndescription: subagent skill test\n---\nRun skills.\n", "utf8");
+      installPluginFixture(projectRoot, "same@market", "same", () => undefined);
       for (const name of ["plugin", "plugins", "reload-plugins"]) {
         for (const skillName of [`owner-${name}:${name}`, `other-${name}:${name}`]) {
           const skillDir = path.join(projectRoot, ".claude", "skills", skillName.replace(":", "-"));
@@ -526,6 +528,26 @@ describe("reserved plugin-management commands", () => {
           expect(fresh.customs).toHaveLength(customBaseline);
         }
       }
+
+      const bareOutputs: string[] = [];
+      for (const [mode, makeCtx] of admissionModes.filter(([mode]) => mode !== "tui")) {
+        fresh.entries.length = 0;
+        const customBaseline = fresh.customs.length;
+        expect(await fresh.fire("input", { text: "/plugin list", source: mode }, makeCtx())).toEqual({ action: "handled" });
+        const explicit = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        expect(explicit).toContain("Plugin: same@market");
+        fresh.entries.length = 0;
+        expect(await fresh.fire("input", { text: "/plugin", source: mode }, makeCtx())).toEqual({ action: "handled" });
+        const bare = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+        bareOutputs.push(bare);
+        expect(bare).toBe(explicit);
+        expect(fresh.customs).toHaveLength(customBaseline);
+      }
+      expect(new Set(bareOutputs).size).toBe(1);
+      expect(bareOutputs[0]).toContain("Plugin inventory (read-only)");
+      expect(fresh.messages).toEqual([]);
+      expect(fresh.userMessages).toEqual([]);
+      expect(sdk.promptCalls()).toBe(0);
 
       fresh.entries.length = 0;
       await fresh.commands.get("plugins").handler("", fresh.printCtx());
@@ -795,6 +817,16 @@ describe("reserved plugin-management commands", () => {
       expect(promptResourceEvidence).not.toMatch(/DISTINCTIVE_LAZY_(?:PLUGIN|PROJECT)_BODY/);
       const runtimeBaseline = [...runtimeCalls];
       const providerBaseline = fresh.providerRegistrations.length;
+      const tree = (directory: string): string[] => fs.readdirSync(directory, { recursive: true, withFileTypes: true })
+        .map((entry) => `${entry.isDirectory() ? "d" : "f"}:${path.relative(directory, path.join(entry.parentPath, entry.name)).replaceAll("\\", "/")}${entry.isFile() ? `:${fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")}` : ""}`)
+        .sort();
+      const fetchTrap = vi.fn(() => { throw new Error("inventory network access forbidden"); });
+      vi.stubGlobal("fetch", fetchTrap);
+      const connectTrap = vi.spyOn(net, "connect").mockImplementation((() => { throw new Error("inventory socket access forbidden"); }) as typeof net.connect);
+      const createConnectionTrap = vi.spyOn(net, "createConnection").mockImplementation((() => { throw new Error("inventory socket access forbidden"); }) as typeof net.createConnection);
+      const projectBefore = tree(root);
+      const profileBefore = tree(path.join(root, ".claude-user"));
+      try {
       const compactBaseline = fresh.compactCalls.length;
       const customBaseline = fresh.customs.length;
       await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
@@ -802,9 +834,13 @@ describe("reserved plugin-management commands", () => {
       fresh.entries.length = 0;
       await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
       const detailsBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      expect(tree(root)).toEqual(projectBefore);
+      expect(tree(path.join(root, ".claude-user"))).toEqual(profileBefore);
 
       fs.rmSync(path.join(root, ".claude-user", "plugins"), { recursive: true, force: true });
       fs.rmSync(path.join(root, ".claude-user", "settings.json"), { force: true });
+      const projectAfterBackingChange = tree(root);
+      const profileAfterBackingChange = tree(path.join(root, ".claude-user"));
       fresh.entries.length = 0;
       await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
       expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(listBefore);
@@ -835,6 +871,16 @@ describe("reserved plugin-management commands", () => {
       expect(fresh.providerRegistrations).toHaveLength(providerBaseline);
       expect(fresh.compactCalls).toHaveLength(compactBaseline);
       expect(hookFixture!.spawnedChildren()).toHaveLength(0);
+      expect(tree(root)).toEqual(projectAfterBackingChange);
+      expect(tree(path.join(root, ".claude-user"))).toEqual(profileAfterBackingChange);
+      expect(fetchTrap).not.toHaveBeenCalled();
+      expect(connectTrap).not.toHaveBeenCalled();
+      expect(createConnectionTrap).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+        connectTrap.mockRestore();
+        createConnectionTrap.mockRestore();
+      }
     } finally {
       await hookFixture?.cleanup("inventory-hook");
       cleanupFixture(root);
@@ -946,7 +992,7 @@ describe("plugin startup warning wiring", () => {
       expect(notices).toHaveLength(1);
       expect(notices[0]!.text.match(/same@market-a/g)).toHaveLength(1);
       expect(notices[0]!.text.match(/same@market-b/g)).toHaveLength(1);
-      expect(notices[0]!.text).not.toContain("/doctor");
+      expect(notices[0]!.text).toContain("Run /doctor for details");
       expect(notices[0]!.text).not.toMatch(/installed_plugins|\.claude-user|SECRET_RAW_DIAGNOSTIC_PATH|C:\/private/i);
 
       await omitted.fresh.fire("session_start", { reason: "startup" }, omitted.fresh.tuiCtx());
@@ -1085,7 +1131,6 @@ describe("plugin activation runtime failures", () => {
       expect(report).not.toContain("at least 2");
       expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
       expect(report).not.toContain("Reconcile or reinstall the plugin");
-      expect(report).not.toContain("canonical /reload");
       expect(report).toContain("execution did not occur");
 
       for (let index = 22; index < 26; index++) {
@@ -1140,7 +1185,6 @@ describe("plugin activation runtime failures", () => {
       const report = String(fresh.entries.at(-1)?.data?.output ?? "");
       expect(report).toContain("Agent \"broken-agent-owner:broken-agent\" did not start");
       expect(report).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
-      expect(report).not.toContain("canonical /reload");
       expect(report).not.toContain("trusted context");
     } finally {
       cleanupFixture(root);

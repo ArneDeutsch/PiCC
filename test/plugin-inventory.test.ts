@@ -147,6 +147,34 @@ describe("buildPluginInventorySnapshot", () => {
     expect(() => (snapshot.items as unknown as unknown[]).push({})).toThrow();
   });
 
+  it.each([
+    ["valid channel schema", { mcpServers: { events: {} }, channels: [{ server: "events", userConfig: { token: { type: "string", title: "Token", description: "Authentication token", default: "SECRET" } } }] }, true],
+    ["malformed channel schema", { mcpServers: { events: {} }, channels: [{ server: "events", userConfig: { token: { type: "string", title: "Token", description: "", default: "SECRET" } } }] }, false],
+  ] as const)("maps %s to diagnostic-or-capability evidence without retaining values", (_label, manifest, valid) => {
+    const { projectRoot, userDir } = fixture();
+    const projected = projectPluginManifest(manifest);
+    const root = path.join(userDir, "plugins", "cache", "official", "plug", "1");
+    const selected: InstalledPlugin = {
+      pluginId: "plug@official", name: "plug", marketplace: "official", version: "1", scope: "user", root, dataDir: path.join(userDir, "plugins", "data", "plug"),
+      manifestProjection: projected.projection, skillSources: [], commandSources: [], agentSources: [], hookSources: [], hookPathSources: [], enabled: true, diagnostics: projected.diagnostics,
+      installation: { pluginId: "plug@official", scope: "user", installPath: root, version: "1", provenance: { statePath: "state", stateVersion: 2 } },
+      context: { pluginId: "plug@official", pluginName: "plug", root, dataDir: path.join(userDir, "plugins", "data", "plug"), projectDir: projectRoot },
+    };
+    const snapshot = buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [selected], capabilityEvidence: [] });
+    expect(snapshot.capabilityEvidence.some((entry) => entry.capabilityId === "feature.plugins-other-components" && entry.component === "channels")).toBe(valid);
+    expect(snapshot.find("plug@official")!.components.some((component) => component.origin === "selected-manifest" && component.kind === "channels")).toBe(valid);
+    expect(snapshot.find("plug@official")!.diagnostics.some((diagnostic) => diagnostic.message.includes("metadata field channels"))).toBe(!valid);
+    expect(JSON.stringify(snapshot)).not.toContain("SECRET");
+  });
+
+  it("drops exact duplicate capability evidence without recording an omission axis", () => {
+    const { projectRoot, userDir } = fixture();
+    const evidence = { capabilityId: "feature.plugins-content", qualifiedIdentity: "plug@market", component: "commands", observation: "Final loaded component support is partial" };
+    const snapshot = buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [], capabilityEvidence: [evidence, evidence] });
+    expect(snapshot.capabilityEvidence).toHaveLength(1);
+    expect(snapshot.omissions).not.toHaveProperty("snapshot.duplicate-evidence");
+  });
+
   it("classifies enabledPlugins diagnostics into fixed immutable evidence", () => {
     const { projectRoot, userDir } = fixture();
     const snapshot = buildPluginInventorySnapshot({
@@ -331,15 +359,15 @@ describe("buildPluginInventorySnapshot", () => {
     const field = { field: "plugins", sourcePath: catalogPath, entryIndex: 1, itemIndex: 2, key: "plug" };
     const selected: InstalledPlugin = {
       pluginId: "plug@official", name: "manifest-plug", marketplace: "official", version: "1", scope: "user", root, dataDir: path.join(userDir, "plugins", "data", "plug"),
-      manifestProjection: { manifestName: "manifest-plug", description: "safe", keywords: ["one"], components: [{ field: "hooks", declaration: "path", count: 1 }], omissions: { keywords: 0, components: 0, diagnostics: 0 } },
-      skillSources: [], commandSources: [], agentSources: [], hookSources: [{ kind: "inline", value: { PreToolUse: "echo safe" }, pluginId: "plug@official", pluginName: "manifest-plug", source: "plugin manifest hooks" }], hookPathSources: [], enabled: true, diagnostics: [{ severity: "warning", message: "safe warning" }],
+      manifestProjection: { manifestName: "manifest-plug", description: "safe", keywords: ["one"], dependencies: [{ name: "local", itemIndex: 0 }, { name: "remote", marketplace: "partner", version: "2", itemIndex: 1 }, { name: "blocked", marketplace: "other", itemIndex: 2 }], components: [{ field: "hooks", declaration: "path", count: 1 }, { field: "channels", declaration: "shape", count: 2 }], omissions: { keywords: 0, dependencies: 0, components: 0, diagnostics: 0 } },
+      skillSources: [], commandSources: [], agentSources: [], hookSources: [{ kind: "inline", value: { PreToolUse: "echo safe" }, pluginId: "plug@official", pluginName: "manifest-plug", source: "plugin manifest hooks" }], hookPathSources: [], enabled: true, diagnostics: [{ severity: "warning", message: "selected fallback warning" }],
       installation: { pluginId: "plug@official", scope: "user", installPath: root, version: "1", provenance: { statePath: path.join(userDir, "plugins", "installed_plugins.json"), stateVersion: 2, installedAt: "then" } },
       context: { pluginId: "plug@official", pluginName: "manifest-plug", root, dataDir: path.join(userDir, "plugins", "data", "plug"), projectDir: projectRoot },
     };
     const state = marketplace({
       registrations: [{ name: "official", source: { kind: "github", repo: "owner/catalog" }, sourceProvenance: field, provenance: full, fixtureContract: "fixture-derived-unverified", catalogPath, selected: true, validity: "valid" }],
       catalogs: [{ marketplace: "official", catalogPath, metadata: { pluginRoot: "./plugins", provenance: field, posture: "inert-lexical-effect-only" }, provenance: full }],
-      entries: [{ identity: "plug@official", name: "plug", marketplace: "official", source: { kind: "relative", value: "./plug" }, fieldProvenance: { source: field }, strict: true, strictDeclaration: { value: true, presence: "explicit", provenance: field }, defaultEnabled: true, defaultEnabledDeclaration: { value: true, presence: "explicit", provenance: field }, components: { hooks: [{ kind: "path", value: "./hooks.json", provenance: field, posture: "declared-not-effective" }] }, dependencies: [{ declaredName: "dep", declaringIdentity: "plug@official", targetIdentity: "dep@official", marketplace: "official", provenance: field, crossMarketplace: "same-marketplace", posture: "declared-locally-observable-not-resolved" }], userConfig: { keys: [{ key: "mode", type: "string" }], omitted: 0, provenance: field }, provenance: { ...full, catalogPath, entryIndex: 1 }, runtimeEffect: "declared-not-effective" }],
+      entries: [{ identity: "plug@official", name: "plug", marketplace: "official", source: { kind: "relative", value: "./plug" }, fieldProvenance: { source: field }, strict: true, strictDeclaration: { value: true, presence: "explicit", provenance: field }, defaultEnabled: true, defaultEnabledDeclaration: { value: true, presence: "explicit", provenance: field }, components: { hooks: [{ kind: "path", value: "./hooks.json", provenance: field, posture: "declared-not-effective" }] }, unsupportedComponents: [{ field: "experimental.monitors", declaration: "array-shape", count: 3, provenance: field, posture: "declared-not-effective" }], dependencies: [{ declaredName: "dep", declaringIdentity: "plug@official", targetIdentity: "dep@official", marketplace: "official", provenance: field, crossMarketplace: "same-marketplace", posture: "declared-locally-observable-not-resolved" }], userConfig: { keys: [{ key: "mode", type: "string" }], omitted: 0, provenance: field }, provenance: { ...full, catalogPath, entryIndex: 1 }, runtimeEffect: "declared-not-effective" }],
       allowlists: [{ marketplace: "official", allowedMarketplace: "partner", provenance: field }],
       renames: [{ marketplace: "official", from: "old", declaredTarget: "plug", currentIdentity: "plug@official", status: "current", fieldProvenance: field, provenance: { ...full, catalogPath }, runtimeEffect: "declared-not-effective" }],
       conflicts: [{ identity: "plug@official", winner: field, loser: { ...field, itemIndex: 3 }, posture: "observed-conflict-not-effective" }],
@@ -354,10 +382,27 @@ describe("buildPluginInventorySnapshot", () => {
       capabilityEvidence: [{ capabilityId: "agent.frontmatter.hooks", qualifiedIdentity: "plug@official", component: "agent", observation: "Plugin agent field hooks was stripped before runtime construction" }],
     };
     const snapshot = buildPluginInventorySnapshot(options); const before = JSON.stringify(snapshot);
+    const withoutOutcome = buildPluginInventorySnapshot({ ...options, outcomes: [] }).find("plug@official")!;
     mutateSourceGraph(options);
     expect(JSON.stringify(snapshot)).toBe(before); expectRecursivelyFrozen(snapshot);
     expect(snapshot.marketplaces[0]).toMatchObject({ fixtureContract: "fixture-derived-unverified", provenance: { scope: "user", origin: "primary", order: 7, source: { kind: "marketplace-cache" } }, sourceProvenance: { scope: "user", origin: "primary", order: 7, field: "plugins", entryIndex: 1, itemIndex: 2, key: "plug" } });
-    expect(snapshot.find("plug@official")!.components.filter((component) => component.origin === "final-runtime")).toEqual(expect.arrayContaining([
+    const item = snapshot.find("plug@official")!;
+    expect(item.dependencies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ origin: "selected-manifest", targetIdentity: "local@official", posture: "selected-manifest-observed-not-resolved", provenance: expect.objectContaining({ field: "dependencies", itemIndex: 0 }) }),
+      expect.objectContaining({ origin: "selected-manifest", targetIdentity: "remote@partner", version: "2", crossMarketplace: "declared-allowed" }),
+      expect.objectContaining({ origin: "selected-manifest", targetIdentity: "blocked@other", crossMarketplace: "declared-not-allowed" }),
+      expect.objectContaining({ origin: "catalog", targetIdentity: "dep@official" }),
+    ]));
+    expect(item.components).toEqual(expect.arrayContaining([
+      expect.objectContaining({ origin: "selected-manifest", kind: "channels", executionRisk: "unsupported-runtime", supportTier: "not-supported" }),
+      expect.objectContaining({ origin: "catalog", kind: "experimental.monitors", executionRisk: "unsupported-runtime", supportTier: "not-supported" }),
+    ]));
+    expect(item.diagnostics.filter((entry) => entry.message === "outcome warning")).toHaveLength(1);
+    expect(item.diagnostics.some((entry) => entry.message === "selected fallback warning")).toBe(false);
+    expect(withoutOutcome.diagnostics).toEqual([expect.objectContaining({ message: "selected fallback warning" })]);
+    expect(snapshot.capabilityEvidence).toContainEqual(expect.objectContaining({ capabilityId: "feature.plugins-other-components", qualifiedIdentity: "plug@official", component: "channels", observation: "Selected manifest declares an unsupported plugin component" }));
+    expect(item.components.find((value) => value.origin === "selected-manifest" && value.kind === "channels")?.provenance).toMatchObject({ field: "channels", source: { kind: "plugin-cache" } });
+    expect(item.components.filter((component) => component.origin === "final-runtime")).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "skills", count: 1, countSemantics: "finalized-registrations" }),
       expect.objectContaining({ kind: "commands", count: 1, countSemantics: "finalized-registrations" }),
       expect.objectContaining({ kind: "agents", count: 1, countSemantics: "finalized-registrations" }),
@@ -389,20 +434,28 @@ describe("buildPluginInventorySnapshot", () => {
       policies: Array.from({ length: 257 }, (_, index) => ({ kind: "strict" as const, provenance: { ...full, order: index }, validScope: true, match: false, posture: "claude-lifecycle-observation-not-enforced" as const })),
     });
     const installedObservations: InstalledPluginObservation[] = Array.from({ length: 65 }, (_, index) => ({ qualifiedIdentity: "plug@official", lifecycleName: "plug", marketplaceName: "official", validity: "valid", loadEligibility: "observation-only", declared: { scope: "user", version: `${index}`, installPath: path.join(userDir, "plugins", "cache", "official", "plug", `${index}`) }, problems: [] }));
+    const selectedRoot = path.join(userDir, "plugins", "cache", "official", "plug", "selected");
+    const selected: InstalledPlugin = {
+      pluginId: "plug@official", name: "plug", marketplace: "official", version: "selected", scope: "user", root: selectedRoot, dataDir: path.join(userDir, "plugins", "data", "plug"),
+      manifestProjection: { keywords: [], dependencies: Array.from({ length: 129 }, (_, index) => ({ name: `selected-${index}`, itemIndex: index })), components: [], omissions: { keywords: 0, dependencies: 0, components: 0, diagnostics: 0 } },
+      skillSources: [], commandSources: [], agentSources: [], hookSources: [], hookPathSources: [], enabled: true, diagnostics: [],
+      installation: { pluginId: "plug@official", scope: "user", version: "selected", installPath: selectedRoot, provenance: { statePath: "state", stateVersion: 2 } },
+      context: { pluginId: "plug@official", pluginName: "plug", root: selectedRoot, dataDir: path.join(userDir, "plugins", "data", "plug"), projectDir: projectRoot },
+    };
     const snapshot = buildPluginInventorySnapshot({
       projectRoot, userDir, installedStateStatus: "valid", installedObservations, marketplaceState: state, enablement: {},
-      outcomes: [{ pluginId: "plug@official", status: "rejected", diagnostics: Array.from({ length: 129 }, (_, index) => ({ severity: "warning" as const, message: `item ${index}` })) }], selectedPlugins: [],
+      outcomes: [{ pluginId: "plug@official", status: "rejected", diagnostics: Array.from({ length: 129 }, (_, index) => ({ severity: "warning" as const, message: `item ${index}` })) }], selectedPlugins: [selected],
       diagnostics: Array.from({ length: 129 }, (_, index) => ({ severity: "warning" as const, message: `global ${index}` })),
       capabilityEvidence: Array.from({ length: 257 }, (_, index) => ({ capabilityId: "agent.frontmatter.hooks", qualifiedIdentity: "plug@official", component: `agent${index}`, observation: "Plugin agent field hooks was stripped before runtime construction" })),
     });
     const item = snapshot.find("plug@official")!;
     expect(item.installations).toHaveLength(64); expect(item.catalogDeclarations).toHaveLength(64); expect(item.components).toHaveLength(128);
-    expect(item.dependencies).toHaveLength(128); expect(item.renames).toHaveLength(64); expect(item.diagnostics).toHaveLength(128);
+    expect(item.dependencies).toHaveLength(256); expect(item.dependencies.filter((value) => value.origin === "selected-manifest")).toHaveLength(128); expect(item.dependencies.filter((value) => value.origin === "catalog")).toHaveLength(128); expect(item.renames).toHaveLength(64); expect(item.diagnostics).toHaveLength(128);
     expect(snapshot.marketplaces).toHaveLength(256); expect(snapshot.marketplaceCatalogs).toHaveLength(256); expect(snapshot.allowlistObservations).toHaveLength(64);
     expect(snapshot.conflictObservations).toHaveLength(64); expect(snapshot.policyObservations).toHaveLength(256);
     expect(snapshot.diagnostics).toHaveLength(128); expect(snapshot.capabilityEvidence).toHaveLength(256);
     expect(snapshot.omissions).toMatchObject({
-      "snapshot.installations": 1, "snapshot.catalog-declarations": 1, "snapshot.components": 1, "snapshot.dependencies": 1, "snapshot.renames": 1,
+      "snapshot.installations": 1, "snapshot.catalog-declarations": 1, "snapshot.components": 1, "snapshot.dependencies.selected-manifest": 1, "snapshot.dependencies.catalog": 1, "snapshot.renames": 1,
       "snapshot.item-diagnostics": 1, "snapshot.marketplaces": 1, "snapshot.marketplace-catalogs": 1, "snapshot.allowlists": 1, "snapshot.conflicts": 1,
       "snapshot.policies": 1, "snapshot.diagnostics": 1, "snapshot.capability-evidence": 1,
     });
@@ -410,12 +463,24 @@ describe("buildPluginInventorySnapshot", () => {
   });
 
   it("bounds observational manifest bytes and nesting plus metadata allowlists and omissions", () => {
-    const projection = projectPluginManifest({ keywords: Array.from({ length: 33 }, () => 7), skills: Array.from({ length: 65 }, () => "x"), unknownSecret: "ignored", homepage: "https://user:pass@example.test/private", name: 7, version: 7, description: 7, author: 7, repository: 7, license: 7 });
-    expect(projection.projection.keywords).toHaveLength(0); expect(projection.projection.components[0]).toMatchObject({ count: 64 }); expect(projection.diagnostics).toHaveLength(32);
-    expect(projection.projection.omissions).toMatchObject({ keywords: 1, components: 1 }); expect(projection.projection.omissions!.diagnostics).toBeGreaterThan(0); expect(projection.projection).not.toHaveProperty("unknownSecret"); expect(projection.projection).not.toHaveProperty("homepage");
+    const projection = projectPluginManifest({ keywords: Array.from({ length: 33 }, () => 7), dependencies: Array.from({ length: 129 }, (_, index) => `dep-${index}`), skills: Array.from({ length: 65 }, () => "x"), workflows: Array.from({ length: 65 }, (_, index) => `./workflow-${index}.json`), unknownSecret: "ignored", homepage: "https://user:pass@example.test/private", name: 7, version: 7, description: 7, author: 7, repository: 7, license: 7 });
+    expect(projection.projection.keywords).toHaveLength(0); expect(projection.projection.dependencies).toHaveLength(128); expect(projection.projection.components).toEqual(expect.arrayContaining([expect.objectContaining({ field: "skills", count: 64 }), expect.objectContaining({ field: "workflows", count: 64 })])); expect(projection.diagnostics).toHaveLength(32);
+    expect(projection.projection.omissions).toMatchObject({ keywords: 1, dependencies: 1, components: 2 }); expect(projection.projection.omissions!.diagnostics).toBeGreaterThan(0); expect(projection.projection).not.toHaveProperty("unknownSecret"); expect(projection.projection).not.toHaveProperty("homepage");
+    const invalidUnsupported = projectPluginManifest({ workflows: {}, outputStyles: 1, mcpServers: { safe: {} }, themes: ["./safe.json", 7], monitors: ["./safe.json", { name: "inline", command: "not retained", description: "shape" }, { name: "missing", command: "invalid" }], channels: [{ server: "safe", userConfig: { secret: { type: "string", title: "Secret", description: "Not retained", sensitive: true, default: "not retained" } } }, { server: "missing" }], experimental: { themes: {}, monitors: [{ name: "experimental", command: "not retained", description: "shape" }, 2] } });
+    expect(invalidUnsupported.projection.components).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "themes", count: 1 }), expect.objectContaining({ field: "monitors", count: 2 }),
+      expect.objectContaining({ field: "channels", count: 1 }), expect.objectContaining({ field: "experimental.monitors", count: 1 }),
+    ]));
+    expect(JSON.stringify(invalidUnsupported.projection)).not.toMatch(/not retained|invalid|safe/u);
+    expect(invalidUnsupported.diagnostics.map((value) => value.message)).toEqual(expect.arrayContaining([expect.stringContaining("workflows"), expect.stringContaining("outputStyles"), expect.stringContaining("channels"), expect.stringContaining("experimental.themes"), expect.stringContaining("experimental.monitors")]));
     const { userDir } = fixture(); const cache = path.join(userDir, "plugins", "cache"); const root = path.join(cache, "m", "p", "1"); const manifest = path.join(root, ".claude-plugin", "plugin.json"); fs.mkdirSync(path.dirname(manifest), { recursive: true });
     const capability = createPluginMetadataReadCapability([cache]);
     fs.writeFileSync(manifest, `${" ".repeat(256 * 1024)}x`); expect(readObservedPluginMetadata(root, capability).diagnostics[0]!.message).toContain("byte limit");
     fs.writeFileSync(manifest, `${"[".repeat(65)}0${"]".repeat(65)}`); expect(readObservedPluginMetadata(root, capability).diagnostics[0]!.message).toContain("nesting limit");
+    fs.writeFileSync(manifest, JSON.stringify({ name: "short-read", description: "complete across legal short reads" }));
+    const originalRead = fs.readSync;
+    vi.spyOn(fs, "readSync").mockImplementation(((descriptor: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) =>
+      originalRead(descriptor, buffer, offset, Math.min(length, 7), position)) as typeof fs.readSync);
+    expect(readObservedPluginMetadata(root, capability).projection).toMatchObject({ manifestName: "short-read", description: "complete across legal short reads" });
   });
 });

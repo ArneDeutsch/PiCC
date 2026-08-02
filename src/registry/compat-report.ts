@@ -399,9 +399,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   const inventoryCapability = lookupCapability("feature.plugins-inventory");
   if (pluginInventory !== undefined) {
     if (inventoryCapability) {
-      const omittedDiagnostics = pluginInventory.omitted.diagnostics.capture + pluginInventory.omitted.diagnostics.projection;
-      if (omittedDiagnostics > 0) addFinding(inventoryCapability, `${omittedDiagnostics} additional captured plugin diagnostic(s) omitted.`);
       for (const omission of pluginInventory.captureOmissions) {
+        if (omission.axis.includes("diagnostic") || omission.axis.includes("evidence")) continue;
         addFinding(inventoryCapability, `${omission.count} captured plugin inventory value(s) omitted on ${omission.axis}.`);
       }
     }
@@ -412,8 +411,6 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       if (capability) addFinding(capability, rendered);
       else unassessed.push(`plugin capability ${JSON.stringify(evidence.capabilityId)} (${evidence.qualifiedIdentity})`);
     }
-    const omittedEvidence = pluginInventory.omitted.capabilityEvidence.capture + pluginInventory.omitted.capabilityEvidence.projection;
-    if (omittedEvidence > 0 && inventoryCapability) addFinding(inventoryCapability, `${omittedEvidence} additional captured plugin capability observation(s) omitted.`);
     const policyCapability = lookupCapability("feature.managed-policy");
     if (policyCapability) for (const evidence of pluginInventory.managedPolicyEvidence) {
       const impact = evidence.impact === "source-ignored" ? "this source was ignored" : "weaker policy was suppressed";
@@ -1648,7 +1645,9 @@ function pluginInventoryLines(inventory: PluginInventoryDoctorProjection | undef
     const owner = diagnostic.qualifiedIdentity ?? "global";
     const status = diagnostic.status === undefined ? "" : ` [${diagnostic.status}]`;
     const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
-    lines.push(`  - ${owner}${status}: ${diagnostic.message}.${action}`);
+    const repair = diagnostic.repairBoundary === undefined ? "" : ` Repair boundary: ${diagnostic.repairBoundary}.`;
+    const refresh = diagnostic.refreshGuidance === undefined ? "" : ` Refresh: ${diagnostic.refreshGuidance}.`;
+    lines.push(`  - ${owner}${status}: ${diagnostic.message}.${action}${repair}${refresh}`);
   }
   const diagnosticOmissions = inventory.omitted.diagnostics.capture + inventory.omitted.diagnostics.projection;
   if (diagnosticOmissions > 0) lines.push(`  - ${diagnosticOmissions} additional captured diagnostic(s) omitted.`);

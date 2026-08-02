@@ -206,6 +206,14 @@ export type PluginMarketplaceComponentDeclaration =
 
 export type PluginMarketplaceComponentField = "commands" | "agents" | "skills" | "hooks" | "mcpServers" | "lspServers";
 export type PluginMarketplaceComponentMap = Partial<Record<PluginMarketplaceComponentField, readonly PluginMarketplaceComponentDeclaration[]>>;
+export type PluginMarketplaceUnsupportedComponentField = "workflows" | "outputStyles" | "themes" | "monitors" | "experimental.themes" | "experimental.monitors" | "channels";
+export interface PluginMarketplaceUnsupportedComponentObservation {
+  field: PluginMarketplaceUnsupportedComponentField;
+  declaration: "string-shape" | "array-shape";
+  count: number;
+  provenance: PluginMarketplaceFieldProvenance;
+  posture: "declared-not-effective";
+}
 
 export interface PluginMarketplaceCatalogObservation {
   marketplace: string;
@@ -231,6 +239,7 @@ export interface PluginMarketplaceCatalogEntry {
   defaultEnabled: boolean;
   defaultEnabledDeclaration: { value: boolean; presence: "explicit" | "default"; provenance: PluginMarketplaceFieldProvenance };
   components: Readonly<PluginMarketplaceComponentMap>;
+  unsupportedComponents?: readonly PluginMarketplaceUnsupportedComponentObservation[];
   dependencies: PluginMarketplaceDependency[];
   userConfig?: PluginMarketplaceSafeShape & { provenance: PluginMarketplaceFieldProvenance };
   provenance: PluginMarketplaceProvenance & { catalogPath: string; entryIndex: number };

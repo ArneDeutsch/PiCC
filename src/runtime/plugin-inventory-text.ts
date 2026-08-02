@@ -8,6 +8,7 @@ import {
   type PluginInventorySnapshot,
 } from "../plugin-inventory.js";
 import { parseQualifiedPluginId } from "../util/plugin-id.js";
+import { formatPluginInventoryStructuredSource } from "./plugin-inventory-display.js";
 
 const MAX_INPUT = 512;
 const MAX_LIST_ITEMS = 100;
@@ -238,7 +239,27 @@ function installationSummary(item: PluginInventoryItem): string {
 }
 function runtimeStatus(item: PluginInventoryItem): string { return item.outcome?.status ?? "not resolved"; }
 function lowerBoundary(value: string): string { const plain = value.endsWith(".") ? value.slice(0, -1) : value; return `${plain[0]?.toLowerCase() ?? ""}${plain.slice(1)}`; }
-function boundary(snapshot: PluginInventorySnapshot): string { return snapshot.lifetime === "session" ? lowerBoundary(PLUGIN_INVENTORY_SESSION_BOUNDARY) : "captured for this command"; }
+function boundary(snapshot: PluginInventorySnapshot): string {
+  return snapshot.lifetime === "session"
+    ? lowerBoundary(PLUGIN_INVENTORY_SESSION_BOUNDARY)
+    : "captured for this command; rerun this command to refresh";
+}
+
+function needsAttention(item: PluginInventoryItem): boolean {
+  return item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
+    (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
+}
+
+function relevance(item: PluginInventoryItem): number {
+  return (item.installations.length > 0 ? 16 : 0) + (item.enablement?.enabled === true ? 8 : 0) +
+    (item.selectedInstallation !== undefined ? 4 : 0) + (item.outcome?.status === "loaded" ? 2 : 0) +
+    (needsAttention(item) ? 32 : 0);
+}
+
+function relevantItems(items: readonly PluginInventoryItem[]): PluginInventoryItem[] {
+  return items.map((item, index) => ({ item, index })).sort((left, right) =>
+    relevance(right.item) - relevance(left.item) || left.index - right.index).map(({ item }) => item);
+}
 
 function captureOmissions(snapshot: PluginInventorySnapshot): PluginInventoryCaptureOmission[] {
   return Object.entries(snapshot.omissions)
@@ -277,7 +298,7 @@ function addBoundedRecords<T>(lines: string[], heading: string, values: readonly
 
 export function renderPluginInventoryList(snapshot: PluginInventorySnapshot): string {
   const lines = ["Plugin inventory (read-only)", `Snapshot: ${boundary(snapshot)}`];
-  for (const item of snapshot.items.slice(0, MAX_LIST_ITEMS)) {
+  for (const item of relevantItems(snapshot.items).slice(0, MAX_LIST_ITEMS)) {
     lines.push(`Plugin: ${qualified(item.qualifiedIdentity)}`);
     lines.push(`  installed: ${installationSummary(item)}`);
     lines.push(`  enabled: ${yesNo(item.enablement?.enabled)}`);
@@ -285,7 +306,7 @@ export function renderPluginInventoryList(snapshot: PluginInventorySnapshot): st
     lines.push(`  catalog: ${item.catalogPresence ? "known" : "not known"}`);
   }
   const localRows = Math.max(0, snapshot.items.length - MAX_LIST_ITEMS);
-  if (localRows > 0) lines.push(`Local rows not shown: ${localRows}`);
+  if (localRows > 0) lines.push(`Local rows not shown: ${localRows}. Catalog-only identities may be omitted; in the interactive TUI use the literal /plugin filter to look them up.`);
   const capture = captureOmissions(snapshot);
   if (capture.length > 0) lines.push(`Snapshot-capture evidence omissions: ${capture.map((value) => `${value.axis}=${value.count}`).join(", ")}`);
   if (snapshot.items.length === 0) lines.push("No plugins are known in this snapshot.");
@@ -295,7 +316,7 @@ export function renderPluginInventoryList(snapshot: PluginInventorySnapshot): st
 export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, qualifiedIdentity: string): string {
   if (!validQualifiedIdentity(qualifiedIdentity)) return snapshot.lifetime === "command" ? PLUGIN_INVENTORY_ARGV_USAGE : PLUGIN_INVENTORY_SLASH_USAGE;
   const item = snapshot.find(qualifiedIdentity);
-  if (item === undefined || item.qualifiedIdentity !== qualifiedIdentity) return [`Plugin not found: ${qualified(qualifiedIdentity)}`, `Snapshot: ${boundary(snapshot)}`, "Use the list command to copy an exact qualified identity."].join("\n");
+  if (item === undefined || item.qualifiedIdentity !== qualifiedIdentity) return [`Plugin not found: ${qualified(qualifiedIdentity)}`, `Snapshot: ${boundary(snapshot)}`, "Bounded output can omit catalog-only identities. Use the list command to copy an exact qualified identity; in the interactive TUI use the literal /plugin filter."].join("\n");
   const lines = [
     `Plugin: ${qualified(item.qualifiedIdentity)}`, "Mode: read-only", `Snapshot: ${boundary(snapshot)}`,
     `Installed: ${installationSummary(item)}`,
@@ -319,7 +340,7 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
     `diagnostics=${value.diagnostics.length === 0 ? "none" : value.diagnostics.slice(0, MAX_DETAIL_VALUES).map((diagnostic) => `${diagnostic.severity}:${text(diagnostic.message, 80)}`).join(", ")}`,
   ]);
   addBoundedRecords(lines, "Catalog declarations (locally observed; not runtime authority)", item.catalogDeclarations, (value) => [
-    `source=${text(JSON.stringify(value.source), 160)}`, `version=${text(value.version ?? "not declared", 80)}`, `revision=${text(value.revision ?? "not declared", 80)}; evidence=${text(value.revisionEvidence ?? "not declared", 80)}`,
+    `source=${formatPluginInventoryStructuredSource(value.source)}`, `version=${text(value.version ?? "not declared", 80)}`, `revision=${text(value.revision ?? "not declared", 80)}; evidence=${text(value.revisionEvidence ?? "not declared", 80)}`,
     `source-effect=${value.sourceEffect === undefined ? "not declared" : `availability=${text(value.sourceEffect.availability, 80)}; location=${location(value.sourceEffect.location)}; provenance=${provenance(value.sourceEffect.provenance)}`}`,
     `release=${value.release === undefined ? "not declared" : `${text(value.release.kind, 80)}:${text(value.release.value, 80)}; evidence=${text(value.release.evidence ?? "not declared", 80)}; provenance=${provenance(value.release.provenance)}`}`,
     `description=${text(value.description ?? "not declared", 160)}`, `strict=${yesNo(value.strict.value)}; presence=${value.strict.presence}; provenance=${provenance(value.strict.provenance)}`,
@@ -334,8 +355,8 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
     `provenance=${provenance(value.provenance)}`,
   ]);
   addBoundedRecords(lines, "Dependencies (declared only; resolution is not performed)", item.dependencies, (value) => [
-    `identity=${qualified(value.targetIdentity)}`, `version=${text(value.version ?? "not declared", 80)}; status=${text(value.versionStatus ?? "not declared", 80)}`,
-    `marketplace=${text(value.crossMarketplace, 80)}`, `posture=${text(value.posture, 120)}`, `provenance=${provenance(value.provenance)}`,
+    `identity=${qualified(value.targetIdentity)}`, `origin=${value.origin}`, `version=${text(value.version ?? "not declared", 80)}; status=${text(value.versionStatus ?? "not declared", 80)}`,
+    `qualification=${text(value.crossMarketplace, 80)}`, `posture=${text(value.posture, 120)}`, `provenance=${provenance(value.provenance)}`,
   ]);
   addBoundedRecords(lines, "Renames (declared only; migration is not performed)", item.renames, (value) => [
     `from=${text(value.from, 100)}; target=${value.target === null ? "removed" : text(value.target, 100)}`, `status=${text(value.status, 80)}`, `posture=${value.posture}`, `provenance=${provenance(value.provenance)}`,
@@ -390,28 +411,45 @@ export function projectPluginInventoryStartup(snapshot: PluginInventorySnapshot)
 export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot): PluginInventoryDoctorProjection {
   const allDiagnostics: PluginInventoryDoctorDiagnostic[] = [];
   const next = (identity: string): string => snapshot.lifetime === "session" ? `/plugin details ${identity}` : `picc plugin details ${identity}`;
+  const recovery = Object.freeze({
+    repairBoundary: "PiCC inventory is read-only; repair plugin state, declarations, or policy outside this command",
+    ...(snapshot.lifetime === "session" ? { refreshGuidance: PLUGIN_INVENTORY_SESSION_BOUNDARY } : { refreshGuidance: "rerun this command to refresh" }),
+  });
   for (const item of snapshot.items) {
     if (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") {
       const identity = qualified(item.qualifiedIdentity);
-      allDiagnostics.push(Object.freeze({ qualifiedIdentity: identity, global: false, severity: "warning", message: `Plugin runtime outcome is ${item.outcome.status}`, status: item.outcome.status, nextCommand: next(identity), repairBoundary: "PiCC inventory is read-only; repair plugin state, declarations, or policy outside this command", ...(snapshot.lifetime === "session" ? { refreshGuidance: PLUGIN_INVENTORY_SESSION_BOUNDARY } : {}) }));
+      allDiagnostics.push(Object.freeze({ qualifiedIdentity: identity, global: false, severity: "warning", message: `Plugin runtime outcome is ${item.outcome.status}`, status: item.outcome.status, nextCommand: next(identity), ...recovery }));
     }
-    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)) }));
+    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
   }
   for (const diagnostic of snapshot.diagnostics) {
     if (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") continue;
-    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, message: text(diagnostic.message) }));
+    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, message: text(diagnostic.message), ...recovery }));
   }
-  const diagnostics = allDiagnostics.slice(0, MAX_DIAGNOSTICS);
-  const evidence = snapshot.capabilityEvidence.slice(0, MAX_EVIDENCE).map((value) => Object.freeze({ capabilityId: value.capabilityId, qualifiedIdentity: qualified(value.qualifiedIdentity), ...(value.component === undefined ? {} : { component: text(value.component, 80) }), observation: text(value.observation) }));
+  const uniqueDiagnostics = allDiagnostics.filter((value, index, values) => values.findIndex((candidate) =>
+    candidate.qualifiedIdentity === value.qualifiedIdentity && candidate.global === value.global &&
+    candidate.severity === value.severity && candidate.message === value.message) === index);
+  const diagnostics = uniqueDiagnostics.slice(0, MAX_DIAGNOSTICS);
+  const uniqueEvidence = snapshot.capabilityEvidence.filter((value, index, values) => values.findIndex((candidate) =>
+    candidate.capabilityId === value.capabilityId && candidate.qualifiedIdentity === value.qualifiedIdentity &&
+    candidate.component === value.component && candidate.supportTier === value.supportTier && candidate.observation === value.observation) === index);
+  const evidence = uniqueEvidence.slice(0, MAX_EVIDENCE).map((value) => Object.freeze({ capabilityId: value.capabilityId, qualifiedIdentity: qualified(value.qualifiedIdentity), ...(value.component === undefined ? {} : { component: text(value.component, 80) }), ...(value.supportTier === undefined ? {} : { supportTier: value.supportTier }), observation: text(value.observation) }));
   const allPolicies = policyEvidence(snapshot.diagnostics); const policies = capPolicyPerImpact(allPolicies, MAX_DOCTOR_POLICY_PER_IMPACT);
   const capture = Object.freeze(captureOmissions(snapshot));
   const captureDiagnostics = captureOmissionTotal(snapshot, (axis) => axis.includes("diagnostic"));
   const captureCapabilities = captureOmissionTotal(snapshot, (axis) => axis.includes("evidence"));
-  const attention = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled").length;
+  const attentionIdentities = new Set<string>();
+  for (const item of snapshot.items) {
+    if ((item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") ||
+      item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
+      item.components.some((value) => value.supportTier !== "full")) attentionIdentities.add(item.qualifiedIdentity);
+  }
+  for (const value of uniqueEvidence) if (value.supportTier !== undefined && value.supportTier !== "full") attentionIdentities.add(value.qualifiedIdentity);
+  const attention = attentionIdentities.size;
   return Object.freeze({
     counts: Object.freeze({ known: snapshot.items.length, installed: snapshot.items.filter((item) => item.installations.some((entry) => entry.validity === "valid")).length, enabled: snapshot.items.filter((item) => item.enablement?.enabled === true).length, loaded: snapshot.items.filter((item) => item.outcome?.status === "loaded").length, cataloged: snapshot.items.filter((item) => item.catalogPresence).length, attention }),
     diagnostics: Object.freeze(diagnostics), capabilityEvidence: Object.freeze(evidence), managedPolicyEvidence: Object.freeze(policies), captureOmissions: capture,
-    omitted: Object.freeze({ diagnostics: Object.freeze({ capture: captureDiagnostics, projection: Math.max(0, allDiagnostics.length - diagnostics.length) }), capabilityEvidence: Object.freeze({ capture: captureCapabilities, projection: Math.max(0, snapshot.capabilityEvidence.length - evidence.length) }), managedPolicyEvidence: Object.freeze({ projection: Math.max(0, allPolicies.length - policies.length) }) }),
+    omitted: Object.freeze({ diagnostics: Object.freeze({ capture: captureDiagnostics, projection: Math.max(0, uniqueDiagnostics.length - diagnostics.length) }), capabilityEvidence: Object.freeze({ capture: captureCapabilities, projection: Math.max(0, uniqueEvidence.length - evidence.length) }), managedPolicyEvidence: Object.freeze({ projection: Math.max(0, allPolicies.length - policies.length) }) }),
     snapshotBoundary: boundary(snapshot),
   });
 }

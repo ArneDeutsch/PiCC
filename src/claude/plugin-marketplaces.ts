@@ -19,11 +19,13 @@ import type {
   PluginMarketplaceRename,
   PluginMarketplaceSafeShape,
   PluginMarketplaceSettingsContribution,
+  PluginMarketplaceUnsupportedComponentObservation,
   PluginMarketplaceState,
   Scope,
 } from "../types.js";
 import { stripBom } from "../util/fs.js";
 import { canonicalDirectory, projectIdentities } from "../util/project-identity.js";
+import { observeUnsupportedPluginComponents } from "./plugin-component-observation.js";
 import {
   extractMarketplaceSourceHost,
   isSafeMarketplaceGitLocation,
@@ -452,7 +454,7 @@ function parseCatalog(registration: PluginMarketplaceRegistration, state: Plugin
   const seenIdentities = new Map(state.entries.map((entry) => [entry.identity, fieldProvenance(registration, entry.provenance.entryIndex, "name")]));
   const knownEntryNames = new Set<string>();
   let entryEvidenceOmitted = false;
-  let retainedComponentCount = state.entries.reduce((sum, entry) => sum + Object.values(entry.components).reduce((inner, list) => inner + list.length, 0), 0);
+  let retainedComponentCount = state.entries.reduce((sum, entry) => sum + (entry.unsupportedComponents?.length ?? 0) + Object.values(entry.components).reduce((inner, list) => inner + list.length, 0), 0);
   let retainedUserConfigKeys = state.entries.reduce((sum, entry) => sum + (entry.userConfig?.keys.length ?? 0), 0);
   for (let index = 0; index < plugins.length; index++) {
     const raw = plugins[index];
@@ -499,6 +501,21 @@ function parseCatalog(registration: PluginMarketplaceRegistration, state: Plugin
       if (value === undefined) continue;
       if (Array.isArray(value)) value.forEach((item, itemIndex) => retainComponent(key, item, itemIndex, true));
       else retainComponent(key, value, undefined, true);
+    }
+
+    const unsupportedComponents: PluginMarketplaceUnsupportedComponentObservation[] = [];
+    const unsupported = observeUnsupportedPluginComponents(raw, {
+      maximumItems: 64,
+      reportInvalid: (field, item) => report(
+        `Catalog plugin ${field} declaration${item ? " item" : ""} has the wrong or unsafe shape; ignored`,
+        registration.catalogPath,
+      ),
+    });
+    state.omissions.components += unsupported.omittedItems;
+    for (const observation of unsupported.observations) {
+      if (retainedComponentCount >= MAX_COMPONENTS) { state.omissions.components++; continue; }
+      unsupportedComponents.push({ ...observation, provenance: fieldProvenance(registration, index, observation.field), posture: "declared-not-effective" });
+      retainedComponentCount++;
     }
 
     const dependencies: PluginMarketplaceDependency[] = [];
@@ -587,7 +604,7 @@ function parseCatalog(registration: PluginMarketplaceRegistration, state: Plugin
       strictDeclaration: { value: strict, presence: typeof strictRaw === "boolean" ? "explicit" : "default", provenance: fieldEvidence.strict! },
       defaultEnabled,
       defaultEnabledDeclaration: { value: defaultEnabled, presence: typeof defaultRaw === "boolean" ? "explicit" : "default", provenance: fieldEvidence.defaultEnabled! },
-      components, dependencies, ...(userConfig === undefined ? {} : { userConfig }),
+      components, unsupportedComponents, dependencies, ...(userConfig === undefined ? {} : { userConfig }),
       provenance: { ...registration.provenance, catalogPath: registration.catalogPath, entryIndex: index }, runtimeEffect: "declared-not-effective",
     };
     state.entries.push(entry);

@@ -568,7 +568,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const hooks = lookupCapability("feature.plugins-hooks")?.note ?? "";
     for (const phrase of ["command and argument fields alone", "canonical authorized root", "matcher, condition, URL, and arbitrary raw fields remain literal"]) expect(hooks).toContain(phrase);
     const metadata = lookupCapability("feature.plugins-manifest-metadata")?.note ?? "";
-    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible runtime component namespace", "manifestless content uses the validated installed lifecycle name", "bounded same-read projection", "name, description, version, author, homepage, repository, license, keywords", "Skills, commands, agents, and hooks declarations can affect runtime only after selection and validation", "dependencies and renames are catalog declarations observed by the inventory but not resolved or migrated", "Broader recognized metadata validation", "defaultEnabled execution", "marketplace strict overlays", "settings rewrite are unsupported"]) expect(metadata).toContain(phrase);
+    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible runtime component namespace", "manifestless content uses the validated installed lifecycle name", "bounded same-read projection", "name, description, version, author, homepage, repository, license, keywords, dependencies", "supported or unsupported component declaration shapes", "Skills, commands, agents, and hooks declarations can affect runtime only after selection and validation", "manifest dependencies remain unresolved inventory evidence", "renames remain catalog-only inert declarations", "Broader recognized metadata validation", "defaultEnabled execution", "marketplace strict overlays", "settings rewrite are unsupported"]) expect(metadata).toContain(phrase);
     expect(lookupCapability("feature.plugins-development-trust")).toMatchObject({ tier: "not-supported" });
     expect(lookupCapability("feature.plugins-development-trust")?.note).toContain("repository-bundled");
     expect(lookupCapability("feature.plugins-command-plugin")).toMatchObject({ tier: "partial" });
@@ -587,7 +587,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       ["feature.plugin-update", "update is not implemented"],
       ["feature.plugin-uninstall", "uninstall is not implemented"],
       ["feature.plugin-marketplace", "marketplace add, update, remove, refresh"],
-      ["feature.plugins-other-components", "LSP, workflows, themes, monitors, channels"],
+      ["feature.plugins-other-components", "LSP, workflows, output styles, top-level and experimental themes and monitors, channels"],
     ] as const) {
       expect(lookupCapability(id)?.tier, id).toBe("not-supported");
       expect(lookupCapability(id)?.note, id).toContain(phrase);
@@ -596,17 +596,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
       expect(lookupCapability(id)?.note, id).toContain("or relaunch PiCC");
     }
+    expect(lookupCapability("feature.plugins-other-components")?.note).toContain("bounded shape-only inventory evidence");
     expect(lookupCapability("feature.plugins-other-components")?.note).toContain("feature.mcp-plugin-servers");
 
     for (const id of ["feature.plugins-inventory", "feature.plugins-launcher-inventory", "feature.plugins-marketplace-observation"] as const) {
       expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
     }
     const inventory = lookupCapability("feature.plugins-inventory")?.note ?? "";
-    for (const phrase of ["bounded read-only snapshot", "by qualified identity", "marketplace registrations and policy stay global", "qualified catalog dependencies and renames join only as inert declarations", "Session UI/text/doctor consumers share one immutable capture", "command consumers build one fresh snapshot", "No disk reread", "stable JSON automation contract", "exact Claude rendering parity"]) expect(inventory).toContain(phrase);
+    for (const phrase of ["bounded read-only snapshot", "by qualified identity", "marketplace registrations and policy stay global", "selected-manifest and catalog dependencies retain distinct unresolved provenance", "renames remain catalog-only inert declarations", "Session UI/text/doctor consumers share one immutable capture", "command consumers build one fresh snapshot", "No disk reread", "stable JSON automation contract", "exact Claude rendering parity"]) expect(inventory).toContain(phrase);
     const launcher = lookupCapability("feature.plugins-launcher-inventory")?.note ?? "";
     for (const phrase of ["picc plugin list", "picc plugin details <qualified-name>", "one fresh command-scoped", "avoid normal Pi extension, hook, MCP, and plugin-runtime startup", "not stable JSON automation"]) expect(launcher).toContain(phrase);
     const marketplace = lookupCapability("feature.plugins-marketplace-observation")?.note ?? "";
-    for (const phrase of ["local-only observation", "fixture-derived known_marketplaces.json serialization", "dependencies", "renames", "Catalogs are inventory-only and never authorize content", "no network refresh", "dependency resolution", "rename migration", "strict-overlay execution"]) expect(marketplace).toContain(phrase);
+    for (const phrase of ["local-only observation", "fixture-derived known_marketplaces.json serialization", "supported and unsupported component shapes", "dependencies", "renames", "Catalogs are inventory-only and never authorize content", "no network refresh", "dependency resolution", "rename migration", "strict-overlay execution"]) expect(marketplace).toContain(phrase);
     for (const id of ["setting.extraKnownMarketplaces", "setting.strictKnownMarketplaces", "setting.blockedMarketplaces"] as const) {
       expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
       expect(lookupCapability(id)?.note, id).toContain("read-only observation");
@@ -1130,6 +1131,7 @@ describe("buildCompatReport", () => {
       ],
       capabilityEvidence: [
         { capabilityId: "feature.plugins-content", qualifiedIdentity: "broken@community", component: "commands", observation: "Final loaded component support is partial" },
+        { capabilityId: "feature.plugins-other-components", qualifiedIdentity: "broken@community", component: "channels", observation: "Selected manifest declares an unsupported plugin component" },
         { capabilityId: "feature.hook-handler.prompt", qualifiedIdentity: "broken@community", component: "hooks", observation: "Plugin hook handler support is degraded-noop" },
         { capabilityId: "agent.frontmatter.hooks", qualifiedIdentity: "broken@community", component: "worker", observation: "Plugin agent field hooks was stripped before runtime construction" },
         { capabilityId: "feature.future-plugin-capability", qualifiedIdentity: "broken@community", observation: "Capability observation is unassessed because its registry entry is absent" },
@@ -1148,21 +1150,26 @@ describe("buildCompatReport", () => {
     expect(report.pluginInventory?.diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ qualifiedIdentity: "broken@community", status: "enabled-but-uninstalled", nextCommand: "/plugin details broken@community" }),
     ]));
-    for (const id of ["feature.plugins-content", "feature.hook-handler.prompt", "agent.frontmatter.hooks"]) {
+    for (const id of ["feature.plugins-content", "feature.plugins-other-components", "feature.hook-handler.prompt", "agent.frontmatter.hooks"]) {
       expect([...report.findings, ...report.safetyFindings].some((finding) => finding.capability.id === id), id).toBe(true);
     }
     expect(report.unassessed).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
-    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin diagnostic(s) omitted"))).toBe(true);
-    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin capability observation(s) omitted"))).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin diagnostic(s) omitted"))).toBe(false);
+    expect(report.findings.some((finding) => finding.evidence.includes("captured plugin capability observation(s) omitted"))).toBe(false);
     const doctor = renderDoctorReport(project, report);
     expect(doctor).toContain("known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1");
     expect(doctor).toContain("broken@community");
+    expect(doctor).toContain("Selected manifest declares an unsupported plugin component");
     expect(doctor).toContain("<redacted-field>");
     expect(doctor).toContain("A non-boolean enabledPlugins value was ignored");
     expect(doctor).toContain("managed-policy override was malformed; this source was ignored. Correct the managed-policy override format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
     expect(doctor).toContain("Capture omissions may make these retained counts incomplete: snapshot.items=4.");
     expect(doctor).toContain("Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+    expect(doctor).toContain("Repair boundary: PiCC inventory is read-only; repair plugin state, declarations, or policy outside this command.");
+    expect(doctor).toContain("Refresh: Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
     expect(doctor.match(/Repair the captured declaration/gu)).toHaveLength(1);
+    expect(doctor.match(/3 additional captured diagnostic\(s\) omitted/gu)).toHaveLength(1);
+    expect(doctor.match(/2 additional captured capability observation\(s\) omitted/gu)).toHaveLength(1);
     expect(doctor).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
     for (const absent of ["healthy@official", "STALE@outcomes", "STALE@hooks", "STALE@settings", "C:/SECRET", "C:/RAW/POLICY", "token=RAW", "caller-provided wording"]) expect(doctor).not.toContain(absent);
   });

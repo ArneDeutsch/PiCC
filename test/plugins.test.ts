@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EffectivePluginEnablement, NormalizedPluginInstallation } from "../src/types.js";
+import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
 import {
   loadPluginHooks,
   resolveInstalledPlugins,
@@ -83,6 +84,13 @@ function enablement(values: Record<string, boolean>): Record<string, EffectivePl
   }]));
 }
 
+function channelWithOption(option: unknown, key = "token"): Record<string, unknown> {
+  return {
+    mcpServers: { events: {} },
+    channels: [{ server: "events", userConfig: { [key]: option } }],
+  };
+}
+
 function resolve(options: {
   enabled?: Record<string, boolean>;
   installations?: NormalizedPluginInstallation[];
@@ -128,9 +136,15 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     const installation = record();
     const manifestPath = path.join(installation.installPath, ".claude-plugin", "plugin.json");
     write(manifestPath, JSON.stringify({
-      name: "alpha-runtime", description: "safe description", version: "2.0.0",
+      name: "alpha-runtime", description: "safe description", version: "2.0.0", source: "../invented-runtime-root",
       author: { name: "Maintainer", email: "secret@example.test" },
       homepage: "https://example.test/plugin", unknownSecret: "do-not-retain",
+      dependencies: ["local-dep", { name: "qualified", version: "^2", marketplace: "partner" }, "invented@grammar", { name: "bad", command: "do-not-run" }],
+      mcpServers: { "safe-server": { command: "node", args: ["server.js"] } },
+      workflows: ["./private/workflow.json", 7, "SECRET-WORKFLOW"], outputStyles: "./styles/output.md",
+      themes: ["./themes/legacy.json", 7], monitors: ["./monitors/path.json", { name: "inline", command: "SECRET-COMMAND", description: "safe shape" }, { name: "missing", command: "SECRET" }],
+      experimental: { themes: "./themes/current.json", monitors: [{ name: "current", command: "SECRET-EXPERIMENTAL", description: "safe shape" }, 7] },
+      channels: [{ server: "safe-server", userConfig: { token: { type: "string", title: "Token", description: "Authentication token", sensitive: true, default: "SECRET-CHANNEL" } } }, { server: "missing-server" }, { server: "safe-server", userConfig: "INVALID-SIBLING" }],
     }));
     const original = fs.readFileSync;
     let manifestReads = 0;
@@ -143,13 +157,78 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
       expect(manifestReads).toBe(1);
       expect(result.plugins[0]!.manifestProjection).toMatchObject({
         manifestName: "alpha-runtime", description: "safe description", version: "2.0.0", author: "Maintainer",
+        dependencies: [{ name: "local-dep", itemIndex: 0 }, { name: "qualified", version: "^2", marketplace: "partner", itemIndex: 1 }],
+        components: expect.arrayContaining([
+          { field: "workflows", declaration: "shape", count: 1 }, { field: "outputStyles", declaration: "shape", count: 1 },
+          { field: "themes", declaration: "shape", count: 1 }, { field: "monitors", declaration: "shape", count: 2 },
+          { field: "experimental.themes", declaration: "shape", count: 1 }, { field: "experimental.monitors", declaration: "shape", count: 1 },
+          { field: "channels", declaration: "shape", count: 1 },
+        ]),
       });
-      expect(JSON.stringify(result.plugins[0]!.manifestProjection)).not.toContain("secret@example.test");
-      expect(JSON.stringify(result.plugins[0]!.manifestProjection)).not.toContain("do-not-retain");
+      expect(result.outcomes[0]!.status).toBe("loaded");
+      expect(result.plugins[0]).toMatchObject({ root: installation.installPath, installation, skillSources: [], commandSources: [], agentSources: [], hookSources: [] });
+      expect(result.outcomes).toHaveLength(1);
+      expect(JSON.stringify(result.plugins[0]!.manifestProjection)).not.toMatch(/secret@example\.test|do-not-retain|SECRET-|do-not-run/u);
       expect(Object.isFrozen(result.plugins[0]!.manifestProjection)).toBe(true);
     } finally {
       readSpy.mockRestore();
     }
+  });
+
+  it.each([
+    ["valid workflows", { workflows: "./workflow.json" }, "workflows", 1, 0],
+    ["malformed workflows", { workflows: {} }, "workflows", 0, 1],
+    ["valid output styles", { outputStyles: ["./style.md"] }, "outputStyles", 1, 0],
+    ["malformed output styles", { outputStyles: 7 }, "outputStyles", 0, 1],
+    ["valid top-level themes", { themes: "./theme.json" }, "themes", 1, 0],
+    ["malformed top-level themes", { themes: {} }, "themes", 0, 1],
+    ["valid path monitor", { monitors: "./monitor.json" }, "monitors", 1, 0],
+    ["valid inline monitor without when", { monitors: [{ name: "watch", command: "SECRET", description: "Watch" }] }, "monitors", 1, 0],
+    ["valid inline monitor always", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "always" }] }, "monitors", 1, 0],
+    ["valid inline monitor skill invoke", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:build" }] }, "monitors", 1, 0],
+    ["malformed monitor", { monitors: [{ name: "watch", command: "SECRET" }] }, "monitors", 0, 1],
+    ["empty skill invoke monitor", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:" }] }, "monitors", 0, 1],
+    ["unknown monitor field", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", extra: true }] }, "monitors", 0, 1],
+    ["valid channel display name and closed userConfig", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: "Events", userConfig: {
+      text: { type: "string", title: "Text", description: "Text", default: "SECRET" },
+      list: { type: "string", title: "List", description: "List", multiple: true, default: ["SECRET"] },
+      retries: { type: "number", title: "Retries", description: "Retries", required: true, min: 0, max: 5, default: 2 },
+      enabled: { type: "boolean", title: "Enabled", description: "Enabled", sensitive: false, default: true },
+      folder: { type: "directory", title: "Folder", description: "Folder", default: "C:/SECRET" },
+      configFile: { type: "file", title: "File", description: "File", default: "/SECRET" },
+    } }] }, "channels", 1, 0],
+    ["malformed channel", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: 7 }] }, "channels", 0, 1],
+    ["unknown channel field", { mcpServers: { events: {} }, channels: [{ server: "events", extra: true }] }, "channels", 0, 1],
+    ["missing channel server declaration", { channels: [{ server: "events" }] }, "channels", 0, 1],
+    ["non-object userConfig option", channelWithOption("invalid"), "channels", 0, 1],
+    ["required wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", required: "yes" }), "channels", 0, 1],
+    ["sensitive wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", sensitive: 1 }), "channels", 0, 1],
+    ["multiple wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: "yes" }), "channels", 0, 1],
+    ["multiple on non-string option", channelWithOption({ type: "number", title: "Token", description: "Token", multiple: true }), "channels", 0, 1],
+    ["min wrong value type", channelWithOption({ type: "number", title: "Token", description: "Token", min: "zero" }), "channels", 0, 1],
+    ["min on wrong option type", channelWithOption({ type: "string", title: "Token", description: "Token", min: 0 }), "channels", 0, 1],
+    ["max wrong value type", channelWithOption({ type: "number", title: "Token", description: "Token", max: "five" }), "channels", 0, 1],
+    ["max on wrong option type", channelWithOption({ type: "string", title: "Token", description: "Token", max: 5 }), "channels", 0, 1],
+    ["incompatible scalar default", channelWithOption({ type: "number", title: "Token", description: "Token", default: "SECRET" }), "channels", 0, 1],
+    ["dollar userConfig key", channelWithOption({ type: "string", title: "Token", description: "Token" }, "$token"), "channels", 0, 1],
+    ["non-identifier userConfig key", channelWithOption({ type: "string", title: "Token", description: "Token" }, "not-valid"), "channels", 0, 1],
+    ["unknown userConfig option field", channelWithOption({ type: "string", title: "Token", description: "Token", extra: true }), "channels", 0, 1],
+    ["string array without multiple", channelWithOption({ type: "string", title: "Token", description: "Token", default: ["SECRET"] }), "channels", 0, 1],
+    ["non-string array default", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: true, default: [7] }), "channels", 0, 1],
+    ["valid experimental themes", { experimental: { themes: ["./theme.json"] } }, "experimental.themes", 1, 0],
+    ["malformed experimental themes", { experimental: { themes: {} } }, "experimental.themes", 0, 1],
+    ["valid experimental monitors", { experimental: { monitors: "./monitor.json" } }, "experimental.monitors", 1, 0],
+    ["malformed experimental monitors", { experimental: { monitors: 7 } }, "experimental.monitors", 0, 1],
+    ["valid sibling beside malformed monitor", { monitors: ["./good.json", { name: "broken", command: "SECRET" }] }, "monitors", 1, 1],
+  ] as const)("observes selected-manifest %s independently without retaining declaration values", (_label, declaration, field, count, diagnosticCount) => {
+    const result = projectPluginManifest(declaration);
+    expect(result.projection.components.filter((component) => component.field === field)).toEqual(
+      count === 0 ? [] : [{ field, declaration: "shape", count }],
+    );
+    expect(result.diagnostics).toEqual(Array.from({ length: diagnosticCount }, () => ({
+      severity: "warning", message: `Plugin manifest metadata field ${field} has an invalid type or unsafe value and was ignored`,
+    })));
+    expect(JSON.stringify(result.projection)).not.toMatch(/SECRET|watch|events|Events|Token|C:\/|\/SECRET/u);
   });
 
   it("represents false, missing, absent, unsupported, malformed, and unreadable state without loading", () => {

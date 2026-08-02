@@ -63,6 +63,7 @@ export function loadClaudeProject(opts: {
   pluginInventoryLifetime?: "session" | "command";
 }): LoadedProject {
   const diagnostics: Diagnostic[] = [];
+  const env = opts.env ?? process.env;
   const cwd = path.resolve(opts.cwd);
   const profile = resolveClaudeProfile({
     ...(opts.userDir === undefined ? {} : { userDir: opts.userDir }),
@@ -100,6 +101,7 @@ export function loadClaudeProject(opts: {
     userDir,
     projectRoot: root,
     settings,
+    env,
   });
   diagnostics.push(...marketplaceState.diagnostics);
   const pluginResult = resolveInstalledPlugins({
@@ -108,6 +110,7 @@ export function loadClaudeProject(opts: {
     enablement: settings.effectivePluginEnablement ?? {},
     installations: installedState.installations,
     installedStateStatus: installedState.status,
+    env,
   });
   diagnostics.push(...pluginResult.diagnostics);
   const selectedPlugins = pluginResult.plugins;
@@ -307,7 +310,7 @@ export function loadClaudeProject(opts: {
     installedObservations: installedState.observations,
     installedObservationDiagnostics: installedState.observationDiagnostics,
     installedObservationOmissions: { ...installedState.observationOmissions },
-    metadataReadCapability: createPluginMetadataReadCapability(authorizedCacheRoots(userDir, process.env)),
+    metadataReadCapability: createPluginMetadataReadCapability(authorizedCacheRoots(userDir, env)),
     enablementDiagnostics: settings.diagnostics,
     marketplaceState,
     enablement: settings.effectivePluginEnablement ?? {},

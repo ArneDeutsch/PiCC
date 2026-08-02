@@ -8,7 +8,10 @@ import {
 } from "./runtime/plugin-inventory-text.js";
 
 const PROJECT_UNAVAILABLE = "PiCC plugin inventory could not access the target project directory. Run from an accessible target project directory.";
-const INVENTORY_INCOMPLETE = "PiCC plugin inventory may be incomplete. Repair malformed or unreadable Claude plugin state.";
+const INVENTORY_INCOMPLETE_PREFIX = "PiCC plugin inventory may be incomplete";
+const INVENTORY_FORMAT_RECOVERY = "Update PiCC or report the unsupported plugin-state format.";
+const INVENTORY_REPAIR_RECOVERY = "Repair the malformed or unreadable Claude plugin state outside PiCC.";
+const INVENTORY_DOCTOR_RECOVERY = "Run PiCC interactively in the same project and profile, then use `/doctor` for details.";
 const WINDOWS_REGISTRY_NOT_INSPECTED = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
 
 export interface PluginInventoryCliOutput {
@@ -80,6 +83,32 @@ function resolveCommandInputs(options: PluginInventoryCliOptions):
   return { cwd, profile };
 }
 
+function incompleteStateWarning(
+  installedStateStatus: "absent" | "valid" | "unreadable" | "unsupported" | "malformed",
+  diagnostics: readonly { readonly category?: string; readonly sourceClass?: string; readonly message: string }[],
+): string {
+  const classes = new Set<string>();
+  let unsupportedFormat = installedStateStatus === "unsupported";
+  let repairState = installedStateStatus === "malformed" || installedStateStatus === "unreadable";
+  for (const diagnostic of diagnostics) {
+    const evidence = `${diagnostic.category ?? ""} ${diagnostic.sourceClass ?? ""} ${diagnostic.message}`.toLowerCase();
+    if (/installed|blocklist/u.test(evidence)) classes.add("installed plugin state");
+    if (/marketplace|catalog|allowlist/u.test(evidence)) classes.add("marketplace state");
+    if (/managed-policy|registry-/u.test(evidence)) classes.add("managed policy state");
+    if (/manifest|metadata/u.test(evidence)) classes.add("plugin metadata");
+    const formatDiagnostic = /unsupported (?:format|version)|format is unsupported|undocumented/u.test(evidence);
+    if (formatDiagnostic) unsupportedFormat = true;
+    else if (/malformed|unreadable|could not be read|invalid type|wrong (?:type|shape)/u.test(evidence)) repairState = true;
+  }
+  const category = classes.size > 0 ? ` (${[...classes].sort().join(", ")})` : "";
+  const actions = [
+    ...(unsupportedFormat ? [INVENTORY_FORMAT_RECOVERY] : []),
+    ...(repairState || !unsupportedFormat ? [INVENTORY_REPAIR_RECOVERY] : []),
+    INVENTORY_DOCTOR_RECOVERY,
+  ];
+  return `${INVENTORY_INCOMPLETE_PREFIX}${category}. ${actions.join(" ")}`;
+}
+
 function isDefaultRegistryOmission(diagnostic: {
   readonly category?: string;
   readonly sourceClass?: string;
@@ -125,7 +154,7 @@ export function runPluginInventoryCli(
   }
 
   if (parsed.operation.kind === "details" && project.pluginInventory.find(parsed.operation.qualifiedIdentity) === undefined) {
-    output.error(`PiCC plugin not found: ${parsed.operation.qualifiedIdentity}. Run \`picc plugin list\` to copy an exact qualified identity.`);
+    output.error(`PiCC plugin not found: ${parsed.operation.qualifiedIdentity}. The bounded launcher list can omit catalog-only identities. Run \`picc plugin list\` to copy a listed qualified identity, or run PiCC interactively in the same project and profile and use the literal \`/plugin\` filter.`);
     return 1;
   }
 
@@ -134,6 +163,6 @@ export function runPluginInventoryCli(
   const otherDiagnostics = defaultRegistryOmitted
     ? project.pluginInventory.diagnostics.filter((diagnostic) => !isDefaultRegistryOmission(diagnostic))
     : project.pluginInventory.diagnostics;
-  if (otherDiagnostics.length > 0) output.error(INVENTORY_INCOMPLETE);
+  if (otherDiagnostics.length > 0) output.error(incompleteStateWarning(project.pluginInventory.installedStateStatus, otherDiagnostics));
   return 0;
 }

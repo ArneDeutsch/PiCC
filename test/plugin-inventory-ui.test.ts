@@ -28,7 +28,7 @@ function item(identity: string, options: {
       defaultEnabled: { value: false, presence: "default", provenance: { source: { kind: "marketplace-cache", display: `<marketplace-cache>/${marketplace}/catalog.json` } } },
       provenance: { source: { kind: "marketplace-cache", display: `<marketplace-cache>/${marketplace}/catalog.json` }, scope: "user", origin: "catalog" }, runtimeEffect: "declared-not-effective",
     }],
-    dependencies: Array.from({ length: 18 }, (_, index) => ({ targetIdentity: `dependency${index}@${marketplace}`, version: `^${index}`, posture: "declared-not-effective", crossMarketplace: "same-marketplace", provenance: { source: { kind: "marketplace-cache" as const, display: `<marketplace-cache>/${marketplace}/catalog.json` }, field: "dependencies" } })),
+    dependencies: Array.from({ length: 18 }, (_, index) => ({ origin: "catalog" as const, targetIdentity: `dependency${index}@${marketplace}`, version: `^${index}`, posture: "declared-not-effective", crossMarketplace: "same-marketplace", provenance: { source: { kind: "marketplace-cache" as const, display: `<marketplace-cache>/${marketplace}/catalog.json` }, field: "dependencies" } })),
     renames: [{ from: "old-name", target: name!, status: "current", posture: "declared-not-effective", provenance: { source: { kind: "marketplace-cache", display: `<marketplace-cache>/${marketplace}/catalog.json` }, field: "renames" } }],
     components: Array.from({ length: componentCount }, (_, index) => ({ origin: "selected-manifest" as const, kind: index % 2 ? "mcpServers" as const : "skills" as const, count: 1, countSemantics: "selected-manifest-declarations" as const, capabilityId: `plugin.component.${index}`, supportTier: index % 2 ? "not-supported" as const : "full" as const, executionRisk: index % 2 ? "unsupported-runtime" as const : "context" as const, provenance: { source: { kind: "plugin-cache" as const, display: `<plugin-cache>/${identity}/plugin.json` }, field: "components" } })),
     executionRisk: ["context", "unsupported-runtime"], diagnostics: options.diagnostics ?? [],
@@ -173,7 +173,7 @@ describe("plugin inventory focused UI", () => {
     visible.setView(2);
     expect(visible.enterDetail()).toBe("entered");
     const detail = allDetail(visible);
-    for (const evidence of ["Fixture contract: fixture-derived-unverified", "kind=github", "repo=<redacted-field>", "scope user", "origin source", "order 1", "field source", "entry 2", "item 3", "key rich"]) expect(normalizedOutput(detail.split("\n"))).toContain(evidence);
+    for (const evidence of ["Fixture contract: fixture-derived-unverified", "kind=github", "repo=owner/repo", "scope user", "origin source", "order 1", "field source", "entry 2", "item 3", "key rich"]) expect(normalizedOutput(detail.split("\n"))).toContain(evidence);
 
     const provenanceChanges = (field: keyof NonNullable<PluginInventoryMarketplace["provenance"]>, changed: unknown) =>
       (value: PluginInventoryMarketplace): PluginInventoryMarketplace => ({ ...value, provenance: { ...value.provenance, [field]: changed } });
@@ -209,9 +209,26 @@ describe("plugin inventory focused UI", () => {
     for (const label of ["Description:", "Source:", "Version:", "Revision:", "Scope:", "Anchored location:", "Dependencies", "Renames", "Components:", "PiCC support:", "Execution risk:", "Policy:", "Diagnostics with provenance:", "Catalog declarations with provenance:"]) expect(detail).toContain(label);
     expect(detail).toContain("catalog 2.0.0");
     expect(detail).toContain("catalog rev-abc");
+    expect(detail).toContain("origin catalog");
+    expect(detail).toContain("qualification same-marketplace");
+    expect(detail).toContain("source kind=github");
+    expect(detail).toContain("selected-manifest/mcpServers");
+    expect(detail).toContain("<plugin-cache>/complete@official/plugin.json");
     expect(detail).toContain("2 additional retained values are not expanded here; use /plugin details complete@official");
     expect(detail).toContain("4 additional retained values are not expanded here; use /plugin details complete@official");
     expect(detail).toContain("<plugin-cache>/complete@official/1.2.3");
+  });
+
+  it("renders normalized safe relative sources and redacts hostile structured paths in details", () => {
+    const withSource = (value: string): PluginInventoryItem => {
+      const base = item("source@official");
+      return { ...base, catalogDeclarations: base.catalogDeclarations.map((entry) => ({ ...entry, source: { kind: "relative", value } })) };
+    };
+    for (const [value, expected] of [["./plugins/safe", "source kind=relative, value=plugins/safe"], ["plugins/../private", "source kind=relative, value=<redacted>"]] as const) {
+      const model = new PluginInventoryModel(snapshot({ items: [withSource(value)] }));
+      expect(model.enterDetail()).toBe("entered");
+      expect(allDetail(model)).toContain(expected);
+    }
   });
 
   it("shows valid/invalid installation evidence independently from session outcome", () => {
@@ -350,6 +367,13 @@ describe("plugin inventory focused UI", () => {
       if (width >= 4) expect(output(rendered.lines)).toContain("PiCC");
       if (width >= 12) expect(normalizedOutput(rendered.lines)).toContain("/plugin list");
       if (width > 0 && width < 8) expect(output(rendered.lines).replace(/\n/gu, "")).toContain("unusable");
+    }
+    for (const width of [1, 4, 7]) {
+      const lines = renderPluginInventory(model.view(), { width, theme: plainTheme }).lines;
+      const reconstructed = lines.join("").replace(/\s+/gu, "");
+      for (const signal of ["PiCCplugininventory", "read-onlysessionsnapshot", "widthunusable", "resizewider", "Esccloses"]) expect(reconstructed, `width ${width}`).toContain(signal);
+      expect(reconstructed, `width ${width}`).not.toMatch(/Discover|Installed|Marketplaces|Errors|installation records|Filter:|←|Enter details|\/plugin list/u);
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
     for (const width of [12, 72, 120]) {
       const lines = renderPluginInventory(model.view(), { width, theme: plainTheme }).lines;

@@ -322,6 +322,8 @@ function parseRecord(
   };
 }
 
+// Observation records are isolated per entry, but authoritative import remains all-or-nothing:
+// partial evidence can never weaken installed-state authority.
 export function loadPluginInstalledState(userDir: string): LoadPluginInstalledStateResult {
   const statePath = path.join(userDir, "plugins", INSTALLED_STATE_FILENAME);
   let bytes: Buffer;

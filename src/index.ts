@@ -2907,8 +2907,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           projection.omissions.managedPolicyEvidence > 0 || captureEvidenceOmitted
           ? "This startup notice is abbreviated."
           : undefined;
-        const startupText = projection.text?.replaceAll(" Run /doctor for details.", "");
-        const pluginNotice = [startupText, omissionCue].filter((line): line is string => line !== undefined).join("\n");
+        const pluginNotice = [projection.text, omissionCue].filter((line): line is string => line !== undefined).join("\n");
         if (pluginNotice) {
           pluginStartupNoticePresented = true;
           try {

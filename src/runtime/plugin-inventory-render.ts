@@ -4,6 +4,7 @@ import { clampLines, pushWrapped, themedFg } from "./render-util.js";
 import { PLUGIN_INVENTORY_VIEWS, type PluginInventoryModelView, type PluginInventoryRow } from "./plugin-inventory-model.js";
 import { parseQualifiedPluginId } from "../util/plugin-id.js";
 import { formatPluginInventoryDisplayLocation, sanitizePluginInventoryDisplayText } from "./plugin-inventory-text.js";
+import { formatPluginInventoryStructuredSource } from "./plugin-inventory-display.js";
 
 const LIST_WINDOW = 8;
 const DETAIL_WINDOW = 12;
@@ -166,7 +167,7 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
     return `scope ${safe(value.scope ?? "not available", 80)} · version ${safe(value.version ?? "not available", 100)} · validity ${value.validity} · ${value.selected ? "selected" : "not selected"} · location ${location(value.location)} · project ${location(value.projectLocation)} · problems ${problems} · diagnostics ${diagnostics}`;
   }), identity, item.installations.some((value) => value.validity === "invalid") ? "warning" : "text");
   pushDetail(lines, `Session outcome: ${safe(item.outcome?.status ?? "not resolved", 80)}`, pluginStatusColor({ kind: "plugin", key: `plugin:${item.qualifiedIdentity}`, identity: item.qualifiedIdentity, item }));
-  addDetailValues(lines, "Dependencies (declared only; not resolved)", item.dependencies.map((value) => `${qualifiedIdentity(value.targetIdentity)} · version ${safe(value.version ?? "not declared", 80)} · ${safe(value.posture, 100)} · ${provenance(value.provenance)}`), identity);
+  addDetailValues(lines, "Dependencies (declared only; not resolved)", item.dependencies.map((value) => `${qualifiedIdentity(value.targetIdentity)} · origin ${value.origin} · version ${safe(value.version ?? "not declared", 80)} · qualification ${safe(value.crossMarketplace, 80)} · ${safe(value.posture, 100)} · ${provenance(value.provenance)}`), identity);
   addDetailValues(lines, "Renames (declared only; not applied)", item.renames.map((value) => `${safe(value.from, 100)} → ${safe(value.target ?? "removed", 100)} · ${safe(value.status, 80)} · ${provenance(value.provenance)}`), identity);
   addDetailValues(lines, "Components", item.components.map((value) => `${safe(value.origin, 50)}/${safe(value.kind, 50)} · count ${value.count} ${safe(value.countSemantics, 80)} · support ${safe(value.supportTier, 50)} · risk ${safe(value.executionRisk, 60)} · ${provenance(value.provenance)}`), identity, support.limited ? "warning" : "text");
   pushDetail(lines, `PiCC support: ${support.text}`, support.limited ? "warning" : "text");
@@ -178,7 +179,7 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
   ], identity, "warning");
   addDetailValues(lines, "Diagnostics with provenance", item.diagnostics.map((value) => `${safe(value.severity, 30)} · category ${safe(value.category ?? "uncategorized", 80)} · source ${safe(value.sourceClass ?? "unknown", 80)} · impact ${safe(value.impact ?? "not stated", 100)} · ${safe(value.message)}`), identity,
     item.diagnostics.some((value) => value.severity === "error") ? "error" : item.diagnostics.length ? "warning" : "text");
-  addDetailValues(lines, "Catalog declarations with provenance", item.catalogDeclarations.map((value) => `description ${safe(value.description ?? "not declared")} · version ${safe(value.version ?? "not declared", 80)} · revision ${safe(value.revision ?? "not declared", 80)} · ${provenance(value.provenance)} · ${safe(value.runtimeEffect, 80)}`), identity);
+  addDetailValues(lines, "Catalog declarations with provenance", item.catalogDeclarations.map((value) => `source ${formatPluginInventoryStructuredSource(value.source)} · description ${safe(value.description ?? "not declared")} · version ${safe(value.version ?? "not declared", 80)} · revision ${safe(value.revision ?? "not declared", 80)} · ${provenance(value.provenance)} · ${safe(value.runtimeEffect, 80)}`), identity);
   return lines;
 }
 function marketplaceDetail(view: PluginInventoryModelView): DetailLine[] {
@@ -191,7 +192,7 @@ function marketplaceDetail(view: PluginInventoryModelView): DetailLine[] {
     { text: `Scope/origin: ${safe(value.scope, 100)} · ${safe(value.origin, 100)}`, color: "text" },
     { text: `Fixture contract: ${safe(value.fixtureContract ?? "not declared", 80)}`, color: "text" },
     { text: `Anchored catalog location: ${location(value.catalog)}`, color: "text" },
-    { text: `Source fields: ${Object.entries(value.source).sort(([a], [b]) => a.localeCompare(b)).map(([key, field]) => `${safe(key, 60)}=${safe(field)}`).join(", ") || "none"}`, color: "text" },
+    { text: `Source fields: ${formatPluginInventoryStructuredSource(value.source)}`, color: "text" },
     { text: `Source provenance: ${provenance(value.sourceProvenance)}`, color: "text" },
     { text: `Registration provenance: ${provenance(value.provenance)}`, color: "text" },
     { text: "Local registration/catalog evidence only; no network refresh, download, install, update, enable, disable, or removal is available here.", color: "muted" },
@@ -231,7 +232,10 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   const width = Number.isFinite(options.width) ? Math.max(0, Math.floor(options.width)) : 0;
   if (width === 0) return { lines: [""], maxDetailScroll: 0, selectedVisible: false };
   const lines: string[] = [];
-  if (width < 8) addWrapped(lines, options.theme, "warning", "Width unusable; resize. Esc closes.", width);
+  if (width < 8) {
+    for (const value of ["PiCC plugin inventory", "read-only session snapshot", "width unusable", "resize wider", "Esc closes"]) addWrapped(lines, options.theme, "warning", value, width);
+    return { lines: clampLines(lines, width), maxDetailScroll: 0, selectedVisible: false };
+  }
   framing(view, options.theme, width, lines);
   tabs(view, options.theme, width, lines);
   let maxDetailScroll = 0;

@@ -58,6 +58,13 @@ function catalog(plugins: unknown[], extra: Record<string, unknown> = {}): Recor
   return { name: "official-marketplace", owner: { name: "Example" }, plugins, ...extra };
 }
 
+function channelWithOption(option: unknown, key = "token"): Record<string, unknown> {
+  return {
+    mcpServers: { events: {} },
+    channels: [{ server: "events", userConfig: { [key]: option } }],
+  };
+}
+
 function gitStructure(root: string): void {
   for (const directory of ["objects", "refs"]) fs.mkdirSync(path.join(root, ".git", directory), { recursive: true });
   fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -108,7 +115,7 @@ describe("loadPluginMarketplaceState", () => {
     });
     expect(result.catalogs[0]?.metadata).toMatchObject({ pluginRoot: "./runtime", provenance: { field: "metadata.pluginRoot" }, posture: "inert-lexical-effect-only" });
     expect(result.dependencies).toContainEqual(expect.objectContaining({
-      targetIdentity: "shared-plugin@partner-marketplace",
+      targetIdentity: "core-plugin@official-marketplace",
       posture: "declared-locally-observable-not-resolved",
     }));
     expect(result.renames).toContainEqual(expect.objectContaining({
@@ -412,29 +419,101 @@ describe("loadPluginMarketplaceState", () => {
     const root = temporaryRoot();
     const userDir = writeMarketplaceState(root, catalog([
       { name: "safe-plugin", source: "./safe", commands: "./one.md", skills: ["./a", "./b"], agents: ["ok", 4], dependencies: [
-        "same", { name: "allowed", marketplace: "partner", version: "^1" }, { name: "blocked", marketplace: "other" },
-        { name: "bad-market", marketplace: 4 }, { name: "bad-version", version: 4 },
-      ] },
+        "same", { name: "versioned", version: "^1" }, { name: "allowed-cross", marketplace: "partner" }, { name: "blocked-cross", marketplace: "blocked" },
+        "invented@grammar", { name: "bad-version", version: 4 },
+      ], mcpServers: { "safe-server": { command: "SECRET-MCP-COMMAND" } }, workflows: Array.from({ length: 65 }, (_, index) => `./workflows/${index}.json`), outputStyles: "./styles/output.md", themes: ["./themes/legacy.json", 7], monitors: ["./monitors/path.json", { name: "inline", command: "SECRET-MONITOR-COMMAND", description: "safe shape" }, { name: "missing", command: "SECRET" }], channels: [{ server: "safe-server", userConfig: { token: { type: "string", title: "Token", description: "Authentication token", sensitive: true, default: "SECRET-TOKEN" } } }, { server: "missing-server" }, { server: "safe-server", userConfig: "INVALID-SIBLING" }],
+      experimental: { themes: "./themes/current.json", monitors: [{ name: "current", command: "SECRET-EXPERIMENTAL", description: "safe shape" }, 7], malformedSibling: "ignored" } },
+      { name: "malformed-unsupported", source: "./malformed", workflows: 7, outputStyles: {}, channels: "invalid", experimental: { themes: {}, monitors: [] } },
       { name: "safe-plugin", source: "./duplicate" }, { name: "missing-source" }, { name: "sibling-plugin", source: "./sibling" },
     ], { allowCrossMarketplaceDependenciesOn: ["partner", 4] }));
     const result = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [] });
     const safe = result.entries.find((entry) => entry.name === "safe-plugin")!;
-    expect(Object.fromEntries(Object.entries(safe.components).map(([field, declarations]) => [field, declarations.map((item) => item.kind === "path" ? item.value : undefined)]))).toEqual({ commands: ["./one.md"], skills: ["./a", "./b"] });
+    expect(Object.fromEntries(Object.entries(safe.components).map(([field, declarations]) => [field, declarations.map((item) => item.kind === "path" ? item.value : undefined)]))).toEqual({ commands: ["./one.md"], skills: ["./a", "./b"], mcpServers: [undefined] });
     expect(safe.components.skills?.map((item) => item.provenance)).toEqual([
       expect.objectContaining({ field: "skills", entryIndex: 0, itemIndex: 0 }), expect.objectContaining({ field: "skills", entryIndex: 0, itemIndex: 1 }),
     ]);
     expect(safe.dependencies.map((dependency) => [dependency.targetIdentity, dependency.crossMarketplace])).toEqual([
-      ["same@official-marketplace", "same-marketplace"], ["allowed@partner", "declared-allowed"], ["blocked@other", "declared-not-allowed"],
+      ["same@official-marketplace", "same-marketplace"], ["versioned@official-marketplace", "same-marketplace"], ["allowed-cross@partner", "declared-allowed"], ["blocked-cross@blocked", "declared-not-allowed"],
     ]);
     expect(safe.dependencies.every((dependency) => dependency.declaringIdentity === safe.identity && dependency.provenance.field === "dependencies" && dependency.provenance.itemIndex !== undefined)).toBe(true);
     expect(safe.dependencies.find((dependency) => dependency.version)?.versionStatus).toBe("syntax-unverified-not-resolved");
-    expect(result.entries.map((entry) => entry.name)).toEqual(["safe-plugin", "sibling-plugin"]);
+    const unsupported = safe.unsupportedComponents!;
+    expect(unsupported.map((item) => [item.field, item.count])).toEqual([
+      ["workflows", 64], ["outputStyles", 1], ["themes", 1], ["monitors", 2], ["channels", 1], ["experimental.themes", 1], ["experimental.monitors", 1],
+    ]);
+    expect(result.omissions.components).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(unsupported)).not.toMatch(/SECRET-|command/u);
+    expect(result.entries.find((entry) => entry.name === "malformed-unsupported")!.unsupportedComponents).toEqual([
+      expect.objectContaining({ field: "experimental.monitors" }),
+    ]);
+    expect(result.entries.map((entry) => entry.name)).toEqual(["malformed-unsupported", "safe-plugin", "sibling-plugin"]);
     expect(result.diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ message: expect.stringContaining("agents declaration") }),
       expect.objectContaining({ message: expect.stringContaining("malformed dependency") }),
       expect.objectContaining({ message: expect.stringContaining("allowlist contains") }),
       expect.objectContaining({ message: expect.stringContaining("duplicate conflict for safe-plugin@official-marketplace") }),
     ]));
+  });
+
+  it.each([
+    ["valid workflows", { workflows: "./workflow.json" }, "workflows", 1, false],
+    ["malformed workflows", { workflows: {} }, "workflows", 0, false],
+    ["valid output styles", { outputStyles: ["./style.md"] }, "outputStyles", 1, false],
+    ["malformed output styles", { outputStyles: 7 }, "outputStyles", 0, false],
+    ["valid top-level themes", { themes: "./theme.json" }, "themes", 1, false],
+    ["malformed top-level themes", { themes: {} }, "themes", 0, false],
+    ["valid path monitor", { monitors: "./monitor.json" }, "monitors", 1, false],
+    ["valid inline monitor without when", { monitors: [{ name: "watch", command: "SECRET", description: "Watch" }] }, "monitors", 1, false],
+    ["valid inline monitor always", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "always" }] }, "monitors", 1, false],
+    ["valid inline monitor skill invoke", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:build" }] }, "monitors", 1, false],
+    ["malformed monitor", { monitors: [{ name: "watch", command: "SECRET" }] }, "monitors", 0, true],
+    ["invalid monitor when", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "sometimes" }] }, "monitors", 0, true],
+    ["unknown monitor field", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", extra: true }] }, "monitors", 0, true],
+    ["valid channel display name and closed userConfig", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: "Events", userConfig: {
+      text: { type: "string", title: "Text", description: "Text", default: "SECRET" },
+      list: { type: "string", title: "List", description: "List", multiple: true, default: ["SECRET"] },
+      retries: { type: "number", title: "Retries", description: "Retries", required: true, min: 0, max: 5, default: 2 },
+      enabled: { type: "boolean", title: "Enabled", description: "Enabled", sensitive: false, default: true },
+      folder: { type: "directory", title: "Folder", description: "Folder", default: "C:/SECRET" },
+      configFile: { type: "file", title: "File", description: "File", default: "/SECRET" },
+    } }] }, "channels", 1, false],
+    ["malformed channel display name", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: 7 }] }, "channels", 0, true],
+    ["unknown channel field", { mcpServers: { events: {} }, channels: [{ server: "events", extra: true }] }, "channels", 0, true],
+    ["missing channel server declaration", { channels: [{ server: "events" }] }, "channels", 0, true],
+    ["non-object userConfig option", channelWithOption("invalid"), "channels", 0, true],
+    ["required wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", required: "yes" }), "channels", 0, true],
+    ["sensitive wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", sensitive: 1 }), "channels", 0, true],
+    ["multiple wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: "yes" }), "channels", 0, true],
+    ["multiple on non-string option", channelWithOption({ type: "number", title: "Token", description: "Token", multiple: true }), "channels", 0, true],
+    ["min wrong value type", channelWithOption({ type: "number", title: "Token", description: "Token", min: "zero" }), "channels", 0, true],
+    ["min on wrong option type", channelWithOption({ type: "string", title: "Token", description: "Token", min: 0 }), "channels", 0, true],
+    ["max wrong value type", channelWithOption({ type: "number", title: "Token", description: "Token", max: "five" }), "channels", 0, true],
+    ["max on wrong option type", channelWithOption({ type: "string", title: "Token", description: "Token", max: 5 }), "channels", 0, true],
+    ["incompatible scalar default", channelWithOption({ type: "number", title: "Token", description: "Token", default: "SECRET" }), "channels", 0, true],
+    ["dollar userConfig key", channelWithOption({ type: "string", title: "Token", description: "Token" }, "$token"), "channels", 0, true],
+    ["non-identifier userConfig key", channelWithOption({ type: "string", title: "Token", description: "Token" }, "not-valid"), "channels", 0, true],
+    ["unknown userConfig option field", channelWithOption({ type: "string", title: "Token", description: "Token", extra: true }), "channels", 0, true],
+    ["string array without multiple", channelWithOption({ type: "string", title: "Token", description: "Token", default: ["SECRET"] }), "channels", 0, true],
+    ["non-string array default", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: true, default: [7] }), "channels", 0, true],
+    ["valid experimental themes", { experimental: { themes: ["./theme.json"] } }, "experimental.themes", 1, false],
+    ["malformed experimental themes", { experimental: { themes: {} } }, "experimental.themes", 0, false],
+    ["valid experimental monitors", { experimental: { monitors: "./monitor.json" } }, "experimental.monitors", 1, false],
+    ["malformed experimental monitors", { experimental: { monitors: 7 } }, "experimental.monitors", 0, false],
+    ["valid sibling beside malformed monitor", { monitors: ["./good.json", { name: "broken", command: "SECRET" }] }, "monitors", 1, true],
+  ] as const)("observes catalog %s independently", (_label, declaration, field, count, malformedItem) => {
+    const root = temporaryRoot();
+    const userDir = writeMarketplaceState(root, catalog([{ name: "observed", source: "./observed", ...declaration }]));
+    const result = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [] });
+    expect(result.entries[0]!.unsupportedComponents!.filter((component) => component.field === field)).toEqual(
+      count === 0 ? [] : [expect.objectContaining({ field, count })],
+    );
+    const expectedDiagnostics = count > 0 && _label !== "valid sibling beside malformed monitor" ? [] : [{
+      severity: "warning",
+      message: `Catalog plugin ${field} declaration${malformedItem ? " item" : ""} has the wrong or unsafe shape; ignored`,
+      source: expect.any(String),
+    }];
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.message.startsWith(`Catalog plugin ${field} declaration`))).toEqual(expectedDiagnostics);
+    expect(JSON.stringify(result.entries[0]!.unsupportedComponents)).not.toMatch(/SECRET|watch|events|Events|Token|C:\/|\/SECRET/u);
   });
 
   it("classifies rename current, removal, chain, cycle, dangling, and malformed siblings", () => {
@@ -660,13 +739,13 @@ describe("loadPluginMarketplaceState", () => {
   it("uses bounded semantic indexes across display caps without affirmative false negatives", () => {
     const root = temporaryRoot();
     const allowlist = Array.from({ length: 257 }, (_, index) => `market-${index}`);
-    const plugins = Array.from({ length: 1025 }, (_, index) => ({ name: `plugin-${String(index).padStart(4, "0")}`, source: `./plugin-${index}`, ...(index === 0 ? { dependencies: [{ name: "target", marketplace: "market-256" }] } : {}) }));
+    const plugins = Array.from({ length: 1025 }, (_, index) => ({ name: `plugin-${String(index).padStart(4, "0")}`, source: `./plugin-${index}`, ...(index === 0 ? { dependencies: [{ name: "target", version: "1" }] } : {}) }));
     const renames: Record<string, string> = Object.create(null);
     for (let index = 0; index < 513; index++) renames[`chain-${String(index).padStart(4, "0")}`] = index === 512 ? "plugin-1024" : `chain-${String(index + 1).padStart(4, "0")}`;
     renames["aaa-entry-target"] = "plugin-1024";
     const userDir = writeMarketplaceState(root, catalog(plugins, { allowCrossMarketplaceDependenciesOn: allowlist, renames }));
     const result = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [] });
-    expect(result.dependencies[0]?.crossMarketplace).toBe("declared-allowed");
+    expect(result.dependencies[0]?.crossMarketplace).toBe("same-marketplace");
     expect(result.renames.find((item) => item.from === "aaa-entry-target")?.status).toBe("current");
     expect(result.renames.find((item) => item.from === "chain-0000")?.status).toBe("current");
 
@@ -680,9 +759,9 @@ describe("loadPluginMarketplaceState", () => {
     const root = temporaryRoot();
     const allowlist = Array.from({ length: 2049 }, (_, index) => `market-${index}`);
     const longChain = Object.fromEntries(Array.from({ length: 2049 }, (_, index) => [`chain-${String(index).padStart(4, "0")}`, index === 2048 ? "source" : `chain-${String(index + 1).padStart(4, "0")}`]));
-    const userDir = writeMarketplaceState(root, catalog([{ name: "source", source: "./source", dependencies: [{ name: "target", marketplace: "not-indexed" }] }], { allowCrossMarketplaceDependenciesOn: allowlist, renames: longChain }));
+    const userDir = writeMarketplaceState(root, catalog([{ name: "source", source: "./source", dependencies: [{ name: "target", version: "1" }] }], { allowCrossMarketplaceDependenciesOn: allowlist, renames: longChain }));
     const result = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [] });
-    expect(result.dependencies[0]?.crossMarketplace).toBe("indeterminate-because-evidence-omitted");
+    expect(result.dependencies[0]?.crossMarketplace).toBe("same-marketplace");
     expect(result.renames.find((item) => item.from === "chain-0000")?.status).toBe("indeterminate-because-evidence-omitted");
 
     const extras = Object.fromEntries(Array.from({ length: 2049 }, (_, index) => [`semantic-${index}`, { source: "github", repo: `example/semantic-${index}` }]));
@@ -698,7 +777,7 @@ describe("loadPluginMarketplaceState", () => {
     fs.writeFileSync(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify(Object.fromEntries(names.map((marketName) => [marketName, { source: { source: "github", repo: `example/${marketName}` } }]))));
     for (const marketName of names) {
       const plugins = Array.from({ length: 600 }, (_, index) => ({
-        name: `plugin-${index}`, source: `./plugin-${index}`, commands: [`./command-${index}-a`, `./command-${index}-b`], dependencies: [`dependency-${index}-a`, `dependency-${index}-b`],
+        name: `plugin-${index}`, source: `./plugin-${index}`, commands: [`./command-${index}`], workflows: "./observed-workflow", dependencies: [`dependency-${index}-a`, `dependency-${index}-b`],
         metadata: { pluginRoot: `./plugin-${index}` }, userConfig: { key: "secret-value-never-retained" },
       }));
       const body = { name: marketName, owner: { name: "Owner" }, plugins, allowCrossMarketplaceDependenciesOn: Array.from({ length: 150 }, (_, index) => `allow-${index}`), renames: Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`old-${index}`, `plugin-${index}`])) };
@@ -711,7 +790,11 @@ describe("loadPluginMarketplaceState", () => {
     expect(result.dependencies).toHaveLength(1024);
     expect(result.allowlists).toHaveLength(256);
     expect(result.renames).toHaveLength(512);
-    expect(result.entries.flatMap((entry) => Object.values(entry.components)).flat()).toHaveLength(1024);
+    const supportedCount = result.entries.flatMap((entry) => Object.values(entry.components)).flat().length;
+    const unsupportedCount = result.entries.flatMap((entry) => entry.unsupportedComponents ?? []).length;
+    expect(supportedCount + unsupportedCount).toBe(1024);
+    expect(supportedCount).toBeGreaterThan(0);
+    expect(unsupportedCount).toBeGreaterThan(0);
     for (const key of ["entries", "components", "dependencies", "renames", "allowlists", "userConfig"] as const) expect(result.omissions[key]).toBeGreaterThan(0);
     expect(JSON.stringify(result)).not.toContain("secret-value-never-retained");
   });

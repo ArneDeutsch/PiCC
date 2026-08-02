@@ -331,8 +331,16 @@ require("node:module").syncBuiltinESMExports();
           ? "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.\n"
           : "",
       });
-      expect(list.stdout).toContain("Snapshot: captured for this command");
-      expect(list.stdout).toContain("Plugin: hostile@market");
+      expect(list.stdout).toBe([
+        "Plugin inventory (read-only)",
+        "Snapshot: captured for this command; rerun this command to refresh",
+        "Plugin: hostile@market",
+        "  installed: 1 valid",
+        "  enabled: yes",
+        "  runtime: loaded",
+        "  catalog: not known",
+        "",
+      ].join("\n"));
 
       const details = await run(["details", "hostile@market"]);
       expect(details).toMatchObject({
