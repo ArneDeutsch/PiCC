@@ -24,8 +24,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Verify source
-        run: npm run typecheck:all && npm run test:source
+      - name: Verify build-free source lanes
+        run: npm run typecheck:all && npm run test:unit && npm run test:integration
       - name: Capture release context
         id: context
         shell: bash
@@ -37,28 +37,30 @@ jobs:
             echo "event=manual" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
           fi
-      - name: Verify source identity
-        shell: bash
-        run: |
-          args=(source --event "${{ steps.context.outputs.event }}")
-          if [[ "${{ steps.context.outputs.event }}" == "tag" ]]; then
-            args+=(--tag "${{ steps.context.outputs.tag }}")
-          fi
-          node scripts/verify-release.mjs "${args[@]}"
-      - name: Pack once
+      - name: Build verified runtime and pack once
         id: pack
         shell: bash
+        env:
+          RELEASE_EVENT: ${{ steps.context.outputs.event }}
+          RELEASE_TAG: ${{ steps.context.outputs.tag }}
         run: |
           output_dir="$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID"
           mkdir "$output_dir"
-          result="$(node scripts/pack-release.mjs --output-dir "$output_dir")"
+          args=(--output-dir "$output_dir" --event "$RELEASE_EVENT")
+          if [[ "$RELEASE_EVENT" == "tag" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          result="$(node scripts/pack-release.mjs "${args[@]}")"
           node -e 'const p=require("node:path");const v=JSON.parse(process.argv[1]);for(const k of ["tarball","sha256","version"]){if(typeof v[k]!=="string")process.exit(1);console.log(k+"="+v[k])}console.log("filename="+p.basename(v.tarball))' "$result" >> "$GITHUB_OUTPUT"
-      - name: Verify packed artifact
+      - name: Inspect and hash exact packed artifact
         shell: bash
+        env:
+          RELEASE_EVENT: ${{ steps.context.outputs.event }}
+          RELEASE_TAG: ${{ steps.context.outputs.tag }}
         run: |
-          args=(artifact --event "${{ steps.context.outputs.event }}" --tarball "${{ steps.pack.outputs.tarball }}" --expected-sha256 "${{ steps.pack.outputs.sha256 }}")
-          if [[ "${{ steps.context.outputs.event }}" == "tag" ]]; then
-            args+=(--tag "${{ steps.context.outputs.tag }}")
+          args=(artifact --event "$RELEASE_EVENT" --tarball "${{ steps.pack.outputs.tarball }}" --expected-sha256 "${{ steps.pack.outputs.sha256 }}")
+          if [[ "$RELEASE_EVENT" == "tag" ]]; then
+            args+=(--tag "$RELEASE_TAG")
           fi
           node scripts/verify-release.mjs "${args[@]}"
       - name: Test exact packaged product

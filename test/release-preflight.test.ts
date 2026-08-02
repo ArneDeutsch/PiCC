@@ -8,7 +8,13 @@ import YAML from "yaml";
 import { afterEach, describe, expect, it } from "vitest";
 import { packRelease } from "../scripts/pack-release.mjs";
 import { publishRelease } from "../scripts/publish-release.mjs";
-import { verifyArtifactIdentity, verifyRelease } from "../scripts/verify-release.mjs";
+import {
+  RELEASE_FILE_POLICY,
+  RELEASE_STATIC_FILES,
+  verifyArtifactIdentity,
+  verifyRelease,
+  verifyReleaseAdmission,
+} from "../scripts/verify-release.mjs";
 
 const PI = [
   "@earendil-works/pi-agent-core",
@@ -27,7 +33,7 @@ function canonical(file: string) {
 function fixture() {
   const root = temp("picc-release-source-");
   const dependencies = Object.fromEntries(PI.map((name) => [name, "0.82.0"]));
-  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "picc", version: "1.2.3", dependencies }));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "picc", version: "1.2.3", type: "module", dependencies }));
   for (const name of PI) {
     const dir = path.join(root, "node_modules", ...name.split("/"));
     fs.mkdirSync(dir, { recursive: true });
@@ -53,20 +59,59 @@ afterEach(() => {
 describe("release identity", () => {
   it("checks source version, tag, exact Pi pins, and artifact hash", () => {
     const root = fixture();
-    expect(verifyRelease({ mode: "source", event: "tag", tag: "v1.2.3", packageRoot: root }))
+    const runtimeVerifier = () => ({ ok: true, manifest: { sourceDigest: "a".repeat(64) } });
+    expect(verifyRelease({ mode: "source", event: "tag", tag: "v1.2.3", packageRoot: root, runtimeVerifier }))
       .toMatchObject({ version: "1.2.3", suiteVersion: "0.82.0" });
-    expect(() => verifyRelease({ mode: "source", event: "tag", tag: "v9.9.9", packageRoot: root })).toThrow(/tag/);
+    expect(() => verifyRelease({ mode: "source", event: "tag", tag: "v9.9.9", packageRoot: root, runtimeVerifier })).toThrow(/tag/);
     const manifestFile = path.join(root, "package.json");
     const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
     manifest.dependencies[PI[0]!] = "0.83.0";
     fs.writeFileSync(manifestFile, JSON.stringify(manifest));
-    expect(() => verifyRelease({ mode: "source", event: "manual", packageRoot: root })).toThrow(/one exact Pi suite/);
+    expect(() => verifyRelease({ mode: "source", event: "manual", packageRoot: root, runtimeVerifier })).toThrow(/one exact Pi suite/);
+    manifest.dependencies[PI[0]!] = "0.82.0";
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest));
     const tarball = path.join(temp("picc-release-artifact-"), "picc.tgz");
     fs.writeFileSync(tarball, "release bytes");
     const sha = createHash("sha256").update("release bytes").digest("hex");
     expect(verifyArtifactIdentity({ tarball, expectedSha256: sha }).sha256).toBe(sha);
+    let inspected: any;
+    expect(verifyRelease({
+      mode: "artifact",
+      event: "manual",
+      packageRoot: root,
+      tarball,
+      expectedSha256: sha,
+      inspectArtifact: true,
+      sourceIdentityCollector: () => ({ sourceDigest: "c".repeat(64) }),
+      artifactVerifier: (options: any) => { inspected = options; },
+    })).toMatchObject({ sha256: sha });
+    expect(inspected).toMatchObject({
+      expectedPackage: { name: "picc", version: "1.2.3", type: "module" },
+      expectedSourceDigest: "c".repeat(64),
+    });
+    expect(inspected.archiveBytes.toString("utf8")).toBe("release bytes");
+    expect(inspected.filePolicy.files).toContain("picc/index.js");
+    expect(inspected.filePolicy.prefixes).toContain("dist/");
+
     fs.appendFileSync(tarball, "changed");
     expect(() => verifyArtifactIdentity({ tarball, expectedSha256: sha })).toThrow(/SHA-256/);
+  });
+});
+
+describe("release file policy", () => {
+  it("makes the sorted static inventory exact while leaving only schema-owned trees dynamic", () => {
+    expect(RELEASE_FILE_POLICY.files).toBe(RELEASE_STATIC_FILES);
+    expect(RELEASE_STATIC_FILES).toEqual([...RELEASE_STATIC_FILES].sort((left, right) =>
+      Buffer.compare(Buffer.from(left), Buffer.from(right))));
+    expect(RELEASE_FILE_POLICY.prefixes).toEqual(["dist/", "src/"]);
+    for (const required of ["bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.js"]) {
+      expect(RELEASE_STATIC_FILES).toContain(required);
+      expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => required.startsWith(prefix))).toBe(false);
+    }
+    for (const unexpected of ["bin/nested/tool.mjs", "doc/nested/extra.md", "examples/hello-claude/nested/extra.txt", "picc/nested/index.js"]) {
+      expect(RELEASE_STATIC_FILES).not.toContain(unexpected);
+      expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => unexpected.startsWith(prefix))).toBe(false);
+    }
   });
 });
 
@@ -76,10 +121,24 @@ describe("pack release", () => {
     const output = temp("picc-release-output-");
     const filename = "picc-1.2.3.tgz";
     let call: any;
+    const operations: string[] = [];
+    const runtimeManifest = { sourceDigest: "a".repeat(64), runtimeDigest: "b".repeat(64) };
     const result = await (packRelease as any)({
       packageRoot: root,
       outputDir: output,
+      event: "manual",
+      admissionVerifier: (options: any) => {
+        operations.push("admit");
+        return verifyReleaseAdmission(options);
+      },
+      build: () => { operations.push("build"); },
+      runtimeVerifier: () => { operations.push("verify-runtime"); return { ok: true, manifest: runtimeManifest }; },
+      artifactVerifier: ({ archiveBytes }: { archiveBytes: Buffer }) => {
+        operations.push("inspect-artifact");
+        expect(archiveBytes.toString("utf8")).toBe("packed once");
+      },
       runNpm: ((args: string[], options: any) => {
+        operations.push("pack");
         call = { args, options };
         return childResult({
           stdout: JSON.stringify([{ name: "picc", version: "1.2.3", filename }]),
@@ -87,6 +146,7 @@ describe("pack release", () => {
         });
       }) as never,
     });
+    expect(operations).toEqual(["admit", "build", "verify-runtime", "pack", "inspect-artifact"]);
     expect(call.args).toEqual([
       "pack", canonical(root), "--json", "--ignore-scripts",
       `--pack-destination=${canonical(output)}`,
@@ -103,10 +163,34 @@ describe("pack release", () => {
     await expect((packRelease as any)({
       packageRoot: otherRoot,
       outputDir: otherOutput,
+      event: "manual",
+      build: () => undefined,
+      runtimeVerifier: () => ({ ok: true, manifest: runtimeManifest }),
+      artifactVerifier: () => undefined,
       runNpm: (() => childResult({
         stdout: JSON.stringify([{ name: "other", version: "1.2.3", filename }]),
       })) as never,
     })).rejects.toThrow(/matching picc artifact/);
+  });
+
+  it("admits event, tag, package, and Pi identity before build or pack", async () => {
+    const root = fixture();
+    const output = temp("picc-release-output-");
+    const operations: string[] = [];
+    await expect((packRelease as any)({
+      packageRoot: root,
+      outputDir: output,
+      event: "tag",
+      tag: "v9.9.9",
+      admissionVerifier: (options: any) => {
+        operations.push("admit");
+        return verifyReleaseAdmission(options);
+      },
+      build: () => { operations.push("build"); },
+      runNpm: (() => { operations.push("pack"); return childResult(); }) as never,
+    })).rejects.toThrow(/tag/);
+    expect(operations).toEqual(["admit"]);
+    expect(fs.readdirSync(output)).toEqual([]);
   });
 });
 
@@ -204,14 +288,29 @@ describe("release workflow", () => {
     expect(manifest.scripts.preversion).toBe("npm run verify:all");
     expect(manifest.scripts.version).toBeUndefined();
     expect(manifest.scripts.prepublishOnly).toBe("npm run verify:all");
-    expect(manifest.scripts["test:e2e:source"]).toBe(
-      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    expect(manifest.scripts.build).toBe("node scripts/build-runtime.mjs");
+    expect(manifest.scripts.setup).toBe("npm ci && npm run build && npm link");
+    const packageJson = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as any;
+    expect(packageJson.files).toEqual([
+      "dist", "src", "picc/index.js", "picc/index.ts", "bin", "examples", "doc/*.md",
+      "CONTRIBUTING.md", "LICENSE", "README.md",
+    ]);
+    expect(packageJson.dependencies).not.toHaveProperty("jiti");
+    expect(packageJson.devDependencies.jiti).toBe("2.7.0");
+    const lock = JSON.parse(fs.readFileSync(path.resolve("package-lock.json"), "utf8")) as any;
+    expect(lock.packages[""].dependencies).not.toHaveProperty("jiti");
+    expect(lock.packages[""].devDependencies.jiti).toBe("2.7.0");
+    expect(manifest.scripts["test:e2e:compiled"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\" --exclude \"test/e2e-source-fallback.test.ts\"",
+    );
+    expect(manifest.scripts["test:e2e:source-fallback"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-source-fallback.test.ts",
     );
     expect(manifest.scripts["test:e2e"]).toBe(
-      "npm run test:e2e:source && npm run test:packaged",
+      "npm run test:packaged && npm run test:e2e:compiled && npm run test:e2e:source-fallback",
     );
     expect(manifest.scripts["test:source"]).toBe(
-      "npm run test:unit && npm run test:integration && npm run test:e2e:source",
+      "npm run test:unit && npm run test:integration && npm run test:e2e:source-fallback",
     );
     expect(manifest.scripts["test:packaged"]).toBe(
       "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
@@ -226,11 +325,40 @@ describe("release workflow", () => {
     const publishSteps = publishJob.steps as any[];
     const allSteps = [...packageSteps, ...publishSteps];
     const runs = allSteps.map((step) => step.run ?? "");
-    expect(packageSteps.find((step) => step.name === "Verify source")?.run)
-      .toBe("npm run typecheck:all && npm run test:source");
+    expect(packageSteps.find((step) => step.name === "Verify build-free source lanes")?.run)
+      .toBe("npm run typecheck:all && npm run test:unit && npm run test:integration");
     expect(packageSteps.find((step) => step.name === "Test exact packaged product")?.run)
       .toBe("npm run test:packaged");
     expect(runs.filter((run) => run.includes("scripts/pack-release.mjs"))).toHaveLength(1);
+    const pack = packageSteps.find((step) => step.name === "Build verified runtime and pack once");
+    const inspect = packageSteps.find((step) => step.name === "Inspect and hash exact packed artifact");
+    expect(pack).toBeDefined();
+    expect(inspect).toBeDefined();
+    for (const step of [pack, inspect]) {
+      expect(step.env).toEqual({
+        RELEASE_EVENT: "${{ steps.context.outputs.event }}",
+        RELEASE_TAG: "${{ steps.context.outputs.tag }}",
+      });
+      expect(step.run).toContain('--event "$RELEASE_EVENT"');
+      expect(step.run).toContain('[[ "$RELEASE_EVENT" == "tag" ]]');
+      expect(step.run).toContain('--tag "$RELEASE_TAG"');
+      expect(step.run).not.toContain("${{ steps.context.outputs.event }}");
+      expect(step.run).not.toContain("${{ steps.context.outputs.tag }}");
+    }
+    const hostileContext = {
+      event: 'tag"; touch "$RUNNER_TEMP/event-injected"; #',
+      tag: 'v1.2.3"; touch "$RUNNER_TEMP/tag-injected"; #',
+    };
+    const shellSource = `${pack.run}\n${inspect.run}`;
+    const expressionExpandedSource = shellSource
+      .replaceAll("${{ steps.context.outputs.event }}", hostileContext.event)
+      .replaceAll("${{ steps.context.outputs.tag }}", hostileContext.tag);
+    expect(expressionExpandedSource).toBe(shellSource);
+    expect(shellSource).not.toContain("event-injected");
+    expect(shellSource).not.toContain("tag-injected");
+    expect(packageSteps.indexOf(pack)).toBeLessThan(packageSteps.indexOf(inspect));
+    expect(runs.filter((run) => /npm run build|build-runtime\.mjs/u.test(run))).toHaveLength(0);
+    expect(publishSteps.map((step) => step.run ?? "").join("\n")).not.toMatch(/npm run build|pack-release\.mjs/u);
     expect(packageJob.outputs).toEqual({
       filename: "${{ steps.pack.outputs.filename }}",
       sha256: "${{ steps.pack.outputs.sha256 }}",

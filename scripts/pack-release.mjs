@@ -6,12 +6,24 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { canonicalPath, findPackageRoot, isPathInside, parseStableExactVersion, spawnNpm } from "../bin/picc-admin.mjs";
+import { verifyCompiledRuntime } from "../bin/picc-runtime.mjs";
+import { buildRuntime } from "./build-runtime.mjs";
+import { verifyRuntimeArtifact } from "./runtime-artifact.mjs";
+import { RELEASE_FILE_POLICY, verifyReleaseAdmission } from "./verify-release.mjs";
 
-const USAGE = "Usage: node scripts/pack-release.mjs --output-dir <empty-out-of-tree-directory>";
+const USAGE = "Usage: node scripts/pack-release.mjs --output-dir <empty-out-of-tree-directory> --event <tag|manual> [--tag vX.Y.Z]";
 
 function parseCli(argv) {
-  if (argv.length !== 2 || argv[0] !== "--output-dir") throw new Error(USAGE);
-  return { outputDir: argv[1] };
+  const values = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = argv[index];
+    const value = argv[index + 1];
+    const property = { "--output-dir": "outputDir", "--event": "event", "--tag": "tag" }[key];
+    if (!property || value === undefined || values[property] !== undefined) throw new Error(USAGE);
+    values[property] = value;
+  }
+  if (values.outputDir === undefined || values.event === undefined) throw new Error(USAGE);
+  return values;
 }
 
 function collect(child) {
@@ -41,13 +53,23 @@ function sha256(filename) {
 
 export async function packRelease({
   outputDir,
+  event,
+  tag,
   packageRoot = findPackageRoot(import.meta.url),
   runNpm = spawnNpm,
+  admissionVerifier = verifyReleaseAdmission,
+  build = buildRuntime,
+  runtimeVerifier = verifyCompiledRuntime,
+  artifactVerifier = verifyRuntimeArtifact,
 } = {}) {
   const root = canonicalPath(packageRoot);
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-  if (manifest?.name !== "picc" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
+  const admission = admissionVerifier({ packageRoot: root, event, tag });
+  const manifest = admission.manifest;
+  if (manifest?.name !== "picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
   const destination = emptyOutputDirectory(outputDir, root);
+  build({ packageRoot: root });
+  const runtime = runtimeVerifier({ packageRoot: root, checkSource: true });
+  if (!runtime.ok) throw new Error(`Built runtime verification failed (${runtime.category})`);
   const child = runNpm([
     "pack", root, "--json", "--ignore-scripts", `--pack-destination=${destination}`,
   ], { cwd: root, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -64,7 +86,20 @@ export async function packRelease({
   const tarball = canonicalPath(path.join(destination, record.filename));
   if (!isPathInside(tarball, destination) || !fs.statSync(tarball).isFile()) throw new Error("npm pack artifact escaped its destination");
   if (fs.readdirSync(destination).filter((entry) => entry.endsWith(".tgz")).length !== 1) throw new Error("npm pack produced an ambiguous artifact set");
-  return { name: "picc", version: manifest.version, tarball, sha256: sha256(tarball) };
+  artifactVerifier({
+    archiveBytes: fs.readFileSync(tarball),
+    expectedPackage: { name: manifest.name, version: manifest.version, type: manifest.type },
+    expectedSourceDigest: runtime.manifest.sourceDigest,
+    filePolicy: RELEASE_FILE_POLICY,
+  });
+  return {
+    name: "picc",
+    version: manifest.version,
+    tarball,
+    sha256: sha256(tarball),
+    sourceDigest: runtime.manifest.sourceDigest,
+    runtimeDigest: runtime.manifest.runtimeDigest,
+  };
 }
 
 export async function runPackReleaseCli(argv = process.argv.slice(2), output = console) {

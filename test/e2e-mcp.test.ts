@@ -49,7 +49,7 @@ import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from 
  * deliberately not duplicated here.
  */
 
-const { startPi, runPi, cleanup } = createE2ELive();
+const { startPi, runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 /** Fixture-server entry for a `.mcp.json` / settings `mcpServers` map. */

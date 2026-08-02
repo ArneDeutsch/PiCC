@@ -29,7 +29,7 @@ import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const realPiCli = resolveRealPiCli({ repoRoot: REPO_ROOT });
 export const CLI_PATH = realPiCli.cliPath;
-export const EXTENSION_PATH = path.join(REPO_ROOT, "src", "index.ts");
+export const COMPILED_EXTENSION_PATH = path.join(REPO_ROOT, "picc", "index.js");
 export const cliMissing = realPiCli.missing;
 export const RUN_TIMEOUT_MS = 90_000;
 export const TEST_TIMEOUT_MS = 120_000;
@@ -108,7 +108,7 @@ export interface RunPiOptions {
   piSettings?: Record<string, unknown>;
   /** CLI mode arguments replacing print `-p <prompt>` (RPC/JSON contract tests). */
   modeArgs?: string[];
-  /** Run an installed PiCC launcher instead of the source Pi CLI + explicit extension. */
+  /** Required for source-fallback and installed-launcher selection; forbidden for compiled selection. */
   launcherPath?: string;
 }
 
@@ -129,6 +129,8 @@ export interface StartedPi {
   completion: Promise<RunResult>;
   stop(): Promise<void>;
 }
+
+export type E2ERuntime = "compiled" | "source-fallback" | "installed-launcher";
 
 export interface E2ELive {
   startPi: (opts: RunPiOptions) => Promise<StartedPi>;
@@ -195,7 +197,18 @@ export async function stopProcessTree(
  * at module scope and wires `afterEach(cleanup)`, so per-run temp dirs and
  * fixtures never leak across files.
  */
-export function createE2ELive(): E2ELive {
+export function createE2ELive({
+  runtime,
+  sourceWitnessWatchdogMs,
+}: {
+  runtime: E2ERuntime;
+  sourceWitnessWatchdogMs?: number;
+}): E2ELive {
+  if (sourceWitnessWatchdogMs !== undefined && (runtime !== "source-fallback"
+    || !Number.isSafeInteger(sourceWitnessWatchdogMs) || sourceWitnessWatchdogMs <= RUN_TIMEOUT_MS)) {
+    throw new Error("sourceWitnessWatchdogMs must be an integer above the broad ceiling and is reserved for source-fallback");
+  }
+  const processWatchdogMs = sourceWitnessWatchdogMs ?? RUN_TIMEOUT_MS;
   const tempDirs: string[] = [];
   const fixtures: string[] = [];
   const retainedTempDirs = new Set<string>();
@@ -345,12 +358,18 @@ export function createE2ELive(): E2ELive {
       return stopOperation;
     };
     try {
+      if (runtime === "compiled" && opts.launcherPath !== undefined) {
+        throw new Error("The compiled E2E runtime selects the verified wrapper directly; launcherPath is forbidden");
+      }
+      if (runtime !== "compiled" && opts.launcherPath === undefined) {
+        throw new Error(`${runtime} E2E runtime requires launcherPath`);
+      }
       child = spawn(
         process.execPath,
         [
-          ...(opts.launcherPath
-            ? [opts.launcherPath]
-            : [CLI_PATH, "-e", EXTENSION_PATH]),
+          ...(runtime === "compiled"
+            ? [CLI_PATH, "-e", COMPILED_EXTENSION_PATH]
+            : [opts.launcherPath!]),
           ...(opts.persistSession ? [] : ["--no-session"]),
           ...(opts.modeArgs ?? ["-p", opts.prompt]),
         ],
@@ -397,7 +416,7 @@ export function createE2ELive(): E2ELive {
       });
       killTimer = setTimeout(() => {
         void stop().catch(() => undefined);
-      }, RUN_TIMEOUT_MS);
+      }, processWatchdogMs);
       const completion = (async (): Promise<RunResult> => {
         try {
           const code = await closed;

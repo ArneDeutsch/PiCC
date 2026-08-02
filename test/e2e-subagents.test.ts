@@ -26,7 +26,7 @@ import { RECORD_EXPAND_HINT, RECORD_FORK_MARKER } from "../src/runtime/subagent-
  * failure, and on-disk transcript persistence. See test/helpers/e2e-live.ts.
  */
 
-const { runPi, cleanup } = createE2ELive();
+const { runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 /** Canonicalize a path for cross-form comparison (backslashes, casing, trailing slash). */

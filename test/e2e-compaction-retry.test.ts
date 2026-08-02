@@ -18,7 +18,7 @@ import {
 } from "./helpers/e2e-live.js";
 import type { CapturedRequest, Turn } from "./helpers/mock-openai.js";
 
-const { runPi, cleanup } = createE2ELive();
+const { runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 const MAIN_RETRY_SETTINGS = {

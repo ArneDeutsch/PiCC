@@ -76,17 +76,20 @@ describe("test workflow lanes", () => {
     expect(scripts.test).toBe("vitest run --project unit");
     expect(scripts["test:unit"]).toBe("vitest run --project unit");
     expect(scripts["test:integration"]).toBe("vitest run --project integration");
-    expect(scripts["test:e2e:source"]).toBe(
-      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    expect(scripts["test:e2e:compiled"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\" --exclude \"test/e2e-source-fallback.test.ts\"",
+    );
+    expect(scripts["test:e2e:source-fallback"]).toBe(
+      "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-source-fallback.test.ts",
     );
     expect(scripts["test:packaged"]).toBe(
       "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
     );
     expect(scripts["test:e2e"]).toBe(
-      "npm run test:e2e:source && npm run test:packaged",
+      "npm run test:packaged && npm run test:e2e:compiled && npm run test:e2e:source-fallback",
     );
     expect(scripts["test:source"]).toBe(
-      "npm run test:unit && npm run test:integration && npm run test:e2e:source",
+      "npm run test:unit && npm run test:integration && npm run test:e2e:source-fallback",
     );
     expect(scripts["test:all"]).toBe(
       "npm run test:unit && npm run test:integration && npm run test:e2e",
@@ -159,10 +162,12 @@ describe("test workflow lanes", () => {
     expect(e2eJob.strategy.matrix.os).toEqual(["ubuntu-latest", "windows-latest"]);
     expect(e2eJob.steps.filter((step) => step.run?.startsWith("npm run test:")))
       .toEqual([
-        { name: "Source end-to-end tests", run: "npm run test:e2e:source" },
+        { name: "Compiled runtime end-to-end tests", run: "npm run test:e2e:compiled" },
+        { name: "Isolated source-fallback end-to-end witness", run: "npm run test:e2e:source-fallback" },
         {
-          name: "Packaged end-to-end tests",
+          name: "Scripts-disabled packaged end-to-end witness",
           env: {
+            PICC_TEST_TARBALL: "${{ steps.pack.outputs.tarball }}",
             TEMP: "${{ runner.temp }}",
             TMP: "${{ runner.temp }}",
             TMPDIR: "${{ runner.temp }}",
@@ -170,6 +175,10 @@ describe("test workflow lanes", () => {
           run: "npm run test:packaged",
         },
       ]);
+    const pack = e2eJob.steps.find((step) => step.name === "Build verified runtime and pack exact product once");
+    expect(pack?.run).toContain("scripts/pack-release.mjs");
+    expect(pack?.run).toContain("--event manual");
+    expect(e2eJob.steps.filter((step) => step.run?.includes("scripts/pack-release.mjs"))).toHaveLength(1);
     expect(e2eJob.steps.filter((step) => step.run === "npm ci")).toHaveLength(1);
     expect(e2eJob.steps.filter((step) => step.uses?.startsWith("actions/setup-node@")))
       .toEqual([expect.objectContaining({ with: { "node-version": 22, cache: "npm" } })]);
