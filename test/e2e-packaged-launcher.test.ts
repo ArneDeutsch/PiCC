@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -53,6 +54,26 @@ function temporaryDirectory(prefix: string): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   tempDirs.push(directory);
   return directory;
+}
+
+function treeSnapshot(root: string): string[] {
+  const values: string[] = [];
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const filename = path.join(directory, entry.name);
+      const relative = path.relative(root, filename).split(path.sep).join("/");
+      if (entry.isDirectory()) {
+        values.push(`${relative}/`);
+        visit(filename);
+      } else if (entry.isFile()) {
+        values.push(`${relative}:${fs.readFileSync(filename).toString("base64")}`);
+      } else {
+        values.push(`${relative}:other`);
+      }
+    }
+  };
+  visit(root);
+  return values;
 }
 
 function releaseTarball(): string {
@@ -172,7 +193,6 @@ function writeLockedConsumerProject(directory: string, release: string): void {
 }
 
 beforeAll(() => {
-  if (!BASH_AVAILABLE) return;
   tarball = releaseTarball();
   const prefix = temporaryDirectory("picc-packaged-prefix-");
   writeLockedConsumerProject(prefix, tarball);
@@ -197,6 +217,151 @@ afterAll(() => {
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 120_000);
+
+it(
+  "installed release tarball > runs read-only packaged plugin inventory commands without PiCC runtime startup",
+  async () => {
+    const root = temporaryDirectory("picc-packaged-inventory-");
+    const project = path.join(root, "project");
+    const userDir = path.join(root, "profile");
+    const pluginRoot = path.join(userDir, "plugins", "cache", "market", "hostile", "1.0.0");
+    const executionCanary = path.join(root, "executed");
+    const runtimeCanary = path.join(root, "runtime-executed");
+    const tsconfigCanary = path.join(root, "tsconfig-executed");
+    const cacheCanary = path.join(root, "jiti-cache");
+    const managedPolicyIsolation = path.join(root, "isolate-managed-policy.cjs");
+    fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+    fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+
+    let networkRequests = 0;
+    const server = http.createServer((_request, response) => {
+      networkRequests += 1;
+      response.writeHead(500).end();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("network canary did not bind");
+
+    const writeJson = (filename: string, value: unknown) => {
+      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      fs.writeFileSync(filename, JSON.stringify(value));
+    };
+    writeJson(path.join(userDir, "settings.json"), {
+      enabledPlugins: { "hostile@market": true },
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'settings-hook')`] }] }] },
+    });
+    writeJson(path.join(userDir, "plugins", "installed_plugins.json"), {
+      version: 2,
+      plugins: { "hostile@market": [{ scope: "user", installPath: pluginRoot, version: "1.0.0" }] },
+    });
+    writeJson(path.join(userDir, "plugins", "known_marketplaces.json"), {
+      market: { source: { source: "url", url: `http://127.0.0.1:${address.port}/must-not-fetch` } },
+    });
+    writeJson(path.join(pluginRoot, ".claude-plugin", "plugin.json"), {
+      name: "hostile",
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'plugin-hook')`] }] }] },
+      mcpServers: { canary: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'mcp')`] } },
+    });
+    fs.writeFileSync(path.join(project, "redirect-yaml.ts"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(tsconfigCanary)}, "executed"); export const parse = () => ({});\n`);
+    writeJson(path.join(project, "tsconfig.json"), {
+      compilerOptions: { baseUrl: ".", paths: { yaml: ["./redirect-yaml.ts"] } },
+    });
+
+    const installedManifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    assertSameStringMap(
+      installedManifest.dependencies,
+      sourceManifest.dependencies,
+      "installed tarball dependencies",
+    );
+    const installedNodeModules = path.dirname(packageRoot);
+    const installedJiti = JSON.parse(
+      fs.readFileSync(path.join(installedNodeModules, "jiti", "package.json"), "utf8"),
+    ) as { name?: unknown; version?: unknown };
+    expect({ name: installedJiti.name, version: installedJiti.version }).toEqual({
+      name: "jiti",
+      version: sourceManifest.dependencies.jiti,
+    });
+    expect(fs.existsSync(path.join(installedNodeModules, "tsx"))).toBe(false);
+    expect(fs.existsSync(path.join(installedNodeModules, "esbuild"))).toBe(false);
+
+    fs.writeFileSync(managedPolicyIsolation, `
+const fs = require("node:fs");
+const denied = value => typeof value === "string" && value.toLowerCase().startsWith("c:\\\\program files\\\\claudecode");
+const missing = value => Object.assign(new Error("test-isolated managed policy"), { code: "ENOENT", path: value });
+for (const name of ["statSync", "readFileSync", "readdirSync"]) {
+  const original = fs[name];
+  fs[name] = function(value, ...rest) { if (denied(value)) throw missing(value); return original.call(this, value, ...rest); };
+}
+require("node:module").syncBuiltinESMExports();
+`);
+    const beforeProject = treeSnapshot(project);
+    const beforeProfile = treeSnapshot(userDir);
+    const run = (args: string[]) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      execFile(process.execPath, [launcher, "plugin", ...args], {
+        cwd: project,
+        env: {
+          ...process.env,
+          JITI_FS_CACHE: cacheCanary,
+          PICC_CLAUDE_USER_DIR: userDir,
+          ...(process.platform === "win32"
+            ? { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(managedPolicyIsolation)}`.trim() }
+            : {}),
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      }, (error, stdout, stderr) => {
+        if (error && error.code === undefined) return reject(error);
+        resolve({ code: error ? Number(error.code) : 0, stdout, stderr });
+      });
+    });
+
+    const runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
+    const savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
+    try {
+      fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(runtimeCanary)}, "executed"); export default function canary() {}\n`);
+      const list = await run(["list"]);
+      expect(list).toMatchObject({
+        code: 0,
+        stderr: process.platform === "win32"
+          ? "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.\n"
+          : "",
+      });
+      expect(list.stdout).toContain("Snapshot: captured for this command");
+      expect(list.stdout).toContain("Plugin: hostile@market");
+
+      const details = await run(["details", "hostile@market"]);
+      expect(details).toMatchObject({
+        code: 0,
+        stderr: process.platform === "win32"
+          ? "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.\n"
+          : "",
+      });
+      expect(details.stdout).toContain("Plugin: hostile@market");
+      expect(details.stdout).toContain("Mode: read-only");
+
+      expect(networkRequests).toBe(0);
+      expect(fs.existsSync(executionCanary)).toBe(false);
+      expect(fs.existsSync(runtimeCanary)).toBe(false);
+      expect(fs.existsSync(tsconfigCanary)).toBe(false);
+      expect(fs.existsSync(cacheCanary)).toBe(false);
+      expect(fs.existsSync(path.join(packageRoot, "node_modules", ".cache", "jiti"))).toBe(false);
+      expect(fs.existsSync(path.join(userDir, "plugins", "data"))).toBe(false);
+      expect(fs.existsSync(path.join(project, ".claude", ".picc"))).toBe(false);
+      expect(fs.existsSync(path.join(project, ".git", "info", "exclude"))).toBe(false);
+      expect(treeSnapshot(project)).toEqual(beforeProject);
+      expect(treeSnapshot(userDir)).toEqual(beforeProfile);
+    } finally {
+      fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+  TEST_TIMEOUT_MS,
+);
 
 describe("installed release tarball", () => {
   it.skipIf(!BASH_AVAILABLE)(

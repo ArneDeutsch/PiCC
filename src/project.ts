@@ -5,6 +5,7 @@ import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discov
 import { loadSettings } from "./discovery/settings.js";
 import { resolveMcpConfig } from "./discovery/mcp.js";
 import { resolveClaudeProfile } from "./discovery/claude-profile.js";
+import type { ManagedRegistryAdapter } from "./discovery/managed-policy.js";
 import { loadMcpJson } from "./claude/mcp-config.js";
 import { loadClaudeMcpState } from "./claude/claude-mcp-state.js";
 import { loadPluginSkills, loadSkills } from "./claude/skills.js";
@@ -53,6 +54,10 @@ export function loadClaudeProject(opts: {
   homeDir?: string;
   /** Override managed/policy settings file locations (used by tests). */
   managedSettingsPaths?: string[];
+  /** Override only the Windows managed-policy registry read boundary. */
+  managedPolicyRegistry?: ManagedRegistryAdapter;
+  /** Override managed-policy platform selection (used by deterministic command tests). */
+  managedPolicyPlatform?: NodeJS.Platform;
   /** Override managed/policy artifact base directories (used by tests). */
   managedArtifactDirs?: string[];
   pluginInventoryLifetime?: "session" | "command";
@@ -72,6 +77,14 @@ export function loadClaudeProject(opts: {
     projectRoot: root,
     userDir,
     managedPaths: opts.managedSettingsPaths,
+    ...(opts.managedPolicyRegistry === undefined && opts.managedPolicyPlatform === undefined
+      ? {}
+      : {
+          managedPolicy: {
+            ...(opts.managedPolicyRegistry === undefined ? {} : { registry: opts.managedPolicyRegistry }),
+            ...(opts.managedPolicyPlatform === undefined ? {} : { platform: opts.managedPolicyPlatform }),
+          },
+        }),
   });
   const dirs = discoverArtifactDirs({
     cwd,

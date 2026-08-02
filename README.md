@@ -42,7 +42,7 @@ RemoteSigned`. Details per shell/OS in the guide.
 
 Once published, `npm install --global picc` gives you the same `picc` command without a source
 checkout.
-PiCC ships as TypeScript source that Pi loads via jiti — there is no build step.
+PiCC ships as TypeScript source loaded through jiti — there is no release build step.
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
