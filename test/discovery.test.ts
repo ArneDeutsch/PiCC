@@ -2,7 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { expandEnvVars, loadSettings, stripJsonc } from "../src/discovery/settings.js";
+import {
+  expandEnvVars,
+  loadSettings,
+  stripJsonc,
+  type OrdinarySettingsProbeResult,
+} from "../src/discovery/settings.js";
 import {
   createWindowsManagedRegistryAdapter,
   defaultManagedPolicyDescription,
@@ -17,7 +22,7 @@ import {
   discoverArtifactDirs,
   resolveProjectRoot,
 } from "../src/discovery/locations.js";
-import type { SourceRef } from "../src/types.js";
+import { DEFAULT_CLEANUP_PERIOD_DAYS, type SourceRef } from "../src/types.js";
 
 const tempDirs: string[] = [];
 
@@ -741,6 +746,208 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.disableSkillShellExecution).toBe(false);
     expect(settings.diagnostics).toEqual([]);
+  });
+});
+
+describe("loadSettings — retention cleanup policy", () => {
+  it("defaults an omitted period to 30 days and admits cleanup", () => {
+    const settings = load(makeScopes());
+    expect(settings.cleanupPeriodDays).toBe(DEFAULT_CLEANUP_PERIOD_DAYS);
+    expect(settings.retentionCleanupAllowed).toBe(true);
+    expect(settings.retentionCleanupBlockers).toEqual([]);
+  });
+
+  it.each([1, 30, Number.MAX_SAFE_INTEGER])(
+    "accepts the literal positive integer %s",
+    (value) => {
+      const scopes = makeScopes();
+      writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+        cleanupPeriodDays: value,
+      });
+      const settings = load(scopes);
+      expect(settings.cleanupPeriodDays).toBe(value);
+      expect(settings.retentionCleanupAllowed).toBe(true);
+    },
+  );
+
+  it.each(["30", 1.5, 0, -1, null, true])(
+    "rejects cleanupPeriodDays=%j and blocks cleanup",
+    (value) => {
+      const scopes = makeScopes();
+      writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+        cleanupPeriodDays: value,
+      });
+      const settings = load(scopes);
+      expect(settings.cleanupPeriodDays).toBe(DEFAULT_CLEANUP_PERIOD_DAYS);
+      expect(settings.retentionCleanupAllowed).toBe(false);
+      expect(settings.retentionCleanupBlockers).toEqual([{
+        reason: "invalid-period",
+        source: path.join(scopes.projectRoot, ".claude", "settings.json"),
+      }]);
+      expect(settings.diagnostics).toContainEqual(
+        expect.objectContaining({ message: expect.stringContaining("literal positive integer") }),
+      );
+    },
+  );
+
+  it("latches cleanup off across precedence while retaining ordinary scalar precedence", () => {
+    const invalidLower = makeScopes();
+    writeJson(path.join(invalidLower.userDir, "settings.json"), { cleanupPeriodDays: 0 });
+    writeJson(path.join(invalidLower.projectRoot, ".claude", "settings.json"), {
+      cleanupPeriodDays: 7,
+    });
+    const laterValid = load(invalidLower);
+    expect(laterValid.cleanupPeriodDays).toBe(7);
+    expect(laterValid.retentionCleanupAllowed).toBe(false);
+    expect(laterValid.retentionCleanupBlockers).toEqual([{
+      reason: "invalid-period",
+      source: path.join(invalidLower.userDir, "settings.json"),
+    }]);
+
+    const invalidHigher = makeScopes();
+    writeJson(path.join(invalidHigher.userDir, "settings.json"), { cleanupPeriodDays: 9 });
+    writeJson(path.join(invalidHigher.projectRoot, ".claude", "settings.json"), {
+      cleanupPeriodDays: -2,
+    });
+    const higherInvalid = load(invalidHigher);
+    expect(higherInvalid.cleanupPeriodDays).toBe(9);
+    expect(higherInvalid.retentionCleanupAllowed).toBe(false);
+    expect(higherInvalid.retentionCleanupBlockers).toEqual([{
+      reason: "invalid-period",
+      source: path.join(invalidHigher.projectRoot, ".claude", "settings.json"),
+    }]);
+  });
+
+  it.each([
+    ["absent", { status: "absent" }, true],
+    ["unreadable", { status: "unreadable" }, false],
+    ["malformed", { status: "text", text: "{ nope" }, false],
+    ["non-object", { status: "text", text: "[]" }, false],
+    ["non-finite value", { status: "text", text: '{"cleanupPeriodDays":1e400}' }, false],
+  ] as const)(
+    "classifies an injected %s ordinary settings source",
+    (_name, outcome, allowed) => {
+      const scopes = makeScopes();
+      const projectFile = path.join(scopes.projectRoot, ".claude", "settings.json");
+      const settings = loadSettings({
+        cwd: scopes.projectRoot,
+        projectRoot: scopes.projectRoot,
+        userDir: scopes.userDir,
+        managedPaths: scopes.absentManaged,
+        ordinarySettingsProbe: (filePath): OrdinarySettingsProbeResult =>
+          filePath === projectFile ? outcome : { status: "absent" },
+      });
+      expect(settings.retentionCleanupAllowed).toBe(allowed);
+      expect(settings.cleanupPeriodDays).toBe(DEFAULT_CLEANUP_PERIOD_DAYS);
+      expect(settings.retentionCleanupBlockers).toEqual(
+        allowed ? [] : [{
+          reason: _name === "unreadable"
+            ? "unreadable-source"
+            : _name === "malformed"
+              ? "malformed-source"
+              : _name === "non-object"
+                ? "non-object-source"
+                : "invalid-period",
+          source: projectFile,
+        }],
+      );
+    },
+  );
+
+  it("classifies stat-time ENOENT as absent but read-time ENOENT as unreadable", () => {
+    const scopes = makeScopes();
+    const absent = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: scopes.absentManaged,
+      ordinarySettingsIo: {
+        statIsFile: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
+        readText: () => { throw new Error("must not read"); },
+      },
+    });
+    expect(absent.retentionCleanupAllowed).toBe(true);
+    expect(absent.retentionCleanupBlockers).toEqual([]);
+
+    const racedPath = path.join(scopes.userDir, "settings.json");
+    const raced = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: scopes.absentManaged,
+      ordinarySettingsIo: {
+        statIsFile: (filePath) => {
+          if (filePath === racedPath) return true;
+          throw Object.assign(new Error("absent"), { code: "ENOENT" });
+        },
+        readText: () => { throw Object.assign(new Error("gone after stat"), { code: "ENOENT" }); },
+      },
+    });
+    expect(raced.retentionCleanupAllowed).toBe(false);
+    expect(raced.retentionCleanupBlockers).toEqual([
+      { reason: "unreadable-source", source: racedPath },
+    ]);
+  });
+
+  it.each(["<unreadable>", "{ malformed"] as const)(
+    "blocks cleanup for a managed source failure (%s)",
+    (managedValue) => {
+      const scopes = makeScopes();
+      const source = "/policy/managed-settings.json";
+      const settings = loadSettings({
+        cwd: scopes.projectRoot,
+        projectRoot: scopes.projectRoot,
+        userDir: scopes.userDir,
+        managedPolicy: {
+          platform: "linux",
+          description: {
+            systemSettingsPath: source,
+            dropInDir: "/policy/managed-settings.d",
+            artifactDirs: ["/policy"],
+          },
+          io: inertPolicyIo({ [source]: managedValue }),
+        },
+        ordinarySettingsProbe: () => ({ status: "absent" }),
+      });
+      expect(settings.retentionCleanupAllowed).toBe(false);
+      expect(settings.retentionCleanupBlockers).toEqual([{
+        reason: managedValue === "<unreadable>" ? "unreadable-source" : "malformed-source",
+        source,
+      }]);
+      expect(settings.diagnostics).toContainEqual(
+        expect.objectContaining({
+          category:
+            managedValue === "<unreadable>"
+              ? "managed-policy-unreadable"
+              : "managed-policy-malformed",
+        }),
+      );
+    },
+  );
+
+  it("deduplicates the same blocker reason and source", () => {
+    const scopes = makeScopes();
+    const source = "/policy/duplicate.json";
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: [source, source],
+      managedPolicy: { io: inertPolicyIo({ [source]: "{ malformed" }) },
+      ordinarySettingsProbe: () => ({ status: "absent" }),
+    });
+    expect(settings.retentionCleanupBlockers).toEqual([
+      { reason: "malformed-source", source },
+    ]);
+  });
+
+  it("does not block cleanup for unrelated validation diagnostics", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { model: 42 });
+    const settings = load(scopes);
+    expect(settings.diagnostics).not.toHaveLength(0);
+    expect(settings.retentionCleanupAllowed).toBe(true);
+    expect(settings.retentionCleanupBlockers).toEqual([]);
   });
 });
 

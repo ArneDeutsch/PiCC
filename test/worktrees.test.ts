@@ -1,13 +1,30 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { WorktreeManager, flattenWorktreeName } from "../src/runtime/worktrees.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  WorktreeManager,
+  flattenWorktreeName,
+  type WorktreeReapFailureCategory,
+} from "../src/runtime/worktrees.js";
 import type { WorktreeSettings } from "../src/types.js";
 import { makeRepoFromTemplate } from "./helpers/git-repo.js";
 
 const tempDirs: string[] = [];
 const children: ChildProcess[] = [];
+
+function failureCounts(
+  changed?: Partial<Record<WorktreeReapFailureCategory, number>>,
+): Record<WorktreeReapFailureCategory, number> {
+  return {
+    "settings-blocked": 0,
+    "git-authority": 0,
+    permission: 0,
+    busy: 0,
+    "other-io": 0,
+    ...changed,
+  };
+}
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true }).trim();
@@ -22,7 +39,7 @@ function makeRepo(): string {
 function makeManager(
   projectRoot: string,
   settings: WorktreeSettings = { baseRef: "head" },
-  extra: { cleanupPeriodDays?: number } = {},
+  extra: { cleanupPeriodDays?: number; retentionCleanupAllowed?: boolean } = {},
 ): WorktreeManager {
   return new WorktreeManager({ projectRoot, settings, ...extra });
 }
@@ -40,6 +57,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   while (children.length > 0) {
     const child = children.pop()!;
     try {
@@ -310,6 +328,8 @@ describe("WorktreeManager.enter (path mode)", () => {
 
     const reaped = await mgr.reapOrphans();
     expect(reaped.reaped).toEqual([]);
+    expect(reaped.retainedWorktrees).toBe(0);
+    expect(reaped.failureCounts).toEqual(failureCounts({ "git-authority": 1 }));
     expect(fs.existsSync(orphan)).toBe(true);
 
     const removed = await mgr.exit({ worktreePath: pointed, action: "remove" });
@@ -451,7 +471,9 @@ describe("WorktreeManager.exit", () => {
 
     if (fs.existsSync(res.worktreePath!)) {
       expect(exit.orphaned).toBe(true);
-      const reap = await mgr.reapOrphans();
+      const stale = new Date(Date.now() - 1_000);
+      fs.utimesSync(res.worktreePath!, stale, stale);
+      const reap = await mgr.reapOrphans({ maxAgeDays: 0 });
       expect(reap.reaped.map((p) => path.resolve(p))).toContain(path.resolve(res.worktreePath!));
     }
     expect(fs.existsSync(res.worktreePath!)).toBe(false);
@@ -503,6 +525,51 @@ describe("WorktreeManager.exit", () => {
 });
 
 describe("WorktreeManager.reapOrphans", () => {
+  it("treats an absent worktrees root as a healthy empty scan", async () => {
+    const repo = makeRepo();
+    const worktreesRoot = path.join(repo, ".claude", "worktrees");
+    expect(fs.existsSync(worktreesRoot)).toBe(false);
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      reapIo: {
+        readDirectories: (root) => {
+          expect(path.resolve(root)).toBe(path.resolve(worktreesRoot));
+          throw Object.assign(new Error("worktrees root absent"), { code: "ENOENT" });
+        },
+      },
+    });
+
+    const reap = await mgr.reapOrphans();
+    expect(reap).toEqual({
+      reaped: [],
+      retainedWorktrees: 0,
+      failureCounts: failureCounts(),
+      diagnostics: [],
+    });
+  });
+
+  it("retains classification for genuine worktrees root scan failures", async () => {
+    const repo = makeRepo();
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      reapIo: {
+        readDirectories: () => {
+          throw Object.assign(new Error("scan failed"), { code: "EIO" });
+        },
+      },
+    });
+
+    const reap = await mgr.reapOrphans();
+    expect(reap.reaped).toEqual([]);
+    expect(reap.retainedWorktrees).toBe(0);
+    expect(reap.failureCounts).toEqual(failureCounts({ "other-io": 1 }));
+    expect(reap.diagnostics).toContainEqual(
+      expect.objectContaining({ message: expect.stringContaining("directory scan failed") }),
+    );
+  });
+
   it("removes manually-orphaned dirs under .claude/worktrees but leaves live worktrees alone", async () => {
     const repo = makeRepo();
     const mgr = makeManager(repo);
@@ -512,34 +579,85 @@ describe("WorktreeManager.reapOrphans", () => {
     const zombie = path.join(repo, ".claude", "worktrees", "zombie");
     fs.mkdirSync(path.join(zombie, "sub"), { recursive: true });
     fs.writeFileSync(path.join(zombie, "sub", "junk.txt"), "x\n", "utf8");
+    const staleTime = new Date(Date.now() - 1_000);
+    fs.utimesSync(zombie, staleTime, staleTime);
 
-    const reap = await mgr.reapOrphans();
+    const reap = await mgr.reapOrphans({ maxAgeDays: 0 });
     expect(reap.reaped.map((p) => path.resolve(p))).toEqual([path.resolve(zombie)]);
+    expect(reap.retainedWorktrees).toBe(0);
+    expect(reap.failureCounts).toEqual(failureCounts());
     expect(fs.existsSync(zombie)).toBe(false);
     expect(fs.existsSync(alive.worktreePath!)).toBe(true);
     expect((await mgr.list()).some((e) => path.resolve(e.path) === path.resolve(alive.worktreePath!))).toBe(true);
   });
 
-  it("honors cleanupPeriodDays as the default orphan max-age (mtime-based grace period)", async () => {
+  it("defaults to 30 days and retains exact-cutoff equality", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2035-06-01T12:00:00.000Z"));
     const repo = makeRepo();
-    const mgr = makeManager(repo, { baseRef: "head" }, { cleanupPeriodDays: 30 });
+    const mgr = makeManager(repo);
+    const dayMs = 24 * 60 * 60 * 1000;
 
     const fresh = path.join(repo, ".claude", "worktrees", "fresh-orphan");
-    fs.mkdirSync(fresh, { recursive: true });
+    const equal = path.join(repo, ".claude", "worktrees", "equal-orphan");
     const stale = path.join(repo, ".claude", "worktrees", "stale-orphan");
-    fs.mkdirSync(stale, { recursive: true });
-    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
-    fs.utimesSync(stale, old, old);
+    for (const dir of [fresh, equal, stale]) fs.mkdirSync(dir, { recursive: true });
+    fs.utimesSync(fresh, new Date(Date.now() - dayMs), new Date(Date.now() - dayMs));
+    fs.utimesSync(equal, new Date(Date.now() - 30 * dayMs), new Date(Date.now() - 30 * dayMs));
+    fs.utimesSync(stale, new Date(Date.now() - 30 * dayMs - 1_000), new Date(Date.now() - 30 * dayMs - 1_000));
 
-    // Default max-age = cleanupPeriodDays: only the stale orphan is reaped.
     const reap = await mgr.reapOrphans();
     expect(reap.reaped.map((p) => path.resolve(p))).toEqual([path.resolve(stale)]);
+    expect(reap.retainedWorktrees).toBe(0);
+    expect(reap.failureCounts).toEqual(failureCounts());
     expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(equal)).toBe(true);
 
-    // Explicit override wins over the settings default.
     const reapNow = await mgr.reapOrphans({ maxAgeDays: 0 });
-    expect(reapNow.reaped.map((p) => path.resolve(p))).toEqual([path.resolve(fresh)]);
-    expect(fs.existsSync(fresh)).toBe(false);
+    expect(reapNow.reaped.map((p) => path.resolve(p)).sort()).toEqual(
+      [path.resolve(equal), path.resolve(fresh)].sort(),
+    );
+  });
+
+  it("skips deletion when retention cleanup admission is blocked", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo, { baseRef: "head" }, { retentionCleanupAllowed: false });
+    const orphan = path.join(repo, ".claude", "worktrees", "blocked-orphan");
+    fs.mkdirSync(orphan, { recursive: true });
+
+    const reap = await mgr.reapOrphans({ maxAgeDays: 0 });
+    expect(reap.reaped).toEqual([]);
+    expect(reap.retainedWorktrees).toBe(0);
+    expect(reap.failureCounts).toEqual(failureCounts({ "settings-blocked": 1 }));
+    expect(fs.existsSync(orphan)).toBe(true);
+    expect(reap.diagnostics).toContainEqual(
+      expect.objectContaining({ message: expect.stringContaining("deletion skipped") }),
+    );
+  });
+
+  it.each([
+    ["EACCES", "permission"],
+    ["EBUSY", "busy"],
+    ["EIO", "other-io"],
+  ] as const)("classifies %s removal failures as %s and counts the retained orphan", async (code, category) => {
+    const repo = makeRepo();
+    const orphan = path.join(repo, ".claude", "worktrees", `${category}-orphan`);
+    fs.mkdirSync(orphan, { recursive: true });
+    const stale = new Date(Date.now() - 1_000);
+    fs.utimesSync(orphan, stale, stale);
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      reapIo: {
+        remove: () => { throw Object.assign(new Error(code), { code }); },
+      },
+    });
+
+    const reap = await mgr.reapOrphans({ maxAgeDays: 0 });
+    expect(reap.reaped).toEqual([]);
+    expect(reap.retainedWorktrees).toBe(1);
+    expect(reap.failureCounts).toEqual(failureCounts({ [category]: 1 }));
+    expect(fs.existsSync(orphan)).toBe(true);
   });
 });
 
