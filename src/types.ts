@@ -770,7 +770,8 @@ export type ClaudeProfileSource = "explicit" | "picc-override" | "claude-config"
 export type McpPolicyInactiveReason =
   | "policy-denied"
   | "policy-allow-miss"
-  | "policy-managed-only";
+  | "policy-managed-only"
+  | "policy-candidate-invalid";
 
 export type McpInactiveReason =
   | "mcpjson-unapproved"

@@ -1,4 +1,9 @@
-/** Pure `${VAR}` / `${VAR:-default}` interpolation for bounded policy identity matching. */
+/**
+ * Deterministic `${VAR}` / `${VAR:-default}` interpolation against the caller's
+ * bounded environment snapshot. The optional unset callback is caller-owned.
+ * Direct appends intentionally avoid replacement-string APIs, which reinterpret
+ * `$&`, `$'`, and related sequences in environment-provided values.
+ */
 export function expandEnvVars(
   value: string,
   env: Readonly<Record<string, string | undefined>>,

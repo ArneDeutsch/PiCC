@@ -44,6 +44,20 @@ function expectSecretSafeRejection(
 }
 
 describe("parseRemoteMcpFields", () => {
+  it.each(["http", "sse"] as const)("deferred %s parsing reads transport identity only", (type) => {
+    let headerReads = 0;
+    let helperReads = 0;
+    const entry: Record<string, unknown> = { type, url: "https://example.test/mcp" };
+    Object.defineProperty(entry, "headers", { enumerable: true, get: () => { headerReads += 1; throw new Error("headers touched"); } });
+    Object.defineProperty(entry, "headersHelper", { enumerable: true, get: () => { helperReads += 1; throw new Error("helper touched"); } });
+    const result = parseRemoteMcpFields(entry, SERVER, SOURCE, { deferPostAdmission: true });
+    expect(result.kind).toBe("supported");
+    expect([headerReads, helperReads]).toEqual([0, 0]);
+    if (result.kind !== "supported") return;
+    expect(result.fields).toMatchObject({ configuredType: type, rawUrl: "https://example.test/mcp" });
+    expect(result.fields.rawHeaders).toEqual({});
+  });
+
   it("distinguishes non-remote entries", () => {
     expect(parse({ command: "mcp" })).toEqual({ kind: "not-remote" });
     expect(parse({ type: "stdio", command: "mcp", url: "https://ignored.test" })).toEqual({
@@ -242,6 +256,26 @@ describe("parseRemoteMcpFields", () => {
 });
 
 describe("resolveRemoteMcpFields", () => {
+  it("exposes deterministic positive work counters only during resolution", () => {
+    const fields = parseRemoteMcpFields(
+      { type: "http", url: "https://example.test/mcp", headers: { "X-Test": "ok" } },
+      SERVER,
+      SOURCE,
+      { deferPostAdmission: true },
+    );
+    expect(fields.kind).toBe("supported");
+    if (fields.kind !== "supported") return;
+    const counts = { header: 0, headers: 0, helper: 0, materializer: 0 };
+    const result = resolveRemoteMcpFields(fields.fields, {}, undefined, SERVER, SOURCE, {
+      onHeaderValidation: () => { counts.header += 1; },
+      onHeadersConstruction: () => { counts.headers += 1; },
+      onHelperInspection: () => { counts.helper += 1; },
+      onMaterialization: () => { counts.materializer += 1; },
+    });
+    expect(result.kind).toBe("resolved");
+    expect(counts).toEqual({ header: 2, headers: 2, helper: 1, materializer: 1 });
+  });
+
   it("expands URL and header values while retaining raw identity and null-prototype copies", () => {
     const fields = raw({
       type: "streamable-http",

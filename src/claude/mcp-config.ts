@@ -149,7 +149,7 @@ export function normalizeMcpServerBlock(
       typeof rawEntry.command === "string" && rawEntry.command.trim() !== "";
     const remote = type === undefined && hasValidCommand
       ? { kind: "not-remote" as const }
-      : parseRemoteMcpFields(rawEntry, rawName, sourceLabel);
+      : parseRemoteMcpFields(rawEntry, rawName, sourceLabel, { deferPostAdmission: true });
     if (remote.kind === "skipped") {
       entry.skipped = true;
       entry.diagnostics.push(...remote.diagnostics.map(clean));
@@ -161,6 +161,7 @@ export function normalizeMcpServerBlock(
         configuredType: remote.configuredType,
         transportKind: remote.configuredType === "sse" ? "sse" : "http",
         rawUrl: "",
+        rawEntry: rawEntry as Record<string, unknown>,
         rawHeaders: Object.create(null) as Record<string, string>,
         ...(remote.configuredType === "sse"
           ? { sseDeprecation: { deprecated: true as const, replacement: "http" as const } }

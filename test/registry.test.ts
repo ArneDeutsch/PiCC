@@ -461,7 +461,6 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "feature.mcp-sampling",
       "feature.mcp-roots",
       "feature.mcp-channels",
-      "feature.mcp-managed-config",
       "feature.mcp-connectors",
       "feature.mcp-output-token-cap",
       "feature.mcp-idle-timeout",
@@ -499,12 +498,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     const managedConfig = lookupCapability("feature.mcp-managed-config");
-    expect(managedConfig).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
-      expect(managedConfig?.note).toContain(source);
-    }
-    for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
-      expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    expect(managedConfig).toMatchObject({ tier: "partial", safetyRelevant: true });
+    expect(managedConfig?.note).toContain("platform-fixed `managed-mcp.json`");
+    expect(managedConfig?.note).toContain("loaded empty set disables MCP");
+    for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers", "setting.allowManagedMcpServersOnly"]) {
+      expect(lookupCapability(id)).toMatchObject({ tier: "partial", safetyRelevant: true });
+      expect(lookupCapability(id)?.note).toContain("all currently loaded ordinary and standalone-managed");
     }
     // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");

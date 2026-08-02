@@ -713,6 +713,66 @@ describe("managed MCP policy status foundation", () => {
     expect(doctor(mcp)).not.toMatch(/repair|recover/iu);
   });
 
+  it("prioritizes native-state recovery over generic policy fail-closed prose", () => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [], diagnostics: [],
+      failClosed: "native-state-unusable",
+      failClosedProfile: "default",
+      policyPosture: "fail-closed",
+      policyAuthority: "administrator-controlled",
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("native Claude state is unusable");
+      expect(report).toContain("known-good backup");
+      expect(report).not.toContain("repair or recover the applicable managed MCP policy input");
+    }
+  });
+
+  it.each([
+    ["standalone managed", "managed-mcp", "ask the administrator to repair the managed MCP server configuration"],
+    ["managed settings", "settings-managed", "ask the administrator to repair the managed MCP server configuration"],
+    ["ordinary project", "settings-project", "repair the MCP server configuration"],
+    ["ordinary native", "native-user", "repair the MCP server configuration"],
+  ] as const)("renders $0 candidate-invalid with source-aware configuration repair on both surfaces", (_label, source, expected) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("invalid", "blocked", { source, inactiveReason: "policy-candidate-invalid" })],
+      diagnostics: [],
+      policyPosture: source === "managed-mcp" ? "exclusive" : "active-rules",
+      policyAuthority: source === "managed-mcp" || source === "settings-managed" ? "administrator-controlled" : "user-controlled",
+      ...(source === "managed-mcp" ? { policyOrdinarySourcesSuppressed: true } : {}),
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("configured identity is invalid, ambiguous, or over the admission limit");
+      expect(report).toContain(`${expected}, then run /reload or restart PiCC`);
+      if (source === "managed-mcp" || source === "settings-managed") {
+        expect(report).not.toContain("; repair the MCP server configuration");
+      } else {
+        expect(report).not.toContain("ask the administrator to repair the managed MCP server configuration");
+      }
+      expect(report).not.toMatch(/allowlist|policy change|pending approval|enabledMcpjsonServers/iu);
+    }
+  });
+
+  it("renders populated exclusive managed rows while suppressing ordinary rows", () => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [
+        server("enabled-managed", "enabled", { source: "managed-mcp" }),
+        server("denied-managed", "blocked", { source: "managed-mcp", inactiveReason: "policy-denied" }),
+        server("invalid-managed", "blocked", { source: "managed-mcp", inactiveReason: "policy-candidate-invalid" }),
+        server("skipped-managed", "skipped", { source: "managed-mcp" }),
+        server("ordinary-canary", "enabled", { source: "settings-user" }),
+      ],
+      diagnostics: [], policyPosture: "exclusive", policyAuthority: "administrator-controlled",
+      policyOrdinarySourcesSuppressed: true,
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      for (const name of ["enabled-managed", "denied-managed", "invalid-managed", "skipped-managed"]) {
+        expect(report).toContain(name);
+      }
+      expect(report).not.toContain("ordinary-canary");
+    }
+  });
+
   it.each([
     ["user-controlled", "Repair or recover the applicable user-controlled MCP policy input"],
     ["administrator-controlled", "Ask the administrator to repair or recover the applicable managed MCP policy input"],

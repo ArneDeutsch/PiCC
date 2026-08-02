@@ -776,8 +776,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // never a finding). Display hygiene: server names are bounded and quoted;
   // diagnostics are classified without reflecting configuration values.
   const mcp = project.mcp ?? EMPTY_MCP;
-  const aggregatePolicyState = mcp.policyPosture === "exclusive" || mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed";
-  const pendingNames = aggregatePolicyState ? [] : mcp.servers
+  const aggregatePolicyState = mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed";
+  const pendingNames = aggregatePolicyState || mcp.policyPosture === "exclusive" ? [] : mcp.servers
     .filter((s) => s.status === "pending-approval")
     .map((s) => s.name);
   if (pendingNames.length > 0) {
@@ -1210,7 +1210,14 @@ function mcpPolicyReason(reason: McpPolicyInactiveReason): string {
     case "policy-denied": return "denied by MCP policy";
     case "policy-allow-miss": return "not present in the effective MCP allowlist";
     case "policy-managed-only": return "not present in the effective managed allow contributions";
+    case "policy-candidate-invalid": return "configured identity is invalid, ambiguous, or over the admission limit";
   }
+}
+
+function mcpCandidateRepair(source: McpSourceClass): string {
+  return source === "managed-mcp" || source === "settings-managed"
+    ? "ask the administrator to repair the managed MCP server configuration, then run /reload or restart PiCC"
+    : "repair the MCP server configuration, then run /reload or restart PiCC";
 }
 
 const MCP_POLICY_OBSERVATION_LABELS: Readonly<Record<McpPolicyObservation, string>> = {
@@ -1282,11 +1289,17 @@ function mcpPostureLine(
   mcp: ResolvedMcpConfig,
   liveStates: readonly McpServerLiveState[],
 ): string {
+  if (mcp.policyPosture === "exclusive" && mcp.servers.some((server) => server.source !== "managed-mcp")) {
+    return mcpPostureLine(
+      { ...mcp, servers: mcp.servers.filter((server) => server.source === "managed-mcp") },
+      liveStates,
+    );
+  }
   if (mcp.failClosed === "native-state-unusable") {
     return `MCP: fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(mcp)}`;
   }
   const policy = mcpPolicySummary(mcp);
-  if (mcp.policyPosture === "exclusive" || mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed") {
+  if (mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed") {
     return policy ?? "MCP: fail closed by policy.";
   }
   if (mcp.servers.length === 0) return policy ?? "MCP: no servers configured.";
@@ -1347,7 +1360,9 @@ function mcpPostureLine(
           ? `${identity}: disabled${mcpInactiveTransportSuffix(server)} (native disabledMcpServers); use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC`
           : `${identity}: disabled${mcpInactiveTransportSuffix(server)} (settings disabledMcpjsonServers)`;
       case "blocked":
-        return `${identity}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(mcp.policyAuthority)}`;
+        return server.inactiveReason === "policy-candidate-invalid"
+          ? `${identity}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpCandidateRepair(server.source)}`
+          : `${identity}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(mcp.policyAuthority)}`;
       case "not-configured":
         return `${identity}: not configured${mcpInactiveTransportSuffix(server)}`;
       case "skipped":
@@ -1502,7 +1517,9 @@ function mcpStatusRow(
         : `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — settings disabledMcpjsonServers rejection`;
     case "blocked":
       return server.status === "blocked"
-        ? `- ${name}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(policyAuthority)}`
+        ? server.inactiveReason === "policy-candidate-invalid"
+          ? `- ${name}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpCandidateRepair(server.source)}`
+          : `- ${name}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(policyAuthority)}`
         : `- ${name}: blocked — policy state unavailable`;
     case "not configured":
       return `- ${name}: not configured${mcpInactiveTransportSuffix(server)}`;
@@ -1542,7 +1559,10 @@ export function renderMcpStatusReport(
   mcp: ResolvedMcpConfig | undefined,
   liveStates: readonly McpServerLiveState[],
 ): string {
-  const config = mcp ?? EMPTY_MCP;
+  const rawConfig = mcp ?? EMPTY_MCP;
+  const config = rawConfig.policyPosture === "exclusive"
+    ? { ...rawConfig, servers: rawConfig.servers.filter((server) => server.source === "managed-mcp") }
+    : rawConfig;
   const unsupportedEnablement = config.diagnostics.some(
     (diagnostic) => diagnostic.includes("enabledMcpServers is unsupported"),
   );
@@ -1550,25 +1570,27 @@ export function renderMcpStatusReport(
     (diagnostic) => !diagnostic.includes("enabledMcpServers is unsupported"),
   );
   const lines = ["MCP status (read-only)"];
-  const policySummary = mcpPolicySummary(config);
+  const nativeStateUnusable = config.failClosed === "native-state-unusable";
+  const policySummary = nativeStateUnusable ? undefined : mcpPolicySummary(config);
   if (policySummary) lines.push(policySummary);
-  const aggregateOnly = config.policyPosture === "exclusive" || config.policyPosture === "exclusive-empty" || config.policyPosture === "fail-closed";
-  if (config.servers.length === 0 && !aggregateOnly) {
+  const aggregateOnly = config.policyPosture === "exclusive-empty" || config.policyPosture === "fail-closed";
+  if (nativeStateUnusable) {
+    lines.push(`MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`);
+  } else if (config.servers.length === 0 && !aggregateOnly) {
     lines.push(
-      config.failClosed === "native-state-unusable"
-        ? `MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`
-        : otherConfigDiagnostics
-          ? "No usable MCP servers were resolved."
-          : "No MCP servers are configured.",
+      otherConfigDiagnostics
+        ? "No usable MCP servers were resolved."
+        : "No MCP servers are configured.",
     );
   } else if (!aggregateOnly) {
     lines.push(`Resolved server entries: ${config.servers.length}`);
   }
 
   const liveByName = mcpLiveByName(liveStates);
-  const detailCount = aggregateOnly ? 0 : Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
+  const suppressRows = aggregateOnly || nativeStateUnusable;
+  const detailCount = suppressRows ? 0 : Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
   const indexed = config.servers.map((server, index) => ({ server, index }));
-  const selected = aggregateOnly
+  const selected = suppressRows
     ? []
     : config.servers.length <= MCP_STATUS_DETAIL_MAX
       ? indexed
@@ -1588,7 +1610,7 @@ export function renderMcpStatusReport(
     lines.push(`${mcpStatusRow(server, liveByName.get(server.name), config.policyAuthority)} [source: ${mcpSourceLabel(server.source)}]`);
   }
 
-  if (!aggregateOnly && config.servers.length > detailCount) {
+  if (!suppressRows && config.servers.length > detailCount) {
     const omitted = new Map<McpRenderedState, number>();
     for (let index = 0; index < config.servers.length; index += 1) {
       if (selectedIndexes.has(index)) continue;

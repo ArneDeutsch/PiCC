@@ -32,6 +32,8 @@ export interface CompileMcpPolicyInput {
   /** Undefined means no exclusive managed configuration; zero means MCP is disabled. */
   exclusiveManagedServerCount?: number;
   env?: Readonly<Record<string, string | undefined>>;
+  /** The prepared environment snapshot could not be read completely. */
+  environmentUnavailable?: boolean;
   /** An upstream bounded collector detected lost policy material. */
   restrictiveMaterialOmitted?: boolean;
 }
@@ -304,7 +306,10 @@ function compileField(
   };
 }
 
-/** Compile settings contributions into an immutable, side-effect-free admission policy. */
+/**
+ * Compile settings contributions without ambient, process, or network reads.
+ * Opaque compiled-token bookkeeping is retained in module-local state.
+ */
 export function compileMcpPolicy(input: CompileMcpPolicyInput): CompiledMcpPolicy {
   try {
     if (!input || typeof input !== "object" || Array.isArray(input)) return EMERGENCY_POLICY;
@@ -315,12 +320,13 @@ export function compileMcpPolicy(input: CompileMcpPolicyInput): CompiledMcpPolic
     const copiedFailures = copyFailures(input.sourceFailures);
     const copiedEnv = copyEnvironment(input.env);
     const observations: McpPolicyObservation[] = [];
+    const environmentUnavailable = input.environmentUnavailable === true;
     const unknownAuthority = input.restrictiveMaterialOmitted === true || providedSettingsInvalid || settingsOverLimit || copiedFailures.invalid;
-    let failClosed = unknownAuthority || copiedEnv.overLimit;
+    let failClosed = unknownAuthority || environmentUnavailable || copiedEnv.overLimit;
     if (input.restrictiveMaterialOmitted === true || settingsOverLimit || copiedFailures.invalid) {
       appendObservation(observations, "restrictive-material-omitted");
     }
-    if (providedSettingsInvalid || copiedEnv.overLimit) appendObservation(observations, "compiler-uncertainty-fail-closed");
+    if (environmentUnavailable || providedSettingsInvalid || copiedEnv.overLimit) appendObservation(observations, "compiler-uncertainty-fail-closed");
     if (copiedFailures.failures.length > 0) {
       failClosed = true;
       appendObservation(observations, "source-failure-fail-closed");
@@ -636,7 +642,10 @@ function candidateInvalidity(candidate: RawMcpPolicyCandidate, checkRemoteIdenti
   return checkRemoteIdentity && !parseCandidateUrl(candidate.url) ? "identity-ambiguity" : undefined;
 }
 
-/** Evaluate one raw candidate without materializing it or consulting ambient state. */
+/**
+ * Evaluate one raw identity using bounded snapshot interpolation, without
+ * post-admission server materialization or ambient/process/network access.
+ */
 export function evaluateMcpPolicy(policy: CompiledMcpPolicy, candidate: RawMcpPolicyCandidate): McpAdmissionDecision {
   try {
     const token = policy.compiled;
