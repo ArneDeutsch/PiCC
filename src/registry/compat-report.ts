@@ -987,6 +987,9 @@ function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig)
   if (/Native (?:user|local) MCP (?:server .* ignored or adjusted|state contains adjusted server configuration)/u.test(diagnostic)) {
     return "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.";
   }
+  if (diagnostic === "Native Claude project MCP state has conflicting matching records") {
+    return `Canonical-equivalent native Claude project records disagree on MCP server or runtime-control state, so all MCP loading is fail closed. ${mcpFailClosedRecovery(mcp)}`;
+  }
   if (/(?:Native Claude|Active project) .*identity|ambiguous matching records/u.test(diagnostic)) {
     return `Native Claude project identity could not be selected safely, so MCP is fail closed. ${mcpFailClosedRecovery(mcp)}`;
   }

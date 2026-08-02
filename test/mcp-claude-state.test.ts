@@ -158,12 +158,186 @@ describe("loadClaudeMcpState scope selection", () => {
     expect(loaded().local.servers).toEqual([]);
   });
 
-  it("rejects ambiguous equivalent records instead of merging them", () => {
+  it("coalesces equivalent empty, populated, reordered, and metadata-different aliases", () => {
+    const aliases = [localKey(), path.join(root, "alias-a"), path.join(root, "alias-b")];
+    const first = JSON.parse('{"mcpServers":{"shared":{"command":"run","args":["a","b"],"future":{"__proto__":{"flag":true},"z":1}}},"disabledMcpServers":["off","off","other"],"enabledMcpServers":["on","extra"],"metadata":"first"}') as unknown;
+    const reordered = JSON.parse('{"metadata":"second","enabledMcpServers":["extra","on","on"],"disabledMcpServers":["other","off"],"mcpServers":{"shared":{"future":{"z":1,"__proto__":{"flag":true}},"args":["a","b"],"command":"run"}}}') as unknown;
+    write({ projects: { [aliases[0]!]: first, [aliases[1]!]: reordered, [aliases[2]!]: first } });
+
+    const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) });
+
+    expect(result.local.servers.map(({ name, command, args }) => ({ name, command, args }))).toEqual([
+      { name: "shared", command: "run", args: ["a", "b"] },
+    ]);
+    expect([...result.disabledMcpServers]).toEqual(["off", "other"]);
+    expect(result.enabledMcpServers).toEqual(["on", "extra"]);
+    expect(result.diagnostics).toEqual([
+      "Native Claude enabledMcpServers is unsupported; listed default-off servers remain disabled",
+      "Native local MCP server \"shared\" has configuration PiCC ignored or adjusted; its definition was retained for later resolution",
+    ]);
+  });
+
+  it("prefers the exact family-identity record regardless of project-record order", () => {
+    const exact = localKey();
     const alias = path.join(root, "alias");
-    write({ projects: { [localKey()]: {}, [alias]: {} } });
+    const exactRecord = {
+      mcpServers: { zeta: { command: "z" }, alpha: { command: "a" } },
+      disabledMcpServers: ["zeta", "alpha"],
+      enabledMcpServers: ["right", "left"],
+    };
+    const aliasRecord = {
+      mcpServers: { alpha: { command: "a" }, zeta: { command: "z" } },
+      disabledMcpServers: ["alpha", "zeta"],
+      enabledMcpServers: ["left", "right"],
+    };
+
+    for (const entries of [
+      [[alias, aliasRecord], [exact, exactRecord]],
+      [[exact, exactRecord], [alias, aliasRecord]],
+    ] as const) {
+      write({ projects: Object.fromEntries(entries) });
+      const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: exact }) });
+      expect(result.local.servers.map((server) => server.name)).toEqual(["zeta", "alpha"]);
+      expect([...result.disabledMcpServers]).toEqual(["zeta", "alpha"]);
+      expect(result.enabledMcpServers).toEqual(["right", "left"]);
+    }
+  });
+
+  it("uses an ordinal lexical-key fallback regardless of project-record order", () => {
+    const family = localKey();
+    const lexicalFirst = path.join(root, "alias-a");
+    const lexicalLast = path.join(root, "alias-z");
+    expect(lexicalFirst < lexicalLast).toBe(true);
+    const firstRecord = {
+      mcpServers: { zeta: { command: "z" }, alpha: { command: "a" } },
+      disabledMcpServers: ["zeta", "alpha"],
+      enabledMcpServers: ["right", "left"],
+    };
+    const lastRecord = {
+      mcpServers: { alpha: { command: "a" }, zeta: { command: "z" } },
+      disabledMcpServers: ["alpha", "zeta"],
+      enabledMcpServers: ["left", "right"],
+    };
+
+    for (const entries of [
+      [[lexicalLast, lastRecord], [lexicalFirst, firstRecord]],
+      [[lexicalFirst, firstRecord], [lexicalLast, lastRecord]],
+    ] as const) {
+      write({ projects: Object.fromEntries(entries) });
+      const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: family }) });
+      expect(result.local.servers.map((server) => server.name)).toEqual(["zeta", "alpha"]);
+      expect([...result.disabledMcpServers]).toEqual(["zeta", "alpha"]);
+      expect(result.enabledMcpServers).toEqual(["right", "left"]);
+    }
+  });
+
+  it("treats missing and empty disabled lists as equivalent but enabled-list presence as significant", () => {
+    const alias = path.join(root, "alias");
+    write({ projects: { [localKey()]: {}, [alias]: { mcpServers: {}, disabledMcpServers: [] } } });
+    expect(load({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) }).kind).toBe("loaded");
+
+    write({ projects: { [localKey()]: {}, [alias]: { enabledMcpServers: [] } } });
     expect(load({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) })).toEqual({
       kind: "unusable",
-      diagnostics: ["Native Claude project state has ambiguous matching records"],
+      diagnostics: ["Native Claude project MCP state has conflicting matching records"],
+    });
+  });
+
+  it("fails closed with one redacted diagnostic for every MCP projection conflict class", () => {
+    const alias = path.join(root, "alias");
+    const conflicts: Array<[unknown, unknown]> = [
+      [{ mcpServers: { s: { command: "one" } } }, { mcpServers: { s: { command: "two" } } }],
+      [{ mcpServers: { s: { command: "x", args: ["a", "b"] } } }, { mcpServers: { s: { command: "x", args: ["b", "a"] } } }],
+      [{ mcpServers: { s: { command: "x", future: { token: "secret-one" } } } }, { mcpServers: { s: { command: "x", future: { token: "secret-two" } } } }],
+      [{ disabledMcpServers: ["one"] }, { disabledMcpServers: ["two"] }],
+      [{ enabledMcpServers: ["one"] }, { enabledMcpServers: ["two"] }],
+    ];
+    for (const [first, second] of conflicts) {
+      write({ projects: { [localKey()]: first, [alias]: second } });
+      const result = load({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) });
+      expect(result).toEqual({
+        kind: "unusable",
+        diagnostics: ["Native Claude project MCP state has conflicting matching records"],
+      });
+      expect(result.diagnostics.join(" ")).not.toMatch(/one|two|secret|token|command|future|\b s\b/i);
+    }
+  });
+
+  it("rejects every malformed alias shape after valid state and when both aliases are identically malformed", () => {
+    const alias = path.join(root, "alias");
+    const malformedCases: Array<{ valid: unknown; malformed: unknown; diagnostic: string }> = [
+      {
+        valid: {},
+        malformed: "not-an-object",
+        diagnostic: "Matching native Claude project record has an invalid shape",
+      },
+      {
+        valid: { mcpServers: {} },
+        malformed: { mcpServers: [] },
+        diagnostic: "Native Claude local MCP state has an invalid object shape",
+      },
+      {
+        valid: { disabledMcpServers: [] },
+        malformed: { disabledMcpServers: "all" },
+        diagnostic: "Native Claude disabled MCP list has an invalid shape",
+      },
+      {
+        valid: { enabledMcpServers: [] },
+        malformed: { enabledMcpServers: "all" },
+        diagnostic: "Native Claude enabled MCP list has an invalid shape",
+      },
+    ];
+    for (const { valid, malformed, diagnostic } of malformedCases) {
+      for (const records of [[valid, malformed], [malformed, malformed]]) {
+        write({ projects: { [localKey()]: records[0], [alias]: records[1] } });
+        expect(load({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) })).toEqual({
+          kind: "unusable",
+          diagnostics: [diagnostic],
+        });
+      }
+    }
+  });
+
+  it("normalizes one equivalent bounded definition, including a skipped definition, only once", () => {
+    const alias = path.join(root, "alias");
+    const record = { mcpServers: { malformed: { command: 7, future: { value: true } } } };
+    write({ projects: { [localKey()]: record, [alias]: record } });
+    const result = loaded({ canonicalizeProject: () => ({ kind: "canonical", path: localKey() }) });
+    expect(result.local.servers).toHaveLength(1);
+    expect(result.local.servers[0]).toMatchObject({ name: "malformed", skipped: true });
+    expect(result.diagnostics).toEqual([
+      "Native local MCP server \"malformed\" has an invalid or unsupported definition and was skipped",
+    ]);
+  });
+
+  it("continues canonicalizing after equivalent matches and preserves a later indeterminate failure", () => {
+    const aliases = [localKey(), path.join(root, "alias"), path.join(root, "later")];
+    write({ projects: Object.fromEntries(aliases.map((candidate) => [candidate, {}])) });
+    const probes: string[] = [];
+    expect(load({ canonicalizeProject: (candidate) => {
+      probes.push(candidate);
+      return candidate === aliases[2]
+        ? { kind: "indeterminate" }
+        : { kind: "canonical", path: localKey() };
+    } })).toEqual({
+      kind: "unusable",
+      diagnostics: ["Native Claude project identity could not be determined safely"],
+    });
+    expect(probes).toEqual(aliases);
+  });
+
+  it.skipIf(process.platform !== "win32")("coalesces real Windows drive-letter case aliases", () => {
+    const canonical = localKey();
+    const swapped = `${canonical[0] === canonical[0]!.toUpperCase() ? canonical[0]!.toLowerCase() : canonical[0]!.toUpperCase()}${canonical.slice(1)}`;
+    expect(swapped).not.toBe(canonical);
+
+    write({ projects: { [canonical]: { mcpServers: { local: { command: "run" } } }, [swapped]: { mcpServers: { local: { command: "run" } } } } });
+    expect(loaded().local.servers.map((server) => server.name)).toEqual(["local"]);
+
+    write({ projects: { [canonical]: { mcpServers: { local: { command: "run" } } }, [swapped]: { mcpServers: { local: { command: "conflict" } } } } });
+    expect(load()).toEqual({
+      kind: "unusable",
+      diagnostics: ["Native Claude project MCP state has conflicting matching records"],
     });
   });
 
