@@ -204,9 +204,21 @@ describe("strict tarball inspection", () => {
     ])), /explicit directory/u);
   });
 
+  it("accepts npm portable all-NUL uid and gid fields as zero", () => {
+    const inspected = inspectTarball(archive([{ name: "package/a", bytes: content("a"), header: (header) => {
+      header.fill(0, 108, 124);
+    } }]));
+    expect(inspected.files.get("a")?.toString("utf8")).toBe("a");
+  });
+
   it.each([
     ["invalid fixed-field UTF-8", (header: Buffer) => { header[265] = 0xff; }, /UTF-8/u],
     ["non-NUL fixed-field tail", (header: Buffer) => { header[157] = 0; header[158] = 0x61; }, /link name field/u],
+    ["base-256 uid", (header: Buffer) => { header[108] = 0x80; }, /numeric encoding/u],
+    ["malformed octal gid", (header: Buffer) => { header[116] = 0x38; }, /field is malformed/u],
+    ["all-space uid", (header: Buffer) => { header.fill(0x20, 108, 116); }, /field is malformed/u],
+    ["partially empty gid", (header: Buffer) => { header.fill(0, 116, 124); header[123] = 0x20; }, /field is malformed/u],
+    ["noncanonical NUL-prefixed uid", (header: Buffer) => { header.fill(0, 108, 116); header[109] = 0x30; }, /field is malformed/u],
     ["base-256 device number", (header: Buffer) => { header[329] = 0x80; }, /numeric encoding/u],
     ["malformed octal device number", (header: Buffer) => { header[329] = 0x38; }, /field is malformed/u],
     ["nonzero link metadata", (header: Buffer) => { header[157] = 0x61; }, /contradictory metadata/u],
@@ -214,6 +226,17 @@ describe("strict tarball inspection", () => {
     ["nonzero reserved bytes", (header: Buffer) => { header[500] = 1; }, /reserved/u],
   ])("rejects %s", (_label, mutate, pattern) => {
     expectInvariant(() => inspectTarball(archive([{ name: "package/a", bytes: content("a"), header: mutate }])), pattern);
+  });
+
+  it("does not extend all-NUL zero to required numeric fields", () => {
+    for (const [start, end] of [[100, 108], [124, 136], [136, 148]]) {
+      expectInvariant(() => inspectTarball(archive([{ name: "package/a", bytes: content("a"), header: (header) => {
+        header.fill(0, start, end);
+      } }])), /field is malformed/u);
+    }
+    const emptyChecksum = tar([{ name: "package/a", bytes: content("a") }]);
+    emptyChecksum.fill(0, 148, 156);
+    expectInvariant(() => inspectTarball(gzipSync(emptyChecksum)), /checksum field is malformed/u);
   });
 
   it("distinguishes ustar magic, version, directory data, truncation, and malformed termination", () => {

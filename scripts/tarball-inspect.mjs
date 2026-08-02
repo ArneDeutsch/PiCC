@@ -105,12 +105,13 @@ function fieldText(header, start, length, label) {
   }
 }
 
-function octal(header, start, length, label, allowEmpty = false) {
+function octal(header, start, length, label, allowEmpty = false, allowNulZero = false) {
   const field = header.subarray(start, start + length);
   if ((field[0] & 0x80) !== 0) fail(`${label} uses unsupported numeric encoding`);
   if (field.some((value) => value !== 0 && value !== 0x20 && (value < 0x30 || value > 0x37))) {
     fail(`${label} field is malformed`);
   }
+  if (allowNulZero && allZero(field)) return 0;
   const text = Buffer.from(field).toString("ascii").replace(/[\0 ]+$/u, "").replace(/^ +/u, "");
   if (text.length === 0) {
     if (allowEmpty) return 0;
@@ -178,8 +179,8 @@ export function inspectTarball(archiveBytes, options = {}) {
     const recordedChecksum = octal(header, 148, 8, "tar checksum");
     if (recordedChecksum !== checksum(header)) fail("tar header checksum is invalid");
     const mode = octal(header, 100, 8, "mode");
-    const uid = octal(header, 108, 8, "uid");
-    const gid = octal(header, 116, 8, "gid");
+    const uid = octal(header, 108, 8, "uid", false, true);
+    const gid = octal(header, 116, 8, "gid", false, true);
     const size = octal(header, 124, 12, "member size");
     const mtime = octal(header, 136, 12, "mtime");
     const deviceMajor = octal(header, 329, 8, "device major", true);
