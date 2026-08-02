@@ -2343,7 +2343,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     process.exitCode = savedExitCode;
   });
 
-  it.each(["json", "rpc"] as const)(
+  it.each(["tui", "json", "rpc"] as const)(
     "fails closed with one structured %s manual refusal when callback compaction exceeds the production ceiling",
     async (mode) => {
       const deadlinePi = fakePi();
@@ -2359,7 +2359,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const committed = deferred<void>();
     let ctx: any;
     ctx = deadlinePi.ctx({
-      mode, hasUI: mode === "rpc",
+      mode, hasUI: mode === "tui" || mode === "rpc",
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => false,
@@ -2400,8 +2400,18 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       phase: "exhausted", admission: "closed", failureCategory: "unconfirmed-host",
     });
     expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
-    const notice = deadlinePi.entries.find((entry) => entry.data.category === "checkpoint-cancelled")?.data.notice;
+    const presentation = deadlinePi.entries.filter((entry) => entry.customType === "picc-proactive-compact");
+    const notice = mode === "tui"
+      ? presentation.find((entry) => entry.data.severity === "error")?.data.notice
+      : deadlinePi.entries.find((entry) => entry.data.category === "checkpoint-cancelled")?.data.notice;
     expectUnconfirmedHostRecovery(String(notice));
+    expect(presentation).toHaveLength(mode === "tui" ? 2 : 0);
+    if (mode === "tui") {
+      expect(presentation.at(-1)?.data).toEqual({
+        notice: "1 queued input was not replayed; 1 text input was restored.",
+        severity: "info",
+      });
+    }
 
     const recoveryCount = deadlinePi.entries.filter((entry) =>
       entry.data.category === "checkpoint-input-recovery").length;
@@ -2409,9 +2419,15 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       .resolves.toEqual({ cancel: true });
     const manualRefusals = deadlinePi.entries.filter((entry) =>
       entry.data.category === "checkpoint-manual-compaction-refused");
-    expect(manualRefusals).toHaveLength(1);
-    expect(manualRefusals[0]?.data).toMatchObject({ action: "restart-process" });
-    expectUnconfirmedHostRecovery(String(manualRefusals[0]?.data.notice));
+    if (mode === "tui") {
+      expect(manualRefusals).toHaveLength(0);
+      expect(deadlinePi.notifications.at(-1)?.severity).toBe("warning");
+      expectUnconfirmedHostRecovery(String(deadlinePi.notifications.at(-1)?.text));
+    } else {
+      expect(manualRefusals).toHaveLength(1);
+      expect(manualRefusals[0]?.data).toMatchObject({ action: "restart-process" });
+      expectUnconfirmedHostRecovery(String(manualRefusals[0]?.data.notice));
+    }
     expect(deadlinePi.entries.filter((entry) =>
       entry.data.category === "checkpoint-input-recovery")).toHaveLength(recoveryCount);
 
@@ -3501,6 +3517,142 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     ...overrides,
   });
 
+  it("keeps TUI preparation transient without adding a resumed-success record", async () => {
+    let percent = 90;
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: percent * 10, contextWindow: 1000, percent }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      abort: () => undefined,
+    });
+    await pi.fire("session_start", { reason: "startup" }, ctx);
+    pi.entries.length = 0;
+    pi.notifications.length = 0;
+    pi.statusCalls.length = 0;
+    const { outer } = await driveResumeToResuming("tui-resumed-presentation", ctx);
+    percent = 10;
+    await pi.fire("agent_settled", {}, ctx);
+    await outer;
+
+    expect(pi.notifications).toContainEqual({
+      text: "Context checkpoint queued; waiting for safe settlement.",
+      severity: "info",
+    });
+    expect(pi.notifications.some((notification) =>
+      notification.text === "Context compacted; resumed the paused work.")).toBe(false);
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact")).toEqual([]);
+    expect(pi.messages.some((message) => message.message.customType === "picc-proactive-compact")).toBe(false);
+    expect(pi.statusCalls.filter((call) => call.key === "picc-checkpoint" && call.text !== undefined)).toEqual([]);
+  });
+
+  it.each(["print", "json", "rpc"] as const)(
+    "preserves the exact resumed success contract in %s mode",
+    async (mode) => {
+      let percent = 90;
+      const base = {
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: percent * 10, contextWindow: 1000, percent }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+        abort: () => undefined,
+      };
+      const ctx = mode === "print" ? pi.printCtx(base)
+        : mode === "rpc" ? pi.rpcCtx(base) : pi.printCtx({ ...base, mode: "json" });
+      await pi.fire("session_start", { reason: "startup" }, ctx);
+      pi.entries.length = 0;
+      pi.notifications.length = 0;
+      pi.statusCalls.length = 0;
+      const errors: string[] = [];
+      let generation = -1;
+      const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+      try {
+        const { outer } = await driveResumeToResuming(`${mode}-resumed-contract`, ctx);
+        generation = mainCheckpointGate.currentController().snapshot().generation;
+        percent = 10;
+        await pi.fire("agent_settled", {}, ctx);
+        await outer;
+      } finally {
+        errorSpy.mockRestore();
+      }
+
+      const lifecycle = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
+      const presentation = pi.entries.filter((entry) => entry.customType === "picc-proactive-compact");
+      if (mode === "print") {
+        expect(errors).toEqual([
+          "PiCC: Context checkpoint queued; waiting for safe settlement.",
+          "PiCC: Context compacted; reconnecting the paused work.",
+          "PiCC: Context compacted; resumed the paused work.",
+        ]);
+        expect(lifecycle).toEqual([]);
+      } else {
+        expect(errors).toEqual([]);
+        expect(lifecycle.map((entry) => entry.data)).toEqual([
+          {
+            category: "checkpoint-armed",
+            generation,
+            notice: "Context checkpoint queued; waiting for safe settlement.",
+          },
+          {
+            category: "checkpoint-complete",
+            generation,
+            action: "resume",
+            notice: "Context compacted; reconnecting the paused work.",
+          },
+          {
+            category: "checkpoint-resumed",
+            generation,
+            notice: "Context compacted; resumed the paused work.",
+          },
+        ]);
+      }
+      expect(presentation).toEqual([]);
+      expect(pi.notifications).toEqual([]);
+      expect(pi.statusCalls.filter((call) => call.key === "picc-checkpoint" && call.text !== undefined)).toEqual([]);
+    },
+  );
+
+  it("leaves settled-fallback success to Pi's native compaction card", async () => {
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    });
+    await pi.fire("session_start", { reason: "startup" }, ctx);
+    pi.entries.length = 0;
+    pi.notifications.length = 0;
+
+    await pi.fire("agent_settled", {}, ctx);
+
+    expect(pi.notifications).toContainEqual({
+      text: "Context checkpoint starting from the settled fallback.", severity: "info",
+    });
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact")).toEqual([]);
+  });
+
+  it.each([
+    ["info", "dim"], ["warning", "warning"], ["error", "error"],
+  ] as const)("renders %s checkpoint entries as unboxed fully wrapped chat rows", (severity, color) => {
+    const renderer = pi.entryRenderers.get("picc-proactive-compact");
+    expect(renderer).toBeDefined();
+    const roles: string[] = [];
+    const component = renderer!(
+      { data: { notice: "alpha beta gamma", severity } },
+      { expanded: false },
+      { fg: (role: string, text: string) => { roles.push(role); return text; } },
+    );
+
+    const lines = component.render(6);
+    expect(roles).toEqual([color]);
+    expect(lines).toEqual(["alpha", "beta", "gamma"]);
+    expect(lines.join(" ")).not.toContain("PiCC proactive compaction");
+  });
+
   it("abandons a resumed run when PiCC's own admission refuses its Stop continuation", async () => {
     const marker = path.join(dir, ".claude", "block-stop");
     const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
@@ -3888,6 +4040,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
      * reader's only remaining surface is stderr and there is no editor to restore into.
      */
     rendererStopped?: boolean;
+    severity: "warning" | "error";
     drive(ctx: any, controller: MidRunCompactionController, generation: number): Promise<unknown>;
     /** The claim the reader must be able to act on, which is not the same in every mode. */
     guidance(mode: string): string;
@@ -3910,12 +4063,14 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     ["a user cancellation", {
       drops: true,
       category: "checkpoint-cancelled",
+      severity: "warning",
       drive: (_ctx, controller, generation) => controller.cancel(generation, "user"),
       guidance: () => "Run /compact to recover this session",
     }],
     ["a replacement cancellation", {
       drops: true,
       category: "checkpoint-cancelled",
+      severity: "warning",
       drive: (_ctx, controller, generation) => controller.cancel(generation, "replacement"),
       guidance: () => "resend input in the new session",
     }],
@@ -3926,12 +4081,14 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       // sent them to a new session that will never exist. `quit` is the exact reason Pi's
       // `dispose()` emits, and the one it has already stopped the renderer for.
       rendererStopped: true,
+      severity: "warning",
       drive: (ctx) => pi.fire("session_shutdown", { reason: "quit" }, ctx),
       guidance: () => "stopped when the session ended",
     }],
     ["a post-commit failure", {
       drops: true,
       category: "checkpoint-exhausted",
+      severity: "error",
       drive: (_ctx, controller, generation) => controller.failAfterCommittedSummary(generation),
       guidance: (mode) => mode === "tui"
         ? "start a new session and resend the retained input"
@@ -3942,14 +4099,17 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       // is what rejects the retained input.
       drops: false,
       category: "checkpoint-exhausted",
+      severity: "error",
       drive: (ctx) => pi.fire("agent_settled", {}, ctx),
       guidance: (mode) => mode === "tui"
         ? "Run /compact, then explicitly continue"
-        : "This headless session is ephemeral and cannot be reopened",
+        : mode === "rpc"
+          ? "live RPC session can run /compact, then explicitly continue"
+          : "This headless session is ephemeral and cannot be reopened",
     }],
   ];
 
-  const modes = ["tui", "print", "json"] as const;
+  const modes = ["tui", "print", "json", "rpc"] as const;
 
   it.each(endings.flatMap(([name, ending]) =>
     modes.map((mode) => [`${name} in ${mode} mode`, mode, ending] as const)))(
@@ -3972,12 +4132,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         };
         const ctx = mode === "tui"
           ? pi.tuiCtx(ending.rendererStopped ? { ...base, ui: stoppedUi } : base)
-          : mode === "print" ? pi.printCtx(base) : pi.printCtx({ ...base, mode: "json" });
+          : mode === "print" ? pi.printCtx(base)
+            : mode === "rpc" ? pi.rpcCtx(base) : pi.printCtx({ ...base, mode: "json" });
         // The channel this mode still has when the ending arrives. A stopped TUI has none
         // of its own left: `notify` and `setEditorText` return without doing anything.
-        const channel = mode === "json"
+        const channel = mode === "json" || mode === "rpc"
           ? "lifecycle"
-          : mode === "tui" && !ending.rendererStopped ? "notification" : "stderr";
+          : mode === "tui" && !ending.rendererStopped ? "presentation" : "stderr";
         const { controller, generation } = await armCheckpoint(ctx, `ending-${mode}`, "retained by the ending");
         // After arming, not before: starting this session replaces the previous case's
         // controller, and a recoverable exhaustion that still held input reports it right
@@ -3991,12 +4152,24 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
 
         const entries = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
         const lifecycle = entries.filter((entry) => entry.data.category === ending.category);
-        // The ending reached the channel this mode actually has. A status-bar line the
-        // reader may never look at is not an announcement of a terminal, and neither is a
-        // notification handed to a renderer that has stopped.
-        if (channel === "notification") {
-          expect(pi.notifications.map((note) => note.text).join("\n"))
-            .toContain(ending.guidance(mode));
+        const presentation = pi.entries.filter((entry) => entry.customType === "picc-proactive-compact");
+        // The ending reached the channel this mode actually has. A footer line the reader
+        // may never look at is not an announcement of a terminal, and a stopped renderer
+        // cannot accept a durable chat entry.
+        if (channel === "presentation") {
+          expect(presentation).toEqual([
+            {
+              customType: "picc-proactive-compact",
+              data: { notice: expect.stringContaining(ending.guidance(mode)), severity: ending.severity },
+            },
+            ...(ending.drops ? [{
+              customType: "picc-proactive-compact",
+              data: {
+                notice: "1 queued input was not replayed; 1 text input was restored.",
+                severity: "info",
+              },
+            }] : []),
+          ]);
         } else if (channel === "stderr") {
           expect(errors.filter((line) => line.startsWith("PiCC: ")).join("\n"))
             .toContain(ending.guidance(mode));
@@ -4007,16 +4180,19 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         // Persistence is unchanged for this ending's own category: json/rpc carry every
         // category, print/TUI carry only exhaustion.
         expect(lifecycle.length)
-          .toBe(mode === "json" || ending.category === "checkpoint-exhausted" ? 1 : 0);
+          .toBe(mode === "json" || mode === "rpc" || ending.category === "checkpoint-exhausted" ? 1 : 0);
         // And nothing else widened it behind that filter: the ending's own record, plus at
         // most the input-recovery report, which every mode persists.
         expect(entries.length).toBe(lifecycle.length + (ending.drops ? 1 : 0));
+        expect(presentation).toHaveLength(channel === "presentation" ? 1 + Number(ending.drops) : 0);
+        expect(pi.messages.some((message) => message.message.customType === "picc-proactive-compact")).toBe(false);
+        expect(pi.statusCalls.filter((call) => call.key === "picc-checkpoint" && call.text !== undefined)).toEqual([]);
 
         // What the ending cost, named rather than implied — and where there is still an
         // editor, handed back into it instead of only counted. A stopped renderer must
         // report a restore of nothing rather than record text it silently discarded.
         const recovery = entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
-        const restores = channel === "notification";
+        const restores = channel === "presentation";
         expect(recovery.map((entry) => entry.data.count)).toEqual(ending.drops ? [1] : []);
         expect(recovery.map((entry) => entry.data.restoredTextCount))
           .toEqual(ending.drops ? [restores ? 1 : 0] : []);
@@ -4941,14 +5117,112 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     mainCheckpointGate.captureAcceptedInput(ctx, "with image", [{ type: "image", data: "x" }], "followUp");
     await pi.fire("agent_settled", {}, ctx);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact").at(-1)?.data)
+      .toMatchObject({ severity: "error", notice: expect.stringContaining("could not complete") });
 
+    const presentationBaseline = pi.entries.filter(
+      (entry) => entry.customType === "picc-proactive-compact",
+    ).length;
     await pi.fire("session_before_compact", { reason: "manual" }, ctx);
     await pi.fire("session_compact", { reason: "manual", compactionEntry: { summary: "manual" } }, ctx);
     expect(pi.editorText).toBe("restore me\nwith image\nexisting draft");
     const report = pi.entries.find((entry) => entry.data.category === "checkpoint-input-recovery");
     expect(report?.data).toMatchObject({ count: 2, restoredTextCount: 2, unrepresentableCount: 1 });
-    expect(pi.notifications.at(-1)?.text).toContain("must be resent");
+    pi.notifications.length = 0; // Pi's post-compaction rebuild discards transient notifications.
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact")
+      .slice(presentationBaseline).map((entry) => entry.data)).toEqual([
+      {
+        notice: "Manual compaction recovered the paused session; explicitly continue when ready.",
+        severity: "info",
+      },
+      {
+        notice: "2 queued inputs were not replayed; 2 text inputs were restored; remaining input must be resent.",
+        severity: "warning",
+      },
+    ]);
+    expect(pi.messages.some((message) => message.message.customType === "picc-proactive-compact")).toBe(false);
   });
+
+  it.each(["print", "json", "rpc"] as const)(
+    "preserves the exact manual-recovery compatibility stream in %s mode",
+    async (mode) => {
+      await mainCheckpointGate.startSession(`manual-recovery-${mode}`);
+      pi.entries.length = 0;
+      pi.notifications.length = 0;
+      const ctx = pi.ctx({
+        mode,
+        hasUI: mode === "rpc",
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        compact: (options: any) => queueMicrotask(() => options.onError(new Error("offline"))),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: `recover-${mode}`, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const result = await wrapped.execute(`recover-${mode}`, {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: `recover-${mode}`, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      mainCheckpointGate.captureAcceptedInput(ctx, "restore me", undefined, "steer");
+
+      const errors: string[] = [];
+      const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+      try {
+        await pi.fire("agent_settled", {}, ctx);
+        const generation = mainCheckpointGate.currentController().snapshot().generation;
+        const entryBaseline = pi.entries.length;
+        errors.length = 0;
+
+        await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+        await pi.fire("session_compact", {
+          reason: "manual", compactionEntry: { summary: "manual" },
+        }, ctx);
+
+        const delta = pi.entries.slice(entryBaseline);
+        const recovered = delta.filter((entry) =>
+          entry.customType === "picc-checkpoint-lifecycle" &&
+          entry.data.category === "checkpoint-recovered");
+        if (mode === "print") {
+          expect(errors).toEqual([
+            "PiCC: Manual compaction recovered the paused session; explicitly continue when ready.",
+            "PiCC: Manual compaction recovered the paused session; explicitly continue when ready.",
+            "PiCC: 1 queued input was not replayed. Resend 1 text input.",
+          ]);
+          expect(recovered).toEqual([]);
+        } else {
+          expect(errors).toEqual([]);
+          expect(recovered.map((entry) => entry.data)).toEqual([
+            {
+              category: "checkpoint-recovered",
+              generation,
+              notice: "Manual compaction recovered the paused session; explicitly continue when ready.",
+            },
+            {
+              category: "checkpoint-recovered",
+              generation,
+              notice: "Manual compaction recovered the paused session; explicitly continue when ready.",
+              action: "manual-recovery",
+            },
+          ]);
+        }
+        expect(delta.filter((entry) => entry.customType === "picc-proactive-compact")).toEqual([]);
+        expect(pi.messages.some((message) => message.message.customType === "picc-proactive-compact")).toBe(false);
+        expect(delta.at(-1)?.data).toMatchObject({
+          category: "checkpoint-input-recovery",
+          count: 1,
+          action: "resend-input",
+        });
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
 
   it("revalidates same-controller manual compact authority after an awaited PreCompact hook", async () => {
     await mainCheckpointGate.startSession("manual-hook-authority-race");
@@ -4997,7 +5271,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const marker = path.join(dir, ".claude", "block-compact");
     fs.writeFileSync(marker, "block");
     pi.compactCalls.length = 0;
-    const ctx = pi.printCtx({
+    const ctx = pi.tuiCtx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
@@ -5008,6 +5282,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         })();
       },
     });
+    pi.entries.length = 0;
     try {
       await pi.fire("agent_settled", {}, ctx);
     } finally {
@@ -5015,6 +5290,8 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
     expect(pi.compactCalls).toHaveLength(1);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact").at(-1)?.data)
+      .toMatchObject({ severity: "error", notice: expect.stringContaining("blocked by a PreCompact hook") });
   });
 
   it.each([
@@ -5209,23 +5486,39 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
   });
 
-  it("session lifecycle events reject old shadows and install a fresh controller", async () => {
-    await mainCheckpointGate.startSession("event-old");
-    const old = mainCheckpointGate.currentController();
-    mainCheckpointGate.assistantMessageEnded({
-      role: "assistant", content: [{ type: "toolCall", id: "a", name: "probe", arguments: {} }],
-    });
-    const high = pi.ctx({
+  it("records replacement cancellation in the outgoing session before installing a fresh controller", async () => {
+    const high = pi.tuiCtx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => false,
+      abort: () => undefined,
     });
-    mainCheckpointGate.turnEnded(high);
-    mainCheckpointGate.captureAcceptedInput(high, "queued", undefined, "steer");
+    await pi.fire("session_start", { reason: "startup" }, high);
+    const { controller: old } = await armCheckpoint(high, "event-old", "queued");
+    pi.entries.length = 0;
     await pi.fire("session_before_switch", {}, high);
     expect(old.snapshot().phase).toBe("cancelled");
     expect(old.queuedInputSnapshot()).toEqual([]);
+    const outgoingPresentation = pi.entries.filter((entry) => entry.customType === "picc-proactive-compact");
+    expect(outgoingPresentation).toEqual([
+      {
+        customType: "picc-proactive-compact",
+        data: {
+          notice: "Proactive context compaction stopped with the old session; resend input in the new session.",
+          severity: "warning",
+        },
+      },
+      {
+        customType: "picc-proactive-compact",
+        data: {
+          notice: "1 queued input was not replayed; 1 text input was restored.",
+          severity: "info",
+        },
+      },
+    ]);
     await pi.fire("session_start", { reason: "switch" }, high);
+    expect(pi.entries.filter((entry) => entry.customType === "picc-proactive-compact"))
+      .toEqual(outgoingPresentation);
     expect(mainCheckpointGate.currentController()).not.toBe(old);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
   });
