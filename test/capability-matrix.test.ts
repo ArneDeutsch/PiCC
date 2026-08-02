@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
+import { CAPABILITY_REGISTRY, CLAUDE_BASELINE } from "../src/registry/capability-registry.js";
 
 describe("renderCapabilityMatrix", () => {
   it("renders audited evidence, relationships, safety, ordering, and Markdown escaping", () => {
@@ -47,5 +48,19 @@ describe("renderCapabilityMatrix", () => {
     expect(rendered).toMatch(/\| `feature\.a` \| full \|  \|  \| unaudited \|/);
     expect(rendered.indexOf("`feature.a`")).toBeLessThan(rendered.indexOf("`feature.ä`"));
     expect(rendered.indexOf("`feature.ä`")).toBeLessThan(rendered.indexOf("`feature.z\\|unsafe`"));
+  });
+
+  it("projects final managed MCP claims into their own matrix rows", () => {
+    const rendered = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const row = (id: string): string => {
+      const value = rendered.split("\n").find((line) => line.startsWith(`| \`${id}\``));
+      expect(value, id).toBeDefined();
+      return value!;
+    };
+
+    expect(row("setting.allowedMcpServers")).toMatch(/⚠ \| partial[\s\S]*documented soft allowlist/);
+    expect(row("setting.allowManagedMcpServersOnly")).toContain("does not turn an ordinary soft allowlist into an immutable administrator list");
+    expect(row("feature.mcp-managed-config")).toMatch(/⚠ \| partial[\s\S]*`feature.managed-policy`[\s\S]*`feature.mcp-project-approval`[\s\S]*PiCC-defined \/mcp and \/doctor summaries[\s\S]*not Claude UI parity/);
+    expect(row("setting.strictPluginOnlyCustomization.mcp")).toContain("manual/CLI/runtime source delivery are themselves unsupported rather than governed");
   });
 });

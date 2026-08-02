@@ -106,15 +106,25 @@ hierarchies, and they are not the same set:
 recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
 than dropped.
 
-**MCP server config** is a third input: read-only native Claude user/project-local state, project
-`.mcp.json`, and the subordinate PiCC `mcpServers` settings extension. `discovery/claude-profile.ts`
-selects one coherent user profile, the native loader uses canonical project identities, and
-`discovery/mcp.ts` resolves whole entries in native local → `.mcp.json` → native user → settings
-extension order before any expansion. Project `.mcp.json` and project-origin extension servers stay
-pending until approved from a user-authored settings scope; native local/user definitions instead
-use native runtime disablement. A git-tracked `settings.local.json` is demoted to project scope so a
-cloned repo can never self-approve. Present-but-unusable authoritative native state fails MCP closed,
-while an absent native state file preserves the other inputs.
+**MCP server config** is a third input. The platform-fixed standalone `managed-mcp.json` is an
+exclusive administrator authority: its presence suppresses ordinary acquisition, including native
+Claude user/project-local state, project `.mcp.json`, and the subordinate PiCC `mcpServers` settings
+extension. `discovery/claude-profile.ts` selects one coherent user profile, the native loader uses
+canonical project identities, and `discovery/mcp.ts` otherwise resolves whole entries in native local
+→ `.mcp.json` → native user → settings extension order. It compiles one immutable managed-settings
+policy and admits each raw effective winner before expansion, approval, native disablement, or
+runtime materialization. Project `.mcp.json` and project-origin extension servers stay pending until
+approved from a user-authored settings scope; native local/user definitions instead use native
+runtime disablement. A git-tracked `settings.local.json` is demoted to project scope so a cloned repo
+can never self-approve. The fixed bounded Git classification may precede final policy admission only
+where it can change same-name winner or approval selection; inadmissible contenders do not trigger it,
+and no further classification occurs after a blocked winner is known. Present-but-unusable
+authoritative native state or standalone managed MCP fails MCP closed, while absence preserves the
+applicable lower inputs.
+
+Every current MCP source crosses this admission seam before post-admission materialization. A future
+plugin, agent-inline, or explicit runtime/CLI adapter must do the same before its source can be
+claimed as supported; those adapters do not exist today.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -127,9 +137,9 @@ artifact's *content*.
 ### `claude/` — parse each artifact format (loaders only, no runtime)
 
 One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
-with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json`, native Claude state,
-and settings `mcpServers` blocks; `mcp-config.ts` and `claude-mcp-state.ts`), and installed-plugin
-content. `src/project.ts` — at the source root, *above* the loaders, importing both `discovery/` and
+with `@import` expansion, memory, hooks config, MCP server entries (standalone `managed-mcp.json`,
+`.mcp.json`, native Claude state, and settings `mcpServers` blocks; `managed-mcp.ts`, `mcp-config.ts`,
+and `claude-mcp-state.ts`), and installed-plugin content. `src/project.ts` — at the source root, *above* the loaders, importing both `discovery/` and
 `claude/` — orchestrates them
 into one loaded project model. It sits outside this folder precisely because it depends on both:
 a loader knows one format and nothing else.
@@ -137,10 +147,10 @@ a loader knows one format and nothing else.
 Invariants across the folder:
 
 - **Loaders never throw.** Malformed ordinary input degrades to an empty value plus a diagnostic.
-  Authoritative native MCP state is the deliberate exception: absence is empty, but a present
-  unusable file returns an explicit fail-closed result so uncertainty cannot activate lower MCP
-  sources. A broken project must never crash the harness: `src/index.ts` catches load failure and
-  returns quietly.
+  Authoritative native MCP state and standalone managed MCP are deliberate exceptions: absence
+  preserves lower inputs, but a present unusable authority returns an explicit fail-closed result so
+  uncertainty cannot activate a server. A broken project must never crash the harness:
+  `src/index.ts` catches load failure and returns quietly.
 - **Progressive disclosure is a hard requirement, not an optimization.** Skill frontmatter is
   parsed; the body is **never** stored on the returned object and is re-read only on activation. A
   change that eagerly holds bodies defeats the whole design.
@@ -206,6 +216,9 @@ execution, usage mutation, or prompt-cache invalidation.
   `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`) and the `deny` engine.
   Matching is **shell-operator aware**, paths are normalized to POSIX form on Windows, and it never
   throws.
+- **`mcp-policy.ts`** — compiles bounded managed-setting contributions into one immutable admission
+  snapshot and evaluates raw stdio/remote identities deny-first, without ambient reads or runtime
+  materialization. Uncertainty that could weaken an applicable restriction fails closed.
 - **`hook-runner.ts`** — spawns `type: command` hooks, delivers the Claude Code JSON payload on
   stdin, and aggregates the exit-code / stdout-JSON contract into a single `HookOutcome`. Matching
   handlers run in parallel and merge **most-restrictive-wins**; `fire()` never throws.
@@ -307,8 +320,8 @@ where to start reading, not the extent of its cluster.
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
 
 - **MCP runtime** (`mcp.ts`, `mcp-remote.ts`, `mcp-tools.ts`, `mcp-prompts.ts`,
-  `mcp-resources.ts`) — starts the **enabled** discovery-resolved servers without blocking extension
-  load. `mcp.ts` owns transport lifecycle, capability negotiation, immutable initial tool/prompt/
+  `mcp-resources.ts`) — starts only **enabled, policy-admitted** discovery-resolved servers without
+  blocking extension load. Blocked identities never enter this layer. `mcp.ts` owns transport lifecycle, capability negotiation, immutable initial tool/prompt/
   resource snapshots, live status, and recovery-aware operations over the current client;
   `mcp-remote.ts` owns the safe remote adapter and typed failure/disconnect evidence. Tool catalogs
   become guarded `mcp__<server>__<tool>` proxies, prompt catalogs feed the user-input and palette
@@ -416,9 +429,11 @@ Single-consumer logic stays with its consumer.
 The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
 1. **Extension load.** The process env is made UTF-8-safe, then `loadClaudeProject()` assembles the
-   project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
-   multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime`
-   (enabled MCP servers begin connecting in the background, non-blocking) are constructed. All
+   project model. MCP loading resolves standalone authority and immutable managed-settings policy,
+   admits raw winners, and materializes only enabled results. `CwdState`, `PermissionEngine`,
+   `WorktreeManager`, `HookRunner` (behind a multiplexer so skill-scoped hooks can be added
+   dynamically), `SubagentRuntime`, and `McpRuntime` (admitted enabled MCP servers begin connecting
+   in the background, non-blocking) are constructed. All
    Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard
    extension is installed on tool events, and extension load creates the MCP exposure transaction.
    When initial settlement completes, that transaction publishes stable proxies, the prompt command

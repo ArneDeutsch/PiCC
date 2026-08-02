@@ -166,7 +166,7 @@ user-profile base when an override is selected.
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific approval and disablement apply |
+| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific policy, approval, and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -618,10 +618,10 @@ user profile for user-scoped settings and artifacts, imported installed-plugin s
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
 roots remain in effect.
 
-Native definitions resolve as whole entries in local → project `.mcp.json` → user order; the PiCC
-settings `mcpServers` compatibility extension is lower priority, with its existing managed →
-untracked local → project → user ordering. Fields never merge across same-name definitions. Native
-user and local winners start without the project approval gate. Project `.mcp.json` and committed
+When standalone managed MCP is absent, native definitions resolve as whole entries in local →
+project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
+priority, with its existing managed → untracked local → project → user ordering. Fields never merge
+across same-name definitions. Native user and local winners start without the project approval gate. Project `.mcp.json` and committed
 project-settings extension winners remain pending until approved as described below. An exact name
 in the selected native project's `disabledMcpServers` disables an authentic native or `.mcp.json`
 winner before expansion. `enabledMcpServers` is recognized and reported but cannot activate
@@ -634,13 +634,33 @@ For project-local native state, PiCC canonicalizes real paths so equivalent spel
 select the same record. A verified linked worktree also considers its main checkout identity. This
 is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
 
-A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
-present but unusable (for example, malformed or unreadable), PiCC starts no MCP server and emits a
-bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
+Without standalone exclusive control, a missing native state file preserves `.mcp.json` and
+settings-extension sources. If the file is present but unusable (for example, malformed or
+unreadable), PiCC starts no MCP server and emits a bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
 command: restore a known-good backup of the active profile or its native state. If no
 known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC
 after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
 These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
+
+**Managed MCP policy.** A valid platform-fixed `managed-mcp.json` is exclusive: a populated file
+suppresses ordinary sources and an empty server set disables MCP. Its fixed path is
+`C:\Program Files\ClaudeCode\managed-mcp.json` on Windows,
+`/Library/Application Support/ClaudeCode/managed-mcp.json` on macOS, and
+`/etc/claude-code/managed-mcp.json` on Linux; it is distinct from `managed-settings.json`. Managed
+settings deny rules always win; allow contributions are documented soft lists that can be broadened
+by valid lower scopes unless `allowManagedMcpServersOnly` is active. Claude's managed validation
+treats an invalid allow list as active-empty, drops an invalid deny list, and treats invalid
+managed-only as true. PiCC fails the snapshot closed when applicable source uncertainty may have lost
+restrictive material; over-limit allow material becomes active-empty, while ambiguous or over-limit
+candidate identities are blocked individually. Admission uses only bounded identity interpolation
+from one startup environment snapshot. The fixed bounded PiCC-owned Git tracking classification may
+run only when winner or approval selection needs it. After a winner is blocked, no further probe,
+server-controlled helper, MCP server process, DNS lookup, or network activity occurs. `/mcp` and
+`/doctor` show PiCC-defined structured posture, blocked reasons, and authority-specific remediation:
+repair user policy yourself, ask an administrator to repair managed policy, or do both for mixed
+authority. One bounded warning appears at extension startup for an empty exclusive set, fail-closed
+policy, or blocked servers. See the [capability matrix](supported-features.md) for exact matching,
+limits, deferred sources, and presentation differences.
 
 **Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
 the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient

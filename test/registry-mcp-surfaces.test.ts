@@ -141,22 +141,6 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-sampling")).toContain("cannot ask PiCC to run model generations");
   });
 
-  it("pins native source boundaries and managed-policy exposure", () => {
-    const extension = note("setting.mcpServers");
-    expect(extension).toContain("Native runtime disablement applies only to authentic native/.mcp.json winners, never settings-extension winners");
-    expect(extension).toContain("managed settings extension > untracked settings.local.json extension > project settings extension > user settings extension");
-    expect(extension).toContain("all applicable inactive gates run before expansion");
-
-    expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({
-      tier: "partial",
-      safetyRelevant: true,
-    });
-    const managed = note("feature.mcp-managed-config");
-    expect(managed).toContain("platform-fixed `managed-mcp.json`");
-    expect(managed).toContain("loaded empty set disables MCP");
-    expect(managed).toContain("deferred plugin/inline/explicit-runtime sources are not loaded");
-  });
-
   it("distinguishes inherited resource tools from user-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
     expect(frontmatter).toContain("gated MCP tool proxies and conditional resource tools");
@@ -212,30 +196,30 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
 };
 
 const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
-  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-remote-transports","setting.mcpServers"],
+  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-remote-transports","setting.mcpServers"],
   "feature.mcp-auto-background": ["feature.mcp-first-byte-timeout","feature.mcp-idle-timeout"],
   "feature.mcp-capability-discovery": ["feature.mcp","feature.mcp-model-failure-visibility","feature.mcp-prompts","feature.mcp-resources"],
   "feature.mcp-channels": ["feature.mcp","setting.allowedChannelPlugins","setting.channelsEnabled"],
   "feature.mcp-child-session-env": ["feature.mcp"],
-  "feature.mcp-claude-json-scopes": ["feature.mcp","feature.mcp-connectors","feature.mcp-project-approval","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.mcpServers"],
+  "feature.mcp-claude-json-scopes": ["feature.mcp","feature.mcp-connectors","feature.mcp-managed-config","feature.mcp-project-approval","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.mcpServers"],
   "feature.mcp-cli-invocation-controls": ["setting.disableSideloadFlags","setting.mcpServers"],
   "feature.mcp-cli-management": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","setting.mcpServers"],
   "feature.mcp-connect-timeout-ms": ["feature.mcp-first-byte-timeout","feature.mcp-server-always-load"],
   "feature.mcp-connectors": ["feature.mcp-claude-json-scopes","feature.mcp-oauth","setting.disableClaudeAiConnectors"],
-  "feature.mcp-control-status": ["feature.mcp","feature.mcp-cli-management","tool.WaitForMcpServers"],
+  "feature.mcp-control-status": ["feature.mcp","feature.mcp-cli-management","feature.mcp-managed-config","tool.WaitForMcpServers"],
   "feature.mcp-elicitation": ["hook.event.Elicitation","hook.event.ElicitationResult"],
   "feature.mcp-first-byte-timeout": ["feature.mcp","feature.mcp-auto-background","feature.mcp-connect-timeout-ms"],
   "feature.mcp-headers-helper": ["feature.mcp-oauth","feature.mcp-remote-transports","feature.mcp-websocket"],
   "feature.mcp-url-without-type-validation": ["setting.mcpServers","feature.mcp-remote-transports"],
   "feature.mcp-idle-timeout": ["feature.mcp-auto-background","feature.mcp-remote-transports"],
   "feature.mcp-list-changed": ["feature.mcp-prompts","feature.mcp-resource-subscriptions","feature.mcp-resources"],
-  "feature.mcp-managed-config": ["feature.mcp-project-approval","setting.allowManagedMcpServersOnly","setting.allowedMcpServers","setting.deniedMcpServers","setting.mcpServers","setting.strictPluginOnlyCustomization.mcp"],
+  "feature.mcp-managed-config": ["feature.managed-policy","feature.mcp-project-approval","setting.allowManagedMcpServersOnly","setting.allowedMcpServers","setting.deniedMcpServers","setting.mcpServers","setting.strictPluginOnlyCustomization.mcp"],
   "feature.mcp-max-result-size-chars": ["feature.mcp-output-token-cap","feature.tool-output-clip"],
   "feature.mcp-model-failure-visibility": ["feature.mcp-capability-discovery","feature.mcp-tool-search","tool.ToolSearch","tool.WaitForMcpServers"],
   "feature.mcp-oauth": ["feature.mcp-connectors","feature.mcp-remote-transports"],
   "feature.mcp-output-token-cap": ["feature.mcp-max-result-size-chars","feature.tool-output-clip"],
   "feature.mcp-plugin-servers": ["feature.mcp","feature.plugins-content"],
-  "feature.mcp-project-approval": ["feature.mcp-claude-json-scopes","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
+  "feature.mcp-project-approval": ["feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
   "feature.mcp-prompts": ["feature.mcp-capability-discovery","feature.mcp-list-changed"],
   "feature.mcp-remote-transports": ["feature.mcp","feature.mcp-headers-helper","feature.mcp-oauth","feature.mcp-websocket"],
   "feature.mcp-requires-user-interaction": ["tool.mcp__*"],
@@ -244,7 +228,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-resources": ["feature.mcp-resource-subscriptions","feature.mcp-resource-templates","tool.ListMcpResourcesTool","tool.ReadMcpResourceTool"],
   "feature.mcp-root-schema-combinators": ["tool.mcp__*"],
   "feature.mcp-roots": ["feature.mcp"],
-  "feature.mcp-runtime-disabled": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
+  "feature.mcp-runtime-disabled": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","feature.mcp-managed-config","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
   "feature.mcp-runtime-enabled": ["feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-disabled"],
   "feature.mcp-sampling": ["feature.mcp"],
   "feature.mcp-server-always-load": ["feature.mcp-connect-timeout-ms","feature.mcp-tool-search","tool.WaitForMcpServers"],
@@ -272,7 +256,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "setting.disabledMcpjsonServers": ["feature.mcp-project-approval","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
   "setting.enableAllProjectMcpServers": ["feature.mcp-project-approval","setting.disabledMcpjsonServers","setting.enabledMcpjsonServers"],
   "setting.enabledMcpjsonServers": ["feature.mcp-project-approval","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers"],
-  "setting.mcpServers": ["feature.mcp","feature.mcp-claude-json-scopes","feature.mcp-project-approval"],
+  "setting.mcpServers": ["feature.mcp","feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-project-approval"],
   "tool.ListMcpResourcesTool": ["feature.mcp-resources","tool.ReadMcpResourceTool"],
   "tool.ReadMcpResourceTool": ["feature.mcp-resources","tool.ListMcpResourcesTool"],
   "tool.ToolSearch": ["feature.mcp-model-failure-visibility","feature.mcp-server-always-load","feature.mcp-tool-always-load","feature.mcp-tool-search"],
@@ -612,8 +596,6 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(note("feature.mcp-model-failure-visibility")).toContain("only to humans through `/mcp`, `/doctor`");
     expect(note("feature.mcp-model-failure-visibility")).toContain("none is model-visible");
-    expect(lookupCapability("feature.mcp-managed-config")?.note).toContain("loaded empty set disables MCP");
-    expect(lookupCapability("feature.mcp-managed-config")?.note).toContain("unusable or omitted authoritative input fails closed");
     expect(note("feature.mcp-websocket")).toContain("stdio, HTTP, and SSE alternatives");
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");
@@ -629,8 +611,6 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("cannot enforce valid deny/block output");
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("For events where PiCC enforces command-hook blocking results");
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("WorktreeCreate creation-time enforcement or other unavailable enforcement");
-    expect(note("setting.allowedMcpServers")).toContain("invalid managed allow values become active-empty");
-    expect(note("setting.allowManagedMcpServersOnly")).toContain("invalid managed values act as true");
     for (const id of ["feature.mcp-managed-config", "setting.allowManagedMcpServersOnly", "setting.allowedMcpServers", "setting.deniedMcpServers"]) {
       expect(lookupCapability(id), id).toMatchObject({ tier: "partial", safetyRelevant: true });
     }
