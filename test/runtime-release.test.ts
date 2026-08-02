@@ -377,8 +377,13 @@ describe("schema-v1 runtime artifact policy", () => {
     ["dependencies", "jiti"],
     ["optionalDependencies", "jiti"],
     ["dependencies", "JITI"],
+    ["peerDependencies", "JiTi"],
   ])("rejects a direct production loader in %s as %s", (field, loader) => {
     expectInvariant(() => verify(validArtifact({ packageJson: { ...PACKAGE, [field]: { [loader]: "2.7.0" } } })), /runtime loader/u);
+  });
+
+  it.each(["dependencies", "optionalDependencies", "peerDependencies"])("rejects malformed %s metadata", (field) => {
+    expectInvariant(() => verify(validArtifact({ packageJson: { ...PACKAGE, [field]: null } })), new RegExp(`package ${field} has an invalid shape`, "u"));
   });
 
   it("rejects unsafe and wrong-recorded-source maps even when hashes are self-consistent", () => {

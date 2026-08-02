@@ -169,7 +169,7 @@ function verifyMap(manifestPath, content, sourcePaths) {
 }
 
 function productionLoaderDeclared(packageJson) {
-  for (const field of ["dependencies", "optionalDependencies"]) {
+  for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
     const declarations = packageJson?.[field];
     if (declarations !== undefined && (declarations === null || typeof declarations !== "object" || Array.isArray(declarations))) {
       fail(`package ${field} has an invalid shape`);

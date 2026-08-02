@@ -443,7 +443,7 @@ describe("compiled runtime identity", () => {
       ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts" },
       notice: {
         category: "missing",
-        message: "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.",
+        message: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.",
       },
     });
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({
@@ -458,14 +458,14 @@ describe("compiled runtime identity", () => {
       ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts" },
       notice: {
         category: "source-stale",
-        message: "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.",
+        message: "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.",
       },
     });
     fs.appendFileSync(path.join(fixtureRoot, "dist", "index.js"), "// corrupt\n");
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" })).toStrictEqual({
       ok: false,
       category: "corrupt",
-      reason: "The source-checkout compiled runtime is damaged. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC.",
+      reason: "The source-checkout compiled runtime is damaged. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.",
     });
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({
       ok: false,
@@ -593,7 +593,7 @@ describe("compiled runtime identity", () => {
     const saved = path.join(fixtureRoot, "saved dist");
     fs.renameSync(path.join(fixtureRoot, "dist"), saved);
     await expect(import(`${wrapperUrl}?source-missing`)).rejects.toMatchObject({
-      message: "The source-checkout compiled PiCC runtime is unavailable or damaged. Run `node scripts/build-runtime.mjs`, exit PiCC, and relaunch.",
+      message: "The source-checkout compiled PiCC runtime is unavailable or damaged. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch.",
     });
     fs.renameSync(saved, path.join(fixtureRoot, "dist"));
 
@@ -601,7 +601,7 @@ describe("compiled runtime identity", () => {
     fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// reload drift\n");
     const staleImport = import(`${wrapperUrl}?source-stale`);
     await expect(staleImport).rejects.toMatchObject({
-      message: "The compiled runtime does not match this checkout. Run `node scripts/build-runtime.mjs`, exit PiCC, and relaunch; `/reload` cannot switch runtime representation.",
+      message: "The compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch; `/reload` cannot switch runtime representation.",
     });
     await staleImport.catch((error: unknown) => {
       expect(String(error)).not.toContain(fixtureRoot);

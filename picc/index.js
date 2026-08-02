@@ -15,10 +15,10 @@ try {
 const verified = verifyCompiledRuntime({ packageRoot, checkSource: sourceCheckout });
 if (!verified.ok) {
   if (sourceCheckout && verified.category === "source-stale") {
-    throw new Error("The compiled runtime does not match this checkout. Run `node scripts/build-runtime.mjs`, exit PiCC, and relaunch; `/reload` cannot switch runtime representation.");
+    throw new Error("The compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch; `/reload` cannot switch runtime representation.");
   }
   if (sourceCheckout) {
-    throw new Error("The source-checkout compiled PiCC runtime is unavailable or damaged. Run `node scripts/build-runtime.mjs`, exit PiCC, and relaunch.");
+    throw new Error("The source-checkout compiled PiCC runtime is unavailable or damaged. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch.");
   }
   throw new Error("The installed PiCC runtime is unavailable, damaged, or version-incoherent. Update or reinstall PiCC, then relaunch.");
 }

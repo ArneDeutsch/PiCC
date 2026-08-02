@@ -531,7 +531,7 @@ process.exit(23);
       });
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("source-checkout compiled runtime is damaged");
-      expect(result.stderr).toContain("node scripts/build-runtime.mjs");
+      expect(result.stderr).toContain("npm run build");
       expect(result.stderr).not.toContain("using TypeScript source");
     }
     expect(fs.existsSync(piCanary)).toBe(false);
@@ -558,11 +558,46 @@ process.exit(23);
       expect(result.stdout).toContain(state === "corrupt"
         ? "Runtime unavailable (corrupt): The source-checkout compiled runtime is damaged."
         : "Runtime source fallback (source-stale): PiCC is using TypeScript source because the compiled runtime does not match this checkout.");
-      expect(result.stdout).toContain("Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC");
+      expect(result.stdout).toContain("Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC");
       expect(result.stdout).toContain(state === "corrupt" ? "Runtime unavailable" : "Runtime source fallback");
       expect(result.stdout).not.toMatch(/[0-9a-f]{64}/u);
       expect(result.stdout).not.toContain(root);
     }
+  });
+
+  it("keeps source-checkout recovery actionable when the runtime selector cannot import", () => {
+    const root = makePackage();
+    installLauncher(root);
+    fs.rmSync(path.join(root, "bin", "picc-runtime.mjs"));
+    const piCanary = path.join(root, "pi-started");
+    write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+      `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(piCanary)}, "started");`);
+
+    const cases = [
+      {
+        argv: ["--version"],
+        expected: {
+          status: 0,
+          stdout: "PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\nRuntime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+          stderr: "",
+        },
+      },
+      {
+        argv: [],
+        expected: {
+          status: 1,
+          stdout: "",
+          stderr: "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+        },
+      },
+    ] as const;
+    for (const { argv, expected } of cases) {
+      const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
+        cwd: root, encoding: "utf8",
+      });
+      expect(result, argv.join(" ") || "normal launch").toMatchObject(expected);
+    }
+    expect(fs.existsSync(piCanary)).toBe(false);
   });
 
   it("routes installed and source-classified compiled plugin list/details through only the verified inventory entry", () => {
@@ -606,7 +641,7 @@ process.exit(23);
     });
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
-    expect(result.stderr.trim()).toBe("PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\nPiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.");
+    expect(result.stderr.trim()).toBe("PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\nPiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.");
     expect(fs.existsSync(piCanary)).toBe(false);
   });
 
@@ -625,7 +660,7 @@ process.exit(23);
     expect(local).toMatchObject({
       status: 0,
       stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\n",
+      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
     });
 
     const prefix = temp("picc-plugin-loader-");
@@ -657,7 +692,7 @@ process.exit(23);
     });
     expect(escaped).toMatchObject({
       status: 0, stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\n",
+      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
     });
     expect(fs.existsSync(escapedCanary)).toBe(false);
 
@@ -673,7 +708,7 @@ process.exit(23);
     });
     expect(rejected).toMatchObject({
       status: 0, stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\n",
+      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
     });
     expect(fs.existsSync(rejectedCanary)).toBe(false);
   });
@@ -972,14 +1007,14 @@ require("node:module").syncBuiltinESMExports();
       cwd: root, encoding: "utf8",
     });
     expect(version).toMatchObject({ status: 0, stderr: "" });
-    expect(version.stdout).toBe("PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\n");
+    expect(version.stdout).toBe("PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n");
 
     const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
       cwd: root, encoding: "utf8",
     });
     expect(plugins).toMatchObject({
       status: 0, stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup.\n",
+      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
     });
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
       "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",

@@ -26,7 +26,7 @@ their package manager and are never modified by PiCC.`;
 const NPM_FLAGS = Object.freeze(["--ignore-scripts", "--no-audit", "--no-fund"]);
 const CHILD_OUTPUT_LIMIT = 64 * 1024;
 const PI_UPDATE_SUFFIX = "Run `picc update` or reinstall PiCC.";
-const SOURCE_BUILD_COMMAND = "node scripts/build-runtime.mjs";
+const SOURCE_BUILD_COMMAND = "npm run build";
 const SOURCE_NPM_COMMAND = "npm ci --ignore-scripts --no-audit --no-fund";
 
 function readManifest(root) {
@@ -97,7 +97,7 @@ async function inspectSource(root, runGit) {
     return {
       ok: false,
       dirty: true,
-      reason: `PiCC: update refused because the source checkout has staged, unstaged, unmerged, or untracked changes. Keep intentional edits and run \`${SOURCE_BUILD_COMMAND}\` to refresh the compiled runtime.`,
+      reason: `PiCC: update refused because the source checkout has staged, unstaged, unmerged, or untracked changes. Keep intentional edits and run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root to refresh the compiled runtime.`,
     };
   }
   return { ok: true, dirty: false };
@@ -140,11 +140,11 @@ function reportSourceCheck({ source, product, output }) {
   }
   if (productFailed) {
     if (!product.runtime.ok && !product.suite.ok) {
-      output.error(`After correcting the reported problems, run \`${SOURCE_NPM_COMMAND}\`, then \`${SOURCE_BUILD_COMMAND}\`, then \`picc update --check\`.`);
+      output.error(`After correcting the reported problems, run \`${SOURCE_NPM_COMMAND}\` from the PiCC checkout root, then run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     } else if (!product.runtime.ok) {
-      output.error(`After correcting the reported runtime problem, run \`${SOURCE_BUILD_COMMAND}\`, then \`picc update --check\`.`);
+      output.error(`After correcting the reported runtime problem, run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     } else {
-      output.error(`After correcting the reported dependency problem, run \`${SOURCE_NPM_COMMAND}\`, then \`picc update --check\`.`);
+      output.error(`After correcting the reported dependency problem, run \`${SOURCE_NPM_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     }
   }
   if (failed) return 1;
@@ -173,19 +173,19 @@ async function handleSource({ action, root, output, runGit, runNpm, buildRuntime
   } catch (error) {
     const detail = boundedDetail(error instanceof Error ? error.message : String(error));
     output.error(`PiCC: dependency synchronization completed but the compiled runtime build failed${detail ? `: ${detail}` : "."}`);
-    output.error(`After correcting the reported build error, run \`${SOURCE_BUILD_COMMAND}\`, then run \`picc update --check\`.`);
+    output.error(`After correcting the reported build error, run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     return 1;
   }
   const runtime = await validateRuntime({ packageRoot: root, checkSource: true });
   if (!runtime.ok) {
     output.error(`PiCC: the runtime build completed but product validation failed. ${runtimeReason(runtime)}`);
-    output.error(`After correcting the reported runtime problem, run \`${SOURCE_BUILD_COMMAND}\`, then run \`picc update --check\`.`);
+    output.error(`After correcting the reported runtime problem, run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     return 1;
   }
   const suite = await validateSuite({ packageRoot: root });
   if (!suite.ok) {
     output.error(`PiCC: the runtime build completed but Pi validation failed. ${updaterPiReason(suite)}`);
-    output.error(`After correcting the reported embedded Pi problem, run \`${SOURCE_NPM_COMMAND}\`, then \`${SOURCE_BUILD_COMMAND}\`, then \`picc update --check\`.`);
+    output.error(`After correcting the reported embedded Pi problem, run \`${SOURCE_NPM_COMMAND}\` from the PiCC checkout root, then run \`${SOURCE_BUILD_COMMAND}\` from the PiCC checkout root, then run \`picc update --check\`.`);
     return 1;
   }
   output.log(`Outcome: synchronized dependencies and verified the compiled runtime for this revision (embedded Pi ${suite.version}).`);

@@ -359,12 +359,12 @@ export function selectPiccRuntime({ packageRoot, installationKind }) {
   if (verified.ok) return { ok: true, mode: "compiled", entries: verified.entries, manifest: verified.manifest, notice: null };
   if (installationKind === "source" && (verified.category === "missing" || verified.category === "source-stale")) {
     const message = verified.category === "missing"
-      ? "PiCC is using TypeScript source because the compiled runtime is missing. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC to restore compiled startup."
-      : "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.";
+      ? "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup."
+      : "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.";
     return { ok: true, mode: "source", entries: { extensionPath: SOURCE_EXTENSION_ENTRY, pluginInventoryPath: SOURCE_INVENTORY_ENTRY }, notice: { category: verified.category, message } };
   }
   const reason = installationKind === "installed"
     ? `The installed PiCC runtime is ${verified.category === "missing" ? "missing" : verified.category === "version-mismatch" ? "version-incoherent" : "damaged"}. Update or reinstall PiCC, then relaunch.`
-    : "The source-checkout compiled runtime is damaged. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC.";
+    : "The source-checkout compiled runtime is damaged. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.";
   return { ok: false, category: verified.category, reason };
 }

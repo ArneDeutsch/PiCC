@@ -67,7 +67,7 @@ async function main() {
         status = runtimeStatus(await selectRuntime(packageRoot, installationKind), installationKind);
       } catch {
         status = installationKind === "source"
-          ? "Runtime unavailable (launcher): Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC."
+          ? "Runtime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC."
           : "Runtime unavailable (launcher): TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.";
       }
       console.log(`PiCC ${manifest.version}\nEmbedded Pi ${suite.ok ? suite.version : "unavailable/incoherent"}\nInstall ${installationKind}\n${status}`);
@@ -108,7 +108,7 @@ async function main() {
       selection = await selectRuntime(packageRoot, installationKind);
     } catch {
       return fail(installationKind === "source"
-        ? "PiCC: runtime selection is unavailable. Run `node scripts/build-runtime.mjs`, then exit and relaunch PiCC."
+        ? "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC."
         : "PiCC: runtime selection is unavailable. TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.");
     }
     if (!selection.ok) return fail(runtimeFailure(selection, installationKind));

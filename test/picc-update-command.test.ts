@@ -137,7 +137,7 @@ describe("source checkout update", () => {
     expect(calls).toEqual(["runtime", "pi"]);
     expect(capture.logs).toEqual([]);
     expect(capture.errors).toEqual([
-      "PiCC: update refused because the source checkout has staged, unstaged, unmerged, or untracked changes. Keep intentional edits and run `node scripts/build-runtime.mjs` to refresh the compiled runtime.",
+      "PiCC: update refused because the source checkout has staged, unstaged, unmerged, or untracked changes. Keep intentional edits and run `npm run build` from the PiCC checkout root to refresh the compiled runtime.",
     ]);
   });
 
@@ -148,7 +148,7 @@ describe("source checkout update", () => {
       suite: healthySuite(),
       expectedErrors: [
         "Outcome: the source checkout runtime needs rebuilding. Runtime is stale.",
-        "After correcting the reported runtime problem, run `node scripts/build-runtime.mjs`, then `picc update --check`.",
+        "After correcting the reported runtime problem, run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
       ],
     },
     {
@@ -157,7 +157,7 @@ describe("source checkout update", () => {
       suite: piFailure("The embedded Pi CLI is unavailable"),
       expectedErrors: [
         "Outcome: source dependencies are not coherent. The embedded Pi CLI is unavailable.",
-        "After correcting the reported dependency problem, run `npm ci --ignore-scripts --no-audit --no-fund`, then `picc update --check`.",
+        "After correcting the reported dependency problem, run `npm ci --ignore-scripts --no-audit --no-fund` from the PiCC checkout root, then run `picc update --check`.",
       ],
     },
     {
@@ -167,7 +167,7 @@ describe("source checkout update", () => {
       expectedErrors: [
         "Outcome: the source checkout runtime needs rebuilding. Runtime is stale.",
         "Outcome: source dependencies are not coherent. The embedded Pi CLI is unavailable.",
-        "After correcting the reported problems, run `npm ci --ignore-scripts --no-audit --no-fund`, then `node scripts/build-runtime.mjs`, then `picc update --check`.",
+        "After correcting the reported problems, run `npm ci --ignore-scripts --no-audit --no-fund` from the PiCC checkout root, then run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
       ],
     },
   ])("rejects a clean check for a $kind failure with component-aware recovery", async ({ runtime, suite, expectedErrors }) => {
@@ -265,7 +265,7 @@ describe("source checkout update", () => {
     expect(buildCalls).toEqual([]);
     expect(buildCapture.errors).toEqual([
       "PiCC: dependency synchronization completed but the compiled runtime build failed: compile failed",
-      "After correcting the reported build error, run `node scripts/build-runtime.mjs`, then run `picc update --check`.",
+      "After correcting the reported build error, run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
     ]);
 
     const runtimeCalls: string[] = [];
@@ -282,7 +282,7 @@ describe("source checkout update", () => {
     expect(runtimeCalls).toEqual([]);
     expect(runtimeCapture.errors).toEqual([
       "PiCC: the runtime build completed but product validation failed. bad runtime",
-      "After correcting the reported runtime problem, run `node scripts/build-runtime.mjs`, then run `picc update --check`.",
+      "After correcting the reported runtime problem, run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
     ]);
   });
 
@@ -304,7 +304,7 @@ describe("source checkout update", () => {
     expect(capture.errors.join("\n")).toMatch(/Pi validation failed.*pi-ai is 0\.82\.0; expected 0\.83\.0/i);
     expect(capture.errors).toEqual([
       "PiCC: the runtime build completed but Pi validation failed. @earendil-works/pi-ai is 0.82.0; expected 0.83.0.",
-      "After correcting the reported embedded Pi problem, run `npm ci --ignore-scripts --no-audit --no-fund`, then `node scripts/build-runtime.mjs`, then `picc update --check`.",
+      "After correcting the reported embedded Pi problem, run `npm ci --ignore-scripts --no-audit --no-fund` from the PiCC checkout root, then run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
     ]);
     expect(capture.errors.join("\n")).not.toContain("Run `picc update` or reinstall PiCC.");
   });
