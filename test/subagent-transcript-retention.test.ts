@@ -21,7 +21,8 @@ afterEach(() => {
 });
 
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-reaper-"));
+  // GitHub Windows may return an aliased temp root; match the reaper's native-canonical path identity.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-reaper-")));
   roots.push(root);
   const cwd = fs.mkdtempSync(path.join(root, "cwd-"));
   const active = SessionManager.create(cwd, root, { id: `active-${roots.length}` });
