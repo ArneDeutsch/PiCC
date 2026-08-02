@@ -178,6 +178,8 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
   it.each([
     ["valid workflows", { workflows: "./workflow.json" }, "workflows", 1, 0],
     ["malformed workflows", { workflows: {} }, "workflows", 0, 1],
+    ["workflow with internal parent segment", { workflows: "./safe/../private.json" }, "workflows", 0, 1],
+    ["workflow with internal dot segment", { workflows: "./safe/./private.json" }, "workflows", 0, 1],
     ["valid output styles", { outputStyles: ["./style.md"] }, "outputStyles", 1, 0],
     ["malformed output styles", { outputStyles: 7 }, "outputStyles", 0, 1],
     ["valid top-level themes", { themes: "./theme.json" }, "themes", 1, 0],
@@ -187,7 +189,11 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     ["valid inline monitor always", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "always" }] }, "monitors", 1, 0],
     ["valid inline monitor skill invoke", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:build" }] }, "monitors", 1, 0],
     ["malformed monitor", { monitors: [{ name: "watch", command: "SECRET" }] }, "monitors", 0, 1],
+    ["empty monitor name", { monitors: [{ name: "", command: "SECRET", description: "Watch" }] }, "monitors", 0, 1],
+    ["empty monitor command", { monitors: [{ name: "watch", command: "", description: "Watch" }] }, "monitors", 0, 1],
+    ["empty monitor description", { monitors: [{ name: "watch", command: "SECRET", description: "" }] }, "monitors", 0, 1],
     ["empty skill invoke monitor", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:" }] }, "monitors", 0, 1],
+    ["arbitrary invalid monitor when", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "sometimes" }] }, "monitors", 0, 1],
     ["unknown monitor field", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", extra: true }] }, "monitors", 0, 1],
     ["valid channel display name and closed userConfig", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: "Events", userConfig: {
       text: { type: "string", title: "Text", description: "Text", default: "SECRET" },
@@ -201,6 +207,8 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
     ["unknown channel field", { mcpServers: { events: {} }, channels: [{ server: "events", extra: true }] }, "channels", 0, 1],
     ["missing channel server declaration", { channels: [{ server: "events" }] }, "channels", 0, 1],
     ["non-object userConfig option", channelWithOption("invalid"), "channels", 0, 1],
+    ["empty userConfig title", channelWithOption({ type: "string", title: "", description: "Token" }), "channels", 0, 1],
+    ["empty userConfig description", channelWithOption({ type: "string", title: "Token", description: "" }), "channels", 0, 1],
     ["required wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", required: "yes" }), "channels", 0, 1],
     ["sensitive wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", sensitive: 1 }), "channels", 0, 1],
     ["multiple wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: "yes" }), "channels", 0, 1],
@@ -229,6 +237,29 @@ describe("resolveInstalledPlugins — installed identity selection", () => {
       severity: "warning", message: `Plugin manifest metadata field ${field} has an invalid type or unsafe value and was ignored`,
     })));
     expect(JSON.stringify(result.projection)).not.toMatch(/SECRET|watch|events|Events|Token|C:\/|\/SECRET/u);
+  });
+
+  it("omits uncertain nested channel evidence while preserving valid and invalid siblings", () => {
+    const options = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`option${index}`, { type: "string", title: "Title", description: "Description" }]));
+    const servers = Object.fromEntries(["events", ...Array.from({ length: 64 }, (_, index) => `server${index}`)].map((key) => [key, {}]));
+    const result = projectPluginManifest({
+      mcpServers: servers,
+      channels: [
+        { server: "events" },
+        { server: "events", userConfig: options },
+        { server: "events", userConfig: { list: { type: "string", title: "List", description: "List", multiple: true, default: Array.from({ length: 65 }, () => "value") } } },
+        { server: "server63" },
+        { server: "events", extra: true },
+      ],
+    });
+    expect(result.projection.components.filter((component) => component.field === "channels")).toEqual([
+      { field: "channels", declaration: "shape", count: 1 },
+    ]);
+    expect(result.projection.omissions?.components).toBe(3);
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.message.includes("nested evidence exceeded observation limits"))).toHaveLength(3);
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.message.includes("channels has an invalid type or unsafe value"))).toEqual([{
+      severity: "warning", message: "Plugin manifest metadata field channels has an invalid type or unsafe value and was ignored",
+    }]);
   });
 
   it("represents false, missing, absent, unsupported, malformed, and unreadable state without loading", () => {

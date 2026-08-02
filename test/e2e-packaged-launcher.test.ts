@@ -238,17 +238,20 @@ it(
       networkRequests += 1;
       response.writeHead(500).end();
     });
+    let runtimeEntrypoint: string | undefined;
+    let savedRuntimeEntrypoint: Buffer | undefined;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
-    const address = server.address();
-    if (address === null || typeof address === "string") throw new Error("network canary did not bind");
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("network canary did not bind");
 
-    const writeJson = (filename: string, value: unknown) => {
-      fs.mkdirSync(path.dirname(filename), { recursive: true });
-      fs.writeFileSync(filename, JSON.stringify(value));
-    };
+      const writeJson = (filename: string, value: unknown) => {
+        fs.mkdirSync(path.dirname(filename), { recursive: true });
+        fs.writeFileSync(filename, JSON.stringify(value));
+      };
     writeJson(path.join(userDir, "settings.json"), {
       enabledPlugins: { "hostile@market": true },
       hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'settings-hook')`] }] }] },
@@ -320,9 +323,8 @@ require("node:module").syncBuiltinESMExports();
       });
     });
 
-    const runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
-    const savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
-    try {
+      runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
+      savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
       fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(runtimeCanary)}, "executed"); export default function canary() {}\n`);
       const list = await run(["list"]);
       expect(list).toMatchObject({
@@ -364,7 +366,7 @@ require("node:module").syncBuiltinESMExports();
       expect(treeSnapshot(project)).toEqual(beforeProject);
       expect(treeSnapshot(userDir)).toEqual(beforeProfile);
     } finally {
-      fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint);
+      if (runtimeEntrypoint !== undefined && savedRuntimeEntrypoint !== undefined) fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint);
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   },

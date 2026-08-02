@@ -458,6 +458,8 @@ describe("loadPluginMarketplaceState", () => {
   it.each([
     ["valid workflows", { workflows: "./workflow.json" }, "workflows", 1, false],
     ["malformed workflows", { workflows: {} }, "workflows", 0, false],
+    ["workflow with internal parent segment", { workflows: "./safe/../private.json" }, "workflows", 0, false],
+    ["workflow with internal dot segment", { workflows: "./safe/./private.json" }, "workflows", 0, false],
     ["valid output styles", { outputStyles: ["./style.md"] }, "outputStyles", 1, false],
     ["malformed output styles", { outputStyles: 7 }, "outputStyles", 0, false],
     ["valid top-level themes", { themes: "./theme.json" }, "themes", 1, false],
@@ -467,6 +469,9 @@ describe("loadPluginMarketplaceState", () => {
     ["valid inline monitor always", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "always" }] }, "monitors", 1, false],
     ["valid inline monitor skill invoke", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "on-skill-invoke:build" }] }, "monitors", 1, false],
     ["malformed monitor", { monitors: [{ name: "watch", command: "SECRET" }] }, "monitors", 0, true],
+    ["empty monitor name", { monitors: [{ name: "", command: "SECRET", description: "Watch" }] }, "monitors", 0, true],
+    ["empty monitor command", { monitors: [{ name: "watch", command: "", description: "Watch" }] }, "monitors", 0, true],
+    ["empty monitor description", { monitors: [{ name: "watch", command: "SECRET", description: "" }] }, "monitors", 0, true],
     ["invalid monitor when", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", when: "sometimes" }] }, "monitors", 0, true],
     ["unknown monitor field", { monitors: [{ name: "watch", command: "SECRET", description: "Watch", extra: true }] }, "monitors", 0, true],
     ["valid channel display name and closed userConfig", { mcpServers: { events: {} }, channels: [{ server: "events", displayName: "Events", userConfig: {
@@ -481,6 +486,8 @@ describe("loadPluginMarketplaceState", () => {
     ["unknown channel field", { mcpServers: { events: {} }, channels: [{ server: "events", extra: true }] }, "channels", 0, true],
     ["missing channel server declaration", { channels: [{ server: "events" }] }, "channels", 0, true],
     ["non-object userConfig option", channelWithOption("invalid"), "channels", 0, true],
+    ["empty userConfig title", channelWithOption({ type: "string", title: "", description: "Token" }), "channels", 0, true],
+    ["empty userConfig description", channelWithOption({ type: "string", title: "Token", description: "" }), "channels", 0, true],
     ["required wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", required: "yes" }), "channels", 0, true],
     ["sensitive wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", sensitive: 1 }), "channels", 0, true],
     ["multiple wrong type", channelWithOption({ type: "string", title: "Token", description: "Token", multiple: "yes" }), "channels", 0, true],
@@ -514,6 +521,33 @@ describe("loadPluginMarketplaceState", () => {
     }];
     expect(result.diagnostics.filter((diagnostic) => diagnostic.message.startsWith(`Catalog plugin ${field} declaration`))).toEqual(expectedDiagnostics);
     expect(JSON.stringify(result.entries[0]!.unsupportedComponents)).not.toMatch(/SECRET|watch|events|Events|Token|C:\/|\/SECRET/u);
+  });
+
+  it("omits uncertain nested catalog channels while preserving valid and invalid siblings", () => {
+    const root = temporaryRoot();
+    const options = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`option${index}`, { type: "string", title: "Title", description: "Description" }]));
+    const servers = Object.fromEntries(["events", ...Array.from({ length: 64 }, (_, index) => `server${index}`)].map((key) => [key, {}]));
+    const userDir = writeMarketplaceState(root, catalog([{
+      name: "bounded", source: "./bounded", mcpServers: servers,
+      channels: [
+        { server: "events" },
+        { server: "events", userConfig: options },
+        { server: "events", userConfig: { list: { type: "string", title: "List", description: "List", multiple: true, default: Array.from({ length: 65 }, () => "value") } } },
+        { server: "server63" },
+        { server: "events", extra: true },
+      ],
+    }]));
+    const result = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [] });
+    expect(result.entries[0]!.unsupportedComponents!.map(({ field, count }) => ({ field, count }))).toEqual([
+      { field: "channels", count: 1 },
+    ]);
+    expect(result.omissions.components).toBe(3);
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.message.includes("nested evidence exceeded observation limits"))).toHaveLength(3);
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.message.startsWith("Catalog plugin channels declaration item"))).toEqual([{
+      severity: "warning",
+      message: "Catalog plugin channels declaration item has the wrong or unsafe shape; ignored",
+      source: expect.any(String),
+    }]);
   });
 
   it("classifies rename current, removal, chain, cycle, dangling, and malformed siblings", () => {

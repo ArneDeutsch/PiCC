@@ -128,9 +128,33 @@ describe("plugin inventory shared display safety", () => {
     expect(formatPluginInventoryStructuredSource({ kind: "github", repo: "owner/repo", url: "https://example.test/source?token=hidden", secret: "SECRET" })).toBe("kind=github, repo=owner/repo, url=https://example.test/source");
     expect(formatPluginInventoryStructuredSource({ kind: "github\u001b[31m", repo: "../private", url: "https://user:pass@example.test/source" })).toBe("kind=github, repo=<redacted>, url=<redacted>");
     expect(formatPluginInventoryStructuredSource({ kind: "relative", value: "./plugins/safe-name" })).toBe("kind=relative, value=plugins/safe-name");
-    for (const hostile of ["././nested", "plugins/./nested", "plugins/../private", "/rooted", "C:/rooted", "~/rooted", "plugins\\private", "token=secret", "plugins/\u0001private", "plugins/token"]) {
+    expect(formatPluginInventoryStructuredSource({ kind: "git", url: "https://example.test/releases/safe-plugin?view=compact#current" })).toBe("kind=git, url=https://example.test/releases/safe-plugin");
+    for (const hostile of ["././nested", "plugins/./nested", "plugins/../private", "/rooted", "C:/rooted", "~/rooted", "plugins\\private", "token=secret", "plugins/\u0001private", "plugins/token", "plugins/%74oken/value", "plugins/%2574oken/value", "plugins/%252574oken/value", "plugins/%25252574oken/value", "plugins/%zz"]) {
       expect(formatPluginInventoryStructuredSource({ value: hostile }), hostile).toBe("value=<redacted>");
     }
+    for (const key of ["repo", "ref", "package", "version", "sha", "hostPattern", "pathPattern"] as const) {
+      expect(formatPluginInventoryStructuredSource({ [key]: "%EF%BD%81%EF%BD%90%EF%BD%89%EF%BC%8D%EF%BD%8B%EF%BD%85%EF%BD%99=value" }), key).toBe(`${key}=<redacted>`);
+    }
+    for (const url of ["https://example.test/password/value", "https://example.test/%70assword/value", "https://example.test/%2570assword/value", "https://example.test/%EF%BD%81%EF%BD%90%EF%BD%89/%EF%BD%8B%EF%BD%85%EF%BD%99", "https://example.test/%zz"]) {
+      expect(formatPluginInventoryStructuredSource({ url }), url).toBe("url=<redacted>");
+    }
+    const controlSuffixes = [
+      "\u001b[31m", "%1B%5B31m", "%251B%255B31m",
+      "\u0001", "%01", "%2501",
+      "\u200B", "%E2%80%8B", "%25E2%2580%258B",
+      "\u2028", "%E2%80%A8", "%25E2%2580%25A8",
+      "\u2029", "%E2%80%A9", "%25E2%2580%25A9",
+    ];
+    for (const suffix of controlSuffixes) {
+      for (const key of ["ref", "hostPattern", "pathPattern"] as const) {
+        expect(formatPluginInventoryStructuredSource({ [key]: `safe${suffix}tail` }), `${key} ${JSON.stringify(suffix)}`).toBe(`${key}=<redacted>`);
+      }
+      expect(formatPluginInventoryStructuredSource({ url: `https://example.test/safe${suffix}tail` }), `url ${JSON.stringify(suffix)}`).toBe("url=<redacted>");
+    }
+    for (const key of ["ref", "hostPattern", "pathPattern"] as const) {
+      expect(formatPluginInventoryStructuredSource({ [key]: "release%2Dsafe" })).toBe(`${key}=release-safe`);
+    }
+    expect(formatPluginInventoryStructuredSource({ url: "https://example.test/caf%C3%A9" })).toBe("url=https://example.test/caf%C3%A9");
   });
 });
 

@@ -219,13 +219,20 @@ describe("plugin inventory focused UI", () => {
     expect(detail).toContain("<plugin-cache>/complete@official/1.2.3");
   });
 
-  it("renders normalized safe relative sources and redacts hostile structured paths in details", () => {
-    const withSource = (value: string): PluginInventoryItem => {
+  it("renders benign structured URLs and redacts raw or encoded credential paths in details", () => {
+    const withSource = (source: Readonly<Record<string, string>>): PluginInventoryItem => {
       const base = item("source@official");
-      return { ...base, catalogDeclarations: base.catalogDeclarations.map((entry) => ({ ...entry, source: { kind: "relative", value } })) };
+      return { ...base, catalogDeclarations: base.catalogDeclarations.map((entry) => ({ ...entry, source })) };
     };
-    for (const [value, expected] of [["./plugins/safe", "source kind=relative, value=plugins/safe"], ["plugins/../private", "source kind=relative, value=<redacted>"]] as const) {
-      const model = new PluginInventoryModel(snapshot({ items: [withSource(value)] }));
+    const cases: ReadonlyArray<readonly [Readonly<Record<string, string>>, string]> = [
+      [{ kind: "relative", value: "./plugins/safe" }, "source kind=relative, value=plugins/safe"],
+      [{ kind: "git", url: "https://example.test/releases/safe?view=compact#current" }, "source kind=git, url=https://example.test/releases/safe"],
+      [{ kind: "relative", value: "plugins/../private" }, "source kind=relative, value=<redacted>"],
+      [{ kind: "relative", value: "plugins/%2574oken/value" }, "source kind=relative, value=<redacted>"],
+      [{ kind: "git", url: "https://example.test/%EF%BD%81%EF%BD%90%EF%BD%89/%EF%BD%8B%EF%BD%85%EF%BD%99" }, "source kind=git, url=<redacted>"],
+    ];
+    for (const [source, expected] of cases) {
+      const model = new PluginInventoryModel(snapshot({ items: [withSource(source)] }));
       expect(model.enterDetail()).toBe("entered");
       expect(allDetail(model)).toContain(expected);
     }

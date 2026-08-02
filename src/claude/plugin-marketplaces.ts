@@ -510,6 +510,10 @@ function parseCatalog(registration: PluginMarketplaceRegistration, state: Plugin
         `Catalog plugin ${field} declaration${item ? " item" : ""} has the wrong or unsafe shape; ignored`,
         registration.catalogPath,
       ),
+      reportOmitted: (field) => report(
+        `Catalog plugin ${field} nested evidence exceeded observation limits and was omitted`,
+        registration.catalogPath,
+      ),
     });
     state.omissions.components += unsupported.omittedItems;
     for (const observation of unsupported.observations) {

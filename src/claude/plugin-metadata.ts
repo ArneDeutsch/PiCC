@@ -168,6 +168,7 @@ export function projectPluginManifest(manifest: Readonly<Record<string, unknown>
   const unsupported = observeUnsupportedPluginComponents(manifest, {
     maximumItems: MAX_COMPONENTS,
     reportInvalid: (field) => wrong(field),
+    reportOmitted: (field) => diagnostics.push({ severity: "warning", message: `Plugin manifest metadata field ${field} nested evidence exceeded observation limits and was omitted` }),
   });
   componentOmissions += unsupported.omittedItems;
   components.push(...unsupported.observations.map(({ field, count }) => ({ field, declaration: "shape" as const, count })));
