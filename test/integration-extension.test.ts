@@ -1378,10 +1378,10 @@ describe("session lifecycle hooks", () => {
       });
       await rejectedPi.waitForInitialization();
       await rejectedPi.fire("session_start", { reason: "startup" }, rejectedPi.tuiCtx());
-      const pluginNotices = rejectedPi.notifications.filter((item) => item.text.includes("Enabled plugin content did not load"));
-      expect(pluginNotices).toHaveLength(1);
-      expect(pluginNotices[0]!.text).toContain(pluginId);
-      expect(pluginNotices[0]!.text).toContain("/doctor");
+      const pluginNotices = rejectedPi.notifications.filter((item) => item.text.split("\n").some((line) => /^Plugin .+ needs attention: .+\. Run \/doctor for details\.$/u.test(line)));
+      expect(pluginNotices.map(({ text }) => text)).toEqual([
+        `Plugin ${pluginId} needs attention: rejected. Run /doctor for details.`,
+      ]);
     } finally {
       process.chdir(previousCwd);
       if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
@@ -1393,7 +1393,7 @@ describe("session lifecycle hooks", () => {
   it("emits no plugin-failure notice for loaded and disabled installed states", async () => {
     pi.notifications.length = 0;
     await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
-    expect(pi.notifications.filter((item) => item.text.includes("Enabled plugin content did not load"))).toEqual([]);
+    expect(pi.notifications.filter((item) => item.text.split("\n").some((line) => /^Plugin .+ needs attention: .+\. Run \/doctor for details\.$/u.test(line)))).toEqual([]);
   });
 
   it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {
