@@ -3146,7 +3146,7 @@ describe("managed MCP policy diagnostics through the real extension snapshot", (
       for (const report of reports) {
         expect(report).toContain("Managed MCP policy: fail closed; no candidate can start");
         expect(report).toContain("Ask the administrator to repair or recover the applicable managed MCP policy input");
-        expect(report).toContain("administrator system file was unreadable");
+        expect(report).toContain("standalone managed MCP file was unreadable");
       }
       expect(fixture.owner.messages).toEqual([]);
       expect([...fixture.owner.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
