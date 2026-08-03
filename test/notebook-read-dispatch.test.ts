@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import picc from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake-sdk.js";
@@ -26,6 +27,13 @@ let pi: FakePi;
 let h: FakeSdkHandle;
 const originalCwd = process.cwd();
 const originalUserDir = process.env.PICC_CLAUDE_USER_DIR;
+
+function createMainSession(cwd: string): string {
+  const manager = SessionManager.create(cwd, cwd);
+  manager.appendMessage({ role: "user", content: "parent" } as never);
+  manager.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+  return manager.getSessionFile()!;
+}
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -161,9 +169,10 @@ describe("NotebookRead degrade-stub subagent-dispatch wiring", () => {
         picc(localPi.api as never, { sdk: handle.sdk, onInitializationSettled: localPi.captureInitialization });
         await localPi.waitForInitialization();
         await localPi.waitForTools(["read", "Agent"]);
+        const modeMain = createMainSession(dir);
         await localPi.fire("session_start", { reason: "startup" }, localPi.ctx({
           sessionManager: {
-            getSessionFile: () => path.join(dir, `${mode}-main.jsonl`),
+            getSessionFile: () => modeMain,
             getBranch: () => [],
           },
         }));
@@ -241,7 +250,7 @@ describe("NotebookRead degrade-stub subagent-dispatch wiring", () => {
       cells: [{ cell_type: "code", id: "persist-cell", metadata: {}, source: "old", execution_count: null, outputs: [] }],
       metadata: {}, nbformat: 4, nbformat_minor: 5,
     }), "utf8");
-    const mainPath = path.join(dir, "main.jsonl");
+    const mainPath = createMainSession(dir);
     const mainBranch: unknown[] = [];
     const handle = fakeSdk({
       fakePersistedSessions: true,
@@ -303,8 +312,9 @@ describe("NotebookRead degrade-stub subagent-dispatch wiring", () => {
     picc(localPi.api as never, { sdk: handle.sdk, onInitializationSettled: localPi.captureInitialization });
     await localPi.waitForInitialization();
     await localPi.waitForTools(["read", "Agent", "SendMessage"]);
+    const failureMain = createMainSession(dir);
     await localPi.fire("session_start", { reason: "startup" }, localPi.ctx({
-      sessionManager: { getSessionFile: () => path.join(dir, "failure-main.jsonl"), getBranch: () => [] },
+      sessionManager: { getSessionFile: () => failureMain, getBranch: () => [] },
     }));
     const started = await localPi.tools.get("Agent").execute("failure-child", {
       subagent_type: "future-agent", prompt: "first", run_in_background: false,

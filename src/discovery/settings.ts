@@ -1,5 +1,5 @@
+import fs from "node:fs";
 import path from "node:path";
-import { isFile, readTextSafe } from "../util/fs.js";
 import {
   isDocumentedMarketplaceName,
   normalizeMarketplacePolicyDescriptor,
@@ -13,6 +13,7 @@ import {
   stripJsonc,
   type ManagedPolicyDiscoveryOptions,
 } from "./managed-policy.js";
+import { DEFAULT_CLEANUP_PERIOD_DAYS } from "../types.js";
 import type {
   ClaudeSettings,
   Diagnostic,
@@ -21,6 +22,7 @@ import type {
   HookMatcherEntry,
   McpSettingsEntry,
   PluginMarketplaceSettingsContribution,
+  RetentionCleanupBlocker,
   Scope,
 } from "../types.js";
 
@@ -35,6 +37,18 @@ export { stripJsonc } from "./managed-policy.js";
  * and valid scalar values replace lower-precedence values. Malformed entries
  * diagnose without discarding unrelated settings or valid lower-scope values.
  */
+export type OrdinarySettingsProbeResult =
+  | { status: "absent" }
+  | { status: "text"; text: string }
+  | { status: "unreadable" };
+
+export type OrdinarySettingsProbe = (filePath: string) => OrdinarySettingsProbeResult;
+
+export interface OrdinarySettingsIo {
+  statIsFile(filePath: string): boolean;
+  readText(filePath: string): string;
+}
+
 export interface LoadSettingsOptions {
   /** Launch directory; nested settings between here and projectRoot load too. */
   cwd: string;
@@ -44,6 +58,10 @@ export interface LoadSettingsOptions {
   managedPaths?: string[];
   /** Injectable ambient managed-policy boundary (used by deterministic tests). */
   managedPolicy?: ManagedPolicyDiscoveryOptions;
+  /** Narrow deterministic seam for ordinary settings discovery and reads. */
+  ordinarySettingsProbe?: OrdinarySettingsProbe;
+  /** Low-level probe IO used only to exercise production race classification deterministically. */
+  ordinarySettingsIo?: OrdinarySettingsIo;
 }
 
 const DEFERRED_TOP_KEYS = new Set([
@@ -74,6 +92,9 @@ function createDefaultSettings(): ClaudeSettings {
     claudeMdExcludes: [],
     autoMemoryEnabled: true,
     worktree: { baseRef: "head" },
+    cleanupPeriodDays: DEFAULT_CLEANUP_PERIOD_DAYS,
+    retentionCleanupAllowed: true,
+    retentionCleanupBlockers: [],
     subagentsEnabled: true,
     // maxDepth accepts positive integers, but nesting requires a value greater than 1.
     // Main-session-only remains the default to avoid unexpected recursive fan-out
@@ -261,6 +282,38 @@ function expectPositiveInt(
     return undefined;
   }
   return n;
+}
+
+function isValidCleanupPeriodDays(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 1;
+}
+
+function addRetentionCleanupBlocker(
+  out: ClaudeSettings,
+  blocker: RetentionCleanupBlocker,
+): void {
+  out.retentionCleanupAllowed = false;
+  const blockers = (out.retentionCleanupBlockers ??= []);
+  if (!blockers.some(({ reason, source }) => reason === blocker.reason && source === blocker.source)) {
+    blockers.push(blocker);
+  }
+}
+
+function applyCleanupPeriodDays(
+  value: unknown,
+  source: string,
+  out: ClaudeSettings,
+): void {
+  if (!isValidCleanupPeriodDays(value)) {
+    addRetentionCleanupBlocker(out, { reason: "invalid-period", source });
+    out.diagnostics.push({
+      severity: "warning",
+      message: 'Setting "cleanupPeriodDays" must be a literal positive integer (>= 1); ignored',
+      source,
+    });
+    return;
+  }
+  out.cleanupPeriodDays = value;
 }
 
 function asBool(value: unknown): boolean | undefined {
@@ -736,11 +789,9 @@ function applySettingsFile(
       case "worktree":
         applyWorktree(value, scope, source, out);
         break;
-      case "cleanupPeriodDays": {
-        const n = expectNumber(value, "cleanupPeriodDays", source, out.diagnostics);
-        if (n !== undefined) out.cleanupPeriodDays = n;
+      case "cleanupPeriodDays":
+        applyCleanupPeriodDays(value, source, out);
         break;
-      }
       case "apiKeyHelper": {
         const s = expectString(value, "apiKeyHelper", source, out.diagnostics);
         if (s !== undefined) out.apiKeyHelper = expandEnvVars(s);
@@ -921,6 +972,29 @@ function settingsDirChain(cwd: string, projectRoot: string): string[] {
   return chain.reverse();
 }
 
+const nodeOrdinarySettingsIo: OrdinarySettingsIo = {
+  statIsFile: (filePath) => fs.statSync(filePath).isFile(),
+  readText: (filePath) => fs.readFileSync(filePath, "utf8"),
+};
+
+function nodeOrdinarySettingsProbe(
+  filePath: string,
+  io: OrdinarySettingsIo = nodeOrdinarySettingsIo,
+): OrdinarySettingsProbeResult {
+  try {
+    if (!io.statIsFile(filePath)) return { status: "unreadable" };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { status: "absent" }
+      : { status: "unreadable" };
+  }
+  try {
+    return { status: "text", text: io.readText(filePath) };
+  } catch {
+    return { status: "unreadable" };
+  }
+}
+
 /**
  * Load and merge the full settings hierarchy for a project.
  * Never throws — every problem degrades to a Diagnostic on the result.
@@ -939,10 +1013,13 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
     files.push({ path: path.join(dir, ".claude", "settings.local.json"), scope: "local" });
   }
 
+  const ordinarySettingsProbe = opts.ordinarySettingsProbe ??
+    ((filePath: string) => nodeOrdinarySettingsProbe(filePath, opts.ordinarySettingsIo));
   for (const file of files) {
-    if (!isFile(file.path)) continue; // absent — degrade silently (incl. managed/policy)
-    const text = readTextSafe(file.path);
-    if (text === undefined) {
+    const probe = ordinarySettingsProbe(file.path);
+    if (probe.status === "absent") continue;
+    if (probe.status === "unreadable") {
+      addRetentionCleanupBlocker(settings, { reason: "unreadable-source", source: file.path });
       settings.diagnostics.push({
         severity: "warning",
         message: "Settings file unreadable; skipped",
@@ -952,8 +1029,9 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(stripJsonc(text));
+      parsed = JSON.parse(stripJsonc(probe.text));
     } catch (err) {
+      addRetentionCleanupBlocker(settings, { reason: "malformed-source", source: file.path });
       settings.diagnostics.push({
         severity: "error",
         message: `Malformed settings JSON (${(err as Error).message}); file skipped`,
@@ -962,6 +1040,7 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
       continue;
     }
     if (!isPlainObject(parsed)) {
+      addRetentionCleanupBlocker(settings, { reason: "non-object-source", source: file.path });
       settings.diagnostics.push({
         severity: "error",
         message: "Settings root is not an object; file skipped",
@@ -984,6 +1063,17 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
   for (const event of managed.events) {
     if (event.type === "diagnostic") {
       settings.diagnostics.push(event.diagnostic);
+      if (
+        event.diagnostic.category === "managed-policy-malformed" ||
+        event.diagnostic.category === "managed-policy-unreadable"
+      ) {
+        addRetentionCleanupBlocker(settings, {
+          reason: event.diagnostic.category === "managed-policy-malformed"
+            ? "malformed-source"
+            : "unreadable-source",
+          source: event.diagnostic.source ?? "managed-policy",
+        });
+      }
     } else {
       applySettingsFile(
         event.source.value,

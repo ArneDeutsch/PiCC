@@ -1026,12 +1026,27 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bash?.note).toContain("deliberately disables Pi's");
   });
 
-  // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent
-  // transcript reaper, so the claim is downgraded from full to partial (undersell).
-  it("marks cleanupPeriodDays partial — worktrees only, no subagent-transcript cleanup", () => {
+  it("keeps cleanupPeriodDays partial and bounds its implemented retention claim", () => {
     const c = lookupCapability("setting.cleanupPeriodDays");
     expect(c?.tier).toBe("partial");
-    expect(c?.note).toContain(".subagents/");
+    expect(c?.note).toContain("30-day default");
+    expect(c?.note).toContain("literal integer >= 1");
+    expect(c?.note).toContain("applicable settings source");
+    expect(c?.note).toContain("stale verified parents only when no ownership marker conflicts");
+    expect(c?.note).toContain("marker-owned orphan collections");
+    expect(c?.note).toContain("orphaned worktrees");
+    expect(c?.note).toContain("manager-supplied default or custom session directory");
+    expect(c?.note).toContain("project's .claude/worktrees directory");
+    expect(c?.note).toContain("mtime refresh");
+    expect(c?.note).toContain("without a lock-grade guarantee");
+    expect(c?.note).toContain("the exact startup session's child transcript collection");
+    expect(c?.note).toContain("malformed, unreadable, or mismatched ownership evidence");
+    expect(c?.note).toContain("main-session transcripts");
+    expect(c?.note).toContain("markerless legacy orphans");
+    expect(c?.note).toContain("unfamiliar content");
+    expect(c?.note).toContain("unrelated Pi data");
+    expect(c?.note).toContain("secure erasure");
+    expect(c?.note).toContain("Claude Code's broader application-data cleanup");
   });
 
   it("agent permissionMode is a safety-relevant no-op, consistent with permissions.defaultMode", () => {

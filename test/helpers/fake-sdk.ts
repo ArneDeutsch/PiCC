@@ -9,6 +9,7 @@ import {
 import { PermissionEngine } from "../../src/engine/permissions.js";
 import { HookRunner } from "../../src/engine/hook-runner.js";
 import type { ClaudeAgent, HookOutcome } from "../../src/types.js";
+import { subagentSessionDir } from "../../src/util/subagent-transcripts.js";
 import { deferred, waitUntil, type Deferred } from "./async.js";
 
 /**
@@ -557,6 +558,12 @@ export function makeSubagentRuntime(
     allKnownToolNames: () => ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
     permissionEngine: engine,
     getCwd: () => process.cwd(),
+    // Shared tests isolate runtime outcomes from disk-ownership admission. The
+    // production helper remains the default whenever this explicit fake is absent.
+    prepareTranscriptCollection: (mainSessionFile) => ({
+      ok: true,
+      directory: subagentSessionDir(mainSessionFile),
+    }),
     resolveModel: () => undefined,
     mapEffort: () => undefined,
     maxDepth: 2,

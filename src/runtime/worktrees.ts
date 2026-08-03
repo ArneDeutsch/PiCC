@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picomatch from "picomatch";
-import type { Diagnostic, WorktreeSettings } from "../types.js";
+import { DEFAULT_CLEANUP_PERIOD_DAYS, type Diagnostic, type WorktreeSettings } from "../types.js";
 import { isDirectory, readTextSafe } from "../util/fs.js";
 
 /**
@@ -54,9 +54,25 @@ type VerifiedWorktreeList =
   | { ok: true; entries: WorktreeListEntry[] }
   | { ok: false; error: string };
 
+export type WorktreeReapFailureCategory =
+  | "settings-blocked"
+  | "git-authority"
+  | "permission"
+  | "busy"
+  | "other-io";
+
 export interface WorktreeReapResult {
   reaped: string[];
+  retainedWorktrees: number;
+  failureCounts: Record<WorktreeReapFailureCategory, number>;
   diagnostics: Diagnostic[];
+}
+
+export interface WorktreeReapIo {
+  readDirectories(root: string): fs.Dirent[];
+  statMtimeMs(dir: string): number;
+  remove(dir: string): void;
+  exists(dir: string): boolean;
 }
 
 const SOURCE = "worktrees";
@@ -71,6 +87,33 @@ function diag(severity: Diagnostic["severity"], message: string): Diagnostic {
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+function emptyReapFailureCounts(): Record<WorktreeReapFailureCategory, number> {
+  return {
+    "settings-blocked": 0,
+    "git-authority": 0,
+    permission: 0,
+    busy: 0,
+    "other-io": 0,
+  };
+}
+
+function classifyIoFailure(
+  error: unknown,
+): Exclude<WorktreeReapFailureCategory, "settings-blocked" | "git-authority"> {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EACCES" || code === "EPERM") return "permission";
+  if (code === "EBUSY" || code === "ENOTEMPTY" || code === "ETXTBSY") return "busy";
+  return "other-io";
+}
+
+const defaultWorktreeReapIo: WorktreeReapIo = {
+  readDirectories: (root) => fs.readdirSync(root, { withFileTypes: true }),
+  statMtimeMs: (dir) => fs.statSync(dir).mtimeMs,
+  remove: (dir) =>
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }),
+  exists: (dir) => fs.existsSync(dir),
+};
 
 /** Default ExecFn: node:child_process.execFile — arguments are never shell-interpolated. */
 const defaultExec: ExecFn = (cmd, args, opts) =>
@@ -167,9 +210,10 @@ function parsePorcelain(stdout: string): WorktreeListEntry[] {
 export class WorktreeManager {
   private readonly projectRoot: string;
   private readonly settings: WorktreeSettings;
-  /** Claude settings `cleanupPeriodDays` — default max-age for orphan reaping. */
-  private readonly cleanupPeriodDays: number | undefined;
+  private readonly cleanupPeriodDays: number;
+  private readonly retentionCleanupAllowed: boolean;
   private readonly exec: ExecFn;
+  private readonly reapIo: WorktreeReapIo;
   /** Construction-time setup (core.longpaths on win32); never rejects. */
   private readonly ready: Promise<void>;
 
@@ -177,12 +221,16 @@ export class WorktreeManager {
     projectRoot: string;
     settings: WorktreeSettings;
     cleanupPeriodDays?: number;
+    retentionCleanupAllowed?: boolean;
     exec?: ExecFn;
+    reapIo?: Partial<WorktreeReapIo>;
   }) {
     this.projectRoot = path.resolve(opts.projectRoot);
     this.settings = opts.settings;
-    this.cleanupPeriodDays = opts.cleanupPeriodDays;
+    this.cleanupPeriodDays = opts.cleanupPeriodDays ?? DEFAULT_CLEANUP_PERIOD_DAYS;
+    this.retentionCleanupAllowed = opts.retentionCleanupAllowed ?? true;
     this.exec = opts.exec ?? defaultExec;
+    this.reapIo = { ...defaultWorktreeReapIo, ...opts.reapIo };
     this.ready =
       process.platform === "win32"
         ? this.git(["config", "core.longpaths", "true"]).then(
@@ -303,68 +351,93 @@ export class WorktreeManager {
    * Remove orphaned dirs under .claude/worktrees (leftovers of blocked
    * removals). Active/locked worktrees are registered with git and never
    * touched; everything reaped passes the same containment gate as exit().
-   * `maxAgeDays` (default: the settings `cleanupPeriodDays`, else 0 = reap
-   * immediately) grants younger orphans a grace period, keyed off dir mtime.
+   * `maxAgeDays` defaults to the resolved retention period and grants younger
+   * orphans a grace period keyed off directory mtime. Explicit zero uses the
+   * call-time cutoff, so entries equal to it remain fresh.
    */
   async reapOrphans(options?: { maxAgeDays?: number }): Promise<WorktreeReapResult> {
     const diagnostics: Diagnostic[] = [];
     const reaped: string[] = [];
+    const failureCounts = emptyReapFailureCounts();
+    let retainedWorktrees = 0;
+    const result = (): WorktreeReapResult => ({ reaped, retainedWorktrees, failureCounts, diagnostics });
     try {
       await this.ready;
-      const maxAgeDays = options?.maxAgeDays ?? this.cleanupPeriodDays ?? 0;
+      if (!this.retentionCleanupAllowed) {
+        failureCounts["settings-blocked"]++;
+        diagnostics.push(diag("warning", "orphan deletion skipped: retention cleanup is blocked by settings state"));
+        return result();
+      }
+      const maxAgeDays = options?.maxAgeDays ?? this.cleanupPeriodDays;
       const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
       const beforePrune = await this.listVerified();
       if (!beforePrune.ok) {
+        failureCounts["git-authority"]++;
         diagnostics.push(diag("warning", `orphan reaping skipped: ${beforePrune.error}`));
-        return { reaped, diagnostics };
+        return result();
       }
       const prune = await this.git(["worktree", "prune"]);
       if (prune.code !== 0) {
+        failureCounts["git-authority"]++;
         diagnostics.push(diag("warning", `orphan reaping skipped: git worktree prune failed (${prune.stderr.trim() || `exit ${prune.code}`})`));
-        return { reaped, diagnostics };
+        return result();
       }
       const listed = await this.listVerified();
       if (!listed.ok) {
+        failureCounts["git-authority"]++;
         diagnostics.push(diag("warning", `orphan reaping skipped: ${listed.error}`));
-        return { reaped, diagnostics };
+        return result();
       }
       const registered = new Set(listed.entries.map((e) => canonical(e.path)));
       const worktreesRoot = this.worktreesRoot();
-      let entries: fs.Dirent[] = [];
+      let entries: fs.Dirent[];
       try {
-        entries = fs.readdirSync(worktreesRoot, { withFileTypes: true });
-      } catch {
-        return { reaped, diagnostics };
+        entries = this.reapIo.readDirectories(worktreesRoot);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return result();
+        failureCounts[classifyIoFailure(error)]++;
+        diagnostics.push(diag("warning", `orphan directory scan failed: ${errorMessage(error)}`));
+        return result();
       }
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const dir = path.join(worktreesRoot, entry.name);
         if (registered.has(canonical(dir))) continue; // active/locked worktrees stay
         if (!this.isManagedWorktreePath(dir)) continue; // containment (defense in depth)
-        if (maxAgeDays > 0) {
-          try {
-            if (fs.statSync(dir).mtimeMs > cutoffMs) continue; // within grace period
-          } catch {
-            continue; // cannot stat — leave it for a later pass
-          }
+        try {
+          if (this.reapIo.statMtimeMs(dir) >= cutoffMs) continue;
+        } catch (error) {
+          failureCounts[classifyIoFailure(error)]++;
+          diagnostics.push(diag("warning", `stat of orphan candidate ${dir} failed: ${errorMessage(error)}`));
+          continue;
         }
         if (process.platform === "win32") this.stripReparsePoints(dir, diagnostics);
+        let removalFailed = false;
         try {
-          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-        } catch (e) {
-          diagnostics.push(diag("warning", `reap of ${dir} failed: ${errorMessage(e)}`));
+          this.reapIo.remove(dir);
+        } catch (error) {
+          removalFailed = true;
+          failureCounts[classifyIoFailure(error)]++;
+          diagnostics.push(diag("warning", `reap of ${dir} failed: ${errorMessage(error)}`));
         }
-        await this.git(["worktree", "prune"]);
-        if (!fs.existsSync(dir)) {
+        const afterPrune = await this.git(["worktree", "prune"]);
+        if (afterPrune.code !== 0) {
+          failureCounts["git-authority"]++;
+          diagnostics.push(diag("warning", `git worktree prune after reaping ${dir} failed (${afterPrune.stderr.trim() || `exit ${afterPrune.code}`})`));
+        }
+        if (!this.reapIo.exists(dir)) {
           reaped.push(dir);
         } else {
+          retainedWorktrees++;
+          if (!removalFailed) failureCounts["other-io"]++;
           diagnostics.push(diag("warning", `orphaned worktree dir ${dir} still present after reap attempt`));
         }
       }
-      return { reaped, diagnostics };
+      return result();
     } catch (e) {
+      failureCounts[classifyIoFailure(e)]++;
       diagnostics.push(diag("error", `reapOrphans failed: ${errorMessage(e)}`));
-      return { reaped, diagnostics };
+      return result();
     }
   }
 

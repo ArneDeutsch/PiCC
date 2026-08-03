@@ -291,10 +291,15 @@ targets, while terminal record expansion carries the operational IDs.
 
 Every subagent is visible, both to you and to the coordinating model:
 
-- **Transcript on disk.** Each dispatch leaves a JSONL transcript under
-  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` in Pi's sessions dir
-  (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
-  full record without guessing. These files are not reaped automatically.
+- **Transcript storage.** When persistence is available, a dispatch writes
+  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` beside its main-session transcript in
+  Pi's manager-supplied session directory. The default tree is
+  `$HOME/.pi/agent/sessions/<encoded-cwd>/…` on POSIX and
+  `%USERPROFILE%\.pi\agent\sessions\<encoded-cwd>\…` on Windows, where Pi derives `<encoded-cwd>`
+  from the absolute cwd; the host/session manager supplies a custom replacement directory when
+  configured. The agent id in the dispatch result identifies its file. If the main transcript or Pi
+  persistence API is unavailable, or persistence creation or
+  ownership admission fails, the dispatch runs in memory instead and is not resumable.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
   no `TaskOutput` await needed. Each individually rendered active agent uses one physical status row.
   When row space permits, a muted separator precedes a bounded current-activity fragment after the
@@ -362,6 +367,41 @@ Every subagent is visible, both to you and to the coordinating model:
   agent refuses resume and steering permanently.
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
   interactive TUI.
+
+### Transcript and worktree retention (`cleanupPeriodDays`)
+
+`cleanupPeriodDays` is a top-level setting shared by persisted subagent transcripts and orphaned
+worktrees. It defaults to 30 and accepts only a literal integer of at least 1. A fresh verified
+main-session transcript retains its complete child collection; once that parent is older than the
+effective period, recognized children are eligible only when no ownership marker conflicts with the
+parent. An absent marker does not conflict in this parent-backed legacy case; an unreadable,
+malformed, or mismatched marker preserves the collection. If the parent is gone, PiCC ages
+recognized files individually only when the collection has PiCC's matching ownership marker,
+retaining fresh files and removing an empty collection. An unreadable, malformed, or mismatched
+parent also preserves the collection, as do markerless legacy orphans. When ownership is ambiguous,
+PiCC leaves existing transcript data untouched. Preserve or back up that data, and never edit or
+delete an ownership marker by hand. Start a new main session for future persisted subagents and
+review the old data separately; the new session does not clean the old data.
+
+For transcripts, PiCC scans only the default or custom session directory supplied by the active Pi
+session manager; it never crawls global Pi data. Orphan-worktree cleanup separately scans the
+project-owned `.claude/worktrees` directory. The exact startup session's collection is excluded. At
+session activation PiCC refreshes an existing main transcript's modification time, then does so
+approximately hourly without creating the file or changing transcript content. This reduces
+concurrent-process races, but is best-effort protection, not a lock or a deletion-time guarantee.
+
+Destructive cleanup is skipped if any applicable settings source is unreadable, malformed, not a
+settings object, or contains an invalid `cleanupPeriodDays`; unrelated settings warnings do not
+block it. Cleanup runs asynchronously and best-effort around startup, so missing, changed, locked,
+or inaccessible files do not prevent the session from becoming usable. A clean no-op is silent;
+removals, blocked policy, or problems produce one bounded TUI notification in TUI mode or one
+`PiCC:` line on stderr otherwise. The same 30-day default gives orphaned worktrees a grace period
+when no value is configured. `/doctor` reports the effective period and whether settings admit
+cleanup, not per-run cleanup details or absolute session-directory paths.
+
+PiCC does not remove main-session transcripts, unfamiliar files, markerless legacy orphans, or data
+outside these PiCC-owned child collections and orphaned worktrees. Eligibility is not immediate or
+secure erasure, and this policy is not global Pi or Claude Code application-data cleanup.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
