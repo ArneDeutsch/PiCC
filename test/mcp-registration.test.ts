@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,6 +9,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
 import { flattenProjectPath } from "../src/claude/memory.js";
+import { createNodeManagedMcpIo } from "../src/claude/managed-mcp.js";
 import {
   createMcpProcessFixture,
   processIsAlive,
@@ -119,6 +121,213 @@ afterAll(() => {
       /* best effort — vitest swallows afterAll console output anyway */
     }
   }
+});
+
+describe("managed MCP admission reaches the real extension runtime boundary", () => {
+  async function listenForBlockedRemote(): Promise<{
+    readonly origin: string;
+    readonly connections: () => number;
+    readonly close: () => Promise<void>;
+  }> {
+    let count = 0;
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+      count += 1;
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      socket.destroy();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    const address = server.address() as net.AddressInfo;
+    return {
+      origin: `http://127.0.0.1:${address.port}`,
+      connections: () => count,
+      close: async () => {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      },
+    };
+  }
+
+  it("starts only the policy-allowed managed stdio server under populated exclusive authority", async () => {
+    const projectDir = makeTempDir("picc-policy-runtime-");
+    const userDir = makeTempDir("picc-policy-runtime-user-");
+    const fixture = createMcpProcessFixture(makeTempDir("picc-policy-runtime-fx-"));
+    const remote = await listenForBlockedRemote();
+    const ordinaryWrapper = path.join(projectDir, "ordinary-stdio.mjs");
+    const managedBlockedWrapper = path.join(projectDir, "managed-blocked-stdio.mjs");
+    const managedMcpPath = path.join(projectDir, "managed-mcp.json");
+    const managedPolicyPath = path.join(projectDir, "managed-policy.json");
+    writeProjectFile(projectDir, "CLAUDE.md", "POLICY-RUNTIME-PROJECT\n");
+    for (const [wrapper, marker, mode] of [
+      [ordinaryWrapper, "ordinary-stdio.attempt", "ordinary-stdio"],
+      [managedBlockedWrapper, "managed-blocked-stdio.attempt", "managed-blocked-stdio"],
+    ] as const) {
+      fs.writeFileSync(wrapper, [
+        'import fs from "node:fs";',
+        'import path from "node:path";',
+        `fs.writeFileSync(path.join(process.env.MCP_BARRIER_DIR, ${JSON.stringify(marker)}), "unexpected\\n");`,
+        `process.argv[2] = ${JSON.stringify(mode)};`,
+        `await import(${JSON.stringify(pathToFileURL(fixture.serverScript).href)});`,
+      ].join("\n"));
+    }
+    writeProjectFile(userDir, "settings.json", JSON.stringify({
+      mcpServers: {
+        ordinaryStdio: {
+          command: fixture.nodeCommand,
+          args: [ordinaryWrapper, "ORDINARY_STDIO_CANARY"],
+          env: fixture.env,
+        },
+        ordinaryRemote: { type: "http", url: `${remote.origin}/ordinary-ORDINARY_REMOTE_CANARY` },
+      },
+    }));
+    fs.writeFileSync(managedMcpPath, JSON.stringify({
+      mcpServers: {
+        managedAllowed: {
+          command: fixture.nodeCommand,
+          args: [fixture.serverScript, "serve"],
+          env: fixture.env,
+        },
+        managedBlockedStdio: {
+          command: fixture.nodeCommand,
+          args: [managedBlockedWrapper, "MANAGED_STDIO_CANARY"],
+          env: fixture.env,
+        },
+        managedBlockedRemote: {
+          type: "http",
+          url: `${remote.origin}/managed-MANAGED_REMOTE_CANARY`,
+        },
+      },
+    }));
+    fs.writeFileSync(managedPolicyPath, JSON.stringify({
+      deniedMcpServers: [
+        { serverName: "managedBlockedStdio" },
+        { serverName: "managedBlockedRemote" },
+      ],
+    }));
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const policyPi = fakePi();
+    try {
+      process.chdir(projectDir);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      picc(policyPi.api as never, {
+        managedSettingsPaths: [managedPolicyPath],
+        managedArtifactDirs: [],
+        managedMcpDiscovery: { testAuthority: { path: managedMcpPath, io: createNodeManagedMcpIo() } },
+        onInitializationSettled: policyPi.captureInitialization,
+      });
+      await policyPi.waitForInitialization();
+      await policyPi.waitForTools(["mcp__managedAllowed__echo"]);
+      await fixture.waitFor(["serve.pid"], "the policy-allowed managed server to launch");
+      await policyPi.fire("before_agent_start", { systemPrompt: "BASE" }, policyPi.printCtx());
+
+      expect(fixture.publishedPids()).toEqual([fixture.pidOf("serve.pid")]);
+      expect(fixture.exists("managed-blocked-stdio.attempt")).toBe(false);
+      expect(fixture.exists("managed-blocked-stdio.pid")).toBe(false);
+      expect(fixture.exists("ordinary-stdio.attempt")).toBe(false);
+      expect(fixture.exists("ordinary-stdio.pid")).toBe(false);
+      expect(remote.connections()).toBe(0);
+      expect([...policyPi.tools.keys()].filter((name) => name.startsWith("mcp__ordinary"))).toEqual([]);
+      expect([...policyPi.tools.keys()].filter((name) => name.startsWith("mcp__managedBlocked"))).toEqual([]);
+      expect(policyPi.tools.has("mcp__managedAllowed__echo")).toBe(true);
+
+      await policyPi.commands.get("mcp").handler("", policyPi.tuiCtx());
+      const status = String(policyPi.entries.at(-1)?.data?.output ?? "");
+      expect(status).toContain("exclusive administrator server set is active");
+      expect(status).toContain('"managedAllowed": connected');
+      expect(status).toContain('"managedBlockedStdio": blocked — denied by MCP policy');
+      expect(status).toContain('"managedBlockedRemote": blocked — denied by MCP policy');
+      expect(status).not.toContain('"ordinaryStdio":');
+      expect(status).not.toContain('"ordinaryRemote":');
+      expect(status).not.toMatch(/(?:ORDINARY|MANAGED)_(?:STDIO|REMOTE)_CANARY/u);
+    } finally {
+      await shutdownExtension(policyPi);
+      await fixture.cleanup();
+      await remote.close();
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  }, 30_000);
+
+  it("injected exclusive-empty and fail-closed snapshots suppress stdio and loopback acquisition", async () => {
+    const projectDir = makeTempDir("picc-exclusive-empty-");
+    const userDir = makeTempDir("picc-exclusive-empty-user-");
+    const fixture = createMcpProcessFixture(makeTempDir("picc-exclusive-empty-fx-"));
+    const remote = await listenForBlockedRemote();
+    const managedMcpPath = path.join(projectDir, "managed-mcp.json");
+    writeProjectFile(projectDir, "CLAUDE.md", "EXCLUSIVE-EMPTY-PROJECT\n");
+    writeProjectFile(userDir, "settings.json", JSON.stringify({
+      mcpServers: {
+        ordinaryStdio: {
+          command: fixture.nodeCommand,
+          args: [fixture.serverScript, "serve"],
+          env: fixture.env,
+        },
+        ordinaryRemote: { type: "http", url: `${remote.origin}/mcp` },
+      },
+    }));
+    fs.writeFileSync(managedMcpPath, JSON.stringify({ mcpServers: {} }));
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const emptyPi = fakePi();
+    const failClosedPi = fakePi();
+    try {
+      process.chdir(projectDir);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      picc(emptyPi.api as never, {
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+        managedMcpDiscovery: {
+          testAuthority: { path: managedMcpPath, io: createNodeManagedMcpIo() },
+        },
+        onInitializationSettled: emptyPi.captureInitialization,
+      });
+      await emptyPi.waitForInitialization();
+      await emptyPi.fire("before_agent_start", { systemPrompt: "BASE" }, emptyPi.printCtx());
+      expect(fixture.publishedPids()).toEqual([]);
+      expect(remote.connections()).toBe(0);
+      expect([...emptyPi.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
+      await emptyPi.commands.get("mcp").handler("", emptyPi.tuiCtx());
+      expect(String(emptyPi.entries.at(-1)?.data?.output ?? "")).toContain(
+        "exclusive administrator server set is empty; all MCP is disabled",
+      );
+      await shutdownExtension(emptyPi);
+
+      picc(failClosedPi.api as never, {
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+        managedMcpDiscovery: {
+          testAuthority: { path: managedMcpPath, io: { open: () => ({ status: "unreadable" }) } },
+        },
+        onInitializationSettled: failClosedPi.captureInitialization,
+      });
+      await failClosedPi.waitForInitialization();
+      await failClosedPi.fire("before_agent_start", { systemPrompt: "BASE" }, failClosedPi.printCtx());
+      expect(fixture.publishedPids()).toEqual([]);
+      expect(remote.connections()).toBe(0);
+      expect([...failClosedPi.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
+      await failClosedPi.commands.get("mcp").handler("", failClosedPi.tuiCtx());
+      expect(String(failClosedPi.entries.at(-1)?.data?.output ?? "")).toContain(
+        "Managed MCP policy: fail closed; no candidate can start",
+      );
+    } finally {
+      await shutdownExtension(failClosedPi);
+      await shutdownExtension(emptyPi);
+      await fixture.cleanup();
+      await remote.close();
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -682,14 +891,18 @@ describe("native Claude profile MCP wiring", () => {
     try {
       await closedPi.waitForInitialization();
       await closedPi.fire("before_agent_start", { systemPrompt: "BASE" }, closedPi.printCtx());
+      await closedPi.fire("session_start", { reason: "startup" }, closedPi.printCtx());
+      await closedPi.fire("session_start", { reason: "new" }, closedPi.printCtx());
       expect([...closedPi.tools.keys()].some((name) => name.startsWith("mcp__"))).toBe(false);
       expect(closedFixture.publishedPids()).toEqual([]);
-      expect(warning.mock.calls.filter(([line]) => String(line).includes("MCP loading is fail closed")))
+      expect(warning.mock.calls.filter(([line]) => String(line).includes("fail closed because native Claude state is unusable")))
         .toHaveLength(1);
+      await closedPi.commands.get("mcp").handler("", closedPi.tuiCtx());
+      const recovery = String(closedPi.entries.at(-1)?.data?.output ?? "");
+      expect(recovery).toContain("Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.");
       const warningText = warning.mock.calls.flat().join("\n");
-      expect(warningText).toContain("Preserve or back up the active user profile. PiCC has no repair command. Restore a known-good backup of the active profile or its native state; use the .claude.json inside the user profile directory selected by PICC_CLAUDE_USER_DIR to locate the active state. If no known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC after recovery.");
-      expect(warningText).not.toContain(userDir);
-      expect(warningText).not.toMatch(/malformed native state|CONFLICTING_NATIVE_CANARY/u);
+      expect(`${warningText}\n${recovery}`).not.toContain(userDir);
+      expect(`${warningText}\n${recovery}`).not.toMatch(/malformed native state|CONFLICTING_NATIVE_CANARY/u);
       expect(fs.readFileSync(nativePath)).toEqual(malformedBytes);
     } finally {
       warning.mockRestore();

@@ -166,7 +166,7 @@ user-profile base when an override is selected.
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific approval and disablement apply |
+| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific policy, approval, and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -657,10 +657,10 @@ user profile for user-scoped settings and artifacts, imported installed-plugin s
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
 roots remain in effect.
 
-Native definitions resolve as whole entries in local → project `.mcp.json` → user order; the PiCC
-settings `mcpServers` compatibility extension is lower priority, with its existing managed →
-untracked local → project → user ordering. Fields never merge across same-name definitions. Native
-user and local winners start without the project approval gate. Project `.mcp.json` and committed
+When standalone managed MCP is absent, native definitions resolve as whole entries in local →
+project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
+priority, with its existing managed → untracked local → project → user ordering. Fields never merge
+across same-name definitions. Native user and local winners start without the project approval gate. Project `.mcp.json` and committed
 project-settings extension winners remain pending until approved as described below. An exact name
 in the selected native project's `disabledMcpServers` disables an authentic native or `.mcp.json`
 winner before expansion. `enabledMcpServers` is recognized and reported but cannot activate
@@ -680,13 +680,34 @@ unusable and fail all MCP loading closed.
 This is a conservative PiCC identity and conflict policy, not a claim about Claude Code's exact
 behavior for canonical-equivalent records.
 
-A missing native state file preserves `.mcp.json` and settings-extension sources. If the file is
-present but unusable (for example, malformed or unreadable), PiCC starts no MCP server and emits a
-bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
+Without standalone exclusive control, a missing native state file preserves `.mcp.json` and
+settings-extension sources. If the file is present but unusable (for example, malformed or
+unreadable), PiCC starts no MCP server and emits a bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
 command: restore a known-good backup of the active profile or its native state. If no
 known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC
 after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
 These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
+
+**Managed MCP policy.** A platform-fixed `managed-mcp.json` has the minimal valid root shape
+`{ "mcpServers": { ... } }` and is exclusive: a populated map suppresses ordinary sources, while an
+empty map disables MCP. Its fixed path is
+`C:\Program Files\ClaudeCode\managed-mcp.json` on Windows,
+`/Library/Application Support/ClaudeCode/managed-mcp.json` on macOS, and
+`/etc/claude-code/managed-mcp.json` on Linux; it is distinct from `managed-settings.json`. Managed
+settings deny rules always win; allow contributions are documented soft lists that can be broadened
+by valid lower scopes unless `allowManagedMcpServersOnly` is active. Claude's managed validation
+treats an invalid allow list as active-empty, drops an invalid deny list, and treats invalid
+managed-only as true. PiCC fails the snapshot closed when applicable source uncertainty may have lost
+restrictive material; over-limit allow material becomes active-empty, while ambiguous or over-limit
+candidate identities are blocked individually. Admission uses only bounded identity interpolation
+from one startup environment snapshot. The fixed bounded PiCC-owned Git tracking classification may
+run only when winner or approval selection needs it. After a winner is blocked, no further probe,
+server-controlled helper, MCP server process, DNS lookup, or network activity occurs. `/mcp` and
+`/doctor` show PiCC-defined structured posture, blocked reasons, and authority-specific remediation:
+repair user policy yourself, ask an administrator to repair managed policy, or do both for mixed
+authority. One bounded warning appears at extension startup for an empty exclusive set, fail-closed
+policy, or blocked servers. See the [capability matrix](supported-features.md) for exact matching,
+limits, deferred sources, and presentation differences.
 
 **Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
 the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient
@@ -798,6 +819,7 @@ behaviors worth knowing:
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | MCP pending-approval notice at every startup | Review the pending servers and choose approval or decline under [MCP server settings](#6-security--permission-posture). Use `/mcp` for bounded status and settings guidance, or `/doctor` for broader compatibility findings. |
+| Managed MCP policy is fail closed or a repaired policy is not taking effect | Use `/mcp` or `/doctor` to inspect the reported authority, compiler observations, and any redacted source label. For the standalone managed MCP file, ask the administrator to repair the platform-fixed `managed-mcp.json`; for the managed-settings system file, system drop-in, or machine registry, ask the administrator to repair that source; for user-controlled authority, repair or recover the reported user-controlled policy input. Then use `/reload` or restart PiCC; `/new` does not reload policy. |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the session was persisted and its process exited, reopen that exact session before `/compact`; a one-shot ephemeral print/JSON session cannot be reopened, so start a replacement session and resend retained input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from client/request history, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; outside the TUI, exit status **3** does report that a main-session checkpoint gave up. |
 | `picc -p` exited with status **3** | A main-session checkpoint gave up: PiCC paused the work for context compaction and it never resumed, so stdout is a partial answer. Read the `PiCC: ` line on stderr — or the `picc-checkpoint-lifecycle` entries under `--mode json`/RPC — for which ending it was and what to resend. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |

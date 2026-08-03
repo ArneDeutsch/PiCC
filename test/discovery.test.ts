@@ -10,12 +10,20 @@ import {
 } from "../src/discovery/settings.js";
 import {
   createWindowsManagedRegistryAdapter,
+  defaultManagedMcpPath,
   defaultManagedPolicyDescription,
+  discoverManagedMcp,
   discoverManagedPolicy,
   type ManagedPolicyIo,
   type ManagedRegistryAdapter,
   type RegistryCommandInvocation,
 } from "../src/discovery/managed-policy.js";
+import {
+  createNodeManagedMcpIo,
+  type ManagedMcpFileMetadata,
+  type ManagedMcpIo,
+  type ManagedMcpNodeFs,
+} from "../src/claude/managed-mcp.js";
 import {
   dedupeByName,
   defaultManagedDirs,
@@ -507,7 +515,7 @@ describe("loadSettings — precedence & merging", () => {
     expect(settings.managedClaudeMd).toEqual({ content: "MANAGED INLINE", source: managedFile });
     // The project-scope attempt degrades to a diagnostic, not silence.
     expect(
-      settings.diagnostics.some((d) => d.message.includes('"claudeMd" is only honored in managed')),
+      settings.diagnostics.some((d) => d.message.includes('"claudeMd" applies only in managed')),
     ).toBe(true);
 
     // Without a managed file, a project claudeMd never lands anywhere.
@@ -1310,6 +1318,510 @@ describe("loadSettings — strict plugin enablement diagnostics", () => {
   });
 });
 
+describe("MCP policy settings projection", () => {
+  const malformedFields = {
+    allowedMcpServers: { not: "a-list" },
+    deniedMcpServers: "not-a-list",
+    allowManagedMcpServersOnly: "not-a-boolean",
+  } as const;
+
+  it("rejects each malformed policy field as a whole ordinary user, project, or local file", () => {
+    for (const scope of ["user", "project", "local"] as const) {
+      for (const [key, value] of Object.entries(malformedFields)) {
+        const scopes = makeScopes();
+        const filePath = scope === "user"
+          ? path.join(scopes.userDir, "settings.json")
+          : path.join(scopes.projectRoot, ".claude", scope === "project" ? "settings.json" : "settings.local.json");
+        writeJson(filePath, { model: "must-not-apply", [key]: value });
+        const settings = load(scopes);
+        expect(settings.model, `${scope}:${key}`).toBeUndefined();
+        expect(settings.mcpPolicySettings, `${scope}:${key}`).toEqual([]);
+        expect(settings.diagnostics).toContainEqual(expect.objectContaining({
+          severity: "error", message: `Setting "${key}" is invalid; settings file skipped`, source: filePath,
+        }));
+        expect(settings.unknownKeys).toEqual([]);
+      }
+    }
+  });
+
+  it("retains zero ordinary projection while preserving an independent managed contribution", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      allowedMcpServers: [{ serverName: "must-not-authorize" }, { malformed: true }],
+      deniedMcpServers: [{ serverName: "must-not-restrict" }],
+    });
+    const managedPath = path.join(makeTmp(), "managed.json");
+    writeJson(managedPath, { deniedMcpServers: [{ serverName: "managed-only" }] });
+
+    const settings = load(scopes, [managedPath]);
+    expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({
+      scope: "managed",
+      sourcePath: managedPath,
+      deniedMcpServers: [{ serverName: "managed-only" }],
+    })]);
+  });
+
+  it("retains managed whole-field presence, strips malformed list entries, and preserves source order", () => {
+    const scopes = makeScopes();
+    const first = path.join(makeTmp(), "first.json");
+    const second = path.join(makeTmp(), "second.json");
+    const third = path.join(makeTmp(), "third.json");
+    writeJson(first, {
+      allowedMcpServers: [{ serverName: "kept" }, { wrong: "stripped" }],
+      allowManagedMcpServersOnly: false,
+    });
+    writeJson(second, {
+      allowedMcpServers: { malformed: "whole-field" },
+      deniedMcpServers: { malformed: "whole-field" },
+      allowManagedMcpServersOnly: "invalid-whole-field",
+    });
+    writeJson(third, {
+      deniedMcpServers: [{ serverCommand: ["node", "ok"] }, { serverCommand: [] }],
+      allowManagedMcpServersOnly: true,
+    });
+
+    const settings = load(scopes, [first, second, third]);
+    expect(settings.mcpPolicySettings).toEqual([
+      {
+        scope: "managed", sourcePath: first, order: 0, valid: true,
+        allowedMcpServers: [{ serverName: "kept" }], allowManagedMcpServersOnly: false,
+      },
+      {
+        scope: "managed", sourcePath: second, order: 1, valid: true,
+        allowedMcpServers: { malformed: "whole-field" },
+        deniedMcpServers: { malformed: "whole-field" }, allowManagedMcpServersOnly: "invalid-whole-field",
+      },
+      {
+        scope: "managed", sourcePath: third, order: 2, valid: true,
+        deniedMcpServers: [{ serverCommand: ["node", "ok"] }], allowManagedMcpServersOnly: true,
+      },
+    ]);
+    expect(settings.diagnostics.filter((diagnostic) => diagnostic.message.startsWith("Managed MCP policy field"))).toHaveLength(5);
+  });
+
+  it("rejects mixed malformed ordinary arrays but strips malformed managed siblings field-sensitively", () => {
+    for (const scope of ["user", "project", "local"] as const) {
+      for (const key of ["allowedMcpServers", "deniedMcpServers"] as const) {
+        const scopes = makeScopes();
+        const filePath = scope === "user"
+          ? path.join(scopes.userDir, "settings.json")
+          : path.join(scopes.projectRoot, ".claude", scope === "project" ? "settings.json" : "settings.local.json");
+        writeJson(filePath, { model: "must-not-apply", [key]: [{ serverName: "valid" }, { extra: "malformed" }] });
+        const settings = load(scopes);
+        expect(settings.model, `${scope}:${key}`).toBeUndefined();
+        expect(settings.mcpPolicySettings).toEqual([]);
+      }
+    }
+
+    const scopes = makeScopes();
+    const managedPath = path.join(makeTmp(), "managed.json");
+    writeJson(managedPath, {
+      allowedMcpServers: [{ serverName: "valid_name" }, { serverName: "invalid.name" }],
+      deniedMcpServers: [{ serverName: "punctuation.is/valid:here" }, { serverName: "" }],
+    });
+    const settings = load(scopes, [managedPath]);
+    expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({
+      valid: true,
+      allowedMcpServers: [{ serverName: "valid_name" }],
+      deniedMcpServers: [{ serverName: "punctuation.is/valid:here" }],
+    })]);
+  });
+
+  it("rejects undocumented allow-name punctuation but accepts deny-name punctuation in ordinary scopes", () => {
+    for (const scope of ["user", "project", "local"] as const) {
+      const scopes = makeScopes();
+      const filePath = scope === "user"
+        ? path.join(scopes.userDir, "settings.json")
+        : path.join(scopes.projectRoot, ".claude", scope === "project" ? "settings.json" : "settings.local.json");
+      writeJson(filePath, {
+        model: "must-not-apply",
+        allowedMcpServers: [{ serverName: "invalid.name" }],
+        deniedMcpServers: [{ serverName: "punctuation.is/valid:here" }],
+      });
+      const settings = load(scopes);
+      expect(settings.model).toBeUndefined();
+      expect(settings.mcpPolicySettings).toEqual([]);
+
+      writeJson(filePath, {
+        model: "applies",
+        deniedMcpServers: [{ serverName: "punctuation.is/valid:here" }],
+      });
+      const denyOnly = load(scopes);
+      expect(denyOnly.model).toBe("applies");
+      expect(denyOnly.mcpPolicySettings).toEqual([expect.objectContaining({ valid: true })]);
+    }
+  });
+
+  it("projects valid ordinary allow and deny lists while managed-only outside managed scope has no effect", () => {
+    const scopes = makeScopes();
+    const userFile = path.join(scopes.userDir, "settings.json");
+    writeJson(userFile, {
+      allowedMcpServers: [{ serverUrl: "https://allowed.example" }],
+      deniedMcpServers: [{ serverName: "blocked" }],
+      allowManagedMcpServersOnly: true,
+    });
+    const settings = load(scopes);
+    expect(settings.mcpPolicySettings).toEqual([{
+      scope: "user", sourcePath: userFile, order: 0, valid: true,
+      allowedMcpServers: [{ serverUrl: "https://allowed.example" }],
+      deniedMcpServers: [{ serverName: "blocked" }],
+    }]);
+    expect(settings.diagnostics).toContainEqual(expect.objectContaining({
+      message: 'Setting "allowManagedMcpServersOnly" applies only in managed settings; ignored',
+    }));
+    expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
+  });
+
+  it("projects administrator and active HKCU failures without paths or raw policy data", () => {
+    const scopes = makeScopes();
+    const description = {
+      systemSettingsPath: "/policy/system.json",
+      dropInDir: "/policy/drop-ins",
+      artifactDirs: ["/policy"],
+    };
+    const administrator = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo({ [description.systemSettingsPath]: "{ malformed" }),
+      },
+    });
+    expect(administrator.mcpPolicySourceFailures).toEqual([{
+      kind: "malformed", sourceClass: "system-file", authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
+    }]);
+
+    const registryCalls: string[] = [];
+    const hkcu = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "win32",
+        description,
+        io: inertPolicyIo({}),
+        registry: inertRegistry({ status: "absent" }, { status: "unreadable" }, registryCalls),
+      },
+    });
+    expect(registryCalls).toEqual(["HKLM", "HKCU"]);
+    expect(hkcu.mcpPolicySourceFailures).toEqual([{
+      kind: "unreadable", sourceClass: "registry-hkcu", authority: "user-controlled",
+      remediation: "repair-user-policy",
+    }]);
+    const serialized = JSON.stringify([...administrator.mcpPolicySourceFailures, ...hkcu.mcpPolicySourceFailures]);
+    expect(serialized).not.toContain(description.systemSettingsPath);
+    expect(serialized).not.toContain("{ malformed");
+    expect(serialized).not.toContain("SOFTWARE\\Policies\\ClaudeCode");
+  });
+
+  it("bounds policy contributions with stable order and retains later managed evidence", () => {
+    const atLimitScopes = makeScopes();
+    const atLimitPaths = Array.from({ length: 256 }, (_, index) => {
+      const filePath = path.join(makeTmp(), `managed-${index}.json`);
+      writeJson(filePath, { deniedMcpServers: [{ serverName: `deny-${index}` }] });
+      return filePath;
+    });
+    const atLimit = load(atLimitScopes, atLimitPaths);
+    expect(atLimit.mcpPolicySettings).toHaveLength(256);
+    expect(atLimit.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
+    expect(atLimit.mcpPolicySettings.map((entry) => entry.order)).toEqual(
+      Array.from({ length: 256 }, (_, index) => index),
+    );
+
+    const overflowScopes = makeScopes();
+    const userFile = path.join(overflowScopes.userDir, "settings.json");
+    writeJson(userFile, { deniedMcpServers: [{ serverName: "ordinary-first" }] });
+    const overflowPaths = Array.from({ length: 256 }, (_, index) => {
+      const filePath = path.join(makeTmp(), `later-${index}.json`);
+      writeJson(filePath, { deniedMcpServers: [{ serverName: `managed-${index}` }] });
+      return filePath;
+    });
+    const overflow = load(overflowScopes, overflowPaths);
+    expect(overflow.mcpPolicySettings).toHaveLength(256);
+    expect(overflow.mcpPolicyRestrictiveMaterialOmitted).toBe(true);
+    expect(overflow.mcpPolicySettings[0]).toEqual(expect.objectContaining({ scope: "managed", order: 1 }));
+    expect(overflow.mcpPolicySettings.at(-1)).toEqual(expect.objectContaining({ scope: "managed", order: 256 }));
+    expect(overflow.mcpPolicySettings.map((entry) => entry.order)).toEqual(
+      Array.from({ length: 256 }, (_, index) => index + 1),
+    );
+  });
+
+  it("preserves duplicate limit-plus-one rule material for bounded compiler projection", () => {
+    const scopes = makeScopes();
+    const managedPath = path.join(makeTmp(), "duplicates.json");
+    const rules = Array.from({ length: 513 }, () => ({ serverName: "same-name" }));
+    writeJson(managedPath, { deniedMcpServers: rules });
+    const settings = load(scopes, [managedPath]);
+    expect(settings.mcpPolicySettings).toHaveLength(1);
+    expect(settings.mcpPolicySettings[0]?.deniedMcpServers).toHaveLength(513);
+    expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
+  });
+
+  it("bounds failure records, retains later administrator evidence, and redacts source data", () => {
+    const scopes = makeScopes();
+    const description = {
+      systemSettingsPath: "/policy/system.json",
+      dropInDir: "/policy/drop-ins",
+      artifactDirs: ["/policy"],
+    };
+    const dropIns = Array.from({ length: 64 }, (_, index) => `/policy/drop-ins/${String(index).padStart(2, "0")}-secret.json`);
+    const files = Object.fromEntries(dropIns.map((filePath) => [filePath, `{ malformed-secret-${filePath}`]));
+    const atLimit = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: { platform: "linux", description, io: inertPolicyIo(files, dropIns) },
+    });
+    expect(atLimit.mcpPolicySourceFailures).toHaveLength(64);
+    expect(atLimit.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
+    expect(atLimit.mcpPolicySourceFailures.every((failure) => failure.sourceClass === "system-drop-in")).toBe(true);
+
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "win32",
+        description,
+        io: inertPolicyIo(files, dropIns),
+        registry: inertRegistry(
+          { status: "present", json: "{ malformed-registry-secret" },
+          { status: "absent" },
+        ),
+      },
+    });
+    expect(settings.mcpPolicySourceFailures).toHaveLength(64);
+    expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(true);
+    expect(settings.mcpPolicySourceFailures.at(-1)).toEqual({
+      kind: "malformed", sourceClass: "registry-hklm", authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
+    });
+    const serialized = JSON.stringify(settings.mcpPolicySourceFailures);
+    expect(serialized).not.toContain("/policy");
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("SOFTWARE\\Policies");
+  });
+
+  it("projects malformed and unreadable evidence for every active managed source class", () => {
+    const scopes = makeScopes();
+    const description = {
+      systemSettingsPath: "/redacted/system.json",
+      dropInDir: "/redacted/drop-ins",
+      artifactDirs: ["/redacted"],
+    };
+    for (const unreadable of [false, true]) {
+      const category = unreadable ? "unreadable" : "malformed";
+      const malformed = unreadable ? "<unreadable>" : "{ secret-value";
+      const fileSettings = loadSettings({
+        cwd: scopes.projectRoot, projectRoot: scopes.projectRoot, userDir: scopes.userDir,
+        managedPolicy: {
+          platform: "linux", description,
+          io: inertPolicyIo({
+            [description.systemSettingsPath]: malformed,
+            [`${description.dropInDir}/entry.json`]: malformed,
+          }, [`${description.dropInDir}/entry.json`]),
+        },
+      });
+      expect(fileSettings.mcpPolicySourceFailures).toEqual([
+        { kind: category, sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+        { kind: category, sourceClass: "system-drop-in", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      ]);
+
+      for (const [hive, sourceClass, authority, remediation] of [
+        ["HKLM", "registry-hklm", "administrator-controlled", "repair-administrator-policy"],
+        ["HKCU", "registry-hkcu", "user-controlled", "repair-user-policy"],
+      ] as const) {
+        const calls: string[] = [];
+        const read = unreadable ? { status: "unreadable" as const } : { status: "present" as const, json: "{ registry-secret" };
+        const registrySettings = loadSettings({
+          cwd: scopes.projectRoot, projectRoot: scopes.projectRoot, userDir: scopes.userDir,
+          managedPolicy: {
+            platform: "win32", description, io: inertPolicyIo({}),
+            registry: inertRegistry(hive === "HKLM" ? read : { status: "absent" }, hive === "HKCU" ? read : { status: "absent" }, calls),
+          },
+        });
+        expect(calls).toEqual(hive === "HKLM" ? ["HKLM"] : ["HKLM", "HKCU"]);
+        expect(registrySettings.mcpPolicySourceFailures).toEqual([
+          { kind: category, sourceClass, authority, remediation },
+        ]);
+        expect(JSON.stringify(registrySettings.mcpPolicySourceFailures)).not.toMatch(/redacted|secret|SOFTWARE/u);
+      }
+    }
+  });
+
+  it("suppresses HKCU completely when HKLM is present and valid", () => {
+    const scopes = makeScopes();
+    const calls: string[] = [];
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "win32",
+        description: { systemSettingsPath: "/none", dropInDir: "/none.d", artifactDirs: ["/"] },
+        io: inertPolicyIo({}),
+        registry: inertRegistry(
+          { status: "present", json: JSON.stringify({ deniedMcpServers: [] }) },
+          { status: "unreadable" },
+          calls,
+        ),
+      },
+    });
+    expect(calls).toEqual(["HKLM"]);
+    expect(settings.mcpPolicySourceFailures).toEqual([]);
+    expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({ scope: "managed", order: 0, deniedMcpServers: [] })]);
+  });
+});
+
+interface ManagedMcpIoFixture {
+  io: ManagedMcpIo;
+  calls: string[];
+}
+
+function managedMcpIoFixture(options: {
+  bytes?: Uint8Array;
+  open?: "absent" | "unreadable";
+  before?: Partial<ManagedMcpFileMetadata>;
+  after?: Partial<ManagedMcpFileMetadata>;
+  current?: Partial<ManagedMcpFileMetadata>;
+  readFails?: boolean;
+  closeFails?: boolean;
+  closeThrows?: boolean;
+}): ManagedMcpIoFixture {
+  const bytes = options.bytes ?? Buffer.from('{"mcpServers":{}}');
+  const base: ManagedMcpFileMetadata = {
+    regular: true,
+    size: bytes.byteLength,
+    identity: "1:2",
+    modified: "3:4",
+  };
+  const calls: string[] = [];
+  return {
+    calls,
+    io: {
+      open(filePath) {
+        calls.push(`open:${filePath}`);
+        if (options.open !== undefined) return { status: options.open };
+        let metadataCalls = 0;
+        return {
+          status: "opened",
+          handle: {
+            metadata() {
+              calls.push("metadata");
+              return metadataCalls++ === 0 ? { ...base, ...options.before } : { ...base, ...options.after };
+            },
+            read(maxBytes) {
+              calls.push(`read:${maxBytes}`);
+              return options.readFails ? undefined : bytes.subarray(0, maxBytes);
+            },
+            currentPathMetadata() {
+              calls.push("current-path-metadata");
+              return { ...base, ...options.current };
+            },
+            close() {
+              calls.push("close");
+              if (options.closeThrows === true) throw new Error("close canary");
+              return options.closeFails !== true;
+            },
+          },
+        };
+      },
+    },
+  };
+}
+
+describe("standalone managed MCP discovery", () => {
+  it("uses the fixed platform paths", () => {
+    expect(defaultManagedMcpPath("darwin")).toBe("/Library/Application Support/ClaudeCode/managed-mcp.json");
+    expect(defaultManagedMcpPath("linux")).toBe("/etc/claude-code/managed-mcp.json");
+    expect(defaultManagedMcpPath("win32")).toBe("C:\\Program Files\\ClaudeCode\\managed-mcp.json");
+  });
+
+  it("distinguishes absent, loaded empty, and loaded populated snapshots without expansion", () => {
+    const absent = managedMcpIoFixture({ open: "absent" });
+    expect(discoverManagedMcp({ platform: "linux", testAuthority: { path: "/test/policy", io: absent.io } })).toEqual({ status: "absent" });
+
+    const empty = managedMcpIoFixture({});
+    expect(discoverManagedMcp({ testAuthority: { path: "/test/empty", io: empty.io } })).toEqual({ status: "loaded", servers: [] });
+
+    const populated = managedMcpIoFixture({ bytes: Buffer.from(JSON.stringify({ mcpServers: {
+      raw: { command: "${MCP_COMMAND}", args: ["${MCP_ARG:-fallback}"] },
+    } })) });
+    const result = discoverManagedMcp({ testAuthority: { path: "/test/populated", io: populated.io } });
+    expect(result).toMatchObject({ status: "loaded", servers: [{
+      name: "raw", source: "managed-mcp", command: "${MCP_COMMAND}", args: ["${MCP_ARG:-fallback}"], skipped: false,
+    }] });
+    expect(populated.calls.filter((call) => call.startsWith("open:"))).toEqual(["open:/test/populated"]);
+    expect(populated.calls).toContain("read:1048577");
+  });
+
+  it("returns fixed unusable reasons for every whole-artifact uncertainty", () => {
+    const cases: Array<[string, Parameters<typeof managedMcpIoFixture>[0], string]> = [
+      ["unreadable open", { open: "unreadable" }, "unreadable"],
+      ["unreadable read", { readFails: true }, "unreadable"],
+      ["non-regular", { before: { regular: false } }, "non-regular"],
+      ["oversized metadata", { before: { size: 1_048_577 } }, "oversized"],
+      ["invalid encoding", { bytes: Uint8Array.from([0xc3, 0x28]) }, "invalid-encoding"],
+      ["malformed", { bytes: Buffer.from("{") }, "malformed"],
+      ["JSONC rejected", { bytes: Buffer.from('{"mcpServers":{} // comment\n}') }, "malformed"],
+      ["wrong root", { bytes: Buffer.from('{"servers":{}}') }, "wrong-root"],
+      ["handle metadata race", { after: { modified: "changed" } }, "unstable"],
+      ["path replacement", { current: { identity: "replacement" } }, "unstable"],
+      ["close failure", { closeFails: true }, "unstable"],
+      ["close exception", { closeThrows: true }, "unstable"],
+    ];
+    for (const [label, fixtureOptions, reason] of cases) {
+      const fixture = managedMcpIoFixture(fixtureOptions);
+      expect(discoverManagedMcp({ testAuthority: { path: `/test/${label}`, io: fixture.io } }), label)
+        .toEqual({ status: "unusable", reason });
+    }
+  });
+
+  it("treats open ENOENT as absent only when lstat also proves the path absent", () => {
+    const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("redacted"), { code: "ENOENT" });
+    const adapter = (pathPresent: boolean): ManagedMcpIo => createNodeManagedMcpIo({
+      constants: { O_RDONLY: 0 },
+      openSync() { throw enoent(); },
+      lstatSync() {
+        if (!pathPresent) throw enoent();
+        return { isFile: () => false } as fs.Stats;
+      },
+      fstatSync() { throw new Error("not reached"); },
+      readSync() { throw new Error("not reached"); },
+      closeSync() { throw new Error("not reached"); },
+    } satisfies ManagedMcpNodeFs);
+
+    expect(discoverManagedMcp({ testAuthority: { path: "/fixed/absent", io: adapter(false) } }))
+      .toEqual({ status: "absent" });
+    expect(discoverManagedMcp({ testAuthority: { path: "/fixed/dangling-symlink", io: adapter(true) } }))
+      .toEqual({ status: "unusable", reason: "unreadable" });
+  });
+
+  it("accepts the exact byte boundary and rejects one byte beyond it", () => {
+    const prefix = '{"mcpServers":{}}';
+    const exactBytes = Buffer.from(prefix + " ".repeat(1_048_576 - Buffer.byteLength(prefix)));
+    const exact = managedMcpIoFixture({ bytes: exactBytes });
+    expect(discoverManagedMcp({ testAuthority: { path: "/test/exact", io: exact.io } })).toEqual({ status: "loaded", servers: [] });
+
+    const overBytes = Buffer.concat([exactBytes, Buffer.from(" ")]);
+    expect(overBytes.byteLength).toBe(1_048_577);
+    const over = managedMcpIoFixture({ bytes: overBytes, before: { size: 1_048_576 } });
+    expect(discoverManagedMcp({ testAuthority: { path: "/test/over", io: over.io } })).toEqual({ status: "unusable", reason: "oversized" });
+  });
+
+  it("uses only injected standalone authority and performs no registry, drop-in, or project lookup", () => {
+    const fixture = managedMcpIoFixture({ open: "absent" });
+    discoverManagedMcp({
+      platform: "win32",
+      testAuthority: { path: "/only/injected", io: fixture.io },
+    });
+    expect(fixture.calls).toEqual(["open:/only/injected"]);
+  });
+});
+
 describe("managed policy discovery", () => {
   it("describes current platform file and artifact locations without obsolete ProgramData", () => {
     expect(defaultManagedPolicyDescription("win32")).toEqual({
@@ -1368,6 +1880,39 @@ describe("managed policy discovery", () => {
       b,
       `HKLM\\SOFTWARE\\Policies\\ClaudeCode\\Settings`,
     ]);
+  });
+
+  it("preserves exact duplicate policy arrays per physical source while aggregate merging stays compatible", () => {
+    const first = "/policy/first.json";
+    const second = "/policy/second.json";
+    const duplicate = { serverName: "duplicate" };
+    const result = discoverManagedPolicy({
+      platform: "linux",
+      overridePaths: [first, second],
+      io: inertPolicyIo({
+        [first]: JSON.stringify({
+          allowedMcpServers: [duplicate, duplicate, { serverName: "tail" }],
+          deniedMcpServers: [{ serverName: "deny" }, { serverName: "deny" }],
+          allowManagedMcpServersOnly: false,
+        }),
+        [second]: JSON.stringify({
+          allowedMcpServers: [{ serverName: "second" }, duplicate],
+          allowManagedMcpServersOnly: true,
+        }),
+      }),
+    });
+
+    expect(result.sources[0]?.value).toMatchObject({
+      allowedMcpServers: [duplicate, duplicate, { serverName: "tail" }],
+      deniedMcpServers: [{ serverName: "deny" }, { serverName: "deny" }],
+      allowManagedMcpServersOnly: false,
+    });
+    expect(result.sources[1]?.value.allowedMcpServers).toEqual([{ serverName: "second" }, duplicate]);
+    expect(result.settings).toMatchObject({
+      allowedMcpServers: [duplicate, { serverName: "tail" }, { serverName: "second" }],
+      deniedMcpServers: [{ serverName: "deny" }],
+      allowManagedMcpServersOnly: true,
+    });
   });
 
   it("keeps hostile managed object keys on null-prototype records without leakage", () => {

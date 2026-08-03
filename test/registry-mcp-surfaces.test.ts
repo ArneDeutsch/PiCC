@@ -141,22 +141,6 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-sampling")).toContain("cannot ask PiCC to run model generations");
   });
 
-  it("pins native source boundaries and managed-policy exposure", () => {
-    const extension = note("setting.mcpServers");
-    expect(extension).toContain("Native runtime disablement applies only to authentic native/.mcp.json winners, never settings-extension winners");
-    expect(extension).toContain("managed settings extension > untracked settings.local.json extension > project settings extension > user settings extension");
-    expect(extension).toContain("all applicable inactive gates run before expansion");
-
-    expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({
-      tier: "not-supported",
-      safetyRelevant: true,
-    });
-    const managed = note("feature.mcp-managed-config");
-    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
-      expect(managed).toContain(source);
-    }
-  });
-
   it("distinguishes inherited resource tools from user-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
     expect(frontmatter).toContain("gated MCP tool proxies and conditional resource tools");
@@ -188,7 +172,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "feature.mcp-max-result-size-chars": "The metadata and persistence behavior are the same unsupported per-tool text-threshold contract, distinct from generic clipping.",
   "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share the same absent model-visible evidence channel and human-only PiCC remedy.",
   "feature.mcp-server-instructions": "Instruction forwarding and its truncation rule share one absent model-context behavior and non-safety conclusion.",
-  "feature.mcp-managed-config": "The managed source and managed-mcp.json file are one absent exclusive-control policy whose fixed or empty server set can restrict MCP execution.",
+  "feature.mcp-managed-config": "The standalone managed source, exclusive/empty behavior, fail-closed hardening, and deferred delivery/source limits form one partial administrator-control boundary." ,
   "feature.mcp-oauth": "OAuth login, logout, and dynamic registration share the absent credential flow, non-safety tier, and static-header remedy.",
   "feature.mcp-roots": "roots/list and roots/list_changed share PiCC's absent workspace-root exposure and non-safety conclusion.",
   "feature.mcp-channels": "Channel behavior and its two channel-specific CLI loading controls are all unavailable because PiCC has no channel loading path.",
@@ -207,35 +191,35 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "feature.mcp-tool-search": "Deferred loading and both documented loading-control environment variables share PiCC's upfront-schema behavior and the same unsupported tool-search remedy.",
   "feature.mcp-capability-discovery": "Capability discovery and failure coupling share PiCC's partial initial publication behavior and the same /mcp visibility remedy.",
   "feature.mcp-remote-transports": "HTTP, deprecated SSE, static headers, and automatic reconnection share PiCC's remote-client implementation, partial transport limits, non-safety conclusion, and remote-config remedy.",
-  "setting.allowManagedMcpServersOnly": "The setting, managed-only restriction, and invalid-value fail-closed rule are one unenforced enterprise gate with the same safety conclusion and prohibited-server remedy.",
-  "setting.allowedMcpServers": "The allowlist and invalid-value empty-allowlist rule share one unenforced managed restriction, safety conclusion, and prohibited-server remedy.",
+  "setting.allowManagedMcpServersOnly": "The setting, managed-only restriction, invalid-value handling, central admission coverage, and missing-source limits form one partial enterprise gate.",
+  "setting.allowedMcpServers": "The soft allowlist, invalid-value active-empty behavior, central admission coverage, hardening, and missing-source limits form one partial managed restriction.",
 };
 
 const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
-  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-remote-transports","setting.mcpServers"],
+  "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-remote-transports","setting.mcpServers"],
   "feature.mcp-auto-background": ["feature.mcp-first-byte-timeout","feature.mcp-idle-timeout"],
   "feature.mcp-capability-discovery": ["feature.mcp","feature.mcp-model-failure-visibility","feature.mcp-prompts","feature.mcp-resources"],
   "feature.mcp-channels": ["feature.mcp","setting.allowedChannelPlugins","setting.channelsEnabled"],
   "feature.mcp-child-session-env": ["feature.mcp"],
-  "feature.mcp-claude-json-scopes": ["feature.mcp","feature.mcp-connectors","feature.mcp-project-approval","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.mcpServers"],
+  "feature.mcp-claude-json-scopes": ["feature.mcp","feature.mcp-connectors","feature.mcp-managed-config","feature.mcp-project-approval","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.mcpServers"],
   "feature.mcp-cli-invocation-controls": ["setting.disableSideloadFlags","setting.mcpServers"],
   "feature.mcp-cli-management": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","setting.mcpServers"],
   "feature.mcp-connect-timeout-ms": ["feature.mcp-first-byte-timeout","feature.mcp-server-always-load"],
   "feature.mcp-connectors": ["feature.mcp-claude-json-scopes","feature.mcp-oauth","setting.disableClaudeAiConnectors"],
-  "feature.mcp-control-status": ["feature.mcp","feature.mcp-cli-management","tool.WaitForMcpServers"],
+  "feature.mcp-control-status": ["feature.mcp","feature.mcp-cli-management","feature.mcp-managed-config","tool.WaitForMcpServers"],
   "feature.mcp-elicitation": ["hook.event.Elicitation","hook.event.ElicitationResult"],
   "feature.mcp-first-byte-timeout": ["feature.mcp","feature.mcp-auto-background","feature.mcp-connect-timeout-ms"],
   "feature.mcp-headers-helper": ["feature.mcp-oauth","feature.mcp-remote-transports","feature.mcp-websocket"],
   "feature.mcp-url-without-type-validation": ["setting.mcpServers","feature.mcp-remote-transports"],
   "feature.mcp-idle-timeout": ["feature.mcp-auto-background","feature.mcp-remote-transports"],
   "feature.mcp-list-changed": ["feature.mcp-prompts","feature.mcp-resource-subscriptions","feature.mcp-resources"],
-  "feature.mcp-managed-config": ["feature.mcp-project-approval","setting.allowManagedMcpServersOnly","setting.allowedMcpServers","setting.deniedMcpServers","setting.mcpServers","setting.strictPluginOnlyCustomization.mcp"],
+  "feature.mcp-managed-config": ["feature.managed-policy","feature.mcp-project-approval","setting.allowManagedMcpServersOnly","setting.allowedMcpServers","setting.deniedMcpServers","setting.mcpServers","setting.strictPluginOnlyCustomization.mcp"],
   "feature.mcp-max-result-size-chars": ["feature.mcp-output-token-cap","feature.tool-output-clip"],
   "feature.mcp-model-failure-visibility": ["feature.mcp-capability-discovery","feature.mcp-tool-search","tool.ToolSearch","tool.WaitForMcpServers"],
   "feature.mcp-oauth": ["feature.mcp-connectors","feature.mcp-remote-transports"],
   "feature.mcp-output-token-cap": ["feature.mcp-max-result-size-chars","feature.tool-output-clip"],
   "feature.mcp-plugin-servers": ["feature.mcp","feature.plugins-content"],
-  "feature.mcp-project-approval": ["feature.mcp-claude-json-scopes","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
+  "feature.mcp-project-approval": ["feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-runtime-disabled","feature.mcp-runtime-enabled","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
   "feature.mcp-prompts": ["feature.mcp-capability-discovery","feature.mcp-list-changed"],
   "feature.mcp-remote-transports": ["feature.mcp","feature.mcp-headers-helper","feature.mcp-oauth","feature.mcp-websocket"],
   "feature.mcp-requires-user-interaction": ["tool.mcp__*"],
@@ -244,7 +228,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "feature.mcp-resources": ["feature.mcp-resource-subscriptions","feature.mcp-resource-templates","tool.ListMcpResourcesTool","tool.ReadMcpResourceTool"],
   "feature.mcp-root-schema-combinators": ["tool.mcp__*"],
   "feature.mcp-roots": ["feature.mcp"],
-  "feature.mcp-runtime-disabled": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
+  "feature.mcp-runtime-disabled": ["feature.mcp-claude-json-scopes","feature.mcp-control-status","feature.mcp-managed-config","feature.mcp-project-approval","feature.mcp-runtime-enabled"],
   "feature.mcp-runtime-enabled": ["feature.mcp-control-status","feature.mcp-project-approval","feature.mcp-runtime-disabled"],
   "feature.mcp-sampling": ["feature.mcp"],
   "feature.mcp-server-always-load": ["feature.mcp-connect-timeout-ms","feature.mcp-tool-search","tool.WaitForMcpServers"],
@@ -272,7 +256,7 @@ const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
   "setting.disabledMcpjsonServers": ["feature.mcp-project-approval","setting.enableAllProjectMcpServers","setting.enabledMcpjsonServers"],
   "setting.enableAllProjectMcpServers": ["feature.mcp-project-approval","setting.disabledMcpjsonServers","setting.enabledMcpjsonServers"],
   "setting.enabledMcpjsonServers": ["feature.mcp-project-approval","setting.disabledMcpjsonServers","setting.enableAllProjectMcpServers"],
-  "setting.mcpServers": ["feature.mcp","feature.mcp-claude-json-scopes","feature.mcp-project-approval"],
+  "setting.mcpServers": ["feature.mcp","feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-project-approval"],
   "tool.ListMcpResourcesTool": ["feature.mcp-resources","tool.ReadMcpResourceTool"],
   "tool.ReadMcpResourceTool": ["feature.mcp-resources","tool.ListMcpResourcesTool"],
   "tool.ToolSearch": ["feature.mcp-model-failure-visibility","feature.mcp-server-always-load","feature.mcp-tool-always-load","feature.mcp-tool-search"],
@@ -397,18 +381,18 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("plugins.placeholder-substitution", "MCP reference", "Plugin MCP placeholder expansion and substitution", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
   s("plugins.scoped-naming", "MCP reference", "Plugin-scoped MCP tool and server naming", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
   s("plugins.transport-substitution", "MCP reference", "Transport-specific plugin substitution and support behavior", "Plugin-provided MCP servers", "feature.mcp-plugin-servers", "not-supported"),
-  s("managed.server-config", "MCP reference", "Managed MCP configuration", "Managed MCP configuration", "feature.mcp-managed-config", "not-supported", true),
-  s("managed.server-config-file", "MCP reference", "managed-mcp.json", "Managed MCP configuration", "feature.mcp-managed-config", "not-supported", true),
-  s("managed.only", "Settings reference", "allowManagedMcpServersOnly", "Available settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
-  s("managed.only-restriction", "Settings reference", "allowManagedMcpServersOnly restriction", "Available settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
-  s("managed.invalid-only-treated-true", "Settings reference", "Invalid allowManagedMcpServersOnly is treated as true", "Invalid entries in managed settings", "setting.allowManagedMcpServersOnly", "not-supported", true),
+  s("managed.server-config", "MCP reference", "Managed MCP configuration", "Managed MCP configuration", "feature.mcp-managed-config", "partial", true),
+  s("managed.server-config-file", "MCP reference", "managed-mcp.json", "Managed MCP configuration", "feature.mcp-managed-config", "partial", true),
+  s("managed.only", "Settings reference", "allowManagedMcpServersOnly", "Available settings", "setting.allowManagedMcpServersOnly", "partial", true),
+  s("managed.only-restriction", "Settings reference", "allowManagedMcpServersOnly restriction", "Available settings", "setting.allowManagedMcpServersOnly", "partial", true),
+  s("managed.invalid-only-treated-true", "Settings reference", "Invalid allowManagedMcpServersOnly is treated as true", "Invalid entries in managed settings", "setting.allowManagedMcpServersOnly", "partial", true),
   s("managed.strict-plugin-only", "Settings reference", "strictPluginOnlyCustomization with mcp", "Available settings", "setting.strictPluginOnlyCustomization.mcp", "not-supported", true),
   s("managed.allow-claude-ai", "Settings reference", "allowAllClaudeAiMcps", "Available settings", "setting.allowAllClaudeAiMcps", "not-supported"),
   s("managed.disable-connectors", "Settings reference", "disableClaudeAiConnectors", "Available settings", "setting.disableClaudeAiConnectors", "not-supported"),
   s("managed.disable-sideload", "Settings reference", "disableSideloadFlags", "Available settings", "setting.disableSideloadFlags", "not-supported"),
-  s("managed.allowlist", "Settings reference", "allowedMcpServers", "Available settings", "setting.allowedMcpServers", "not-supported", true),
-  s("managed.invalid-allowlist-empty", "Settings reference", "Invalid allowedMcpServers becomes an empty allowlist", "Invalid entries in managed settings", "setting.allowedMcpServers", "not-supported", true),
-  s("managed.denylist", "Settings reference", "deniedMcpServers", "Available settings", "setting.deniedMcpServers", "not-supported", true),
+  s("managed.allowlist", "Settings reference", "allowedMcpServers", "Available settings", "setting.allowedMcpServers", "partial", true),
+  s("managed.invalid-allowlist-empty", "Settings reference", "Invalid allowedMcpServers becomes an empty allowlist", "Invalid entries in managed settings", "setting.allowedMcpServers", "partial", true),
+  s("managed.denylist", "Settings reference", "deniedMcpServers", "Available settings", "setting.deniedMcpServers", "partial", true),
   s("oauth.auth-detection", "MCP reference", "401/403 authentication detection", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.refresh-reconnect-retry", "MCP reference", "automatic token refresh, reconnect, and one retry", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
   s("oauth.reauthenticate", "MCP reference", "re-authenticate path", "Authenticate with remote MCP servers", "feature.mcp-oauth", "not-supported", false),
@@ -604,7 +588,7 @@ describe("dated Claude Code MCP surface audit", () => {
 
   it("pins the material safety and uncertainty decisions", () => {
     expect(lookupCapability("feature.mcp-requires-user-interaction")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    expect(lookupCapability("feature.mcp-managed-config")).toMatchObject({ tier: "partial", safetyRelevant: true });
     expect(lookupCapability("feature.mcp-runtime-disabled")).toMatchObject({ tier: "partial", safetyRelevant: true });
     expect(note("feature.mcp-runtime-disabled")).toContain("final pre-expansion deny");
     expect(note("feature.mcp-runtime-disabled")).toContain("does not disable settings-extension winners");
@@ -612,9 +596,6 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(note("feature.mcp-model-failure-visibility")).toContain("only to humans through `/mcp`, `/doctor`");
     expect(note("feature.mcp-model-failure-visibility")).toContain("none is model-visible");
-    expect(lookupCapability("feature.mcp-managed-config")?.note).toContain("empty map disables all MCP");
-    expect(lookupCapability("feature.mcp-managed-config")?.note).toContain("Do not use PiCC where this enterprise policy is required");
-    expect(lookupCapability("feature.mcp-managed-config")?.note).toContain("independently ensure prohibited servers are absent or disabled through PiCC-supported configuration");
     expect(note("feature.mcp-websocket")).toContain("stdio, HTTP, and SSE alternatives");
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");
@@ -630,12 +611,10 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("cannot enforce valid deny/block output");
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("For events where PiCC enforces command-hook blocking results");
     expect(note("feature.hook-handler.mcp_tool-blocking-enforcement")).toContain("WorktreeCreate creation-time enforcement or other unavailable enforcement");
-    expect(note("setting.allowedMcpServers")).toContain("invalid value becomes an empty allowlist");
-    expect(note("setting.allowManagedMcpServersOnly")).toContain("invalid value is treated as true");
-    for (const id of ["feature.mcp-managed-config", "setting.allowManagedMcpServersOnly", "setting.allowedMcpServers", "setting.deniedMcpServers", "setting.strictPluginOnlyCustomization.mcp"]) {
-      expect(note(id), id).toContain("Do not use PiCC where this enterprise policy is required");
-      expect(note(id), id).toContain("independently ensure prohibited servers are absent or disabled through PiCC-supported configuration");
+    for (const id of ["feature.mcp-managed-config", "setting.allowManagedMcpServersOnly", "setting.allowedMcpServers", "setting.deniedMcpServers"]) {
+      expect(lookupCapability(id), id).toMatchObject({ tier: "partial", safetyRelevant: true });
     }
+    expect(note("setting.strictPluginOnlyCustomization.mcp")).toContain("Do not use PiCC where this enterprise policy is required");
     expect(note("setting.channelsEnabled")).toContain("master switch");
     expect(note("setting.channelsEnabled")).toContain("PiCC cannot load channels");
     expect(note("setting.allowedChannelPlugins")).toContain("replacement and empty-list semantics");

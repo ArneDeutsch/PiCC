@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { buildMcpStartupNotice } from "../src/index.js";
 import {
   buildCompatReport,
   renderDoctorReport,
@@ -89,6 +90,13 @@ function project(mcp: ResolvedMcpConfig): ClaudeProject {
 function doctor(mcp: ResolvedMcpConfig, live: McpServerLiveState[] = []): string {
   const loaded = project(mcp);
   return renderDoctorReport(loaded, buildCompatReport(loaded), undefined, undefined, live);
+}
+
+function mcpGuidanceSegment(report: string): string {
+  if (report.startsWith("MCP status (read-only)")) return report;
+  const segment = report.split("\n").find((line) => line.includes("MCP servers:"));
+  if (segment === undefined) throw new Error("Expected an MCP server segment in the doctor report");
+  return segment;
 }
 
 function detailRows(report: string): string[] {
@@ -413,6 +421,36 @@ describe("renderMcpStatusReport", () => {
     );
   });
 
+  it("escapes bidi formatting controls in blocked names before trusted startup and report suffixes", () => {
+    const blockedName = `managed"\\\u202Ereorder\u2066-${"x".repeat(160)}`;
+    const escapeBidi = (text: string): string =>
+      text.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, (control) =>
+        `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+      );
+    const noticeQuoted = JSON.stringify(escapeBidi(`${blockedName.slice(0, 39)}…`));
+    const reportSafeName = escapeBidi(blockedName);
+    const reportQuoted = JSON.stringify(`${reportSafeName.slice(0, 120)}…`);
+    const mcp = config([server(blockedName, "blocked", {
+      source: "managed-mcp",
+      inactiveReason: "policy-denied",
+    })]);
+
+    const notice = buildMcpStartupNotice(mcp, undefined);
+    expect(notice).toContain(`MCP policy blocked 1 server(s): ${noticeQuoted}; run /mcp or /doctor`);
+    expect(notice).toContain("\\\\u202E");
+    expect(notice).toContain("\\\\u2066");
+
+    const reports = [renderMcpStatusReport(mcp, []), doctor(mcp)];
+    for (const report of reports) {
+      expect(report).toContain(`${reportQuoted}: blocked`);
+      expect(report).toContain("\\\\u202E");
+      expect(report).toContain("\\\\u2066");
+    }
+    for (const output of [notice, ...reports]) {
+      expect(output).not.toMatch(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u);
+    }
+  });
+
   it.each([31, 32, 33, 5000])(
     "details at most 32 of %i servers and stays within the aggregate ceiling",
     (count) => {
@@ -668,6 +706,259 @@ describe("MCP pending guidance", () => {
     const doctorReport = doctor(mcp);
     expect(doctorReport).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
     expect(doctorReport).not.toContain("TRACKED_LOCAL_PATH_CANARY");
+  });
+});
+
+describe("managed MCP policy status foundation", () => {
+  it.each([
+    ["active-rules", "Managed MCP policy: active rules."],
+    ["managed-only", "Managed MCP policy: managed-only"],
+    ["exclusive", "exclusive administrator server set is active"],
+    ["exclusive-empty", "exclusive administrator server set is empty; all MCP is disabled"],
+    ["fail-closed", "Managed MCP policy: fail closed; no candidate can start"],
+  ] as const)("renders the %s posture on /mcp and /doctor", (policyPosture, expected) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("ordinary", "blocked", { inactiveReason: "policy-allow-miss" })],
+      diagnostics: [],
+      policyPosture,
+      policyAuthority: "administrator-controlled",
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain(expected);
+      if (policyPosture === "exclusive-empty") {
+        expect(report).toContain("If access is expected, request an administrator policy change.");
+      }
+      expect(report).not.toMatch(/COMMAND_CANARY|ARG_CANARY|ENV_CANARY|RAW_COMMAND_CANARY/u);
+    }
+    if (["exclusive", "exclusive-empty", "fail-closed"].includes(policyPosture)) {
+      expect(renderMcpStatusReport(mcp, [])).not.toContain('"ordinary":');
+      expect(doctor(mcp)).not.toContain('"ordinary":');
+    }
+  });
+
+  it.each([
+    ["policy-denied", "denied by MCP policy"],
+    ["policy-allow-miss", "not present in the effective MCP allowlist"],
+    ["policy-managed-only", "not present in the effective managed allow contributions"],
+  ] as const)("renders blocked reason %s without project-approval guidance", (inactiveReason, expected) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("blocked", "blocked", { inactiveReason })],
+      diagnostics: [],
+      policyPosture: "active-rules",
+      policyAuthority: "administrator-controlled",
+    };
+    const status = renderMcpStatusReport(mcp, []);
+    expect(status).toContain(expected);
+    expect(status).not.toMatch(/enabledMcpjsonServers|settings\.local\.json|approve/iu);
+    const doctorReport = doctor(mcp);
+    expect(doctorReport).toContain("If access is expected, request an administrator policy change");
+    expect(mcpGuidanceSegment(doctorReport)).not.toMatch(/repair|recover/iu);
+  });
+
+  it("prioritizes native-state recovery over generic policy fail-closed prose", () => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [], diagnostics: [],
+      failClosed: "native-state-unusable",
+      failClosedProfile: "default",
+      policyPosture: "fail-closed",
+      policyAuthority: "administrator-controlled",
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("native Claude state is unusable");
+      expect(report).toContain("known-good backup");
+      expect(report).not.toContain("repair or recover the applicable managed MCP policy input");
+    }
+  });
+
+  it.each([
+    ["standalone managed", "managed-mcp", "ask the administrator to repair the managed MCP server configuration"],
+    ["managed settings", "settings-managed", "ask the administrator to repair the managed MCP server configuration"],
+    ["ordinary project", "settings-project", "repair the MCP server configuration"],
+    ["ordinary native", "native-user", "repair the MCP server configuration"],
+  ] as const)("renders $0 candidate-invalid with source-aware configuration repair on both surfaces", (_label, source, expected) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("invalid", "blocked", { source, inactiveReason: "policy-candidate-invalid" })],
+      diagnostics: [],
+      policyPosture: source === "managed-mcp" ? "exclusive" : "active-rules",
+      policyAuthority: source === "managed-mcp" || source === "settings-managed" ? "administrator-controlled" : "user-controlled",
+      ...(source === "managed-mcp" ? { policyOrdinarySourcesSuppressed: true } : {}),
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("configured identity is invalid, ambiguous, or over the admission limit");
+      expect(report).toContain(`${expected}, then run /reload or restart PiCC`);
+      if (source === "managed-mcp" || source === "settings-managed") {
+        expect(report).not.toContain("; repair the MCP server configuration");
+      } else {
+        expect(report).not.toContain("ask the administrator to repair the managed MCP server configuration");
+      }
+      expect(report).not.toMatch(/allowlist|policy change|pending approval|enabledMcpjsonServers/iu);
+    }
+  });
+
+  it("renders populated exclusive managed rows while suppressing ordinary rows", () => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [
+        server("enabled-managed", "enabled", { source: "managed-mcp" }),
+        server("denied-managed", "blocked", { source: "managed-mcp", inactiveReason: "policy-denied" }),
+        server("invalid-managed", "blocked", { source: "managed-mcp", inactiveReason: "policy-candidate-invalid" }),
+        server("skipped-managed", "skipped", { source: "managed-mcp" }),
+        server("ordinary-canary", "enabled", { source: "settings-user" }),
+      ],
+      diagnostics: [], policyPosture: "exclusive", policyAuthority: "administrator-controlled",
+      policyOrdinarySourcesSuppressed: true,
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      for (const name of ["enabled-managed", "denied-managed", "invalid-managed", "skipped-managed"]) {
+        expect(report).toContain(name);
+      }
+      expect(report).not.toContain("ordinary-canary");
+    }
+  });
+
+  it.each([
+    ["user-controlled", "Repair or recover the applicable user-controlled MCP policy input"],
+    ["administrator-controlled", "Ask the administrator to repair or recover the applicable managed MCP policy input"],
+    ["mixed", "Repair or recover user-controlled policy inputs and ask the administrator"],
+  ] as const)("uses fixed %s remediation", (policyAuthority, expected) => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [], diagnostics: [], policyPosture: "fail-closed", policyAuthority,
+    };
+    expect(renderMcpStatusReport(mcp, [])).toContain(expected);
+    expect(doctor(mcp)).toContain(expected);
+  });
+
+  it("renders bounded fixed compiler observations and omits value/path/error canaries", () => {
+    const observations = [
+      "invalid-managed-allow-active-empty",
+      "invalid-managed-deny-dropped",
+      "invalid-managed-only-treated-true",
+      "invalid-non-managed-projection",
+      "invalid-rule-stripped",
+      "unset-environment-variable",
+      "allow-over-limit-active-empty",
+      "restrictive-material-omitted",
+      "source-failure-fail-closed",
+      "compiler-uncertainty-fail-closed",
+      "candidate-over-limit-blocked",
+      "identity-ambiguity-blocked",
+    ] as const;
+    const mcp: ResolvedMcpConfig = {
+      servers: [],
+      diagnostics: ["ERROR_VALUE_CANARY C:/SOURCE_PATH_CANARY SECRET_URL_CANARY"],
+      policyPosture: "fail-closed",
+      policyAuthority: "mixed",
+      policyObservations: [...observations, ...observations],
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("Policy observations:");
+      expect(report).toContain("invalid managed allow field became an empty allowlist");
+      expect(report).toContain("the affected allow contribution supplied no authorization and was active-empty");
+      expect(report).toContain("an applicable policy source failed");
+      expect(report).not.toContain("applicable managed policy source");
+      expect(report).toContain("ambiguous candidate identity was blocked");
+      expect(report).not.toContain("additional observation(s) omitted");
+      expect(report.length).toBeLessThanOrEqual(16_384);
+      expect(report).not.toMatch(/ERROR_VALUE_CANARY|SOURCE_PATH_CANARY|SECRET_URL_CANARY/u);
+    }
+  });
+
+  it.each([
+    ["user-controlled", "Review the applicable user-controlled MCP policy."],
+    ["administrator-controlled", "If access is expected, request an administrator policy change."],
+    ["mixed", "Review the applicable user-controlled policy and, if access is expected, request an administrator policy change."],
+  ] as const)("uses intentional-enforcement guidance for every %s authority on /mcp and /doctor", (policyAuthority, action) => {
+    const reasons = [
+      ["policy-denied", "denied by MCP policy"],
+      ["policy-allow-miss", "not present in the effective MCP allowlist"],
+      ["policy-managed-only", "not present in the effective managed allow contributions"],
+    ] as const;
+    for (const [inactiveReason, wording] of reasons) {
+      const mcp: ResolvedMcpConfig = {
+        servers: [server("STATUS_NAME_CANARY", "blocked", { source: "managed-mcp", inactiveReason })],
+        diagnostics: [], policyPosture: "active-rules", policyAuthority,
+      };
+      for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+        expect(report).toContain(wording);
+        expect(report).toContain(action);
+        expect(report).toContain("[source: exclusive managed MCP]");
+        expect(mcpGuidanceSegment(report)).not.toMatch(/repair|recover|pending approval|enabledMcpjsonServers/iu);
+        expect(report).not.toMatch(/COMMAND_CANARY|ARG_CANARY|ENV_CANARY|RAW_COMMAND_CANARY/u);
+      }
+    }
+  });
+
+  it("uses authority-aware headings and states managed-only semantics without classifying candidate sources", () => {
+    const cases = [
+      ["user-controlled", "User-controlled MCP policy: active rules."],
+      ["administrator-controlled", "Managed MCP policy: active rules."],
+      ["mixed", "MCP policy (user and managed): active rules."],
+    ] as const;
+    for (const [policyAuthority, heading] of cases) {
+      const mcp: ResolvedMcpConfig = { servers: [], diagnostics: [], policyPosture: "active-rules", policyAuthority };
+      expect(renderMcpStatusReport(mcp, [])).toContain(heading);
+      expect(doctor(mcp)).toContain(heading);
+    }
+    const only: ResolvedMcpConfig = { servers: [], diagnostics: [], policyPosture: "managed-only", policyAuthority: "administrator-controlled" };
+    for (const report of [renderMcpStatusReport(only, []), doctor(only)]) {
+      expect(report).toContain("only managed allow contributions remain effective");
+      expect(report).not.toContain("non-managed candidates");
+    }
+  });
+
+  it("renders exclusive aggregate claims only from established suppression evidence and emits no pending guidance", () => {
+    const retained = server("pending-canary", "pending-approval", { source: "project-mcpjson", inactiveReason: "mcpjson-unapproved" });
+    const unknown: ResolvedMcpConfig = {
+      servers: [retained], diagnostics: [], policyPosture: "exclusive", policyAuthority: "administrator-controlled",
+    };
+    const established: ResolvedMcpConfig = { ...unknown, policyOrdinarySourcesSuppressed: true };
+    for (const report of [renderMcpStatusReport(unknown, []), doctor(unknown)]) {
+      expect(report).not.toContain("ordinary sources were suppressed");
+      expect(report).not.toContain("Resolved server entries");
+      expect(report).not.toMatch(/pending approval|enabledMcpjsonServers/iu);
+    }
+    for (const report of [renderMcpStatusReport(established, []), doctor(established)]) {
+      expect(report).toContain("ordinary sources were suppressed");
+      expect(report).not.toMatch(/pending approval|enabledMcpjsonServers/iu);
+    }
+  });
+
+  it("renders bounded redacted failure evidence consistently for malformed, unreadable, omitted, and compiler uncertainty", () => {
+    const policyFailures = [
+      { kind: "malformed", sourceClass: "standalone-mcp", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { kind: "unreadable", sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { kind: "unreadable", sourceClass: "registry-hkcu", authority: "user-controlled", remediation: "repair-user-policy" },
+      { kind: "omitted", sourceClass: "override", authority: "mixed", remediation: "repair-mixed-policy" },
+    ] as const;
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("STATUS_CANARY", "blocked", { inactiveReason: "policy-denied" })],
+      diagnostics: ["RAW_ERROR_CANARY /SOURCE_PATH_CANARY"],
+      policyPosture: "fail-closed",
+      policyAuthority: "mixed",
+      policyFailures,
+      policyObservations: ["compiler-uncertainty-fail-closed"],
+    };
+    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
+      expect(report).toContain("standalone managed MCP file was malformed");
+      expect(report).toContain("managed-settings system file was unreadable");
+      expect(report).toContain("user registry fallback was unreadable");
+      expect(report).toContain("managed-settings override was omitted");
+      expect(report).toContain("policy compilation was uncertain");
+      expect(report.match(/Repair or recover user-controlled policy inputs and ask the administrator/gu)).toHaveLength(1);
+      expect(report).not.toMatch(/RAW_ERROR_CANARY|SOURCE_PATH_CANARY|COMMAND_CANARY|ARG_CANARY|ENV_CANARY/u);
+    }
+  });
+
+  it("renders an explicit absent posture exactly like legacy absence", () => {
+    const explicit: ResolvedMcpConfig = { servers: [], diagnostics: [], policyPosture: "absent" };
+    expect(renderMcpStatusReport(explicit, [])).toBe("MCP status (read-only)\nNo MCP servers are configured.");
+    expect(doctor(explicit)).toContain("MCP: no servers configured.");
+  });
+
+  it("keeps legacy absent-policy output stable", () => {
+    const legacy = config();
+    expect(renderMcpStatusReport(legacy, [])).toBe("MCP status (read-only)\nNo MCP servers are configured.");
+    expect(doctor(legacy)).toContain("MCP: no servers configured.");
+    expect(doctor(legacy)).not.toContain("Managed MCP policy:");
   });
 });
 

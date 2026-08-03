@@ -10,6 +10,10 @@ import type {
   Diagnostic,
   HookConfig,
   McpSourceClass,
+  McpPolicyAuthority,
+  McpPolicyInactiveReason,
+  McpPolicyObservation,
+  McpPolicySourceFailure,
   ClaudeProfileSource,
   PluginResolutionOutcome,
   PluginResolutionStatus,
@@ -773,7 +777,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // never a finding). Display hygiene: server names are bounded and quoted;
   // diagnostics are classified without reflecting configuration values.
   const mcp = project.mcp ?? EMPTY_MCP;
-  const pendingNames = mcp.servers
+  const aggregatePolicyState = mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed";
+  const pendingNames = aggregatePolicyState || mcp.policyPosture === "exclusive" ? [] : mcp.servers
     .filter((s) => s.status === "pending-approval")
     .map((s) => s.name);
   if (pendingNames.length > 0) {
@@ -952,9 +957,13 @@ const MCP_NOTICE_NAME_MAX = 40;
 
 /** Bound on a per-server diagnostic quoted on the /doctor posture line. */
 const MCP_POSTURE_DIAG_MAX_CHARS = 240;
+const MCP_BIDI_FORMATTING_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 
 function quotedMcpName(name: string, max: number): string {
-  return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
+  const bidiSafe = name.replace(MCP_BIDI_FORMATTING_CONTROLS, (control) =>
+    `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+  );
+  return JSON.stringify(mcpStatusScalar(bidiSafe, max) || "(unnamed)");
 }
 
 function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig): string {
@@ -1015,6 +1024,7 @@ function mcpSourceLabel(source: McpSourceClass): string {
     case "settings-local": return "settings local extension";
     case "settings-project": return "settings project extension";
     case "settings-user": return "settings user extension";
+    case "managed-mcp": return "exclusive managed MCP";
   }
   const exhaustive: never = source;
   return exhaustive;
@@ -1185,14 +1195,123 @@ function mcpCapabilitySummary(live: McpServerLiveState, retained = false): strin
   return `tools: ${fallbackCount}${retained ? " retained" : ""}`;
 }
 
+function mcpPolicyRepair(authority: McpPolicyAuthority | undefined): string {
+  switch (authority) {
+    case "administrator-controlled": return "Ask the administrator to repair or recover the applicable managed MCP policy input, then reload or restart PiCC.";
+    case "mixed": return "Repair or recover user-controlled policy inputs and ask the administrator to repair or recover managed policy inputs as applicable, then reload or restart PiCC.";
+    case "user-controlled":
+    case undefined: return "Repair or recover the applicable user-controlled MCP policy input, then reload or restart PiCC.";
+  }
+}
+
+function mcpPolicyEnforcementAction(authority: McpPolicyAuthority | undefined): string {
+  switch (authority) {
+    case "administrator-controlled": return "If access is expected, request an administrator policy change.";
+    case "mixed": return "Review the applicable user-controlled policy and, if access is expected, request an administrator policy change.";
+    case "user-controlled":
+    case undefined: return "Review the applicable user-controlled MCP policy.";
+  }
+}
+
+function mcpPolicyReason(reason: McpPolicyInactiveReason): string {
+  switch (reason) {
+    case "policy-denied": return "denied by MCP policy";
+    case "policy-allow-miss": return "not present in the effective MCP allowlist";
+    case "policy-managed-only": return "not present in the effective managed allow contributions";
+    case "policy-candidate-invalid": return "configured identity is invalid, ambiguous, or over the admission limit";
+  }
+}
+
+function mcpCandidateRepair(source: McpSourceClass): string {
+  return source === "managed-mcp" || source === "settings-managed"
+    ? "ask the administrator to repair the managed MCP server configuration, then run /reload or restart PiCC"
+    : "repair the MCP server configuration, then run /reload or restart PiCC";
+}
+
+const MCP_POLICY_OBSERVATION_LABELS: Readonly<Record<McpPolicyObservation, string>> = {
+  "invalid-managed-allow-active-empty": "invalid managed allow field became an empty allowlist",
+  "invalid-managed-deny-dropped": "invalid managed deny field was stripped",
+  "invalid-managed-only-treated-true": "invalid managed-only value was treated as true",
+  "invalid-non-managed-projection": "invalid non-managed policy projection could not authorize servers",
+  "invalid-rule-stripped": "invalid policy rule was stripped",
+  "unset-environment-variable": "an unset environment variable remained literal",
+  "allow-over-limit-active-empty": "the affected allow contribution supplied no authorization and was active-empty",
+  "restrictive-material-omitted": "potentially restrictive policy material was omitted",
+  "source-failure-fail-closed": "an applicable policy source failed",
+  "compiler-uncertainty-fail-closed": "policy compilation was uncertain",
+  "candidate-over-limit-blocked": "an over-limit candidate identity was blocked",
+  "identity-ambiguity-blocked": "an ambiguous candidate identity was blocked",
+};
+
+function mcpPolicyHeading(authority: McpPolicyAuthority | undefined): string {
+  return authority === "administrator-controlled" ? "Managed MCP policy"
+    : authority === "mixed" ? "MCP policy (user and managed)"
+    : "User-controlled MCP policy";
+}
+
+function mcpPolicySummary(mcp: ResolvedMcpConfig): string | undefined {
+  const heading = mcpPolicyHeading(mcp.policyAuthority);
+  switch (mcp.policyPosture) {
+    case undefined:
+    case "absent": return undefined;
+    case "active-rules": return `${heading}: active rules.`;
+    case "managed-only": return `${heading}: managed-only; only managed allow contributions remain effective.`;
+    case "exclusive": return `Managed MCP policy: exclusive administrator server set is active${mcp.policyOrdinarySourcesSuppressed === true ? "; ordinary sources were suppressed" : ""}.`;
+    case "exclusive-empty": return "Managed MCP policy: exclusive administrator server set is empty; all MCP is disabled. If access is expected, request an administrator policy change.";
+    case "fail-closed": return `${heading}: fail closed; no candidate can start. ${mcpPolicyRepair(mcp.policyAuthority)}`;
+  }
+}
+
+function mcpPolicyObservationSummary(mcp: ResolvedMcpConfig): string | undefined {
+  const unique = [...new Set(mcp.policyObservations ?? [])];
+  const observations = unique.slice(0, 12);
+  if (observations.length === 0) return undefined;
+  const omitted = Math.max(0, unique.length - observations.length);
+  return `Policy observations: ${observations.map((item) => MCP_POLICY_OBSERVATION_LABELS[item]).join("; ")}${omitted > 0 ? `; ${omitted} additional observation(s) omitted` : ""}.`;
+}
+
+function mcpPolicyFailureSummary(mcp: ResolvedMcpConfig): string | undefined {
+  const labels: Readonly<Record<McpPolicySourceFailure["kind"], string>> = {
+    malformed: "malformed",
+    unreadable: "unreadable",
+    omitted: "omitted",
+  };
+  const sourceLabels: Readonly<Record<McpPolicySourceFailure["sourceClass"], string>> = {
+    "standalone-mcp": "standalone managed MCP file",
+    "system-file": "managed-settings system file",
+    "system-drop-in": "administrator system drop-in",
+    "registry-hklm": "administrator machine registry",
+    "registry-hkcu": "user registry fallback",
+    override: "managed-settings override",
+  };
+  const unique = [...new Map((mcp.policyFailures ?? []).map((failure) => [
+    `${failure.kind}|${failure.sourceClass}|${failure.authority}|${failure.remediation}`,
+    failure,
+  ])).values()];
+  if (unique.length === 0) return undefined;
+  const shown = unique.slice(0, 8);
+  const omitted = unique.length - shown.length;
+  return `Policy source failures: ${shown.map((failure) => `${sourceLabels[failure.sourceClass]} was ${labels[failure.kind]}`).join("; ")}${omitted > 0 ? `; ${omitted} additional failure(s) omitted` : ""}.`;
+}
+
 function mcpPostureLine(
   mcp: ResolvedMcpConfig,
   liveStates: readonly McpServerLiveState[],
 ): string {
+  if (mcp.policyPosture === "exclusive" && mcp.servers.some((server) => server.source !== "managed-mcp")) {
+    return mcpPostureLine(
+      { ...mcp, servers: mcp.servers.filter((server) => server.source === "managed-mcp") },
+      liveStates,
+    );
+  }
   if (mcp.failClosed === "native-state-unusable") {
     return `MCP: fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(mcp)}`;
   }
-  if (mcp.servers.length === 0) return "MCP: no servers configured.";
+  const policy = mcpPolicySummary(mcp);
+  if (mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed") {
+    return policy ?? "MCP: fail closed by policy.";
+  }
+  if (mcp.servers.length === 0) return policy ?? "MCP: no servers configured.";
   const liveByName = new Map(liveStates.map((s) => [s.name, s]));
   const ordered = mcp.servers.length <= 32 ? mcp.servers : [...mcp.servers].sort((left, right) => {
     const actionable = (server: ResolvedMcpConfig["servers"][number]): number => {
@@ -1249,6 +1368,10 @@ function mcpPostureLine(
         return server.inactiveReason === "native-runtime-disabled"
           ? `${identity}: disabled${mcpInactiveTransportSuffix(server)} (native disabledMcpServers); use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC`
           : `${identity}: disabled${mcpInactiveTransportSuffix(server)} (settings disabledMcpjsonServers)`;
+      case "blocked":
+        return server.inactiveReason === "policy-candidate-invalid"
+          ? `${identity}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpCandidateRepair(server.source)}`
+          : `${identity}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(mcp.policyAuthority)}`;
       case "not-configured":
         return `${identity}: not configured${mcpInactiveTransportSuffix(server)}`;
       case "skipped":
@@ -1260,7 +1383,7 @@ function mcpPostureLine(
     })();
     return `${part} [source: ${mcpSourceLabel(server.source)}]`;
   });
-  const prefix = "MCP servers: ";
+  const prefix = policy ? `${policy} MCP servers: ` : "MCP servers: ";
   const rendered: string[] = [];
   for (const part of parts) {
     const omitted = mcp.servers.length - rendered.length - 1;
@@ -1292,6 +1415,7 @@ type McpRenderedState =
   | "failed"
   | "pending approval"
   | "disabled"
+  | "blocked"
   | "not configured"
   | "skipped";
 
@@ -1304,6 +1428,7 @@ const MCP_RENDERED_STATE_ORDER: readonly McpRenderedState[] = [
   "failed",
   "pending approval",
   "disabled",
+  "blocked",
   "not configured",
   "skipped",
 ];
@@ -1347,6 +1472,7 @@ function mcpAttemptSuffix(live: McpServerLiveState | undefined): string {
 function mcpStatusRow(
   server: ResolvedMcpConfig["servers"][number],
   live: McpServerLiveState | undefined,
+  policyAuthority: McpPolicyAuthority | undefined,
 ): string {
   const name = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
   switch (mcpEffectiveState(server, live)) {
@@ -1398,6 +1524,12 @@ function mcpStatusRow(
       return "inactiveReason" in server && server.inactiveReason === "native-runtime-disabled"
         ? `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — native disabledMcpServers; use Claude Code with the same active user profile for this project to remove the exact disabled name if trusted, then run /reload or restart PiCC`
         : `- ${name}: disabled${mcpInactiveTransportSuffix(server)} — settings disabledMcpjsonServers rejection`;
+    case "blocked":
+      return server.status === "blocked"
+        ? server.inactiveReason === "policy-candidate-invalid"
+          ? `- ${name}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpCandidateRepair(server.source)}`
+          : `- ${name}: blocked — ${mcpPolicyReason(server.inactiveReason)}; ${mcpPolicyEnforcementAction(policyAuthority)}`
+        : `- ${name}: blocked — policy state unavailable`;
     case "not configured":
       return `- ${name}: not configured${mcpInactiveTransportSuffix(server)}`;
     case "skipped":
@@ -1436,7 +1568,10 @@ export function renderMcpStatusReport(
   mcp: ResolvedMcpConfig | undefined,
   liveStates: readonly McpServerLiveState[],
 ): string {
-  const config = mcp ?? EMPTY_MCP;
+  const rawConfig = mcp ?? EMPTY_MCP;
+  const config = rawConfig.policyPosture === "exclusive"
+    ? { ...rawConfig, servers: rawConfig.servers.filter((server) => server.source === "managed-mcp") }
+    : rawConfig;
   const unsupportedEnablement = config.diagnostics.some(
     (diagnostic) => diagnostic.includes("enabledMcpServers is unsupported"),
   );
@@ -1444,24 +1579,31 @@ export function renderMcpStatusReport(
     (diagnostic) => !diagnostic.includes("enabledMcpServers is unsupported"),
   );
   const lines = ["MCP status (read-only)"];
-  if (config.servers.length === 0) {
+  const nativeStateUnusable = config.failClosed === "native-state-unusable";
+  const policySummary = nativeStateUnusable ? undefined : mcpPolicySummary(config);
+  if (policySummary) lines.push(policySummary);
+  const aggregateOnly = config.policyPosture === "exclusive-empty" || config.policyPosture === "fail-closed";
+  if (nativeStateUnusable) {
+    lines.push(`MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`);
+  } else if (config.servers.length === 0 && !aggregateOnly) {
     lines.push(
-      config.failClosed === "native-state-unusable"
-        ? `MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`
-        : otherConfigDiagnostics
-          ? "No usable MCP servers were resolved."
-          : "No MCP servers are configured.",
+      otherConfigDiagnostics
+        ? "No usable MCP servers were resolved."
+        : "No MCP servers are configured.",
     );
-  } else {
+  } else if (!aggregateOnly) {
     lines.push(`Resolved server entries: ${config.servers.length}`);
   }
 
   const liveByName = mcpLiveByName(liveStates);
-  const detailCount = Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
+  const suppressRows = aggregateOnly || nativeStateUnusable;
+  const detailCount = suppressRows ? 0 : Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
   const indexed = config.servers.map((server, index) => ({ server, index }));
-  const selected = config.servers.length <= MCP_STATUS_DETAIL_MAX
-    ? indexed
-    : [...indexed].sort((left, right) => {
+  const selected = suppressRows
+    ? []
+    : config.servers.length <= MCP_STATUS_DETAIL_MAX
+      ? indexed
+      : [...indexed].sort((left, right) => {
         const priority = (item: typeof left): number => {
           const state = mcpEffectiveState(item.server, liveByName.get(item.server.name));
           return ["retrying", "reconnecting", "failed", "skipped", "pending approval"].includes(state)
@@ -1474,10 +1616,10 @@ export function renderMcpStatusReport(
       }).slice(0, detailCount);
   const selectedIndexes = new Set(selected.map((item) => item.index));
   for (const { server } of selected) {
-    lines.push(`${mcpStatusRow(server, liveByName.get(server.name))} [source: ${mcpSourceLabel(server.source)}]`);
+    lines.push(`${mcpStatusRow(server, liveByName.get(server.name), config.policyAuthority)} [source: ${mcpSourceLabel(server.source)}]`);
   }
 
-  if (config.servers.length > detailCount) {
+  if (!suppressRows && config.servers.length > detailCount) {
     const omitted = new Map<McpRenderedState, number>();
     for (let index = 0; index < config.servers.length; index += 1) {
       if (selectedIndexes.has(index)) continue;
@@ -1491,6 +1633,11 @@ export function renderMcpStatusReport(
     });
     lines.push(`Omitted ${config.servers.length - detailCount} servers (${groups.join(", ")}); run /doctor for bounded details.`);
   }
+
+  const policyObservationSummary = mcpPolicyObservationSummary(config);
+  if (policyObservationSummary) lines.push(policyObservationSummary);
+  const policyFailureSummary = mcpPolicyFailureSummary(config);
+  if (policyFailureSummary) lines.push(policyFailureSummary);
 
   if (
     otherConfigDiagnostics ||
@@ -1507,7 +1654,7 @@ export function renderMcpStatusReport(
     );
   }
 
-  const pending = config.servers.filter((server) => server.status === "pending-approval");
+  const pending = aggregateOnly ? [] : config.servers.filter((server) => server.status === "pending-approval");
   const allPendingDisplayed = config.servers.every(
     (server, index) => server.status !== "pending-approval" || selectedIndexes.has(index),
   );
@@ -1727,6 +1874,8 @@ export function renderDoctorReport(
     subagentPostureLine(project),
     retentionPostureLine(project),
     mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
+    ...(mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP)!] : []),
+    ...(mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP)!] : []),
     ...(report.pluginInventory === undefined ? [pluginPostureLine(report.pluginPosture)] : pluginInventoryLines(report.pluginInventory)),
     ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",

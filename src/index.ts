@@ -11,9 +11,11 @@ import {
   type HookOutcome,
   type HookPayload,
   type PluginRuntimeContext,
+  type ResolvedMcpConfig,
   type ToolCallDescriptor,
 } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
+import type { ManagedMcpDiscoveryOptions } from "./discovery/managed-policy.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
 import { HookRunner, mergeHookOutcomes } from "./engine/hook-runner.js";
@@ -102,7 +104,6 @@ import {
   buildCompatReport,
   renderDoctorReport,
   renderMcpStatusReport,
-  mcpFailClosedRecovery,
   type CompatReport,
 } from "./registry/compat-report.js";
 import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -373,6 +374,8 @@ export interface PiccTestSeam {
   };
   /** TEST-ONLY managed settings locations passed directly to project loading. */
   managedSettingsPaths?: string[];
+  /** TEST-ONLY standalone managed-MCP authority and I/O passed directly to project loading. */
+  managedMcpDiscovery?: ManagedMcpDiscoveryOptions;
   /** TEST-ONLY managed artifact directories passed directly to project loading. */
   managedArtifactDirs?: string[];
   /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
@@ -394,6 +397,45 @@ export interface PiccTestSeam {
 }
 
 const codexProviderRegistries = new WeakSet<object>();
+
+const MCP_BIDI_FORMATTING_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+
+function escapeMcpBidiFormattingControls(text: string): string {
+  return text.replace(MCP_BIDI_FORMATTING_CONTROLS, (control) =>
+    `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+  );
+}
+
+export function buildMcpStartupNotice(
+  mcp: ResolvedMcpConfig,
+  pendingNotice: string | undefined,
+): string | undefined {
+  const parts: string[] = [];
+  if (pendingNotice) parts.push(pendingNotice);
+
+  if (mcp.failClosed === "native-state-unusable") {
+    parts.push("MCP is fail closed because native Claude state is unusable; run /mcp or /doctor for recovery guidance.");
+  } else if (mcp.policyPosture === "exclusive-empty") {
+    parts.push("Managed MCP policy supplies an empty exclusive server set, so all MCP is disabled; run /mcp or /doctor for details.");
+  } else if (mcp.policyPosture === "fail-closed") {
+    parts.push("MCP policy is fail closed, so no server can start; run /mcp or /doctor for authority-specific recovery guidance.");
+  } else {
+    const blocked = mcp.servers.filter((server) => server.status === "blocked");
+    if (blocked.length > 0) {
+      const shown = blocked.slice(0, 3).map((server) =>
+        JSON.stringify(escapeMcpBidiFormattingControls(sanitizeLine(server.name, 40)))
+      );
+      const omitted = blocked.length - shown.length;
+      parts.push(
+        `MCP policy blocked ${blocked.length} server(s): ${shown.join(", ")}` +
+          (omitted > 0 ? `, and ${omitted} more` : "") +
+          "; run /mcp or /doctor for reason and remediation details.",
+      );
+    }
+  }
+
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
 
 /**
  * Process status for a non-interactive run whose proactive checkpoint ended without
@@ -661,6 +703,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       ...(testSeam?.managedSettingsPaths
         ? { managedSettingsPaths: testSeam.managedSettingsPaths }
         : {}),
+      ...(testSeam?.managedMcpDiscovery
+        ? { managedMcpDiscovery: testSeam.managedMcpDiscovery }
+        : {}),
       ...(testSeam?.managedArtifactDirs
         ? { managedArtifactDirs: testSeam.managedArtifactDirs }
         : {}),
@@ -670,12 +715,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
     return;
   }
-  if (project.mcp.failClosed === "native-state-unusable") {
-    console.error(
-      `PiCC: Native Claude MCP state is unusable, so MCP loading is fail closed. Run /mcp or /doctor. ${mcpFailClosedRecovery(project.mcp)}`,
-    );
-  }
-
   const config = loadPiCCConfig(project.root);
   // Config-validation findings (malformed file, out-of-range compaction knob reverted
   // to its default) surface once at startup — never silently swallowed. Same pattern as
@@ -920,6 +959,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   };
   let compat: CompatReport = { findings: [], safetyFindings: [], unassessed: [] };
   let pluginStartupNoticePresented = false;
+  let mcpStartupNoticePresented = false;
   const pluginContexts = project.pluginContexts;
   const RUNTIME_FINDING_RETAIN_CAP = 20;
   const RUNTIME_FINDING_FINGERPRINT_CAP = 25;
@@ -3195,12 +3235,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      // Pending servers require a bounded approval or decline decision, so this
-      // actionable state survives quiet startup as one notice. Startup only —
-      // /new and reload must not re-toast state the user already saw.
-      if (event.reason === "startup" && compat.mcpPendingNotice) {
-        if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
-        else console.error(`PiCC: ${compat.mcpPendingNotice}`);
+      // Approval and policy outcomes share one immutable-snapshot notice. Only a
+      // newly loaded extension's startup may present it; /new and same-instance
+      // lifecycle events cannot replay it.
+      if (event.reason === "startup" && !mcpStartupNoticePresented) {
+        const mcpStartupNotice = buildMcpStartupNotice(project.mcp, compat.mcpPendingNotice);
+        if (mcpStartupNotice) {
+          mcpStartupNoticePresented = true;
+          if (ctx.mode === "tui") ctx.ui?.notify?.(mcpStartupNotice, "warning");
+          else console.error(`PiCC: ${mcpStartupNotice}`);
+        }
       }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);

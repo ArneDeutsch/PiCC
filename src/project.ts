@@ -5,8 +5,12 @@ import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discov
 import { loadSettings } from "./discovery/settings.js";
 import { resolveMcpConfig } from "./discovery/mcp.js";
 import { resolveClaudeProfile } from "./discovery/claude-profile.js";
-import type { ManagedRegistryAdapter } from "./discovery/managed-policy.js";
-import { loadMcpJson } from "./claude/mcp-config.js";
+import {
+  discoverManagedMcp,
+  type ManagedMcpDiscoveryOptions,
+  type ManagedRegistryAdapter,
+} from "./discovery/managed-policy.js";
+import { loadMcpJson, type McpJsonResult } from "./claude/mcp-config.js";
 import { loadClaudeMcpState } from "./claude/claude-mcp-state.js";
 import { loadPluginSkills, loadSkills } from "./claude/skills.js";
 import { loadAgents, loadPluginAgents } from "./claude/agents.js";
@@ -60,6 +64,13 @@ export function loadClaudeProject(opts: {
   managedPolicyPlatform?: NodeJS.Platform;
   /** Override managed/policy artifact base directories (used by tests). */
   managedArtifactDirs?: string[];
+  /** Structural standalone managed-MCP authority reserved for deterministic tests. */
+  managedMcpDiscovery?: ManagedMcpDiscoveryOptions;
+  /** Counted/throwing ordinary MCP loader seam reserved for deterministic tests. */
+  mcpOrdinaryLoadersForTest?: {
+    loadNativeState(options: Parameters<typeof loadClaudeMcpState>[0]): ReturnType<typeof loadClaudeMcpState>;
+    loadProjectMcpJson(projectRoot: string): McpJsonResult;
+  };
   pluginInventoryLifetime?: "session" | "command";
 }): LoadedProject {
   const diagnostics: Diagnostic[] = [];
@@ -72,6 +83,9 @@ export function loadClaudeProject(opts: {
   });
   const userDir = profile.userDir;
   const root = resolveProjectRoot(cwd);
+  // Every present standalone state suppresses ordinary MCP acquisition. Loaded
+  // states are exclusive; unusable state is administrator-controlled fail-closed evidence.
+  const managedMcp = discoverManagedMcp(opts.managedMcpDiscovery);
 
   const settings = loadSettings({
     cwd,
@@ -221,18 +235,28 @@ export function loadClaudeProject(opts: {
   // Auto memory, read side: undefined when disabled by setting or env.
   const autoMemory = loadAutoMemory(root, userDir, settings);
 
-  // MCP discovery resolves the inert native snapshot, `.mcp.json`, and
-  // scope-tagged settings captures before the runtime can create clients.
-  const nativeMcpState = loadClaudeMcpState({
-    statePath: profile.nativeStatePath,
-    projectRoot: root,
-  });
+  // The resolver prepares policy from one environment snapshot before deciding
+  // whether ordinary acquisition can affect admission. These callbacks are test
+  // authority only and are never project data.
+  const ordinaryLoaders = opts.mcpOrdinaryLoadersForTest ?? {
+    loadNativeState: loadClaudeMcpState,
+    loadProjectMcpJson: loadMcpJson,
+  };
   const mcp = resolveMcpConfig({
     projectRoot: root,
-    mcpJson: loadMcpJson(root),
+    loadOrdinaryMcp: () => ({
+      nativeState: ordinaryLoaders.loadNativeState({
+        statePath: profile.nativeStatePath,
+        projectRoot: root,
+      }),
+      mcpJson: ordinaryLoaders.loadProjectMcpJson(root),
+    }),
     mcpSettings: settings.mcpSettings ?? [],
-    nativeState: nativeMcpState,
     nativeStateProfile: profile.source,
+    mcpPolicySettings: settings.mcpPolicySettings,
+    mcpPolicySourceFailures: settings.mcpPolicySourceFailures,
+    mcpPolicyRestrictiveMaterialOmitted: settings.mcpPolicyRestrictiveMaterialOmitted,
+    managedMcp,
     ...(opts.env === undefined ? {} : { env: opts.env }),
   });
 
