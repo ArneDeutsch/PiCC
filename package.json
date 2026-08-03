@@ -31,8 +31,10 @@
     "picc": "bin/picc.mjs"
   },
   "files": [
+    "dist",
     "src",
-    "picc",
+    "picc/index.js",
+    "picc/index.ts",
     "bin",
     "examples",
     "doc/*.md",
@@ -44,7 +46,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build-runtime.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "typecheck:all": "npm run typecheck && npm run typecheck:test",
@@ -52,16 +54,17 @@
     "verify": "npm run typecheck:all && npm run test:unit",
     "test:watch": "vitest --project unit",
     "test:unit": "vitest run --project unit",
-    "test:e2e": "npm run test:e2e:source && npm run test:packaged",
-    "test:e2e:source": "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\"",
+    "test:e2e": "npm run test:packaged && npm run test:e2e:compiled && npm run test:e2e:source-fallback",
+    "test:e2e:compiled": "node scripts/check-real-pi.mjs && vitest run --project e2e --exclude \"test/e2e-packaged-launcher.test.ts\" --exclude \"test/e2e-source-fallback.test.ts\"",
+    "test:e2e:source-fallback": "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-source-fallback.test.ts",
     "test:coverage": "vitest run --coverage --project unit --project integration",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
-    "setup": "npm ci && npm link",
+    "setup": "npm ci && npm run build && npm link",
     "hooks:install": "git config core.hooksPath .githooks",
     "update:pi": "node scripts/update-pi-suite.mjs",
     "preversion": "npm run verify:all",
     "prepublishOnly": "npm run verify:all",
-    "test:source": "npm run test:unit && npm run test:integration && npm run test:e2e:source",
+    "test:source": "npm run test:unit && npm run test:integration && npm run test:e2e:source-fallback",
     "test:packaged": "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
     "test:integration": "vitest run --project integration",
     "test:all": "npm run test:unit && npm run test:integration && npm run test:e2e",
@@ -73,7 +76,6 @@
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "jiti": "2.7.0",
     "picomatch": "^4.0.5",
     "typebox": "1.3.7",
     "yaml": "^2.9.0"
@@ -82,6 +84,7 @@
     "@types/node": "^26.1.1",
     "@types/picomatch": "^4.0.3",
     "@vitest/coverage-v8": "^4.1.10",
+    "jiti": "2.7.0",
     "tsx": "4.23.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

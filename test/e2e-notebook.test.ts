@@ -9,7 +9,7 @@ import {
   TEST_TIMEOUT_MS,
 } from "./helpers/e2e-live.js";
 
-const { runPi, cleanup } = createE2ELive();
+const { runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 const MACHINE_PRESENTATION = /\u001b|[○●✗■╭╮╰╯│─]|notebook write|Ctrl\+O|\bexpansion\b|\bexpand(?:ed|s|ing|able)?\b/iu;

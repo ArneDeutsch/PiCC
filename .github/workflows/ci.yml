@@ -55,14 +55,27 @@ jobs:
       - name: Install
         run: npm ci
 
-      # Drives the real Pi CLI with local model traffic and no subscription.
-      - name: Source end-to-end tests
-        run: npm run test:e2e:source
+      - name: Build verified runtime and pack exact product once
+        id: pack
+        shell: bash
+        run: |
+          output_dir="$RUNNER_TEMP/picc-ci-release-$GITHUB_RUN_ID"
+          mkdir "$output_dir"
+          result="$(node scripts/pack-release.mjs --output-dir "$output_dir" --event manual)"
+          node -e 'const v=JSON.parse(process.argv[1]);if(typeof v.tarball!=="string"||typeof v.sha256!=="string")process.exit(1);console.log("tarball="+v.tarball);console.log("sha256="+v.sha256)' "$result" >> "$GITHUB_OUTPUT"
 
-      # The packaged consumer installs from a derived lock in hard-offline mode; package archives
-      # come from the npm cache populated by the preceding repository dependency installation.
-      - name: Packaged end-to-end tests
+      # Drives the real Pi CLI with local model traffic and no subscription.
+      - name: Compiled runtime end-to-end tests
+        run: npm run test:e2e:compiled
+
+      - name: Isolated source-fallback end-to-end witness
+        run: npm run test:e2e:source-fallback
+
+      # The packaged consumer installs the already-packed bytes from a derived lock in hard-offline
+      # mode; package archives come from the preceding repository dependency installation.
+      - name: Scripts-disabled packaged end-to-end witness
         env:
+          PICC_TEST_TARBALL: ${{ steps.pack.outputs.tarball }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
           TMPDIR: ${{ runner.temp }}

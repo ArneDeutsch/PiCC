@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import os from "node:os";
+import { pathToFileURL } from "node:url";
 import {
   allText,
   BASH_AVAILABLE,
@@ -12,7 +14,6 @@ import {
   createE2ELive,
   findSessionFiles,
   readJsonLines,
-  REPO_ROOT,
   systemText,
   toolResultText,
   TEST_TIMEOUT_MS,
@@ -29,10 +30,42 @@ import { createResponseGate } from "./helpers/mock-openai.js";
  * See test/helpers/e2e-live.ts for the shared runPi harness.
  */
 
-const { startPi, runPi, cleanup } = createE2ELive();
+const { startPi, runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 const TOOL_ROW_PRESENTATION = /[○●✗■]|\u001b\[[0-?]*[ -/]*[@-~]/u;
+
+it.skipIf(cliMissing)("e2e core: Pi loads and reloads the compiled wrapper with the picc label", async () => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-e2e-loader-"));
+  try {
+    const interactiveModule = await import(pathToFileURL(
+      path.join(path.dirname(CLI_PATH), "modes", "interactive", "interactive-mode.js"),
+    ).href) as any;
+    const formatter = Object.create(interactiveModule.InteractiveMode.prototype) as any;
+    const loader = new DefaultResourceLoader({
+      cwd: agentDir,
+      agentDir,
+      additionalExtensionPaths: [path.resolve("picc", "index.js")],
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    });
+    for (let generation = 0; generation < 2; generation += 1) {
+      await loader.reload();
+      const loaded = loader.getExtensions();
+      expect(loaded.errors).toEqual([]);
+      expect(loaded.extensions).toHaveLength(1);
+      const observedPath = loaded.extensions[0]!.path;
+      expect(path.basename(observedPath)).toBe("index.js");
+      expect(path.basename(path.dirname(observedPath))).toBe("picc");
+      expect(observedPath).not.toContain(`${path.sep}src${path.sep}`);
+      expect(formatter.getCompactExtensionLabels(loaded.extensions)).toEqual(["picc"]);
+    }
+  } finally {
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
+});
 
 function expectNoToolRowPresentation(value: unknown, source: string): void {
   if (typeof value === "string") {
@@ -81,7 +114,6 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
     ].join(";");
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)}`;
     const live = await startPi({
-      launcherPath: path.join(REPO_ROOT, "bin", "picc.mjs"),
       script: [],
       prompt: "unused",
       modeArgs: ["--mode", "rpc"],
@@ -103,7 +135,7 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
       const markerLines = fs.readFileSync(path.join(result.fixture, "rpc-bash-marker.json"), "utf8")
         .trim().split(/\r?\n/u);
       expect(markerLines).toHaveLength(1);
-      expect(JSON.parse(markerLines[0]!)).toEqual({ skip: null, launcher: null });
+      expect(JSON.parse(markerLines[0]!)).toEqual({ skip: "1", launcher: null });
     } finally {
       live.closeInput();
       await live.stop();

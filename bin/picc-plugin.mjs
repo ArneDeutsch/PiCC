@@ -1,8 +1,9 @@
 import fs from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, setSourceMapsSupport } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { canonicalPath, isPathInside } from "./picc-admin.mjs";
+import { canonicalPath, classifyInstallation, isPathInside } from "./picc-admin.mjs";
+import { selectPiccRuntime } from "./picc-runtime.mjs";
 
 const UNAVAILABLE = "PiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.";
 
@@ -33,8 +34,8 @@ function allowedDependencyRoots(packageRoot) {
   return roots;
 }
 
-function trustedEntrypoint(packageRoot) {
-  const entrypoint = canonicalPath(path.join(packageRoot, "src", "plugin-inventory-cli.ts"));
+function trustedEntrypoint(packageRoot, relativePath) {
+  const entrypoint = canonicalPath(path.join(packageRoot, ...relativePath.split("/")));
   if (!isPathInside(entrypoint, packageRoot) || !fs.statSync(entrypoint).isFile()) throw new Error("entrypoint unavailable");
   return entrypoint;
 }
@@ -45,6 +46,8 @@ function trustedJitiApi(packageRoot) {
     throw new Error("PiCC manifest unavailable");
   }
   const piccManifest = JSON.parse(fs.readFileSync(piccManifestPath, "utf8"));
+  const declarations = [piccManifest?.dependencies?.jiti, piccManifest?.devDependencies?.jiti]
+    .filter((value) => value !== undefined);
 
   for (const root of allowedDependencyRoots(packageRoot)) {
     try {
@@ -56,7 +59,7 @@ function trustedJitiApi(packageRoot) {
 
       const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
       const staticExport = manifest?.exports?.["./static"]?.import;
-      if (manifest?.name !== "jiti" || piccManifest?.dependencies?.jiti !== manifest.version) continue;
+      if (manifest?.name !== "jiti" || declarations.length === 0 || !declarations.every((version) => version === manifest.version)) continue;
       if (typeof staticExport !== "string" || !staticExport.startsWith("./")) continue;
       const api = canonicalPath(path.join(owner, staticExport));
       if (!isPathInside(api, owner) || !fs.statSync(api).isFile()) continue;
@@ -68,9 +71,39 @@ function trustedJitiApi(packageRoot) {
   throw new Error("loader unavailable");
 }
 
+function reportSelectionFailure(selection, installationKind, output) {
+  if (installationKind === "source") {
+    output.error(`PiCC plugin inventory: ${selection.reason}`);
+    return;
+  }
+  const state = selection.category === "missing" ? "missing" : selection.category === "version-mismatch" ? "version-incoherent" : "damaged";
+  output.error(`PiCC plugin inventory: The installed PiCC runtime is ${state}. TypeScript source was not used. Run \`picc update\`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.`);
+}
+
 export async function runPackagedPluginCommand({ packageRoot, argv, output = console }) {
+  const installationKind = classifyInstallation({ packageRoot });
+  let selection;
   try {
-    const entrypoint = trustedEntrypoint(packageRoot);
+    selection = selectPiccRuntime({ packageRoot, installationKind });
+  } catch {
+    output.error(UNAVAILABLE);
+    return 1;
+  }
+  if (!selection.ok) {
+    reportSelectionFailure(selection, installationKind, output);
+    return 1;
+  }
+  if (selection.notice) output.error(selection.notice.message);
+
+  setSourceMapsSupport(true, { nodeModules: true, generatedCode: true });
+  try {
+    const entrypoint = trustedEntrypoint(packageRoot, selection.entries.pluginInventoryPath);
+    if (selection.mode === "compiled") {
+      const loaded = await import(pathToFileURL(entrypoint).href);
+      if (typeof loaded?.runPluginInventoryCli !== "function") throw new Error("entrypoint API unavailable");
+      return loaded.runPluginInventoryCli(argv, output);
+    }
+
     const loaderApi = trustedJitiApi(packageRoot);
     const loader = await import(pathToFileURL(loaderApi).href);
     if (typeof loader.createJiti !== "function") throw new Error("loader API unavailable");

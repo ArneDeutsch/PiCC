@@ -49,9 +49,9 @@ cd PiCC
 npm run setup
 ```
 
-`npm run setup` installs the locked dependencies and globally links that checkout, so edits and
-pulls continue to drive the `picc` command. The npm global prefix must be writable. Configure a
-user-level prefix rather than running the setup as an administrator.
+`npm run setup` installs the locked dependencies, builds and verifies the runtime, then globally
+links that checkout, so edits and pulls continue to drive the `picc` command. The npm global prefix
+must be writable. Configure a user-level prefix rather than running the setup as an administrator.
 
 On Windows:
 
@@ -74,9 +74,15 @@ npm install --global picc
 
 ### No global link
 
-- Contributors and users without a writable npm global prefix can run `npm ci` in the checkout,
-  then launch it from the target project directory:
+- Contributors and users without a writable npm global prefix can prepare PiCC inside its checkout:
   ```powershell
+  cd <path-to-PiCC>
+  npm ci
+  npm run build
+  ```
+  Then change to the target Claude Code project and launch that prepared checkout:
+  ```powershell
+  cd <path-to-your-claude-code-project>
   node <path-to-PiCC>/bin/picc.mjs
   ```
 - Or, if you already use Pi, load the extension directly:
@@ -86,17 +92,34 @@ npm install --global picc
   { "extensions": ["<path-to-picc>/src/index.ts"] }
   ```
 
+### Runtime selection and recovery
+
+The PiCC launcher selects the representation and verifies any compiled runtime before loading the
+extension. Healthy startup is quiet; `picc --version` reports the installation kind and runtime
+selection.
+
+| How PiCC is hosted | Runtime and recovery | Setup, update, and reload |
+|---|---|---|
+| Published/global installation | Verified installed JavaScript for interactive and standalone plugin commands. Missing, damaged, or version-incoherent output fails closed; TypeScript is never substituted. Run `picc update`, or repair/reinstall through the package manager or project that owns the copy. | Installation already contains the built runtime and source maps; lifecycle scripts are not required. `/reload` keeps the verified compiled generation selected for the process. Exit and relaunch after update or repair. |
+| Source-checkout `picc` or `node …/bin/picc.mjs` | Uses verified JavaScript when it matches the checkout. Missing or stale output produces a notice and uses TypeScript source; damaged output fails closed. Run `npm run build` from the PiCC checkout root, then exit and relaunch. | `npm run setup` installs locked dependencies, builds and verifies the runtime, then globally links the checkout. `picc update` synchronizes locked dependencies, builds for the checked-out revision, and verifies the product without changing tracked source. A compiled selection stays on its verified generation; source fallback stays source-hosted and may observe source edits under Pi's reload semantics. `/reload` cannot adopt a new build. |
+| External Pi with `pi -e <path-to-PiCC>/src/index.ts` (or that path in Pi settings) | Explicit TypeScript development path; it does not use PiCC launcher selection or compiled-runtime verification. | Prepare dependencies with `npm ci`. Update ownership stays with the external Pi installation. Reloading remains source-hosted and may observe source edits under Pi's reload semantics; it never switches to compiled output. |
+
+Generated external source maps support source-oriented stack traces for compiled execution, though
+exact stack formatting depends on Node and the host. The retained TypeScript files are for explicit
+source development and debugging; an installed launch does not use them as integrity recovery.
+
 ### Check and update PiCC
 
-`picc --version` reports the PiCC version, embedded Pi version, and whether PiCC is running from a
-source checkout or an installed package. `picc update --check` reports the current state without
-changing the installation; a global npm installation asks npm for the current published version.
-The update path depends on who owns the installation:
+`picc --version` reports the PiCC version, embedded Pi version, installation kind, and whether the
+runtime is verified compiled output, a disclosed source fallback, or unavailable. `picc update
+--check` reports the current state without changing the installation; a global npm installation asks
+npm for the current published version. The update path depends on who owns the installation:
 
 - **Source checkout / global link:** `picc update` first requires a clean `git status`, using your
   normal Git configuration and global ignores. It then runs `npm ci --ignore-scripts --no-audit
-  --no-fund` and revalidates the four coordinated Pi packages. It never pulls or changes tracked
-  source; update that through your normal reviewed Git workflow first.
+  --no-fund`, builds and verifies the runtime for the current revision, and revalidates the four
+  coordinated Pi packages. It never pulls or changes tracked source; update that through your normal
+  reviewed Git workflow first.
 - **Global npm installation:** PiCC updates itself only when its package root is contained by npm's
   reported global root. The npm child inherits your proxy, CA, registry, and other npm settings.
   Exit active sessions before updating.
@@ -813,6 +836,8 @@ behaviors worth knowing:
 
 | Symptom | Fix |
 |---|---|
+| A source checkout reports a missing, stale, or damaged runtime | Run `npm run build` from the PiCC checkout root, exit, and relaunch; `/reload` cannot adopt the build. |
+| An installed copy reports a missing, damaged, or version-incoherent runtime | For a global installation, run `picc update`. Otherwise repair or reinstall it through its package manager or parent project. Installed PiCC never falls back to TypeScript. |
 | `/picc-update` is absent | The extension is hosted by an external Pi or the direct-launch lineage did not agree. Use that installation's owner and `picc --version`; do not send `/picc-update` as model input |
 | Worktree commands say Git is unavailable | Ensure Git is on PATH, or set `PICC_GIT` to its absolute executable path before starting PiCC |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |

@@ -20,6 +20,7 @@ interface SourceManifest {
   version: string;
   bin: { picc: string };
   dependencies: Record<string, string>;
+  devDependencies: Record<string, string>;
 }
 
 function readSourceManifest(): SourceManifest {
@@ -38,10 +39,11 @@ function readSourceManifest(): SourceManifest {
     version: parsed.version,
     bin: { picc: parsed.bin.picc },
     dependencies: stringMap(parsed.dependencies, "package.json dependencies"),
+    devDependencies: stringMap(parsed.devDependencies, "package.json devDependencies"),
   };
 }
 
-const { runPi, cleanup } = createE2ELive();
+const { runPi, cleanup } = createE2ELive({ runtime: "installed-launcher" });
 const sourceManifest = readSourceManifest();
 const expectedPiPins = PI_SUITE_PACKAGES.map((name) => sourceManifest.dependencies[name]);
 const expectedPiVersion = expectedPiPins[0]!;
@@ -89,7 +91,7 @@ function releaseTarball(): string {
   const outputDirectory = temporaryDirectory("picc-packaged-pack-");
   const output = execFileSync(
     process.execPath,
-    [path.resolve("scripts/pack-release.mjs"), "--output-dir", outputDirectory],
+    [path.resolve("scripts/pack-release.mjs"), "--output-dir", outputDirectory, "--event", "manual"],
     { cwd: path.resolve("."), encoding: "utf8", timeout: 120_000 },
   );
   const parsed: unknown = JSON.parse(output);
@@ -281,14 +283,9 @@ it(
       sourceManifest.dependencies,
       "installed tarball dependencies",
     );
+    expect(installedManifest.dependencies).not.toHaveProperty("jiti");
+    expect(sourceManifest.devDependencies.jiti).toBe("2.7.0");
     const installedNodeModules = path.dirname(packageRoot);
-    const installedJiti = JSON.parse(
-      fs.readFileSync(path.join(installedNodeModules, "jiti", "package.json"), "utf8"),
-    ) as { name?: unknown; version?: unknown };
-    expect({ name: installedJiti.name, version: installedJiti.version }).toEqual({
-      name: "jiti",
-      version: sourceManifest.dependencies.jiti,
-    });
     expect(fs.existsSync(path.join(installedNodeModules, "tsx"))).toBe(false);
     expect(fs.existsSync(path.join(installedNodeModules, "esbuild"))).toBe(false);
 
@@ -411,6 +408,28 @@ describe("installed release tarball", () => {
       expect(PI_SUITE_PACKAGES.map((name) => installedManifest.dependencies[name]))
         .toEqual(expectedPiPins);
       expect(new Set(expectedPiPins)).toEqual(new Set([expectedPiVersion]));
+      expect(installedManifest.dependencies).not.toHaveProperty("jiti");
+      expect(sourceManifest.devDependencies.jiti).toBe("2.7.0");
+      expect(fs.readdirSync(packageRoot).sort()).toEqual([
+        "CONTRIBUTING.md", "LICENSE", "README.md", "bin", "dist", "doc", "examples",
+        "package.json", "picc", "src",
+      ]);
+      expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.js", "index.ts"]);
+      expect(fs.existsSync(path.join(packageRoot, "scripts"))).toBe(false);
+      expect(fs.existsSync(path.join(packageRoot, "tsconfig.runtime.json"))).toBe(false);
+      const runtimeManifest = JSON.parse(
+        fs.readFileSync(path.join(packageRoot, "dist", "picc-runtime.json"), "utf8"),
+      ) as { entries: { extension: string; pluginInventory: string }; files: Array<{ path: string }> };
+      expect(runtimeManifest.entries).toEqual({
+        extension: "picc/index.js",
+        pluginInventory: "dist/plugin-inventory-cli.js",
+      });
+      for (const entry of ["dist/index.js", "dist/plugin-inventory-cli.js"]) {
+        expect(runtimeManifest.files.map((record) => record.path)).toContain(entry);
+        expect(runtimeManifest.files.map((record) => record.path)).toContain(`${entry}.map`);
+        const sourceMap = JSON.parse(fs.readFileSync(path.join(packageRoot, `${entry}.map`), "utf8")) as Record<string, unknown>;
+        expect(sourceMap).not.toHaveProperty("sourcesContent");
+      }
 
       const suite = validatePiSuite({ packageRoot });
       expect(suite).toMatchObject({ ok: true, version: expectedPiVersion });
@@ -455,6 +474,31 @@ describe("installed release tarball", () => {
       expect(bash).toContain(`"project":${JSON.stringify(result.fixture)}`);
       expect(result.stdout).toContain("PACKAGED_EXTENSION_OK");
       expect(result.stderr).not.toMatch(/latest-version|api\.openai\.com|anthropic\.com/iu);
+
+      const compiledEntry = path.join(packageRoot, "dist", "index.js");
+      const sourceEntry = path.join(packageRoot, "picc", "index.ts");
+      const originalCompiled = fs.readFileSync(compiledEntry);
+      const originalSource = fs.readFileSync(sourceEntry);
+      const sourceCanary = path.join(temporaryDirectory("picc-packaged-tamper-"), "source-executed");
+      try {
+        fs.appendFileSync(compiledEntry, "\n");
+        fs.writeFileSync(
+          sourceEntry,
+          `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sourceCanary)}, "executed"); export default function canary() {}\n`,
+        );
+        const tampered = await runPi({
+          launcherPath: launcher,
+          prompt: "must fail before Pi",
+          script: [{ text: "PI_MUST_NOT_RUN" }],
+        });
+        expect(tampered.code).toBe(1);
+        expect(tampered.requests).toHaveLength(0);
+        expect(tampered.stderr).toContain("installed PiCC runtime is damaged");
+        expect(fs.existsSync(sourceCanary)).toBe(false);
+      } finally {
+        fs.writeFileSync(compiledEntry, originalCompiled);
+        fs.writeFileSync(sourceEntry, originalSource);
+      }
     },
     TEST_TIMEOUT_MS,
   );
