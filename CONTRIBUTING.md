@@ -117,39 +117,82 @@ pull request. Never couple Pi release detection or adoption to automatic merging
 
 ### Cutting a PiCC release
 
-Release only a reviewed, clean default branch. Choose `patch`, `minor`, `major`, or an exact stable
-version:
+Prepare the version in `package.json` and `package-lock.json` through reviewed work. Release only
+from a clean, synchronized `main` whose CI is green. The Release workflow packages, tests, and
+uploads one candidate on manual dispatch; manual runs do not request protected-environment
+approval, access its npm secret, create a GitHub Release, or publish to npm.
+
+From Git Bash or another POSIX shell, replace `X.Y.Z`, then rehearse the merged commit:
 
 ```bash
-npm version patch
-git push origin HEAD --follow-tags
+set -euo pipefail
+VERSION=X.Y.Z
+git switch main
+git fetch --prune origin
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+REHEARSED_SHA="$(git rev-parse HEAD)"
+node -e 'const p=require("./package.json"),l=require("./package-lock.json"),v=process.argv[1];if(p.version!==v||l.version!==v||l.packages?.[""]?.version!==v)process.exit(1)' "$VERSION"
+gh workflow run release.yml --repo ArneDeutsch/PiCC --ref main
+gh run list --repo ArneDeutsch/PiCC --workflow release.yml --event workflow_dispatch --limit 5
 ```
 
-`npm version` runs the complete verification gate before it updates `package.json` and
-`package-lock.json`, commits them, and creates the matching `v<version>` tag. The workflow first
-runs the build-free source verification lanes. It then admits the source and tag, builds once,
-verifies that runtime, packs once, inspects and tests that exact tarball, and uploads it
-as a short-lived workflow artifact. This **build once → verify → pack once → publish one artifact**
-invariant forbids rebuilding or repacking between verification and publication. For a tag, a
-separate `npm-publish` environment job downloads and rehashes those same bytes before handing them
-to the GitHub Release and npm publication steps. A manual workflow run stops after the first job and
-retains the verified candidate artifact for seven days; it cannot access the npm credential or
-publish a release.
+Open the new run and require its `headSha` to equal `REHEARSED_SHA`. Record the run URL, candidate
+filename, and SHA-256; require the package and exact packaged-product steps to pass and `publish` to
+be skipped. If `main` moves before tagging, rehearse its new tip instead.
 
-The repository must define an `npm-publish` environment whose `NPM_TOKEN` exists only as an
-environment secret and whose deployment rule allows tags matching `v*`. On public repositories,
-configure the release owner as the required reviewer, allow that owner to review their own release,
-and disable administrator bypass. Keep an active `v*` tag ruleset that restricts creation, updates,
-deletion, and force-push bypass to repository administrators. The protected publication job waits
-for environment approval before GitHub makes `NPM_TOKEN` available; inspect the tag and commit, then
-approve that deployment.
+After the rehearsal, run the complete gate and tag that same commit. Set `REHEARSED_SHA` to the
+recorded full SHA. Run verification first, then repeat the identity checks immediately before the
+mutation so a stale tree, moved branch, version mismatch, or existing tag stops the sequence:
 
-If a tagged workflow fails after either publication step, inspect all three identities before doing
-anything else: the verified SHA-256 in the workflow log, the asset on the GitHub Release for the tag,
-and `npm view picc@<version> dist`. Never rebuild or retag the version, and never publish bytes with a
-different hash. If neither destination exists, rerun the tagged workflow. If one or both exist,
-reconcile the missing destination from the already verified artifact; do not repeat an immutable npm
-publication that already succeeded.
+```bash
+set -euo pipefail
+VERSION=X.Y.Z
+REHEARSED_SHA=0123456789abcdef0123456789abcdef01234567
+git switch main
+npm run verify:all
+git fetch --prune origin
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = "$REHEARSED_SHA"
+test "$(git rev-parse origin/main)" = "$REHEARSED_SHA"
+node -e 'const p=require("./package.json"),l=require("./package-lock.json"),v=process.argv[1];if(p.version!==v||l.version!==v||l.packages?.[""]?.version!==v)process.exit(1)' "$VERSION"
+test -z "$(git tag --list "v$VERSION")"
+test -z "$(git ls-remote --tags origin "refs/tags/v$VERSION")"
+git tag --annotate "v$VERSION" "$REHEARSED_SHA" --message "PiCC v$VERSION"
+test "$(git rev-list -n 1 "v$VERSION")" = "$REHEARSED_SHA"
+git push origin "refs/tags/v$VERSION"
+```
+
+The tag starts a fresh run. Before personally approving its waiting `npm-publish` deployment,
+require the tag and peeled commit to match the rehearsal, and inspect the package-job result,
+version, candidate filename, and tag run's own SHA-256. The tag run independently creates its own
+candidate; its SHA-256 need not equal the rehearsal candidate's. The workflow builds and packs once,
+re-downloads and verifies that artifact in the protected job, attaches those bytes to the GitHub
+Release, and gives the same archive to `npm publish --provenance`. Provenance identifies the public
+repository and workflow that published the npm package; it does not by itself prove byte equality.
+
+After the run succeeds, verify both destinations and launch the exact registry version from a test
+Claude Code project:
+
+```bash
+gh release view "v$VERSION" --repo ArneDeutsch/PiCC --json url,tagName,targetCommitish,assets
+npm view "picc@$VERSION" version dist.tarball dist.integrity repository.url --json
+cd /path/to/test-claude-code-project
+npx --yes "picc@$VERSION" --version
+npx --yes "picc@$VERSION"
+```
+
+Require the GitHub Release to contain `picc-X.Y.Z.tgz`, npm metadata to identify the intended
+version and repository, and `picc --version` to report that version before checking normal startup.
+Open npm's provenance details and require the repository, release workflow, tag, commit, and package
+version to match.
+
+If publication is partial or ambiguous, stop and preserve the tag, version, workflow run, candidate
+filename, and SHA-256. Inspect the workflow and independently check GitHub Releases and npm before
+any recovery action: a timed-out npm client may still have published. Never move, delete, or
+recreate the remote tag; never rebuild or substitute bytes under that version; and never retry npm
+until its immutable version is proven absent. A hash mismatch, missing evidence, or uncertain
+outcome requires investigation rather than a blind rerun.
 
 ## Guiding principles
 
