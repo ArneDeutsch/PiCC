@@ -322,8 +322,10 @@ Several dedicated hooks — all low-risk:
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
   true })`. **PiCC already does this** for subagent lifecycle status, ordinary API retries, and
   sanitized summary-retry activity (`src/runtime/subagent-progress.ts` → `subagent-render.ts`).
-  Each individually rendered active agent shows one bounded structured current-activity fragment in
-  its single physical status row. Depending on available row space, that fragment can be ellipsized or
+  Each individually rendered active agent shows one bounded structured live-activity payload in its
+  single physical status row. While synthetic default `Thinking…` is displayed, it includes the
+  remembered activity as `<activity> · Thinking…`; genuine activity replaces it immediately. With a
+  valid theme, the payload is muted italic and, depending on available row space, can be ellipsized or
   omitted with its separator. The bounded agent window and narrow aggregate remain distinct: windowing
   limits visible agents, while widths too narrow for individual rows show no per-agent fragment. The
   selected-agent view owns long or multiline history and detail. Copy the pattern for any long tool.

@@ -93,17 +93,33 @@ export function themedBold(theme: unknown, text: string): string {
   return invokeTheme(theme, "bold", [text], text);
 }
 
-/** Safely compose `theme.fg(color, theme.italic(text))`; malformed styling fails open. */
+/**
+ * Safely compose muted foreground and italic while preserving each decoration
+ * independently when the other theme method is absent, throws, or emits invalid SGR.
+ */
 export function themedFgItalic(theme: unknown, color: string, text: string): string {
+  let italicText = text;
   try {
     const italic = Reflect.get(theme as object, "italic");
-    const fg = Reflect.get(theme as object, "fg");
-    if (typeof italic !== "function" || typeof fg !== "function") return text;
-    const italicText = safeSgrText(Reflect.apply(italic, theme, [text]), text);
-    if (italicText === undefined) return text;
-    return safeSgrText(Reflect.apply(fg, theme, [color, italicText]), text) ?? text;
+    if (typeof italic === "function") {
+      italicText = safeSgrText(Reflect.apply(italic, theme, [text]), text) ?? text;
+    }
   } catch {
-    return text;
+    italicText = text;
+  }
+
+  try {
+    const fg = Reflect.get(theme as object, "fg");
+    if (typeof fg !== "function") return italicText;
+    const candidate = Reflect.apply(fg, theme, [color, italicText]);
+    const styled = safeSgrText(candidate, text);
+    if (styled === undefined) return italicText;
+    // A foreground decorator must preserve already-validated inner italic bytes;
+    // otherwise its text-safe output would silently discard that valid decoration.
+    if (italicText !== text && !styled.includes(italicText)) return italicText;
+    return styled;
+  } catch {
+    return italicText;
   }
 }
 

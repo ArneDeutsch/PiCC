@@ -655,7 +655,7 @@ describe("responsive panel table", () => {
       rec({ agentId: "reason", startedAt: 2, liveActivity: { kind: "reasoning", text: "checking invariants" } }),
       rec({ agentId: "assistant", startedAt: 3, liveActivity: { kind: "assistant", text: ASSISTANT_CANARY } }),
       rec({ agentId: "output", startedAt: 4, liveActivity: { kind: "output", text: "command output" } }),
-      rec({ agentId: "status", startedAt: 5, liveActivity: { kind: "status", text: "waiting: API retry 2/3" } }),
+      rec({ agentId: "status", startedAt: 5, liveActivity: { kind: "status", text: "previous command · Thinking…" } }),
     ];
     const fg = vi.fn((_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m`);
     const italic = vi.fn((text: string) => `${ESC}[3m${text}${ESC}[23m`);
@@ -669,7 +669,7 @@ describe("responsive panel table", () => {
     expect(plainRows.join("\n")).toContain(ASSISTANT_CANARY);
     const activities = [...new Set([
       "Waiting for capacity", "Read src/index.ts", "checking invariants",
-      ASSISTANT_CANARY, "command output", "waiting: API retry 2/3",
+      ASSISTANT_CANARY, "command output", "previous command · Thinking…",
     ])];
     for (const activity of activities) {
       expect(italic).toHaveBeenCalledWith(activity);
@@ -1122,12 +1122,31 @@ describe("responsive panel table", () => {
       (slot === "text" || slot === "accent") && String(text).includes("Read")
     )).toBe(false);
 
-    const rejected = renderSubagentPanel(panel, {
+    const invalidForeground = renderSubagentPanel(panel, {
       width: 80, entryChord: CHORD,
       theme: { fg: (_color: string, text: string) => `${ESC}[90m${text}`, italic },
     })[0]!;
-    expect(rejected).not.toContain(ESC);
-    expect(rejected).toContain(activity);
+    expect(invalidForeground).toContain(`${ESC}[3m${activity}${ESC}[23m`);
+    expect(invalidForeground).not.toContain(`${ESC}[90m`);
+
+    const invalidItalic = renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD,
+      theme: {
+        fg,
+        italic: (text: string) => `${ESC}[3mchanged ${text}${ESC}[23m`,
+      },
+    })[0]!;
+    expect(invalidItalic).toContain(`${ESC}[90m${activity}${ESC}[39m`);
+    expect(invalidItalic).not.toContain(`${ESC}[3m`);
+
+    const italicOnly = renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD, theme: { italic },
+    })[0]!;
+    expect(italicOnly).toContain(`${ESC}[3m${activity}${ESC}[23m`);
+    const foregroundOnly = renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD, theme: { fg },
+    })[0]!;
+    expect(foregroundOnly).toContain(`${ESC}[90m${activity}${ESC}[39m`);
 
     const injected = "\u200Binjected";
     const plain = renderSubagentPanel(panel, { width: 80, entryChord: CHORD })[0]!;
@@ -1381,7 +1400,7 @@ describe("panel aggregate, palette, and width safety", () => {
     expect(malformed).not.toContain("bad");
   });
 
-  it("fails hostile reasoning theme composition open to the sanitized themeless line", () => {
+  it("keeps sanitized reasoning width-safe with independent hostile-theme fallbacks", () => {
     const panel = view(makeModel({ t: 100 }), [rec({
       agentId: "hostile-reasoning",
       liveActivity: { kind: "reasoning", text: `think${ESC}[31m\r\n\u0001\uD800 safely` },
@@ -1391,24 +1410,29 @@ describe("panel aggregate, palette, and width safety", () => {
     const baseline = baselineLines.map(stripAnsi);
     const validFg = (_color: string, value: string) => value;
     const validItalic = (value: string) => `${ESC}[3m${value}${ESC}[23m`;
-    const themes: Array<[string, unknown]> = [
-      ["malformed italic", { fg: validFg, italic: "malformed" }],
-      ["throwing italic getter", { fg: validFg, get italic(): never { throw new Error("hostile italic getter"); } }],
-      ["throwing italic method", { fg: validFg, italic: () => { throw new Error("hostile italic method"); } }],
-      ["unbalanced italic output", { fg: validFg, italic: (value: string) => `${ESC}[3m${value}` }],
-      ["malformed outer fg", { fg: "malformed", italic: validItalic }],
-      ["throwing outer fg getter", { get fg(): never { throw new Error("hostile fg getter"); }, italic: validItalic }],
-      ["throwing outer fg method", { fg: () => { throw new Error("hostile fg method"); }, italic: validItalic }],
-      ["unbalanced outer fg output", { fg: (_color: string, value: string) => `${ESC}[90m${value}`, italic: validItalic }],
+    const themes: Array<[string, unknown, boolean]> = [
+      ["malformed italic", { fg: validFg, italic: "malformed" }, false],
+      ["throwing italic getter", { fg: validFg, get italic(): never { throw new Error("hostile italic getter"); } }, false],
+      ["throwing italic method", { fg: validFg, italic: () => { throw new Error("hostile italic method"); } }, false],
+      ["unbalanced italic output", { fg: validFg, italic: (value: string) => `${ESC}[3m${value}` }, false],
+      ["malformed outer fg", { fg: "malformed", italic: validItalic }, true],
+      ["throwing outer fg getter", { get fg(): never { throw new Error("hostile fg getter"); }, italic: validItalic }, true],
+      ["throwing outer fg method", { fg: () => { throw new Error("hostile fg method"); }, italic: validItalic }, true],
+      ["unbalanced outer fg output", { fg: (_color: string, value: string) => `${ESC}[90m${value}`, italic: validItalic }, true],
     ];
 
     expect(baselineLines).toHaveLength(2);
     expect(baseline[0]).toMatch(/ · think +safely/u);
-    for (const [label, theme] of themes) {
+    for (const [label, theme, keepsItalic] of themes) {
       const lines = renderSubagentPanel(panel, { width, entryChord: CHORD, theme });
       const plain = lines.map(stripAnsi);
       expect(plain, label).toEqual(baseline);
-      expect(lines[0], label).toBe(baselineLines[0]);
+      if (keepsItalic) {
+        expect(lines[0], label).toContain(`${ESC}[3m`);
+        expect(lines[0], label).toContain(`${ESC}[23m`);
+      } else {
+        expect(lines[0], label).toBe(baselineLines[0]);
+      }
       expect(lines, label).toHaveLength(baselineLines.length);
       for (const line of lines) {
         expect(visibleWidth(line), label).toBeLessThanOrEqual(width);

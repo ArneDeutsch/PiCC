@@ -104,7 +104,7 @@ export interface PanelRowView {
   elapsedMs: number;
   /** Live-accumulated or settlement usage (settled wins); absent until known. */
   usage?: SubagentUsage;
-  /** Current activity for active rows only; copied from the registry or model fallback. */
+  /** Bounded live-panel payload for active rows; copied from the registry or model fallback. */
   activity?: SubagentLiveActivity;
   selected: boolean;
   /** Descendants hidden by the overflow window — the `(+N)` chip; 0 = none. */
@@ -189,7 +189,7 @@ function expiryOf(
   return endpoint + linger;
 }
 
-/** Stable active-state activity, with capacity waiting authoritative over captured runtime state. */
+/** Stable active-state display payload, with capacity waiting authoritative over captured runtime state. */
 function activityOf(record: SubagentRegistryRecord, state: PanelRowState): SubagentLiveActivity | undefined {
   if (state === "waiting") return { kind: "status", text: "Waiting for capacity" };
   if (state !== "running") return undefined;
