@@ -26,6 +26,8 @@ const runtimeSelectorSource = path.join(repoRoot, "bin", "picc-runtime.mjs");
 const windowsRegistryWarning = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
 const inventoryIncompleteWarning = (classes: string, actions = "repair") => `PiCC plugin inventory may be incomplete (${classes}). ${actions.includes("format") ? "Update PiCC or report the unsupported plugin-state format. " : ""}${actions.includes("repair") ? "Repair the malformed or unreadable Claude plugin state outside PiCC. " : ""}Run PiCC interactively in the same project and profile, then use \`/doctor\` for details.`;
 const inventoryPolicyWarning = process.platform === "win32" ? `${windowsRegistryWarning}\n` : "";
+const sourceFallbackNotice = "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.";
+const sourcePluginStderr = `${sourceFallbackNotice}\n${inventoryPolicyWarning}`;
 const tempDirs: string[] = [];
 
 function temp(prefix: string): string {
@@ -141,6 +143,21 @@ function installVerifiedRuntime(root: string, options: {
 }
 
 function runSourcePluginWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv) {
+  const packageRoot = makePackage({ withCli: false });
+  installLauncher(packageRoot);
+  const manifestPath = path.join(packageRoot, "package.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+    devDependencies?: Record<string, string>;
+  };
+  manifest.devDependencies = { jiti: "2.7.0" };
+  write(manifestPath, JSON.stringify(manifest));
+  copyJiti(path.join(packageRoot, "node_modules", "jiti"));
+  const implementationUrl = pathToFileURL(path.join(repoRoot, "src", "plugin-inventory-cli.ts")).href;
+  write(
+    path.join(packageRoot, "src", "plugin-inventory-cli.ts"),
+    `export { runPluginInventoryCli } from ${JSON.stringify(implementationUrl)};\n`,
+  );
+
   const childEnv = { ...process.env };
   delete childEnv.PICC_CLAUDE_USER_DIR;
   delete childEnv.CLAUDE_CONFIG_DIR;
@@ -159,7 +176,7 @@ require("node:module").syncBuiltinESMExports();
 `);
     childEnv.NODE_OPTIONS = `${childEnv.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
   }
-  return spawnSync(process.execPath, [launcherSource, "plugin", ...args], {
+  return spawnSync(process.execPath, [path.join(packageRoot, "bin", "picc.mjs"), "plugin", ...args], {
     cwd,
     encoding: "utf8",
     env: childEnv,
@@ -950,7 +967,7 @@ require("node:module").syncBuiltinESMExports();
       NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
     });
     expect(result.status).toBe(0);
-    expect(result.stderr).toBe(inventoryPolicyWarning);
+    expect(result.stderr).toBe(sourcePluginStderr);
     expect(result.stdout).toContain("No plugins are known in this snapshot.");
     expect(fs.existsSync(tsconfigCanary)).toBe(false);
     expect(fs.existsSync(cacheCanary)).toBe(false);
@@ -979,7 +996,7 @@ require("node:module").syncBuiltinESMExports();
     const before = fs.readdirSync(project).sort();
     const result = runSourcePlugin(project, userDir, ["details", "hostile@market"]);
     expect(result.status).toBe(0);
-    expect(result.stderr).toBe(inventoryPolicyWarning);
+    expect(result.stderr).toBe(sourcePluginStderr);
     expect(result.stdout).toContain("Plugin: hostile@market");
     expect(fs.existsSync(marker)).toBe(false);
     expect(fs.existsSync(path.join(userDir, "plugins", "data"))).toBe(false);
