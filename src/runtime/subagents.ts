@@ -2587,7 +2587,7 @@ export class SubagentRuntime {
       }
 
       // Project every child event independently into the legacy snapshot, structured
-      // detail log, and current live-activity atom. The registry mirrors all three for
+      // detail log, and bounded live-panel display payload. The registry mirrors all three for
       // foreground, background, nested, and resumed dispatches; opts.onProgress receives
       // snapshot changes only, preserving its model-facing cadence. Mirror before emit so
       // the registry never lags a consumer-visible snapshot. Event-stream only — NEVER

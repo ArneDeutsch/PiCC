@@ -16,6 +16,7 @@ import {
   sanitizeDetailScalar,
   sanitizeLine,
   sanitizeProgressText,
+  subagentLiveActivityText,
   SubagentProgressCondenser,
   type ProgressSnapshot,
 } from "../src/runtime/subagent-progress.js";
@@ -284,6 +285,104 @@ describe("SubagentProgressCondenser", () => {
 });
 
 describe("SubagentProgressCondenser live activity", () => {
+  it("shares one pure activity formatter across ordinary and retained forms", () => {
+    expect(subagentLiveActivityText({ kind: "tool", tool: "read", detail: "src/index.ts" }))
+      .toBe("read src/index.ts");
+    expect(subagentLiveActivityText({ kind: "reasoning", text: "**checking**" }))
+      .toBe("checking");
+    expect(subagentLiveActivityText({ kind: "assistant", text: "**answer**" }))
+      .toBe("**answer**");
+  });
+
+  it("retains meaningful tool activity across neutral completion and empty turn boundaries", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Thinking…" });
+    c.consume({
+      type: "tool_execution_start", toolCallId: "read", toolName: "Read", args: { path: "src/index.ts" },
+    });
+    c.consume({ type: "tool_execution_end", toolCallId: "read", toolName: "Read", result: "" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+    c.consume({ type: "turn_end", message: assistant("") });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "read src/index.ts · Thinking…" });
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "read src/index.ts · Thinking…" });
+    expect((c.liveActivity() as { text: string }).text.match(/Thinking…/gu)).toHaveLength(1);
+  });
+
+  it("treats text-bearing turn_end as genuine output while keeping its immediate neutral presentation", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolCallId: "old", toolName: "Bash", args: { command: "pwd" } });
+    c.consume({ type: "turn_end", message: assistant("final answer without a streamed update") });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({
+      kind: "status", text: "final answer without a streamed update · Thinking…",
+    });
+  });
+
+  it("replaces retained thinking handoffs on every genuine activity provenance", () => {
+    const c = new SubagentProgressCondenser();
+    const expectRetained = (text: string): void => {
+      c.consume({ type: "turn_start" });
+      expect(c.liveActivity()).toEqual({ kind: "status", text: `${text} · Thinking…` });
+    };
+
+    c.consume({ type: "tool_execution_start", toolCallId: "tool", toolName: "Read", args: { path: "a.ts" } });
+    expectRetained("read a.ts");
+    c.consume({ type: "tool_execution_end", toolCallId: "tool", toolName: "Read", result: "visible output" });
+    expect(c.liveActivity()).toEqual({ kind: "output", text: "visible output" });
+    expectRetained("visible output");
+
+    c.consume({ type: "tool_execution_start", toolCallId: "fail", toolName: "Bash", args: { command: "false" } });
+    c.consume({ type: "tool_execution_end", toolCallId: "fail", toolName: "Bash", result: "exit 1", isError: true });
+    expectRetained("Failed: bash — exit 1");
+
+    const thinking = { content: [{ type: "thinking", thinking: "" }] };
+    c.consume({
+      type: "message_update", message: thinking,
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "**reasoning**", partial: thinking },
+    });
+    expectRetained("reasoning");
+    for (const text of ["Working…", "Thinking…"]) {
+      c.consume({
+        type: "message_update", message: assistant(text),
+        assistantMessageEvent: { type: "text_delta", delta: text },
+      });
+      expectRetained(text);
+    }
+    c.consume({ type: "auto_retry_start", attempt: 2, maxAttempts: 3 });
+    expectRetained("waiting: API retry 2/3");
+    c.consume({ type: "summarization_retry_finished" });
+    expectRetained("summary retry finished");
+  });
+
+  it("bounds and sanitizes a retained oversized activity while preserving the thinking suffix", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "tool_execution_start", toolCallId: "hostile", toolName: "Read",
+      args: { path: `${ESC}[31m${"x".repeat(10_000)}${BEL}` },
+    });
+    const legacyBefore = c.snapshot();
+    const detailBefore = c.detailLog();
+    c.consume({ type: "turn_start" });
+    const legacyAfter = c.snapshot();
+    expect(legacyAfter.activity).toBe("thinking…");
+    expect(renderProgressText(legacyAfter)).toBe(`${legacyBefore.tail.join("\n")}\n… thinking…`);
+    expect(progressActivityLine(legacyAfter)).toBe("thinking…");
+    expect(c.detailLog()).toEqual(detailBefore);
+
+    const retained = c.liveActivity() as { kind: "status"; text: string };
+    expect(retained.text).toHaveLength(DETAIL_FIELD_MAX_LENGTH);
+    expect(retained.text).toMatch(/ · Thinking…$/u);
+    expect(retained.text).not.toContain(ESC);
+    expect(retained.text).not.toContain(BEL);
+    expect(legacyAfter.tail).toEqual(legacyBefore.tail);
+    expect(legacyAfter).not.toHaveProperty("liveActivity");
+  });
+
   it("captures display tool names and primary arguments without changing legacy snapshots", () => {
     const c = new SubagentProgressCondenser();
     c.consume({
@@ -335,6 +434,8 @@ describe("SubagentProgressCondenser live activity", () => {
     reveal.consume({ type: "tool_execution_start", toolCallId: "b", toolName: "Grep", args: { pattern: "needle" } });
     reveal.consume({ type: "tool_execution_end", toolCallId: "b", toolName: "Grep", result: "done" });
     expect(reveal.liveActivity()).toEqual({ kind: "tool", tool: "read", detail: "a.ts" });
+    reveal.consume({ type: "turn_start" });
+    expect(reveal.liveActivity()).toEqual({ kind: "status", text: "read a.ts · Thinking…" });
     reveal.consume({ type: "tool_execution_end", toolCallId: "a", toolName: "Read", result: "contents" });
     expect(reveal.liveActivity()).toEqual({ kind: "output", text: "contents" });
   });
@@ -367,6 +468,10 @@ describe("SubagentProgressCondenser live activity", () => {
     c.consume({ type: "tool_execution_start", toolCallId, toolName: "Read", args: { path: "a" } });
     c.consume({ type: "tool_execution_end", toolCallId, toolName: "Read", result: "done" });
     expect(c.liveActivity()).toEqual({ kind: "status", text: "Tool activity in progress…" });
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({
+      kind: "status", text: "Tool activity in progress… · Thinking…",
+    });
     c.consume({ type: "turn_end", message: assistant("done") });
     expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
   });
@@ -431,6 +536,8 @@ describe("SubagentProgressCondenser live activity", () => {
       expect(c.liveActivity()).toEqual({ kind: "status", text: "Working…" });
       expect(JSON.stringify(c.liveActivity())).not.toContain("redacted");
     }
+    c.consume({ type: "turn_start" });
+    expect(c.liveActivity()).toEqual({ kind: "status", text: "visible · Thinking…" });
   });
 
   it("defensively inspects fallback partial blocks", () => {
@@ -477,6 +584,8 @@ describe("SubagentProgressCondenser live activity", () => {
     expect(JSON.stringify(c.liveActivity())).not.toContain("BEYOND_DELTA_BUDGET");
 
     c.consume({ type: "turn_start" });
+    const retained = c.liveActivity();
+    expect(retained).toMatchObject({ kind: "status", text: expect.stringMatching(/ · Thinking…$/u) });
     c.consume({
       type: "message_update",
       message: { content: [] },
@@ -489,7 +598,8 @@ describe("SubagentProgressCondenser live activity", () => {
         },
       },
     });
-    expect(c.liveActivity()).toEqual({ kind: "status", text: "Thinking…" });
+    expect(c.liveActivity()).toEqual(retained);
+    expect(JSON.stringify(c.liveActivity())).not.toContain("BEYOND_FALLBACK_BUDGET");
   });
 
   it("uses truthful neutral and failed-tool statuses", () => {

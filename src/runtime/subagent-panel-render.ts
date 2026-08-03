@@ -9,7 +9,9 @@ import {
   sanitizeLine,
   sanitizeProgressText,
   scalarSafeText,
+  subagentLiveActivityText,
   type SubagentDetailEntry,
+  type SubagentLiveActivity,
 } from "./subagent-progress.js";
 import { clampLines, pushWrapped, themedFg, themedFgItalic } from "./render-util.js";
 import type { PanelRowView, PanelViewModel } from "./subagent-panel-model.js";
@@ -232,13 +234,6 @@ function fitActivityText(text: string, width: number): string {
   }
 }
 
-function stripReasoningOuterBold(text: string): string {
-  let normalized = text;
-  if (normalized.startsWith("**")) normalized = normalized.slice(2);
-  if (normalized.endsWith("**")) normalized = normalized.slice(0, -2);
-  return normalized;
-}
-
 function activityValue(row: PanelRowView): PanelRowView["activity"] {
   try {
     const activity = row.activity;
@@ -263,20 +258,20 @@ function prepareActivityText(row: PanelRowView): string {
   if (row.state !== "running" && row.state !== "waiting") return "";
   if (row.state === "waiting") return "Waiting for capacity";
   const activity = activityValue(row);
-  if (activity?.kind === "tool") {
+  const fallback = "Working…";
+  if (!activity) return fallback;
+  let sanitized: SubagentLiveActivity;
+  if (activity.kind === "tool") {
     const tool = scalarSafeText(sanitizeLine(activity.tool, ACTIVITY_RENDER_CAP)) || "tool";
     const detail = activity.detail === undefined
       ? ""
       : scalarSafeText(sanitizeLine(activity.detail, ACTIVITY_RENDER_CAP));
-    return detail ? `${tool} ${detail}` : tool;
+    sanitized = detail ? { kind: "tool", tool, detail } : { kind: "tool", tool };
+  } else {
+    const text = scalarSafeText(sanitizeLine(activity.text, ACTIVITY_RENDER_CAP)) || fallback;
+    sanitized = { kind: activity.kind, text };
   }
-
-  const fallback = "Working…";
-  const sanitizedText = activity
-    ? scalarSafeText(sanitizeLine(activity.text, ACTIVITY_RENDER_CAP)) || fallback
-    : fallback;
-  if (activity?.kind !== "reasoning") return sanitizedText;
-  return stripReasoningOuterBold(sanitizedText) || fallback;
+  return subagentLiveActivityText(sanitized) || fallback;
 }
 
 function renderInlineActivity(activity: string, width: number, opts: PanelRenderOptions): string {

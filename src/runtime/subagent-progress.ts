@@ -13,12 +13,12 @@ import { formatToolDisplayName } from "./tool-display.js";
  *   - a rolling `tail` of recent activity lines (tool calls, the subagent's own
  *     assistant output, short tool-result previews), newest last, capped in
  *     both count and per-line length, and
- *   - a single `activity` line naming what is happening RIGHT NOW (current tool,
- *     or a silent auto-retry wait - "waiting: API retry 2/3"), and
+ *   - a single `activity` line naming the compact legacy progress state (current
+ *     tool, or a silent auto-retry wait - "waiting: API retry 2/3"), and
  *   - accumulated token `usage`, absent until the first usage-bearing event.
  *
  * Beside the snapshot, the condenser keeps a typed structured detail log and
- * an independent current-activity atom. Both are capture-sanitized, hard-bounded,
+ * an independent live-panel display atom. Both are capture-sanitized, hard-bounded,
  * and excluded from model-facing progress.
  *
  * SANITIZATION IS SECURITY, NOT COSMETICS: the tail replays subagent-controlled
@@ -46,13 +46,23 @@ export interface SnapshotUsage {
   costUsd?: number;
 }
 
-/** One bounded, sanitized description of a running subagent's current activity. */
+/** One bounded, sanitized payload for a running subagent's live panel display. */
 export type SubagentLiveActivity =
   | { kind: "tool"; tool: string; detail?: string }
   | { kind: "reasoning"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "output"; text: string }
   | { kind: "status"; text: string };
+
+/** Pure canonical text projection shared by retained composition and panel rendering. */
+export function subagentLiveActivityText(activity: SubagentLiveActivity): string {
+  if (activity.kind === "tool") return activity.detail ? `${activity.tool} ${activity.detail}` : activity.tool;
+  if (activity.kind !== "reasoning") return activity.text;
+  let normalized = activity.text;
+  if (normalized.startsWith("**")) normalized = normalized.slice(2);
+  if (normalized.endsWith("**")) normalized = normalized.slice(0, -2);
+  return normalized;
+}
 
 /** One bounded, sanitized event for the selected-agent detail view. */
 export type SubagentDetailEntry =
@@ -65,7 +75,7 @@ export type SubagentDetailEntry =
 export interface ProgressSnapshot {
   /** Recent activity lines, oldest -> newest; bounded in count and line length. */
   tail: string[];
-  /** What the subagent is doing right now (current tool / retry wait / thinking). */
+  /** Compact legacy progress state (tool / retry wait / thinking). */
   activity: string;
   /**
    * Usage accumulated across this dispatch's turns so far. ABSENT until the
@@ -657,7 +667,7 @@ function sameLiveActivity(a: SubagentLiveActivity | undefined, b: SubagentLiveAc
 
 /**
  * Folds a subagent's event stream into independent legacy progress, structured
- * detail, and current live-activity projections. Pure and deterministic: no
+ * detail, and live-panel display projections. Pure and deterministic: no
  * timers or I/O. `consume()` reports only legacy {@link ProgressSnapshot}
  * changes; callers read the other two change signals separately.
  */
@@ -668,6 +678,7 @@ export class SubagentProgressCondenser {
   private detailChangedOnLastConsume = false;
   private liveActivityChangedOnLastConsume = false;
   private currentLiveActivity: SubagentLiveActivity | undefined;
+  private rememberedMeaningfulActivity: SubagentLiveActivity | undefined;
   private streamedLine = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
   private streamedKind: "reasoning" | "assistant" | undefined;
   private untrackedToolActivity = false;
@@ -705,7 +716,7 @@ export class SubagentProgressCondenser {
       case "turn_start":
         this.activity = "thinking…";
         this.resetStream();
-        this.setLiveActivity({ kind: "status", text: "Thinking…" });
+        this.setSyntheticThinkingActivity();
         break;
       case "auto_retry_start": {
         // Backoff is otherwise silent, so retain a visible, provider-detail-free wait state.
@@ -802,7 +813,7 @@ export class SubagentProgressCondenser {
         } else if (preview.detail) {
           this.setLiveActivity({ kind: "output", text: preview.detail });
         } else {
-          this.setLiveActivity({ kind: "status", text: "Working…" });
+          this.setLiveActivity({ kind: "status", text: "Working…" }, false);
         }
         break;
       }
@@ -846,7 +857,8 @@ export class SubagentProgressCondenser {
         // can no longer denote running tools.
         this.activeTools.clear();
         this.untrackedToolActivity = false;
-        this.setLiveActivity({ kind: "status", text: "Working…" });
+        if (detailText) this.rememberMeaningfulActivity({ kind: "assistant", text: detailText });
+        this.setLiveActivity({ kind: "status", text: "Working…" }, false);
         break;
       }
       default:
@@ -873,7 +885,7 @@ export class SubagentProgressCondenser {
     return this.detailChangedOnLastConsume;
   }
 
-  /** Current bounded live activity, copied so callers cannot mutate condenser state. */
+  /** Bounded live-panel display payload, copied so callers cannot mutate condenser state. */
   liveActivity(): SubagentLiveActivity | undefined {
     return copiedLiveActivity(this.currentLiveActivity);
   }
@@ -883,7 +895,7 @@ export class SubagentProgressCondenser {
     return this.liveActivityChangedOnLastConsume;
   }
 
-  private setLiveActivity(value: SubagentLiveActivity): void {
+  private sanitizedLiveActivity(value: SubagentLiveActivity): SubagentLiveActivity | undefined {
     const sanitized = value.kind === "tool"
       ? {
           kind: "tool" as const,
@@ -891,10 +903,38 @@ export class SubagentProgressCondenser {
           ...(value.detail ? { detail: sanitizeDetailScalar(value.detail) } : {}),
         }
       : { kind: value.kind, text: sanitizeDetailScalar(value.text) };
-    if (!sanitized.kind || (sanitized.kind !== "tool" && !sanitized.text)) return;
+    return sanitized.kind === "tool" || sanitized.text ? sanitized : undefined;
+  }
+
+  private rememberMeaningfulActivity(value: SubagentLiveActivity): void {
+    const sanitized = this.sanitizedLiveActivity(value);
+    if (sanitized) this.rememberedMeaningfulActivity = copiedLiveActivity(sanitized);
+  }
+
+  private setLiveActivity(value: SubagentLiveActivity, meaningful = true): void {
+    const sanitized = this.sanitizedLiveActivity(value);
+    if (!sanitized) return;
+    if (meaningful) this.rememberedMeaningfulActivity = copiedLiveActivity(sanitized);
     if (sameLiveActivity(this.currentLiveActivity, sanitized)) return;
     this.currentLiveActivity = sanitized;
     this.liveActivityChangedOnLastConsume = true;
+  }
+
+  private setSyntheticThinkingActivity(): void {
+    const remembered = this.rememberedMeaningfulActivity;
+    if (!remembered) {
+      this.setLiveActivity({ kind: "status", text: "Thinking…" }, false);
+      return;
+    }
+    const suffix = " · Thinking…";
+    const prefix = sanitizeDetailScalar(
+      subagentLiveActivityText(remembered),
+      DETAIL_FIELD_MAX_LENGTH - suffix.length,
+    );
+    this.setLiveActivity(
+      { kind: "status", text: prefix ? `${prefix}${suffix}` : "Thinking…" },
+      false,
+    );
   }
 
   private resetStream(): void {
@@ -925,7 +965,7 @@ export class SubagentProgressCondenser {
       // Pi represents redaction as an ordinary thinking event whose indexed block
       // contains a placeholder. Replace prior reasoning rather than exposing either.
       this.resetStream();
-      this.setLiveActivity({ kind: "status", text: "Working…" });
+      this.setLiveActivity({ kind: "status", text: "Working…" }, false);
       return;
     }
 
@@ -1028,7 +1068,7 @@ export class SubagentProgressCondenser {
 /**
  * Flatten a snapshot into display text for the Agent tool's `onUpdate` content
  * (what the interactive fallback and print/RPC modes show): the rolling tail
- * followed by the current-activity line.
+ * followed by the compact legacy activity line.
  */
 export function renderProgressText(snapshot: ProgressSnapshot): string {
   const lines = [...snapshot.tail];
@@ -1038,7 +1078,7 @@ export function renderProgressText(snapshot: ProgressSnapshot): string {
 
 /**
  * A single-line activity label for a background task's last-activity field: the
- * current activity, else the newest tail line, else empty. Pure — reads only
+ * compact legacy activity, else the newest tail line, else empty. Pure — reads only
  * `snapshot.activity`/`tail`, no `pi-tui`. Shared by `noteProgress`
  * (background-tasks.ts) to derive the model-facing `lastActivity`/poll string.
  */

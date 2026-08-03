@@ -193,7 +193,7 @@ export interface SubagentRegistryRecord {
    * `progress.usage` is the live accumulation; settlement-time `usage` wins.
    */
   progress?: ProgressSnapshot;
-  /** Independent bounded current activity for live panel presentation. */
+  /** Independent bounded live-panel payload; may include a display-only thinking handoff. */
   liveActivity?: SubagentLiveActivity;
   /**
    * Structured, typed live detail events for the selected-agent view. Entries

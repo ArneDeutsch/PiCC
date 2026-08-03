@@ -818,11 +818,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   const duplicatedPanelMechanics = [
-    /\binline[- ](?:current[- ])?activity(?: fragment)?\b|\bcurrent[- ]activity fragment[^.]{0,60}\binline\b/iu,
+    /\binline[- ](?:live[- ])?activity(?: payload)?\b|\blive[- ]activity payload[^.]{0,60}\binline\b/iu,
     /\b(?:one|single) physical (?:status )?row\b|\bone[- ]row (?:status )?layout\b/iu,
-    /\bbounded (?:sanitized )?current[- ]activity(?: fragment)?\b/iu,
-    /(?=[^.]{0,160}(?:current[- ]activity|activity fragment))(?=[^.]{0,160}(?:responsiv(?:e|ely)|(?:row )?(?:space|width) (?:changes|narrows)))(?=[^.]{0,160}(?:shorten(?:ed|ing|s)?|truncat(?:e|ed|es|ion)|disappear(?:s|ance)?|om(?:it(?:ted|s)?|ission)))[^.]{1,160}/iu,
-    /(?=[^.]{0,140}\bterminal (?:status )?rows?\b)(?=[^.]{0,140}(?:current[- ]activity|activity fragment))(?=[^.]{0,140}\b(?:omit(?:ted|s)?|omission)\b)[^.]{1,140}/iu,
+    /\bbounded (?:sanitized )?live[- ]activity(?: payload)?\b/iu,
+    /(?=[^.]{0,160}(?:live[- ]activity|activity payload))(?=[^.]{0,160}(?:responsiv(?:e|ely)|(?:row )?(?:space|width) (?:changes|narrows)))(?=[^.]{0,160}(?:shorten(?:ed|ing|s)?|truncat(?:e|ed|es|ion)|disappear(?:s|ance)?|om(?:it(?:ted|s)?|ission)))[^.]{1,160}/iu,
+    /(?=[^.]{0,140}\bterminal (?:status )?rows?\b)(?=[^.]{0,140}(?:live[- ]activity|activity payload))(?=[^.]{0,140}\b(?:omit(?:ted|s)?|omission)\b)[^.]{1,140}/iu,
     /\bbounded (?:agent )?window\b/iu,
     /(?:narrow widths?|widths? too narrow)[^.]{0,100}(?:truthful )?aggregates?\b/iu,
     /(?:drill-down|detail(?: view)?)[^.]{0,100}\bmultiline (?:activity )?history\b|\bmultiline (?:activity )?history[^.]{0,100}(?:drill-down|detail(?: view)?)/iu,
@@ -833,12 +833,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   }
 
   it.each([
-    ["inline/current-activity fragment", "The panel puts the current-activity fragment inline beside identity."],
+    ["inline/live-activity payload", "The panel puts the live-activity payload inline beside identity."],
     ["one physical row/one-row layout", "Each running agent uses a one-row status layout."],
-    ["bounded sanitized current activity", "Each row includes a bounded sanitized current activity fragment."],
-    ["responsive shortening with separator wording", "The current activity responsively shortens or is omitted with its separator."],
-    ["responsive disappearance without separator wording", "The activity fragment disappears responsively as row width narrows."],
-    ["terminal omission", "Terminal rows omit the current-activity fragment."],
+    ["bounded sanitized live activity", "Each row includes a bounded sanitized live-activity payload."],
+    ["responsive shortening with separator wording", "The live activity responsively shortens or is omitted with its separator."],
+    ["responsive disappearance without separator wording", "The activity payload disappears responsively as row width narrows."],
+    ["terminal omission", "Terminal rows omit the live-activity payload."],
     ["bounded windowing", "A bounded agent window remains navigable."],
     ["narrow aggregate fallback", "At narrow widths truthful aggregates replace individual rows."],
     ["multiline/detail history", "The detail view retains multiline activity history."],
@@ -851,7 +851,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const clause of [
       "inline layout is PiCC-defined presentation rather than verified Claude Code presentation parity",
       "every individually rendered running or capacity-waiting agent uses one physical status row",
-      "bounded sanitized current-activity fragment",
+      "bounded sanitized live-activity payload",
+      "With a valid theme, every dynamic payload is muted and italic",
+      "synthetic default `Thinking…` is displayed, it includes the remembered activity as `<activity> · Thinking…`; genuine activity replaces it immediately",
       "As available row space changes",
       "truncated with an ellipsis or omitted together with its separator",
       "terminal rows omit it",
@@ -990,7 +992,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /panel tree/,
         /parent's transcript/,
         /inline layout.*PiCC-defined presentation.*one physical status row/s,
-        /bounded sanitized current-activity fragment.*available row space.*truncated with an ellipsis.*omitted together with its separator/s,
+        /bounded sanitized live-activity payload.*valid theme.*muted and italic.*synthetic default `Thinking…` is displayed.*includes the remembered activity as `<activity> · Thinking…`.*genuine activity replaces it immediately.*available row space.*truncated with an ellipsis.*omitted together with its separator/s,
         /terminal rows omit.*bounded agent window.*overflow/s,
         /widths too narrow for individual rows.*truthful aggregates.*without per-agent activity/s,
         /drill-down.*retains multiline history and richer detail/,

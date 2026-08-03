@@ -325,11 +325,13 @@ Every subagent is visible, both to you and to the coordinating model:
   ownership admission fails, the dispatch runs in memory instead and is not resumable.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
   no `TaskOutput` await needed. Each individually rendered active agent uses one physical status row.
-  When row space permits, a muted separator precedes a bounded current-activity fragment after the
+  When row space permits, a muted separator precedes a bounded live-activity payload after the
   dispatch description, or after identity when there is no distinct description. In the normal theme,
-  the activity text is muted italic. As available row space changes, the fragment may be truncated
-  with an ellipsis or omitted together with its separator. It remains current throughout the active
-  state, while terminal rows omit it. The status bubble is `◌` while waiting for configured capacity,
+  the entire payload is muted italic. While synthetic default `Thinking…` is displayed, it includes
+  the remembered activity as `<activity> · Thinking…`; genuine activity replaces it immediately. As
+  available row space changes, the payload may be truncated with an ellipsis or omitted together with
+  its separator, while terminal rows omit it. The status bubble is `◌` while waiting for configured
+  capacity,
   a spinner while running, `●` when done, `✗` when failed, and `■` when stopped. Recognized `color:`
   frontmatter values tint the agent type; other values do not. State and identity take priority as
   width changes; the dispatch description appears when space permits, and elapsed time and token usage
