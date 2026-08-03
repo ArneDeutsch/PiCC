@@ -155,7 +155,7 @@ function writeLockedConsumerProject(directory: string, release: string): void {
     name: "picc-packaged-e2e-prefix",
     version: "1.0.0",
     private: true,
-    dependencies: { picc: tarballUrl },
+    dependencies: { "@arnedeutsch/picc": tarballUrl },
   };
   const packages: Record<string, Record<string, unknown>> = {
     "": {
@@ -175,7 +175,7 @@ function writeLockedConsumerProject(directory: string, release: string): void {
 
   const piccDescriptor = { ...rootDescriptor };
   delete piccDescriptor.devDependencies;
-  packages["node_modules/picc"] = {
+  packages["node_modules/@arnedeutsch/picc"] = {
     ...piccDescriptor,
     name: sourceManifest.name,
     version: sourceManifest.version,
@@ -209,7 +209,7 @@ beforeAll(() => {
     "--audit=false",
     "--fund=false",
   ], { cwd: prefix, stdio: "pipe", timeout: 300_000 });
-  packageRoot = path.join(prefix, "node_modules", "picc");
+  packageRoot = path.join(prefix, "node_modules", "@arnedeutsch", "picc");
   launcher = path.join(packageRoot, "bin", "picc.mjs");
 }, 450_000);
 
@@ -285,7 +285,7 @@ it(
     );
     expect(installedManifest.dependencies).not.toHaveProperty("jiti");
     expect(sourceManifest.devDependencies.jiti).toBe("2.7.0");
-    const installedNodeModules = path.dirname(packageRoot);
+    const installedNodeModules = path.dirname(path.dirname(packageRoot));
     expect(fs.existsSync(path.join(installedNodeModules, "tsx"))).toBe(false);
     expect(fs.existsSync(path.join(installedNodeModules, "esbuild"))).toBe(false);
 
@@ -396,7 +396,7 @@ describe("installed release tarball", () => {
         ),
       };
       expect(installedManifest).toMatchObject({
-        name: "picc",
+        name: "@arnedeutsch/picc",
         version: sourceManifest.version,
         bin: { picc: "bin/picc.mjs" },
       });

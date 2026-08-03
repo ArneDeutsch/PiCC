@@ -65,7 +65,7 @@ export async function packRelease({
   const root = canonicalPath(packageRoot);
   const admission = admissionVerifier({ packageRoot: root, event, tag });
   const manifest = admission.manifest;
-  if (manifest?.name !== "picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
+  if (manifest?.name !== "@arnedeutsch/picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
   const destination = emptyOutputDirectory(outputDir, root);
   build({ packageRoot: root });
   const runtime = runtimeVerifier({ packageRoot: root, checkSource: true });
@@ -78,10 +78,10 @@ export async function packRelease({
   let records;
   try { records = JSON.parse(result.stdout); } catch { throw new Error("npm pack returned malformed JSON"); }
   const record = Array.isArray(records) && records.length === 1 ? records[0] : undefined;
-  if (record?.name !== "picc" || record.version !== manifest.version ||
+  if (record?.name !== "@arnedeutsch/picc" || record.version !== manifest.version ||
       typeof record.filename !== "string" || path.basename(record.filename) !== record.filename ||
       !record.filename.endsWith(".tgz")) {
-    throw new Error("npm pack did not return one matching picc artifact");
+    throw new Error("npm pack did not return one matching @arnedeutsch/picc artifact");
   }
   const tarball = canonicalPath(path.join(destination, record.filename));
   if (!isPathInside(tarball, destination) || !fs.statSync(tarball).isFile()) throw new Error("npm pack artifact escaped its destination");
@@ -93,7 +93,7 @@ export async function packRelease({
     filePolicy: RELEASE_FILE_POLICY,
   });
   return {
-    name: "picc",
+    name: "@arnedeutsch/picc",
     version: manifest.version,
     tarball,
     sha256: sha256(tarball),

@@ -39,7 +39,7 @@ function hashFile(file: string): string {
 
 function writeFixture(): void {
   fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc runtime path with spaces "));
-  fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ name: "picc", version: "0.1.0", type: "module" }));
+  fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ name: "@arnedeutsch/picc", version: "0.1.1", type: "module" }));
   fs.writeFileSync(path.join(fixtureRoot, "package-lock.json"), '{"lockfileVersion":3}\n');
   fs.mkdirSync(path.join(fixtureRoot, "src", "nested"), { recursive: true });
   fs.writeFileSync(path.join(fixtureRoot, "src", "index.ts"), 'export default function mappedWitness(): never { throw new Error("mapped witness"); }\n');
@@ -171,7 +171,7 @@ describe("compiled runtime identity", () => {
   });
 
   it("pins independently serialized source and runtime digest known vectors", () => {
-    const packageIdentity = { name: "picc", version: "1.2.3", type: "module" };
+    const packageIdentity = { name: "@arnedeutsch/picc", version: "1.2.3", type: "module" };
     const compiler = {
       typescriptVersion: "7.0.2", configPath: "tsconfig.runtime.json", configSha256: "0".repeat(64),
       dependencyLockPath: "package-lock.json", dependencyLockSha256: "a".repeat(64),
@@ -181,7 +181,7 @@ describe("compiled runtime identity", () => {
       { path: "dist/index.js", sha256: "2".repeat(64) },
       { path: "picc/index.js", sha256: "3".repeat(64) },
     ];
-    expect(digest({ package: packageIdentity, compiler, sources })).toBe("d05b03b5f55a9154dc7cffa9dd7aebf78be42005ec2025d3e878955e990c8b4c");
+    expect(digest({ package: packageIdentity, compiler, sources })).toBe("eed003bd1c6c2ccd6695227e890208a2ec3c5268b08f0b96d4566fe6fd438464");
     expect(digest(files)).toBe("d67be9d39cd2b99f71eebb15b2c7e8cbec52eb714b171aba00ebf52a63774169");
   });
 

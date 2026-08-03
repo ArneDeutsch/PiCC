@@ -13,6 +13,7 @@ import {
   discoverNpmCommand,
   discoverTrustedGit,
   findPackageRoot,
+  isPathInside,
   parseStableExactVersion,
   resolvePiCli,
 } from "./picc-admin.mjs";
@@ -32,7 +33,7 @@ const SOURCE_NPM_COMMAND = "npm ci --ignore-scripts --no-audit --no-fund";
 function readManifest(root) {
   try {
     const value = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-    return value?.name === "picc" && parseStableExactVersion(value.version) ? value : undefined;
+    return value?.name === "@arnedeutsch/picc" && parseStableExactVersion(value.version) ? value : undefined;
   } catch { return undefined; }
 }
 
@@ -215,8 +216,8 @@ function installedFailure(product) {
   return reasons.join(" ");
 }
 
-async function handleGlobal({ action, root, manifest, output, runNpm, validateRuntime, validateSuite }) {
-  const latestResult = await runChild(runNpm, ["view", "picc", "version", "--json"], root);
+async function handleGlobal({ action, root, globalRoot, manifest, output, runNpm, validateRuntime, validateSuite }) {
+  const latestResult = await runChild(runNpm, ["view", "@arnedeutsch/picc", "version", "--json"], root);
   if (!latestResult.ok) {
     output.error(childReason("npm version check", latestResult));
     return 1;
@@ -242,11 +243,11 @@ async function handleGlobal({ action, root, manifest, output, runNpm, validateRu
   }
 
   const forceReplacement = !product.runtime.ok || !product.suite.ok;
-  const installArgs = ["install", "--global", ...(forceReplacement ? ["--force"] : []), "picc@latest", ...NPM_FLAGS];
-  const installed = await runChild(runNpm, installArgs, path.dirname(root));
+  const installArgs = ["install", "--global", ...(forceReplacement ? ["--force"] : []), "@arnedeutsch/picc@latest", ...NPM_FLAGS];
+  const installed = await runChild(runNpm, installArgs, globalRoot);
   if (!installed.ok) {
     output.error(childReason(forceReplacement ? "global npm repair" : "global npm update", installed));
-    output.error(`Retry \`npm install --global${forceReplacement ? " --force" : ""} picc@latest --ignore-scripts --no-audit --no-fund\` after correcting the npm error.`);
+    output.error(`Retry \`npm install --global${forceReplacement ? " --force" : ""} @arnedeutsch/picc@latest --ignore-scripts --no-audit --no-fund\` after correcting the npm error.`);
     return 1;
   }
 
@@ -257,7 +258,7 @@ async function handleGlobal({ action, root, manifest, output, runNpm, validateRu
       ? `Expected PiCC ${latest}; found ${nextManifest?.version ?? "unknown"}.`
       : installedFailure(nextProduct);
     output.error(`PiCC: npm completed but the installed product did not validate. ${detail}`);
-    output.error("Repair this global npm-owned copy with `npm install --global --force picc@latest --ignore-scripts --no-audit --no-fund`, then run `picc update --check`.");
+    output.error("Repair this global npm-owned copy with `npm install --global --force @arnedeutsch/picc@latest --ignore-scripts --no-audit --no-fund`, then run `picc update --check`.");
     return 1;
   }
   output.log(`${forceReplacement ? "Outcome: repaired" : "Outcome: updated"} PiCC ${latest} with a verified runtime (embedded Pi ${nextProduct.suite.version}).`);
@@ -283,12 +284,22 @@ export async function runUpdate(options = {}) {
     const buildRuntime = options.buildRuntime ?? defaultBuildRuntime;
     return handleSource({ action, root, output, runGit, runNpm, buildRuntime, validateRuntime, validateSuite });
   }
-  const globalRoot = options.globalRoot === undefined ? discoverGlobalNpmRoot() : options.globalRoot;
+  const discoveredGlobalRoot = options.globalRoot === undefined ? discoverGlobalNpmRoot() : options.globalRoot;
+  let globalRoot;
   let globalPackage;
-  try { globalPackage = globalRoot ? canonicalPath(path.join(globalRoot, "picc")) : undefined; }
-  catch { globalPackage = undefined; }
-  if (globalPackage === root) return handleGlobal({ action, root, manifest, output, runNpm, validateRuntime, validateSuite });
-  output.error("Outcome: this installed PiCC copy is owned by another package manager or project and was not modified. Update it through that owner; for the documented global npm install run `npm install --global picc@latest`.");
+  try {
+    globalRoot = discoveredGlobalRoot ? canonicalPath(discoveredGlobalRoot) : undefined;
+    const candidate = globalRoot ? path.join(globalRoot, "@arnedeutsch", "picc") : undefined;
+    globalPackage = candidate && fs.statSync(candidate).isDirectory() ? canonicalPath(candidate) : undefined;
+    if (globalPackage && !isPathInside(globalPackage, globalRoot)) globalPackage = undefined;
+  } catch {
+    globalRoot = undefined;
+    globalPackage = undefined;
+  }
+  if (globalRoot && globalPackage === root) {
+    return handleGlobal({ action, root, globalRoot, manifest, output, runNpm, validateRuntime, validateSuite });
+  }
+  output.error("Outcome: this installed PiCC copy is owned by another package manager or project and was not modified. Update it through that owner; for the documented global npm install run `npm install --global @arnedeutsch/picc@latest`.");
   return 1;
 }
 

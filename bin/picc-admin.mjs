@@ -50,7 +50,7 @@ export function isPathInside(candidate, parent) {
 export function findPackageRoot(moduleUrl = import.meta.url) {
   let current = path.dirname(fileURLToPath(moduleUrl));
   for (;;) {
-    if (readJson(path.join(current, "package.json"))?.name === "picc") return canonicalPath(current);
+    if (readJson(path.join(current, "package.json"))?.name === "@arnedeutsch/picc") return canonicalPath(current);
     const parent = path.dirname(current);
     if (parent === current) throw new Error("PiCC package root is unavailable");
     current = parent;

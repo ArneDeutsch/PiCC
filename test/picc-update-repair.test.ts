@@ -60,7 +60,7 @@ describe("global same-version runtime repair", () => {
     fs.mkdirSync(path.join(packageDirectory, "dist"), { recursive: true });
     fs.mkdirSync(archiveDirectory, { recursive: true });
     fs.writeFileSync(path.join(packageDirectory, "package.json"), JSON.stringify({
-      name: "picc",
+      name: "@arnedeutsch/picc",
       version: "1.2.3",
       type: "module",
       files: ["dist"],
@@ -76,13 +76,15 @@ describe("global same-version runtime repair", () => {
     };
     const packJson = runNpmSync(npm!, ["pack", "--ignore-scripts", "--json", "--pack-destination", archiveDirectory], packageDirectory, env);
     const packed = JSON.parse(packJson) as Array<{ filename: string }>;
+    expect(packed).toHaveLength(1);
+    expect(packed[0]!.filename).toBe("arnedeutsch-picc-1.2.3.tgz");
     const tarball = path.join(archiveDirectory, packed[0]!.filename);
     runNpmSync(npm!, [
       "install", "--global", tarball, "--prefix", prefix, "--offline",
       "--ignore-scripts", "--no-audit", "--no-fund",
     ], workspace, env);
     const globalRoot = runNpmSync(npm!, ["root", "--global", "--prefix", prefix], workspace, env);
-    const root = path.join(globalRoot, "picc");
+    const root = path.join(globalRoot, "@arnedeutsch", "picc");
     const runtime = path.join(root, "dist", "runtime.js");
     expect(fs.readFileSync(runtime, "utf8")).toBe("verified-runtime\n");
     fs.writeFileSync(runtime, "corrupted-runtime\n");
@@ -95,7 +97,7 @@ describe("global same-version runtime repair", () => {
       runNpm: (args: string[], options: { cwd: string }) => {
         observed.push(args);
         if (args[0] === "view") return fakeChild("\"1.2.3\"\n");
-        const localArgs = args.map((arg) => arg === "picc@latest" ? tarball : arg);
+        const localArgs = args.map((arg) => arg === "@arnedeutsch/picc@latest" ? tarball : arg);
         return spawn(npm!.command, [...npm!.args, ...localArgs, "--prefix", prefix, "--offline"], {
           cwd: options.cwd,
           env,
@@ -115,8 +117,8 @@ describe("global same-version runtime repair", () => {
     expect(errors).toEqual([]);
     expect(result).toBe(0);
     expect(observed).toEqual([
-      ["view", "picc", "version", "--json"],
-      ["install", "--global", "--force", "picc@latest", "--ignore-scripts", "--no-audit", "--no-fund"],
+      ["view", "@arnedeutsch/picc", "version", "--json"],
+      ["install", "--global", "--force", "@arnedeutsch/picc@latest", "--ignore-scripts", "--no-audit", "--no-fund"],
     ]);
     expect(fs.readFileSync(runtime, "utf8")).toBe("verified-runtime\n");
   });

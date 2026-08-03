@@ -32,7 +32,7 @@ export function readLocalPiccVersion(): string | undefined {
     const manifest = JSON.parse(
       fs.readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
     ) as { name?: unknown; version?: unknown };
-    return manifest.name === "picc" && parseStableVersion(manifest.version)
+    return manifest.name === "@arnedeutsch/picc" && parseStableVersion(manifest.version)
       ? manifest.version as string
       : undefined;
   } catch {

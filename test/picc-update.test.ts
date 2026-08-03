@@ -7,6 +7,7 @@ import picc from "../src/index.js";
 import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
+  readLocalPiccVersion,
   type PiccInstallKind,
 } from "../src/runtime/picc-update.js";
 import { fakePi } from "./helpers/fake-pi.js";
@@ -30,6 +31,10 @@ function directEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 describe("PiCC direct launch context", () => {
+  it("resolves the scoped repository package version", () => {
+    expect(readLocalPiccVersion()).toBe("0.1.1");
+  });
+
   it("accepts only the complete agreeing tuple and deletes PICC_* immediately", () => {
     const env = directEnv();
     const context = capturePiccLaunchContext({ env, parentPid: 41, localVersion: "1.2.3" });
@@ -118,7 +123,7 @@ describe("extension command boundary", () => {
       process.env.PICC_CLAUDE_USER_DIR = userDir;
       process.env.PICC_LAUNCHER_PID = String(process.ppid);
       process.env.PICC_INSTALL_KIND = "source";
-      process.env.PICC_VERSION = "0.1.0";
+      process.env.PICC_VERSION = "0.1.1";
       process.env.PI_SKIP_VERSION_CHECK = "1";
       const pi = fakePi();
       picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
@@ -162,7 +167,7 @@ describe("extension command boundary", () => {
       process.chdir(root);
       Object.assign(process.env, directEnv({
         PICC_LAUNCHER_PID: String(process.ppid),
-        PICC_VERSION: "0.1.0",
+        PICC_VERSION: "0.1.1",
       }));
       const pi = fakePi();
       picc(pi.api as never, {
@@ -216,7 +221,7 @@ describe("extension command boundary", () => {
       process.chdir(root);
       Object.assign(process.env, directEnv({
         PICC_LAUNCHER_PID: String(process.ppid),
-        PICC_VERSION: "0.1.0",
+        PICC_VERSION: "0.1.1",
       }));
       const pi = fakePi();
       picc(pi.api as never, {
@@ -245,7 +250,7 @@ describe("extension command boundary", () => {
       process.chdir(root);
       Object.assign(process.env, directEnv({
         PICC_LAUNCHER_PID: String(process.ppid),
-        PICC_VERSION: "0.1.0",
+        PICC_VERSION: "0.1.1",
       }));
       const pi = fakePi();
       picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });

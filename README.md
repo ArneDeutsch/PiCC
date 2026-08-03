@@ -23,7 +23,7 @@ PiCC requires Node.js 22.19 or newer, npm, and git. Windows also requires Git Ba
 Windows. Install the current release, then launch it from the Claude Code project you want to use:
 
 ```powershell
-npm install --global picc
+npm install --global @arnedeutsch/picc
 cd <path-to-your-claude-code-project>
 picc
 # /login  → connect ChatGPT Plus/Pro (one time)
@@ -31,8 +31,7 @@ picc
 # /doctor → review this project's compatibility findings
 ```
 
-If npm reports that no `picc` release is published yet, use the source checkout until the first
-release lands:
+If npm cannot resolve `@arnedeutsch/picc`, use the source checkout instead:
 
 ```powershell
 git clone https://github.com/ArneDeutsch/PiCC.git

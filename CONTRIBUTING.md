@@ -176,13 +176,13 @@ Claude Code project:
 
 ```bash
 gh release view "v$VERSION" --repo ArneDeutsch/PiCC --json url,tagName,targetCommitish,assets
-npm view "picc@$VERSION" version dist.tarball dist.integrity repository.url --json
+npm view "@arnedeutsch/picc@$VERSION" version dist.tarball dist.integrity repository.url --json
 cd /path/to/test-claude-code-project
-npx --yes "picc@$VERSION" --version
-npx --yes "picc@$VERSION"
+npx --yes "@arnedeutsch/picc@$VERSION" --version
+npx --yes "@arnedeutsch/picc@$VERSION"
 ```
 
-Require the GitHub Release to contain `picc-X.Y.Z.tgz`, npm metadata to identify the intended
+Require the GitHub Release to contain `arnedeutsch-picc-X.Y.Z.tgz`, npm metadata to identify the intended
 version and repository, and `picc --version` to report that version before checking normal startup.
 Open npm's provenance details and require the repository, release workflow, tag, commit, and package
 version to match.

@@ -58,7 +58,7 @@ function makePackage(options: {
   const piVersion = options.piVersion ?? "0.82.0";
   const dependencies = Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, piVersion]));
   write(path.join(root, "package.json"), JSON.stringify({
-    name: "picc", version: "0.1.0", type: "module", dependencies,
+    name: "@arnedeutsch/picc", version: "0.1.1", type: "module", dependencies,
   }));
   if (options.source ?? true) {
     fs.mkdirSync(path.join(root, ".git"), { recursive: true });
@@ -104,7 +104,7 @@ function installVerifiedRuntime(root: string, options: {
   for (const [relative, contentsValue] of contents) write(path.join(root, ...relative.split("/")), contentsValue);
 
   let identity = {
-    package: { name: "picc", version: "0.1.0", type: "module" },
+    package: { name: "@arnedeutsch/picc", version: "0.1.1", type: "module" },
     compiler: {
       typescriptVersion: "test", configPath: "tsconfig.runtime.json", configSha256: "0".repeat(64),
       dependencyLockPath: "package-lock.json", dependencyLockSha256: "0".repeat(64),
@@ -270,7 +270,7 @@ describe("direct Pi package validation", () => {
 
   it("admits npm-hoisted packages only from the node_modules physically containing PiCC", () => {
     const prefix = temp("picc-hoisted-");
-    const root = path.join(prefix, "node_modules", "picc");
+    const root = path.join(prefix, "node_modules", "@arnedeutsch", "picc");
     makePackage({ root, source: false, withCli: false });
     fs.rmSync(path.join(root, "node_modules"), { recursive: true });
     for (const name of PI_SUITE_PACKAGES) {
@@ -283,7 +283,7 @@ describe("direct Pi package validation", () => {
 
   it("does not hide a broken nearer package behind a healthy hoisted copy", () => {
     const prefix = temp("picc-hoisted-shadow-");
-    const root = path.join(prefix, "node_modules", "picc");
+    const root = path.join(prefix, "node_modules", "@arnedeutsch", "picc");
     makePackage({ root, source: false, withCli: false });
     fs.rmSync(path.join(root, "node_modules"), { recursive: true });
     for (const name of PI_SUITE_PACKAGES) {
@@ -445,7 +445,7 @@ process.exit(23);
       };
       expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "--model", "openai/test"]);
       expect(launched).toMatchObject({
-        kind: installationKind, version: "0.1.0", cwd: root, nodeOptions: "--no-warnings",
+        kind: installationKind, version: "0.1.1", cwd: root, nodeOptions: "--no-warnings",
         sourceMapsEnabled: true, descendantStatus: 0, descendantNodeOptions: "--no-warnings",
       });
       expect(launched.parent).toMatch(/^[1-9]\d*$/);
@@ -456,7 +456,7 @@ process.exit(23);
         cwd: root, encoding: "utf8",
       });
       expect(version).toMatchObject({ status: 0, stderr: "" });
-      expect(version.stdout).toBe(`PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall ${installationKind}\nRuntime compiled (verified)\n`);
+      expect(version.stdout).toBe(`PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall ${installationKind}\nRuntime compiled (verified)\n`);
     }
   });
 
@@ -595,7 +595,7 @@ process.exit(23);
         argv: ["--version"],
         expected: {
           status: 0,
-          stdout: "PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\nRuntime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+          stdout: "PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall source\nRuntime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
           stderr: "",
         },
       },
@@ -681,7 +681,7 @@ process.exit(23);
     });
 
     const prefix = temp("picc-plugin-loader-");
-    const root = path.join(prefix, "node_modules", "picc");
+    const root = path.join(prefix, "node_modules", "@arnedeutsch", "picc");
     makePackage({ root, source: true, withCli: false });
     installLauncher(root);
     const manifestPath = path.join(root, "package.json");
@@ -1024,7 +1024,7 @@ require("node:module").syncBuiltinESMExports();
       cwd: root, encoding: "utf8",
     });
     expect(version).toMatchObject({ status: 0, stderr: "" });
-    expect(version.stdout).toBe("PiCC 0.1.0\nEmbedded Pi 0.82.0\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n");
+    expect(version.stdout).toBe("PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n");
 
     const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
       cwd: root, encoding: "utf8",
