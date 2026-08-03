@@ -19,31 +19,30 @@ the model provider. PiCC adds the Claude Code compatibility layer on top.
 
 ## Quick start
 
-Install and link a source checkout with one setup command:
+PiCC requires Node.js 22.19 or newer, npm, and git. Windows also requires Git Bash from Git for
+Windows. Install the current release, then launch it from the Claude Code project you want to use:
+
+```powershell
+npm install --global picc
+cd <path-to-your-claude-code-project>
+picc
+# /login  → connect ChatGPT Plus/Pro (one time)
+# /model  → pick a GPT/Codex model
+# /doctor → review this project's compatibility findings
+```
+
+If npm reports that no `picc` release is published yet, use the source checkout until the first
+release lands:
 
 ```powershell
 git clone https://github.com/ArneDeutsch/PiCC.git
 cd PiCC
 npm run setup
-
-cd <path-to-your-claude-code-project>
-picc
-# /login  → ChatGPT Plus/Pro (Codex subscription)   (one-time)
-# /model  → pick a GPT model
-# /doctor → review this project's compatibility findings
-# work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
 
-`npm run setup` installs the locked dependencies, builds and verifies the runtime for this
-checkout, then globally links it. It requires a writable npm global prefix; the user guide gives a
-no-global-link alternative. Windows notes: Git Bash (from Git for Windows) must be installed; if
-PowerShell blocks the `picc` script shim, use `picc.cmd` or
-`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Details per shell/OS in the guide.
-
-Once published, `npm install --global picc` gives you the same `picc` command without a source
-checkout. Published installations run verified JavaScript and fail with owner-aware repair guidance
-instead of falling back to TypeScript. Source checkouts retain an explicit development fallback;
-see [Install and runtime selection](doc/user-guide.md#2-install).
+Then change to the target project and run `picc` as above. Installation variants, exact versions,
+Windows notes, authentication, and updates are in the [user guide](doc/user-guide.md#2-install).
+Release archives and notes are on [GitHub Releases](https://github.com/ArneDeutsch/PiCC/releases).
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·

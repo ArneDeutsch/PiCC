@@ -39,6 +39,39 @@ Nothing is written to your project's tracked files. For the full design see
 
 ## 2. Install
 
+### Published package
+
+Install the current npm release globally:
+
+```powershell
+npm install --global picc
+picc --version
+```
+
+To select an immutable published version, replace `X.Y.Z` with the required version:
+
+```powershell
+npm install --global picc@X.Y.Z
+picc --version
+```
+
+Each [GitHub Release](https://github.com/ArneDeutsch/PiCC/releases) also attaches
+`picc-X.Y.Z.tgz`. It is the same npm package archive, not a standalone executable. Download it,
+then give its local path to npm:
+
+```powershell
+npm install --global ./picc-X.Y.Z.tgz
+picc --version
+```
+
+All three forms are npm-owned global installations. Running `picc update` on any of them moves that
+installation to the registry's current `latest`, including one originally selected by exact version
+or archive. To remain on a selected version, do not run that updater; reinstall
+`picc@X.Y.Z` or the chosen archive when repair is needed.
+
+If npm reports that no `picc` release is published yet, use the source-checkout path below until the
+first release lands.
+
 ### Source checkout with a global command
 
 These commands work in PowerShell, cmd, and POSIX shells:
@@ -63,14 +96,6 @@ On Windows:
 - **Git Bash must be installed** (it comes with Git for Windows). Pi's `bash` tool and most
   Claude Code projects' scripts assume bash; PiCC finds Git Bash automatically and never
   uses the WSL `bash.exe` stub in System32.
-
-### Published package
-
-Once PiCC is published, install the global command without a source checkout:
-
-```powershell
-npm install --global picc
-```
 
 ### No global link
 

@@ -1,9 +1,11 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 import YAML from "yaml";
 import { afterEach, describe, expect, it } from "vitest";
 import { packRelease } from "../scripts/pack-release.mjs";
@@ -230,7 +232,7 @@ describe("publish release", () => {
     }
     expect(call.args).toEqual([
       "publish", canonical(tarball), "--registry=https://registry.npmjs.org/",
-      "--access=public", "--ignore-scripts",
+      "--access=public", "--ignore-scripts", "--provenance",
     ]);
     expect(call.args.join(" ")).not.toContain("release-secret");
     expect(call.npmrc).toBe("//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}\n");
@@ -246,6 +248,28 @@ describe("publish release", () => {
     expect(inherited("npm_config_globalconfig")).toBe("C:/node/etc/npmrc");
     expect(call.options.env.NPM_TOKEN).toBeUndefined();
     expect(fs.existsSync(call.options.cwd)).toBe(false);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["empty", ""],
+  ])("refuses a %s token before invoking npm", async (_label, token) => {
+    const root = fixture();
+    const tarball = path.join(temp("picc-release-artifact-"), "picc.tgz");
+    fs.writeFileSync(tarball, "release");
+    const prior = process.env.NPM_TOKEN;
+    delete process.env.NPM_TOKEN;
+    let ran = false;
+    try {
+      await expect((publishRelease as any)({
+        packageRoot: root, tarball, expectedSha256: "0".repeat(64),
+        event: "tag", tag: "v1.2.3", token,
+        runNpm: (() => { ran = true; return childResult(); }) as never,
+      })).rejects.toThrow(/NPM_TOKEN is required/);
+    } finally {
+      if (prior === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = prior;
+    }
+    expect(ran).toBe(false);
   });
 
   it("refuses a bad hash before invoking npm", async () => {
@@ -281,6 +305,61 @@ describe("publish release", () => {
 });
 
 describe("release workflow", () => {
+  it.skipIf(process.platform !== "linux")("executes source admission against shallow local Git history", () => {
+    const remote = path.join(temp("picc-release-remote-"), "origin.git");
+    const source = temp("picc-release-git-source-");
+    execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+    execFileSync("git", ["init"], { cwd: source, stdio: "pipe" });
+    execFileSync("git", ["config", "user.name", "Release Test"], { cwd: source });
+    execFileSync("git", ["config", "user.email", "release@example.invalid"], { cwd: source });
+    fs.writeFileSync(path.join(source, "release.txt"), "ancestor\n");
+    execFileSync("git", ["add", "release.txt"], { cwd: source });
+    execFileSync("git", ["commit", "-m", "ancestor"], { cwd: source, stdio: "pipe" });
+    execFileSync("git", ["branch", "-M", "main"], { cwd: source });
+    execFileSync("git", ["branch", "ancestor"], { cwd: source });
+    const ancestor = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+    fs.appendFileSync(path.join(source, "release.txt"), "main\n");
+    execFileSync("git", ["commit", "-am", "main"], { cwd: source, stdio: "pipe" });
+    execFileSync("git", ["checkout", "-b", "divergent", ancestor], { cwd: source, stdio: "pipe" });
+    fs.writeFileSync(path.join(source, "divergent.txt"), "divergent\n");
+    execFileSync("git", ["add", "divergent.txt"], { cwd: source });
+    execFileSync("git", ["commit", "-m", "divergent"], { cwd: source, stdio: "pipe" });
+    const divergent = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: source });
+    execFileSync("git", ["push", "origin", "main", "ancestor", "divergent"], { cwd: source, stdio: "pipe" });
+
+    const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/release.yml"), "utf8")) as any;
+    const admission = workflow.jobs.package.steps.find(
+      (step: any) => step.name === "Verify tagged commit is contained in current main",
+    );
+    const remoteUrl = pathToFileURL(remote).href;
+    const localAdmission = admission.run.replace(
+      "https://github.com/ArneDeutsch/PiCC.git",
+      `'${remoteUrl}'`,
+    );
+    const execute = (branch: string, sha: string) => {
+      const checkout = path.join(temp(`picc-release-${branch}-`), "checkout");
+      execFileSync("git", ["clone", "--depth", "1", "--branch", branch, remoteUrl, checkout], { stdio: "pipe" });
+      expect(execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+        cwd: checkout, encoding: "utf8",
+      }).trim()).toBe("true");
+      const result = spawnSync("bash", ["-c", localAdmission], {
+        cwd: checkout,
+        env: { ...process.env, GITHUB_SHA: sha },
+        encoding: "utf8",
+      });
+      expect(execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+        cwd: checkout, encoding: "utf8",
+      }).trim()).toBe("false");
+      return result;
+    };
+
+    const admitted = execute("ancestor", ancestor);
+    expect(admitted.status, admitted.stderr).toBe(0);
+    const refused = execute("divergent", divergent);
+    expect(refused.status).not.toBe(0);
+  });
+
   it("packs once, hands the verified artifact to a protected publish job, and scopes the token", () => {
     const manifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as {
       scripts: Record<string, string>;
@@ -291,6 +370,12 @@ describe("release workflow", () => {
     expect(manifest.scripts.build).toBe("node scripts/build-runtime.mjs");
     expect(manifest.scripts.setup).toBe("npm ci && npm run build && npm link");
     const packageJson = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as any;
+    expect(packageJson.homepage).toBe("https://github.com/ArneDeutsch/PiCC#readme");
+    expect(packageJson.repository).toEqual({
+      type: "git",
+      url: "git+https://github.com/ArneDeutsch/PiCC.git",
+    });
+    expect(packageJson.bugs).toEqual({ url: "https://github.com/ArneDeutsch/PiCC/issues" });
     expect(packageJson.files).toEqual([
       "dist", "src", "picc/index.js", "picc/index.ts", "bin", "examples", "doc/*.md",
       "CONTRIBUTING.md", "LICENSE", "README.md",
@@ -321,10 +406,25 @@ describe("release workflow", () => {
     expect(Object.keys(workflow.jobs)).toEqual(["package", "publish"]);
     const packageJob = workflow.jobs.package;
     const publishJob = workflow.jobs.publish;
+    expect(packageJob.if).toBeUndefined();
+    expect(packageJob.environment).toBeUndefined();
     const packageSteps = packageJob.steps as any[];
     const publishSteps = publishJob.steps as any[];
     const allSteps = [...packageSteps, ...publishSteps];
     const runs = allSteps.map((step) => step.run ?? "");
+    const checkout = packageSteps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+    const sourceAdmission = packageSteps.find((step) => step.name === "Verify tagged commit is contained in current main");
+    const install = packageSteps.find((step) => step.name === "Install dependencies");
+    expect(checkout.with["persist-credentials"]).toBe(false);
+    expect(sourceAdmission.if).toBe("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}");
+    expect(sourceAdmission.run).toContain("http.https://github.com/.extraheader=");
+    expect(sourceAdmission.run).toContain("https://github.com/ArneDeutsch/PiCC.git");
+    expect(sourceAdmission.run).toContain("+refs/heads/main:refs/remotes/origin/main");
+    expect(sourceAdmission.run).toContain('tag_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"');
+    expect(sourceAdmission.run).toContain('git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main');
+    expect(packageSteps.indexOf(checkout)).toBeLessThan(packageSteps.indexOf(sourceAdmission));
+    expect(packageSteps.indexOf(sourceAdmission)).toBeLessThan(packageSteps.indexOf(install));
+    expect(sourceAdmission["continue-on-error"]).toBeUndefined();
     expect(packageSteps.find((step) => step.name === "Verify build-free source lanes")?.run)
       .toBe("npm run typecheck:all && npm run test:unit && npm run test:integration");
     expect(packageSteps.find((step) => step.name === "Test exact packaged product")?.run)
@@ -356,6 +456,7 @@ describe("release workflow", () => {
     expect(expressionExpandedSource).toBe(shellSource);
     expect(shellSource).not.toContain("event-injected");
     expect(shellSource).not.toContain("tag-injected");
+    expect(packageSteps.indexOf(sourceAdmission)).toBeLessThan(packageSteps.indexOf(pack));
     expect(packageSteps.indexOf(pack)).toBeLessThan(packageSteps.indexOf(inspect));
     expect(runs.filter((run) => /npm run build|build-runtime\.mjs/u.test(run))).toHaveLength(0);
     expect(publishSteps.map((step) => step.run ?? "").join("\n")).not.toMatch(/npm run build|pack-release\.mjs/u);
@@ -376,11 +477,11 @@ describe("release workflow", () => {
     expect(upload.uses).toMatch(/^actions\/upload-artifact@[a-f0-9]{40}$/);
     expect(download.uses).toMatch(/^actions\/download-artifact@[a-f0-9]{40}$/);
     expect(download.with.name).toBe(upload.with.name);
-    expect(publishJob.if).toContain("github.event_name == 'push'");
-    expect(publishJob.if).toContain("startsWith(github.ref, 'refs/tags/')");
+    expect(publishJob.if).toBe("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}");
     expect(publishJob.needs).toBe("package");
     expect(publishJob.environment).toEqual({ name: "npm-publish" });
-    expect(publishJob.permissions).toEqual({ contents: "write" });
+    expect(publishJob.permissions).toEqual({ contents: "write", "id-token": "write" });
+    expect(JSON.stringify(packageJob)).not.toContain("id-token");
     expect(publishJob.env.RELEASE_FILENAME).toBe("${{ needs.package.outputs.filename }}");
     expect(publishJob.env.RELEASE_SHA256).toBe("${{ needs.package.outputs.sha256 }}");
     expect(JSON.stringify(publishJob.env)).not.toContain("runner.");
@@ -393,8 +494,15 @@ describe("release workflow", () => {
     expect(recheck.run).toContain("$RELEASE_SHA256");
     expect(release.with.files).toContain("${{ runner.temp }}");
     expect(release.with.files).toContain("${{ needs.package.outputs.filename }}");
-    expect(publish.run).toContain("$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME");
-    expect(publish.run).toContain("$RELEASE_SHA256");
+    const normalizedPublish = publish.run.replace(/\s+/gu, " ").trim();
+    expect(normalizedPublish).toBe(
+      "node scripts/publish-release.mjs "
+      + "--tarball \"$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME\" "
+      + "--expected-sha256 \"$RELEASE_SHA256\" --event tag --tag \"$GITHUB_REF_NAME\"",
+    );
+    expect(normalizedPublish).not.toMatch(/(?:&&|\|\||[;|])/u);
+    expect(publish.if).toBeUndefined();
+    expect(publish["continue-on-error"]).toBeUndefined();
     expect(publishSteps.at(-1)).toBe(publish);
     expect(publish.env).toEqual({ NPM_TOKEN: "${{ secrets.NPM_TOKEN }}" });
     expect(JSON.stringify(allSteps.filter((step) => step !== publish))).not.toContain("NPM_TOKEN");
