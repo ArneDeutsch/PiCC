@@ -406,6 +406,8 @@ describe("release workflow", () => {
     expect(Object.keys(workflow.jobs)).toEqual(["package", "publish"]);
     const packageJob = workflow.jobs.package;
     const publishJob = workflow.jobs.publish;
+    expect(packageJob.if).toBeUndefined();
+    expect(packageJob.environment).toBeUndefined();
     const packageSteps = packageJob.steps as any[];
     const publishSteps = publishJob.steps as any[];
     const allSteps = [...packageSteps, ...publishSteps];
@@ -475,8 +477,7 @@ describe("release workflow", () => {
     expect(upload.uses).toMatch(/^actions\/upload-artifact@[a-f0-9]{40}$/);
     expect(download.uses).toMatch(/^actions\/download-artifact@[a-f0-9]{40}$/);
     expect(download.with.name).toBe(upload.with.name);
-    expect(publishJob.if).toContain("github.event_name == 'push'");
-    expect(publishJob.if).toContain("startsWith(github.ref, 'refs/tags/')");
+    expect(publishJob.if).toBe("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}");
     expect(publishJob.needs).toBe("package");
     expect(publishJob.environment).toEqual({ name: "npm-publish" });
     expect(publishJob.permissions).toEqual({ contents: "write", "id-token": "write" });
