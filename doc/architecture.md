@@ -289,6 +289,16 @@ where to start reading, not the extent of its cluster.
   `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
   registry).
 
+  `subagent-transcript-retention.ts` owns bounded cleanup of persisted child collections.
+  Activation starts detached orphan-worktree reaping; only the startup `session_start` may run the
+  transcript reaper, once. Every `session_start` immediately touches the current persisted main
+  transcript and replaces its hourly heartbeat; replacement starts do not rerun transcript cleanup.
+  A fresh verified parent retains its whole collection; a stale verified parent admits recognized
+  children only with no conflicting ownership marker, while parentless cleanup requires the
+  collection's matching PiCC ownership marker. The startup collection is excluded exactly.
+  Malformed, unreadable, or mismatched ownership evidence, changed authority, and I/O failures
+  preserve data and flow to one bounded notice rather than blocking startup.
+
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
   `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with shared width/theme helpers in
   `render-util.ts` and validated agent presentation colors in `agent-color.ts`) — the

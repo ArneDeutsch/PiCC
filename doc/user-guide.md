@@ -291,24 +291,29 @@ targets, while terminal record expansion carries the operational IDs.
 
 Every subagent is visible, both to you and to the coordinating model:
 
-- **Transcript on disk.** Each dispatch leaves a JSONL transcript under
-  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` in Pi's sessions dir
-  (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
-  full record without guessing. These files are not reaped automatically.
+- **Transcript storage.** When persistence is available, a dispatch writes
+  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` beside its main-session transcript in
+  Pi's manager-supplied session directory. The default tree is
+  `$HOME/.pi/agent/sessions/<encoded-cwd>/…` on POSIX and
+  `%USERPROFILE%\.pi\agent\sessions\<encoded-cwd>\…` on Windows, where Pi derives `<encoded-cwd>`
+  from the absolute cwd; the host/session manager supplies a custom replacement directory when
+  configured. The agent id in the dispatch result identifies its file. If the main transcript or Pi
+  persistence API is unavailable, or persistence creation or
+  ownership admission fails, the dispatch runs in memory instead and is not resumable.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. In row mode, each individually rendered active agent has an indented
-  status row and a stable second line for its current tool and primary argument, reasoning, assistant
-  or output text, or startup, work, retry, and capacity-waiting status. The second line updates in
-  place and disappears only when the agent completes, fails, stops, or is canceled. The status bubble is `◌`
-  while waiting for configured capacity, a spinner while running, `●` when done, `✗` when failed,
-  and `■` when stopped. Recognized `color:` frontmatter values tint the agent type; other values do
-  not. State and identity take priority as width narrows; the dispatch description appears when
-  space permits, and elapsed time and token usage appear only when known and terminal width permits.
-  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
-  time. The panel window contains at most eight agents, not eight physical lines; overflow markers
-  and `↑↓` navigation move it through the full tree. Below the minimum useful identity-row width,
-  per-agent rows and their activity lines become aggregate state glyphs. Finished rows
-  linger briefly — ~10 s
+  no `TaskOutput` await needed. Each individually rendered active agent uses one physical status row.
+  When row space permits, a muted separator precedes a bounded current-activity fragment after the
+  dispatch description, or after identity when there is no distinct description. In the normal theme,
+  the activity text is muted italic. As available row space changes, the fragment may be truncated
+  with an ellipsis or omitted together with its separator. It remains current throughout the active
+  state, while terminal rows omit it. The status bubble is `◌` while waiting for configured capacity,
+  a spinner while running, `●` when done, `✗` when failed, and `■` when stopped. Recognized `color:`
+  frontmatter values tint the agent type; other values do not. State and identity take priority as
+  width changes; the dispatch description appears when space permits, and elapsed time and token usage
+  appear only when known and terminal width permits. Elapsed time runs from dispatch acceptance until
+  completion or stop, so it includes any queue time. A bounded panel window uses overflow markers and
+  `↑↓` navigation to move through the full tree. At widths too narrow for individual rows, the panel
+  retains aggregate state glyphs without per-agent activity. Finished rows linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
@@ -334,10 +339,9 @@ Every subagent is visible, both to you and to the coordinating model:
   text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
   admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
   line).
-- **Condensed transcript records.** Subagent output does not stream into the chat. The agent list
-  owns one bounded current-activity line; selected-agent detail owns multiline history and richer
-  live detail. Each depth-1 normal-path result replaces its pending call in the same
-  tool row. A successful background acceptance is transient in human chat rather than a durable row;
+- **Condensed transcript records.** Subagent output does not stream into the chat. Each depth-1
+  normal-path result replaces its pending call in the same tool row. A successful background
+  acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That bounded record prioritizes the
   outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an
@@ -363,6 +367,41 @@ Every subagent is visible, both to you and to the coordinating model:
   agent refuses resume and steering permanently.
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
   interactive TUI.
+
+### Transcript and worktree retention (`cleanupPeriodDays`)
+
+`cleanupPeriodDays` is a top-level setting shared by persisted subagent transcripts and orphaned
+worktrees. It defaults to 30 and accepts only a literal integer of at least 1. A fresh verified
+main-session transcript retains its complete child collection; once that parent is older than the
+effective period, recognized children are eligible only when no ownership marker conflicts with the
+parent. An absent marker does not conflict in this parent-backed legacy case; an unreadable,
+malformed, or mismatched marker preserves the collection. If the parent is gone, PiCC ages
+recognized files individually only when the collection has PiCC's matching ownership marker,
+retaining fresh files and removing an empty collection. An unreadable, malformed, or mismatched
+parent also preserves the collection, as do markerless legacy orphans. When ownership is ambiguous,
+PiCC leaves existing transcript data untouched. Preserve or back up that data, and never edit or
+delete an ownership marker by hand. Start a new main session for future persisted subagents and
+review the old data separately; the new session does not clean the old data.
+
+For transcripts, PiCC scans only the default or custom session directory supplied by the active Pi
+session manager; it never crawls global Pi data. Orphan-worktree cleanup separately scans the
+project-owned `.claude/worktrees` directory. The exact startup session's collection is excluded. At
+session activation PiCC refreshes an existing main transcript's modification time, then does so
+approximately hourly without creating the file or changing transcript content. This reduces
+concurrent-process races, but is best-effort protection, not a lock or a deletion-time guarantee.
+
+Destructive cleanup is skipped if any applicable settings source is unreadable, malformed, not a
+settings object, or contains an invalid `cleanupPeriodDays`; unrelated settings warnings do not
+block it. Cleanup runs asynchronously and best-effort around startup, so missing, changed, locked,
+or inaccessible files do not prevent the session from becoming usable. A clean no-op is silent;
+removals, blocked policy, or problems produce one bounded TUI notification in TUI mode or one
+`PiCC:` line on stderr otherwise. The same 30-day default gives orphaned worktrees a grace period
+when no value is configured. `/doctor` reports the effective period and whether settings admit
+cleanup, not per-run cleanup details or absolute session-directory paths.
+
+PiCC does not remove main-session transcripts, unfamiliar files, markerless legacy orphans, or data
+outside these PiCC-owned child collections and orphaned worktrees. Eligibility is not immediate or
+secure erasure, and this policy is not global Pi or Claude Code application-data cleanup.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
@@ -631,8 +670,15 @@ operation with `CLAUDE_CONFIG_DIR` pointing to the same directory; otherwise Cla
 a different profile.
 
 For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
-select the same record. A verified linked worktree also considers its main checkout identity. This
-is a conservative PiCC identity policy, not a claim about Claude Code's exact canonicalization.
+select the same project. A verified linked worktree also considers its main checkout identity.
+Multiple canonical aliases, including Windows drive-letter case variants, require no profile repair
+when their complete bounded MCP projections agree under PiCC's conservative comparison. Raw MCP
+server blocks are compared structurally, while runtime-control lists are validated and deduplicated
+as name sets; explicit `enabledMcpServers` presence remains significant even for an empty list.
+Conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes remain
+unusable and fail all MCP loading closed.
+This is a conservative PiCC identity and conflict policy, not a claim about Claude Code's exact
+behavior for canonical-equivalent records.
 
 Without standalone exclusive control, a missing native state file preserves `.mcp.json` and
 settings-extension sources. If the file is present but unusable (for example, malformed or

@@ -189,7 +189,7 @@ function expiryOf(
   return endpoint + linger;
 }
 
-/** Stable active-line activity, with capacity waiting authoritative over captured runtime state. */
+/** Stable active-state activity, with capacity waiting authoritative over captured runtime state. */
 function activityOf(record: SubagentRegistryRecord, state: PanelRowState): SubagentLiveActivity | undefined {
   if (state === "waiting") return { kind: "status", text: "Waiting for capacity" };
   if (state !== "running") return undefined;
@@ -209,7 +209,7 @@ function activityOf(record: SubagentRegistryRecord, state: PanelRowState): Subag
       return { kind: activity.kind, text: activity.text };
     }
   } catch {
-    // Compatibility records may expose malformed activity; the stable line still gets a fallback.
+    // Compatibility records may expose malformed activity; the active presentation still gets a fallback.
   }
   return { kind: "status", text: record.progress === undefined ? "Starting agent…" : "Working…" };
 }

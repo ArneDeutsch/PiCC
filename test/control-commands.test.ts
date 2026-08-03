@@ -1237,7 +1237,7 @@ describe("plugin startup warning wiring", () => {
     const tui = await freshControlPi(undefined, missingSetup);
     const headless = await freshControlPi(undefined, missingSetup);
     const throwing = await freshControlPi(undefined, missingSetup);
-    let throwingNotifyCalls = 0;
+    let throwingPluginNotifyCalls = 0;
     const omitted = await freshControlPi(undefined, omissionSetup);
     const quiet = await freshControlPi();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1282,11 +1282,14 @@ describe("plugin startup warning wiring", () => {
       expect(stderr[0]).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
 
       const notificationFault = throwing.fresh.tuiCtx({
-        ui: { notify: () => { throwingNotifyCalls += 1; throw new Error("SECRET_NOTIFICATION_EXCEPTION_CANARY"); } },
+        ui: { notify: (text: string) => {
+          if (text.includes("needs attention")) throwingPluginNotifyCalls += 1;
+          throw new Error("SECRET_NOTIFICATION_EXCEPTION_CANARY");
+        } },
       });
       await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
       await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
-      expect(throwingNotifyCalls).toBe(1);
+      expect(throwingPluginNotifyCalls).toBe(1);
       expect(error.mock.calls.flat().join("\n")).not.toContain("SECRET_NOTIFICATION_EXCEPTION_CANARY");
 
       await quiet.fresh.fire("session_start", { reason: "startup" }, quiet.fresh.tuiCtx());

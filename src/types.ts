@@ -579,6 +579,13 @@ export interface PluginMarketplaceSettingsOmissions {
   declarations: number;
 }
 
+export const DEFAULT_CLEANUP_PERIOD_DAYS = 30;
+
+export interface RetentionCleanupBlocker {
+  reason: "unreadable-source" | "malformed-source" | "non-object-source" | "invalid-period";
+  source: string;
+}
+
 export interface ClaudeSettings {
   permissions: PermissionRules;
   hooks: HookConfig;
@@ -600,6 +607,10 @@ export interface ClaudeSettings {
   managedClaudeMd?: { content: string; source: string };
   worktree: WorktreeSettings;
   cleanupPeriodDays?: number;
+  /** False when retention-relevant source uncertainty or an invalid cleanup period makes deletion unsafe. */
+  retentionCleanupAllowed?: boolean;
+  /** Deduplicated structured reasons destructive retention housekeeping is blocked. */
+  retentionCleanupBlockers?: RetentionCleanupBlocker[];
   apiKeyHelper?: string;
   /** Subagent controls. */
   subagentsEnabled: boolean;

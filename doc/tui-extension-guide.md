@@ -322,9 +322,11 @@ Several dedicated hooks — all low-risk:
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
   true })`. **PiCC already does this** for subagent lifecycle status, ordinary API retries, and
   sanitized summary-retry activity (`src/runtime/subagent-progress.ts` → `subagent-render.ts`).
-  In row mode, each individually rendered active agent shows one bounded structured current-activity
-  line; the eight-agent window still counts agents, and the narrow aggregate has no per-agent line.
-  The selected-agent view owns long or multiline history and detail. Copy the pattern for any long tool.
+  Each individually rendered active agent shows one bounded structured current-activity fragment in
+  its single physical status row. Depending on available row space, that fragment can be ellipsized or
+  omitted with its separator. The bounded agent window and narrow aggregate remain distinct: windowing
+  limits visible agents, while widths too narrow for individual rows show no per-agent fragment. The
+  selected-agent view owns long or multiline history and detail. Copy the pattern for any long tool.
 - **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome"); the subagent
   status panel (`src/runtime/subagent-panel-widget.ts`) is the shipped example, including the
   interval-owned-by-the-component lifecycle.

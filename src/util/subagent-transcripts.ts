@@ -1,11 +1,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { Diagnostic } from "../types.js";
 
 /**
  * Subagent transcript location + agent-ID helpers.
  *
- * Every subagent dispatch persists its Pi session as one JSONL transcript,
+ * Every successfully persisted subagent dispatch stores its Pi session as one JSONL transcript,
  * discoverable from the MAIN session's transcript file (Claude parity analog:
  * `…/{sessionId}/subagents/agent-{id}.jsonl`):
  *
@@ -29,6 +30,221 @@ import path from "node:path";
  * simply cannot match. Pi's own `assertValidSessionId` re-validates on create.
  */
 const AGENT_ID_RE = /^agent-[0-9a-f]{12}$/;
+const SESSION_ID_SOURCE = "[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?";
+const SESSION_STAMP_SOURCE = "\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z";
+const SESSION_FILE_RE = new RegExp(`^(${SESSION_STAMP_SOURCE})_(${SESSION_ID_SOURCE})\\.jsonl$`);
+const CHILD_SESSION_FILE_RE = new RegExp(
+  `^(${SESSION_STAMP_SOURCE})_(agent-[0-9a-f]{12})\\.jsonl$`,
+);
+export const MAX_PI_SESSION_HEADER_BYTES = 16 * 1024;
+export const MAX_SUBAGENT_OWNERSHIP_MARKER_BYTES = 4096;
+
+/** Stable evidence file placed in newly admitted PiCC subagent collections. */
+export const SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER = ".picc-owner.json";
+export const SUBAGENT_TRANSCRIPT_OWNERSHIP_VERSION = 1;
+
+export interface SubagentTranscriptOwnership {
+  version: 1;
+  parentBasename: string;
+  cwdHash: string;
+}
+
+export interface PiSessionHeader {
+  id: string;
+  timestamp: string;
+  cwd: string;
+}
+
+export type PrepareSubagentTranscriptCollectionResult =
+  | { ok: true; directory: string }
+  | { ok: false; diagnostic: Diagnostic };
+
+export interface PrepareSubagentTranscriptCollectionFs {
+  realpath(file: string): string;
+  lstat(file: string): fs.Stats;
+  mkdir(directory: string): void;
+  open(file: string, flags: "r"): number;
+  read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
+  close(fd: number): void;
+  writeFile(file: string, data: string, options: { encoding: "utf8"; flag: "wx"; mode: number }): void;
+}
+
+const realPreparationFs: PrepareSubagentTranscriptCollectionFs = {
+  realpath: (file) => fs.realpathSync.native(file),
+  lstat: fs.lstatSync,
+  mkdir: (directory) => fs.mkdirSync(directory),
+  open: fs.openSync,
+  read: fs.readSync,
+  close: fs.closeSync,
+  writeFile: (file, data, options) => fs.writeFileSync(file, data, options),
+};
+
+function safeDiagnostic(message: string): Diagnostic {
+  return { severity: "warning", message };
+}
+
+export function parsePiSessionFilename(
+  basename: string,
+  childOnly = false,
+): { id: string; timestamp: string } | undefined {
+  const match = (childOnly ? CHILD_SESSION_FILE_RE : SESSION_FILE_RE).exec(basename);
+  if (!match) return undefined;
+  const timestamp = match[1]!.replace(
+    /^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+    "$1:$2:$3.$4Z",
+  );
+  if (!Number.isFinite(Date.parse(timestamp))) return undefined;
+  return { timestamp, id: match[2]! };
+}
+
+export function hashCanonicalPath(canonical: string): string {
+  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+export function canonicalCwdHash(
+  cwd: string,
+  realpath: (value: string) => string = fs.realpathSync.native,
+): string {
+  return hashCanonicalPath(realpath(cwd));
+}
+
+export function parsePiSessionHeader(value: unknown): PiSessionHeader | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const header = value as Record<string, unknown>;
+  if (
+    header.type !== "session" ||
+    typeof header.id !== "string" ||
+    typeof header.timestamp !== "string" ||
+    typeof header.cwd !== "string"
+  ) return undefined;
+  return { id: header.id, timestamp: header.timestamp, cwd: header.cwd };
+}
+
+export function parseSubagentOwnershipMarker(
+  value: unknown,
+  parentBasename: string,
+  cwdHash: string,
+): SubagentTranscriptOwnership | undefined {
+  return isMatchingOwnership(value, parentBasename, cwdHash) ? value : undefined;
+}
+
+export function readBoundedPiSessionHeader(
+  file: string,
+  read: (fd: number, buffer: Buffer, offset: number, length: number, position: number) => number =
+    fs.readSync,
+  open: (file: string, flags: "r") => number = fs.openSync,
+  close: (fd: number) => void = fs.closeSync,
+): PiSessionHeader | undefined {
+  let fd: number | undefined;
+  try {
+    fd = open(file, "r");
+    const buffer = Buffer.alloc(MAX_PI_SESSION_HEADER_BYTES + 1);
+    const count = read(fd, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, count).indexOf(0x0a);
+    if (newline < 0 || newline > MAX_PI_SESSION_HEADER_BYTES) return undefined;
+    return parsePiSessionHeader(JSON.parse(buffer.subarray(0, newline).toString("utf8")));
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { close(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
+export function subagentTranscriptOwnership(
+  parentBasename: string,
+  cwdHash: string,
+): SubagentTranscriptOwnership {
+  return {
+    version: SUBAGENT_TRANSCRIPT_OWNERSHIP_VERSION,
+    parentBasename,
+    cwdHash,
+  };
+}
+
+export function serializeSubagentTranscriptOwnership(
+  parentBasename: string,
+  cwdHash: string,
+): string {
+  return `${JSON.stringify(subagentTranscriptOwnership(parentBasename, cwdHash))}\n`;
+}
+
+export function ownershipFor(
+  parentBasename: string,
+  cwd: string,
+  realpath: (value: string) => string = fs.realpathSync.native,
+): SubagentTranscriptOwnership {
+  return subagentTranscriptOwnership(parentBasename, canonicalCwdHash(cwd, realpath));
+}
+
+export function isMatchingOwnership(
+  value: unknown,
+  parentBasename: string,
+  cwdHash: string,
+): value is SubagentTranscriptOwnership {
+  if (typeof value !== "object" || value === null) return false;
+  const marker = value as Record<string, unknown>;
+  return marker.version === SUBAGENT_TRANSCRIPT_OWNERSHIP_VERSION &&
+    marker.parentBasename === parentBasename && marker.cwdHash === cwdHash;
+}
+
+/** Validate the real parent header, then atomically admit its owned collection. */
+export function prepareSubagentTranscriptCollection(
+  mainSessionFile: string,
+  fsOverrides: Partial<PrepareSubagentTranscriptCollectionFs> = {},
+): PrepareSubagentTranscriptCollectionResult {
+  const io: PrepareSubagentTranscriptCollectionFs = { ...realPreparationFs, ...fsOverrides };
+  const parentBasename = path.basename(mainSessionFile);
+  const parsedName = parsePiSessionFilename(parentBasename);
+  try {
+    const parentStat = io.lstat(mainSessionFile);
+    if (!parentStat.isFile() || parentStat.isSymbolicLink() || !parsedName) {
+      return { ok: false, diagnostic: safeDiagnostic(`subagent transcript ownership refused for ${parentBasename}: invalid parent`) };
+    }
+    const header = readBoundedPiSessionHeader(mainSessionFile, io.read, io.open, io.close);
+    if (!header || header.id !== parsedName.id || header.timestamp !== parsedName.timestamp) {
+      return { ok: false, diagnostic: safeDiagnostic(`subagent transcript ownership refused for ${parentBasename}: parent header mismatch`) };
+    }
+    const expected = ownershipFor(parentBasename, header.cwd, io.realpath);
+    const directory = subagentSessionDir(mainSessionFile);
+    try {
+      io.mkdir(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const directoryStat = io.lstat(directory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      return { ok: false, diagnostic: safeDiagnostic(`subagent transcript ownership refused for ${parentBasename}: collection is not a direct directory`) };
+    }
+    const marker = path.join(directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER);
+    const serialized = serializeSubagentTranscriptOwnership(parentBasename, expected.cwdHash);
+    try {
+      io.writeFile(marker, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const markerStat = io.lstat(marker);
+      if (!markerStat.isFile() || markerStat.isSymbolicLink()) throw error;
+      let fd: number | undefined;
+      try {
+        fd = io.open(marker, "r");
+        const buffer = Buffer.alloc(MAX_SUBAGENT_OWNERSHIP_MARKER_BYTES + 1);
+        const count = io.read(fd, buffer, 0, buffer.length, 0);
+        if (count > MAX_SUBAGENT_OWNERSHIP_MARKER_BYTES ||
+            !parseSubagentOwnershipMarker(
+              JSON.parse(buffer.subarray(0, count).toString("utf8")),
+              parentBasename,
+              expected.cwdHash,
+            )) throw error;
+      } finally {
+        if (fd !== undefined) io.close(fd);
+      }
+    }
+    return { ok: true, directory };
+  } catch {
+    return { ok: false, diagnostic: safeDiagnostic(`subagent transcript ownership refused for ${parentBasename}: marker unavailable or mismatched`) };
+  }
+}
 
 /**
  * Prefix marking the developer-/model-facing fork-degrade line. A

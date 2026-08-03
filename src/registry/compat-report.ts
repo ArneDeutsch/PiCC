@@ -3,6 +3,7 @@
  * the generated matrix share the same support claims. buildCompatReport() scans
  * the assembled project; renderDoctorReport() gives a project-specific report.
  */
+import path from "node:path";
 import type {
   CapabilityEntry,
   ClaudeProject,
@@ -19,7 +20,7 @@ import type {
   PluginSharedStateCause,
   ResolvedMcpConfig,
 } from "../types.js";
-import { SUPPORTED_HOOK_EVENTS } from "../types.js";
+import { DEFAULT_CLEANUP_PERIOD_DAYS, SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { modelSupportsImages } from "../util/model.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
@@ -996,6 +997,9 @@ function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig)
   if (/Native (?:user|local) MCP (?:server .* ignored or adjusted|state contains adjusted server configuration)/u.test(diagnostic)) {
     return "A native MCP server entry contained configuration PiCC ignored or adjusted; inspect the entry and effective MCP status, then run /reload or restart PiCC if changed.";
   }
+  if (diagnostic === "Native Claude project MCP state has conflicting matching records") {
+    return `Canonical-equivalent native Claude project records disagree on MCP server or runtime-control state, so all MCP loading is fail closed. ${mcpFailClosedRecovery(mcp)}`;
+  }
   if (/(?:Native Claude|Active project) .*identity|ambiguous matching records/u.test(diagnostic)) {
     return `Native Claude project identity could not be selected safely, so MCP is fail closed. ${mcpFailClosedRecovery(mcp)}`;
   }
@@ -1804,6 +1808,27 @@ function pluginInventoryLines(inventory: PluginInventoryDoctorProjection | undef
   return lines;
 }
 
+export function retentionPostureLine(project: ClaudeProject): string {
+  const days = project.settings.cleanupPeriodDays ?? DEFAULT_CLEANUP_PERIOD_DAYS;
+  if (project.settings.retentionCleanupAllowed === true) {
+    return `Retention: ${days} days for persisted subagent transcripts and orphaned worktrees; cleanup allowed.`;
+  }
+  const blockers = (project.settings.retentionCleanupBlockers ?? []).slice(0, 8).map((blocker) => {
+    const source = mcpStatusScalar(path.posix.basename(String(blocker.source).replaceAll("\\", "/")), 80) || "settings source";
+    const reason = blocker.reason === "invalid-period"
+      ? "invalid cleanupPeriodDays"
+      : blocker.reason === "unreadable-source"
+        ? "unreadable"
+        : blocker.reason === "malformed-source"
+          ? "malformed JSON"
+          : "non-object root";
+    return `${source}: ${reason}`;
+  });
+  const omitted = Math.max(0, (project.settings.retentionCleanupBlockers?.length ?? 0) - blockers.length);
+  const detail = blockers.length > 0 ? blockers.join(", ") : "settings admission unavailable";
+  return `Retention: ${days} days; cleanup paused (${detail}${omitted > 0 ? `; ${omitted} more blocker(s) omitted` : ""}). Repair the reported settings source and restart PiCC.`;
+}
+
 function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: unknown): string {
   const api = activeModel && typeof activeModel === "object"
     ? (activeModel as { api?: unknown }).api
@@ -1847,6 +1872,7 @@ export function renderDoctorReport(
     `Project: ${project.root}`,
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
+    retentionPostureLine(project),
     mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
     ...(mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP)!] : []),
     ...(mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP)!] : []),

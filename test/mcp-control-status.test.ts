@@ -92,6 +92,13 @@ function doctor(mcp: ResolvedMcpConfig, live: McpServerLiveState[] = []): string
   return renderDoctorReport(loaded, buildCompatReport(loaded), undefined, undefined, live);
 }
 
+function mcpGuidanceSegment(report: string): string {
+  if (report.startsWith("MCP status (read-only)")) return report;
+  const segment = report.split("\n").find((line) => line.includes("MCP servers:"));
+  if (segment === undefined) throw new Error("Expected an MCP server segment in the doctor report");
+  return segment;
+}
+
 function detailRows(report: string): string[] {
   return report.split("\n").filter((line) => line.startsWith("- "));
 }
@@ -743,8 +750,9 @@ describe("managed MCP policy status foundation", () => {
     const status = renderMcpStatusReport(mcp, []);
     expect(status).toContain(expected);
     expect(status).not.toMatch(/enabledMcpjsonServers|settings\.local\.json|approve/iu);
-    expect(doctor(mcp)).toContain("If access is expected, request an administrator policy change");
-    expect(doctor(mcp)).not.toMatch(/repair|recover/iu);
+    const doctorReport = doctor(mcp);
+    expect(doctorReport).toContain("If access is expected, request an administrator policy change");
+    expect(mcpGuidanceSegment(doctorReport)).not.toMatch(/repair|recover/iu);
   });
 
   it("prioritizes native-state recovery over generic policy fail-closed prose", () => {
@@ -873,7 +881,7 @@ describe("managed MCP policy status foundation", () => {
         expect(report).toContain(wording);
         expect(report).toContain(action);
         expect(report).toContain("[source: exclusive managed MCP]");
-        expect(report).not.toMatch(/repair|recover|pending approval|enabledMcpjsonServers/iu);
+        expect(mcpGuidanceSegment(report)).not.toMatch(/repair|recover|pending approval|enabledMcpjsonServers/iu);
         expect(report).not.toMatch(/COMMAND_CANARY|ARG_CANARY|ENV_CANARY|RAW_COMMAND_CANARY/u);
       }
     }
