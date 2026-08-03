@@ -2,15 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentTrailerLine,
   isAgentId,
   mintAgentId,
+  prepareSubagentTranscriptCollection,
   resolveSubagentTranscript,
+  SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER,
   subagentSessionDir,
 } from "../src/util/subagent-transcripts.js";
 import {
+  TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
   type PiSdk,
@@ -34,7 +37,7 @@ import {
 useRealSessionManager(SessionManager);
 
 /**
- * Persisted subagent transcripts + agent IDs: every dispatch leaves a
+ * Persisted subagent transcripts + agent IDs: every successfully persisted dispatch leaves a
  * JSONL transcript discoverable from the main session via the hardened
  * resolver; the coordinator receives the agent ID in model-readable text; the
  * dispose→reopen round-trip is proven on the REAL Pi SessionManager.
@@ -174,12 +177,221 @@ describe("agent IDs and the hardened transcript resolver", () => {
   });
 });
 
+describe("collection ownership admission", () => {
+  it("gates ordinary persistence before its factory and degrades with recovery guidance", async () => {
+    const sessions = tempSessionsDir();
+    const parent = SessionManager.create(sessions, sessions, { id: "main-order" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const parentFile = parent.getSessionFile()!;
+    const h = fakeSdk({ replies: ["done"] });
+    let calls = 0;
+    const sdk: PiSdk = {
+      ...h.sdk,
+      persistedSessionManager: (cwd, directory, id) => {
+        calls++;
+        expect(fs.existsSync(path.join(directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER))).toBe(true);
+        return h.sdk.persistedSessionManager!(cwd, directory, id);
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+      getMainSessionFile: () => parentFile,
+      prepareTranscriptCollection: undefined,
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  it("refuses every unsafe marker state before the ordinary persistence factory", async () => {
+    const assertSafeOwnershipRecovery = (message: string | undefined) => {
+      expect(message).toContain(TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE);
+      expect(message).not.toMatch(
+        /repair|readable (?:ownership )?marker|ownership marker.{0,20}readable|reconcile (?:transcript )?ownership|restart PiCC/i,
+      );
+      const messageWithoutSafeGuidance = message?.replace(TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE, "");
+      expect(messageWithoutSafeGuidance).not.toMatch(
+        /(?:edit|delete|remove).{0,60}ownership marker|ownership marker.{0,60}(?:edit|delete|remove)|(?:delete|remove|clean|discard).{0,60}(?:transcript|collection|data)|(?:transcript|collection|data).{0,60}(?:delete|remove|clean|discard)/i,
+      );
+      expect(message).not.toMatch(
+        /new (?:main )?session.{0,80}(?:cleans?|deletes?|removes?|discards?)/i,
+      );
+    };
+    const cases = ["malformed", "oversized", "unreadable", "mismatch", "linked", "EEXIST"] as const;
+    for (const kind of cases) {
+      const sessions = tempSessionsDir();
+      const parent = SessionManager.create(sessions, sessions, { id: `main-${kind}` });
+      parent.appendMessage({ role: "user", content: "parent" } as never);
+      parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+      const parentFile = parent.getSessionFile()!;
+      const directory = subagentSessionDir(parentFile);
+      const marker = path.join(directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER);
+      fs.mkdirSync(directory);
+      if (kind !== "EEXIST") {
+        fs.writeFileSync(marker, kind === "malformed" ? "not-json\n"
+          : kind === "oversized" ? "x".repeat(4097)
+            : "{}\n");
+      }
+      const prepare = () => prepareSubagentTranscriptCollection(parentFile, kind === "unreadable" ? {
+        open: (file, flags) => {
+          if (file === marker) throw Object.assign(new Error("denied"), { code: "EACCES" });
+          return fs.openSync(file, flags);
+        },
+      } : kind === "linked" ? {
+        lstat: (file) => {
+          const stat = fs.lstatSync(file);
+          return file === marker
+            ? { ...stat, isFile: () => true, isSymbolicLink: () => true } as fs.Stats
+            : stat;
+        },
+      } : kind === "EEXIST" ? {
+        writeFile: (file, data, options) => {
+          fs.writeFileSync(file, "{}\n", { encoding: "utf8", flag: "wx", mode: options.mode });
+          throw Object.assign(new Error("raced"), { code: "EEXIST" });
+        },
+      } : {});
+      const admission = prepare();
+      expect(admission.ok, kind).toBe(false);
+      const markerAfterAdmission = fs.readFileSync(marker, "utf8");
+      const h = fakeSdk({ replies: ["in memory"] });
+      let factoryCalls = 0;
+      const sdk: PiSdk = {
+        ...h.sdk,
+        persistedSessionManager: (...args) => {
+          factoryCalls++;
+          return h.sdk.persistedSessionManager!(...args);
+        },
+      };
+      const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+        getMainSessionFile: () => parentFile,
+        prepareTranscriptCollection: () => admission,
+      });
+      const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(result.ok).toBe(true);
+      expect(result.resumable).toBe(false);
+      expect(factoryCalls).toBe(0);
+      expect(fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
+      expect(fs.readFileSync(marker, "utf8")).toBe(markerAfterAdmission);
+      const ordinaryDiagnostic = result.diagnostics.find((diagnostic) =>
+        diagnostic.message.includes("persistence was skipped") &&
+        diagnostic.message.includes("in-memory and non-resumable"));
+      expect(ordinaryDiagnostic, kind).toBeDefined();
+      assertSafeOwnershipRecovery(ordinaryDiagnostic?.message);
+
+      const forkHandle = fakeSdk({ replies: ["fresh"] });
+      let forkFactoryCalls = 0;
+      const forkSdk: PiSdk = {
+        ...forkHandle.sdk,
+        forkSessionManager: (...args) => {
+          forkFactoryCalls++;
+          return forkHandle.sdk.forkSessionManager!(...args);
+        },
+      };
+      const forkRuntime = makeSubagentRuntime([], forkSdk, {
+        getMainSessionFile: () => parentFile,
+        prepareTranscriptCollection: () => admission,
+      });
+      const forkResult = await forkRuntime.dispatch({ subagentType: "fork", prompt: "p", depth: 1 });
+      expect(forkResult.ok).toBe(true);
+      expect(forkResult.isFork).toBe(false);
+      expect(forkFactoryCalls).toBe(0);
+      const forkDiagnostic = forkResult.diagnostics.find((diagnostic) =>
+        diagnostic.message.startsWith("fork ran with fresh context:"));
+      expect(forkDiagnostic, kind).toBeDefined();
+      assertSafeOwnershipRecovery(forkDiagnostic?.message);
+      expect(fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
+    }
+  });
+  it("uses the native synchronous canonical-path authority by default", () => {
+    const sessions = tempSessionsDir();
+    const cwd = fs.mkdtempSync(path.join(sessions, "cwd-native-"));
+    const parent = SessionManager.create(cwd, sessions, { id: "main-native-realpath" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const parentFile = parent.getSessionFile()!;
+    const nativeRealpath = vi.spyOn(fs.realpathSync, "native");
+    try {
+      expect(prepareSubagentTranscriptCollection(parentFile).ok).toBe(true);
+      expect(nativeRealpath).toHaveBeenCalledWith(cwd);
+    } finally {
+      nativeRealpath.mockRestore();
+    }
+  });
+
+  it("bounds parent-header and marker reads at the descriptor operation", () => {
+    const sessions = tempSessionsDir();
+    const parent = SessionManager.create(sessions, sessions, { id: "main-bounded" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const parentFile = parent.getSessionFile()!;
+    expect(prepareSubagentTranscriptCollection(parentFile).ok).toBe(true);
+    const requested: number[] = [];
+    const second = prepareSubagentTranscriptCollection(parentFile, {
+      read: (fd, buffer, offset, length, position) => {
+        requested.push(length);
+        return fs.readSync(fd, buffer, offset, length, position);
+      },
+    });
+    expect(second.ok).toBe(true);
+    expect(requested).toEqual([16 * 1024 + 1, 4096 + 1]);
+  });
+
+  it("creates stable non-plaintext ownership evidence and leaves a matching marker unchanged", () => {
+    const sessions = tempSessionsDir();
+    const cwd = fs.mkdtempSync(path.join(sessions, "cwd-"));
+    const parent = SessionManager.create(cwd, sessions, { id: "main-owned" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const parentFile = parent.getSessionFile()!;
+    const first = prepareSubagentTranscriptCollection(parentFile);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const marker = path.join(first.directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER);
+    const before = fs.readFileSync(marker, "utf8");
+    expect(before).toContain('"version":1');
+    expect(before).toContain(path.basename(parentFile));
+    expect(before).not.toContain(cwd);
+    expect(prepareSubagentTranscriptCollection(parentFile)).toEqual(first);
+    expect(fs.readFileSync(marker, "utf8")).toBe(before);
+  });
+
+  it("refuses malformed, mismatched, and linked markers without overwriting them", () => {
+    const kinds: Array<"malformed" | "mismatch" | "linked"> = ["malformed", "mismatch"];
+    if (process.platform !== "win32") kinds.push("linked");
+    for (const kind of kinds) {
+      const sessions = tempSessionsDir();
+      const parent = SessionManager.create(sessions, sessions, { id: `main-${kind}` });
+      parent.appendMessage({ role: "user", content: "parent" } as never);
+      parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+      const parentFile = parent.getSessionFile()!;
+      const directory = subagentSessionDir(parentFile);
+      fs.mkdirSync(directory);
+      const marker = path.join(directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER);
+      const target = path.join(sessions, `target-${kind}`);
+      if (kind === "linked") {
+        fs.writeFileSync(target, "foreign\n");
+        fs.symlinkSync(target, marker, "file");
+      } else {
+        fs.writeFileSync(marker, kind === "malformed" ? "not-json\n" : '{"version":1}\n');
+      }
+      const before = kind === "linked" ? fs.readFileSync(target, "utf8") : fs.readFileSync(marker, "utf8");
+      expect(prepareSubagentTranscriptCollection(parentFile).ok).toBe(false);
+      expect(kind === "linked" ? fs.readFileSync(target, "utf8") : fs.readFileSync(marker, "utf8")).toBe(before);
+    }
+  });
+});
+
 describe("dispatch persists a transcript (real Pi SessionManager)", () => {
-  it("a completed dispatch leaves a JSONL transcript named by the agent ID, discoverable via the resolver", async () => {
-    const main = fakeMainSessionFile();
+  it("a completed dispatch leaves a marked JSONL transcript named by the agent ID", async () => {
+    const sessions = tempSessionsDir();
+    const parent = SessionManager.create(sessions, sessions, { id: "main-dispatch" });
+    parent.appendMessage({ role: "user", content: "parent" } as never);
+    parent.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as never);
+    const main = parent.getSessionFile()!;
     const h = fakeSdk({ replies: ["the review verdict"] });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
       getMainSessionFile: () => main,
+      prepareTranscriptCollection: prepareSubagentTranscriptCollection,
     });
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "review it", depth: 1 });
 
@@ -192,6 +404,7 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
     );
     expect(path.basename(result.transcriptPath!)).toContain(`_${result.agentId}.jsonl`);
     expect(fs.existsSync(result.transcriptPath!)).toBe(true);
+    expect(fs.existsSync(path.join(subagentSessionDir(main), SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER))).toBe(true);
 
     // The transcript carries the run: Pi session header (id = agent ID) + turns.
     const entries = readEntries(result.transcriptPath!);
@@ -427,7 +640,17 @@ describe("fork inheritance on the REAL Pi SessionManager", () => {
   it("a depth-1 fork seeds the child with the parent's full history (genuine inheritance)", async () => {
     const { file: parentFile, token } = seedParentTranscript();
     const h = fakeSdk({ replies: ["the fork's own verbatim answer"] });
-    const runtime = makeSubagentRuntime([], h.sdk, { getMainSessionFile: () => parentFile });
+    const sdk: PiSdk = {
+      ...h.sdk,
+      forkSessionManager: (source, cwd, directory, id) => {
+        expect(fs.existsSync(path.join(directory, SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER))).toBe(true);
+        return h.sdk.forkSessionManager!(source, cwd, directory, id);
+      },
+    };
+    const runtime = makeSubagentRuntime([], sdk, {
+      getMainSessionFile: () => parentFile,
+      prepareTranscriptCollection: undefined,
+    });
     const result = await runtime.dispatch({ subagentType: "fork", prompt: "continue", depth: 1 });
 
     expect(result.ok).toBe(true);
@@ -439,6 +662,7 @@ describe("fork inheritance on the REAL Pi SessionManager", () => {
     expect(path.dirname(path.resolve(result.transcriptPath!))).toBe(
       path.resolve(subagentSessionDir(parentFile)),
     );
+    expect(fs.existsSync(path.join(subagentSessionDir(parentFile), SUBAGENT_TRANSCRIPT_OWNERSHIP_MARKER))).toBe(true);
     // Reopen the fork's own file from disk: it carries the inherited parent token.
     const reopened = SessionManager.open(result.transcriptPath!);
     const texts = JSON.stringify(reopened.buildSessionContext().messages);

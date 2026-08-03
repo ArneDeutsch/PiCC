@@ -9,10 +9,15 @@ import {
   type McpJsonResult,
 } from "../src/claude/mcp-config.js";
 import { resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
+import { MCP_POLICY_LIMITS } from "../src/engine/mcp-policy.js";
+import type { RemoteMcpWorkHooks } from "../src/claude/mcp-remote-config.js";
 import { loadClaudeProject } from "../src/project.js";
 import type { ClaudeMcpStateResult } from "../src/claude/claude-mcp-state.js";
+import type { ManagedMcpIo, ManagedMcpResult } from "../src/claude/managed-mcp.js";
 import type {
   EnabledStdioMcpServer,
+  McpPolicySettingsEntry,
+  McpPolicySourceFailure,
   McpSettingsEntry,
   ResolvedMcpConfig,
   ResolvedMcpServer,
@@ -85,14 +90,24 @@ function resolve(opts: {
   env?: NodeJS.ProcessEnv;
   probe?: GitTrackedProbe;
   nativeState?: ClaudeMcpStateResult;
+  policy?: McpPolicySettingsEntry[];
+  policyFailures?: McpPolicySourceFailure[];
+  restrictiveMaterialOmitted?: boolean;
+  managedMcp?: ManagedMcpResult;
+  remoteWorkHooks?: RemoteMcpWorkHooks;
 }): ResolvedMcpConfig {
   return resolveMcpConfig({
     projectRoot: FAKE_ROOT,
     mcpJson: opts.mcpJson ?? EMPTY_MCP_JSON,
     mcpSettings: opts.entries ?? [],
     ...(opts.nativeState === undefined ? {} : { nativeState: opts.nativeState }),
+    mcpPolicySettings: opts.policy ?? [],
+    mcpPolicySourceFailures: opts.policyFailures ?? [],
+    mcpPolicyRestrictiveMaterialOmitted: opts.restrictiveMaterialOmitted ?? false,
+    ...(opts.managedMcp === undefined ? {} : { managedMcp: opts.managedMcp }),
     env: opts.env ?? ({} as NodeJS.ProcessEnv),
     isGitTracked: opts.probe ?? (() => false),
+    ...(opts.remoteWorkHooks === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooks }),
   });
 }
 
@@ -701,6 +716,33 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(project.mcp.diagnostics.some((d) => d.includes("tracked by git"))).toBe(true);
   });
 
+  it.skipIf(!gitAvailable)("default probe: a tracked nested child beginning with dots is contained and demoted", () => {
+    const root = makeTmp();
+    const nested = path.join(root, "..app");
+    const localFile = path.join(nested, ".claude", "settings.local.json");
+    spawnSync("git", ["init", "-q"], { cwd: root, stdio: "ignore" });
+    writeJson(localFile, {
+      enableAllProjectMcpServers: true,
+      mcpServers: { nested: { command: "nested" } },
+    });
+    const relativeLocal = path.relative(root, localFile).split(path.sep).join("/");
+    spawnSync("git", ["add", "-f", "--", relativeLocal], { cwd: root, stdio: "ignore" });
+
+    const project = loadClaudeProject({
+      cwd: nested,
+      userDir: path.join(root, "no-such-home", ".claude"),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+    });
+    expect(server(project.mcp, "nested")).toMatchObject({
+      status: "pending-approval",
+      source: "settings-local",
+    });
+    expect(project.mcp.servers.some((candidate) => candidate.status === "enabled")).toBe(false);
+    expect(project.mcp.diagnostics.some((diagnostic) =>
+      diagnostic.includes("tracked by git") && diagnostic.includes("treated as project scope"))).toBe(true);
+  });
+
   it.skipIf(!gitAvailable)("default probe: a tracked case-variant Settings.local.json is still demoted", () => {
     const root = makeTmp();
     // The bypass only exists where the filesystem case-folds (Windows/macOS):
@@ -912,6 +954,30 @@ describe("resolveMcpConfig — native Claude hierarchy and gates", () => {
     expect(server(cfg, "srv")?.command).toBe("near");
   });
 
+  it("composes native runtime disablement after policy admission without weakening deny", () => {
+    const native = nativeState({ local: { exact: { command: "native", args: ["secret-arg"], env: { SECRET: "value" } } }, disabled: ["exact"] });
+    const allowed = resolve({
+      nativeState: native,
+      policy: [{ scope: "managed", sourcePath: "/policy", order: 0, valid: true, allowedMcpServers: [{ serverName: "exact" }] }],
+    });
+    expect(server(allowed, "exact")).toEqual({
+      name: "exact", source: "native-local", transport: "stdio", status: "disabled",
+      inactiveReason: "native-runtime-disabled", diagnostics: [],
+    });
+
+    const denied = resolve({
+      nativeState: native,
+      policy: [
+        { scope: "managed", sourcePath: "/policy", order: 0, valid: true, allowedMcpServers: [{ serverName: "exact" }] },
+        { scope: "managed", sourcePath: "/policy", order: 1, valid: true, deniedMcpServers: [{ serverName: "exact" }] },
+      ],
+    });
+    expect(server(denied, "exact")).toEqual({
+      name: "exact", source: "native-local", transport: "stdio", status: "blocked",
+      inactiveReason: "policy-denied", diagnostics: [],
+    });
+  });
+
   it("applies exact native runtime disablement to every authentic winner but not the settings extension", () => {
     for (const [label, native, mcpJson] of [
       ["local", nativeState({ local: { exact: { command: "local" } }, disabled: ["exact"] }), EMPTY_MCP_JSON],
@@ -998,6 +1064,10 @@ describe("resolveMcpConfig — native Claude hierarchy and gates", () => {
       servers: [],
       diagnostics: ["Native Claude state is malformed JSON"],
       failClosed: "native-state-unusable",
+      policyPosture: "fail-closed",
+      policyAuthority: "user-controlled",
+      policyObservations: [],
+      policyFailures: [],
     });
   });
 
@@ -1122,8 +1192,8 @@ describe("resolveMcpConfig — remote arms and secret materialization", () => {
   it("never expands or materializes secret templates on pending, disabled, or not-configured arms", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({
-        pending: { type: "http", url: "https://${PENDING_SECRET}/mcp", headers: { Authorization: "${TOKEN}" } },
-        disabled: { type: "sse", url: "https://${DISABLED_SECRET}/sse", headers: { Authorization: "${TOKEN}" } },
+        pending: { type: "http", url: "https://pending.example/mcp", headers: { Authorization: "${PENDING_SECRET}" } },
+        disabled: { type: "sse", url: "https://disabled.example/sse", headers: { Authorization: "${DISABLED_SECRET}" } },
         empty: { type: "http", url: "" },
       }),
       entries: [entry("user", "/approval", { disabledMcpjsonServers: ["disabled"] })],
@@ -1137,11 +1207,11 @@ describe("resolveMcpConfig — remote arms and secret materialization", () => {
     for (const item of cfg.servers) {
       expect(item).not.toHaveProperty("url");
       expect(item).not.toHaveProperty("headers");
-      expect(JSON.stringify(item)).not.toMatch(/PENDING_SECRET|DISABLED_SECRET|TOKEN/u);
+      expect(JSON.stringify(item)).not.toMatch(/PENDING_SECRET|DISABLED_SECRET/u);
     }
   });
 
-  it("skips enabled remote entries whose expanded endpoint is invalid without leaking values", () => {
+  it("blocks an invalid expanded remote identity before materialization without leaking values", () => {
     const cfg = resolve({
       entries: [entry("user", "/user-settings", {
         servers: { remote: { type: "http", url: "${BAD_URL}", headers: {} } },
@@ -1149,9 +1219,11 @@ describe("resolveMcpConfig — remote arms and secret materialization", () => {
       env: { BAD_URL: "SECRET_INVALID_ENDPOINT" },
     });
     const resolved = cfg.servers[0]!;
-    expect(resolved.status).toBe("skipped");
+    expect(resolved).toMatchObject({
+      status: "blocked",
+      inactiveReason: "policy-candidate-invalid",
+    });
     expect(resolved).not.toHaveProperty("url");
-    expect(resolved.diagnostics.join("\n")).toContain("malformed expanded URL");
     expect(resolved.diagnostics.join("\n")).not.toContain("SECRET_INVALID_ENDPOINT");
   });
 
@@ -1203,6 +1275,363 @@ describe("resolveMcpConfig — remote arms and secret materialization", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Managed policy admission
+// ---------------------------------------------------------------------------
+
+describe("resolveMcpConfig — managed policy admission", () => {
+  const policyEntry = (
+    scope: Scope,
+    order: number,
+    fields: Partial<McpPolicySettingsEntry>,
+  ): McpPolicySettingsEntry => ({ scope, order, sourcePath: `/${scope}-${order}`, valid: true, ...fields });
+
+  it("routes every ordinary source class through deny-first admission", () => {
+    const names = ["native-local", "project-mcpjson", "native-user", "settings-managed", "settings-local", "settings-project", "settings-user"];
+    const cfg = resolve({
+      nativeState: nativeState({
+        local: { "native-local": { command: "nl" } },
+        user: { "native-user": { command: "nu" } },
+      }),
+      mcpJson: mcpJsonOf({ "project-mcpjson": { command: "pj" } }),
+      entries: [
+        entry("user", "/u", { servers: { "settings-user": { command: "u" } }, enabledMcpjsonServers: names }),
+        entry("project", "/p", { servers: { "settings-project": { command: "p" } } }),
+        entry("local", "/l", { servers: { "settings-local": { command: "l" } } }),
+        entry("managed", "/m", { servers: { "settings-managed": { command: "m" } } }),
+      ],
+      policy: [policyEntry("managed", 0, {
+        allowedMcpServers: names.map((serverName) => ({ serverName })),
+        deniedMcpServers: names.map((serverName) => ({ serverName })),
+      })],
+    });
+    expect(cfg.policyPosture).toBe("active-rules");
+    expect(cfg.servers).toHaveLength(names.length);
+    expect(cfg.servers.map((item) => item.source).sort()).toEqual([...names].sort());
+    expect(cfg.servers.every((item) => item.status === "blocked" && item.inactiveReason === "policy-denied")).toBe(true);
+  });
+
+  it("applies the same admission stage to populated managed-exclusive entries", () => {
+    const managedEntry = Object.freeze({
+      ...normalizeMcpServerBlock({ managed: { command: "managed-command" } }, "managed")[0]!,
+      source: "managed-mcp" as const,
+    });
+    const cfg = resolve({
+      managedMcp: { status: "loaded", servers: [managedEntry] },
+      policy: [policyEntry("managed", 0, { deniedMcpServers: [{ serverCommand: ["managed-command"] }] })],
+    });
+    expect(cfg.policyPosture).toBe("exclusive");
+    expect(server(cfg, "managed")).toMatchObject({
+      status: "blocked",
+      source: "managed-mcp",
+      inactiveReason: "policy-denied",
+    });
+  });
+
+  it.each([
+    {
+      label: "over-limit stdio",
+      block: { oversized: { command: "x".repeat(MCP_POLICY_LIMITS.candidateCommandChars + 1) } },
+      observation: "candidate-over-limit-blocked",
+      transport: "stdio",
+    },
+    {
+      label: "ambiguous remote",
+      block: { ambiguous: { type: "http", url: "https://example.test\\ambiguous", headers: { Authorization: "secret-canary" } } },
+      observation: "identity-ambiguity-blocked",
+      transport: "http",
+    },
+  ] as const)("blocks $label under absent policy through the central evaluator", ({ block, observation, transport }) => {
+    const cfg = resolve({ entries: [entry("user", "/u", { servers: block })] });
+    expect(cfg.policyPosture).toBe("absent");
+    expect(cfg.servers[0]).toMatchObject({
+      status: "blocked",
+      transport,
+      inactiveReason: "policy-candidate-invalid",
+    });
+    expect(cfg.policyObservations).toContain(observation);
+    expect(JSON.stringify(cfg.servers[0])).not.toContain("secret-canary");
+    for (const key of ["command", "args", "env", "rawCommand", "url", "headers"]) {
+      expect(cfg.servers[0]).not.toHaveProperty(key);
+    }
+  });
+
+  it.each(["http", "sse"] as const)("performs no remote header/helper/materializer work for policy-blocked %s", (type) => {
+    const counts = { header: 0, headers: 0, helper: 0, materializer: 0 };
+    const hooks: RemoteMcpWorkHooks = {
+      onHeaderValidation: () => { counts.header += 1; },
+      onHeadersConstruction: () => { counts.headers += 1; },
+      onHelperInspection: () => { counts.helper += 1; },
+      onMaterialization: () => { counts.materializer += 1; },
+    };
+    const blocked = resolve({
+      entries: [entry("user", "/u", { servers: {
+        remote: { type, url: "https://blocked.example/mcp", headersHelper: "helper-canary", headers: { Authorization: "header-canary" } },
+      } })],
+      policy: [policyEntry("managed", 0, { deniedMcpServers: [{ serverName: "remote" }] })],
+      remoteWorkHooks: hooks,
+    });
+    expect(server(blocked, "remote")).toMatchObject({ status: "blocked", inactiveReason: "policy-denied" });
+    expect(counts).toEqual({ header: 0, headers: 0, helper: 0, materializer: 0 });
+    expect(JSON.stringify(blocked)).not.toMatch(/helper-canary|header-canary/u);
+
+    const allowed = resolve({
+      entries: [entry("user", "/u", { servers: {
+        remote: { type, url: "https://allowed.example/mcp", headers: { "X-Test": "ok" } },
+      } })],
+      remoteWorkHooks: hooks,
+    });
+    expect(server(allowed, "remote")?.status).toBe("enabled");
+    expect(counts.materializer).toBe(1);
+    expect(counts.helper).toBe(1);
+    expect(counts.header).toBe(2);
+    expect(counts.headers).toBe(2);
+  });
+
+  it("composes soft allowlists, managed-only, approval, and identity-only blocked output", () => {
+    const base = {
+      mcpJson: mcpJsonOf({ project: { command: "${BIN}", args: ["${ARG}"], env: { SECRET: "${SECRET}" }, timeout: 3000 } }),
+      entries: [entry("user", "/approval", { enabledMcpjsonServers: ["project"] })],
+      env: { BIN: "expanded", ARG: "arg-secret", SECRET: "value-secret" },
+    };
+    const soft = resolve({ ...base, policy: [
+      policyEntry("managed", 0, { allowedMcpServers: [{ serverName: "other" }] }),
+      policyEntry("user", 1, { allowedMcpServers: [{ serverName: "project" }] }),
+    ] });
+    expect(server(soft, "project")).toMatchObject({ status: "enabled", command: "expanded" });
+
+    const managedOnly = resolve({ ...base, policy: [
+      policyEntry("managed", 0, {
+        allowManagedMcpServersOnly: true,
+        allowedMcpServers: [{ serverName: "other" }],
+      }),
+      policyEntry("user", 1, { allowedMcpServers: [{ serverName: "project" }] }),
+    ] });
+    const blocked = server(managedOnly, "project")!;
+    expect(blocked).toMatchObject({ status: "blocked", inactiveReason: "policy-managed-only" });
+    for (const key of ["timeoutMs", "command", "args", "env", "rawCommand", "url", "headers"]) {
+      expect(blocked).not.toHaveProperty(key);
+    }
+    expect(JSON.stringify(blocked)).not.toMatch(/expanded|arg-secret|value-secret|\$\{BIN\}/u);
+  });
+
+  it.each([
+    ["non-regular", "unreadable"],
+    ["unreadable", "unreadable"],
+    ["oversized", "omitted"],
+    ["invalid-encoding", "malformed"],
+    ["malformed", "malformed"],
+    ["wrong-root", "malformed"],
+    ["unstable", "unreadable"],
+  ] as const)("maps unusable standalone reason %s to administrator fail-closed %s evidence", (reason, kind) => {
+    const cfg = resolve({ managedMcp: { status: "unusable", reason } });
+    expect(cfg.policyPosture).toBe("fail-closed");
+    expect(cfg.policyOrdinarySourcesSuppressed).toBe(true);
+    expect(cfg.servers).toEqual([]);
+    expect(cfg.policyFailures).toContainEqual({
+      kind,
+      sourceClass: "standalone-mcp",
+      authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
+    });
+  });
+
+  it("globally fails closed on typed source failure or restrictive-material omission, including exclusive state", () => {
+    const failure: McpPolicySourceFailure = {
+      kind: "unreadable",
+      sourceClass: "system-file",
+      authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
+    };
+    for (const cfg of [
+      resolve({ entries: [entry("user", "/u", { servers: { srv: { command: "x" } } })], policyFailures: [failure] }),
+      resolve({ restrictiveMaterialOmitted: true, managedMcp: { status: "loaded", servers: [] } }),
+      resolve({ policyFailures: [failure], managedMcp: { status: "loaded", servers: [] } }),
+    ]) {
+      expect(cfg.servers).toEqual([]);
+      expect(cfg.policyPosture).toBe("fail-closed");
+    }
+  });
+
+  it("keeps policy final while preserving allowed disablement and approval gates", () => {
+    const allowedDisabled = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "x" } }),
+      entries: [entry("user", "/u", { enabledMcpjsonServers: ["srv"], disabledMcpjsonServers: ["srv"] })],
+      policy: [policyEntry("managed", 0, { allowedMcpServers: [{ serverName: "srv" }] })],
+    });
+    expect(server(allowedDisabled, "srv")).toMatchObject({ status: "disabled", inactiveReason: "mcpjson-rejected" });
+
+    for (const fields of [
+      { enabledMcpjsonServers: ["srv"] },
+      { disabledMcpjsonServers: ["srv"] },
+    ]) {
+      const denied = resolve({
+        mcpJson: mcpJsonOf({ srv: { command: "x" } }),
+        entries: [entry("user", "/u", fields)],
+        policy: [policyEntry("managed", 0, { deniedMcpServers: [{ serverName: "srv" }] })],
+      });
+      expect(server(denied, "srv")).toMatchObject({ status: "blocked", inactiveReason: "policy-denied" });
+    }
+  });
+
+  it("lets policy failures dominate unusable native state and populated exclusive input", () => {
+    const failure: McpPolicySourceFailure = {
+      kind: "unreadable", sourceClass: "system-file", authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
+    };
+    const unusableNative = resolve({
+      nativeState: { kind: "unusable", diagnostics: ["native-canary"] },
+      policyFailures: [failure],
+    });
+    expect(unusableNative).toMatchObject({ policyPosture: "fail-closed", servers: [] });
+    expect(unusableNative.failClosed).toBeUndefined();
+    expect(unusableNative.diagnostics).not.toContain("native-canary");
+
+    const managedEntry = Object.freeze({
+      ...normalizeMcpServerBlock({ managed: { command: "managed" } }, "managed")[0]!,
+      source: "managed-mcp" as const,
+    });
+    const exclusive = resolve({ managedMcp: { status: "loaded", servers: [managedEntry] }, policyFailures: [failure] });
+    expect(exclusive).toMatchObject({ policyPosture: "fail-closed", servers: [] });
+  });
+
+  it("does not classify local definitions or approvals once policy blocks every candidate", () => {
+    let probes = 0;
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ project: { command: "deny-project" } }),
+      entries: [entry("local", "/local", {
+        servers: { blocked: { command: "deny-local" } },
+        enabledMcpjsonServers: ["project"],
+      })],
+      policy: [policyEntry("managed", 0, { deniedMcpServers: [
+        { serverCommand: ["deny-local"] },
+        { serverCommand: ["deny-project"] },
+      ] })],
+      probe: () => { probes += 1; return true; },
+    });
+    expect(cfg.servers.every((item) => item.status === "blocked")).toBe(true);
+    expect(probes).toBe(0);
+  });
+
+  it.each(["settings-managed", "native-user", "project-mcpjson", "native-local"] as const)(
+    "does not probe a local same-name loser behind higher fixed winner %s",
+    (source) => {
+      let probes = 0;
+      const entries: McpSettingsEntry[] = [entry("local", "/local", { servers: { same: { command: "local" } } })];
+      let native: ClaudeMcpStateResult | undefined;
+      let mcpJson: McpJsonResult | undefined;
+      if (source === "settings-managed") entries.push(entry("managed", "/managed", { servers: { same: { command: "fixed" } } }));
+      if (source === "native-user") native = nativeState({ user: { same: { command: "fixed" } } });
+      if (source === "native-local") native = nativeState({ local: { same: { command: "fixed" } } });
+      if (source === "project-mcpjson") mcpJson = mcpJsonOf({ same: { command: "fixed" } });
+      const cfg = resolve({
+        entries,
+        ...(native === undefined ? {} : { nativeState: native }),
+        ...(mcpJson === undefined ? {} : { mcpJson }),
+        policy: [policyEntry("managed", 0, { deniedMcpServers: [{ serverCommand: ["fixed"] }] })],
+        probe: () => { probes += 1; throw new Error("higher fixed winner must suppress classification"); },
+      });
+      expect(probes).toBe(0);
+      expect(server(cfg, "same")).toMatchObject({ status: "blocked", inactiveReason: "policy-denied" });
+    },
+  );
+
+  it.each([
+    { blocked: false, probes: 1, status: "pending-approval" },
+    { blocked: true, probes: 0, status: "blocked" },
+  ] as const)("probes approval-only local input exactly $probes time(s) when policyBlocked=$blocked", ({ blocked, probes, status }) => {
+    let calls = 0;
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ target: { command: "target" }, unrelated: { command: "unrelated" } }),
+      entries: [entry("local", "/local", { enabledMcpjsonServers: ["target"] })],
+      policy: [policyEntry("managed", 0, blocked
+        ? { deniedMcpServers: [{ serverName: "target" }], allowedMcpServers: [{ serverName: "unrelated" }] }
+        : { allowedMcpServers: [{ serverName: "target" }, { serverName: "unrelated" }] })],
+      probe: () => { calls += 1; return true; },
+    });
+    expect(calls).toBe(probes);
+    expect(server(cfg, "target")?.status).toBe(status);
+  });
+
+  it.each([
+    { tracked: false, denied: "local", winner: "local", status: "blocked" },
+    { tracked: true, denied: "local", winner: "project", status: "enabled" },
+    { tracked: false, denied: "project", winner: "local", status: "enabled" },
+    { tracked: true, denied: "project", winner: "project", status: "blocked" },
+  ] as const)("selects the $winner winner before policy when tracked=$tracked and never falls back", ({ tracked, denied, winner, status }) => {
+    let probes = 0;
+    const cfg = resolve({
+      entries: [
+        entry("local", "/outer/.claude/settings.local.json", { servers: { same: { command: "local" } } }),
+        entry("project", "/near/.claude/settings.json", { servers: { same: { command: "project" } } }),
+        entry("user", "/approval", { enabledMcpjsonServers: ["same"] }),
+      ],
+      policy: [policyEntry("managed", 0, { deniedMcpServers: [{ serverCommand: [denied] }] })],
+      probe: () => { probes += 1; return tracked; },
+    });
+    expect(probes).toBe(1);
+    expect(cfg.servers).toHaveLength(1);
+    expect(server(cfg, "same")?.status).toBe(status);
+    if (status === "enabled") expect(server(cfg, "same")).toMatchObject({ command: winner });
+    else expect(server(cfg, "same")).not.toHaveProperty("command");
+  });
+
+  it("uses one immutable environment snapshot for admission and enabled materialization", () => {
+    const env = { BIN: "before" } as NodeJS.ProcessEnv;
+    const cfg = resolve({
+      entries: [entry("user", "/u", { servers: { srv: { command: "${BIN}" } } })],
+      policy: [policyEntry("managed", 0, { allowedMcpServers: [{ serverCommand: ["before"] }] })],
+      env,
+    });
+    env.BIN = "after";
+    expect(server(cfg, "srv")).toMatchObject({ status: "enabled", command: "before" });
+  });
+
+  it("reads getter-backed environment values once and shares that snapshot", () => {
+    let reads = 0;
+    const env = Object.create(null) as NodeJS.ProcessEnv;
+    Object.defineProperty(env, "BIN", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? "snapshot-value" : "changed-value";
+      },
+    });
+    const cfg = resolve({
+      entries: [entry("user", "/u", { servers: { srv: { command: "${BIN}" } } })],
+      policy: [policyEntry("managed", 0, { allowedMcpServers: [{ serverCommand: ["snapshot-value"] }] })],
+      env,
+    });
+    expect(reads).toBe(1);
+    expect(server(cfg, "srv")).toMatchObject({ status: "enabled", command: "snapshot-value" });
+  });
+
+  it("does not acquire ordinary inputs when a getter makes the prepared environment uncertain", () => {
+    const env = Object.create(null) as NodeJS.ProcessEnv;
+    Object.defineProperty(env, "BROKEN", {
+      enumerable: true,
+      get: () => { throw new Error("environment getter uncertainty"); },
+    });
+    let calls = 0;
+    const cfg = resolveMcpConfig({
+      projectRoot: "/project",
+      mcpSettings: [],
+      env,
+      loadOrdinaryMcp: () => {
+        calls += 1;
+        throw new Error("ordinary inputs must not be acquired");
+      },
+    });
+    expect(calls).toBe(0);
+    expect(cfg).toMatchObject({
+      policyPosture: "fail-closed",
+      policyAuthority: "user-controlled",
+      policyObservations: ["compiler-uncertainty-fail-closed"],
+      servers: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Assembly (loadClaudeProject)
 // ---------------------------------------------------------------------------
 
@@ -1215,6 +1644,172 @@ describe("loadClaudeProject — mcp assembly", () => {
       managedArtifactDirs: [],
     });
   }
+
+  function managedIo(text: string): ManagedMcpIo {
+    const bytes = Buffer.from(text, "utf8");
+    const metadata = { regular: true, size: bytes.length, identity: "managed", modified: "fixed" };
+    return {
+      open: () => ({
+        status: "opened",
+        handle: {
+          metadata: () => metadata,
+          read: () => bytes,
+          currentPathMetadata: () => metadata,
+          close: () => true,
+        },
+      }),
+    };
+  }
+
+  it.each([
+    { label: "populated", io: managedIo(JSON.stringify({ mcpServers: { managed: { command: "managed-command" } } })), posture: "exclusive", names: ["managed"] },
+    { label: "empty", io: managedIo(JSON.stringify({ mcpServers: {} })), posture: "exclusive-empty", names: [] },
+    { label: "unusable", io: { open: () => ({ status: "unreadable" as const }) }, posture: "fail-closed", names: [] },
+  ] as const)("skips throwing ordinary loaders for $label standalone state", ({ io, posture, names }) => {
+    const root = makeTmp();
+    writeText(path.join(root, ".mcp.json"), "expensive malformed ordinary input");
+    let nativeCalls = 0;
+    let projectCalls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { nativeCalls += 1; throw new Error("native loader must be skipped"); },
+        loadProjectMcpJson: () => { projectCalls += 1; throw new Error("project loader must be skipped"); },
+      },
+    });
+    expect([nativeCalls, projectCalls]).toEqual([0, 0]);
+    expect(project.mcp.policyPosture).toBe(posture);
+    expect(project.mcp.policyOrdinarySourcesSuppressed).toBe(true);
+    expect(project.mcp.servers.map((item) => item.name)).toEqual(names);
+    expect(project.mcp.diagnostics).toEqual([]);
+    if (names.length > 0) expect(project.mcp.servers[0]).toMatchObject({ status: "enabled", source: "managed-mcp" });
+  });
+
+  it.each([
+    { label: "typed managed-source failure", standalone: "absent" as const },
+    { label: "typed failure plus populated exclusive", standalone: "populated" as const },
+  ])("skips ordinary loaders for $label before native state can fail", ({ standalone }) => {
+    const root = makeTmp();
+    const malformedPolicy = path.join(root, "managed-settings.json");
+    writeText(malformedPolicy, "{");
+    let nativeCalls = 0;
+    let projectCalls = 0;
+    const io = standalone === "populated"
+      ? managedIo(JSON.stringify({ mcpServers: { managed: { command: "managed" } } }))
+      : { open: () => ({ status: "absent" as const }) };
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      managedSettingsPaths: [malformedPolicy],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { nativeCalls += 1; throw new Error("unusable native state must remain unobserved"); },
+        loadProjectMcpJson: () => { projectCalls += 1; throw new Error("project loader must remain unobserved"); },
+      },
+    });
+    expect([nativeCalls, projectCalls]).toEqual([0, 0]);
+    expect(project.mcp.policyPosture).toBe("fail-closed");
+    expect(project.mcp.servers).toEqual([]);
+    expect(project.mcp.policyObservations).toContain("source-failure-fail-closed");
+  });
+
+  it("rejects an invalid ordinary policy file without projecting policy or suppressing ordinary loaders", () => {
+    const root = makeTmp();
+    const userDir = path.join(root, "user");
+    writeJson(path.join(userDir, "settings.json"), {
+      allowedMcpServers: [{ serverName: "ordinary" }],
+      deniedMcpServers: "invalid",
+    });
+    let calls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir,
+      env: {},
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { calls += 1; return { kind: "absent", diagnostics: [] }; },
+        loadProjectMcpJson: () => { calls += 1; return mcpJsonOf({ ordinary: { command: "ordinary" } }); },
+      },
+    });
+    expect(calls).toBe(2);
+    expect(project.mcp.policyPosture).toBe("absent");
+    expect(server(project.mcp, "ordinary")?.status).toBe("pending-approval");
+    expect(project.mcp.policyObservations).not.toContain("invalid-non-managed-projection");
+  });
+
+  it("uses over-limit environment compiler uncertainty to skip ordinary loaders", () => {
+    const root = makeTmp();
+    let calls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      env: Object.fromEntries(Array.from({ length: MCP_POLICY_LIMITS.environmentEntries + 1 }, (_, index) => [`ENV_${index}`, "x"])),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { calls += 1; throw new Error("native loader must be skipped"); },
+        loadProjectMcpJson: () => { calls += 1; throw new Error("project loader must be skipped"); },
+      },
+    });
+    expect(calls).toBe(0);
+    expect(project.mcp).toMatchObject({ policyPosture: "fail-closed", servers: [] });
+    expect(project.mcp.policyObservations).toContain("compiler-uncertainty-fail-closed");
+  });
+
+  it("skips ordinary loaders when bounded policy collection signals restrictive omission", () => {
+    const root = makeTmp();
+    const managedPaths = Array.from({ length: 257 }, (_, index) => {
+      const file = path.join(root, "managed", `${index}.json`);
+      writeJson(file, { deniedMcpServers: [{ serverName: `denied-${index}` }] });
+      return file;
+    });
+    let calls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      managedSettingsPaths: managedPaths,
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { calls += 1; throw new Error("native loader must be skipped"); },
+        loadProjectMcpJson: () => { calls += 1; throw new Error("project loader must be skipped"); },
+      },
+    });
+    expect(calls).toBe(0);
+    expect(project.mcp).toMatchObject({ policyPosture: "fail-closed", servers: [] });
+    expect(project.mcp.policyObservations).toContain("restrictive-material-omitted");
+  });
+
+  it("invokes each ordinary loader exactly once only when standalone state is absent", () => {
+    const root = makeTmp();
+    let nativeCalls = 0;
+    let projectCalls = 0;
+    const project = loadClaudeProject({
+      cwd: root,
+      userDir: path.join(root, "user"),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: { testAuthority: { path: "/managed", io: { open: () => ({ status: "absent" }) } } },
+      mcpOrdinaryLoadersForTest: {
+        loadNativeState: () => { nativeCalls += 1; return { kind: "absent", diagnostics: [] }; },
+        loadProjectMcpJson: () => {
+          projectCalls += 1;
+          return mcpJsonOf({ ordinary: { command: "ordinary" } });
+        },
+      },
+    });
+    expect([nativeCalls, projectCalls]).toEqual([1, 1]);
+    expect(server(project.mcp, "ordinary")?.status).toBe("pending-approval");
+    expect(project.mcp.policyOrdinarySourcesSuppressed).toBeUndefined();
+  });
 
   it.each([
     { route: "explicit userDir", select: "explicit", env: { PICC_CLAUDE_USER_DIR: "picc", CLAUDE_CONFIG_DIR: "claude" } },
@@ -1266,7 +1861,14 @@ describe("loadClaudeProject — mcp assembly", () => {
   it("yields servers: [] (and no diagnostics) when no MCP config exists anywhere", () => {
     const root = makeTmp();
     const project = loadFrom(root);
-    expect(project.mcp).toEqual({ servers: [], diagnostics: [] });
+    expect(project.mcp).toEqual({
+      servers: [],
+      diagnostics: [],
+      policyPosture: "absent",
+      policyAuthority: "user-controlled",
+      policyObservations: [],
+      policyFailures: [],
+    });
   });
 
   it("uses ambient env rather than settings.env for remote interpolation end to end", () => {

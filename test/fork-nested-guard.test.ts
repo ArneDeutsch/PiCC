@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import picc from "../src/index.js";
 import type { PiSdk, PiSessionMessage } from "../src/runtime/subagents.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -47,9 +48,12 @@ beforeAll(() => {
   fs.mkdirSync(userDir, { recursive: true });
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
-  // A plausible main-session transcript path — the FAKE fork manager never reads
-  // it (subagentSessionDir is pure path derivation), so it need not exist.
-  mainFile = path.join(dir, "main-session.jsonl");
+  // Ownership admission intentionally uses Pi's real header rather than a
+  // production-bypassing fake; fork execution itself remains scripted below.
+  const main = SessionManager.create(dir, dir, { id: "main-session" });
+  main.appendMessage({ role: "user", content: SEED[0]!.content } as never);
+  main.appendMessage(SEED[1] as never);
+  mainFile = main.getSessionFile()!;
 });
 
 afterAll(() => {

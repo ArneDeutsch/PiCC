@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { Diagnostic, ManagedPolicySourceClass } from "../types.js";
+import {
+  loadManagedMcpSnapshot,
+  type ManagedMcpIo,
+  type ManagedMcpResult,
+} from "../claude/managed-mcp.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
 
 export { isQualifiedPluginId } from "../util/plugin-id.js";
@@ -130,6 +135,26 @@ export interface ManagedPolicyResult {
   /** Diagnostics and contributions in policy source order. */
   events: ManagedPolicyEvent[];
   administratorPresent: boolean;
+}
+
+export function defaultManagedMcpPath(platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") return "C:\\Program Files\\ClaudeCode\\managed-mcp.json";
+  if (platform === "darwin") return "/Library/Application Support/ClaudeCode/managed-mcp.json";
+  return "/etc/claude-code/managed-mcp.json";
+}
+
+export interface ManagedMcpDiscoveryOptions {
+  platform?: NodeJS.Platform;
+  /** Structural authority reserved for deterministic tests; production callers use the fixed platform path. */
+  testAuthority?: { readonly path: string; readonly io: ManagedMcpIo };
+}
+
+export function discoverManagedMcp(options: ManagedMcpDiscoveryOptions = {}): ManagedMcpResult {
+  const authority = options.testAuthority;
+  return loadManagedMcpSnapshot(
+    authority?.path ?? defaultManagedMcpPath(options.platform ?? process.platform),
+    authority?.io,
+  );
 }
 
 export function defaultManagedPolicyDescription(
@@ -440,6 +465,15 @@ function addJson(
     Object.create(null) as Record<string, unknown>,
     value,
   );
+  // Policy fields are compiler material: generic managed merging may deduplicate
+  // arrays, but each attributed physical contribution must remain verbatim.
+  for (const key of ["allowedMcpServers", "deniedMcpServers", "allowManagedMcpServersOnly"] as const) {
+    if (Object.hasOwn(value, key)) {
+      Object.defineProperty(normalized, key, {
+        value: value[key], writable: true, enumerable: true, configurable: true,
+      });
+    }
+  }
   const contribution = { value: normalized, source, sourceClass };
   parsed.push(contribution);
   events.push({ type: "source", source: contribution });

@@ -1,5 +1,7 @@
+import fs from "node:fs";
 import path from "node:path";
-import { isFile, readTextSafe } from "../util/fs.js";
+import { MCP_POLICY_LIMITS } from "../engine/mcp-policy.js";
+import { expandEnvVars as expandEnvVarsShared } from "../util/expand-env.js";
 import {
   isDocumentedMarketplaceName,
   normalizeMarketplacePolicyDescriptor,
@@ -13,14 +15,18 @@ import {
   stripJsonc,
   type ManagedPolicyDiscoveryOptions,
 } from "./managed-policy.js";
+import { DEFAULT_CLEANUP_PERIOD_DAYS } from "../types.js";
 import type {
   ClaudeSettings,
   Diagnostic,
   HookHandler,
   HookHandlerType,
   HookMatcherEntry,
+  McpPolicySettingsEntry,
+  McpPolicySourceFailure,
   McpSettingsEntry,
   PluginMarketplaceSettingsContribution,
+  RetentionCleanupBlocker,
   Scope,
 } from "../types.js";
 
@@ -33,8 +39,30 @@ export { stripJsonc } from "./managed-policy.js";
  *
  * Rule lists and hooks accumulate, `env` and `enabledPlugins` merge key-wise,
  * and valid scalar values replace lower-precedence values. Malformed entries
- * diagnose without discarding unrelated settings or valid lower-scope values.
+ * normally diagnose without discarding unrelated settings or valid lower-scope
+ * values; ordinary-scope MCP policy schema failures reject their whole file.
  */
+export interface LoadedClaudeSettings extends ClaudeSettings {
+  /** Ordered, presence-preserving inputs for the managed MCP policy compiler. */
+  mcpPolicySettings: McpPolicySettingsEntry[];
+  /** Bounded value-redacted failures from applicable managed policy sources. */
+  mcpPolicySourceFailures: McpPolicySourceFailure[];
+  /** True when either bounded policy projection omitted restrictive material. */
+  mcpPolicyRestrictiveMaterialOmitted: boolean;
+}
+
+export type OrdinarySettingsProbeResult =
+  | { status: "absent" }
+  | { status: "text"; text: string }
+  | { status: "unreadable" };
+
+export type OrdinarySettingsProbe = (filePath: string) => OrdinarySettingsProbeResult;
+
+export interface OrdinarySettingsIo {
+  statIsFile(filePath: string): boolean;
+  readText(filePath: string): string;
+}
+
 export interface LoadSettingsOptions {
   /** Launch directory; nested settings between here and projectRoot load too. */
   cwd: string;
@@ -44,6 +72,10 @@ export interface LoadSettingsOptions {
   managedPaths?: string[];
   /** Injectable ambient managed-policy boundary (used by deterministic tests). */
   managedPolicy?: ManagedPolicyDiscoveryOptions;
+  /** Narrow deterministic seam for ordinary settings discovery and reads. */
+  ordinarySettingsProbe?: OrdinarySettingsProbe;
+  /** Low-level probe IO used only to exercise production race classification deterministically. */
+  ordinarySettingsIo?: OrdinarySettingsIo;
 }
 
 const DEFERRED_TOP_KEYS = new Set([
@@ -63,7 +95,7 @@ const DEFERRED_TOP_KEYS = new Set([
 
 const KNOWN_HANDLER_TYPES: readonly string[] = ["command", "http", "prompt", "agent", "mcp_tool"];
 
-function createDefaultSettings(): ClaudeSettings {
+function createDefaultSettings(): LoadedClaudeSettings {
   return {
     permissions: { allow: [], deny: [], ask: [], additionalDirectories: [] },
     hooks: {},
@@ -74,6 +106,9 @@ function createDefaultSettings(): ClaudeSettings {
     claudeMdExcludes: [],
     autoMemoryEnabled: true,
     worktree: { baseRef: "head" },
+    cleanupPeriodDays: DEFAULT_CLEANUP_PERIOD_DAYS,
+    retentionCleanupAllowed: true,
+    retentionCleanupBlockers: [],
     subagentsEnabled: true,
     // maxDepth accepts positive integers, but nesting requires a value greater than 1.
     // Main-session-only remains the default to avoid unexpected recursive fan-out
@@ -85,6 +120,9 @@ function createDefaultSettings(): ClaudeSettings {
     pluginMarketplaceSettings: [],
     pluginMarketplaceSettingsOmissions: { contributions: 0, declarations: 0 },
     mcpSettings: [],
+    mcpPolicySettings: [],
+    mcpPolicySourceFailures: [],
+    mcpPolicyRestrictiveMaterialOmitted: false,
     unknownKeys: [],
     deferredKeys: [],
     diagnostics: [],
@@ -105,22 +143,7 @@ export function expandEnvVars(
   env: NodeJS.ProcessEnv = process.env,
   onUnset?: (name: string) => void,
 ): string {
-  // The FUNCTION replacer form is load-bearing: a string replacement would let
-  // env values containing `$&`/`$'`-style replacement patterns inject text.
-  return value.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}/g,
-    (match, name: string, defaultPart?: string, defaultValue?: string) => {
-      const current = env[name];
-      if (defaultPart !== undefined) {
-        return current !== undefined ? current : (defaultValue ?? "");
-      }
-      if (current === undefined) {
-        onUnset?.(name);
-        return match;
-      }
-      return current;
-    },
-  );
+  return expandEnvVarsShared(value, env, onUnset);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -261,6 +284,38 @@ function expectPositiveInt(
     return undefined;
   }
   return n;
+}
+
+function isValidCleanupPeriodDays(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 1;
+}
+
+function addRetentionCleanupBlocker(
+  out: ClaudeSettings,
+  blocker: RetentionCleanupBlocker,
+): void {
+  out.retentionCleanupAllowed = false;
+  const blockers = (out.retentionCleanupBlockers ??= []);
+  if (!blockers.some(({ reason, source }) => reason === blocker.reason && source === blocker.source)) {
+    blockers.push(blocker);
+  }
+}
+
+function applyCleanupPeriodDays(
+  value: unknown,
+  source: string,
+  out: ClaudeSettings,
+): void {
+  if (!isValidCleanupPeriodDays(value)) {
+    addRetentionCleanupBlocker(out, { reason: "invalid-period", source });
+    out.diagnostics.push({
+      severity: "warning",
+      message: 'Setting "cleanupPeriodDays" must be a literal positive integer (>= 1); ignored',
+      source,
+    });
+    return;
+  }
+  out.cleanupPeriodDays = value;
 }
 
 function asBool(value: unknown): boolean | undefined {
@@ -585,6 +640,124 @@ function marketplaceEntryFor(
   return entry;
 }
 
+const MCP_POLICY_KEYS = [
+  "allowedMcpServers",
+  "deniedMcpServers",
+  "allowManagedMcpServersOnly",
+] as const;
+
+type McpPolicyKey = (typeof MCP_POLICY_KEYS)[number];
+
+function isMcpPolicyRuleShape(value: unknown, allow: boolean): boolean {
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 1) return false;
+  if (keys[0] === "serverName") {
+    const name = value.serverName;
+    return typeof name === "string" && name.length > 0 &&
+      (!allow || /^[A-Za-z0-9_-]+$/u.test(name));
+  }
+  if (keys[0] === "serverUrl") {
+    return typeof value.serverUrl === "string" && value.serverUrl.length > 0;
+  }
+  if (keys[0] !== "serverCommand") return false;
+  const command = value.serverCommand;
+  return Array.isArray(command) && command.length > 0 &&
+    command.every((part) => typeof part === "string") && command[0]!.length > 0;
+}
+
+function validMcpPolicyField(key: McpPolicyKey, value: unknown): boolean {
+  return key === "allowManagedMcpServersOnly"
+    ? typeof value === "boolean"
+    : Array.isArray(value) && value.every((item) => isMcpPolicyRuleShape(item, key === "allowedMcpServers"));
+}
+
+function policyDiagnostic(
+  key: McpPolicyKey,
+  managed: boolean,
+  wholeFieldInvalid: boolean,
+  source: string,
+): Diagnostic {
+  return {
+    severity: managed ? "warning" : "error",
+    message: managed
+      ? wholeFieldInvalid
+        ? `Managed MCP policy field "${key}" has an invalid shape; retained as policy compiler input`
+        : `Managed MCP policy field "${key}" contains malformed entries; invalid entries are ignored`
+      : `Setting "${key}" is invalid; settings file skipped`,
+    source,
+  };
+}
+
+/** Project one file's policy fields before ordinary strict rejection or managed tolerant application. */
+function projectMcpPolicyFields(
+  raw: Record<string, unknown>,
+  scope: Scope,
+  source: string,
+  out: LoadedClaudeSettings,
+  order: number,
+): boolean {
+  const present = MCP_POLICY_KEYS.filter((key) => Object.hasOwn(raw, key));
+  if (present.length === 0) return true;
+  const managed = scope === "managed";
+  let valid = true;
+  const projected: McpPolicySettingsEntry = {
+    scope,
+    sourcePath: source,
+    order,
+    valid: true,
+  };
+
+  for (const key of present) {
+    const value = raw[key];
+    if (!validMcpPolicyField(key, value)) {
+      valid = false;
+      const wholeFieldInvalid = key === "allowManagedMcpServersOnly" || !Array.isArray(value);
+      out.diagnostics.push(policyDiagnostic(key, managed, wholeFieldInvalid, source));
+    }
+    if (managed && key !== "allowManagedMcpServersOnly" && Array.isArray(value)) {
+      projected[key] = value.filter((item) => isMcpPolicyRuleShape(item, key === "allowedMcpServers"));
+    } else if (!managed && key === "allowManagedMcpServersOnly") {
+      if (typeof value === "boolean") out.diagnostics.push({
+        severity: "warning",
+        message: 'Setting "allowManagedMcpServersOnly" applies only in managed settings; ignored',
+        source,
+      });
+    } else {
+      projected[key] = value;
+    }
+  }
+  projected.valid = managed || valid;
+  if (managed || valid) appendMcpPolicySetting(out, projected);
+  return managed || valid;
+}
+
+function appendMcpPolicySetting(out: LoadedClaudeSettings, entry: McpPolicySettingsEntry): void {
+  const entries = out.mcpPolicySettings;
+  if (entries.length < MCP_POLICY_LIMITS.settingsEntries) {
+    entries.push(entry);
+    return;
+  }
+  out.mcpPolicyRestrictiveMaterialOmitted = true;
+  if (entry.scope !== "managed") return;
+  const lowerAuthority = entries.findIndex((retained) => retained.scope !== "managed");
+  entries.splice(lowerAuthority >= 0 ? lowerAuthority : 0, 1);
+  entries.push(entry);
+}
+
+function appendMcpPolicyFailure(out: LoadedClaudeSettings, failure: McpPolicySourceFailure): void {
+  const failures = out.mcpPolicySourceFailures;
+  if (failures.length < MCP_POLICY_LIMITS.sourceFailures) {
+    failures.push(failure);
+    return;
+  }
+  out.mcpPolicyRestrictiveMaterialOmitted = true;
+  if (failure.authority === "user-controlled") return;
+  const userEvidence = failures.findIndex((retained) => retained.authority === "user-controlled");
+  failures.splice(userEvidence >= 0 ? userEvidence : 0, 1);
+  failures.push(failure);
+}
+
 /** Apply one parsed settings file onto the accumulating result (called in ascending precedence). */
 function applySettingsFile(
   raw: Record<string, unknown>,
@@ -597,6 +770,11 @@ function applySettingsFile(
     switch (key) {
       case "$schema":
         break; // editor metadata — recognized no-op
+      case "allowedMcpServers":
+      case "deniedMcpServers":
+      case "allowManagedMcpServersOnly":
+        // Projected once per physical source before this general settings pass.
+        break;
       case "permissions":
         applyPermissions(value, scope, source, out);
         break;
@@ -724,7 +902,7 @@ function applySettingsFile(
         if (scope !== "managed") {
           out.diagnostics.push({
             severity: "warning",
-            message: `Setting "claudeMd" is only honored in managed settings; ignored`,
+            message: `Setting "claudeMd" applies only in managed settings; ignored`,
             source,
           });
           break;
@@ -736,11 +914,9 @@ function applySettingsFile(
       case "worktree":
         applyWorktree(value, scope, source, out);
         break;
-      case "cleanupPeriodDays": {
-        const n = expectNumber(value, "cleanupPeriodDays", source, out.diagnostics);
-        if (n !== undefined) out.cleanupPeriodDays = n;
+      case "cleanupPeriodDays":
+        applyCleanupPeriodDays(value, source, out);
         break;
-      }
       case "apiKeyHelper": {
         const s = expectString(value, "apiKeyHelper", source, out.diagnostics);
         if (s !== undefined) out.apiKeyHelper = expandEnvVars(s);
@@ -921,11 +1097,34 @@ function settingsDirChain(cwd: string, projectRoot: string): string[] {
   return chain.reverse();
 }
 
+const nodeOrdinarySettingsIo: OrdinarySettingsIo = {
+  statIsFile: (filePath) => fs.statSync(filePath).isFile(),
+  readText: (filePath) => fs.readFileSync(filePath, "utf8"),
+};
+
+function nodeOrdinarySettingsProbe(
+  filePath: string,
+  io: OrdinarySettingsIo = nodeOrdinarySettingsIo,
+): OrdinarySettingsProbeResult {
+  try {
+    if (!io.statIsFile(filePath)) return { status: "unreadable" };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { status: "absent" }
+      : { status: "unreadable" };
+  }
+  try {
+    return { status: "text", text: io.readText(filePath) };
+  } catch {
+    return { status: "unreadable" };
+  }
+}
+
 /**
  * Load and merge the full settings hierarchy for a project.
  * Never throws — every problem degrades to a Diagnostic on the result.
  */
-export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
+export function loadSettings(opts: LoadSettingsOptions): LoadedClaudeSettings {
   const settings = createDefaultSettings();
 
   // Ascending precedence: later files win on scalar conflicts. Project scope
@@ -939,10 +1138,26 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
     files.push({ path: path.join(dir, ".claude", "settings.local.json"), scope: "local" });
   }
 
+  let nextMcpPolicyOrder = 0;
+  const projectPolicy = (raw: Record<string, unknown>, scope: Scope, source: string): boolean => {
+    const present = MCP_POLICY_KEYS.some((key) => Object.hasOwn(raw, key));
+    if (!present) return true;
+    if (!Number.isSafeInteger(nextMcpPolicyOrder)) {
+      settings.mcpPolicyRestrictiveMaterialOmitted = true;
+      return scope === "managed";
+    }
+    const accepted = projectMcpPolicyFields(raw, scope, source, settings, nextMcpPolicyOrder);
+    nextMcpPolicyOrder += 1;
+    return accepted;
+  };
+
+  const ordinarySettingsProbe = opts.ordinarySettingsProbe ??
+    ((filePath: string) => nodeOrdinarySettingsProbe(filePath, opts.ordinarySettingsIo));
   for (const file of files) {
-    if (!isFile(file.path)) continue; // absent — degrade silently (incl. managed/policy)
-    const text = readTextSafe(file.path);
-    if (text === undefined) {
+    const probe = ordinarySettingsProbe(file.path);
+    if (probe.status === "absent") continue;
+    if (probe.status === "unreadable") {
+      addRetentionCleanupBlocker(settings, { reason: "unreadable-source", source: file.path });
       settings.diagnostics.push({
         severity: "warning",
         message: "Settings file unreadable; skipped",
@@ -952,8 +1167,9 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(stripJsonc(text));
+      parsed = JSON.parse(stripJsonc(probe.text));
     } catch (err) {
+      addRetentionCleanupBlocker(settings, { reason: "malformed-source", source: file.path });
       settings.diagnostics.push({
         severity: "error",
         message: `Malformed settings JSON (${(err as Error).message}); file skipped`,
@@ -962,6 +1178,7 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
       continue;
     }
     if (!isPlainObject(parsed)) {
+      addRetentionCleanupBlocker(settings, { reason: "non-object-source", source: file.path });
       settings.diagnostics.push({
         severity: "error",
         message: "Settings root is not an object; file skipped",
@@ -969,6 +1186,7 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
       });
       continue;
     }
+    if (!projectPolicy(parsed, file.scope, file.path)) continue;
     applySettingsFile(parsed, file.scope, file.path, settings);
   }
 
@@ -984,7 +1202,29 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
   for (const event of managed.events) {
     if (event.type === "diagnostic") {
       settings.diagnostics.push(event.diagnostic);
+      if (event.diagnostic.category !== undefined && event.diagnostic.sourceClass !== undefined) {
+        const administrator = event.diagnostic.sourceClass !== "registry-hkcu" &&
+          event.diagnostic.sourceClass !== "override";
+        appendMcpPolicyFailure(settings, {
+          kind: event.diagnostic.category === "managed-policy-malformed" ? "malformed" : "unreadable",
+          sourceClass: event.diagnostic.sourceClass,
+          authority: administrator ? "administrator-controlled" : "user-controlled",
+          remediation: administrator ? "repair-administrator-policy" : "repair-user-policy",
+        });
+      }
+      if (
+        event.diagnostic.category === "managed-policy-malformed" ||
+        event.diagnostic.category === "managed-policy-unreadable"
+      ) {
+        addRetentionCleanupBlocker(settings, {
+          reason: event.diagnostic.category === "managed-policy-malformed"
+            ? "malformed-source"
+            : "unreadable-source",
+          source: event.diagnostic.source ?? "managed-policy",
+        });
+      }
     } else {
+      projectPolicy(event.source.value, "managed", event.source.source);
       applySettingsFile(
         event.source.value,
         "managed",

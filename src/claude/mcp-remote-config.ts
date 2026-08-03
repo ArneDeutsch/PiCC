@@ -1,4 +1,4 @@
-import { expandEnvVars } from "../discovery/settings.js";
+import { expandEnvVars } from "../util/expand-env.js";
 
 export type RemoteMcpTransportKind = "http" | "sse";
 export type RemoteMcpConfiguredType = "http" | "streamable-http" | "sse";
@@ -12,6 +12,9 @@ export interface RawRemoteMcpFields {
   configuredType: RemoteMcpConfiguredType;
   transportKind: RemoteMcpTransportKind;
   rawUrl: string;
+  /** Inert original shape. Header/helper fields are not inspected before admission. */
+  rawEntry?: Record<string, unknown>;
+  /** Empty before admission; retained for already-materialized runtime inputs. */
   rawHeaders: Record<string, string>;
   sseDeprecation?: RemoteMcpSseDeprecation;
 }
@@ -19,6 +22,13 @@ export interface RawRemoteMcpFields {
 export interface ResolvedRemoteMcpFields extends RawRemoteMcpFields {
   url: string;
   headers: Record<string, string>;
+}
+
+export interface RemoteMcpWorkHooks {
+  onHeaderValidation?: () => void;
+  onHeadersConstruction?: () => void;
+  onHelperInspection?: () => void;
+  onMaterialization?: () => void;
 }
 
 export type ParseRemoteMcpFieldsResult =
@@ -73,7 +83,9 @@ function validateAndCopyHeaders(
   value: unknown,
   serverName: string,
   sourceLabel: string,
+  hooks?: RemoteMcpWorkHooks,
 ): { headers: Record<string, string> } | { diagnostic: string } {
+  hooks?.onHeaderValidation?.();
   if (!isPlainRecord(value)) {
     return {
       diagnostic: diagnostic(
@@ -159,6 +171,7 @@ function validateAndCopyHeaders(
       };
     }
     try {
+      hooks?.onHeadersConstruction?.();
       new Headers([[name, valueAtEntry]]);
     } catch {
       return {
@@ -179,6 +192,7 @@ export function parseRemoteMcpFields(
   rawEntry: unknown,
   serverName: string,
   sourceLabel: string,
+  options: { deferPostAdmission?: boolean } = {},
 ): ParseRemoteMcpFieldsResult {
   if (!isPlainRecord(rawEntry)) return { kind: "not-remote" };
 
@@ -227,30 +241,29 @@ export function parseRemoteMcpFields(
   if (rawEntry.url.length === 0) {
     return { kind: "not-configured", configuredType, diagnostics: [] };
   }
-  if (Object.hasOwn(rawEntry, "headersHelper")) {
-    return {
-      kind: "skipped",
-      diagnostics: [
-        diagnostic(serverName, sourceLabel, 'uses deferred dynamic field "headersHelper"'),
-      ],
-    };
+  let rawHeaders = Object.create(null) as Record<string, string>;
+  if (options.deferPostAdmission !== true) {
+    if (Object.hasOwn(rawEntry, "headersHelper")) {
+      return {
+        kind: "skipped",
+        diagnostics: [diagnostic(serverName, sourceLabel, 'uses deferred dynamic field "headersHelper"')],
+      };
+    }
+    const headerResult = validateAndCopyHeaders(
+      rawEntry.headers === undefined ? Object.create(null) : rawEntry.headers,
+      serverName,
+      sourceLabel,
+    );
+    if ("diagnostic" in headerResult) return { kind: "skipped", diagnostics: [headerResult.diagnostic] };
+    rawHeaders = headerResult.headers;
   }
-
-  const rawHeaderResult = validateAndCopyHeaders(
-    rawEntry.headers === undefined ? Object.create(null) : rawEntry.headers,
-    serverName,
-    sourceLabel,
-  );
-  if ("diagnostic" in rawHeaderResult) {
-    return { kind: "skipped", diagnostics: [rawHeaderResult.diagnostic] };
-  }
-
   const transportKind: RemoteMcpTransportKind = configuredType === "sse" ? "sse" : "http";
   const fields: RawRemoteMcpFields = {
     configuredType,
     transportKind,
     rawUrl: rawEntry.url,
-    rawHeaders: rawHeaderResult.headers,
+    rawEntry,
+    rawHeaders,
   };
   if (configuredType === "sse") {
     fields.sseDeprecation = { deprecated: true, replacement: "http" };
@@ -264,7 +277,27 @@ export function resolveRemoteMcpFields(
   onUnset: ((name: string) => void) | undefined,
   serverName: string,
   sourceLabel: string,
+  hooks?: RemoteMcpWorkHooks,
 ): ResolveRemoteMcpFieldsResult {
+  hooks?.onMaterialization?.();
+  const rawEntry = raw.rawEntry;
+  hooks?.onHelperInspection?.();
+  if (rawEntry !== undefined && Object.hasOwn(rawEntry, "headersHelper")) {
+    return {
+      kind: "skipped",
+      diagnostics: [diagnostic(serverName, sourceLabel, 'uses deferred dynamic field "headersHelper"')],
+    };
+  }
+  const rawHeaderResult = validateAndCopyHeaders(
+    rawEntry === undefined
+      ? raw.rawHeaders
+      : rawEntry.headers === undefined ? Object.create(null) : rawEntry.headers,
+    serverName,
+    sourceLabel,
+    hooks,
+  );
+  if ("diagnostic" in rawHeaderResult) return { kind: "skipped", diagnostics: [rawHeaderResult.diagnostic] };
+
   const unsetNames = new Set<string>();
   const reportUnset = (name: string): void => {
     onUnset?.(name);
@@ -272,7 +305,7 @@ export function resolveRemoteMcpFields(
   };
   const url = expandEnvVars(raw.rawUrl, env, reportUnset);
   const expandedHeaders = Object.create(null) as Record<string, string>;
-  for (const [name, value] of Object.entries(raw.rawHeaders)) {
+  for (const [name, value] of Object.entries(rawHeaderResult.headers)) {
     expandedHeaders[name] = expandEnvVars(value, env, reportUnset);
   }
 
@@ -311,7 +344,7 @@ export function resolveRemoteMcpFields(
     };
   }
 
-  const headerResult = validateAndCopyHeaders(expandedHeaders, serverName, sourceLabel);
+  const headerResult = validateAndCopyHeaders(expandedHeaders, serverName, sourceLabel, hooks);
   if ("diagnostic" in headerResult) {
     return { kind: "skipped", diagnostics: [headerResult.diagnostic] };
   }

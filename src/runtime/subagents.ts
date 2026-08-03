@@ -38,7 +38,8 @@ import {
   FORK_DEGRADE_PREFIX,
   isAgentId,
   mintAgentId,
-  subagentSessionDir,
+  prepareSubagentTranscriptCollection,
+  type PrepareSubagentTranscriptCollectionResult,
 } from "../util/subagent-transcripts.js";
 import {
   renderProgressText,
@@ -90,6 +91,9 @@ import {
  * nesting depth, optional worktree isolation, and VERBATIM final-message return
  * (skills parse the final message — often locked YAML — directly; hard contract).
  */
+
+export const TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE =
+  "Preserve or back up any existing transcript data and collections. Never edit or delete an ownership marker by hand. Start a new main session before retrying future persisted subagents, and review old transcript data separately.";
 
 /** Structural interface for the WorktreeManager (avoids import-order coupling). */
 export interface WorktreeManagerLike {
@@ -207,6 +211,8 @@ export interface SubagentRuntimeDeps {
    * derived from it; without it, dispatch degrades to in-memory.
    */
   getMainSessionFile?: () => string | undefined;
+  /** Test-only seam; production validates and marks ownership before either persistence factory runs. */
+  prepareTranscriptCollection?: (mainSessionFile: string) => PrepareSubagentTranscriptCollectionResult;
   worktrees?: WorktreeManagerLike;
   maxDepth: number;
   concurrency: number;
@@ -1600,6 +1606,7 @@ export class SubagentRuntime {
     // never a resume, so the cwd known at interception equals the dispatch cwd passed
     // here. Undefined ⇒ nothing to fork (degraded at interception, or not a fork).
     let attemptForkSession: ((cwd: string) => PiSessionManagerLike) | undefined;
+    let forkOwnershipAdmissionFailed = false;
     // The developer-/model-facing degrade reason + tone (calm `info` for a chosen/
     // expected opt-out, `warning` for a genuine can't-do). Surfaced as a fork-
     // specific notice — never the generic unknown-type warning, never silent. The
@@ -1706,13 +1713,16 @@ export class SubagentRuntime {
         // the dispatch cwd is passed in at the call site.
         const forkSdkRef = forkSdk!;
         const forkMainFileRef = forkMainFile;
-        attemptForkSession = (cwd: string) =>
-          forkSdkRef.forkSessionManager!(
+        attemptForkSession = (cwd: string) => {
+          const prepared = (this.deps.prepareTranscriptCollection ?? prepareSubagentTranscriptCollection)(
             forkMainFileRef,
-            cwd,
-            subagentSessionDir(forkMainFileRef),
-            agentId,
           );
+          if (!prepared.ok) {
+            forkOwnershipAdmissionFailed = true;
+            throw new Error(prepared.diagnostic.message);
+          }
+          return forkSdkRef.forkSessionManager!(forkMainFileRef, cwd, prepared.directory, agentId);
+        };
       }
 
       if (isFork) {
@@ -2177,10 +2187,14 @@ export class SubagentRuntime {
           agent = resolveAgent(builtins, "general-purpose") ?? agent;
           emitForkDegrade(
             "warning",
-            `forking the parent session failed`,
-            `forking the parent session failed (${capErrorText(
-              (err as Error)?.message ?? String(err),
-            )})`,
+            forkOwnershipAdmissionFailed
+              ? `transcript ownership could not be verified. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`
+              : `forking the parent session failed`,
+            forkOwnershipAdmissionFailed
+              ? `forking the parent session failed because transcript ownership could not be verified. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`
+              : `forking the parent session failed (${capErrorText(
+                (err as Error)?.message ?? String(err),
+              )})`,
           );
         }
       }
@@ -2452,14 +2466,20 @@ export class SubagentRuntime {
         }
       } else if (mainSessionFile && sdk.persistedSessionManager) {
         try {
-          const persisted = sdk.persistedSessionManager(
-            cwd,
-            subagentSessionDir(mainSessionFile),
-            agentId,
+          const prepared = (this.deps.prepareTranscriptCollection ?? prepareSubagentTranscriptCollection)(
+            mainSessionFile,
           );
-          transcriptPath = persisted.getSessionFile() ?? undefined;
-          sessionManager = persisted;
-          resumable = !oneShot && transcriptPath !== undefined;
+          if (!prepared.ok) {
+            diagnostics.push(prepared.diagnostic, {
+              severity: "warning",
+              message: `subagent transcript persistence was skipped; this run is in-memory and non-resumable. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`,
+            });
+          } else {
+            const persisted = sdk.persistedSessionManager(cwd, prepared.directory, agentId);
+            transcriptPath = persisted.getSessionFile() ?? undefined;
+            sessionManager = persisted;
+            resumable = !oneShot && transcriptPath !== undefined;
+          }
         } catch (err) {
           diagnostics.push({
             severity: "warning",

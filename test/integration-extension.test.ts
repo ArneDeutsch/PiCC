@@ -1326,11 +1326,6 @@ describe("session lifecycle hooks", () => {
       expect(notificationText).not.toContain("PiCC compatibility:");
       expect(notificationText).not.toContain("Run /doctor");
       expect(notificationText).not.toContain("is not vision-capable");
-      // The ONE deliberate exception to quiet startup: the fixture's unapproved
-      // .mcp.json server is ACTIONABLE state, so exactly one MCP pending toast
-      // fires (asserted in detail in its own test below).
-      expect(pi.notifications.filter((item) => item.text.includes("pending approval"))).toHaveLength(1);
-
       const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
       expect(consoleText).not.toContain("PiCC compatibility:");
       expect(consoleText).not.toContain("Run /doctor");
@@ -1394,25 +1389,6 @@ describe("session lifecycle hooks", () => {
     pi.notifications.length = 0;
     await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
     expect(pi.notifications.filter((item) => item.text.split("\n").some((line) => /^Plugin .+ needs attention: .+\. Run \/doctor for details\.$/u.test(line)))).toEqual([]);
-  });
-
-  it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {
-    pi.notifications.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
-    const pendingToasts = pi.notifications.filter((n) => n.text.includes("pending approval"));
-    expect(pendingToasts).toHaveLength(1);
-    const text = pendingToasts[0]!.text;
-    // The bounded one-line notice carries a server sample, decision keys, and
-    // the /doctor pointer; detailed safe settings guidance stays out of the toast.
-    expect(text).not.toContain("\n");
-    expect(text).toContain("example-server");
-    expect(text).toContain("enabledMcpjsonServers");
-    expect(text).not.toContain("settings.local.json");
-    expect(text).toContain("/doctor for safe settings guidance");
-    // A non-startup session_start (e.g. /new) must not re-toast it.
-    pi.notifications.length = 0;
-    await pi.fire("session_start", { reason: "new" }, pi.tuiCtx());
-    expect(pi.notifications.filter((n) => n.text.includes("pending approval"))).toHaveLength(0);
   });
 
   it("/doctor renders the registry-generated breakdown with the MCP posture line", async () => {
@@ -3089,6 +3065,95 @@ describe("child worktree stops through the production extension assembly", () =>
       }
     },
   );
+});
+
+describe("managed MCP policy diagnostics through the real extension snapshot", () => {
+  async function loadPolicyProject(policyText: string, managedMcp: "absent" | "unreadable" = "absent"): Promise<{
+    readonly projectDir: string;
+    readonly owner: FakePi;
+    readonly cleanup: () => Promise<void>;
+  }> {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-managed-policy-diag-"));
+    const userDir = path.join(projectDir, ".claude-user");
+    const policyPath = path.join(projectDir, "managed-policy.json");
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "CLAUDE.md"), "Managed policy diagnostic fixture.\n");
+    fs.writeFileSync(policyPath, policyText);
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    process.chdir(projectDir);
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    const owner = fakePi();
+    picc(owner.api as never, {
+      managedSettingsPaths: [policyPath],
+      managedArtifactDirs: [],
+      managedMcpDiscovery: {
+        testAuthority: {
+          path: "/test/managed-mcp",
+          io: { open: () => ({ status: managedMcp }) },
+        },
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    process.chdir(previousCwd);
+    return {
+      projectDir,
+      owner,
+      cleanup: async () => {
+        await owner.fire("session_shutdown", { reason: "other" }, owner.printCtx());
+        if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+        else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+        fs.rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      },
+    };
+  }
+
+  it("preserves compiler observations on /mcp and /doctor without inventing a startup warning", async () => {
+    const fixture = await loadPolicyProject(JSON.stringify({ deniedMcpServers: "DENY_FIELD_SECRET_CANARY" }));
+    try {
+      await fixture.owner.fire("session_start", { reason: "startup" }, fixture.owner.tuiCtx());
+      expect(fixture.owner.notifications.filter((item) => item.text.includes("MCP"))).toEqual([]);
+      await fixture.owner.commands.get("mcp").handler("", fixture.owner.tuiCtx());
+      await fixture.owner.commands.get("doctor").handler("", fixture.owner.tuiCtx());
+      const reports = fixture.owner.entries
+        .filter((entry) => entry.data?.command === "mcp" || entry.data?.command === "doctor")
+        .map((entry) => String(entry.data?.output ?? ""));
+      expect(reports).toHaveLength(2);
+      for (const report of reports) {
+        expect(report).toContain("invalid managed deny field was stripped");
+        expect(report).not.toContain("DENY_FIELD_SECRET_CANARY");
+      }
+      expect(fixture.owner.messages).toEqual([]);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("renders one fail-closed startup notice and authority-specific report recovery from the same snapshot", async () => {
+    const fixture = await loadPolicyProject("{}", "unreadable");
+    try {
+      await fixture.owner.fire("session_start", { reason: "startup" }, fixture.owner.tuiCtx());
+      await fixture.owner.fire("session_start", { reason: "new" }, fixture.owner.tuiCtx());
+      const notices = fixture.owner.notifications.filter((item) => item.text.includes("MCP policy is fail closed"));
+      expect(notices).toHaveLength(1);
+      await fixture.owner.commands.get("mcp").handler("", fixture.owner.tuiCtx());
+      await fixture.owner.commands.get("doctor").handler("", fixture.owner.tuiCtx());
+      const reports = fixture.owner.entries
+        .filter((entry) => entry.data?.command === "mcp" || entry.data?.command === "doctor")
+        .map((entry) => String(entry.data?.output ?? ""));
+      expect(reports).toHaveLength(2);
+      for (const report of reports) {
+        expect(report).toContain("Managed MCP policy: fail closed; no candidate can start");
+        expect(report).toContain("Ask the administrator to repair or recover the applicable managed MCP policy input");
+        expect(report).toContain("standalone managed MCP file was unreadable");
+      }
+      expect(fixture.owner.messages).toEqual([]);
+      expect([...fixture.owner.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 });
 
 describe("MCP timeout diagnostic delivery (zero-enabled project)", () => {

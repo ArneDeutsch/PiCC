@@ -67,9 +67,9 @@ see [Install and runtime selection](doc/user-guide.md#2-install).
   bridge), auto memory, and `.claude/rules/`.
 - **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
   as a hard block.
-- **MCP servers** — native user/local and project-configured stdio or selected remote HTTP/SSE
-  servers expose tools, user-invoked prompts, and model-facing resources with source-specific
-  approval and disablement; see the [capability matrix](doc/supported-features.md) for exact limits.
+- **MCP servers** — native, project-configured, and standalone managed stdio or selected remote
+  HTTP/SSE servers expose tools, prompts, and resources behind central policy admission and
+  source-specific controls; see the [capability matrix](doc/supported-features.md) for exact limits.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
 - **Plugins** — read-only local inventory and diagnostics accompany exact installed-state loading;

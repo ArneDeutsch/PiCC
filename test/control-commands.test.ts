@@ -5,6 +5,7 @@ import path from "node:path";
 import net from "node:net";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
+import type { ManagedMcpIo } from "../src/claude/managed-mcp.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred } from "./helpers/async.js";
 import { fakeSdk } from "./helpers/fake-sdk.js";
@@ -468,6 +469,266 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
     } finally {
       fresh.api.appendEntry = append;
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("managed MCP snapshot status and aggregate startup notice", () => {
+  const inertMcpRuntime = {
+    whenSettled: async () => {},
+    tools: () => [],
+    prompts: () => [],
+    resourceServers: () => [],
+    callTool: async () => { throw new Error("inert MCP runtime"); },
+    getPrompt: async () => { throw new Error("inert MCP runtime"); },
+    readResource: async () => { throw new Error("inert MCP runtime"); },
+    diagnostics: () => [],
+    serverStates: () => [],
+    shutdown: async () => {},
+  };
+
+  function managedMcpIo(text: string | undefined): ManagedMcpIo {
+    if (text === undefined) return { open: () => ({ status: "absent" }) };
+    const bytes = Buffer.from(text, "utf8");
+    const metadata = { regular: true, size: bytes.length, identity: "managed-test", modified: "stable" };
+    return {
+      open: () => ({
+        status: "opened",
+        handle: {
+          metadata: () => metadata,
+          read: () => bytes,
+          currentPathMetadata: () => metadata,
+          close: () => true,
+        },
+      }),
+    };
+  }
+
+  async function policySnapshotProject(options: {
+    managed?: Record<string, unknown>;
+    ordinary?: Record<string, unknown>;
+    policy?: Record<string, unknown>;
+  }): Promise<{ fresh: FakePi; root: string }> {
+    const managedPaths: string[] = [];
+    return await freshControlPi({
+      mcpRuntime: inertMcpRuntime,
+      managedSettingsPaths: managedPaths,
+      managedArtifactDirs: [],
+      managedMcpDiscovery: {
+        testAuthority: {
+          path: "/test/managed-mcp",
+          io: managedMcpIo(options.managed === undefined
+            ? undefined
+            : JSON.stringify({ mcpServers: options.managed })),
+        },
+      },
+    }, (root) => {
+      if (options.ordinary) {
+        const userDir = path.join(root, ".claude-user");
+        fs.mkdirSync(userDir, { recursive: true });
+        fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ mcpServers: options.ordinary }));
+      }
+      if (options.policy) {
+        const managed = path.join(root, "managed-policy.json");
+        fs.writeFileSync(managed, JSON.stringify(options.policy));
+        managedPaths.push(managed);
+      }
+    });
+  }
+
+  async function renderedMcpReports(fresh: FakePi): Promise<readonly string[]> {
+    await fresh.commands.get("mcp").handler("", fresh.tuiCtx());
+    await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+    const reports = fresh.entries
+      .filter((entry) => entry.data?.command === "mcp" || entry.data?.command === "doctor")
+      .map((entry) => String(entry.data?.output ?? ""));
+    expect(reports).toHaveLength(2);
+    return reports;
+  }
+
+  async function mixedPolicyProject(): Promise<{ fresh: FakePi; root: string }> {
+    const managedPaths: string[] = [];
+    return await freshControlPi({
+      managedSettingsPaths: managedPaths,
+      managedArtifactDirs: [],
+      managedMcpDiscovery: {
+        testAuthority: { path: "/test/absent-managed-mcp", io: { open: () => ({ status: "absent" }) } },
+      },
+    }, (root) => {
+      fs.writeFileSync(path.join(root, ".mcp.json"), JSON.stringify({
+        mcpServers: {
+          pending: { command: "PENDING_COMMAND_SECRET_CANARY", args: ["PENDING_ARG_SECRET_CANARY"] },
+          blocked: { command: "BLOCKED_COMMAND_SECRET_CANARY" },
+        },
+      }));
+      const managed = path.join(root, "managed-policy.json");
+      fs.writeFileSync(managed, JSON.stringify({
+        deniedMcpServers: [{ serverName: "blocked" }],
+      }));
+      managedPaths.push(managed);
+    });
+  }
+
+  it("reports exclusive-empty once across startup and /new without model messages", async () => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const { fresh, root } = await policySnapshotProject({
+      managed: {},
+      ordinary: { ordinary: { command: "ordinary-command" } },
+    });
+    try {
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
+      const notices = fresh.notifications.filter((item) => item.text.includes("empty exclusive server set"));
+      expect(notices).toHaveLength(1);
+      const reports = await renderedMcpReports(fresh);
+      for (const report of reports) {
+        expect(report).toContain("exclusive administrator server set is empty; all MCP is disabled");
+        expect(report).toContain("If access is expected, request an administrator policy change.");
+        expect(report).not.toContain('"ordinary":');
+      }
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  });
+
+  it("keeps healthy populated-exclusive authority quiet while retaining only managed rows", async () => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const { fresh, root } = await policySnapshotProject({
+      managed: { managed: { command: "managed-command" } },
+      ordinary: { ordinary: { command: "ordinary-command" } },
+    });
+    try {
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
+      expect(fresh.notifications.filter((item) => item.text.includes("MCP"))).toEqual([]);
+      const reports = await renderedMcpReports(fresh);
+      for (const report of reports) {
+        expect(report).toContain("exclusive administrator server set is active");
+        expect(report).toContain('"managed":');
+        expect(report).not.toContain('"ordinary":');
+      }
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  });
+
+  it("reports an actually denied managed row once without /new replay", async () => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const blockedName = "managed-blocked";
+    const { fresh, root } = await policySnapshotProject({
+      managed: { [blockedName]: { command: "MANAGED_BLOCKED_COMMAND_CANARY" } },
+      ordinary: { ordinary: { command: "ordinary-command" } },
+      policy: { deniedMcpServers: [{ serverName: blockedName }] },
+    });
+    try {
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
+      const notices = fresh.notifications.filter((item) => item.text.includes("MCP policy blocked"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text).toContain(`MCP policy blocked 1 server(s): ${JSON.stringify(blockedName)}`);
+      expect(notices[0]!.text).not.toContain("MANAGED_BLOCKED_COMMAND_CANARY");
+      const reports = await renderedMcpReports(fresh);
+      for (const report of reports) {
+        expect(report).toContain(`${JSON.stringify(blockedName)}: blocked`);
+        expect(report).not.toContain('"ordinary":');
+      }
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  });
+
+  it("keeps a valid nonmatching active policy quiet", async () => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const { fresh, root } = await policySnapshotProject({
+      ordinary: { ordinary: { command: "ordinary-command" } },
+      policy: { deniedMcpServers: [{ serverName: "different-server" }] },
+    });
+    try {
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
+      expect(fresh.notifications.filter((item) => item.text.includes("MCP"))).toEqual([]);
+      const reports = await renderedMcpReports(fresh);
+      for (const report of reports) {
+        expect(report).toContain("Managed MCP policy: active rules.");
+        expect(report).toContain('"ordinary":');
+        expect(report).not.toContain("invalid managed deny field was stripped");
+      }
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  });
+
+  it("renders one mixed snapshot in /mcp and /doctor and never repeats it on /new", async () => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const { fresh, root } = await mixedPolicyProject();
+    try {
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "startup" }, fresh.tuiCtx());
+      await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
+      const notices = fresh.notifications.filter((item) => item.text.includes("MCP"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text).toContain("pending approval");
+      expect(notices[0]!.text).toContain('MCP policy blocked 1 server(s): "blocked"');
+      expect(notices[0]!.text.length).toBeLessThan(1_000);
+
+      await fresh.commands.get("mcp").handler("", fresh.tuiCtx());
+      await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
+      const mcp = String(fresh.entries.find((entry) => entry.data?.command === "mcp")?.data?.output ?? "");
+      const doctor = String(fresh.entries.find((entry) => entry.data?.command === "doctor")?.data?.output ?? "");
+      for (const report of [mcp, doctor]) {
+        expect(report).toContain('"pending": pending approval');
+        expect(report).toContain('"blocked": blocked');
+        expect(report).toContain("request an administrator policy change");
+      }
+      const observed = JSON.stringify({ notices, entries: fresh.entries, messages: fresh.messages });
+      expect(observed).not.toMatch(/(?:PENDING_(?:COMMAND|ARG)|BLOCKED_COMMAND)_SECRET_CANARY/u);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    }
+  });
+
+  it.each(["print", "rpc"] as const)("uses stderr rather than UI/model context in %s mode", async (mode) => {
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { fresh, root } = await mixedPolicyProject();
+    try {
+      const ctx = mode === "print" ? fresh.printCtx() : fresh.rpcCtx();
+      await fresh.fire("session_start", { reason: "startup" }, ctx);
+      await fresh.fire("session_start", { reason: "new" }, ctx);
+      const stderr = error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("MCP policy blocked"));
+      expect(stderr).toHaveLength(1);
+      expect(stderr[0]).toContain("pending approval");
+      expect(fresh.notifications).toEqual([]);
+      expect(fresh.messages).toEqual([]);
+      expect(stderr.join("\n")).not.toMatch(/(?:PENDING_(?:COMMAND|ARG)|BLOCKED_COMMAND)_SECRET_CANARY/u);
+    } finally {
+      error.mockRestore();
+      await fresh.fire("session_shutdown", { reason: "other" }, fresh.printCtx());
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
     }
   });
 });
@@ -976,7 +1237,7 @@ describe("plugin startup warning wiring", () => {
     const tui = await freshControlPi(undefined, missingSetup);
     const headless = await freshControlPi(undefined, missingSetup);
     const throwing = await freshControlPi(undefined, missingSetup);
-    let throwingNotifyCalls = 0;
+    let throwingPluginNotifyCalls = 0;
     const omitted = await freshControlPi(undefined, omissionSetup);
     const quiet = await freshControlPi();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1021,11 +1282,14 @@ describe("plugin startup warning wiring", () => {
       expect(stderr[0]).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
 
       const notificationFault = throwing.fresh.tuiCtx({
-        ui: { notify: () => { throwingNotifyCalls += 1; throw new Error("SECRET_NOTIFICATION_EXCEPTION_CANARY"); } },
+        ui: { notify: (text: string) => {
+          if (text.includes("needs attention")) throwingPluginNotifyCalls += 1;
+          throw new Error("SECRET_NOTIFICATION_EXCEPTION_CANARY");
+        } },
       });
       await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
       await expect(throwing.fresh.fire("session_start", { reason: "startup" }, notificationFault)).resolves.toBeUndefined();
-      expect(throwingNotifyCalls).toBe(1);
+      expect(throwingPluginNotifyCalls).toBe(1);
       expect(error.mock.calls.flat().join("\n")).not.toContain("SECRET_NOTIFICATION_EXCEPTION_CANARY");
 
       await quiet.fresh.fire("session_start", { reason: "startup" }, quiet.fresh.tuiCtx());

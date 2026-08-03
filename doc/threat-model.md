@@ -25,6 +25,9 @@ PiCC adds compatibility behavior around Pi, so it must preserve these boundaries
 - **Enforced controls.** Project content and model-generated tool requests must not bypass the
   controls PiCC claims to enforce, including permission denies, agent tool gating, MCP approval, and
   worktree boundaries.
+- **Administrator-managed MCP admission.** Applicable managed policy governs every MCP source PiCC
+  loads. Uncertainty that could weaken that policy fails closed under documented PiCC hardening, and
+  a blocked server cannot initiate server-side effects.
 - **Untrusted project input.** A cloned project's settings, hooks, skills, agents, context files,
   MCP configuration, and path values may be malformed or hostile. Loading and parsing them must not
   silently grant capabilities or escape an advertised project or worktree boundary.

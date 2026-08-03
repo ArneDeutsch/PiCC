@@ -5,16 +5,30 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { Diagnostic, HookOutcome, HookPayload, PluginRuntimeContext, ToolCallDescriptor } from "./types.js";
+import {
+  DEFAULT_CLEANUP_PERIOD_DAYS,
+  type Diagnostic,
+  type HookOutcome,
+  type HookPayload,
+  type PluginRuntimeContext,
+  type ResolvedMcpConfig,
+  type ToolCallDescriptor,
+} from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
+import type { ManagedMcpDiscoveryOptions } from "./discovery/managed-policy.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
 import { HookRunner, mergeHookOutcomes } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
 import { parseHookConfig } from "./claude/hooks.js";
-import { WorktreeManager } from "./runtime/worktrees.js";
+import { WorktreeManager, type WorktreeReapResult } from "./runtime/worktrees.js";
+import {
+  reapSubagentTranscripts,
+  type SubagentTranscriptReapResult,
+} from "./runtime/subagent-transcript-retention.js";
 import {
   SubagentRuntime,
+  TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
   presentDispatchResult,
@@ -90,7 +104,6 @@ import {
   buildCompatReport,
   renderDoctorReport,
   renderMcpStatusReport,
-  mcpFailClosedRecovery,
   type CompatReport,
 } from "./registry/compat-report.js";
 import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -361,6 +374,8 @@ export interface PiccTestSeam {
   };
   /** TEST-ONLY managed settings locations passed directly to project loading. */
   managedSettingsPaths?: string[];
+  /** TEST-ONLY standalone managed-MCP authority and I/O passed directly to project loading. */
+  managedMcpDiscovery?: ManagedMcpDiscoveryOptions;
   /** TEST-ONLY managed artifact directories passed directly to project loading. */
   managedArtifactDirs?: string[];
   /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
@@ -370,9 +385,57 @@ export interface PiccTestSeam {
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
   checkpointDeadlinePolicy?: HostDeadlinePolicy;
+  /** TEST-ONLY retention I/O and timer replacements; production uses the filesystem and Node timers. */
+  retention?: {
+    reapSubagentTranscripts?: typeof reapSubagentTranscripts;
+    touchMainTranscript?: (file: string) => Promise<void>;
+    setInterval?: (callback: () => void, delayMs: number) => ReturnType<typeof setInterval>;
+    clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
+  };
+  /** TEST-ONLY dynamic join: each call waits only for retention jobs already scheduled. */
+  onRetentionJobsSettled?: (join: () => Promise<void>) => void;
 }
 
 const codexProviderRegistries = new WeakSet<object>();
+
+const MCP_BIDI_FORMATTING_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+
+function escapeMcpBidiFormattingControls(text: string): string {
+  return text.replace(MCP_BIDI_FORMATTING_CONTROLS, (control) =>
+    `\\u${control.codePointAt(0)!.toString(16).padStart(4, "0").toUpperCase()}`
+  );
+}
+
+export function buildMcpStartupNotice(
+  mcp: ResolvedMcpConfig,
+  pendingNotice: string | undefined,
+): string | undefined {
+  const parts: string[] = [];
+  if (pendingNotice) parts.push(pendingNotice);
+
+  if (mcp.failClosed === "native-state-unusable") {
+    parts.push("MCP is fail closed because native Claude state is unusable; run /mcp or /doctor for recovery guidance.");
+  } else if (mcp.policyPosture === "exclusive-empty") {
+    parts.push("Managed MCP policy supplies an empty exclusive server set, so all MCP is disabled; run /mcp or /doctor for details.");
+  } else if (mcp.policyPosture === "fail-closed") {
+    parts.push("MCP policy is fail closed, so no server can start; run /mcp or /doctor for authority-specific recovery guidance.");
+  } else {
+    const blocked = mcp.servers.filter((server) => server.status === "blocked");
+    if (blocked.length > 0) {
+      const shown = blocked.slice(0, 3).map((server) =>
+        JSON.stringify(escapeMcpBidiFormattingControls(sanitizeLine(server.name, 40)))
+      );
+      const omitted = blocked.length - shown.length;
+      parts.push(
+        `MCP policy blocked ${blocked.length} server(s): ${shown.join(", ")}` +
+          (omitted > 0 ? `, and ${omitted} more` : "") +
+          "; run /mcp or /doctor for reason and remediation details.",
+      );
+    }
+  }
+
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
 
 /**
  * Process status for a non-interactive run whose proactive checkpoint ended without
@@ -640,6 +703,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       ...(testSeam?.managedSettingsPaths
         ? { managedSettingsPaths: testSeam.managedSettingsPaths }
         : {}),
+      ...(testSeam?.managedMcpDiscovery
+        ? { managedMcpDiscovery: testSeam.managedMcpDiscovery }
+        : {}),
       ...(testSeam?.managedArtifactDirs
         ? { managedArtifactDirs: testSeam.managedArtifactDirs }
         : {}),
@@ -649,12 +715,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
     return;
   }
-  if (project.mcp.failClosed === "native-state-unusable") {
-    console.error(
-      `PiCC: Native Claude MCP state is unusable, so MCP loading is fail closed. Run /mcp or /doctor. ${mcpFailClosedRecovery(project.mcp)}`,
-    );
-  }
-
   const config = loadPiCCConfig(project.root);
   // Config-validation findings (malformed file, out-of-range compaction knob reverted
   // to its default) surface once at startup — never silently swallowed. Same pattern as
@@ -696,7 +756,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Hook payload `transcript_path`: Pi's session manager (captured on
   // session_start) exposes the session file — the closest analog to Claude's
   // transcript. Live getter so session switches stay accurate.
-  let sessionManagerRef: { getSessionFile?: () => string | undefined } | undefined;
+  type MainSessionManager = {
+    getSessionFile?: () => string | undefined;
+    getCwd?: () => string | undefined;
+    getSessionDir?: () => string | undefined;
+  };
+  let sessionManagerRef: MainSessionManager | undefined;
   const transcriptPath = () => {
     try {
       return sessionManagerRef?.getSessionFile?.() ?? undefined;
@@ -704,8 +769,197 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return undefined;
     }
   };
+  const cleanupPeriodDays = project.settings.cleanupPeriodDays ?? DEFAULT_CLEANUP_PERIOD_DAYS;
+  const touchMainTranscript = testSeam?.retention?.touchMainTranscript ?? (async (file: string) => {
+    const now = new Date();
+    await fs.promises.utimes(file, now, now);
+  });
+  const scheduleInterval = testSeam?.retention?.setInterval ?? setInterval;
+  const cancelInterval = testSeam?.retention?.clearInterval ?? clearInterval;
+  const transcriptReaper = testSeam?.retention?.reapSubagentTranscripts ?? reapSubagentTranscripts;
+  let retentionHeartbeat: ReturnType<typeof setInterval> | undefined;
+  let transcriptStartupDecided = false;
+  let transcriptReaping: Promise<SubagentTranscriptReapResult> | undefined;
+  let retentionPresentation: Promise<void> | undefined;
+  let retentionPresentationStarted = false;
+  let retentionStartupContext: any;
+
+  const existingMainFile = (manager: MainSessionManager | undefined): string | undefined => {
+    try {
+      const file = manager?.getSessionFile?.();
+      return typeof file === "string" && file.length > 0 ? file : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const refreshCurrentMain = async (): Promise<void> => {
+    const file = existingMainFile(sessionManagerRef);
+    if (!file) return;
+    await touchMainTranscript(file).catch(() => undefined);
+  };
+  const clearRetentionHeartbeat = (): void => {
+    if (retentionHeartbeat === undefined) return;
+    try { cancelInterval(retentionHeartbeat); } catch { /* heartbeat cleanup is best-effort */ }
+    retentionHeartbeat = undefined;
+  };
+  const refreshAndArmRetentionHeartbeat = (): Promise<void> => {
+    clearRetentionHeartbeat();
+    const immediate = refreshCurrentMain();
+    if (!existingMainFile(sessionManagerRef)) return immediate;
+    try {
+      retentionHeartbeat = scheduleInterval(() => { void refreshCurrentMain(); }, 60 * 60 * 1000);
+      retentionHeartbeat.unref?.();
+    } catch {
+      retentionHeartbeat = undefined;
+    }
+    return immediate;
+  };
+  const emptyTranscriptFailure = (): SubagentTranscriptReapResult => ({
+    removedTranscriptFiles: 0,
+    removedCollections: 0,
+    retainedEntries: 0,
+    failureCounts: {
+      race: 0,
+      permission: 0,
+      busy: 0,
+      "ownership-uncertain": 0,
+      "other-io": 1,
+    },
+    diagnosticsTruncated: false,
+    diagnostics: [],
+  });
+  const retentionBlockerSummary = (): string => {
+    const blockers = (project.settings.retentionCleanupBlockers ?? []).slice(0, 8).map((blocker) => {
+      const source = sanitizeLine(path.posix.basename(String(blocker.source).replaceAll("\\", "/")), 80) || "settings source";
+      const reason = blocker.reason === "invalid-period"
+        ? "has an invalid cleanup period"
+        : blocker.reason === "unreadable-source"
+          ? "could not be read"
+          : blocker.reason === "malformed-source"
+            ? "contains malformed JSON"
+            : "does not contain a settings object";
+      return `${source} ${reason}`;
+    });
+    const omitted = Math.max(0, (project.settings.retentionCleanupBlockers?.length ?? 0) - blockers.length);
+    return `${blockers.join("; ") || "settings admission was unavailable"}${omitted > 0 ? `; ${omitted} more settings problem(s) omitted` : ""}`;
+  };
+  const presentRetentionOutcome = async (
+    ctx: any,
+    worktree: WorktreeReapResult,
+    transcript: SubagentTranscriptReapResult | undefined,
+  ): Promise<void> => {
+    let text: string | undefined;
+    let severity: "info" | "warning" = "info";
+    if (!retentionCleanupAllowed) {
+      severity = "warning";
+      text = `Retention cleanup is paused at ${cleanupPeriodDays} days because ${retentionBlockerSummary()}. No retention deletion was attempted. Run /doctor, repair the reported settings source, then restart PiCC.`;
+    } else {
+      const removedWorktrees = worktree.reaped.length;
+      const removedTranscriptFiles = transcript?.removedTranscriptFiles ?? 0;
+      const removedCollections = transcript?.removedCollections ?? 0;
+      const retainedWorktrees = worktree.retainedWorktrees;
+      const retainedTranscripts = transcript?.retainedEntries ?? 0;
+      const diagnosticCount = worktree.diagnostics.length + (transcript?.diagnostics.length ?? 0);
+      const failureCount = Object.values(worktree.failureCounts).reduce((sum, count) => sum + count, 0) +
+        Object.values(transcript?.failureCounts ?? {}).reduce((sum, count) => sum + count, 0);
+      if (removedWorktrees === 0 && removedTranscriptFiles === 0 && removedCollections === 0 &&
+          retainedWorktrees === 0 && retainedTranscripts === 0 && diagnosticCount === 0 &&
+          failureCount === 0 && !transcript?.diagnosticsTruncated) return;
+
+      const details: string[] = [];
+      const race = transcript?.failureCounts.race ?? 0;
+      if (race > 0) details.push(`${race} transcript cleanup target(s) changed concurrently; no action is needed.`);
+      const transcriptPermission = transcript?.failureCounts.permission ?? 0;
+      if (transcriptPermission > 0) details.push(`${transcriptPermission} transcript item(s) could not be accessed. Repair transcript ownership and permissions, then restart PiCC.`);
+      const worktreePermission = worktree.failureCounts.permission;
+      if (worktreePermission > 0) details.push(`${worktreePermission} worktree item(s) could not be accessed. Repair worktree ownership and permissions, then restart PiCC.`);
+      const transcriptBusy = transcript?.failureCounts.busy ?? 0;
+      if (transcriptBusy > 0) details.push(`${transcriptBusy} transcript item(s) were locked or busy. Close applications using them, then restart PiCC.`);
+      const worktreeBusy = worktree.failureCounts.busy;
+      if (worktreeBusy > 0) details.push(`${worktreeBusy} worktree item(s) were locked or busy. Close applications using them, then restart PiCC.`);
+      const ownershipUncertain = transcript?.failureCounts["ownership-uncertain"] ?? 0;
+      if (ownershipUncertain > 0) details.push(`Ownership could not be verified for ${ownershipUncertain} transcript item(s), so affected data remains untouched. ${TRANSCRIPT_OWNERSHIP_RECOVERY_GUIDANCE}`);
+      const transcriptIo = transcript?.failureCounts["other-io"] ?? 0;
+      if (transcriptIo > 0) details.push(`${transcriptIo} transcript item(s) had another I/O failure. Check session transcript storage access, then restart PiCC.`);
+      const worktreeIo = worktree.failureCounts["other-io"];
+      if (worktreeIo > 0) details.push(`${worktreeIo} worktree item(s) had another I/O failure. Check project-owned worktree storage access, then restart PiCC.`);
+      const settingsBlocked = worktree.failureCounts["settings-blocked"];
+      if (settingsBlocked > 0) details.push(`Settings prevented ${settingsBlocked} worktree cleanup attempt(s). Run /doctor, repair settings, then restart PiCC.`);
+      const gitAuthority = worktree.failureCounts["git-authority"];
+      if (gitAuthority > 0) details.push(`Git authority was unavailable for ${gitAuthority} worktree cleanup attempt(s). Restore repository Git access, then restart PiCC.`);
+      if (retainedWorktrees > 0 || retainedTranscripts > 0) {
+        details.push("Retained items remain untouched. Use the counts and categories in this notice to review them.");
+      }
+      const uncategorizedDiagnostics = diagnosticCount > 0 && failureCount === 0;
+      if (uncategorizedDiagnostics) {
+        details.push(`${diagnosticCount} additional cleanup issue(s) had no structured category. Check session transcript storage and project-owned worktree storage access, then restart PiCC.`);
+      }
+      if (transcript?.diagnosticsTruncated) details.push("Some transcript cleanup detail was omitted from this bounded notice.");
+      text = `Retention cleanup (${cleanupPeriodDays} days): removed ${removedWorktrees} orphaned worktree(s), ${removedTranscriptFiles} transcript file(s), and ${removedCollections} transcript collection(s); retained ${retainedWorktrees} worktree(s) and ${retainedTranscripts} transcript item(s). ${details.join(" ")}`.trim();
+      const actionableFailure = failureCount > race;
+      severity = actionableFailure || retainedWorktrees > 0 || retainedTranscripts > 0 ||
+        uncategorizedDiagnostics || transcript?.diagnosticsTruncated === true ? "warning" : "info";
+    }
+    try {
+      if (ctx?.mode === "tui") ctx.ui?.notify?.(text, severity);
+      else console.error(`PiCC: ${text}`);
+    } catch {
+      // Presentation cannot change cleanup or session lifecycle.
+    }
+  };
+  const startRetentionPresentation = (): void => {
+    if (retentionPresentationStarted || !transcriptStartupDecided) return;
+    retentionPresentationStarted = true;
+    retentionPresentation = Promise.all([orphanReaping, transcriptReaping])
+      .then(([worktree, transcript]) => presentRetentionOutcome(retentionStartupContext, worktree, transcript))
+      .catch(() => undefined);
+    void retentionPresentation;
+  };
+  const joinScheduledRetentionJobs = async (): Promise<void> => {
+    const jobs: Promise<unknown>[] = [orphanReaping];
+    if (transcriptReaping) jobs.push(transcriptReaping);
+    if (retentionPresentation) jobs.push(retentionPresentation);
+    await Promise.allSettled(jobs);
+  };
+  const sessionRetentionStarted = (ctx: any, reason: unknown): void => {
+    sessionManagerRef = ctx?.sessionManager;
+    const immediateRefresh = refreshAndArmRetentionHeartbeat();
+    if (reason !== "startup" || transcriptStartupDecided) return;
+    transcriptStartupDecided = true;
+    retentionStartupContext = ctx;
+    const manager = sessionManagerRef;
+    let activeMainSessionFile: string | undefined;
+    let activeMainCwd: string | undefined;
+    let sessionDirectory: string | undefined;
+    try {
+      activeMainSessionFile = manager?.getSessionFile?.();
+      activeMainCwd = manager?.getCwd?.();
+      sessionDirectory = manager?.getSessionDir?.();
+    } catch {
+      // The startup session decides transcript cleanup eligibility permanently; replacements never retry it.
+    }
+    if (
+      typeof activeMainSessionFile === "string" && activeMainSessionFile.length > 0 &&
+      typeof activeMainCwd === "string" && activeMainCwd.length > 0 &&
+      typeof sessionDirectory === "string" && sessionDirectory.length > 0
+    ) {
+      const options = {
+        sessionDirectory,
+        activeMainSessionFile,
+        activeMainCwd,
+        maxAgeDays: cleanupPeriodDays,
+        cleanupAllowed: retentionCleanupAllowed,
+      };
+      transcriptReaping = immediateRefresh
+        .then(() => transcriptReaper(options))
+        .catch(emptyTranscriptFailure);
+      void transcriptReaping;
+    }
+    startRetentionPresentation();
+  };
   let compat: CompatReport = { findings: [], safetyFindings: [], unassessed: [] };
   let pluginStartupNoticePresented = false;
+  let mcpStartupNoticePresented = false;
   const pluginContexts = project.pluginContexts;
   const RUNTIME_FINDING_RETAIN_CAP = 20;
   const RUNTIME_FINDING_FINGERPRINT_CAP = 25;
@@ -768,10 +1022,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   for (const d of permissionEngine.diagnostics) {
     console.error(`PiCC permissions: ${d.message}`);
   }
+  const retentionCleanupAllowed = project.settings.retentionCleanupAllowed === true;
   const worktrees = new WorktreeManager({
     projectRoot: project.root,
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
+    retentionCleanupAllowed,
     // Worktree setup/reaping can run before first input, so sanitize inherited
     // launcher context without admitting project-controlled environment policy.
     // Only the manager's expected command may cross this administration seam.
@@ -787,9 +1043,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return await sanitizedExecFile(trustedGit, args, opts);
     },
   });
-  // Reap orphaned worktree dirs from crashed sessions — fire-and-forget.
-  const orphanReaping = worktrees.reapOrphans().catch(() => undefined);
+  const emptyWorktreeFailure = (): WorktreeReapResult => ({
+    reaped: [],
+    retainedWorktrees: 0,
+    failureCounts: {
+      "settings-blocked": 0,
+      "git-authority": 0,
+      permission: 0,
+      busy: 0,
+      "other-io": 1,
+    },
+    diagnostics: [],
+  });
+  // Activation-time orphan-worktree cleanup stays detached, retaining its result for one startup report.
+  const orphanReaping = worktrees.reapOrphans().catch(emptyWorktreeFailure);
   void orphanReaping;
+  testSeam?.onRetentionJobsSettled?.(joinScheduledRetentionJobs);
   const state = newSessionContextState(project.claudeMd);
   // Completeness floor: a report failure must never abort extension init.
   try {
@@ -2864,6 +3133,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       branch = undefined;
     }
     installMainNotebookState(branch);
+    // Every start refreshes and replaces the heartbeat; only an actual startup may schedule transcript reaping.
+    sessionRetentionStarted(ctx, event.reason);
     // A session being installed has a live runner behind it — before the outgoing
     // controller hands back what it could not deliver, which is the first thing that has
     // to reach the reader's editor. Pi never starts a session after a `quit` teardown, so
@@ -2879,7 +3150,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     stopHookIterations = 0;
     try {
       modelRegistryRef = ctx.modelRegistry;
-      sessionManagerRef = ctx.sessionManager;
       // Status panel: interactive TUI ONLY. The gate is `ctx.mode === "tui"`
       // specifically, NOT `hasUI` — RPC mode also implements setWidget (and
       // reports hasUI: true), so a hasUI gate would install the panel into an
@@ -2965,12 +3235,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      // Pending servers require a bounded approval or decline decision, so this
-      // actionable state survives quiet startup as one notice. Startup only —
-      // /new and reload must not re-toast state the user already saw.
-      if (event.reason === "startup" && compat.mcpPendingNotice) {
-        if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
-        else console.error(`PiCC: ${compat.mcpPendingNotice}`);
+      // Approval and policy outcomes share one immutable-snapshot notice. Only a
+      // newly loaded extension's startup may present it; /new and same-instance
+      // lifecycle events cannot replay it.
+      if (event.reason === "startup" && !mcpStartupNoticePresented) {
+        const mcpStartupNotice = buildMcpStartupNotice(project.mcp, compat.mcpPendingNotice);
+        if (mcpStartupNotice) {
+          mcpStartupNoticePresented = true;
+          if (ctx.mode === "tui") ctx.ui?.notify?.(mcpStartupNotice, "warning");
+          else console.error(`PiCC: ${mcpStartupNotice}`);
+        }
       }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);
@@ -3006,6 +3280,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_shutdown", async (event: any) => {
+    clearRetentionHeartbeat();
     // `quit` is the one reason Pi has already stopped the renderer for (`dispose()`); the
     // switch reasons (`new`/`resume`/`fork`) and `reload` all leave a live UI behind.
     // Latched before the cancellation, because the cancellation is what announces the
@@ -3038,6 +3313,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {
       /* floor */
+    } finally {
+      if (event?.reason === "quit") await joinScheduledRetentionJobs();
     }
   });
 

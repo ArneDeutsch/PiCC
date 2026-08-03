@@ -33,6 +33,7 @@ export interface SourceRef {
 }
 
 export type ManagedPolicySourceClass =
+  | "standalone-mcp"
   | "system-file"
   | "system-drop-in"
   | "registry-hklm"
@@ -578,6 +579,13 @@ export interface PluginMarketplaceSettingsOmissions {
   declarations: number;
 }
 
+export const DEFAULT_CLEANUP_PERIOD_DAYS = 30;
+
+export interface RetentionCleanupBlocker {
+  reason: "unreadable-source" | "malformed-source" | "non-object-source" | "invalid-period";
+  source: string;
+}
+
 export interface ClaudeSettings {
   permissions: PermissionRules;
   hooks: HookConfig;
@@ -599,6 +607,10 @@ export interface ClaudeSettings {
   managedClaudeMd?: { content: string; source: string };
   worktree: WorktreeSettings;
   cleanupPeriodDays?: number;
+  /** False when retention-relevant source uncertainty or an invalid cleanup period makes deletion unsafe. */
+  retentionCleanupAllowed?: boolean;
+  /** Deduplicated structured reasons destructive retention housekeeping is blocked. */
+  retentionCleanupBlockers?: RetentionCleanupBlocker[];
   apiKeyHelper?: string;
   /** Subagent controls. */
   subagentsEnabled: boolean;
@@ -646,10 +658,112 @@ export interface McpSettingsEntry {
   disabledMcpjsonServers?: string[];
 }
 
+export type McpPolicyAuthority =
+  | "user-controlled"
+  | "administrator-controlled"
+  | "mixed";
+
+export type McpPolicyRemediation =
+  | "repair-user-policy"
+  | "repair-administrator-policy"
+  | "repair-mixed-policy";
+
+/** Presence-preserving projection of one settings file's MCP policy fields. */
+export interface McpPolicySettingsEntry {
+  scope: Scope;
+  /** Internal provenance only; decisions and reports never expose it. */
+  sourcePath: string;
+  /** Stable order within the settings precedence sequence. */
+  order: number;
+  /** False only for a defensive projection whose whole non-managed file failed strict validation. */
+  valid: boolean;
+  allowedMcpServers?: unknown;
+  deniedMcpServers?: unknown;
+  allowManagedMcpServersOnly?: unknown;
+}
+
+/** Applicable managed input that was present but could not be safely consumed. */
+export interface McpPolicySourceFailure {
+  kind: "malformed" | "unreadable" | "omitted";
+  sourceClass: ManagedPolicySourceClass;
+  authority: McpPolicyAuthority;
+  remediation: McpPolicyRemediation;
+}
+
+export type McpPolicyPosture =
+  | "absent"
+  | "active-rules"
+  | "managed-only"
+  | "exclusive"
+  | "exclusive-empty"
+  | "fail-closed";
+
+export type McpPolicyObservation =
+  | "invalid-managed-allow-active-empty"
+  | "invalid-managed-deny-dropped"
+  | "invalid-managed-only-treated-true"
+  | "invalid-non-managed-projection"
+  | "invalid-rule-stripped"
+  | "unset-environment-variable"
+  | "allow-over-limit-active-empty"
+  | "restrictive-material-omitted"
+  | "source-failure-fail-closed"
+  | "compiler-uncertainty-fail-closed"
+  | "candidate-over-limit-blocked"
+  | "identity-ambiguity-blocked";
+
+export type McpPolicyRule =
+  | { serverName: string }
+  | { serverUrl: string }
+  | { serverCommand: readonly string[] };
+
+export type McpCandidateSourceKind =
+  | McpSourceClass
+  | "plugin"
+  | "subagent-inline"
+  | "explicit-runtime";
+
+export interface RawMcpPolicyCandidate {
+  name: string;
+  source: McpCandidateSourceKind;
+  transport: "stdio" | "http" | "sse";
+  command?: string;
+  args?: readonly string[];
+  url?: string;
+  identityAmbiguous?: boolean;
+}
+
+export type McpAdmissionReason =
+  | "allowed"
+  | "denied"
+  | "allow-miss"
+  | "managed-only"
+  | "exclusive-control"
+  | "fail-closed"
+  | "candidate-invalid";
+
+export interface McpAdmissionDecision {
+  status: "allowed" | "blocked";
+  reason: McpAdmissionReason;
+  authority: McpPolicyAuthority;
+  observations: readonly McpPolicyObservation[];
+}
+
+export interface CompiledMcpPolicy {
+  readonly posture: McpPolicyPosture;
+  readonly authority: McpPolicyAuthority;
+  readonly observations: readonly McpPolicyObservation[];
+  /** Bounded, value-redacted evidence retained for status and diagnostics. */
+  readonly failures: readonly Readonly<McpPolicySourceFailure>[];
+  /** Opaque immutable compiler state; consumers use evaluateMcpPolicy(). */
+  readonly compiled: unknown;
+}
+
 export type McpServerStatus =
   | "enabled"
   | "pending-approval"
   | "disabled"
+  | "blocked"
   | "skipped"
   | "not-configured";
 
@@ -660,9 +774,16 @@ export type McpSourceClass =
   | "settings-managed"
   | "settings-local"
   | "settings-project"
-  | "settings-user";
+  | "settings-user"
+  | "managed-mcp";
 
 export type ClaudeProfileSource = "explicit" | "picc-override" | "claude-config" | "default";
+
+export type McpPolicyInactiveReason =
+  | "policy-denied"
+  | "policy-allow-miss"
+  | "policy-managed-only"
+  | "policy-candidate-invalid";
 
 export type McpInactiveReason =
   | "mcpjson-unapproved"
@@ -680,11 +801,18 @@ interface ResolvedMcpServerCommon {
 }
 
 export interface InactiveResolvedMcpServer extends ResolvedMcpServerCommon {
-  status: Exclude<McpServerStatus, "enabled">;
+  status: Exclude<McpServerStatus, "enabled" | "blocked">;
   inactiveReason?: McpInactiveReason;
   /** Safe transport identity only; malformed or unknown shapes omit it. */
   transport?: "stdio" | "http" | "sse";
   /** Original remote type alias, safe to display. */
+  configuredType?: "http" | "streamable-http" | "sse";
+}
+
+export interface PolicyBlockedResolvedMcpServer extends ResolvedMcpServerCommon {
+  status: "blocked";
+  inactiveReason: McpPolicyInactiveReason;
+  transport?: "stdio" | "http" | "sse";
   configuredType?: "http" | "streamable-http" | "sse";
 }
 
@@ -712,6 +840,7 @@ export interface EnabledRemoteMcpServer extends ResolvedMcpServerCommon {
 
 export type ResolvedMcpServer =
   | InactiveResolvedMcpServer
+  | PolicyBlockedResolvedMcpServer
   | EnabledStdioMcpServer
   | EnabledRemoteMcpServer;
 
@@ -724,6 +853,14 @@ export interface ResolvedMcpConfig {
   failClosed?: "native-state-unusable";
   /** Fixed provenance for safe fail-closed repair guidance; never a resolved path. */
   failClosedProfile?: ClaudeProfileSource;
+  /** Optional for legacy/test literals; policy-aware resolver outputs always populate it. */
+  policyPosture?: McpPolicyPosture;
+  policyAuthority?: McpPolicyAuthority;
+  policyObservations?: readonly McpPolicyObservation[];
+  /** Bounded value-redacted compiler failure evidence. */
+  policyFailures?: readonly Readonly<McpPolicySourceFailure>[];
+  /** True only when discovery established that ordinary sources were suppressed. */
+  policyOrdinarySourcesSuppressed?: boolean;
 }
 
 // ---------------------------------------------------------------------------

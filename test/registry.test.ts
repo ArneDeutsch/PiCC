@@ -302,14 +302,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it.each<DisclosureContract>([
     { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
-    { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/Authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
+    { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/present standalone managed-mcp\.json suppresses this source entirely/, /authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /central policy admission before approval, native disablement, or materialization/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /bounded individual server definitions retain skip-or-adjust handling/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent record semantics.*remain inferred or unverified/], precedence: [/local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/not verified Claude behavior for multiple canonical-equivalent project records/, /State is never modified/] },
-    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], visibility: [/cannot edit the list/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /admitted from standalone managed MCP or selected from native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], precedence: [/Standalone exclusive control and settings policy are resolved before post-admission materialization/, /blocked servers never reach runtime/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /bounded individual server definitions retain skip-or-adjust handling/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent project record semantics.*remain inferred or unverified/], precedence: [/Native state is acquired only when standalone managed MCP is absent/, /central policy admission before native disablement or materialization/, /local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/not verified Claude behavior for multiple canonical-equivalent project records/, /State is never modified/] },
+    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], precedence: [/after central policy admission/, /when standalone exclusive control is absent/], visibility: [/cannot edit the list/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/after central policy admission/, /only when standalone exclusive control is absent/, /disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -461,7 +461,6 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "feature.mcp-sampling",
       "feature.mcp-roots",
       "feature.mcp-channels",
-      "feature.mcp-managed-config",
       "feature.mcp-connectors",
       "feature.mcp-output-token-cap",
       "feature.mcp-idle-timeout",
@@ -498,16 +497,119 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
-    const managedConfig = lookupCapability("feature.mcp-managed-config");
-    expect(managedConfig).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    for (const source of ["native local", "native user", "project .mcp.json", "project settings", "settings-extension"]) {
-      expect(managedConfig?.note).toContain(source);
-    }
-    for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
-      expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
-    }
     // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
+  });
+
+  it("pins managed MCP enforcement, hardening, reporting, and deferred-source boundaries", () => {
+    const allowed = lookupCapability("setting.allowedMcpServers");
+    for (const phrase of [
+      "documented soft allowlist",
+      "valid lower-scope list can broaden access unless managed-only is active",
+      "command rules take precedence over name rules",
+      "URL rules take precedence over names",
+      "one frozen launch-environment snapshot",
+      "PiCC additionally makes over-limit allow material active-empty",
+      "deferred plugin/agent-inline/explicit-runtime sources",
+      "silently hidden blocked UI",
+    ]) expect(allowed?.note, phrase).toContain(phrase);
+
+    const denied = lookupCapability("setting.deniedMcpServers");
+    for (const phrase of [
+      "deny always wins over every allow",
+      "complete command-vector matching is exact and case-sensitive",
+      "deny URL matching canonicalizes default ports",
+      "invalid managed deny values as dropped",
+      "schema-invalid ordinary settings files are rejected with zero policy projection",
+      "fails closed when bounded-source or restrictive-projection loss may have omitted deny material",
+    ]) expect(denied?.note, phrase).toContain(phrase);
+
+    const managedOnly = lookupCapability("setting.allowManagedMcpServersOnly");
+    expect(managedOnly?.note).toContain("prevents valid lower-scope soft allowlists from broadening authorization");
+    expect(managedOnly?.note).toContain("does not turn an ordinary soft allowlist into an immutable administrator list");
+
+    for (const setting of [allowed, denied, managedOnly]) {
+      expect(setting?.note).toContain("all currently loaded ordinary and standalone-managed");
+    }
+
+    const managedConfig = lookupCapability("feature.mcp-managed-config");
+    for (const phrase of [
+      "exclusive administrator server set before ordinary MCP acquisition",
+      "loaded empty set disables MCP",
+      "absence preserves ordinary sources",
+      "present but unusable or oversized authority",
+      "bounded projection with restrictive material omitted",
+      "fails MCP closed",
+      "PiCC-defined /mcp and /doctor summaries",
+      "single startup notice",
+      "not Claude UI parity",
+      "server-managed delivery is absent",
+      "deferred plugin/agent-inline/explicit-runtime sources are not loaded",
+    ]) expect(managedConfig?.note, phrase).toContain(phrase);
+
+    expect(lookupCapability("setting.strictPluginOnlyCustomization.mcp")?.note).toContain(
+      "manual/CLI/runtime source delivery are themselves unsupported rather than governed",
+    );
+    expect(lookupCapability("feature.mcp-plugin-servers")?.note).toContain("plugin-bundled MCP servers are deferred");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("per-agent MCP server configs are a deferred surface");
+    expect(lookupCapability("feature.mcp-cli-invocation-controls")?.note).toContain("Claude CLI invocation/loading controls");
+  });
+
+  it("pins managed MCP documentation boundaries by section", () => {
+    const readDoc = (relativePath: string): string => fs.readFileSync(
+      fileURLToPath(new URL(relativePath, import.meta.url)),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    const section = (text: string, heading: string): string => {
+      const start = text.indexOf(heading);
+      expect(start, heading).toBeGreaterThanOrEqual(0);
+      const level = heading.match(/^#+/)?.[0].length ?? 2;
+      const nextHeading = new RegExp(`^#{1,${level}}\\s`, "m");
+      const remainder = text.slice(start + heading.length);
+      const next = remainder.search(nextHeading);
+      return next < 0 ? text.slice(start) : text.slice(start, start + heading.length + next);
+    };
+
+    const readme = readDoc("../README.md");
+    const capabilitySection = section(readme, "## What it does");
+    expect(capabilitySection).toMatch(/MCP servers[\s\S]*standalone managed[\s\S]*central policy admission[\s\S]*\[capability matrix\]\(doc\/supported-features\.md\)/);
+
+    const guide = readDoc("../doc/user-guide.md");
+    const runSection = section(guide, "## 4. Run a Claude Code project");
+    expect(runSection).toMatch(/MCP servers[\s\S]*standalone `managed-mcp\.json`[\s\S]*native Claude user\/project-local state/);
+    const securitySection = section(guide, "## 6. Security & permission posture");
+    for (const predicate of [
+      /Managed MCP policy/,
+      /minimal valid root shape[\s\S]*`\{ "mcpServers": \{ \.\.\. \} \}`[\s\S]*empty map disables MCP/,
+      /managed-mcp\.json` on Windows[\s\S]*macOS[\s\S]*Linux/,
+      /distinct from `managed-settings\.json`/,
+      /source uncertainty may have lost[\s\S]*restrictive material/,
+      /over-limit allow material becomes active-empty/,
+      /ambiguous or over-limit[\s\S]*blocked individually/,
+      /PiCC-owned Git tracking classification may[\s\S]*run only when winner or approval selection needs it/,
+      /After a winner is blocked, no further probe[\s\S]*MCP server process[\s\S]*DNS lookup[\s\S]*network activity/,
+      /authority-specific remediation[\s\S]*ask an administrator/,
+      /\[capability matrix\]\(supported-features\.md\)/,
+    ]) expect(securitySection).toMatch(predicate);
+    const troubleshooting = section(guide, "## 9. Troubleshooting");
+    expect(troubleshooting).toMatch(/Managed MCP policy is fail closed[\s\S]*standalone managed MCP file[\s\S]*`managed-mcp\.json`[\s\S]*managed-settings system file, system drop-in, or machine registry[\s\S]*user-controlled policy input/);
+    expect(troubleshooting).toMatch(/Then use `\/reload` or restart PiCC; `\/new` does not reload policy/);
+
+    const architecture = readDoc("../doc/architecture.md");
+    const discoverySection = section(architecture, "### `discovery/` — where artifacts live, and precedence");
+    for (const predicate of [
+      /standalone `managed-mcp\.json`[\s\S]*exclusive administrator authority/,
+      /managed-settings[\s\S]*policy and admits each raw effective winner before expansion, approval, native disablement, or[\s\S]*runtime materialization/,
+      /future[\s\S]*plugin, agent-inline, or explicit runtime\/CLI adapter must do the same/,
+      /those adapters do not exist today/,
+    ]) expect(discoverySection).toMatch(predicate);
+    const loaderSection = section(architecture, "### `claude/` — parse each artifact format (loaders only, no runtime)");
+    expect(loaderSection).toMatch(/MCP server entries \(standalone `managed-mcp\.json`[\s\S]*`managed-mcp\.ts`/);
+
+    const threatModel = readDoc("../doc/threat-model.md");
+    const inScope = section(threatModel, "## In scope");
+    expect(inScope).toMatch(/Administrator-managed MCP admission[\s\S]*Applicable managed policy governs every MCP source PiCC[\s\S]*loads/);
+    expect(inScope).toMatch(/Uncertainty that could weaken that policy fails closed[\s\S]*blocked server cannot initiate server-side effects/);
   });
 
   it("splits installed plugin support truth by selection, component, management, and lifecycle", () => {
@@ -632,8 +734,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "Scalar replacement plus recursive object merge and stable array dedup",
       "system file → drop-ins → HKLM",
       "only when no administrator policy is present",
+      "managed-settings source discovery",
+      "standalone managed-mcp.json exclusive-server mechanism is distinct",
       "no complete server-managed settings, MDM, MDM-preference, or policy-helper parity",
     ]) expect(managed?.note).toContain(phrase);
+    expect(managed?.related).toContain("feature.mcp-managed-config");
+    expect(lookupCapability("feature.mcp-managed-config")?.related).toContain("feature.managed-policy");
   });
 
   it.each<DisclosureContract>([
@@ -1026,12 +1132,27 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bash?.note).toContain("deliberately disables Pi's");
   });
 
-  // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent
-  // transcript reaper, so the claim is downgraded from full to partial (undersell).
-  it("marks cleanupPeriodDays partial — worktrees only, no subagent-transcript cleanup", () => {
+  it("keeps cleanupPeriodDays partial and bounds its implemented retention claim", () => {
     const c = lookupCapability("setting.cleanupPeriodDays");
     expect(c?.tier).toBe("partial");
-    expect(c?.note).toContain(".subagents/");
+    expect(c?.note).toContain("30-day default");
+    expect(c?.note).toContain("literal integer >= 1");
+    expect(c?.note).toContain("applicable settings source");
+    expect(c?.note).toContain("stale verified parents only when no ownership marker conflicts");
+    expect(c?.note).toContain("marker-owned orphan collections");
+    expect(c?.note).toContain("orphaned worktrees");
+    expect(c?.note).toContain("manager-supplied default or custom session directory");
+    expect(c?.note).toContain("project's .claude/worktrees directory");
+    expect(c?.note).toContain("mtime refresh");
+    expect(c?.note).toContain("without a lock-grade guarantee");
+    expect(c?.note).toContain("the exact startup session's child transcript collection");
+    expect(c?.note).toContain("malformed, unreadable, or mismatched ownership evidence");
+    expect(c?.note).toContain("main-session transcripts");
+    expect(c?.note).toContain("markerless legacy orphans");
+    expect(c?.note).toContain("unfamiliar content");
+    expect(c?.note).toContain("unrelated Pi data");
+    expect(c?.note).toContain("secure erasure");
+    expect(c?.note).toContain("Claude Code's broader application-data cleanup");
   });
 
   it("agent permissionMode is a safety-relevant no-op, consistent with permissions.defaultMode", () => {
