@@ -1163,6 +1163,83 @@ describe("responsive panel table", () => {
     expect(balancedInjection).not.toContain(ESC);
   });
 
+  it("keeps every narrow ordinary-list ellipsis inside its semantic decoration", () => {
+    const fg = vi.fn((color: string, text: string) => {
+      const code = color === "muted" ? "90" : color === "warning" ? "33" : "36";
+      return `${ESC}[${code}m${text}${ESC}[39m`;
+    });
+    const italic = vi.fn((text: string) => `${ESC}[3m${text}${ESC}[23m`);
+    const theme = { fg, italic };
+
+    const activityPanel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "activity", liveActivity: {
+        kind: "tool", tool: "bash", detail: "echo a very long command",
+      },
+    })]);
+    const activity = renderSubagentPanel(activityPanel, {
+      width: 24, entryChord: CHORD, theme,
+    })[0]!;
+    expect(activity).toContain(`${ESC}[90m${ESC}[3mbash echo…${ESC}[23m${ESC}[39m`);
+    expect(activity).toContain(`${ESC}[36m${PANEL_RUNNING_FRAMES[0]}${ESC}[39m`);
+    expect(activity).toContain(`${ESC}[90m · ${ESC}[39m`);
+    expect(activity).toContain(`${ESC}[90m  1s${ESC}[39m`);
+
+    const described = view(makeModel({ t: 1000 }), [rec({
+      agentId: "described", agentName: "coder", description: "alpha dispatch", color: "red",
+    })]);
+    const describedRow = renderSubagentPanel(described, {
+      width: 11, entryChord: CHORD, theme,
+    })[0]!;
+    expect(describedRow).toContain(`${AGENT_COLOR_ANSI.red}co…${ESC}[39m`);
+    expect(describedRow).toContain(`${ESC}[90m · ${ESC}[39m${ESC}[36mal…${ESC}[39m`);
+
+    const waiting = view(makeModel({ t: 1000 }), [rec({
+      agentId: "waiting", admission: "waiting",
+    })]);
+    const waitingRow = renderSubagentPanel(waiting, {
+      width: 15, entryChord: CHORD, theme,
+    })[0]!;
+    expect(waitingRow).toContain(`${ESC}[33m${PANEL_GLYPH_WAITING}${ESC}[39m`);
+    expect(waitingRow).toContain(`co…${ESC}[90m [waiting]${ESC}[39m`);
+
+    const chrome = view(makeModel({ t: 1000 }), [rec({ agentId: "chrome" })]);
+    chrome.hiddenBelow = 123;
+    const chromeLines = renderSubagentPanel(chrome, {
+      width: 8, entryChord: CHORD, theme,
+    });
+    expect(chromeLines).toContain(`${ESC}[90m… 123 m…${ESC}[39m`);
+    expect(chromeLines).toContain(`${ESC}[90malt+a: …${ESC}[39m`);
+    expect(chromeLines.join("")).not.toContain(`${ESC}[0m`);
+  });
+
+  it("keeps independent theme fallback safe on an ellipsized activity fragment", () => {
+    const panel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "fallback", liveActivity: {
+        kind: "tool", tool: "bash", detail: "echo a very long command",
+      },
+    })]);
+    const baseline = renderSubagentPanel(panel, { width: 24, entryChord: CHORD });
+    const validFg = (_color: string, text: string) => `${ESC}[90m${text}${ESC}[39m`;
+    const validItalic = (text: string) => `${ESC}[3m${text}${ESC}[23m`;
+    const injected = `${BEL}injected`;
+    const cases: Array<[string, unknown, string | undefined]> = [
+      ["missing", {}, undefined],
+      ["throwing foreground", { fg: () => { throw new Error("fg"); }, italic: validItalic }, `${ESC}[3mbash echo…${ESC}[23m`],
+      ["text-changing italic", { fg: validFg, italic: (text: string) => `${ESC}[3mchanged ${text}${ESC}[23m` }, `${ESC}[90mbash echo…${ESC}[39m`],
+      ["injecting foreground", { fg: (_color: string, text: string) => `${ESC}[90m${text}${injected}${ESC}[39m`, italic: validItalic }, `${ESC}[3mbash echo…${ESC}[23m`],
+      ["unbalanced italic", { fg: validFg, italic: (text: string) => `${ESC}[3m${text}` }, `${ESC}[90mbash echo…${ESC}[39m`],
+    ];
+
+    for (const [label, theme, survivingStyle] of cases) {
+      const lines = renderSubagentPanel(panel, { width: 24, entryChord: CHORD, theme });
+      expect(lines.map(stripAnsi), label).toEqual(baseline);
+      expect(lines.join(""), label).not.toContain(injected);
+      expect(lines.join(""), label).not.toContain(`${ESC}[0m`);
+      if (survivingStyle) expect(lines[0], label).toContain(survivingStyle);
+      for (const line of lines) expect(visibleWidth(line), label).toBeLessThanOrEqual(24);
+    }
+  });
+
   it("suppresses stale activity when a hand-built row transitions to terminal", () => {
     const row: PanelViewModel["rows"][number] = {
       key: { kind: "agent", agentId: "transition" },
