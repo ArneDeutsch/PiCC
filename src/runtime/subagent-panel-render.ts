@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { AGENT_COLOR_ANSI, tintAgentColor } from "./agent-color.js";
 import {
   DETAIL_FIELD_MAX_LENGTH,
@@ -13,7 +13,7 @@ import {
   type SubagentDetailEntry,
   type SubagentLiveActivity,
 } from "./subagent-progress.js";
-import { clampLines, pushWrapped, themedFg, themedFgItalic } from "./render-util.js";
+import { clampLines, fitPlainFragment, pushWrapped, themedFg, themedFgItalic } from "./render-util.js";
 import type { PanelRowView, PanelViewModel } from "./subagent-panel-model.js";
 import {
   guardSteer,
@@ -225,15 +225,6 @@ function leftPad(text: string, width: number): string {
   return `${" ".repeat(Math.max(0, width - visibleWidth(text)))}${text}`;
 }
 
-function fitActivityText(text: string, width: number): string {
-  if (width <= 0) return "";
-  try {
-    return truncateToWidth(text, width, "…");
-  } catch {
-    return truncateToWidth(scalarSafeText(text), width, "…");
-  }
-}
-
 function activityValue(row: PanelRowView): PanelRowView["activity"] {
   try {
     const activity = row.activity;
@@ -278,7 +269,7 @@ function renderInlineActivity(activity: string, width: number, opts: PanelRender
   const separatorWidth = visibleWidth(ACTIVITY_SEPARATOR);
   if (!activity || width < separatorWidth + 1) return "";
   return panelFg(opts.theme, "muted", ACTIVITY_SEPARATOR) +
-    themedFgItalic(opts.theme, "muted", fitActivityText(activity, width - separatorWidth));
+    themedFgItalic(opts.theme, "muted", fitPlainFragment(activity, width - separatorWidth));
 }
 
 function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string[] {
@@ -371,7 +362,10 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     const gutterPlain = `${markerPlain}${indent}${row.glyph} `;
     const gutterPad = " ".repeat(Math.max(0, gutterWidth - visibleWidth(gutterPlain)));
     const suffix = suffixFits ? row.status + row.chip : "";
-    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - visibleWidth(suffix)), "…");
+    const fittedIdentity = fitPlainFragment(
+      row.identity,
+      Math.max(0, identityWidth - visibleWidth(suffix)),
+    );
     const identityPlain = `${fittedIdentity}${suffix}`;
     let line = `${marker}${indent}${glyph} ${gutterPad}`;
     line += opts.theme ? tintAgentColor(row.source.color, fittedIdentity) : fittedIdentity;
@@ -379,7 +373,7 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     const identityRemaining = Math.max(0, identityWidth - visibleWidth(identityPlain));
     if (hasDescriptionCell) {
       line += " ".repeat(identityRemaining);
-      const description = truncateToWidth(row.description, descriptionWidth, "…");
+      const description = fitPlainFragment(row.description, descriptionWidth);
       if (description) {
         line += panelFg(opts.theme, "muted", DESCRIPTION_SEPARATOR);
         line += panelFg(opts.theme, "accent", description);
@@ -412,13 +406,17 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   });
 
   const lines: string[] = [];
-  if (view.hiddenAbove > 0) lines.push(panelFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
+  if (view.hiddenAbove > 0) {
+    lines.push(panelFg(opts.theme, "muted", fitPlainFragment(panelMoreAbove(view.hiddenAbove), opts.width)));
+  }
   for (let index = 0; index < rows.length; index++) {
     lines.push(renderedRows[index]!);
   }
-  if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
+  if (view.hiddenBelow > 0) {
+    lines.push(panelFg(opts.theme, "muted", fitPlainFragment(panelMoreBelow(view.hiddenBelow), opts.width)));
+  }
   const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);
-  lines.push(panelFg(opts.theme, "muted", hint));
+  lines.push(panelFg(opts.theme, "muted", fitPlainFragment(hint, opts.width)));
   return clampLines(lines, opts.width);
 }
 
