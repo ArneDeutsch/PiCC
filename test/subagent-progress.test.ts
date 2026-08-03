@@ -366,14 +366,21 @@ describe("SubagentProgressCondenser live activity", () => {
       args: { path: `${ESC}[31m${"x".repeat(10_000)}${BEL}` },
     });
     const legacyBefore = c.snapshot();
+    const detailBefore = c.detailLog();
     c.consume({ type: "turn_start" });
+    const legacyAfter = c.snapshot();
+    expect(legacyAfter.activity).toBe("thinking…");
+    expect(renderProgressText(legacyAfter)).toBe(`${legacyBefore.tail.join("\n")}\n… thinking…`);
+    expect(progressActivityLine(legacyAfter)).toBe("thinking…");
+    expect(c.detailLog()).toEqual(detailBefore);
+
     const retained = c.liveActivity() as { kind: "status"; text: string };
     expect(retained.text).toHaveLength(DETAIL_FIELD_MAX_LENGTH);
     expect(retained.text).toMatch(/ · Thinking…$/u);
     expect(retained.text).not.toContain(ESC);
     expect(retained.text).not.toContain(BEL);
-    expect(c.snapshot().tail).toEqual(legacyBefore.tail);
-    expect(c.snapshot()).not.toHaveProperty("liveActivity");
+    expect(legacyAfter.tail).toEqual(legacyBefore.tail);
+    expect(legacyAfter).not.toHaveProperty("liveActivity");
   });
 
   it("captures display tool names and primary arguments without changing legacy snapshots", () => {
