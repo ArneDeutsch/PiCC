@@ -76,6 +76,8 @@ describe("global same-version runtime repair", () => {
     };
     const packJson = runNpmSync(npm!, ["pack", "--ignore-scripts", "--json", "--pack-destination", archiveDirectory], packageDirectory, env);
     const packed = JSON.parse(packJson) as Array<{ filename: string }>;
+    expect(packed).toHaveLength(1);
+    expect(packed[0]!.filename).toBe("arnedeutsch-picc-1.2.3.tgz");
     const tarball = path.join(archiveDirectory, packed[0]!.filename);
     runNpmSync(npm!, [
       "install", "--global", tarball, "--prefix", prefix, "--offline",

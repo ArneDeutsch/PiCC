@@ -441,10 +441,6 @@ describe("release workflow", () => {
     expect(manifest.scripts["test:packaged"]).toBe(
       "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
     );
-    const userGuide = fs.readFileSync(path.resolve("doc/user-guide.md"), "utf8");
-    expect(userGuide).toContain("npm uninstall --global picc");
-    expect(userGuide).toContain("npm install --global @arnedeutsch/picc");
-    expect(userGuide).toContain("picc --version");
     const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/release.yml"), "utf8")) as any;
     expect(workflow.on).toEqual({ push: { tags: ["v*"] }, workflow_dispatch: null });
     expect(workflow.permissions).toEqual({ contents: "read" });

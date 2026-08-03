@@ -31,8 +31,16 @@ picc
 # /doctor → review this project's compatibility findings
 ```
 
-Installation variants, exact versions, Windows notes, authentication, and updates are in the
-[user guide](doc/user-guide.md#2-install).
+If npm cannot resolve `@arnedeutsch/picc`, use the source checkout instead:
+
+```powershell
+git clone https://github.com/ArneDeutsch/PiCC.git
+cd PiCC
+npm run setup
+```
+
+Then change to the target project and run `picc` as above. Installation variants, exact versions,
+Windows notes, authentication, and updates are in the [user guide](doc/user-guide.md#2-install).
 Release archives and notes are on [GitHub Releases](https://github.com/ArneDeutsch/PiCC/releases).
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·

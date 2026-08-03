@@ -69,14 +69,8 @@ current `latest`, including an installation originally selected by exact version
 remain on a selected version, do not run that updater; reinstall `@arnedeutsch/picc@X.Y.Z` or the
 chosen archive when repair is needed.
 
-The `v0.1.0` GitHub archive predates the scoped npm package and is not covered by that self-update
-path. Migrate it once to the scoped package:
-
-```powershell
-npm uninstall --global picc
-npm install --global @arnedeutsch/picc
-picc --version
-```
+If npm cannot resolve `@arnedeutsch/picc`, keep an existing installation or use the source-checkout
+path below instead.
 
 ### Source checkout with a global command
 
@@ -151,9 +145,9 @@ npm for the current published version. The update path depends on who owns the i
   --no-fund`, builds and verifies the runtime for the current revision, and revalidates the four
   coordinated Pi packages. It never pulls or changes tracked source; update that through your normal
   reviewed Git workflow first.
-- **Global npm installation:** PiCC updates itself only when its package root is contained by npm's
-  reported global root. The npm child inherits your proxy, CA, registry, and other npm settings.
-  Exit active sessions before updating.
+- **Global npm installation:** PiCC updates itself only when its canonical package root exactly
+  matches npm's scoped global installation path, `<npm global root>/@arnedeutsch/picc`. The npm child
+  inherits your proxy, CA, registry, and other npm settings. Exit active sessions before updating.
 - **Other installed forms:** PiCC does not guess which package manager or parent project owns the
   files. It prints the command or owner guidance to use and makes no changes.
 
