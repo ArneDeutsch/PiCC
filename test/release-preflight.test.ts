@@ -35,7 +35,14 @@ function canonical(file: string) {
 function fixture() {
   const root = temp("picc-release-source-");
   const dependencies = Object.fromEntries(PI.map((name) => [name, "0.82.0"]));
-  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "picc", version: "1.2.3", type: "module", dependencies }));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({
+    name: "@arnedeutsch/picc",
+    version: "1.2.3",
+    type: "module",
+    publishConfig: { access: "public" },
+    bin: { picc: "bin/picc.mjs" },
+    dependencies,
+  }));
   for (const name of PI) {
     const dir = path.join(root, "node_modules", ...name.split("/"));
     fs.mkdirSync(dir, { recursive: true });
@@ -59,6 +66,29 @@ afterEach(() => {
 });
 
 describe("release identity", () => {
+  it.each(["picc", "@other/picc"])("rejects the non-canonical package identity %s", (name) => {
+    const root = fixture();
+    const manifestFile = path.join(root, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+    manifest.name = name;
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+    expect(() => verifyReleaseAdmission({ packageRoot: root, event: "manual" }))
+      .toThrow(/@arnedeutsch\/picc/);
+  });
+
+  it.each([
+    ["private access", (manifest: any) => { manifest.publishConfig.access = "restricted"; }],
+    ["renamed executable", (manifest: any) => { manifest.bin = { other: "bin/picc.mjs" }; }],
+  ])("rejects %s before release", (_label, mutate) => {
+    const root = fixture();
+    const manifestFile = path.join(root, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+    mutate(manifest);
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+    expect(() => verifyReleaseAdmission({ packageRoot: root, event: "manual" }))
+      .toThrow(/public access and the picc executable/);
+  });
+
   it("checks source version, tag, exact Pi pins, and artifact hash", () => {
     const root = fixture();
     const runtimeVerifier = () => ({ ok: true, manifest: { sourceDigest: "a".repeat(64) } });
@@ -88,7 +118,7 @@ describe("release identity", () => {
       artifactVerifier: (options: any) => { inspected = options; },
     })).toMatchObject({ sha256: sha });
     expect(inspected).toMatchObject({
-      expectedPackage: { name: "picc", version: "1.2.3", type: "module" },
+      expectedPackage: { name: "@arnedeutsch/picc", version: "1.2.3", type: "module" },
       expectedSourceDigest: "c".repeat(64),
     });
     expect(inspected.archiveBytes.toString("utf8")).toBe("release bytes");
@@ -121,7 +151,7 @@ describe("pack release", () => {
   it("binds one npm pack JSON record to source identity, output, and SHA", async () => {
     const root = fixture();
     const output = temp("picc-release-output-");
-    const filename = "picc-1.2.3.tgz";
+    const filename = "arnedeutsch-picc-1.2.3.tgz";
     let call: any;
     const operations: string[] = [];
     const runtimeManifest = { sourceDigest: "a".repeat(64), runtimeDigest: "b".repeat(64) };
@@ -143,7 +173,7 @@ describe("pack release", () => {
         operations.push("pack");
         call = { args, options };
         return childResult({
-          stdout: JSON.stringify([{ name: "picc", version: "1.2.3", filename }]),
+          stdout: JSON.stringify([{ name: "@arnedeutsch/picc", version: "1.2.3", filename }]),
           beforeClose: () => fs.writeFileSync(path.join(output, filename), "packed once"),
         });
       }) as never,
@@ -155,7 +185,7 @@ describe("pack release", () => {
     ]);
     expect(call.options.cwd).toBe(canonical(root));
     expect(result).toMatchObject({
-      name: "picc",
+      name: "@arnedeutsch/picc",
       version: "1.2.3",
       sha256: createHash("sha256").update("packed once").digest("hex"),
     });
@@ -172,7 +202,7 @@ describe("pack release", () => {
       runNpm: (() => childResult({
         stdout: JSON.stringify([{ name: "other", version: "1.2.3", filename }]),
       })) as never,
-    })).rejects.toThrow(/matching picc artifact/);
+    })).rejects.toThrow(/matching @arnedeutsch\/picc artifact/);
   });
 
   it("admits event, tag, package, and Pi identity before build or pack", async () => {
@@ -287,7 +317,7 @@ describe("publish release", () => {
 
   it.each([
     ["E401", /rejected authentication/],
-    ["E403", /refused publication/],
+    ["E403", /refused publication.*@arnedeutsch\/picc/],
     ["EPUBLISHCONFLICT", /version already exists/],
   ])("classifies %s without exposing raw npm output", async (code, expected) => {
     const root = fixture();
@@ -376,6 +406,12 @@ describe("release workflow", () => {
       url: "git+https://github.com/ArneDeutsch/PiCC.git",
     });
     expect(packageJson.bugs).toEqual({ url: "https://github.com/ArneDeutsch/PiCC/issues" });
+    expect(packageJson).toMatchObject({
+      name: "@arnedeutsch/picc",
+      version: "0.1.1",
+      publishConfig: { access: "public" },
+      bin: { picc: "bin/picc.mjs" },
+    });
     expect(packageJson.files).toEqual([
       "dist", "src", "picc/index.js", "picc/index.ts", "bin", "examples", "doc/*.md",
       "CONTRIBUTING.md", "LICENSE", "README.md",
@@ -383,6 +419,11 @@ describe("release workflow", () => {
     expect(packageJson.dependencies).not.toHaveProperty("jiti");
     expect(packageJson.devDependencies.jiti).toBe("2.7.0");
     const lock = JSON.parse(fs.readFileSync(path.resolve("package-lock.json"), "utf8")) as any;
+    expect(lock).toMatchObject({
+      name: "@arnedeutsch/picc",
+      version: "0.1.1",
+      packages: { "": { name: "@arnedeutsch/picc", version: "0.1.1", bin: { picc: "bin/picc.mjs" } } },
+    });
     expect(lock.packages[""].dependencies).not.toHaveProperty("jiti");
     expect(lock.packages[""].devDependencies.jiti).toBe("2.7.0");
     expect(manifest.scripts["test:e2e:compiled"]).toBe(
@@ -400,6 +441,10 @@ describe("release workflow", () => {
     expect(manifest.scripts["test:packaged"]).toBe(
       "node scripts/check-real-pi.mjs && vitest run --project e2e test/e2e-packaged-launcher.test.ts",
     );
+    const userGuide = fs.readFileSync(path.resolve("doc/user-guide.md"), "utf8");
+    expect(userGuide).toContain("npm uninstall --global picc");
+    expect(userGuide).toContain("npm install --global @arnedeutsch/picc");
+    expect(userGuide).toContain("picc --version");
     const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/release.yml"), "utf8")) as any;
     expect(workflow.on).toEqual({ push: { tags: ["v*"] }, workflow_dispatch: null });
     expect(workflow.permissions).toEqual({ contents: "read" });

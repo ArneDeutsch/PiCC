@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { verifyRuntimeArtifact } from "../scripts/runtime-artifact.mjs";
 import { inspectTarball } from "../scripts/tarball-inspect.mjs";
 
-const PACKAGE = { name: "picc", version: "1.2.3", type: "module" } as const;
+const PACKAGE = { name: "@arnedeutsch/picc", version: "1.2.3", type: "module" } as const;
 const sha = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
 const content = (value: string) => Buffer.from(value, "utf8");
 const octal = (value: number, width: number) => `${value.toString(8).padStart(width - 1, "0")}\0`;
@@ -282,6 +282,11 @@ describe("strict tarball inspection", () => {
 });
 
 describe("schema-v1 runtime artifact policy", () => {
+  it.each(["picc", "@other/picc"])("rejects expected package identity %s", (name) => {
+    expect(() => verify(validArtifact(), { expectedPackage: { ...PACKAGE, name } }))
+      .toThrow(/explicit @arnedeutsch\/picc package identity/u);
+  });
+
   it("accepts independently authored runtime bytes and retained source as inert content", () => {
     const result = verify();
     expect(result.package).toEqual(PACKAGE);

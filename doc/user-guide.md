@@ -44,33 +44,39 @@ Nothing is written to your project's tracked files. For the full design see
 Install the current npm release globally:
 
 ```powershell
-npm install --global picc
+npm install --global @arnedeutsch/picc
 picc --version
 ```
 
 To select an immutable published version, replace `X.Y.Z` with the required version:
 
 ```powershell
-npm install --global picc@X.Y.Z
+npm install --global @arnedeutsch/picc@X.Y.Z
 picc --version
 ```
 
-Each [GitHub Release](https://github.com/ArneDeutsch/PiCC/releases) also attaches
-`picc-X.Y.Z.tgz`. It is the same npm package archive, not a standalone executable. Download it,
-then give its local path to npm:
+Each [GitHub Release](https://github.com/ArneDeutsch/PiCC/releases) from `v0.1.1` onward also attaches
+`arnedeutsch-picc-X.Y.Z.tgz`. It is the same npm package archive, not a standalone executable.
+Download it, then give its local path to npm:
 
 ```powershell
-npm install --global ./picc-X.Y.Z.tgz
+npm install --global ./arnedeutsch-picc-X.Y.Z.tgz
 picc --version
 ```
 
-All three forms are npm-owned global installations. Running `picc update` on any of them moves that
-installation to the registry's current `latest`, including one originally selected by exact version
-or archive. To remain on a selected version, do not run that updater; reinstall
-`picc@X.Y.Z` or the chosen archive when repair is needed.
+These forms are npm-owned global installations. Running `picc update` moves them to the registry's
+current `latest`, including an installation originally selected by exact version or archive. To
+remain on a selected version, do not run that updater; reinstall `@arnedeutsch/picc@X.Y.Z` or the
+chosen archive when repair is needed.
 
-If npm reports that no `picc` release is published yet, use the source-checkout path below until the
-first release lands.
+The `v0.1.0` GitHub archive predates the scoped npm package and is not covered by that self-update
+path. Migrate it once to the scoped package:
+
+```powershell
+npm uninstall --global picc
+npm install --global @arnedeutsch/picc
+picc --version
+```
 
 ### Source checkout with a global command
 

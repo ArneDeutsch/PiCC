@@ -39,7 +39,7 @@ function collect(child) {
 
 function publicationFailure(stderr) {
   if (stderr.includes("E401")) return "npm rejected authentication; replace or re-authorize NPM_TOKEN.";
-  if (stderr.includes("E403")) return "npm refused publication; confirm the token can publish picc and satisfies npm policy.";
+  if (stderr.includes("E403")) return "npm refused publication; confirm the token can publish @arnedeutsch/picc and satisfies npm policy.";
   if (stderr.includes("EPUBLISHCONFLICT")) return "npm reports this version already exists; compare its registry integrity with the retained release artifact before deciding whether publication completed.";
   return "npm publication failed; inspect the protected workflow log and retained release artifact before retrying.";
 }
@@ -82,7 +82,7 @@ export async function publishRelease({
 export async function runPublishReleaseCli(argv = process.argv.slice(2), output = console) {
   try {
     const result = await publishRelease(parseCli(argv));
-    output.log(`Published picc ${result.version} from SHA-256 ${result.sha256}.`);
+    output.log(`Published @arnedeutsch/picc ${result.version} from SHA-256 ${result.sha256}.`);
     return 0;
   } catch (error) {
     output.error(error instanceof Error ? error.message : "Release publication failed");

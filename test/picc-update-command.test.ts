@@ -31,8 +31,8 @@ function write(filename: string, contents: string): void {
 function makeRoot(options: { root?: string; source?: boolean; version?: string } = {}): string {
   const root = options.root ?? temp("picc-update-");
   write(path.join(root, "package.json"), JSON.stringify({
-    name: "picc",
-    version: options.version ?? "0.1.0",
+    name: "@arnedeutsch/picc",
+    version: options.version ?? "0.1.1",
     type: "module",
   }));
   if (options.source ?? true) {
@@ -511,9 +511,9 @@ fs.writeFileSync(process.env.PICC_NPM_CANARY, JSON.stringify({
 });
 
 describe("global npm update and repair", () => {
-  function globalFixture(version = "0.1.0") {
+  function globalFixture(version = "0.1.1") {
     const globalRoot = temp("picc-global-root-");
-    const root = makeRoot({ root: path.join(globalRoot, "picc"), source: false, version });
+    const root = makeRoot({ root: path.join(globalRoot, "@arnedeutsch", "picc"), source: false, version });
     return { globalRoot, root };
   }
 
@@ -527,8 +527,8 @@ describe("global npm update and repair", () => {
       globalRoot,
       runNpm: (args: string[]) => {
         calls.push("version");
-        expect(args).toEqual(["view", "picc", "version", "--json"]);
-        return child({ stdout: "\"0.1.0\"\n" });
+        expect(args).toEqual(["view", "@arnedeutsch/picc", "version", "--json"]);
+        return child({ stdout: "\"0.1.1\"\n" });
       },
       buildRuntime: () => { throw new Error("installed packages never build"); },
       validateRuntime: (options: { checkSource: boolean }) => {
@@ -554,7 +554,7 @@ describe("global npm update and repair", () => {
       action: "check",
       packageRoot: root,
       globalRoot,
-      runNpm: () => child({ stdout: "\"0.1.0\"" }),
+      runNpm: () => child({ stdout: "\"0.1.1\"" }),
       validateRuntime: () => runtime,
       validateSuite: suite,
       output: capture.sink,
@@ -580,7 +580,7 @@ describe("global npm update and repair", () => {
       runNpm: (args: string[], options: { cwd: string }) => {
         calls.push(args.join(" "));
         if (args[0] === "install") expect(options.cwd).toBe(canonicalPath(globalRoot));
-        return args[0] === "view" ? child({ stdout: "\"0.1.0\"" }) : child();
+        return args[0] === "view" ? child({ stdout: "\"0.1.1\"" }) : child();
       },
       buildRuntime: () => { throw new Error("installed packages never build"); },
       validateRuntime: () => {
@@ -593,12 +593,12 @@ describe("global npm update and repair", () => {
 
     expect(result).toBe(0);
     expect(calls).toEqual([
-      "view picc version --json",
-      "install --global --force picc@latest --ignore-scripts --no-audit --no-fund",
+      "view @arnedeutsch/picc version --json",
+      "install --global --force @arnedeutsch/picc@latest --ignore-scripts --no-audit --no-fund",
     ]);
     expect(runtimeChecks).toBe(2);
     expect(piChecks).toBe(2);
-    expect(capture.logs.join("\n")).toMatch(/repaired PiCC 0\.1\.0.*verified runtime/i);
+    expect(capture.logs.join("\n")).toMatch(/repaired PiCC 0\.1\.1.*verified runtime/i);
   });
 
   it("updates a newer version without force and re-reads its manifest", async () => {
@@ -610,7 +610,7 @@ describe("global npm update and repair", () => {
       runNpm: (args: string[]) => {
         calls.push(args);
         if (args[0] === "view") return child({ stdout: "\"0.2.0\"" });
-        write(path.join(root, "package.json"), JSON.stringify({ name: "picc", version: "0.2.0", type: "module" }));
+        write(path.join(root, "package.json"), JSON.stringify({ name: "@arnedeutsch/picc", version: "0.2.0", type: "module" }));
         return child();
       },
       validateRuntime: healthyRuntime,
@@ -618,7 +618,7 @@ describe("global npm update and repair", () => {
       output: outputCapture().sink,
     });
     expect(result).toBe(0);
-    expect(calls[1]).toEqual(["install", "--global", "picc@latest", "--ignore-scripts", "--no-audit", "--no-fund"]);
+    expect(calls[1]).toEqual(["install", "--global", "@arnedeutsch/picc@latest", "--ignore-scripts", "--no-audit", "--no-fund"]);
   });
 
   it("rejects a completed update whose package version was not replaced while still post-validating runtime and Pi", async () => {
@@ -637,7 +637,7 @@ describe("global npm update and repair", () => {
     expect(result).toBe(1);
     expect(runtimeChecks).toBe(2);
     expect(piChecks).toBe(2);
-    expect(capture.errors.join("\n")).toMatch(/Expected PiCC 0\.2\.0; found 0\.1\.0/i);
+    expect(capture.errors.join("\n")).toMatch(/Expected PiCC 0\.2\.0; found 0\.1\.1/i);
   });
 
   it.each(["runtime", "Pi"] as const)("rejects a completed repair with a post-install %s-only failure", async (failedOwner) => {
@@ -648,7 +648,7 @@ describe("global npm update and repair", () => {
     const result = await runUpdate({
       packageRoot: root,
       globalRoot,
-      runNpm: (args: string[]) => args[0] === "view" ? child({ stdout: "\"0.1.0\"" }) : child(),
+      runNpm: (args: string[]) => args[0] === "view" ? child({ stdout: "\"0.1.1\"" }) : child(),
       validateRuntime: () => {
         runtimeChecks += 1;
         return failedOwner === "runtime"
@@ -670,7 +670,7 @@ describe("global npm update and repair", () => {
     const expectedReason = failedOwner === "runtime" ? "Runtime is still corrupt." : "The embedded Pi CLI is still incoherent.";
     expect(capture.errors).toEqual([
       `PiCC: npm completed but the installed product did not validate. ${expectedReason}`,
-      "Repair this global npm-owned copy with `npm install --global --force picc@latest --ignore-scripts --no-audit --no-fund`, then run `picc update --check`.",
+      "Repair this global npm-owned copy with `npm install --global --force @arnedeutsch/picc@latest --ignore-scripts --no-audit --no-fund`, then run `picc update --check`.",
     ]);
     expect(capture.errors.join("\n")).not.toContain("Run `picc update` or reinstall PiCC.");
   });
@@ -683,7 +683,7 @@ describe("global npm update and repair", () => {
       packageRoot: root,
       globalRoot,
       runNpm: (args: string[]) => args[0] === "view"
-        ? child({ stdout: "\"0.1.0\"" })
+        ? child({ stdout: "\"0.1.1\"" })
         : child({ code: 1, stderr: "permission denied" }),
       validateRuntime: () => { runtimeChecks += 1; return { ok: false, reason: "bad" }; },
       validateSuite: () => { piChecks += 1; return healthySuite(); },
@@ -694,13 +694,30 @@ describe("global npm update and repair", () => {
     expect(piChecks).toBe(1);
   });
 
-  it("does not mutate or inspect product state for another installation owner", async () => {
-    const root = makeRoot({ source: false });
+  it.each([
+    ["legacy unscoped path", (globalRoot: string) => makeRoot({ root: path.join(globalRoot, "picc"), source: false })],
+    ["another scope", (globalRoot: string) => makeRoot({ root: path.join(globalRoot, "@other", "picc"), source: false })],
+    ["missing scoped candidate", () => makeRoot({ source: false })],
+    ["unusable scoped candidate", (globalRoot: string) => {
+      const root = makeRoot({ source: false });
+      write(path.join(globalRoot, "@arnedeutsch", "picc"), "not a package directory");
+      return root;
+    }],
+    ["scoped candidate escaping the global root", (globalRoot: string) => {
+      const root = makeRoot({ source: false });
+      fs.mkdirSync(path.join(globalRoot, "@arnedeutsch"), { recursive: true });
+      fs.symlinkSync(root, path.join(globalRoot, "@arnedeutsch", "picc"),
+        process.platform === "win32" ? "junction" : "dir");
+      return root;
+    }],
+  ] as const)("rejects %s without npm mutation or product validation", async (_label, arrangeRoot) => {
+    const globalRoot = temp("different-global-root-");
+    const root = arrangeRoot(globalRoot);
     let calls = 0;
     const capture = outputCapture();
     const result = await runUpdate({
       packageRoot: root,
-      globalRoot: temp("different-global-root-"),
+      globalRoot,
       runNpm: () => { calls += 1; return child(); },
       buildRuntime: () => { calls += 1; },
       validateRuntime: () => { calls += 1; return healthyRuntime(); },
@@ -716,7 +733,7 @@ describe("global npm update and repair", () => {
 describe("installed administrative updater shape", () => {
   it("loads without scripts and reaches injected global check, repair, and non-owner routes", async () => {
     const globalRoot = temp("picc-installed-admin-");
-    const root = path.join(globalRoot, "picc");
+    const root = path.join(globalRoot, "@arnedeutsch", "picc");
     const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     for (const relative of ["package.json", "bin/picc-update.mjs", "bin/picc-admin.mjs", "bin/picc-runtime.mjs"]) {
       const source = path.join(repositoryRoot, relative);

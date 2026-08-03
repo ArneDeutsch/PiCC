@@ -49,7 +49,7 @@ async function main() {
     ]);
     const packageRoot = admin.findPackageRoot(import.meta.url);
     const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-    if (manifest?.name !== "picc" || !admin.parseStableExactVersion(manifest.version)) throw new Error("invalid manifest");
+    if (manifest?.name !== "@arnedeutsch/picc" || !admin.parseStableExactVersion(manifest.version)) throw new Error("invalid manifest");
     const installationKind = admin.classifyInstallation({ packageRoot });
     const argv = process.argv.slice(2);
     const first = argv[0];

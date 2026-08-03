@@ -68,9 +68,9 @@ function parseJson(content, label, maxBytes) {
 }
 
 function validateExpectedPackage(value) {
-  if (!exactKeys(value, ["name", "version", "type"]) || value.name !== "picc"
+  if (!exactKeys(value, ["name", "version", "type"]) || value.name !== "@arnedeutsch/picc"
       || typeof value.version !== "string" || value.version.length === 0 || value.type !== "module") {
-    throw new TypeError("expectedPackage must be the explicit picc package identity");
+    throw new TypeError("expectedPackage must be the explicit @arnedeutsch/picc package identity");
   }
 }
 

@@ -1189,7 +1189,7 @@ describe("lifecycle wiring", () => {
     const initializeDirect = async () => {
       process.env.PICC_LAUNCHER_PID = String(process.ppid);
       process.env.PICC_INSTALL_KIND = "source";
-      process.env.PICC_VERSION = "0.1.0";
+      process.env.PICC_VERSION = "0.1.1";
       process.env.PI_SKIP_VERSION_CHECK = "1";
       const directPi = fakePi();
       picc(directPi.api as never, { onInitializationSettled: directPi.captureInitialization });

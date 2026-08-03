@@ -100,7 +100,10 @@ export function verifyReleaseAdmission({ packageRoot, event, tag } = {}) {
   try { root = canonicalPath(packageRoot ?? findPackageRoot(import.meta.url)); }
   catch { fail("package root is unavailable"); }
   const manifest = readManifest(root);
-  if (manifest?.name !== "picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) fail("package name/version/type must identify picc as a stable ESM package");
+  if (manifest?.name !== "@arnedeutsch/picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) fail("package name/version/type must identify @arnedeutsch/picc as a stable ESM package");
+  if (manifest.publishConfig?.access !== "public" || manifest.bin?.picc !== "bin/picc.mjs") {
+    fail("package metadata must declare public access and the picc executable");
+  }
   if (event === "tag" && tag !== `v${manifest.version}`) fail("tag must exactly match v<package version>");
   if (event === "manual" && tag !== undefined) fail("manual verification must not carry a tag");
   if (event !== "tag" && event !== "manual") fail("event must be tag or manual");
