@@ -69,6 +69,7 @@ export async function publishRelease({
       "--registry=https://registry.npmjs.org/",
       "--access=public",
       "--ignore-scripts",
+      "--provenance",
     ], { cwd: temp, env, stdio: ["ignore", "ignore", "pipe"] });
     const result = await collect(child);
     if (!result.ok) throw new Error(publicationFailure(result.stderr));

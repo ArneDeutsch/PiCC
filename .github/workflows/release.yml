@@ -18,6 +18,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Verify tagged commit is contained in current main
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        run: |
+          fetch_args=(--no-tags)
+          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+            fetch_args+=(--unshallow)
+          fi
+          git -c http.https://github.com/.extraheader= fetch "${fetch_args[@]}" https://github.com/ArneDeutsch/PiCC.git +refs/heads/main:refs/remotes/origin/main
+          tag_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
@@ -86,6 +97,7 @@ jobs:
       name: npm-publish
     permissions:
       contents: write
+      id-token: write
     env:
       RELEASE_FILENAME: ${{ needs.package.outputs.filename }}
       RELEASE_SHA256: ${{ needs.package.outputs.sha256 }}
@@ -117,10 +129,7 @@ jobs:
       - name: Publish exact artifact to npm
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        shell: bash
-        run: |
-          if [[ -z "$NPM_TOKEN" ]]; then
-            echo "NPM_TOKEN is absent; npm publication skipped."
-            exit 0
-          fi
-          node scripts/publish-release.mjs --tarball "$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME" --expected-sha256 "$RELEASE_SHA256" --event tag --tag "$GITHUB_REF_NAME"
+        run: >-
+          node scripts/publish-release.mjs
+          --tarball "$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME"
+          --expected-sha256 "$RELEASE_SHA256" --event tag --tag "$GITHUB_REF_NAME"
