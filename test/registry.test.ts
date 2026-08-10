@@ -577,6 +577,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const guide = readDoc("../doc/user-guide.md");
     const runSection = section(guide, "## 4. Run a Claude Code project");
     expect(runSection).toMatch(/MCP servers[\s\S]*standalone `managed-mcp\.json`[\s\S]*native Claude user\/project-local state/);
+    for (const predicate of [
+      /neither reads nor migrates Windows registry policy/,
+      /HKLM-[\s\S]*HKCU-only policy[\s\S]*silently[\s\S]*ignored[\s\S]*no settings, diagnostics, enforcement, cleanup blocking, or fail-closed[\s\S]*behavior/,
+      /manually deploy[\s\S]*administrator-owned Windows system file or its ordered drop-ins/,
+      /no precedence-equivalent[\s\S]*migration/,
+      /lexically last drop-in best approximates the former machine-policy-after-files[\s\S]*order/,
+      /former user fallback has no exact user-writable managed replacement/,
+      /standalone[\s\S]*`managed-mcp\.json` authority is separate[\s\S]*not a migration target/,
+    ]) expect(runSection).toMatch(predicate);
     const securitySection = section(guide, "## 6. Security & permission posture");
     for (const predicate of [
       /Managed MCP policy/,
@@ -592,8 +601,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       /\[capability matrix\]\(supported-features\.md\)/,
     ]) expect(securitySection).toMatch(predicate);
     const troubleshooting = section(guide, "## 9. Troubleshooting");
-    expect(troubleshooting).toMatch(/Managed MCP policy is fail closed[\s\S]*standalone managed MCP file[\s\S]*`managed-mcp\.json`[\s\S]*managed-settings system file, system drop-in, or machine registry[\s\S]*user-controlled policy input/);
-    expect(troubleshooting).toMatch(/Then use `\/reload` or restart PiCC; `\/new` does not reload policy/);
+    const managedMcpRow = troubleshooting.match(/^\| Managed MCP policy is fail closed[^\n]+$/m)?.[0];
+    expect(managedMcpRow).toMatch(/standalone `managed-mcp\.json`[\s\S]*managed-settings system file or ordered drop-in/);
+    expect(managedMcpRow).toMatch(/Then use `\/reload` or restart PiCC; `\/new` does not reload policy/);
+    expect(managedMcpRow).not.toMatch(/override|user-controlled/);
+    const managedPluginRow = troubleshooting.match(/^\| Managed plugin policy is ignored[^\n]+$/m)?.[0];
+    expect(managedPluginRow).toMatch(/Windows registry policy did not migrate[\s\S]*managed system file or ordered drop-in[\s\S]*administrator[\s\S]*`\/reload`[\s\S]*exit and relaunch PiCC[\s\S]*registry-only policy[\s\S]*migrated manually[\s\S]*project loading/);
+    expect(managedPluginRow).not.toMatch(/`override`|user-controlled/);
 
     const architecture = readDoc("../doc/architecture.md");
     const discoverySection = section(architecture, "### `discovery/` — where artifacts live, and precedence");
@@ -608,8 +622,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
     const threatModel = readDoc("../doc/threat-model.md");
     const inScope = section(threatModel, "## In scope");
-    expect(inScope).toMatch(/Administrator-managed MCP admission[\s\S]*Applicable managed policy governs every MCP source PiCC[\s\S]*loads/);
-    expect(inScope).toMatch(/Uncertainty that could weaken that policy fails closed[\s\S]*blocked server cannot initiate server-side effects/);
+    expect(inScope).toMatch(/Administrator-managed MCP admission[\s\S]*system managed[\s\S]*ordered drop-ins[\s\S]*`managed-mcp\.json`[\s\S]*Applicable[\s\S]*policy from those authorities governs every MCP source PiCC loads/);
+    expect(inScope).toMatch(/Uncertainty that could weaken[\s\S]*fails closed[\s\S]*blocked server[\s\S]*cannot initiate[\s\S]*server-side effects/);
+    expect(inScope).toMatch(/Windows registry state is not an applicable enforcement input/);
   });
 
   it("splits installed plugin support truth by selection, component, management, and lifecycle", () => {
@@ -720,7 +735,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const phrase of ["add, update, remove, refresh", "network acquisition", "lifecycle mutation", "observation-only"]) expect(lifecycle?.note).toContain(phrase);
   });
 
-  it("qualifies plugin-agent global fields and implemented managed-policy sources and merge", () => {
+  it("qualifies plugin-agent global fields, retained managed-policy sources, and unsupported Windows registry delivery", () => {
     expect(lookupCapability("agent.frontmatter.hooks")?.note).toContain("for non-plugin agents");
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("for non-plugin agents");
     expect(lookupCapability("agent.frontmatter.permissionMode")?.note).toContain("for non-plugin agents");
@@ -728,18 +743,53 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(managed?.tier).toBe("partial");
     for (const phrase of [
       "system managed settings file",
-      "drop-in files",
-      "Windows HKLM",
-      "HKCU is a user-policy fallback",
+      "lexically ordered drop-in files",
       "Scalar replacement plus recursive object merge and stable array dedup",
-      "system file → drop-ins → HKLM",
-      "only when no administrator policy is present",
       "managed-settings source discovery",
       "standalone managed-mcp.json exclusive-server mechanism is distinct",
+      "Windows registry delivery is unsupported",
       "no complete server-managed settings, MDM, MDM-preference, or policy-helper parity",
+      "malformed or unreadable retained sources diagnose and are ignored",
     ]) expect(managed?.note).toContain(phrase);
-    expect(managed?.related).toContain("feature.mcp-managed-config");
+    const windowsRegistry = lookupCapability("feature.managed-policy-windows-registry");
+    expect(windowsRegistry).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    for (const phrase of [
+      "HKLM and HKCU are neither queried nor probed",
+      "Registry-only policy is silently ignored",
+      "no settings, diagnostics, enforcement, cleanup blocking, or fail-closed behavior",
+      "administrator-owned system managed settings files or ordered drop-ins",
+    ]) expect(windowsRegistry?.note).toContain(phrase);
+    expect(managed?.related).toEqual(expect.arrayContaining(["feature.mcp-managed-config", "feature.managed-policy-windows-registry"]));
+    expect(windowsRegistry?.related).toContain("feature.managed-policy");
     expect(lookupCapability("feature.mcp-managed-config")?.related).toContain("feature.managed-policy");
+
+    const root = makeTempDir();
+    const projectRoot = path.join(root, "project");
+    const userDir = path.join(root, "user", ".claude");
+    const managedRoot = path.join(root, "windows-managed-policy");
+    const description = {
+      systemSettingsPath: path.join(managedRoot, "managed-settings.json"),
+      dropInDir: path.join(managedRoot, "managed-settings.d"),
+      artifactDirs: [managedRoot],
+    };
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.mkdirSync(description.dropInDir, { recursive: true });
+    fs.writeFileSync(description.systemSettingsPath, JSON.stringify({ env: { FROM_SYSTEM_FILE: "loaded" } }));
+    fs.writeFileSync(path.join(description.dropInDir, "10-clean.json"), JSON.stringify({ env: { FROM_DROP_IN: "loaded" } }));
+    const settings = loadSettings({
+      cwd: projectRoot,
+      projectRoot,
+      userDir,
+      managedPolicy: { platform: "win32", description },
+    });
+    expect(settings.env).toMatchObject({ FROM_SYSTEM_FILE: "loaded", FROM_DROP_IN: "loaded" });
+    expect(settings.diagnostics).toEqual([]);
+
+    const cleanProject = makeProject({ root: projectRoot, cwd: projectRoot, userDir, settings });
+    const doctor = renderDoctorReport(cleanProject, buildCompatReport(cleanProject));
+    expect(doctor).not.toContain("feature.managed-policy-windows-registry");
+    expect(doctor).not.toMatch(/Windows registry policy|Registry-only policy/);
   });
 
   it.each<DisclosureContract>([
@@ -1972,7 +2022,7 @@ describe("buildCompatReport", () => {
         agents: [stripped],
         settings: makeSettings({
           diagnostics: [
-            { severity: "warning", message: "raw administrator secret", category: "managed-policy-unreadable", sourceClass: "registry-hklm", impact: "weaker-policy-suppressed", source: "C:/SECRET/policy" },
+            { severity: "warning", message: "raw administrator secret", category: "managed-policy-unreadable", sourceClass: "system-file", impact: "source-ignored", source: "C:/SECRET/policy" },
             { severity: "warning", message: 'Plugin "typed@market" in "enabledPlugins" must be a literal boolean; ignored', source: "C:/SECRET/settings.json" },
           ],
         }),
@@ -2000,7 +2050,7 @@ describe("buildCompatReport", () => {
       expect(outcomeLine).not.toContain("/new");
     }
     expect(doctor.match(/no fallback content loaded/g)?.length).toBeGreaterThanOrEqual(6);
-    expect(doctor).toContain("Administrator policy (registry-hklm) was unreadable; weaker policy was suppressed");
+    expect(doctor).toContain("Administrator policy (system-file) was unreadable; that source was ignored");
     expect(doctor).toContain("non-boolean enablement value was ignored");
     const enablementLine = doctor.split("\n").find((line) => line.includes("non-boolean enablement value was ignored")) ?? "";
     expect(enablementLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
@@ -2090,14 +2140,12 @@ describe("buildCompatReport", () => {
     expect(report.findings.some((finding) => finding.evidence === "30 additional installed-plugin hook limitation(s) omitted.")).toBe(true);
   });
 
-  it("reports the managed-policy and activation diagnostic matrix with fixed safe wording", () => {
+  it("reports the retained managed-policy and activation diagnostic matrix with fixed safe wording", () => {
     const diagnostics = [
       { severity: "warning", message: "RAW malformed detail", category: "managed-policy-malformed", sourceClass: "system-file", impact: "source-ignored", source: "C:/RAW/managed.json" },
-      { severity: "warning", message: "RAW malformed suppressed", category: "managed-policy-malformed", sourceClass: "system-drop-in", impact: "weaker-policy-suppressed", source: "C:/RAW/drop-in.json" },
-      { severity: "warning", message: "RAW unreadable detail", category: "managed-policy-unreadable", sourceClass: "registry-hklm", impact: "source-ignored", source: "C:/RAW/HKLM" },
-      { severity: "warning", message: "RAW unreadable suppressed", category: "managed-policy-unreadable", sourceClass: "registry-hkcu", impact: "weaker-policy-suppressed", source: "C:/RAW/HKCU" },
+      { severity: "warning", message: "RAW unreadable detail", category: "managed-policy-unreadable", sourceClass: "system-drop-in", impact: "source-ignored", source: "C:/RAW/drop-in.json" },
       { severity: "warning", message: "RAW override detail", category: "managed-policy-malformed", sourceClass: "override", impact: "source-ignored", source: "C:/RAW/override" },
-      { severity: "warning", message: "RAW unknown source", category: "managed-policy-unreadable", sourceClass: "RAW-SOURCE-CLASS", impact: "weaker-policy-suppressed", source: "C:/RAW/unknown" },
+      { severity: "warning", message: "RAW unknown source", category: "managed-policy-unreadable", sourceClass: "RAW-SOURCE-CLASS", impact: "source-ignored", source: "C:/RAW/unknown" },
       { severity: "warning", message: "RAW malformed source", category: "managed-policy-malformed", sourceClass: 7, impact: "RAW-IMPACT", source: "C:/RAW/malformed" },
       { severity: "warning", message: "enabledPlugins must be a literal boolean RAW-VALUE", source: "C:/RAW/settings" },
       { severity: "warning", message: "enabledPlugins is not an object RAW-OBJECT", source: "C:/RAW/settings" },
@@ -2108,11 +2156,9 @@ describe("buildCompatReport", () => {
     const doctor = renderDoctorReport(project, buildCompatReport(project));
     for (const phrase of [
       "Administrator policy (system-file) was malformed; that source was ignored",
-      "Administrator policy (system-drop-in) was malformed; weaker policy was suppressed",
-      "Administrator policy (registry-hklm) was unreadable; that source was ignored",
-      "User policy fallback (registry-hkcu) was unreadable; weaker policy was suppressed",
+      "Administrator policy (system-drop-in) was unreadable; that source was ignored",
       "Managed-settings override was malformed; that source was ignored",
-      "Managed-policy source was unreadable; weaker policy was suppressed",
+      "Managed-policy source was unreadable; that source was ignored",
       "Managed-policy source was malformed; policy processing was degraded",
       "a non-boolean enablement value was ignored",
       "the enablement mapping was not an object and was ignored",
@@ -2122,8 +2168,7 @@ describe("buildCompatReport", () => {
     expect(doctor).not.toContain("No compatibility findings detected.");
     for (const raw of ["C:/RAW", "RAW-SOURCE-CLASS", "RAW-IMPACT", "RAW-VALUE", "RAW-OBJECT", "RAW-IDENTITY", "RAW-GENERIC"]) expect(doctor).not.toContain(raw);
     expect(doctor).not.toContain("Administrator policy (override)");
-    expect(doctor).not.toContain("Administrator policy (registry-hkcu)");
-    expect(doctor.match(/Administrator policy/g)).toHaveLength(3);
+    expect(doctor.match(/Administrator policy/g)).toHaveLength(2);
     const managedPolicyLine = doctor.split("\n").find((line) =>
       line.includes("Administrator policy (system-file) was malformed")
     ) ?? "";

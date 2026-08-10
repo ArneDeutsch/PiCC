@@ -390,8 +390,8 @@ describe("plugin inventory startup and doctor projections", () => {
     const failed = Array.from({ length: 12 }, (_, index) => item(`same@m${index}`, { outcome: { status: index === 0 ? "blocked" : "enabled-but-uninstalled", sharedStateCauses: [] } }));
     const state = snapshot(failed, { diagnostics: [
       { severity: "error", message: "raw administrator path", category: "managed-policy-malformed", sourceClass: "system-file", impact: "source-ignored" },
-      { severity: "error", message: "raw administrator path", category: "managed-policy-unreadable", sourceClass: "registry-hklm", impact: "weaker-policy-suppressed" },
-      { severity: "error", message: "not administrator", category: "managed-policy-malformed", sourceClass: "registry-hkcu", impact: "source-ignored" },
+      { severity: "error", message: "raw administrator path", category: "managed-policy-unreadable", sourceClass: "system-drop-in", impact: "source-ignored" },
+      { severity: "error", message: "not administrator", category: "managed-policy-malformed", sourceClass: "override", impact: "source-ignored" },
     ] });
     const projection = projectPluginInventoryStartup(state);
     expect(projection.needsAttention).toBe(true);
@@ -401,25 +401,22 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.omissions).toEqual({ identities: 2, managedPolicyEvidence: 0, captureEvidence: [] });
     expect(projection.managedPolicyEvidence).toEqual([
       { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
-      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "registry-hklm", sourceLabel: "machine registry policy", impact: "weaker-policy-suppressed", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
+      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
     ]);
     expect(projection.text).toContain("Run /doctor for details");
     expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
-    expect(projection.text).toContain("machine registry policy was unreadable; weaker policy was suppressed and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
+    expect(projection.text).toContain("system policy drop-in was unreadable; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
     expect(projection.text).not.toContain("captured for this session");
     expect(projection.text).not.toContain("raw administrator path");
   });
 
-  it("caps startup managed policy per impact so both consequences survive and keeps capture omissions separate", () => {
-    const diagnostics = (["source-ignored", "weaker-policy-suppressed"] as const).flatMap((impact) =>
-      (["system-file", "system-drop-in", "registry-hklm"] as const).flatMap((sourceClass) =>
-        (["managed-policy-malformed", "managed-policy-unreadable"] as const).map((category) => ({ severity: "error" as const, message: "hidden", category, sourceClass, impact }))));
+  it("caps startup managed policy while retaining malformed and unreadable administrator evidence separately from capture omissions", () => {
+    const diagnostics = (["system-file", "system-drop-in"] as const).flatMap((sourceClass) =>
+      (["managed-policy-malformed", "managed-policy-unreadable"] as const).map((category) => ({ severity: "error" as const, message: "hidden", category, sourceClass, impact: "source-ignored" as const })));
     const projection = projectPluginInventoryStartup(snapshot([], { diagnostics, omissions: { "snapshot.items": 2, "snapshot.diagnostics": 4 } }));
-    expect(projection.managedPolicyEvidence.filter((value) => value.impact === "source-ignored")).toHaveLength(3);
-    expect(projection.managedPolicyEvidence.filter((value) => value.impact === "weaker-policy-suppressed")).toHaveLength(3);
-    expect(projection.omissions).toEqual({ identities: 0, managedPolicyEvidence: 6, captureEvidence: [{ axis: "snapshot.diagnostics", count: 4 }, { axis: "snapshot.items", count: 2 }] });
+    expect(projection.managedPolicyEvidence).toHaveLength(3);
+    expect(projection.omissions).toEqual({ identities: 0, managedPolicyEvidence: 1, captureEvidence: [{ axis: "snapshot.diagnostics", count: 4 }, { axis: "snapshot.items", count: 2 }] });
     expect(projection.text).toContain("administrator source was ignored");
-    expect(projection.text).toContain("weaker policy was suppressed");
     expect(projection.text).toContain("correct the policy format");
     expect(projection.text).toContain("correct access to the policy source");
   });
@@ -440,30 +437,24 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.snapshotBoundary).toContain("captured for this session");
   });
 
-  it("projects every safe policy source and impact for doctor without raw paths while startup stays administrator-only", () => {
+  it("projects every retained policy source for doctor without raw paths while startup stays administrator-only", () => {
     const sources = [
       ["system-file", "system policy file", "Ask an administrator"],
       ["system-drop-in", "system policy drop-in", "Ask an administrator"],
-      ["registry-hklm", "machine registry policy", "Ask an administrator"],
-      ["registry-hkcu", "user registry policy", "Correct"],
       ["override", "managed-policy override", "Correct"],
     ] as const;
-    const diagnostics = sources.flatMap(([sourceClass]) => ([
-      { severity: "error" as const, message: `C:/RAW/${sourceClass}`, category: "managed-policy-malformed" as const, sourceClass, impact: "source-ignored" as const },
-      { severity: "error" as const, message: `/RAW/${sourceClass}`, category: "managed-policy-unreadable" as const, sourceClass, impact: "weaker-policy-suppressed" as const },
-    ]));
+    const diagnostics = sources.map(([sourceClass]) => (
+      { severity: "error" as const, message: `C:/RAW/${sourceClass}`, category: "managed-policy-unreadable" as const, sourceClass, impact: "source-ignored" as const }
+    ));
 
     const doctor = projectPluginInventoryDoctor(snapshot([], { diagnostics }));
-    expect(doctor.managedPolicyEvidence).toHaveLength(10);
+    expect(doctor.managedPolicyEvidence).toHaveLength(3);
     for (const [sourceClass, sourceLabel, actor] of sources) {
-      for (const impact of ["source-ignored", "weaker-policy-suppressed"] as const) {
-        expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact, guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("canonical /reload") }));
-      }
+      expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact: "source-ignored", guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("canonical /reload") }));
     }
-    expect(JSON.stringify(doctor)).not.toMatch(/C:\/RAW|\/RAW\//u);
+    expect(JSON.stringify(doctor)).not.toMatch(/C:\/RAW/u);
 
     const startup = projectPluginInventoryStartup(snapshot([], { diagnostics }));
-    expect(startup.managedPolicyEvidence.map((value) => value.sourceClass)).not.toContain("registry-hkcu");
     expect(startup.managedPolicyEvidence.map((value) => value.sourceClass)).not.toContain("override");
   });
 
@@ -514,9 +505,8 @@ describe("plugin inventory startup and doctor projections", () => {
   it("combines upstream capture and local projection omissions without conflating managed policy", () => {
     const diagnostics = Array.from({ length: 70 }, (_, index) => ({ severity: "warning" as const, message: `warning-${index}` }));
     const capabilityEvidence = Array.from({ length: 130 }, (_, index) => ({ capabilityId: `feature.test-${index}`, qualifiedIdentity: `p${index}@market`, observation: "bounded" }));
-    const policyDiagnostics = (["source-ignored", "weaker-policy-suppressed"] as const).flatMap((impact) =>
-      (["system-file", "system-drop-in", "registry-hklm"] as const).flatMap((sourceClass) =>
-        (["managed-policy-malformed", "managed-policy-unreadable"] as const).map((category) => ({ severity: "error" as const, message: "managed", category, sourceClass, impact }))));
+    const policyDiagnostics = (["system-file", "system-drop-in", "override"] as const).flatMap((sourceClass) =>
+      (["managed-policy-malformed", "managed-policy-unreadable"] as const).map((category) => ({ severity: "error" as const, message: "managed", category, sourceClass, impact: "source-ignored" as const })));
     const projection = projectPluginInventoryDoctor(snapshot([item("p@market", { diagnostics })], { diagnostics: policyDiagnostics, capabilityEvidence, omissions: { "snapshot.diagnostics": 4, "snapshot.capability-evidence": 5, "snapshot.policies": 6 } }));
     expect(projection.diagnostics).toHaveLength(64);
     expect(projection.capabilityEvidence).toHaveLength(128);

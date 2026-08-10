@@ -46,7 +46,7 @@ const EXPECTED_LIMITS = {
 
 const failure = {
   kind: "unreadable",
-  sourceClass: "registry-hklm",
+  sourceClass: "system-drop-in",
   authority: "administrator-controlled",
   remediation: "repair-administrator-policy",
 } as const;
@@ -187,7 +187,7 @@ describe("managed MCP policy compiler and evaluator", () => {
   it("keeps applicable source failure globally dominant beside valid rules and exclusive control", () => {
     const policy = compileMcpPolicy({
       settings: [entry("managed", 1, { allowedMcpServers: [{ serverName: "tools" }] })],
-      sourceFailures: [{ kind: "unreadable", sourceClass: "registry-hklm", authority: "administrator-controlled", remediation: "repair-administrator-policy" }],
+      sourceFailures: [{ kind: "unreadable", sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" }],
       exclusiveManagedServerCount: 2,
     });
     expect(policy.posture).toBe("fail-closed");
@@ -366,10 +366,26 @@ describe("managed MCP policy compiler and evaluator", () => {
     expect(evaluateMcpPolicy({ ...empty, compiled: {} }, stdio()).reason).toBe("fail-closed");
   });
 
+  it("accepts every retained source-failure class and rejects unknown classes", () => {
+    const retained = [
+      { sourceClass: "standalone-mcp", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { sourceClass: "system-drop-in", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
+      { sourceClass: "override", authority: "user-controlled", remediation: "repair-user-policy" },
+    ] as const;
+    for (const source of retained) {
+      const policy = compileMcpPolicy({ sourceFailures: [{ kind: "unreadable", ...source }] });
+      expect(policy).toMatchObject({ posture: "fail-closed", authority: source.authority });
+      expect(policy.failures).toContainEqual(expect.objectContaining({ sourceClass: source.sourceClass }));
+    }
+    const invalid = compileMcpPolicy({ sourceFailures: [{ ...failure, sourceClass: "future-source" }] as unknown as readonly McpPolicySourceFailure[] });
+    expect(invalid).toMatchObject({ posture: "fail-closed", authority: "mixed", failures: [] });
+  });
+
   it("makes source failures globally dominant with truthful user, administrator, mixed, and combined authority", () => {
     const userFailure = {
       ...failure,
-      sourceClass: "registry-hkcu",
+      sourceClass: "override",
       authority: "user-controlled",
       remediation: "repair-user-policy",
     } as const;

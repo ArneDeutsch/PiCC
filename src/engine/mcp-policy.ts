@@ -97,7 +97,7 @@ type RuleResult =
   | { readonly state: "over-limit" };
 
 const FAILURE_KINDS = new Set(["malformed", "unreadable", "omitted"]);
-const SOURCE_CLASSES = new Set(["standalone-mcp", "system-file", "system-drop-in", "registry-hklm", "registry-hkcu", "override"]);
+const SOURCE_CLASSES = new Set(["standalone-mcp", "system-file", "system-drop-in", "override"]);
 const AUTHORITIES = new Set(["user-controlled", "administrator-controlled", "mixed"]);
 const REMEDIATIONS = new Set(["repair-user-policy", "repair-administrator-policy", "repair-mixed-policy"]);
 
