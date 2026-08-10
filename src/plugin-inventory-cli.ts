@@ -88,7 +88,7 @@ function incompleteStateWarning(
     const evidence = `${diagnostic.category ?? ""} ${diagnostic.sourceClass ?? ""} ${diagnostic.message}`.toLowerCase();
     if (/installed|blocklist/u.test(evidence)) classes.add("installed plugin state");
     if (/marketplace|catalog|allowlist/u.test(evidence)) classes.add("marketplace state");
-    if (/managed-policy|registry-/u.test(evidence)) classes.add("managed policy state");
+    if (/managed-policy/u.test(evidence)) classes.add("managed policy state");
     if (/manifest|metadata/u.test(evidence)) classes.add("plugin metadata");
     const formatDiagnostic = /unsupported (?:format|version)|format is unsupported|undocumented/u.test(evidence);
     if (formatDiagnostic) unsupportedFormat = true;
