@@ -9,14 +9,11 @@ import {
   type OrdinarySettingsProbeResult,
 } from "../src/discovery/settings.js";
 import {
-  createWindowsManagedRegistryAdapter,
   defaultManagedMcpPath,
   defaultManagedPolicyDescription,
   discoverManagedMcp,
   discoverManagedPolicy,
   type ManagedPolicyIo,
-  type ManagedRegistryAdapter,
-  type RegistryCommandInvocation,
 } from "../src/discovery/managed-policy.js";
 import {
   createNodeManagedMcpIo,
@@ -225,19 +222,6 @@ function inertPolicyIo(
     },
     listJsonFiles() {
       return { status: "present", files: dropIns };
-    },
-  };
-}
-
-function inertRegistry(
-  hklm: ReturnType<ManagedRegistryAdapter["readSettings"]>,
-  hkcu: ReturnType<ManagedRegistryAdapter["readSettings"]>,
-  calls: string[] = [],
-): ManagedRegistryAdapter {
-  return {
-    readSettings(hive) {
-      calls.push(hive);
-      return hive === "HKLM" ? hklm : hkcu;
     },
   };
 }
@@ -733,7 +717,6 @@ describe("loadSettings — robustness (completeness floor)", () => {
         managedPolicy: {
           platform: "win32",
           io: inertPolicyIo({}),
-          registry: inertRegistry({ status: "absent" }, { status: "absent" }),
         },
       }),
     ).not.toThrow();
@@ -1472,49 +1455,30 @@ describe("MCP policy settings projection", () => {
     expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
   });
 
-  it("projects administrator and active HKCU failures without paths or raw policy data", () => {
+  it("projects retained managed-file failures without paths or raw policy data", () => {
     const scopes = makeScopes();
     const description = {
       systemSettingsPath: "/policy/system.json",
       dropInDir: "/policy/drop-ins",
       artifactDirs: ["/policy"],
     };
-    const administrator = loadSettings({
-      cwd: scopes.projectRoot,
-      projectRoot: scopes.projectRoot,
-      userDir: scopes.userDir,
-      managedPolicy: {
-        platform: "linux",
-        description,
-        io: inertPolicyIo({ [description.systemSettingsPath]: "{ malformed" }),
-      },
-    });
-    expect(administrator.mcpPolicySourceFailures).toEqual([{
-      kind: "malformed", sourceClass: "system-file", authority: "administrator-controlled",
-      remediation: "repair-administrator-policy",
-    }]);
-
-    const registryCalls: string[] = [];
-    const hkcu = loadSettings({
+    const settings = loadSettings({
       cwd: scopes.projectRoot,
       projectRoot: scopes.projectRoot,
       userDir: scopes.userDir,
       managedPolicy: {
         platform: "win32",
         description,
-        io: inertPolicyIo({}),
-        registry: inertRegistry({ status: "absent" }, { status: "unreadable" }, registryCalls),
+        io: inertPolicyIo({ [description.systemSettingsPath]: "{ malformed" }),
       },
     });
-    expect(registryCalls).toEqual(["HKLM", "HKCU"]);
-    expect(hkcu.mcpPolicySourceFailures).toEqual([{
-      kind: "unreadable", sourceClass: "registry-hkcu", authority: "user-controlled",
-      remediation: "repair-user-policy",
+    expect(settings.mcpPolicySourceFailures).toEqual([{
+      kind: "malformed", sourceClass: "system-file", authority: "administrator-controlled",
+      remediation: "repair-administrator-policy",
     }]);
-    const serialized = JSON.stringify([...administrator.mcpPolicySourceFailures, ...hkcu.mcpPolicySourceFailures]);
+    const serialized = JSON.stringify(settings.mcpPolicySourceFailures);
     expect(serialized).not.toContain(description.systemSettingsPath);
     expect(serialized).not.toContain("{ malformed");
-    expect(serialized).not.toContain("SOFTWARE\\Policies\\ClaudeCode");
   });
 
   it("bounds policy contributions with stable order and retains later managed evidence", () => {
@@ -1560,52 +1524,30 @@ describe("MCP policy settings projection", () => {
     expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
   });
 
-  it("bounds failure records, retains later administrator evidence, and redacts source data", () => {
+  it("bounds retained managed-file failure records and redacts source data", () => {
     const scopes = makeScopes();
     const description = {
       systemSettingsPath: "/policy/system.json",
       dropInDir: "/policy/drop-ins",
       artifactDirs: ["/policy"],
     };
-    const dropIns = Array.from({ length: 64 }, (_, index) => `/policy/drop-ins/${String(index).padStart(2, "0")}-secret.json`);
+    const dropIns = Array.from({ length: 65 }, (_, index) => `/policy/drop-ins/${String(index).padStart(2, "0")}-secret.json`);
     const files = Object.fromEntries(dropIns.map((filePath) => [filePath, `{ malformed-secret-${filePath}`]));
-    const atLimit = loadSettings({
-      cwd: scopes.projectRoot,
-      projectRoot: scopes.projectRoot,
-      userDir: scopes.userDir,
-      managedPolicy: { platform: "linux", description, io: inertPolicyIo(files, dropIns) },
-    });
-    expect(atLimit.mcpPolicySourceFailures).toHaveLength(64);
-    expect(atLimit.mcpPolicyRestrictiveMaterialOmitted).toBe(false);
-    expect(atLimit.mcpPolicySourceFailures.every((failure) => failure.sourceClass === "system-drop-in")).toBe(true);
-
     const settings = loadSettings({
       cwd: scopes.projectRoot,
       projectRoot: scopes.projectRoot,
       userDir: scopes.userDir,
-      managedPolicy: {
-        platform: "win32",
-        description,
-        io: inertPolicyIo(files, dropIns),
-        registry: inertRegistry(
-          { status: "present", json: "{ malformed-registry-secret" },
-          { status: "absent" },
-        ),
-      },
+      managedPolicy: { platform: "win32", description, io: inertPolicyIo(files, dropIns) },
     });
     expect(settings.mcpPolicySourceFailures).toHaveLength(64);
     expect(settings.mcpPolicyRestrictiveMaterialOmitted).toBe(true);
-    expect(settings.mcpPolicySourceFailures.at(-1)).toEqual({
-      kind: "malformed", sourceClass: "registry-hklm", authority: "administrator-controlled",
-      remediation: "repair-administrator-policy",
-    });
+    expect(settings.mcpPolicySourceFailures.every((failure) => failure.sourceClass === "system-drop-in")).toBe(true);
     const serialized = JSON.stringify(settings.mcpPolicySourceFailures);
     expect(serialized).not.toContain("/policy");
     expect(serialized).not.toContain("secret");
-    expect(serialized).not.toContain("SOFTWARE\\Policies");
   });
 
-  it("projects malformed and unreadable evidence for every active managed source class", () => {
+  it("projects malformed and unreadable evidence for every retained managed-file source class", () => {
     const scopes = makeScopes();
     const description = {
       systemSettingsPath: "/redacted/system.json",
@@ -1615,64 +1557,22 @@ describe("MCP policy settings projection", () => {
     for (const unreadable of [false, true]) {
       const category = unreadable ? "unreadable" : "malformed";
       const malformed = unreadable ? "<unreadable>" : "{ secret-value";
-      const fileSettings = loadSettings({
+      const settings = loadSettings({
         cwd: scopes.projectRoot, projectRoot: scopes.projectRoot, userDir: scopes.userDir,
         managedPolicy: {
-          platform: "linux", description,
+          platform: "win32", description,
           io: inertPolicyIo({
             [description.systemSettingsPath]: malformed,
             [`${description.dropInDir}/entry.json`]: malformed,
           }, [`${description.dropInDir}/entry.json`]),
         },
       });
-      expect(fileSettings.mcpPolicySourceFailures).toEqual([
+      expect(settings.mcpPolicySourceFailures).toEqual([
         { kind: category, sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
         { kind: category, sourceClass: "system-drop-in", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
       ]);
-
-      for (const [hive, sourceClass, authority, remediation] of [
-        ["HKLM", "registry-hklm", "administrator-controlled", "repair-administrator-policy"],
-        ["HKCU", "registry-hkcu", "user-controlled", "repair-user-policy"],
-      ] as const) {
-        const calls: string[] = [];
-        const read = unreadable ? { status: "unreadable" as const } : { status: "present" as const, json: "{ registry-secret" };
-        const registrySettings = loadSettings({
-          cwd: scopes.projectRoot, projectRoot: scopes.projectRoot, userDir: scopes.userDir,
-          managedPolicy: {
-            platform: "win32", description, io: inertPolicyIo({}),
-            registry: inertRegistry(hive === "HKLM" ? read : { status: "absent" }, hive === "HKCU" ? read : { status: "absent" }, calls),
-          },
-        });
-        expect(calls).toEqual(hive === "HKLM" ? ["HKLM"] : ["HKLM", "HKCU"]);
-        expect(registrySettings.mcpPolicySourceFailures).toEqual([
-          { kind: category, sourceClass, authority, remediation },
-        ]);
-        expect(JSON.stringify(registrySettings.mcpPolicySourceFailures)).not.toMatch(/redacted|secret|SOFTWARE/u);
-      }
+      expect(JSON.stringify(settings.mcpPolicySourceFailures)).not.toMatch(/redacted|secret/u);
     }
-  });
-
-  it("suppresses HKCU completely when HKLM is present and valid", () => {
-    const scopes = makeScopes();
-    const calls: string[] = [];
-    const settings = loadSettings({
-      cwd: scopes.projectRoot,
-      projectRoot: scopes.projectRoot,
-      userDir: scopes.userDir,
-      managedPolicy: {
-        platform: "win32",
-        description: { systemSettingsPath: "/none", dropInDir: "/none.d", artifactDirs: ["/"] },
-        io: inertPolicyIo({}),
-        registry: inertRegistry(
-          { status: "present", json: JSON.stringify({ deniedMcpServers: [] }) },
-          { status: "unreadable" },
-          calls,
-        ),
-      },
-    });
-    expect(calls).toEqual(["HKLM"]);
-    expect(settings.mcpPolicySourceFailures).toEqual([]);
-    expect(settings.mcpPolicySettings).toEqual([expect.objectContaining({ scope: "managed", order: 0, deniedMcpServers: [] })]);
   });
 });
 
@@ -1812,7 +1712,7 @@ describe("standalone managed MCP discovery", () => {
     expect(discoverManagedMcp({ testAuthority: { path: "/test/over", io: over.io } })).toEqual({ status: "unusable", reason: "oversized" });
   });
 
-  it("uses only injected standalone authority and performs no registry, drop-in, or project lookup", () => {
+  it("uses only injected standalone authority and performs no managed-settings or project lookup", () => {
     const fixture = managedMcpIoFixture({ open: "absent" });
     discoverManagedMcp({
       platform: "win32",
@@ -1838,7 +1738,8 @@ describe("managed policy discovery", () => {
     expect(defaultManagedDirs("win32").join("|")).not.toContain("ProgramData");
   });
 
-  it("deep-merges base, sorted drop-ins, and HKLM with scalar, object, and stable-array semantics", () => {
+  it("loads system settings plus sorted drop-ins across retained managed policy categories", () => {
+    const scopes = makeScopes();
     const description = {
       systemSettingsPath: "/policy/managed-settings.json",
       dropInDir: "/policy/managed-settings.d",
@@ -1846,40 +1747,74 @@ describe("managed policy discovery", () => {
     };
     const a = "/policy/managed-settings.d/10-a.json";
     const b = "/policy/managed-settings.d/20-b.json";
-    const result = discoverManagedPolicy({
-      platform: "win32",
-      description,
-      io: inertPolicyIo(
-        {
-          [description.systemSettingsPath]: JSON.stringify({
-            model: "base",
-            nested: { a: 1, same: "base" },
-            list: ["base", { x: 1 }],
-            enabledPlugins: { "base@official": true },
-          }),
-          [a]: JSON.stringify({ nested: { b: 2, same: "a" }, list: ["a", { x: 1 }] }),
-          [b]: JSON.stringify({ model: "drop-in", list: ["base", "b"] }),
-        },
-        [a, b],
-      ),
-      registry: inertRegistry(
-        { status: "present", json: JSON.stringify({ model: "hklm", nested: { c: 3 }, list: ["hklm"] }) },
-        { status: "present", json: JSON.stringify({ model: "hkcu" }) },
-      ),
-    });
+    const io = inertPolicyIo(
+      {
+        [description.systemSettingsPath]: JSON.stringify({
+          permissions: { deny: ["Read(./secret)"] },
+          hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo managed" }] }] },
+          deniedMcpServers: [{ serverName: "blocked" }],
+          enabledPlugins: { "base@official": true },
+          claudeMd: "managed instructions",
+          env: { BASE: "yes", SHARED: "base" },
+          subagents: { maxDepth: 3 },
+          worktree: { baseRef: "fresh" },
+          cleanupPeriodDays: 12,
+          autoMemoryEnabled: false,
+          nested: { a: 1, same: "base" },
+          list: ["base", { x: 1 }],
+        }),
+        [a]: JSON.stringify({
+          permissions: { deny: ["Bash(curl *)"] },
+          env: { A: "yes", SHARED: "a" },
+          subagents: { concurrency: 4 },
+          nested: { b: 2, same: "a" },
+          list: ["a", { x: 1 }],
+        }),
+        [b]: JSON.stringify({
+          model: "drop-in",
+          allowedMcpServers: [{ serverName: "allowed" }],
+          autoMemoryDirectory: "/managed/memory",
+          list: ["base", "b"],
+        }),
+      },
+      [b, a],
+    );
 
-    expect(result.settings).toEqual({
-      model: "hklm",
-      nested: { a: 1, same: "a", b: 2, c: 3 },
-      list: ["base", { x: 1 }, "a", "b", "hklm"],
-      enabledPlugins: { "base@official": true },
+    const discovered = discoverManagedPolicy({ platform: "win32", description, io });
+    expect(discovered.settings).toMatchObject({
+      model: "drop-in",
+      nested: { a: 1, same: "a", b: 2 },
+      list: ["base", { x: 1 }, "a", "b"],
     });
-    expect(result.sources.map(({ source }) => source)).toEqual([
-      description.systemSettingsPath,
-      a,
-      b,
-      `HKLM\\SOFTWARE\\Policies\\ClaudeCode\\Settings`,
+    expect(discovered.sources.map(({ source, sourceClass }) => [source, sourceClass])).toEqual([
+      [description.systemSettingsPath, "system-file"],
+      [a, "system-drop-in"],
+      [b, "system-drop-in"],
     ]);
+
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: { platform: "win32", description, io },
+    });
+    expect(settings.permissions.deny).toEqual(["Read(./secret)", "Bash(curl *)"]);
+    expect(settings.hooks.SessionStart?.[0]?.hooks[0]?.command).toBe("echo managed");
+    expect(settings.mcpPolicySettings.map(({ sourcePath }) => sourcePath)).toEqual([
+      description.systemSettingsPath,
+      b,
+    ]);
+    expect(settings.effectivePluginEnablement?.["base@official"]).toMatchObject({
+      enabled: true, scope: "managed", source: description.systemSettingsPath,
+    });
+    expect(settings.managedClaudeMd).toEqual({ content: "managed instructions", source: description.systemSettingsPath });
+    expect(settings.env).toMatchObject({ BASE: "yes", A: "yes", SHARED: "a" });
+    expect(settings.subagentMaxDepth).toBe(3);
+    expect(settings.subagentConcurrency).toBe(4);
+    expect(settings.worktree.baseRef).toBe("fresh");
+    expect(settings.cleanupPeriodDays).toBe(12);
+    expect(settings.autoMemoryEnabled).toBe(false);
+    expect(settings.autoMemoryDirectory).toBe("/managed/memory");
   });
 
   it("preserves exact duplicate policy arrays per physical source while aggregate merging stays compatible", () => {
@@ -1932,77 +1867,6 @@ describe("managed policy discovery", () => {
     expect(Object.keys(nested)).toEqual(["__proto__", "constructor"]);
     expect(nested.__proto__).toEqual({ polluted: "yes" });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
-  });
-
-  it("uses HKCU only when no administrator source is present", () => {
-    const description = {
-      systemSettingsPath: "/policy/base.json",
-      dropInDir: "/policy/drop",
-      artifactDirs: ["/policy"],
-    };
-    const fallbackCalls: string[] = [];
-    const fallback = discoverManagedPolicy({
-      platform: "win32",
-      description,
-      io: inertPolicyIo({}),
-      registry: inertRegistry(
-        { status: "absent" },
-        { status: "present", json: JSON.stringify({ model: "hkcu" }) },
-        fallbackCalls,
-      ),
-    });
-    expect(fallback.settings).toEqual({ model: "hkcu" });
-    expect(fallbackCalls).toEqual(["HKLM", "HKCU"]);
-
-    for (const administrator of ["{ malformed", "<unreadable>"] as const) {
-      const calls: string[] = [];
-      const blockedFallback = discoverManagedPolicy({
-        platform: "win32",
-        description,
-        io: inertPolicyIo({ [description.systemSettingsPath]: administrator }),
-        registry: inertRegistry(
-          { status: "absent" },
-          { status: "present", json: JSON.stringify({ model: "hkcu" }) },
-          calls,
-        ),
-      });
-      expect(blockedFallback.settings).toBeUndefined();
-      expect(calls).toEqual(["HKLM"]);
-      expect(blockedFallback.diagnostics[0]).toMatchObject({
-        sourceClass: "system-file",
-        impact: "weaker-policy-suppressed",
-      });
-    }
-  });
-
-  it("suppresses HKCU for malformed or unreadable HKLM and emits stable policy diagnostics", () => {
-    for (const hklm of [
-      { status: "present", json: "not json" } as const,
-      { status: "unreadable" } as const,
-    ]) {
-      const calls: string[] = [];
-      const result = discoverManagedPolicy({
-        platform: "win32",
-        io: inertPolicyIo({}),
-        registry: inertRegistry(
-          hklm,
-          { status: "present", json: JSON.stringify({ model: "weaker" }) },
-          calls,
-        ),
-      });
-      expect(result.settings).toBeUndefined();
-      expect(calls).toEqual(["HKLM"]);
-      expect(result.diagnostics).toEqual([
-        expect.objectContaining({
-          category: hklm.status === "present" ? "managed-policy-malformed" : "managed-policy-unreadable",
-          sourceClass: "registry-hklm",
-          impact: "weaker-policy-suppressed",
-        }),
-      ]);
-      expect(result.events).toEqual([
-        { type: "diagnostic", diagnostic: result.diagnostics[0] },
-      ]);
-    }
   });
 
   it("emits discovery and validation diagnostics in exact managed source order", () => {
@@ -2232,11 +2096,10 @@ describe("managed policy discovery", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
-  it("explicit settings overrides perform zero ambient directory or registry I/O", () => {
+  it("explicit settings overrides perform zero ambient directory I/O", () => {
     const scopes = makeScopes();
     const override = scopes.absentManaged[0]!;
     const ioCalls: string[] = [];
-    const registryCalls: string[] = [];
     const settings = loadSettings({
       cwd: scopes.projectRoot,
       projectRoot: scopes.projectRoot,
@@ -2255,16 +2118,10 @@ describe("managed policy discovery", () => {
             throw new Error("ambient directory access");
           },
         },
-        registry: inertRegistry(
-          { status: "present", json: JSON.stringify({ model: "ambient" }) },
-          { status: "absent" },
-          registryCalls,
-        ),
       },
     });
     expect(settings.model).toBe("override");
     expect(ioCalls).toEqual([override]);
-    expect(registryCalls).toEqual([]);
   });
 
   it("keeps lower plugin values through invalid whole containers and diagnoses every source", () => {
@@ -2516,9 +2373,9 @@ describe("managed policy discovery", () => {
     ).toHaveLength(1);
   });
 
-  it("covers every injected managed source/status with exact fallback and no host access", () => {
+  it("covers every retained injected file source/status with exact access and no host lookup", () => {
     type Status = "absent" | "unreadable" | "malformed" | "present";
-    type Target = "system" | "directory" | "drop-in" | "HKLM" | "HKCU" | "override";
+    type Target = "system" | "directory" | "drop-in" | "override";
     const description = {
       systemSettingsPath: "/policy/base.json",
       dropInDir: "/policy/drop",
@@ -2526,262 +2383,69 @@ describe("managed policy discovery", () => {
     };
     const dropIn = "/policy/drop/listed.json";
     const override = "/override.json";
-    const registrySource = (hive: "HKLM" | "HKCU"): string =>
-      `${hive}\\SOFTWARE\\Policies\\ClaudeCode\\Settings`;
-    const cases: Array<{
-      target: Target;
-      status: Status;
-      model?: string;
-      diagnostic?: {
-        source: string;
-        sourceClass: "system-file" | "system-drop-in" | "registry-hklm" | "registry-hkcu" | "override";
-        impact: "source-ignored" | "weaker-policy-suppressed";
-      };
-      registryCalls: string[];
-      fileCalls: string[];
-      listCalls: string[];
-    }> = [];
-    const addCases = (
-      target: Target,
-      statuses: readonly Status[],
-      source: string,
-      sourceClass: "system-file" | "system-drop-in" | "registry-hklm" | "registry-hkcu" | "override",
-      administrator: boolean,
-    ): void => {
+    const statuses: readonly Status[] = ["absent", "unreadable", "malformed", "present"];
+    for (const target of ["system", "drop-in", "override"] as const satisfies readonly Target[]) {
       for (const status of statuses) {
-        const success = status === "present";
-        const fallsBack =
-          (target === "system" && status === "absent") ||
-          (target === "directory" && status !== "unreadable") ||
-          (target === "drop-in" && status === "absent") ||
-          (target === "HKLM" && status === "absent");
-        cases.push({
-          target,
-          status,
-          model: success
-            ? target === "directory"
-              ? "hkcu"
-              : target.toLowerCase()
-            : fallsBack
-              ? "hkcu"
-              : undefined,
-          diagnostic:
-            status === "unreadable" || status === "malformed"
-              ? {
-                  source,
-                  sourceClass,
-                  impact: administrator ? "weaker-policy-suppressed" : "source-ignored",
-                }
-              : undefined,
-          registryCalls:
-            target === "override"
-              ? []
-              : target === "HKCU" || fallsBack
-                ? ["HKLM", "HKCU"]
-                : ["HKLM"],
-          fileCalls:
-            target === "override"
-              ? [override]
-              : target === "drop-in"
-                ? [description.systemSettingsPath, dropIn]
-                : [description.systemSettingsPath],
-          listCalls: target === "override" ? [] : [description.dropInDir],
+        const fileCalls: string[] = [];
+        const listCalls: string[] = [];
+        const read = (model: string): ReturnType<ManagedPolicyIo["readFile"]> => {
+          if (status === "absent") return { status: "absent" };
+          if (status === "unreadable") return { status: "unreadable" };
+          return { status: "present", text: status === "malformed" ? "{" : JSON.stringify({ model }) };
+        };
+        const result = discoverManagedPolicy({
+          platform: "win32",
+          description,
+          io: {
+            readFile(filePath) {
+              fileCalls.push(filePath);
+              if (target === "override") return read("override");
+              if (target === "system" && filePath === description.systemSettingsPath) return read("system");
+              if (target === "drop-in" && filePath === dropIn) return read("drop-in");
+              return { status: "absent" };
+            },
+            listJsonFiles(dir) {
+              listCalls.push(dir);
+              return { status: "present", files: target === "drop-in" ? [dropIn] : [] };
+            },
+          },
+          ...(target === "override" ? { overridePaths: [override] } : {}),
         });
+        expect(result.settings, `${target}:${status}`).toEqual(
+          status === "present" ? { model: target } : undefined,
+        );
+        expect(fileCalls).toEqual(
+          target === "override" ? [override] : target === "system"
+            ? [description.systemSettingsPath]
+            : [description.systemSettingsPath, dropIn],
+        );
+        expect(listCalls).toEqual(target === "override" ? [] : [description.dropInDir]);
+        expect(result.diagnostics).toHaveLength(status === "unreadable" || status === "malformed" ? 1 : 0);
       }
-    };
-    addCases("system", ["absent", "unreadable", "malformed", "present"], description.systemSettingsPath, "system-file", true);
-    addCases("directory", ["absent", "unreadable", "present"], description.dropInDir, "system-drop-in", true);
-    addCases("drop-in", ["absent", "unreadable", "malformed", "present"], dropIn, "system-drop-in", true);
-    addCases("HKLM", ["absent", "unreadable", "malformed", "present"], registrySource("HKLM"), "registry-hklm", true);
-    addCases("HKCU", ["absent", "unreadable", "malformed", "present"], registrySource("HKCU"), "registry-hkcu", false);
-    addCases("override", ["absent", "unreadable", "malformed", "present"], override, "override", false);
+    }
 
-    const fileRead = (status: Status, model: string): ReturnType<ManagedPolicyIo["readFile"]> => {
-      if (status === "absent") return { status: "absent" };
-      if (status === "unreadable") return { status: "unreadable" };
-      return {
-        status: "present",
-        text: status === "malformed" ? "{" : JSON.stringify({ model }),
-      };
-    };
-    const registryRead = (
-      status: Status,
-      model: string,
-    ): ReturnType<ManagedRegistryAdapter["readSettings"]> => {
-      if (status === "absent") return { status: "absent" };
-      if (status === "unreadable") return { status: "unreadable" };
-      return {
-        status: "present",
-        json: status === "malformed" ? "{" : JSON.stringify({ model }),
-      };
-    };
-
-    for (const testCase of cases) {
-      const fileCalls: string[] = [];
-      const listCalls: string[] = [];
-      const registryCalls: string[] = [];
-      const io: ManagedPolicyIo = {
-        readFile(filePath) {
-          fileCalls.push(filePath);
-          if (testCase.target === "override") return fileRead(testCase.status, "override");
-          if (filePath === description.systemSettingsPath) {
-            return testCase.target === "system"
-              ? fileRead(testCase.status, "system")
-              : { status: "absent" };
-          }
-          return testCase.target === "drop-in"
-            ? fileRead(testCase.status, "drop-in")
-            : { status: "absent" };
-        },
-        listJsonFiles(dir) {
-          listCalls.push(dir);
-          if (testCase.target === "directory") {
-            if (testCase.status === "absent") return { status: "absent" };
-            if (testCase.status === "unreadable") return { status: "unreadable" };
-            return { status: "present", files: [] };
-          }
-          return {
-            status: "present",
-            files: testCase.target === "drop-in" ? [dropIn] : [],
-          };
-        },
-      };
-      const registry: ManagedRegistryAdapter = {
-        readSettings(hive) {
-          registryCalls.push(hive);
-          if (testCase.target === hive) return registryRead(testCase.status, hive.toLowerCase());
-          if (hive === "HKLM") return { status: "absent" };
-          return { status: "present", json: JSON.stringify({ model: "hkcu" }) };
-        },
-      };
-
+    for (const status of ["absent", "unreadable", "present"] as const) {
       const result = discoverManagedPolicy({
         platform: "win32",
         description,
-        io,
-        registry,
-        ...(testCase.target === "override" ? { overridePaths: [override] } : {}),
+        io: {
+          readFile: () => ({ status: "absent" }),
+          listJsonFiles: () => status === "absent"
+            ? { status: "absent" }
+            : status === "unreadable"
+              ? { status: "unreadable" }
+              : { status: "present", files: [] },
+        },
       });
-      expect(result.settings, `${testCase.target}:${testCase.status} settings`).toEqual(
-        testCase.model === undefined ? undefined : { model: testCase.model },
-      );
-      expect(fileCalls, `${testCase.target}:${testCase.status} file calls`).toEqual(
-        testCase.fileCalls,
-      );
-      expect(listCalls, `${testCase.target}:${testCase.status} directory calls`).toEqual(
-        testCase.listCalls,
-      );
-      expect(registryCalls, `${testCase.target}:${testCase.status} registry calls`).toEqual(
-        testCase.registryCalls,
-      );
-      expect(result.diagnostics, `${testCase.target}:${testCase.status} diagnostics`).toEqual(
-        testCase.diagnostic === undefined
-          ? []
-          : [
-              {
-                severity: "error",
-                message:
-                  testCase.status === "malformed"
-                    ? "Managed policy JSON is malformed; source ignored"
-                    : "Managed policy source is unreadable; source ignored",
-                source: testCase.diagnostic.source,
-                category:
-                  testCase.status === "malformed"
-                    ? "managed-policy-malformed"
-                    : "managed-policy-unreadable",
-                sourceClass: testCase.diagnostic.sourceClass,
-                impact: testCase.diagnostic.impact,
-              },
-            ],
-      );
+      expect(result.diagnostics).toHaveLength(status === "unreadable" ? 1 : 0);
     }
   });
 
-  it("marks policy impact only when a failed source actually suppresses HKCU", () => {
-    const description = {
-      systemSettingsPath: "/policy/base.json",
-      dropInDir: "/policy/drop",
-      artifactDirs: ["/policy"],
-    };
-    const withValidHklm = discoverManagedPolicy({
-      platform: "win32",
-      description,
-      io: inertPolicyIo({ [description.systemSettingsPath]: "<unreadable>" }),
-      registry: inertRegistry(
-        { status: "present", json: JSON.stringify({ model: "admin" }) },
-        { status: "present", json: JSON.stringify({ model: "user" }) },
-      ),
-    });
-    expect(withValidHklm.diagnostics[0]).toMatchObject({ impact: "source-ignored" });
-
-    const onlyFailure = discoverManagedPolicy({
-      platform: "win32",
-      description,
-      io: inertPolicyIo({ [description.systemSettingsPath]: "<unreadable>" }),
-      registry: inertRegistry(
-        { status: "absent" },
-        { status: "present", json: JSON.stringify({ model: "user" }) },
-      ),
-    });
-    expect(onlyFailure.diagnostics[0]).toMatchObject({ impact: "weaker-policy-suppressed" });
-  });
-
-  it("uses an authored locale-independent registry protocol with fixed bounded invocation", () => {
-    const calls: RegistryCommandInvocation[] = [];
-    const absent = createWindowsManagedRegistryAdapter((invocation) => {
-      calls.push(invocation);
-      return "ABSENT";
-    });
-    expect(absent.readSettings("HKLM")).toEqual({ status: "absent" });
-    expect(calls[0]).toMatchObject({
-      executable: "powershell.exe",
-      options: {
-        shell: false,
-        timeout: 2_000,
-        maxBuffer: 256 * 1024,
-        windowsHide: true,
-      },
-    });
-    expect(calls[0]?.args.at(-2)).toBe("-EncodedCommand");
-    const authoredScript = Buffer.from(calls[0]!.args.at(-1)!, "base64").toString("utf16le");
-    expect(authoredScript).toContain("[Microsoft.Win32.Registry]::LocalMachine");
-    expect(authoredScript).toContain("SOFTWARE\\Policies\\ClaudeCode");
-    expect(authoredScript).not.toContain("/policy");
-    expect(authoredScript).not.toContain("project");
-
-    const json = JSON.stringify({ model: "registry" });
-    const present = createWindowsManagedRegistryAdapter(
-      () => `PRESENT\n${Buffer.from(json, "utf8").toString("base64")}`,
-    );
-    expect(present.readSettings("HKCU")).toEqual({ status: "present", json });
-
-    for (const error of [
-      Object.assign(new Error("Der Registrierungsschlüssel wurde nicht gefunden"), {
-        stderr: "Der Registrierungsschlüssel wurde nicht gefunden",
-      }),
-      Object.assign(new Error("tempo limite excedido"), { code: "ETIMEDOUT" }),
-    ]) {
-      const unreadable = createWindowsManagedRegistryAdapter(() => {
-        throw error;
-      });
-      expect(unreadable.readSettings("HKLM")).toEqual({ status: "unreadable" });
-    }
-    expect(createWindowsManagedRegistryAdapter(() => "localized arbitrary output").readSettings("HKLM")).toEqual({
-      status: "unreadable",
-    });
-  });
-
-  it("resolves all platform defaults through inert adapters", () => {
+  it("resolves all platform file defaults without non-file adapters", () => {
     for (const platform of ["win32", "darwin", "linux"] as const) {
-      const registryCalls: string[] = [];
-      const result = discoverManagedPolicy({
-        platform,
-        io: inertPolicyIo({}),
-        registry: inertRegistry({ status: "absent" }, { status: "absent" }, registryCalls),
-      });
+      const result = discoverManagedPolicy({ platform, io: inertPolicyIo({}) });
       expect(result.settings).toBeUndefined();
       expect(result.diagnostics).toEqual([]);
-      expect(registryCalls).toEqual(platform === "win32" ? ["HKLM", "HKCU"] : []);
     }
   });
 });
@@ -2907,8 +2571,10 @@ describe("locations — project root & artifact discovery", () => {
     const userDir = path.join(base, "home", ".claude");
     const managedBase = path.join(base, "managed", "ClaudeCode");
     fs.mkdirSync(path.join(root, ".claude", "skills"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".claude", "commands"), { recursive: true });
     fs.mkdirSync(path.join(managedBase, "skills"), { recursive: true });
     fs.mkdirSync(path.join(managedBase, "agents"), { recursive: true });
+    fs.mkdirSync(path.join(managedBase, "commands"), { recursive: true });
     fs.mkdirSync(userDir, { recursive: true });
 
     const dirs = discoverArtifactDirs({
@@ -2922,6 +2588,10 @@ describe("locations — project root & artifact discovery", () => {
       { dir: path.join(root, ".claude", "skills"), scope: "project" },
     ]);
     expect(dirs.agentDirs).toEqual([{ dir: path.join(managedBase, "agents"), scope: "managed" }]);
+    expect(dirs.commandDirs).toEqual([
+      { dir: path.join(managedBase, "commands"), scope: "managed" },
+      { dir: path.join(root, ".claude", "commands"), scope: "project" },
+    ]);
 
     // Absent managed dir: nothing contributed, nothing thrown.
     const absent = discoverArtifactDirs({

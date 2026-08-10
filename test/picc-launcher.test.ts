@@ -6,7 +6,6 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
-import type { ManagedRegistryAdapter } from "../src/discovery/managed-policy.js";
 import {
   PI_SUITE_PACKAGES,
   canonicalPath,
@@ -23,11 +22,9 @@ const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
 const launcherSource = path.join(repoRoot, "bin", "picc.mjs");
 const pluginAdapterSource = path.join(repoRoot, "bin", "picc-plugin.mjs");
 const runtimeSelectorSource = path.join(repoRoot, "bin", "picc-runtime.mjs");
-const windowsRegistryWarning = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
 const inventoryIncompleteWarning = (classes: string, actions = "repair") => `PiCC plugin inventory may be incomplete (${classes}). ${actions.includes("format") ? "Update PiCC or report the unsupported plugin-state format. " : ""}${actions.includes("repair") ? "Repair the malformed or unreadable Claude plugin state outside PiCC. " : ""}Run PiCC interactively in the same project and profile, then use \`/doctor\` for details.`;
-const inventoryPolicyWarning = process.platform === "win32" ? `${windowsRegistryWarning}\n` : "";
 const sourceFallbackNotice = "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.";
-const sourcePluginStderr = `${sourceFallbackNotice}\n${inventoryPolicyWarning}`;
+const sourcePluginStderr = `${sourceFallbackNotice}\n`;
 const tempDirs: string[] = [];
 
 function temp(prefix: string): string {
@@ -201,20 +198,17 @@ function inventoryFixture(): { project: string; userDir: string } {
   return { project, userDir };
 }
 
-const absentRegistry: ManagedRegistryAdapter = { readSettings: () => ({ status: "absent" }) };
-
 function runPluginInProcess(
   cwd: string,
   args: string[],
   options: PluginInventoryCliOptions,
-  registry: ManagedRegistryAdapter | null = absentRegistry,
 ) {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const code = runPluginInventoryCli(args, {
     log: (message) => stdout.push(message),
     error: (message) => stderr.push(message),
-  }, registry === null ? undefined : registry, { cwd, platform: "linux", ...options });
+  }, { cwd, platform: "linux", ...options });
   return { code, stdout, stderr };
 }
 
@@ -823,17 +817,12 @@ process.exit(23);
     }
   });
 
-  it("separates malformed inventory from the default Windows registry limitation", () => {
+  it("reports malformed and unsupported inventory state generically", () => {
     const { project, userDir } = inventoryFixture();
     const options = { env: { PICC_CLAUDE_USER_DIR: userDir } };
 
-    const healthyWindows = runPluginInProcess(project, ["list"], { ...options, platform: "win32" }, null);
-    expect(healthyWindows).toMatchObject({ code: 0, stderr: [windowsRegistryWarning] });
-
-    const customUnavailable: ManagedRegistryAdapter = { readSettings: () => ({ status: "unreadable" }) };
-    const injected = runPluginInProcess(project, ["list"], { ...options, platform: "win32" }, customUnavailable);
-    expect(injected).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("managed policy state")] });
-    expect(injected.stderr).not.toContain(windowsRegistryWarning);
+    const healthyWindows = runPluginInProcess(project, ["list"], { ...options, platform: "win32" });
+    expect(healthyWindows).toMatchObject({ code: 0, stderr: [] });
 
     write(path.join(userDir, "plugins", "installed_plugins.json"), "{ malformed");
     write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
@@ -862,7 +851,7 @@ process.exit(23);
     });
   });
 
-  it("captures injected managed policy while unavailable Windows registry evidence stays process-free", () => {
+  it("captures managed files while Windows standalone inventory stays process-free", () => {
     const { project, userDir } = inventoryFixture();
     const cli = pathToFileURL(path.join(repoRoot, "src", "plugin-inventory-cli.ts")).href;
     const processCanary = path.join(path.dirname(project), "managed-process-canary");
@@ -901,34 +890,20 @@ syncBuiltinESMExports();
 Object.defineProperty(process, "platform", { value: "win32" });
 process.chdir(${JSON.stringify(project)});
 process.env.PICC_CLAUDE_USER_DIR = ${JSON.stringify(userDir)};
-const run = registry => {
-  const messages = { stdout: [], stderr: [] };
-  const code = loaded.runPluginInventoryCli(["list"], { log: value => messages.stdout.push(value), error: value => messages.stderr.push(value) }, registry);
-  return { code, messages };
-};
-const unavailable = run(undefined);
-const hives = [];
-const managed = run({ readSettings(hive) { hives.push(hive); return { status: "present", json: JSON.stringify({ enabledPlugins: { "policy@managed": true } }) }; } });
-console.log(JSON.stringify({ unavailable, managed, hives }));
+const messages = { stdout: [], stderr: [] };
+const code = loaded.runPluginInventoryCli(["list"], { log: value => messages.stdout.push(value), error: value => messages.stderr.push(value) });
+console.log(JSON.stringify({ code, messages }));
 `;
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
       cwd: repoRoot, encoding: "utf8",
     });
     expect(result).toMatchObject({ status: 0, stderr: "" });
     const observed = JSON.parse(result.stdout) as {
-      unavailable: { code: number; messages: { stdout: string[]; stderr: string[] } };
-      managed: { code: number; messages: { stdout: string[]; stderr: string[] } };
-      hives: string[];
+      code: number;
+      messages: { stdout: string[]; stderr: string[] };
     };
-    expect(observed.unavailable).toMatchObject({
-      code: 0,
-      messages: { stderr: [windowsRegistryWarning] },
-    });
-    expect(observed.unavailable.messages.stdout.join("\n")).toContain("Plugin: file-policy@managed");
-    expect(observed.managed).toMatchObject({ code: 0, messages: { stderr: [] } });
-    expect(observed.managed.messages.stdout.join("\n")).toContain("Plugin: file-policy@managed");
-    expect(observed.managed.messages.stdout.join("\n")).toContain("Plugin: policy@managed");
-    expect(observed.hives).toEqual(["HKLM"]);
+    expect(observed).toMatchObject({ code: 0, messages: { stderr: [] } });
+    expect(observed.messages.stdout.join("\n")).toContain("Plugin: file-policy@managed");
     expect(fs.existsSync(processCanary)).toBe(false);
   });
 

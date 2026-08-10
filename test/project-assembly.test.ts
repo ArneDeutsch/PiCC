@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -109,6 +110,40 @@ function makeMarketplacePlugin(userDir: string, marketplace: string, name: strin
   write(statePath, JSON.stringify(state));
   return root;
 }
+
+describe("loadClaudeProject — Windows managed-file startup", () => {
+  it("fresh-loads the default Windows file path without invoking child-process APIs", () => {
+    const { repo, userDir } = makeBase();
+    const projectModule = path.join(path.resolve("."), "src", "project.ts");
+    const script = `
+import child from "node:child_process";
+const calls = [];
+for (const name of Object.keys(child)) {
+  if (typeof child[name] === "function") child[name] = (...args) => {
+    calls.push({ name, args: args.length });
+    throw new Error("child process forbidden");
+  };
+}
+const { syncBuiltinESMExports } = await import("node:module");
+syncBuiltinESMExports();
+const { createJiti } = await import("jiti/static");
+const jiti = createJiti(import.meta.url, { fsCache: false, moduleCache: false, tsconfigPaths: false, tryNative: false });
+const loaded = await jiti.import(${JSON.stringify(projectModule)});
+const project = loaded.loadClaudeProject({
+  cwd: ${JSON.stringify(repo)},
+  userDir: ${JSON.stringify(userDir)},
+  managedPolicyPlatform: "win32",
+});
+console.log(JSON.stringify({ calls, diagnostics: project.settings.diagnostics.length }));
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: path.resolve("."),
+      encoding: "utf8",
+    });
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ calls: [] });
+  });
+});
 
 describe("loadClaudeProject — imported installed-state enablement", () => {
   it("loads only explicitly enabled installed records from authorized cache roots (skills, agents, hooks)", () => {
