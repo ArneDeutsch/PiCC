@@ -287,7 +287,7 @@ describe("plugin inventory focused UI", () => {
     const theme = { fg(color: string, value: string) { calls.push(`${color}:${value}`); return value; } };
     const diagnostics: PluginInventoryDiagnostic[] = [
       { severity: "info", message: "error unsupported words are informational" },
-      { severity: "warning", category: "managed-policy-unreadable", sourceClass: "system-file", impact: "weaker-policy-suppressed", message: "policy warning" },
+      { severity: "warning", category: "managed-policy-unreadable", sourceClass: "system-file", impact: "source-ignored", message: "policy warning" },
       { severity: "error", category: "managed-policy-malformed", sourceClass: "override", impact: "source-ignored", message: "state failure" },
     ];
     const model = new PluginInventoryModel(snapshot({ items: [], marketplaces: [], diagnostics }));
@@ -303,7 +303,7 @@ describe("plugin inventory focused UI", () => {
     expect(detail).toContain("Administrator action may be required");
     expect(detail).toContain("Severity: warning");
     expect(detail).toContain("Source: system-file");
-    expect(detail).toContain("Impact: weaker-policy-suppressed");
+    expect(detail).toContain("Impact: source-ignored");
   });
 
   it("honors configured and raw keys, revision-only repaint, visible filter, and the Esc ladder", () => {

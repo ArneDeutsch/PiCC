@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import { resolveClaudeProfile, type ClaudeProfile } from "./discovery/claude-profile.js";
-import type { ManagedRegistryAdapter } from "./discovery/managed-policy.js";
 import { loadClaudeProject } from "./project.js";
 import {
   parsePluginInventoryArgv,
@@ -12,7 +11,6 @@ const INVENTORY_INCOMPLETE_PREFIX = "PiCC plugin inventory may be incomplete";
 const INVENTORY_FORMAT_RECOVERY = "Update PiCC or report the unsupported plugin-state format.";
 const INVENTORY_REPAIR_RECOVERY = "Repair the malformed or unreadable Claude plugin state outside PiCC.";
 const INVENTORY_DOCTOR_RECOVERY = "Run PiCC interactively in the same project and profile, then use `/doctor` for details.";
-const WINDOWS_REGISTRY_NOT_INSPECTED = "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.";
 
 export interface PluginInventoryCliOutput {
   log(message: string): void;
@@ -25,10 +23,6 @@ export interface PluginInventoryCliOptions {
   homeDir?: string;
   platform?: NodeJS.Platform;
 }
-
-const unavailableRegistryPolicy: ManagedRegistryAdapter = {
-  readSettings: () => ({ status: "unreadable" }),
-};
 
 function readableDirectory(directory: string): boolean {
   try {
@@ -94,7 +88,7 @@ function incompleteStateWarning(
     const evidence = `${diagnostic.category ?? ""} ${diagnostic.sourceClass ?? ""} ${diagnostic.message}`.toLowerCase();
     if (/installed|blocklist/u.test(evidence)) classes.add("installed plugin state");
     if (/marketplace|catalog|allowlist/u.test(evidence)) classes.add("marketplace state");
-    if (/managed-policy|registry-/u.test(evidence)) classes.add("managed policy state");
+    if (/managed-policy/u.test(evidence)) classes.add("managed policy state");
     if (/manifest|metadata/u.test(evidence)) classes.add("plugin metadata");
     const formatDiagnostic = /unsupported (?:format|version)|format is unsupported|undocumented/u.test(evidence);
     if (formatDiagnostic) unsupportedFormat = true;
@@ -109,17 +103,9 @@ function incompleteStateWarning(
   return `${INVENTORY_INCOMPLETE_PREFIX}${category}. ${actions.join(" ")}`;
 }
 
-function isDefaultRegistryOmission(diagnostic: {
-  readonly category?: string;
-  readonly sourceClass?: string;
-}): boolean {
-  return diagnostic.category === "managed-policy-unreadable" && diagnostic.sourceClass === "registry-hklm";
-}
-
 export function runPluginInventoryCli(
   argv: readonly string[],
   output: PluginInventoryCliOutput = console,
-  managedPolicyRegistry?: ManagedRegistryAdapter,
   options: PluginInventoryCliOptions = {},
 ): number {
   const parsed = parsePluginInventoryArgv(argv);
@@ -135,14 +121,12 @@ export function runPluginInventoryCli(
   }
 
   const platform = options.platform ?? process.platform;
-  const defaultRegistryOmitted = platform === "win32" && managedPolicyRegistry === undefined;
   let project: ReturnType<typeof loadClaudeProject>;
   try {
     project = loadClaudeProject({
       cwd: inputs.cwd,
       ...(options.env === undefined ? {} : { env: options.env }),
       ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
-      managedPolicyRegistry: managedPolicyRegistry ?? unavailableRegistryPolicy,
       managedPolicyPlatform: platform,
       pluginInventoryLifetime: "command",
     });
@@ -159,10 +143,13 @@ export function runPluginInventoryCli(
   }
 
   output.log(renderPluginInventoryOperation(project.pluginInventory, parsed.operation));
-  if (defaultRegistryOmitted) output.error(WINDOWS_REGISTRY_NOT_INSPECTED);
-  const otherDiagnostics = defaultRegistryOmitted
-    ? project.pluginInventory.diagnostics.filter((diagnostic) => !isDefaultRegistryOmission(diagnostic))
-    : project.pluginInventory.diagnostics;
-  if (otherDiagnostics.length > 0) output.error(incompleteStateWarning(project.pluginInventory.installedStateStatus, otherDiagnostics));
+  if (project.pluginInventory.diagnostics.length > 0) {
+    output.error(
+      incompleteStateWarning(
+        project.pluginInventory.installedStateStatus,
+        project.pluginInventory.diagnostics,
+      ),
+    );
+  }
   return 0;
 }

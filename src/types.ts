@@ -36,8 +36,6 @@ export type ManagedPolicySourceClass =
   | "standalone-mcp"
   | "system-file"
   | "system-drop-in"
-  | "registry-hklm"
-  | "registry-hkcu"
   | "override";
 
 export type ManagedPolicyDiagnosticCategory =
@@ -51,7 +49,7 @@ export interface Diagnostic {
   /** Stable policy classification for startup handling; absent on ordinary diagnostics. */
   category?: ManagedPolicyDiagnosticCategory;
   sourceClass?: ManagedPolicySourceClass;
-  impact?: "source-ignored" | "weaker-policy-suppressed";
+  impact?: "source-ignored";
 }
 
 // ---------------------------------------------------------------------------

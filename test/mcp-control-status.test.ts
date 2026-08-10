@@ -926,7 +926,7 @@ describe("managed MCP policy status foundation", () => {
     const policyFailures = [
       { kind: "malformed", sourceClass: "standalone-mcp", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
       { kind: "unreadable", sourceClass: "system-file", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
-      { kind: "unreadable", sourceClass: "registry-hkcu", authority: "user-controlled", remediation: "repair-user-policy" },
+      { kind: "unreadable", sourceClass: "system-drop-in", authority: "administrator-controlled", remediation: "repair-administrator-policy" },
       { kind: "omitted", sourceClass: "override", authority: "mixed", remediation: "repair-mixed-policy" },
     ] as const;
     const mcp: ResolvedMcpConfig = {
@@ -940,7 +940,7 @@ describe("managed MCP policy status foundation", () => {
     for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
       expect(report).toContain("standalone managed MCP file was malformed");
       expect(report).toContain("managed-settings system file was unreadable");
-      expect(report).toContain("user registry fallback was unreadable");
+      expect(report).toContain("administrator system drop-in was unreadable");
       expect(report).toContain("managed-settings override was omitted");
       expect(report).toContain("policy compilation was uncertain");
       expect(report.match(/Repair or recover user-controlled policy inputs and ask the administrator/gu)).toHaveLength(1);

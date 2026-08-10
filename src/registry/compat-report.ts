@@ -160,20 +160,17 @@ const BLOCKLIST_CAUSES: ReadonlySet<PluginSharedStateCause> = new Set([
 const ADMINISTRATOR_POLICY_SOURCE_CLASSES = new Set([
   "system-file",
   "system-drop-in",
-  "registry-hklm",
 ]);
 
 function managedPolicySourceLabel(sourceClass: unknown): string {
   if (typeof sourceClass === "string" && ADMINISTRATOR_POLICY_SOURCE_CLASSES.has(sourceClass)) {
     return `Administrator policy (${sourceClass})`;
   }
-  if (sourceClass === "registry-hkcu") return "User policy fallback (registry-hkcu)";
   if (sourceClass === "override") return "Managed-settings override";
   return "Managed-policy source";
 }
 
 function managedPolicyImpactLabel(impact: unknown): string {
-  if (impact === "weaker-policy-suppressed") return "; weaker policy was suppressed";
   if (impact === "source-ignored") return "; that source was ignored";
   return "; policy processing was degraded";
 }
@@ -418,8 +415,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
     const policyCapability = lookupCapability("feature.managed-policy");
     if (policyCapability) for (const evidence of pluginInventory.managedPolicyEvidence) {
-      const impact = evidence.impact === "source-ignored" ? "this source was ignored" : "weaker policy was suppressed";
-      addFinding(policyCapability, `${evidence.sourceLabel} was ${evidence.condition}; ${impact}. ${evidence.guidance}, then ${evidence.refreshGuidance}.`);
+      addFinding(policyCapability, `${evidence.sourceLabel} was ${evidence.condition}; this source was ignored. ${evidence.guidance}, then ${evidence.refreshGuidance}.`);
     }
   }
 
@@ -1280,8 +1276,6 @@ function mcpPolicyFailureSummary(mcp: ResolvedMcpConfig): string | undefined {
     "standalone-mcp": "standalone managed MCP file",
     "system-file": "managed-settings system file",
     "system-drop-in": "administrator system drop-in",
-    "registry-hklm": "administrator machine registry",
-    "registry-hkcu": "user registry fallback",
     override: "managed-settings override",
   };
   const unique = [...new Map((mcp.policyFailures ?? []).map((failure) => [

@@ -15,8 +15,8 @@ const MAX_LIST_ITEMS = 100;
 const MAX_DETAIL_VALUES = 32;
 const MAX_DIAGNOSTICS = 64;
 const MAX_EVIDENCE = 128;
-const MAX_STARTUP_POLICY_PER_IMPACT = 3;
-const MAX_DOCTOR_POLICY_PER_IMPACT = 10;
+const MAX_STARTUP_POLICY_EVIDENCE = 3;
+const MAX_DOCTOR_POLICY_EVIDENCE = 10;
 const MAX_LINE = 320;
 
 export const PLUGIN_INVENTORY_SLASH_USAGE = "Read-only usage: /plugin list | /plugin details <plugin@marketplace> (example: /plugin details formatter@official). Run /plugin list to copy an exact qualified identity.";
@@ -35,7 +35,7 @@ export interface PluginInventoryManagedPolicyEvidence {
   readonly condition: "malformed" | "unreadable";
   readonly sourceClass: string;
   readonly sourceLabel: string;
-  readonly impact: "source-ignored" | "weaker-policy-suppressed";
+  readonly impact: "source-ignored";
   readonly guidance: string;
   readonly refreshGuidance: string;
 }
@@ -370,18 +370,17 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
 
 export function renderPluginInventoryOperation(snapshot: PluginInventorySnapshot, operation: PluginInventoryOperation): string { return operation.kind === "list" ? renderPluginInventoryList(snapshot) : renderPluginInventoryDetails(snapshot, operation.qualifiedIdentity); }
 
-const SOURCE_LABELS: Readonly<Record<string, string>> = Object.freeze({ "system-file": "system policy file", "system-drop-in": "system policy drop-in", "registry-hklm": "machine registry policy", "registry-hkcu": "user registry policy", override: "managed-policy override" });
-const ADMIN_POLICY_SOURCES = new Set(["system-file", "system-drop-in", "registry-hklm"]);
+const SOURCE_LABELS: Readonly<Record<string, string>> = Object.freeze({ "system-file": "system policy file", "system-drop-in": "system policy drop-in", override: "managed-policy override" });
+const ADMIN_POLICY_SOURCES = new Set(["system-file", "system-drop-in"]);
 function policyGuidance(sourceClass: string, category: PluginInventoryManagedPolicyEvidence["category"]): string {
   if (ADMIN_POLICY_SOURCES.has(sourceClass)) return category === "managed-policy-malformed" ? "Ask an administrator to correct the policy format" : "Ask an administrator to correct access to the policy source";
-  if (sourceClass === "registry-hkcu") return category === "managed-policy-malformed" ? "Correct the user registry policy format" : "Correct access to the user registry policy";
   return category === "managed-policy-malformed" ? "Correct the managed-policy override format" : "Correct access to the managed-policy override input";
 }
 function policyRefreshAction(): string { return "run canonical /reload in the interactive TUI, or exit and relaunch PiCC"; }
 function policyEvidence(diagnostics: readonly PluginInventoryDiagnostic[]): PluginInventoryManagedPolicyEvidence[] {
   const seen = new Set<string>(); const values: PluginInventoryManagedPolicyEvidence[] = [];
   for (const diagnostic of diagnostics) {
-    if ((diagnostic.category !== "managed-policy-malformed" && diagnostic.category !== "managed-policy-unreadable") || (diagnostic.impact !== "source-ignored" && diagnostic.impact !== "weaker-policy-suppressed") || diagnostic.sourceClass === undefined || SOURCE_LABELS[diagnostic.sourceClass] === undefined) continue;
+    if ((diagnostic.category !== "managed-policy-malformed" && diagnostic.category !== "managed-policy-unreadable") || diagnostic.impact !== "source-ignored" || diagnostic.sourceClass === undefined || SOURCE_LABELS[diagnostic.sourceClass] === undefined) continue;
     const key = `${diagnostic.category}\0${diagnostic.sourceClass}\0${diagnostic.impact}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -389,19 +388,18 @@ function policyEvidence(diagnostics: readonly PluginInventoryDiagnostic[]): Plug
   }
   return values;
 }
-function capPolicyPerImpact(values: readonly PluginInventoryManagedPolicyEvidence[], maximum: number): PluginInventoryManagedPolicyEvidence[] {
-  return (["source-ignored", "weaker-policy-suppressed"] as const).flatMap((impact) => values.filter((value) => value.impact === impact).slice(0, maximum));
+function capPolicyEvidence(values: readonly PluginInventoryManagedPolicyEvidence[], maximum: number): PluginInventoryManagedPolicyEvidence[] {
+  return values.slice(0, maximum);
 }
 
 export function projectPluginInventoryStartup(snapshot: PluginInventorySnapshot): PluginInventoryStartupProjection {
   const failed = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
   const allIdentities = [...new Set(failed.map((item) => qualified(item.qualifiedIdentity)))];
   const identities = allIdentities.slice(0, 10);
-  const allPolicies = policyEvidence(snapshot.diagnostics).filter((value) => ADMIN_POLICY_SOURCES.has(value.sourceClass)); const policies = capPolicyPerImpact(allPolicies, MAX_STARTUP_POLICY_PER_IMPACT);
+  const allPolicies = policyEvidence(snapshot.diagnostics).filter((value) => ADMIN_POLICY_SOURCES.has(value.sourceClass)); const policies = capPolicyEvidence(allPolicies, MAX_STARTUP_POLICY_EVIDENCE);
   const lines = failed.slice(0, 10).map((item) => `Plugin ${qualified(item.qualifiedIdentity)} needs attention: ${item.outcome!.status}. Run /doctor for details.`);
   for (const value of policies) {
-    const consequence = value.impact === "source-ignored" ? "the administrator source was ignored" : "weaker policy was suppressed";
-    lines.push(`${value.sourceLabel} was ${value.condition}; ${consequence} and plugin enablement may differ. ${value.guidance}, then ${value.refreshGuidance}.`);
+    lines.push(`${value.sourceLabel} was ${value.condition}; the administrator source was ignored and plugin enablement may differ. ${value.guidance}, then ${value.refreshGuidance}.`);
   }
   const capture = Object.freeze(captureOmissions(snapshot));
   const omissions = Object.freeze({ identities: Math.max(0, allIdentities.length - identities.length), managedPolicyEvidence: Math.max(0, allPolicies.length - policies.length), captureEvidence: capture });
@@ -434,7 +432,7 @@ export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot):
     candidate.capabilityId === value.capabilityId && candidate.qualifiedIdentity === value.qualifiedIdentity &&
     candidate.component === value.component && candidate.supportTier === value.supportTier && candidate.observation === value.observation) === index);
   const evidence = uniqueEvidence.slice(0, MAX_EVIDENCE).map((value) => Object.freeze({ capabilityId: value.capabilityId, qualifiedIdentity: qualified(value.qualifiedIdentity), ...(value.component === undefined ? {} : { component: text(value.component, 80) }), ...(value.supportTier === undefined ? {} : { supportTier: value.supportTier }), observation: text(value.observation) }));
-  const allPolicies = policyEvidence(snapshot.diagnostics); const policies = capPolicyPerImpact(allPolicies, MAX_DOCTOR_POLICY_PER_IMPACT);
+  const allPolicies = policyEvidence(snapshot.diagnostics); const policies = capPolicyEvidence(allPolicies, MAX_DOCTOR_POLICY_EVIDENCE);
   const capture = Object.freeze(captureOmissions(snapshot));
   const captureDiagnostics = captureOmissionTotal(snapshot, (axis) => axis.includes("diagnostic"));
   const captureCapabilities = captureOmissionTotal(snapshot, (axis) => axis.includes("evidence"));

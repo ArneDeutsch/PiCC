@@ -326,9 +326,7 @@ require("node:module").syncBuiltinESMExports();
       const list = await run(["list"]);
       expect(list).toMatchObject({
         code: 0,
-        stderr: process.platform === "win32"
-          ? "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.\n"
-          : "",
+        stderr: "",
       });
       expect(list.stdout).toBe([
         "Plugin inventory (read-only)",
@@ -344,9 +342,7 @@ require("node:module").syncBuiltinESMExports();
       const details = await run(["details", "hostile@market"]);
       expect(details).toMatchObject({
         code: 0,
-        stderr: process.platform === "win32"
-          ? "PiCC plugin inventory: Windows registry policy was not inspected. Managed files and drop-ins were still observed. Run PiCC interactively and use `/plugin list` or `/doctor` for registry-backed policy evidence.\n"
-          : "",
+        stderr: "",
       });
       expect(details.stdout).toContain("Plugin: hostile@market");
       expect(details.stdout).toContain("Mode: read-only");

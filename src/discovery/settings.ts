@@ -33,9 +33,9 @@ import type {
 export { stripJsonc } from "./managed-policy.js";
 
 /**
- * Settings loading and merging in ascending scope precedence. Managed files,
- * drop-ins, and registry values are validated in source order while preserving
- * their deep-object and stable-array merge behavior at managed scope.
+ * Settings loading and merging in ascending scope precedence. Managed files
+ * and drop-ins are validated in source order while preserving their deep-object
+ * and stable-array merge behavior at managed scope.
  *
  * Rule lists and hooks accumulate, `env` and `enabledPlugins` merge key-wise,
  * and valid scalar values replace lower-precedence values. Malformed entries
@@ -1203,8 +1203,7 @@ export function loadSettings(opts: LoadSettingsOptions): LoadedClaudeSettings {
     if (event.type === "diagnostic") {
       settings.diagnostics.push(event.diagnostic);
       if (event.diagnostic.category !== undefined && event.diagnostic.sourceClass !== undefined) {
-        const administrator = event.diagnostic.sourceClass !== "registry-hkcu" &&
-          event.diagnostic.sourceClass !== "override";
+        const administrator = event.diagnostic.sourceClass !== "override";
         appendMcpPolicyFailure(settings, {
           kind: event.diagnostic.category === "managed-policy-malformed" ? "malformed" : "unreadable",
           sourceClass: event.diagnostic.sourceClass,
