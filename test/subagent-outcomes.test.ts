@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { validateAgentMcpAdmission } from "../src/index.js";
+import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import { createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
 import {
   BackgroundTaskRegistry,
@@ -557,6 +560,70 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toContain("stopped before it started");
     expect(h.created).toHaveLength(0); // no session was ever created
     expect(exits).toEqual([{ worktreePath: result.worktreePath, action: "keep" }]);
+  });
+
+  it("passes the admitted worktree path to MCP preparation", async () => {
+    const h = fakeSdk({ replies: ["done"] });
+    const preparedCwds: string[] = [];
+    const admittedWorktree = path.join(process.cwd(), ".claude", "worktrees", "admitted");
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
+      worktrees: {
+        enter: async () => ({ ok: true, worktreePath: admittedWorktree, diagnostics: [] }),
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async (_agent, cwd) => {
+        preparedCwds.push(cwd);
+        return { scope, activeOwnedStdioServerNames: () => [] };
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("completed");
+    expect(preparedCwds).toEqual([admittedWorktree]);
+    expect(h.created[0]?.cwd).toBe(admittedWorktree);
+  });
+
+  it("rejects inline MCP without project admission before hooks, worktree, provider, or MCP activity", async () => {
+    const effects: string[] = [];
+    const h = fakeSdk({ replies: ["must not run"] });
+    const agent = makeAgent({
+      isolation: "worktree",
+      agentMcp: normalizeAgentMcpDeclaration([{ inline: { command: "unused" } }], "project"),
+    });
+    const runtime = makeSubagentRuntime([agent], h.sdk, {
+      validateMcpAgent: (candidate) => validateAgentMcpAdmission(candidate, {}),
+      hookRunner: {
+        fire: async () => {
+          effects.push("hook");
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async () => {
+          effects.push("worktree");
+          return { ok: true, worktreePath: "/must-not-enter", diagnostics: [] };
+        },
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async () => {
+        effects.push("mcp");
+        throw new Error("must not prepare MCP");
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("project MCP admission authority is unavailable");
+    expect(effects).toEqual([]);
+    expect(h.created).toHaveLength(0);
+    expect(h.promptCalls()).toBe(0);
   });
 
   it("orders SubagentStop before scoped MCP shutdown, worktree release, and terminal return", async () => {

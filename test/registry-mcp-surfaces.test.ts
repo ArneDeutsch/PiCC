@@ -145,8 +145,15 @@ describe("MCP prompt and resource capability registry", () => {
 
   it("pins named-agent gating, background resources, and main-session-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
+    expect(frontmatter).toContain("omitted or clean-empty declarations, including on nested agents, inherit eligible published main-session routes");
     expect(frontmatter).toContain("references borrow published routes without duplicate clients");
     expect(frontmatter).toContain("inline stdio/HTTP/SSE servers are dispatch-owned and isolated from parents and siblings");
+    expect(frontmatter).toContain("Parent-inline routes do not propagate to nested children");
+    expect(frontmatter).toContain("non-empty declaration selection and parent-inline non-propagation are inferred, unverified choices");
+    expect(frontmatter).not.toContain("only capabilities they independently declare");
+    expect(frontmatter).toContain("managed agents remain dispatchable but retain the field only as inert evidence");
+    expect(frontmatter).toContain("managed-agent MCP execution");
+    expect(frontmatter).not.toContain("managed-agent execution");
     expect(frontmatter).toContain("The combined universe is gated by agent tools:/disallowedTools:, deny permissions, command hooks, timeouts, managed policy, PiCC's name-based project approval, the disabledMcpjsonServers project-decline gate, and the existing non-fork background resource-tool filter");
     expect(frontmatter).toContain("Prompt commands remain main-session-only");
 

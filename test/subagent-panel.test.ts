@@ -4287,7 +4287,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
 
 describe("agent/task warning presentation", () => {
   it("renders canonical MCP qualification exactly once when expanded while retaining collapsed warning access", () => {
-    const warning = "Agent MCP availability warning: inline-db failed to start; restart the agent after repair.";
+    const warning = "Agent MCP availability warning: inline-db has invalid configuration; repair it, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.";
     const result = {
       content: [{ type: "text", text: `child body\n\n---\n${warning}\n---` }],
       details: {

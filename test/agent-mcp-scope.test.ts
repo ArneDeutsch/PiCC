@@ -288,7 +288,7 @@ describe("agent MCP scope composition", () => {
     expect(scope.diagnostics().join(" ")).not.toMatch(/RAW_ERROR_SECRET|STDERR_SECRET|CONFIG_SECRET/u);
     expect(scope.serverStates()).toHaveLength(2);
     expect(scope.serverStates()[1]?.statusSummary).toBe(
-      "Agent MCP server failed during startup or discovery. Review the server configuration and logs, then restart the agent.",
+      "Agent MCP server failed during startup or discovery. Review the server logs. If repairing configuration, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient failure with a fresh Agent dispatch.",
     );
     expect(JSON.stringify(scope.serverStates())).not.toMatch(/RAW_ERROR_SECRET|\/doctor/u);
     expect(Object.isFrozen(scope.serverStates())).toBe(true);
@@ -335,7 +335,7 @@ describe("agent MCP scope composition", () => {
     expect(scope.serverStates()).toEqual([expect.objectContaining({
       name: "published-then-failed",
       state: "failed",
-      statusSummary: "Previously published agent MCP capabilities are unavailable. Review the server configuration and logs, then restart the agent.",
+      statusSummary: "Previously published agent MCP capabilities are unavailable. Review the server logs. If repairing configuration, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient failure with a fresh Agent dispatch.",
     })]);
     expect(JSON.stringify(scope.serverStates())).not.toMatch(/RAW_REMOTE_SECRET|RAW_OWNED_STATUS_SECRET|\/doctor/u);
     expect(scope.diagnostics()).toContain("Agent MCP runtime produced additional redacted diagnostics.");

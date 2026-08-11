@@ -133,6 +133,9 @@ Each subagent is its own `createAgentSession` run. What that costs us at the Pi 
   blocked. For an eligible named agent, PiCC first composes borrowed session MCP routes and an
   agent-owned inline runtime, then adds only that immutable dispatch-local MCP tool set to
   `customTools`; it never calls the API-global `pi.registerTool` seam for those capabilities.
+  A nested agent with an omitted or clean-empty declaration still inherits eligible published
+  main-session routes; a parent's inline routes do not propagate. Selecting only a non-empty
+  declaration's named routes and parent-inline non-propagation are inferred, unverified PiCC choices.
 - **Model/effort.** Resolved per-agent through `ctx.modelRegistry` and passed as
   `model`/`thinkingLevel`.
 - **Depth.** Pi has no notion of nesting depth; PiCC tracks it in an env/context counter and caps it

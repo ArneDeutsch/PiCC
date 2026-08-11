@@ -555,7 +555,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "pins stdio to that launch cwd",
       "Completed in-process resume reconstructs",
       "ephemeral scopes never enter parent /mcp or /doctor live status",
-      "verified collision/diagnostic parity",
+      "verified selection/nesting/collision/diagnostic parity",
     ]) expect(note, piCcDefined).toContain(piCcDefined);
   });
 
@@ -798,7 +798,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("agent.frontmatter.hooks")?.note).toContain("for non-plugin agents");
     const agentMcp = lookupCapability("agent.frontmatter.mcpServers")?.note;
     expect(agentMcp).toContain("Plugin agents diagnose and strip the field");
-    expect(agentMcp).toContain("managed agents may retain parsed data but PiCC ignores it");
+    expect(agentMcp).toContain("managed agents remain dispatchable but retain the field only as inert evidence");
+    expect(agentMcp).toContain("managed-agent MCP execution");
+    expect(agentMcp).not.toContain("managed-agent execution");
+    expect(agentMcp).toContain("omitted or clean-empty declarations, including on nested agents, inherit eligible published main-session routes");
+    expect(agentMcp).toContain("Parent-inline routes do not propagate to nested children");
+    expect(agentMcp).toContain("non-empty declaration selection and parent-inline non-propagation");
+    expect(agentMcp).toContain("inferred, unverified choices");
+    expect(agentMcp).not.toContain("only capabilities they independently declare");
     expect(agentMcp).toContain("every published session route win quietly");
     expect(lookupCapability("agent.frontmatter.permissionMode")?.note).toContain("for non-plugin agents");
     const managed = lookupCapability("feature.managed-policy");
@@ -1826,8 +1833,10 @@ describe("buildCompatReport", () => {
     });
     const report = buildCompatReport(project);
     const finding = report.findings.find(({ capability }) => capability.id === "agent.frontmatter.mcpServers");
-    expect(finding?.evidence).toContain("retains mcpServers as inert declaration evidence");
+    expect(finding?.evidence).toContain("remains dispatchable");
+    expect(finding?.evidence).toContain("retained only as inert declaration evidence and ignored");
     expect(finding?.evidence).toContain("Define an equivalent user-scoped agent when no project change is wanted");
+    expect(finding?.evidence).not.toContain("managed-agent execution is unsupported");
     expect(finding?.evidence).not.toContain("dispatch-local MCP is effective");
   });
 

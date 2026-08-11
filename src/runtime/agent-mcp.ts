@@ -339,15 +339,16 @@ function safeStateProjection(
 }
 
 function ownedStatusSummary(state: McpServerState["state"], neverPublished: boolean): string {
+  const recovery = "If repairing configuration, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient failure with a fresh Agent dispatch.";
   if (neverPublished) {
-    return "Agent MCP server failed during startup or discovery. Review the server configuration and logs, then restart the agent.";
+    return `Agent MCP server failed during startup or discovery. Review the server logs. ${recovery}`;
   }
   switch (state) {
     case "connecting": return "Agent MCP server startup is in progress.";
     case "connected": return "Agent MCP server is connected.";
     case "retrying":
     case "reconnecting": return "Agent MCP server recovery is in progress.";
-    case "failed": return "Previously published agent MCP capabilities are unavailable. Review the server configuration and logs, then restart the agent.";
+    case "failed": return `Previously published agent MCP capabilities are unavailable. Review the server logs. ${recovery}`;
   }
 }
 

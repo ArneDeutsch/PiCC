@@ -214,7 +214,7 @@ user-profile base when an override is selected.
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific policy, approval, and disablement apply |
+| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension, plus `mcpServers:` frontmatter on user/project agents; source-specific policy, approval, and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -723,15 +723,17 @@ startup-failed capability produces a bounded warning before the child's first re
 reported result. Cleanup uncertainty is known only after child work, so it preserves and qualifies
 the result and receives one session-shutdown retry. Neither warning shows raw configuration. Inline
 servers do not appear in the parent `/mcp` or `/doctor` live inventory, do not pass to siblings or
-nested children, and keep their launch cwd after a later EnterWorktree. When the server must follow,
+nested children, and keep their launch cwd after a later EnterWorktree. A nested agent with omitted
+or clean-empty `mcpServers` still inherits eligible published main-session routes. When the server must follow,
 enter the desired worktree first and make a fresh `Agent` dispatch; `SendMessage` does not migrate an
-existing agent or its server. In-process resume reuses the original cwd but applies the current authored
-definition and policy. Plugin agents diagnose and strip this field; define an equivalent user agent
-when no project change is wanted, define a project agent otherwise, or remove the field from the
-plugin source. Managed-agent definitions retain it only as inert evidence, but PiCC ignores it because
-managed-agent execution is unsupported. PiCC's
-cancellation, project approval, collision, warning, cwd, and resume rules are hardening choices rather
-than verified Claude Code parity. Custom agent definitions cannot execute in the main session; plugin
+existing agent or its server. In-process resume reuses the original cwd but applies the current loaded definition and policy
+snapshot. Plugin agents diagnose and strip this field; define an equivalent user agent when no project
+change is wanted, define a project agent otherwise, or remove the field from the plugin source.
+Managed agents remain dispatchable, but their `mcpServers` field is retained only as inert evidence
+and ignored. PiCC's non-empty declaration selection and rule that a parent's inline servers do not
+propagate to nested children are inferred, unverified choices. Its cancellation, project approval,
+collision, warning, cwd, and resume rules are likewise PiCC-defined hardening rather than verified
+Claude Code parity. Custom agent definitions cannot execute in the main session; plugin
 MCP/source references, WebSocket, `--strict-mcp-config`, and `--bare` are also unsupported.
 
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →

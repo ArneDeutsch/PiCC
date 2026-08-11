@@ -142,6 +142,7 @@ describe("agent MCP generation warning mapper", () => {
     diagnostics: [],
     diagnosticOwnership: [],
   } as never;
+  const overflowWarning = "Agent MCP availability warning: one or more MCP setup issues were omitted; if repairing configuration or policy, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient startup failure with a fresh Agent dispatch.";
 
   it.each(["enabled", "blocked", "pending-approval", "disabled", "invalid"] as const)(
     "keeps a published session-route collision quiet for %s inline admission",
@@ -198,7 +199,7 @@ describe("agent MCP generation warning mapper", () => {
       } as never,
     );
 
-    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries and restart the agent.");
+    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.");
   });
 
   it("warns for a collision plus an unowned malformed sibling", () => {
@@ -216,7 +217,7 @@ describe("agent MCP generation warning mapper", () => {
       } as never,
     );
 
-    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries and restart the agent.");
+    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.");
   });
 
   it.each([
@@ -231,20 +232,67 @@ describe("agent MCP generation warning mapper", () => {
       declaration,
     );
     expect(warning).toContain(expected);
+    expect(warning).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch");
     expect(warning).not.toContain("\n");
     expect(warning!.length).toBeLessThanOrEqual(480);
   });
 
   it.each([
-    ["missing-reference", "configure and enable that server, restart the main PiCC session, then dispatch the agent again"],
-    ["inline-startup-failed", "failed during startup or discovery"],
+    ["missing-reference", "configure and enable that server, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch"],
+    ["inline-startup-failed", "failed during startup or discovery; review its server logs; if repairing configuration, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient failure with a fresh Agent dispatch"],
   ] as const)("maps %s scope outcome without raw diagnostics", (kind, expected) => {
     const warning = formatAgentMcpSetupWarning(
       { borrowedServerNames: () => [], setupOutcomes: () => [{ serverName: "safe", kind }] },
       { servers: [], diagnostics: [], diagnosticOwnership: [] }, declaration,
     );
     expect(warning).toContain(expected);
+    if (kind === "inline-startup-failed") {
+      expect(warning).toContain("if repairing configuration");
+      expect(warning).toContain("otherwise retry a transient failure");
+    }
     expect(warning).not.toContain("transport");
+    expect(warning!.length).toBeLessThanOrEqual(480);
+  });
+
+  it("preserves both recovery branches when one max-safe-name startup failure overflows", () => {
+    const warning = formatAgentMcpSetupWarning(
+      {
+        borrowedServerNames: () => [],
+        setupOutcomes: () => [{
+          serverName: "\\".repeat(96),
+          kind: "inline-startup-failed",
+          rawError: "RAW_UNSAFE_DETAIL",
+        } as never],
+      },
+      { servers: [], diagnostics: [], diagnosticOwnership: [] },
+      declaration,
+    )!;
+
+    expect(warning).toBe(overflowWarning);
+    expect(warning.length).toBeLessThanOrEqual(480);
+    expect(warning).not.toContain("multiple");
+    expect(warning).not.toContain("repair the affected declaration or policy");
+    expect(warning).not.toContain("RAW_UNSAFE_DETAIL");
+  });
+
+  it("preserves both recovery branches when multiple startup failures overflow", () => {
+    const warning = formatAgentMcpSetupWarning(
+      {
+        borrowedServerNames: () => [],
+        setupOutcomes: () => Array.from({ length: 12 }, (_, index) => ({
+          serverName: `server-${index}-RAW_UNSAFE_DETAIL-${"x".repeat(80)}`,
+          kind: "inline-startup-failed" as const,
+        })),
+      },
+      { servers: [], diagnostics: [], diagnosticOwnership: [] },
+      declaration,
+    )!;
+
+    expect(warning).toBe(overflowWarning);
+    expect(warning.length).toBeLessThanOrEqual(480);
+    expect(warning).not.toContain("multiple");
+    expect(warning).not.toContain("repair the affected declaration or policy");
+    expect(warning).not.toContain("RAW_UNSAFE_DETAIL");
   });
 
   it("bounds overflow, redacts controls, and reports malformed declarations", () => {
@@ -256,10 +304,11 @@ describe("agent MCP generation warning mapper", () => {
       { servers, diagnostics: ["RAW_SECRET"] } as never,
       { items: [], diagnostics: ["RAW_SECRET"], diagnosticOwnership: [{ kind: "unowned" }] },
     )!;
+    expect(warning).toBe(overflowWarning);
     expect(warning.length).toBeLessThanOrEqual(480);
     expect(warning).not.toContain("\u001b");
     expect(warning).not.toContain("RAW_SECRET");
-    expect(warning).toContain("MCP setup issue");
+    expect(warning).not.toContain("multiple");
   });
 });
 
@@ -738,6 +787,8 @@ describe("subagent MCP tool provisioning (wired)", () => {
   const childPrompts: string[] = [];
   let backgroundWarningVisibleBeforePrompt = false;
   let livePinToolResult = "";
+  let nestedParentTools: string[] = [];
+  let nestedChildTools: string[] = [];
   let runGuardProof: ((session: { customTools: FakeCustomTool[] }) => Promise<void>) | undefined;
 
   const FIXTURE_TOOLS = [
@@ -777,6 +828,7 @@ describe("subagent MCP tool provisioning (wired)", () => {
       dir,
       ".claude/settings.json",
       JSON.stringify({
+        subagents: { maxDepth: 2 },
         permissions: { deny: ["mcp__denied", "mcp__fixture__echo(text:secret*)"] },
         hooks: {
           PreToolUse: [{ hooks: [{ type: "command", command: "session-pre-must-not-launch" }] }],
@@ -839,9 +891,23 @@ describe("subagent MCP tool provisioning (wired)", () => {
         "",
       ].join("\n"),
     );
+    for (const [agentName, serverName] of [["parent-inline", "parent-owned"], ["nested-inline", "nested-owned"]] as const) {
+      writeProjectFile(
+        dir,
+        `.claude/agents/${agentName}.md`,
+        [
+          "---", `name: ${agentName}`, `description: owns ${serverName}`, "mcpServers:",
+          `  - ${serverName}:`, `      command: ${JSON.stringify(fixture.nodeCommand)}`,
+          `      args: [${JSON.stringify(fixture.serverScript)}, serve]`,
+          "---", `Use ${serverName}.`, "",
+        ].join("\n"),
+      );
+    }
     const userDir = makeTempDir("picc-mcpsub-user-");
     // Approval from a user-authored scope — project scope cannot self-approve.
-    writeProjectFile(userDir, "settings.json", JSON.stringify({ enabledMcpjsonServers: ["fixture", "inline"] }));
+    writeProjectFile(userDir, "settings.json", JSON.stringify({
+      enabledMcpjsonServers: ["fixture", "inline", "parent-owned", "nested-owned"],
+    }));
     process.env.PICC_CLAUDE_USER_DIR = userDir;
     execFileSync("git", ["add", "."], { cwd: dir });
     execFileSync("git", ["commit", "-m", "fixture"], { cwd: dir, stdio: "ignore" });
@@ -854,6 +920,25 @@ describe("subagent MCP tool provisioning (wired)", () => {
         if (text.includes("PENDING-WARNING")) {
           backgroundWarningVisibleBeforePrompt = internals?.backgroundTasks.ids().some((id) =>
             internals.backgroundTasks.get(id)?.lastActivity?.startsWith("Agent MCP availability warning:")) ?? false;
+        }
+        if (text.includes("INLINE-BACKGROUND-CALL")) {
+          const echo = session.customTools.find((tool) => tool.name === "mcp__inline__echo");
+          if (!echo) return "NO-INLINE-TOOL";
+          const result = await echo.execute("inline-background-call", { text: "owned-background" });
+          return `INLINE-BACKGROUND:${result.content[0]?.text ?? ""}`;
+        }
+        if (text.includes("NESTED-CHILD")) {
+          nestedChildTools = session.customTools.map((tool) => tool.name);
+          return "NESTED-CHILD-DONE";
+        }
+        if (text.includes("NESTED-PARENT")) {
+          nestedParentTools = session.customTools.map((tool) => tool.name);
+          const nestedAgent = session.customTools.find((tool) => tool.name === "Agent");
+          if (!nestedAgent) return "NO-NESTED-AGENT";
+          const result = await nestedAgent.execute("nested-dispatch", {
+            subagent_type: "nested-inline", prompt: "NESTED-CHILD", run_in_background: false,
+          });
+          return `NESTED-PARENT:${result.content[0]?.text ?? ""}`;
         }
         if (text.includes("GUARD-PROOF")) {
           await runGuardProof?.(session as unknown as { customTools: FakeCustomTool[] });
@@ -944,7 +1029,7 @@ describe("subagent MCP tool provisioning (wired)", () => {
   it("threads one canonical degraded-setup warning through the child prompt and foreground/background model surfaces", async () => {
     const foreground = await dispatch("pending-inline", "PENDING-WARNING foreground");
     const foregroundText = (foreground.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n");
-    const warning = "Agent MCP availability warning: \"pending-server\" needs project approval in user settings; approve it and restart the agent.";
+    const warning = "Agent MCP availability warning: \"pending-server\" needs project approval in user settings; approve it, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.";
     expect(foregroundText).toContain(warning);
     expect(childPrompts.at(-1)).toContain(warning);
     expect((foreground.details as { diagnostics?: Array<{ message: string }> }).diagnostics
@@ -972,6 +1057,36 @@ describe("subagent MCP tool provisioning (wired)", () => {
     expect(expanded.match(/Agent MCP availability warning:/gu)).toHaveLength(1);
     expect(expanded.match(/in 7/gu)).toHaveLength(1);
     expect(expanded).not.toMatch(/\nusage:/u);
+  });
+
+  it("activates a valid inline server for its background owner and nowhere else", async () => {
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+    const accepted = await pi.tools.get("Agent").execute("inline-background", {
+      subagent_type: "inline-owner", prompt: "INLINE-BACKGROUND-CALL", run_in_background: true,
+    });
+    const taskId = (accepted.details as { taskId: string }).taskId;
+    await internals.backgroundTasks.wait(taskId);
+    const created = handle.created.at(-1)!;
+    expect((created.customTools as FakeCustomTool[]).map((tool) => tool.name)).toContain("mcp__inline__echo");
+    const output = await pi.tools.get("TaskOutput").execute("inline-background-output", { task_id: taskId });
+    expect((output.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n"))
+      .toContain("INLINE-BACKGROUND:owned-background");
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+
+    await dispatch("inheritor", "unrelated after background owner");
+    expect(lastCustomToolNames()).not.toContain("mcp__inline__echo");
+  });
+
+  it("does not propagate parent inline tools to a nested dispatch and activates the nested declaration", async () => {
+    const result = await dispatch("parent-inline", "NESTED-PARENT");
+    expect((result.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n"))
+      .toContain("NESTED-PARENT:NESTED-CHILD-DONE");
+    expect(nestedParentTools).toContain("mcp__parent-owned__echo");
+    expect(nestedParentTools).not.toContain("mcp__nested-owned__echo");
+    expect(nestedChildTools).toContain("mcp__nested-owned__echo");
+    expect(nestedChildTools).not.toContain("mcp__parent-owned__echo");
+    expect(pi.tools.has("mcp__parent-owned__echo")).toBe(false);
+    expect(pi.tools.has("mcp__nested-owned__echo")).toBe(false);
   });
 
   it("starts an inline stdio scope only for its owner and closes its process tree before return", async () => {

@@ -662,6 +662,18 @@ function createBoundedTuiDiagnosticSurface(fingerprintCap = 20): (
   };
 }
 
+const AGENT_MCP_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch";
+const AGENT_MCP_TRANSIENT_OR_CONFIG_ACTION = `if repairing configuration, ${AGENT_MCP_REFRESH_ACTION}; otherwise retry a transient failure with a fresh Agent dispatch`;
+
+export function validateAgentMcpAdmission(
+  agent: Pick<ClaudeAgent, "name" | "agentMcp">,
+  project: Pick<LoadedProject, "agentMcpAdmission">,
+): void {
+  if (agent.agentMcp?.items.some((item) => item.kind === "inline") && !project.agentMcpAdmission) {
+    throw new Error(`Agent ${JSON.stringify(agent.name)} requests inline MCP, but project MCP admission authority is unavailable.`);
+  }
+}
+
 export function formatAgentMcpSetupWarning(
   scope: Pick<AgentMcpScope, "borrowedServerNames" | "setupOutcomes">,
   inlineConfig: ResolvedAgentMcpConfig,
@@ -674,20 +686,20 @@ export function formatAgentMcpSetupWarning(
     if (server.status === "enabled" || borrowedNames.has(server.name)) continue;
     const identity = safeIdentity(server.name);
     const guidance = server.status === "pending-approval"
-      ? `${identity} needs project approval in user settings; approve it and restart the agent`
+      ? `${identity} needs project approval in user settings; approve it, ${AGENT_MCP_REFRESH_ACTION}`
       : server.status === "disabled"
-        ? `${identity} is disabled; enable it and restart the agent`
+        ? `${identity} is disabled; enable it, ${AGENT_MCP_REFRESH_ACTION}`
         : server.status === "blocked"
-          ? `${identity} is blocked by managed MCP policy; ask the policy owner to allow it, then restart the agent`
-          : `${identity} has no usable definition; fix its agent mcpServers entry and restart the agent`;
+          ? `${identity} is blocked by managed MCP policy; ask the policy owner to allow it, ${AGENT_MCP_REFRESH_ACTION}`
+          : `${identity} has no usable definition; fix its agent mcpServers entry, ${AGENT_MCP_REFRESH_ACTION}`;
     findings.set(server.name, guidance);
   }
   for (const outcome of scope.setupOutcomes()) {
     if (borrowedNames.has(outcome.serverName)) continue;
     const identity = safeIdentity(outcome.serverName);
     findings.set(outcome.serverName, outcome.kind === "missing-reference"
-      ? `${identity} is not available in the main session; configure and enable that server, restart the main PiCC session, then dispatch the agent again`
-      : `${identity} failed during startup or discovery; review its configuration and server logs, then restart the agent`);
+      ? `${identity} is not available in the loaded main-session MCP snapshot; configure and enable that server, ${AGENT_MCP_REFRESH_ACTION}`
+      : `${identity} failed during startup or discovery; review its server logs; ${AGENT_MCP_TRANSIENT_OR_CONFIG_ACTION}`);
   }
   const ownerIsBorrowed = (owner: AgentMcpDeclaration["diagnosticOwnership"][number] | undefined): boolean =>
     owner?.kind === "server" && borrowedNames.has(owner.serverName);
@@ -704,8 +716,8 @@ export function formatAgentMcpSetupWarning(
   );
   if (hasVisibleDeclarationDiagnostic || hasVisibleAdmissionDiagnostic || hasVisibleServerDiagnostic) {
     findings.set("\u0000declaration", declaration?.items.length === 0
-      ? "the explicit mcpServers declaration is malformed and selected no MCP servers; fix it and restart the agent"
-      : "part of the mcpServers declaration is malformed; fix the skipped entries and restart the agent");
+      ? `the explicit mcpServers declaration is malformed and selected no MCP servers; fix it, ${AGENT_MCP_REFRESH_ACTION}`
+      : `part of the mcpServers declaration is malformed; fix the skipped entries, ${AGENT_MCP_REFRESH_ACTION}`);
   }
   const retained = [...findings.values()].slice(0, 8);
   if (findings.size > retained.length) retained.push(`${findings.size - retained.length} additional MCP setup issue(s) were omitted`);
@@ -713,8 +725,7 @@ export function formatAgentMcpSetupWarning(
   if (!body) return undefined;
   const warning = `Agent MCP availability warning: ${body}.`;
   if (warning.length <= 480) return warning;
-  const overflow = " Additional MCP setup issue(s) were omitted.";
-  return `${warning.slice(0, 480 - overflow.length - 1)}…${overflow}`;
+  return `Agent MCP availability warning: one or more MCP setup issues were omitted; if repairing configuration or policy, ${AGENT_MCP_REFRESH_ACTION}; otherwise retry a transient startup failure with a fresh Agent dispatch.`;
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
@@ -1900,11 +1911,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       return tools;
     },
-    validateMcpAgent: (agent) => {
-      if (agent.agentMcp?.items.some((item) => item.kind === "inline") && !project.agentMcpAdmission) {
-        throw new Error(`Agent ${JSON.stringify(agent.name)} requests inline MCP, but project MCP admission authority is unavailable.`);
-      }
-    },
+    validateMcpAgent: (agent) => validateAgentMcpAdmission(agent, project),
     prepareMcpFor: async (agent, spawnCwd, signal) => {
       const declaration = agent.agentMcp;
       const inlineConfig = declaration

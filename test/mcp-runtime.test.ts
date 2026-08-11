@@ -10,7 +10,7 @@ import {
   type McpRuntimeDeps,
 } from "../src/runtime/mcp.js";
 import { renderMcpStatusReport } from "../src/registry/compat-report.js";
-import type { EnabledStdioMcpServer, ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
+import type { EnabledStdioMcpServer, ResolvedAgentMcpConfig, ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive } from "./helpers/mcp-process.js";
 import { createMcpRemoteServer } from "./helpers/mcp-remote-server.js";
@@ -2313,12 +2313,17 @@ describe("McpRuntime remote retry and recovery", () => {
     }
   });
 
-  it("round-trips initialize, discovery, call, and close through the real t02 HTTP adapter", async () => {
+  it("round-trips an agent-inline remote through startAgent, discovery, call, and shutdown", async () => {
     const fixture = await createMcpRemoteServer();
-    const runtime = McpRuntime.start(
-      makeConfig(makeRemoteServer({ name: "loopback", url: fixture.streamableUrl })),
-      makeDeps(),
-    );
+    const agentConfig: ResolvedAgentMcpConfig = {
+      servers: [{
+        name: "loopback", source: "subagent-inline", status: "enabled", transport: "http",
+        configuredType: "http", url: fixture.streamableUrl, headers: {}, diagnostics: [],
+      }],
+      diagnostics: [],
+      diagnosticOwnership: [],
+    };
+    const runtime = McpRuntime.startAgent(agentConfig, makeDeps());
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([

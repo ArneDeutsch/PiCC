@@ -734,7 +734,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
         const safeAgent = quotedMcpName(agent.name, 128);
         const dispatchBoundary = "Startup health and deterministic cleanup are dispatch-time only and appear in bounded Agent/TaskOutput results; agent-local servers do not appear in parent /mcp live status.";
         if (agent.source.scope === "managed") {
-          addAgentMcpFinding(cap, `managed agent ${safeAgent} retains mcpServers as inert declaration evidence, but PiCC ignores it because managed-agent execution is unsupported. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the declaration, then ${CANONICAL_REFRESH_ACTION}.`);
+          addAgentMcpFinding(cap, `managed agent ${safeAgent} remains dispatchable, but its mcpServers field is retained only as inert declaration evidence and ignored. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the declaration, then ${CANONICAL_REFRESH_ACTION}.`);
         } else if (agent.agentMcp !== undefined) {
           const scope = agent.source.scope === "user" ? "user" : "project";
           const declaration = agent.agentMcp;
