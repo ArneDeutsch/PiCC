@@ -1,6 +1,6 @@
 ---
 name: future-agent
-description: Uses parser-normalized, runtime-deferred agent MCP declarations plus unknown features to prove graceful degradation.
+description: Uses supported agent MCP declarations that stay intentionally inert when a reference is absent and an inline server is unapproved, plus unknown features.
 memory: project
 mcpServers:
   - fixture-session
@@ -15,4 +15,4 @@ hooks:
 unknownFutureAgentField: 42
 ---
 
-Agent with bounded parser-only MCP evidence. Runtime MCP remains deferred; the agent must still be dispatchable.
+Agent with a supported absent-reference and unapproved-inline MCP topology. The declarations remain intentionally inert in this fixture, and the agent must still be dispatchable.

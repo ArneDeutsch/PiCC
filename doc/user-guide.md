@@ -722,13 +722,17 @@ without starting a duplicate or warning. Missing, invalid, blocked, disabled, pe
 startup-failed capability produces a bounded warning before the child's first request and around its
 reported result. Cleanup uncertainty is known only after child work, so it preserves and qualifies
 the result and receives one session-shutdown retry. Neither warning shows raw configuration. Inline
-servers do not appear in the parent `/mcp` inventory, do not pass to siblings or nested children, and
-keep their launch cwd after a later EnterWorktree; restart the agent in the desired worktree when the
-server must follow. In-process resume reuses the original cwd but applies the current authored
-definition and policy. Plugin agents diagnose and strip this field; managed-agent definitions may
-retain it as parsed data, but PiCC ignores it because managed-agent execution is unsupported. PiCC's
+servers do not appear in the parent `/mcp` or `/doctor` live inventory, do not pass to siblings or
+nested children, and keep their launch cwd after a later EnterWorktree. When the server must follow,
+enter the desired worktree first and make a fresh `Agent` dispatch; `SendMessage` does not migrate an
+existing agent or its server. In-process resume reuses the original cwd but applies the current authored
+definition and policy. Plugin agents diagnose and strip this field; define an equivalent user agent
+when no project change is wanted, define a project agent otherwise, or remove the field from the
+plugin source. Managed-agent definitions retain it only as inert evidence, but PiCC ignores it because
+managed-agent execution is unsupported. PiCC's
 cancellation, project approval, collision, warning, cwd, and resume rules are hardening choices rather
-than verified Claude Code parity.
+than verified Claude Code parity. Custom agent definitions cannot execute in the main session; plugin
+MCP/source references, WebSocket, `--strict-mcp-config`, and `--bare` are also unsupported.
 
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →
 project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
@@ -816,8 +820,8 @@ non-protocol HTTP failure bodies/status/redirect targets, and SDK/fetch exceptio
 valid MCP metadata, prompt/resource content, successful tool results, and protocol-level errors
 remain untrusted, server-controlled model content.
 
-Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
-`.claude/settings.json`) are pending by default and never start until you approve them. Approve
+Project-scope MCP servers (`.mcp.json`, `mcpServers` in the committed
+`.claude/settings.json`, or project-agent inline definitions) are pending by default and never start until you approve them. Approve
 selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
 untracked `.claude/settings.local.json`. User approval settings live in `settings.json` inside the
 active user profile directory (`~/.claude/settings.json` by default, or inside the selected override

@@ -89,7 +89,7 @@ describe("MCP prompt and resource capability registry", () => {
   it("owns capability discovery retries and immutable catalogs at the cross-transport level", () => {
     const proxy = note("tool.mcp__*");
     expect(proxy).toContain("catalog across remote outages and terminal failure remains immutable");
-    expect(proxy).toContain("After aggregate initial settlement, the main session registers one immutable universe");
+    expect(proxy).toContain("After main-session aggregate initial settlement, the main session registers one immutable universe");
     expect(proxy).toContain("Named agents compose an immutable dispatch-local universe from borrowed eligible session servers and their own admitted inline runtime");
     expect(proxy).toContain("then restrict/drop it via tools:/disallowedTools:");
     expect(proxy).toContain("parent and sibling inline capabilities do not propagate");
@@ -145,17 +145,24 @@ describe("MCP prompt and resource capability registry", () => {
 
   it("pins named-agent gating, background resources, and main-session-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
-    expect(frontmatter).toContain("string references borrow them without duplicate clients");
+    expect(frontmatter).toContain("references borrow published routes without duplicate clients");
     expect(frontmatter).toContain("inline stdio/HTTP/SSE servers are dispatch-owned and isolated from parents and siblings");
-    expect(frontmatter).toContain("The combined universe is gated by agent tools:/disallowedTools:, permissions, hooks, timeouts, managed policy, project approval, the disabledMcpjsonServers project-decline gate, and background resource filtering");
-    expect(frontmatter).toContain("prompt commands remain main-session-only");
+    expect(frontmatter).toContain("The combined universe is gated by agent tools:/disallowedTools:, deny permissions, command hooks, timeouts, managed policy, PiCC's name-based project approval, the disabledMcpjsonServers project-decline gate, and the existing non-fork background resource-tool filter");
+    expect(frontmatter).toContain("Prompt commands remain main-session-only");
+
+    const approval = note("feature.mcp-project-approval");
+    expect(approval).toContain("Ordinary main-session pending servers surface as a bounded one-time session-start notice");
+    expect(approval).toContain("/mcp carries bounded approval and decline guidance");
+    expect(approval).toContain("Agent-inline static pending declarations appear only in /doctor");
+    expect(approval).toContain("dispatch-time setup or cleanup outcomes appear only in bounded Agent/TaskOutput results");
+    expect(approval).toContain("agent-inline state is absent from the parent /mcp");
   });
 });
 
 
 type AuditSurface = {
   surfaceKey: string;
-  page: "MCP reference" | "Settings reference" | "CLI reference" | "Hooks reference" | "Claude Code channels";
+  page: "MCP reference" | "Settings reference" | "CLI reference" | "Hooks reference" | "Claude Code channels" | "Subagents reference";
   leafDescription: string;
   authorityHeading: string;
   capabilityId: string;
@@ -199,6 +206,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
 };
 
 const EXPECTED_RELATED: Readonly<Record<string, readonly string[]>> = {
+  "agent.frontmatter.mcpServers": ["feature.mcp","feature.mcp-model-failure-visibility","feature.mcp-project-approval","tool.Agent","tool.TaskOutput","tool.mcp__*"],
   "feature.mcp": ["feature.mcp-capability-discovery","feature.mcp-claude-json-scopes","feature.mcp-managed-config","feature.mcp-remote-transports","setting.mcpServers"],
   "feature.mcp-auto-background": ["feature.mcp-first-byte-timeout","feature.mcp-idle-timeout"],
   "feature.mcp-capability-discovery": ["feature.mcp","feature.mcp-model-failure-visibility","feature.mcp-prompts","feature.mcp-resources"],
@@ -298,7 +306,8 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("scope.precedence", "MCP reference", "Scope precedence", "Scope hierarchy and precedence", "feature.mcp-claude-json-scopes", "partial", false),
   s("approval.enable-all", "Settings reference", "enableAllProjectMcpServers", "Available settings", "setting.enableAllProjectMcpServers", "partial"),
   s("approval.enabled-list", "Settings reference", "enabledMcpjsonServers", "Available settings", "setting.enabledMcpjsonServers", "partial"),
-  s("approval.disabled-list", "Settings reference", "disabledMcpjsonServers", "Available settings", "setting.disabledMcpjsonServers", "full"),
+  s("approval.disabled-list", "Settings reference", "disabledMcpjsonServers", "Available settings", "setting.disabledMcpjsonServers", "partial"),
+  s("agents.mcp-declaration", "Subagents reference", "Named-agent MCP references and inline definitions", "MCP servers", "agent.frontmatter.mcpServers", "partial", false),
   s("runtime.disabled", "MCP reference", "disabledMcpServers", "Disable a server without removing it", "feature.mcp-runtime-disabled", "partial", true),
   s("runtime.enabled", "MCP reference", "enabledMcpServers", "Managing your servers", "feature.mcp-runtime-enabled", "not-supported", false),
   s("management.status", "MCP reference", "/mcp command", "Managing your servers", "feature.mcp-control-status", "partial"),
@@ -441,6 +450,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
 ];
 
 const EXPECTED_EVIDENCE: Readonly<Record<string, readonly AuditSurface["evidence"][number][]>> = {
+  "agent.frontmatter.mcpServers": [{"quality":"documented","source":"Subagents reference — MCP servers","reviewed":"2026-07-31"}],
   "feature.hook-handler.mcp_tool": [{"quality":"documented","source":"Hooks reference \u2014 MCP tool hook fields","reviewed":"2026-07-31"}],
   "feature.hook-handler.mcp_tool-blocking-enforcement": [{"quality":"documented","source":"Hooks reference \u2014 MCP tool hook fields","reviewed":"2026-07-31"}],
   "feature.mcp": [{"quality":"documented","source":"MCP reference — Option 3: Add a local stdio server","reviewed":"2026-07-31"},{"quality":"documented","source":"MCP reference — Push messages with channels","reviewed":"2026-07-31"}],
@@ -517,7 +527,7 @@ const MCP_SURFACES: readonly AuditSurface[] = RAW_MCP_SURFACES.map((row) => {
 });
 
 const EXPECTED_SURFACE_KEYS = [
-  "approval.disabled-list", "approval.enable-all", "approval.enabled-list", "channels.allowed-plugins", "channels.allowlist-replacement-empty", "channels.behavior", "channels.development", "channels.development-exception", "channels.enabled-setting", "channels.load", "channels.master-disable", "config.always-load", "config.child-session-env", "config.command-args-env", "config.connect-timeout", "config.empty-url-placeholder", "config.environment-expansion", "config.first-byte-timeout", "config.reserved-server-names", "config.role", "config.shell-prefix", "config.startup-timeout", "config.tool-timeout", "config.url-without-type-validation", "connection.automatic-reconnection", "connection.capability-discovery", "connection.failure-visibility", "connection.wait-tool", "dynamic.failed-refresh-retains-catalog", "dynamic.prompts-list-changed", "dynamic.resources-list-changed", "dynamic.tools-list-changed", "elicitation.hook-request", "elicitation.hook-result", "elicitation.protocol", "headers.dynamic", "headers.static", "hooks.elicitation-input", "hooks.elicitation-matcher", "hooks.elicitation-output", "hooks.elicitation-result-input", "hooks.elicitation-result-matcher", "hooks.elicitation-result-output", "hooks.match-mcp-tools", "hooks.match-patterns", "hooks.mcp-tool-all-events", "hooks.mcp-tool-connected", "hooks.mcp-tool-early-race", "hooks.mcp-tool-errors", "hooks.mcp-tool-handler-input", "hooks.mcp-tool-handler-server", "hooks.mcp-tool-handler-tool", "hooks.mcp-tool-handler-type", "hooks.mcp-tool-plugin-server", "hooks.mcp-tool-text-output", "invocation.bare", "invocation.mcp-config", "invocation.permission-prompt-tool", "invocation.safe-mode", "invocation.strict-mcp-config", "managed.allow-claude-ai", "managed.allowlist", "managed.denylist", "managed.disable-connectors", "managed.disable-sideload", "managed.invalid-allowlist-empty", "managed.invalid-only-treated-true", "managed.only", "managed.only-restriction", "managed.server-config", "managed.server-config-file", "managed.strict-plugin-membership", "managed.strict-plugin-only", "managed.strict-plugin-restriction", "management.add", "management.add-from-claude-desktop", "management.add-json", "management.connectors", "management.get", "management.list", "management.remove", "management.reset-project-choices", "management.server-mode", "management.status", "oauth.auth-detection", "oauth.auth-metadata-override", "oauth.authorization-header-suppression", "oauth.clear-authentication", "oauth.cli-login", "oauth.cli-logout", "oauth.client-credentials-flags", "oauth.dynamic-client-registration", "oauth.fixed-callback-port", "oauth.headless-tool-search-visibility", "oauth.insufficient-scope", "oauth.login", "oauth.no-browser", "oauth.offline-access", "oauth.preconfigured-client", "oauth.reauthenticate", "oauth.refresh-reconnect-retry", "oauth.scopes", "oauth.startup-notice", "oauth.transport-applicability", "output.idle-timeout", "output.max-mcp-output-tokens", "output.per-tool-persistence", "plugins.lifecycle-reload", "plugins.placeholder-substitution", "plugins.scoped-naming", "plugins.servers", "plugins.transport-substitution", "prompts.catalog-and-get", "resources.attachments", "resources.list", "resources.read", "resources.subscriptions", "resources.templates", "roots.list", "roots.list-changed", "runtime.disabled", "runtime.enabled", "sampling.server-request", "scope.local", "scope.precedence", "scope.project", "scope.user", "server.instructions", "server.instructions-truncation", "timeout.first-byte-default", "timeout.first-byte-override-floor", "timeout.first-byte-transport-exclusions", "timeout.idle-disable-zero", "timeout.idle-in-process-exclusions", "timeout.idle-progress-reset", "timeout.idle-transport-defaults", "timeout.per-server-idle-floor", "timeout.progress-does-not-extend-wall", "timeout.tool-hard-wall", "tools.auto-background-disable", "tools.auto-background-elicitation-deferral", "tools.auto-background-exclusions", "tools.auto-background-noninteractive-opt-in", "tools.auto-background-threshold", "tools.deferred-schema-loading", "tools.enable-tool-search", "tools.long-call-backgrounding", "tools.max-before-defer", "tools.meta-always-load", "tools.meta-max-result-size-chars", "tools.meta-requires-user-interaction", "tools.proxy-registration", "tools.root-combinator-schema", "tools.search", "tools.search-default", "tools.search-failure-dependency", "tools.search-unsupported-paths", "tools.search-wait-selection", "tools.server-always-load", "transport.http", "transport.sse", "transport.stdio", "transport.websocket", "transport.websocket-config"
+  "agents.mcp-declaration", "approval.disabled-list", "approval.enable-all", "approval.enabled-list", "channels.allowed-plugins", "channels.allowlist-replacement-empty", "channels.behavior", "channels.development", "channels.development-exception", "channels.enabled-setting", "channels.load", "channels.master-disable", "config.always-load", "config.child-session-env", "config.command-args-env", "config.connect-timeout", "config.empty-url-placeholder", "config.environment-expansion", "config.first-byte-timeout", "config.reserved-server-names", "config.role", "config.shell-prefix", "config.startup-timeout", "config.tool-timeout", "config.url-without-type-validation", "connection.automatic-reconnection", "connection.capability-discovery", "connection.failure-visibility", "connection.wait-tool", "dynamic.failed-refresh-retains-catalog", "dynamic.prompts-list-changed", "dynamic.resources-list-changed", "dynamic.tools-list-changed", "elicitation.hook-request", "elicitation.hook-result", "elicitation.protocol", "headers.dynamic", "headers.static", "hooks.elicitation-input", "hooks.elicitation-matcher", "hooks.elicitation-output", "hooks.elicitation-result-input", "hooks.elicitation-result-matcher", "hooks.elicitation-result-output", "hooks.match-mcp-tools", "hooks.match-patterns", "hooks.mcp-tool-all-events", "hooks.mcp-tool-connected", "hooks.mcp-tool-early-race", "hooks.mcp-tool-errors", "hooks.mcp-tool-handler-input", "hooks.mcp-tool-handler-server", "hooks.mcp-tool-handler-tool", "hooks.mcp-tool-handler-type", "hooks.mcp-tool-plugin-server", "hooks.mcp-tool-text-output", "invocation.bare", "invocation.mcp-config", "invocation.permission-prompt-tool", "invocation.safe-mode", "invocation.strict-mcp-config", "managed.allow-claude-ai", "managed.allowlist", "managed.denylist", "managed.disable-connectors", "managed.disable-sideload", "managed.invalid-allowlist-empty", "managed.invalid-only-treated-true", "managed.only", "managed.only-restriction", "managed.server-config", "managed.server-config-file", "managed.strict-plugin-membership", "managed.strict-plugin-only", "managed.strict-plugin-restriction", "management.add", "management.add-from-claude-desktop", "management.add-json", "management.connectors", "management.get", "management.list", "management.remove", "management.reset-project-choices", "management.server-mode", "management.status", "oauth.auth-detection", "oauth.auth-metadata-override", "oauth.authorization-header-suppression", "oauth.clear-authentication", "oauth.cli-login", "oauth.cli-logout", "oauth.client-credentials-flags", "oauth.dynamic-client-registration", "oauth.fixed-callback-port", "oauth.headless-tool-search-visibility", "oauth.insufficient-scope", "oauth.login", "oauth.no-browser", "oauth.offline-access", "oauth.preconfigured-client", "oauth.reauthenticate", "oauth.refresh-reconnect-retry", "oauth.scopes", "oauth.startup-notice", "oauth.transport-applicability", "output.idle-timeout", "output.max-mcp-output-tokens", "output.per-tool-persistence", "plugins.lifecycle-reload", "plugins.placeholder-substitution", "plugins.scoped-naming", "plugins.servers", "plugins.transport-substitution", "prompts.catalog-and-get", "resources.attachments", "resources.list", "resources.read", "resources.subscriptions", "resources.templates", "roots.list", "roots.list-changed", "runtime.disabled", "runtime.enabled", "sampling.server-request", "scope.local", "scope.precedence", "scope.project", "scope.user", "server.instructions", "server.instructions-truncation", "timeout.first-byte-default", "timeout.first-byte-override-floor", "timeout.first-byte-transport-exclusions", "timeout.idle-disable-zero", "timeout.idle-in-process-exclusions", "timeout.idle-progress-reset", "timeout.idle-transport-defaults", "timeout.per-server-idle-floor", "timeout.progress-does-not-extend-wall", "timeout.tool-hard-wall", "tools.auto-background-disable", "tools.auto-background-elicitation-deferral", "tools.auto-background-exclusions", "tools.auto-background-noninteractive-opt-in", "tools.auto-background-threshold", "tools.deferred-schema-loading", "tools.enable-tool-search", "tools.long-call-backgrounding", "tools.max-before-defer", "tools.meta-always-load", "tools.meta-max-result-size-chars", "tools.meta-requires-user-interaction", "tools.proxy-registration", "tools.root-combinator-schema", "tools.search", "tools.search-default", "tools.search-failure-dependency", "tools.search-unsupported-paths", "tools.search-wait-selection", "tools.server-always-load", "transport.http", "transport.sse", "transport.stdio", "transport.websocket", "transport.websocket-config"
 ] as const;
 
 const ALLOWED_QUALITIES = new Set(["documented", "observed", "inferred", "unverified"]);
@@ -598,11 +608,16 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(lookupCapability("feature.mcp-runtime-enabled")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "partial", safetyRelevant: false });
     const failureVisibility = note("feature.mcp-model-failure-visibility");
-    expect(failureVisibility).toContain("Main-session startup failures remain human-visible through /mcp, /doctor, warnings, and stderr rather than Claude's ToolSearch/WaitForMcpServers model path");
-    expect(failureVisibility).toContain("Named-agent setup degradation settles before the first child provider request");
+    expect(failureVisibility).toContain("Main-session startup failures are not injected into MAIN-SESSION model context, and raw failure details are not model-reported");
+    expect(failureVisibility).toContain("explicit named-agent reference to a configured route that is unpublished at dispatch may instead receive bounded PiCC-defined unavailability wording");
+    expect(failureVisibility).toContain("direct named-agent inline setup degradation settles before the first child provider request");
     expect(failureVisibility).toContain("one bounded PiCC-defined warning reaches that child and later qualifies Agent/TaskOutput");
     expect(failureVisibility).toContain("Cleanup degradation is discovered only after child work and therefore qualifies the parent-facing result, not the already-finished child request");
     expect(failureVisibility).toContain("No warning exposes raw config or runtime errors");
+    const aggregate = note("feature.mcp");
+    expect(aggregate).toContain("main-session startup failures are not injected into MAIN-SESSION model context, and raw failure details are not model-reported");
+    expect(aggregate).toContain("explicit named-agent reference to a configured route that is unpublished at dispatch may receive bounded PiCC-defined unavailability wording");
+    expect(aggregate).toContain("direct named-agent inline setup degradation receives bounded warning context before that child's first provider request");
     expect(note("feature.mcp-websocket")).toContain("stdio, HTTP, and SSE alternatives");
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");

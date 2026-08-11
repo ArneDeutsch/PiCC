@@ -363,6 +363,10 @@ where to start reading, not the extent of its cluster.
   Session shutdown first stops and joins active generations, retries uncertain agent
   cleanup, closes the global runtime, and only then fires SessionEnd. Agent-local capabilities never
   enter the parent inventory or a sibling/nested agent unless that agent declares them independently.
+  Claude documents the agent declaration's list/reference/inline shape and plugin/managed-policy
+  boundaries; dispatch ordering, session-wins collision precedence, worktree-cwd pinning, warning and
+  result framing, and in-process resume reconstruction are PiCC-defined coherence choices, not parity
+  claims.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
