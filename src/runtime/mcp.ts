@@ -1648,7 +1648,7 @@ function resolveProcessCleanupDeps(deps: McpRuntimeDeps): ProcessCleanupDeps {
     killTree: killProcessTreeByPid,
     kill: (pid, signal) => { process.kill(pid, signal); },
     now: () => performance.now(),
-    delay: sleep,
+    delay: referencedSleep,
   };
 }
 
@@ -1887,6 +1887,10 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function referencedSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function sleep(ms: number): Promise<void> {
