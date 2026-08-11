@@ -31,8 +31,18 @@ import type {
   SubagentRegistry,
   SubagentRegistryRecord,
   SubagentUsage,
+  SubagentMessageSource,
+  CheckpointStopAttemptIdentity,
+  CheckpointStopTerminalEvidence,
 } from "./subagent-registry.js";
-import { guardSteer, oneShotRefusal, userStoppedRefusal } from "./subagent-registry.js";
+import {
+  formatRetainedInputReport,
+  guardSteer,
+  oneShotRefusal,
+  retainedInputCount,
+  taskOutputAgentLocator,
+  userStoppedRefusal,
+} from "./subagent-registry.js";
 import {
   agentTrailerFrame,
   agentTrailerLine,
@@ -1106,7 +1116,7 @@ class ChildCheckpointCoordinator {
       const retainedGuidance = report
         ? "Recover only the represented retained input from the canonical parent report; its unrepresentable count requires separate transcript inspection."
         : "Retained input was not safely reportable; no parent-result recovery source exists.";
-      return `Subagent "${this.agentName}" has unconfirmed host work after checkpoint cancellation. Its live session, transcript, retained input, and worktree remain quarantined; do not resume, replace, or release it in this process. ${retainedGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files/tools/external effects.`;
+      return `Subagent "${this.agentName}" has unconfirmed host work after checkpoint cancellation. Its live session, transcript, retained input, and worktree remain quarantined; do not resume, replace, or release it in this process. Do not retry in this process. ${retainedGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files/tools/external effects.`;
     }
     if (snapshot.failureCategory === "restoration-paused") {
       return `Automatic context compaction for subagent "${this.agentName}" committed, but restoration or continuation did not reach a confirmed reusable completion. The agent is paused; continuation may have been prevented or may have begun before the failure. Files, tools, and external effects may already exist, so inspect them before abandoning it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input. Do not compact it again or retry SendMessage.`;
@@ -1140,6 +1150,19 @@ class ChildCheckpointCoordinator {
     if (this.isQuarantined()) return Promise.reject(new Error(this.failureMessage()));
     if (!retained.cleanupPromise) retained.cleanupPromise = retained.cleanup(outcome, finalText);
     return retained.cleanupPromise;
+  }
+
+  async stopCheckpoint(
+    attempt?: CheckpointStopAttemptIdentity,
+  ): Promise<CheckpointStopTerminalEvidence | void> {
+    const controller = this.gate.currentController();
+    const generation = controller.snapshot().generation;
+    await this.cancel("task-stop");
+    if (!attempt || attempt.agentId !== this.agentId) return;
+    const report = this.cancellationRecovery?.registry.get(this.agentId)?.retainedInputReport;
+    if (this.gate.currentController() !== controller || controller.snapshot().generation !== generation ||
+        !report || report.generation !== generation) return;
+    return Object.freeze({ confirmed: true as const, attemptId: attempt.attemptId, report });
   }
 
   async cancel(kind: CancellationKind): Promise<void> {
@@ -1179,7 +1202,11 @@ class ChildCheckpointCoordinator {
     if (retained) await this.claimRetainedCleanup(retained, "aborted");
   }
 
-  private deliverParentInput(text: string, delivery: "steer" | "followUp"): Promise<void> | void {
+  private deliverParentInput(
+    text: string,
+    delivery: "steer" | "followUp",
+    source: SubagentMessageSource = "send-message",
+  ): Promise<void> | void {
     if (!this.cancellationRecovery) {
       return delivery === "steer" ? this.session?.steer?.(text) : this.session?.followUp?.(text);
     }
@@ -1189,13 +1216,18 @@ class ChildCheckpointCoordinator {
     if (snapshot.phase !== "idle" && snapshot.phase !== "cancelled") {
       const retained = controller.shadowInput(snapshot.generation, text, delivery);
       if (retained) return;
-      throw new Error(`Subagent "${this.agentName}" is settling a checkpoint cancellation. Retry only after the parent call returns; this message was not sent.`);
+      const report = this.cancellationRecovery.registry.get(this.agentId)?.retainedInputReport;
+      const locator = report
+        ? ` Retrieve it with ${taskOutputAgentLocator(this.agentId)}.`
+        : ` If settlement is confirmed, use ${taskOutputAgentLocator(this.agentId)}.`;
+      const origin = source === "panel" ? "Panel steering" : "SendMessage";
+      throw new Error(`${origin} was refused because subagent "${this.agentName}" is settling checkpoint cancellation; the message was not sent.${locator} Inspect possible existing effects before retrying.`);
     }
     return delivery === "steer" ? this.session?.steer?.(text) : this.session?.followUp?.(text);
   }
 
-  steer(text: string): Promise<void> | void {
-    return this.deliverParentInput(text, "steer");
+  steer(text: string, metadata?: { source: SubagentMessageSource }): Promise<void> | void {
+    return this.deliverParentInput(text, "steer", metadata?.source ?? "send-message");
   }
 
   followUp(text: string): Promise<void> | void {
@@ -1763,9 +1795,9 @@ class ChildCheckpointCoordinator {
 
 function quarantineRefusal(record: SubagentRegistryRecord, action: string): string {
   const reportGuidance = record.retainedInputReport
-    ? "Recover represented retained input only from its canonical report; inspect the transcript for any unrepresentable input."
+    ? `Recover represented retained input only with ${taskOutputAgentLocator(record.agentId)}; inspect the transcript for any unrepresentable input.`
     : "No canonical retained-input report is available; inspect the transcript for retained input.";
-  return `Agent ${record.agentId} ("${record.agentName}") is quarantined for this process lifetime. The requested ${action} was not performed. ${reportGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`;
+  return `Agent ${record.agentId} ("${record.agentName}") is quarantined for this process lifetime. The requested ${action} was not performed. ${reportGuidance} Do not retry in this process. Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`;
 }
 
 function scrubEnvelope(details: unknown, key: string): boolean {
@@ -1788,8 +1820,23 @@ export function extractText(content: unknown): string {
   return "";
 }
 
+export interface StopAllSubagentOutcome {
+  agentId: string;
+  disposition: "confirmed" | "unconfirmed";
+  report?: RetainedInputReport;
+  stopRequested: boolean;
+  persisted?: boolean;
+}
+
+export interface StopAllSubagentSessionResult {
+  outcomes: StopAllSubagentOutcome[];
+  confirmed: number;
+  unconfirmed: number;
+}
+
 export class SubagentRuntime {
   private readonly semaphore: Semaphore;
+  private readonly persistedRetainedReports = new WeakSet<object>();
   /**
    * Per-depth budgets for nested BACKGROUND dispatches. Each `depth ≥ 2`
    * gets its own `Semaphore` sized like the root, created lazily. A dispatch
@@ -1844,19 +1891,80 @@ export class SubagentRuntime {
 
   /** Stop one retained child owned by this runtime and join its cleanup. */
   async stopCheckpoint(agentId: string): Promise<void> {
-    const record = this.deps.subagentRegistry?.get(agentId);
+    const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
+    const record = (recoveryRegistry ?? this.deps.subagentRegistry)?.get(agentId);
     if (record?.checkpointQuarantined) throw new Error(quarantineRefusal(record, "stop"));
     if (record?.state === "running" && record.checkpointPaused) {
-      await record.session?.stopCheckpoint?.();
+      if (recoveryRegistry) {
+        await recoveryRegistry.stopCheckpoint(agentId, "session");
+      } else {
+        // Capability omission preserves the existing direct adapter contract.
+        await record.session?.stopCheckpoint?.();
+      }
     }
+  }
+
+  /** Opted-in session boundary for confirmed reports and fail-closed quarantine. */
+  async stopAllRetainedSubagents(options: {
+    persist?: (report: RetainedInputReport) => boolean | Promise<boolean>;
+  } = {}): Promise<StopAllSubagentSessionResult> {
+    const registry = this.deps.compactionCancellationRecovery?.registry;
+    if (!registry) return { outcomes: [], confirmed: 0, unconfirmed: 0 };
+    const outcomes: StopAllSubagentOutcome[] = [];
+    for (const initial of registry.list()) {
+      let record = registry.get(initial.agentId);
+      let stopRequested = false;
+      if (record?.checkpointQuarantined) {
+        // Quarantine is process-terminal authority: never call the adapter again.
+      } else if (record?.state === "running" && record.checkpointPaused) {
+        stopRequested = true;
+        await registry.stopCheckpoint(record.agentId, "session");
+        record = registry.get(initial.agentId);
+      } else if (!record?.retainedInputReport) {
+        continue;
+      } else if (record.checkpointStopState !== "confirmed") {
+        registry.quarantineCheckpoint(record.agentId);
+        record = registry.get(initial.agentId);
+      }
+      const report = record?.retainedInputReport;
+      const disposition = record?.checkpointQuarantined || record?.checkpointStopState !== "confirmed" || !report
+        ? "unconfirmed"
+        : "confirmed";
+      let persisted: boolean | undefined;
+      if (disposition === "confirmed" && report && options.persist && !this.persistedRetainedReports.has(report.reportId)) {
+        try {
+          persisted = await options.persist(report) === true;
+        } catch {
+          persisted = false;
+        }
+        if (persisted) this.persistedRetainedReports.add(report.reportId);
+      } else if (disposition === "confirmed" && report && this.persistedRetainedReports.has(report.reportId)) {
+        persisted = true;
+      }
+      outcomes.push({
+        agentId: initial.agentId,
+        disposition,
+        ...(report ? { report } : {}),
+        stopRequested,
+        ...(persisted !== undefined ? { persisted } : {}),
+      });
+    }
+    return {
+      outcomes,
+      confirmed: outcomes.filter((outcome) => outcome.disposition === "confirmed").length,
+      unconfirmed: outcomes.filter((outcome) => outcome.disposition === "unconfirmed").length,
+    };
   }
 
   /** Session-local shutdown barrier for every retained child of this runtime. */
   async shutdownCheckpointPaused(): Promise<void> {
-    const records = this.deps.subagentRegistry?.list() ?? [];
+    const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
+    const records = (recoveryRegistry ?? this.deps.subagentRegistry)?.list() ?? [];
     await Promise.allSettled(records
       .filter((record) => record.state === "running" && record.checkpointPaused && !record.checkpointQuarantined)
-      .map((record) => record.session?.stopCheckpoint?.() ?? Promise.resolve()));
+      .map((record) => recoveryRegistry
+        ? recoveryRegistry.stopCheckpoint(record.agentId, "session")
+        : record.session?.stopCheckpoint?.() ?? Promise.resolve()));
   }
 
   /**
@@ -3033,9 +3141,9 @@ export class SubagentRuntime {
         resumable: actualResumable,
         oneShot,
         session: {
-          steer: (text: string) => checkpoint.steer(text),
+          steer: (text: string, metadata) => checkpoint.steer(text, metadata),
           recoverCheckpoint: (text: string) => checkpoint.recover(text),
-          stopCheckpoint: () => checkpoint.cancel("task-stop"),
+          stopCheckpoint: (attempt) => checkpoint.stopCheckpoint(attempt),
           followUp: (text: string) => checkpoint.followUp(text),
         },
         // Set-once in the registry: on a fresh dispatch these reconfirm the
@@ -3701,6 +3809,8 @@ export function createAgentToolDefinition(
     dispatchCwd?: () => string;
     /** Captures opaque stop authority for the dispatching logical run. */
     captureUniversalStop?: () => () => boolean;
+    /** Dormant canonical retained-outcome presentation; production omits it until assembled activation. */
+    retainedOutcomes?: { registry: SubagentRegistry };
   },
 ): Record<string, unknown> {
   return {
@@ -3941,6 +4051,19 @@ export function createAgentToolDefinition(
         // completion clock keeps duration and settlement instant in agreement.
         ...timing,
       } satisfies SubagentRenderDetails;
+      const retainedReport = opts.retainedOutcomes?.registry.get(result.agentId)?.retainedInputReport;
+      const canonicalReport = retainedReport && retainedReport === result.retainedInputReport
+        ? retainedReport
+        : undefined;
+      const retainedText = canonicalReport ? formatRetainedInputReport(canonicalReport) : undefined;
+      const retainedDetails = canonicalReport ? {
+        retainedOutcome: true,
+        reportId: canonicalReport.reportId,
+        occurrences: canonicalReport.occurrences,
+        representedCount: canonicalReport.occurrences.length,
+        unrepresentableCount: canonicalReport.unrepresentableCount,
+        retainedCount: retainedInputCount(canonicalReport),
+      } : {};
       // Claude 2.1.200 outcome→presentation mapping: successful identity
       // trailers, failed guidance or neutral identity metadata, cut-off framing,
       // and throw-vs-return decisions live in the shared, pure
@@ -3955,7 +4078,9 @@ export function createAgentToolDefinition(
         // wording naming the abort) both surface on the isError channel.
         // Failed recovery guidance is disposition-dependent; a cause-only ordinary
         // error may expose neutral stable identity without turning it into advice.
-        throw new Error(presentation.message);
+        throw new Error(retainedText
+          ? `${presentation.message}\n\n${retainedText}`
+          : presentation.message);
       }
       // A `kind:"result"` with outcome "failed" is necessarily the cut-off case:
       // presentDispatchResult only routes failed-WITH-partial to `result` (aborted
@@ -3966,9 +4091,10 @@ export function createAgentToolDefinition(
         // partial output and cause stay in the delimited frame, while any trusted,
         // disposition-dependent recovery guidance follows outside it.
         return {
-          content: [{ type: "text", text: presentation.text }],
+          content: [{ type: "text", text: retainedText ? `${presentation.text}\n\n${retainedText}` : presentation.text }],
           details: {
             agent: result.agentName,
+            ...retainedDetails,
             worktreePath: result.worktreePath,
             diagnostics: result.diagnostics,
             outcome: result.outcome,
@@ -3987,9 +4113,10 @@ export function createAgentToolDefinition(
       // the trailer rides INSIDE that frame (single `\n`, non-"completed"
       // wording) rather than stacking a second frame.
       return {
-        content: [{ type: "text", text: presentation.text }],
+        content: [{ type: "text", text: retainedText ? `${presentation.text}\n\n${retainedText}` : presentation.text }],
         details: {
           agent: result.agentName,
+          ...retainedDetails,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
@@ -4129,7 +4256,7 @@ export function createSendMessageToolDefinition(
       // live in the shared guardSteer — the same guard the panel drill-down
       // steer calls — so the two surfaces cannot drift.
       if (record.state === "running") {
-        const guard = guardSteer(record);
+        const guard = guardSteer(record, "send-message");
         if (!guard.ok) throw new Error(guard.refusal);
         await Promise.resolve(guard.steer(message));
         return {
@@ -4253,11 +4380,14 @@ export function createSendMessageToolDefinition(
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
+      const retainedGuidance = record.retainedInputReport
+        ? ` Reported input was not auto-replayed. The unchanged canonical report remains at ${taskOutputAgentLocator(record.agentId)}; inspect possible existing effects before this deliberate retry.`
+        : "";
       return {
         content: [
           {
             type: "text",
-            text: `${identity} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${id}").`,
+            text: `${identity} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${id}").${retainedGuidance}`,
           },
         ],
         details: {

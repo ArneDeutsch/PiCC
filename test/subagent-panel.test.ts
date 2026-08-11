@@ -66,6 +66,7 @@ import {
 import {
   AGENT_COLOR_NAMES,
   normalizeAgentColor,
+  guardSteer,
   SubagentRegistry,
   type RegisterInput,
   type SubagentRegistryRecord,
@@ -91,10 +92,12 @@ import {
   panelNoticeStopAllArmed,
   panelNoticeStopAllDone,
   panelNoticeStopRequested,
+  panelNoticeStopSettling,
   STEER_INPUT_CAP,
   STOP_ALL_CONFIRM_MS,
   SubagentPanelFocusController,
 } from "../src/runtime/subagent-panel-focus.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
@@ -3266,6 +3269,383 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.stopped).toEqual(["task-1"]); // task-side marker+abort
     expect(s.registry.get("agent-a")!.userStopped).toBe(true); // agent-side marker
     expect(s.notices()).toContain(panelNoticeStopRequested("coder"));
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("keeps ordinary no-report panel stops on the exact legacy path when retained outcomes are enabled", async () => {
+    const registry = new SubagentRegistry();
+    reg(registry, "agent-ordinary", "ordinary");
+    const tasks: PanelTaskInfo[] = [{ id: "task-ordinary", status: "running", agentId: "agent-ordinary" }];
+    const stopped: string[] = [];
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry, tasks: () => tasks, retainedOutcomes: true,
+      stopTask: (id) => { stopped.push(id); },
+      widget: { setSuppressed: () => {} }, tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("x");
+    expect(stopped).toEqual(["task-ordinary"]);
+    expect(registry.get("agent-ordinary")?.userStopped).toBe(true);
+    expect(registry.get("agent-ordinary")?.checkpointQuarantined).toBeUndefined();
+    expect(pi.notifications.at(-1)?.text).toBe(panelNoticeStopRequested("coder"));
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("retained-enabled stop-all preserves exact legacy stops for mixed ordinary running targets", async () => {
+    const registry = new SubagentRegistry();
+    reg(registry, "agent-ordinary-a", "ordinary a");
+    reg(registry, "agent-ordinary-b", "ordinary b");
+    const tasks: PanelTaskInfo[] = [
+      { id: "task-ordinary-a", status: "running", agentId: "agent-ordinary-a" },
+      { id: "task-ordinary-b", status: "running", admission: "waiting", agentId: "agent-ordinary-b" },
+    ];
+    const stopped: string[] = [];
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry, tasks: () => tasks, retainedOutcomes: true,
+      stopTask: (id) => { stopped.push(id); },
+      widget: { setSuppressed: () => {} }, tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(30);
+    invocation.input("X");
+    invocation.input("X");
+    expect(stopped).toEqual(["task-ordinary-a", "task-ordinary-b"]);
+    expect(registry.get("agent-ordinary-a")).toMatchObject({ userStopped: true });
+    expect(registry.get("agent-ordinary-b")).toMatchObject({ userStopped: true });
+    expect(registry.list().some((record) => record.checkpointQuarantined || record.retainedInputReport)).toBe(false);
+    expect(pi.notifications.map((notice) => notice.text)).toEqual([
+      panelNoticeStopAllArmed(2), panelNoticeStopAllDone(2),
+    ]);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it.each([false, true])(
+    "retained-enabled stop-all partitions ordinary and checkpoint targets without duplicate stops (aggregate notify throws: %s)",
+    async (throwAggregate) => {
+      const registry = new SubagentRegistry();
+      const checkpointId = "agent-0123456789ab";
+      reg(registry, "agent-ordinary", "ordinary");
+      let checkpointStops = 0;
+      let report!: ReturnType<typeof createRetainedInputReport>;
+      reg(registry, checkpointId, "checkpoint", {
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          checkpointStops++;
+          report = createRetainedInputReport({
+            agentId: checkpointId, sessionId: "session:mixed", generation: 1,
+            stage: "resumed-cancellation", occurrences: [], guidance: "Inspect effects.",
+          });
+          registry.storeRetainedInputReport(checkpointId, report);
+          registry.markSettled(checkpointId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, report };
+        } },
+      });
+      const tasks: PanelTaskInfo[] = [
+        { id: "task-ordinary", status: "running", agentId: "agent-ordinary" },
+        { id: "task-checkpoint", status: "failed", checkpointPaused: true, agentId: checkpointId },
+      ];
+      const ordinaryStops: string[] = [];
+      const stopTask = vi.fn((id: string, metadata?: { source: "panel" }) => {
+        if (id === "task-checkpoint") return registry.stopCheckpoint(checkpointId, metadata!.source);
+        ordinaryStops.push(id);
+      });
+      const pi = fakePi();
+      const ctx = pi.tuiCtx() as any;
+      const recordNotify = ctx.ui.notify;
+      let aggregateAttempts = 0;
+      ctx.ui.notify = (text: string, severity?: string) => {
+        if (text === panelNoticeStopAllDone(1)) {
+          aggregateAttempts++;
+          if (throwAggregate) throw new Error("aggregate notify failed");
+        }
+        recordNotify(text, severity);
+      };
+      const controller = new SubagentPanelFocusController({
+        registry, tasks: () => tasks, retainedOutcomes: true, stopTask,
+        widget: { setSuppressed: () => {} }, tickMs: 3_600_000,
+      });
+      controller.open(ctx);
+      const invocation = pi.customs[0]!;
+      await invocation.ready;
+      invocation.render(120);
+      const unhandled = vi.fn();
+      process.on("unhandledRejection", unhandled);
+      try {
+        invocation.input("X");
+        invocation.input("X");
+        await vi.waitFor(() => expect(registry.get(checkpointId)?.userStopped).toBe(true));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(ordinaryStops).toEqual(["task-ordinary"]);
+        expect(checkpointStops).toBe(1);
+        expect(stopTask.mock.calls).toEqual([
+          ["task-ordinary"], ["task-checkpoint", { source: "panel" }],
+        ]);
+        expect(aggregateAttempts).toBe(1);
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(registry.get(checkpointId)).toMatchObject({
+          state: "settled",
+          checkpointStopState: "confirmed",
+          userStopped: true,
+          retainedInputReport: report,
+        });
+        expect(registry.get(checkpointId)?.checkpointQuarantined).toBeUndefined();
+        expect(await report.claim(async () => true)).toBe(true);
+        const confirmation = `Stop confirmed for coder. 0 retained input occurrence(s); TaskOutput with task_id "${checkpointId}". Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`;
+        expect(pi.notifications.map((notice) => notice.text)).toEqual(throwAggregate
+          ? [panelNoticeStopAllArmed(2), panelNoticeStopSettling("coder"), confirmation]
+          : [
+              panelNoticeStopAllArmed(2),
+              panelNoticeStopSettling("coder"),
+              panelNoticeStopAllDone(1),
+              confirmation,
+            ]);
+        expect(pi.notifications.map((notice) => notice.text)).not.toContain(panelNoticeStopRequested("coder"));
+      } finally {
+        process.off("unhandledRejection", unhandled);
+        invocation.input(ESC);
+        await invocation.result;
+      }
+    },
+  );
+
+  it("opted panel stop stays nonterminal until async confirmation and preserves the canonical locator", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    let settle!: () => void;
+    const stopping = new Promise<void>((resolve) => { settle = resolve; });
+    let report!: ReturnType<typeof createRetainedInputReport>;
+    const steer = vi.fn();
+    reg(registry, agentId, "retained worker", {
+      checkpointPaused: true,
+      session: { steer, stopCheckpoint: async (attempt) => {
+        await stopping;
+        registry.storeRetainedInputReport(agentId, report);
+        registry.markSettled(agentId, { outcome: "aborted" });
+        return { confirmed: true, attemptId: attempt!.attemptId, report };
+      } },
+    });
+    const tasks: PanelTaskInfo[] = [{ id: "task-retained", status: "failed", checkpointPaused: true, agentId }];
+    const sources: unknown[] = [];
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => tasks,
+      retainedOutcomes: true,
+      stopTask: (_id, metadata) => {
+        sources.push(metadata);
+        return registry.stopCheckpoint(agentId, "panel");
+      },
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input(KEY_CTRL_X);
+    expect(pi.notifications.at(-1)?.text).toBe(panelNoticeStopSettling("coder"));
+    expect(pi.notifications.at(-1)?.text).not.toMatch(/aborted|stopped/iu);
+    expect(sources).toEqual([{ source: "panel" }]);
+    expect(registry.get(agentId)?.userStopped).toBeUndefined();
+    expect(registry.get(agentId)?.checkpointStopState).toBe("stopping");
+
+    report = createRetainedInputReport({
+      agentId, sessionId: "session:panel", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:panel", delivery: "steer", content: "retained" }],
+      guidance: "Inspect effects.",
+    });
+    settle();
+    await vi.waitFor(() => expect(pi.notifications.at(-1)?.text).toContain(`TaskOutput with task_id "${agentId}"`));
+    expect(pi.notifications.at(-1)?.text).toMatch(/1 retained input.*not auto-replayed.*existing effects/iu);
+    invocation.render(18);
+    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s); TaskOutput with task_id "${agentId}"`);
+    expect(registry.get(agentId)?.userStopped).toBe(true);
+    invocation.input("must not steer");
+    invocation.input(KEY_ENTER);
+    expect(steer).not.toHaveBeenCalled();
+    expect(invocation.render(400).join("\n")).toMatch(/stopped by the user.*TaskOutput with task_id "agent-0123456789ab"/isu);
+    expect(await report.claim(async () => true)).toBe(true);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it.each(["provisional", "void"] as const)("treats %s panel settlement as unconfirmed even with a stale report", async (mode) => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    reg(registry, agentId, `${mode} worker`, { checkpointPaused: true, session: { stopCheckpoint: async () => {} } });
+    const stale = createRetainedInputReport({
+      agentId, sessionId: `session:${mode}`, generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: `session:${mode}`, delivery: "steer", content: "stale" }],
+      guidance: "Inspect stale effects.",
+    });
+    registry.storeRetainedInputReport(agentId, stale);
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => [{ id: `task-${mode}`, status: "failed", checkpointPaused: true, agentId }],
+      retainedOutcomes: true,
+      stopTask: async () => mode === "provisional" ? { disposition: "provisional" as const } : undefined,
+      widget: { setSuppressed: () => {} }, tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(20);
+    invocation.input("x");
+    await vi.waitFor(() => expect(registry.get(agentId)?.checkpointQuarantined).toBe(true));
+    expect(registry.get(agentId)?.userStopped).toBeUndefined();
+    expect(pi.notifications.at(-1)?.text).toMatch(/unconfirmed.*Do not retry in this process.*fresh process and session.*transcript.*worktree/isu);
+    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s); canonical report: TaskOutput with task_id "${agentId}"`);
+    invocation.render(12);
+    expect(pi.notifications.at(-1)?.text).toContain(`TaskOutput with task_id "${agentId}"`);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("quarantines stale prior-generation panel confirmation and never repeats its physical stop", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    let physicalStops = 0;
+    const stale = createRetainedInputReport({
+      agentId, sessionId: "session:stale-panel", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:stale-panel", delivery: "steer", content: "stale" }],
+      guidance: "Inspect stale effects.",
+    });
+    reg(registry, agentId, "stale generation", { checkpointPaused: true });
+    registry.storeRetainedInputReport(agentId, stale);
+    registry.markSettled(agentId, { outcome: "aborted" });
+    registry.markResuming(agentId);
+    registry.register({
+      agentId, agentName: "coder", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true,
+      session: { stopCheckpoint: (attempt) => {
+        physicalStops++;
+        return Promise.resolve({ confirmed: true as const, attemptId: attempt!.attemptId, report: stale });
+      } },
+    });
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => [{ id: "task-current", status: "failed", checkpointPaused: true, agentId }],
+      retainedOutcomes: true,
+      stopTask: () => registry.stopCheckpoint(agentId, "panel"),
+      widget: { setSuppressed: () => {} }, tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("x");
+    await vi.waitFor(() => expect(registry.get(agentId)?.checkpointQuarantined).toBe(true));
+    expect(registry.get(agentId)?.userStopped).toBeUndefined();
+    expect(pi.notifications.at(-1)?.text).toMatch(/unconfirmed.*Do not retry in this process.*fresh process and session.*transcript.*worktree/isu);
+    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s); canonical report: TaskOutput with task_id "${agentId}"`);
+    invocation.input("x");
+    await Promise.resolve();
+    expect(physicalStops).toBe(1);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("keeps canonical custody and permanent refusal when panel notification throws", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    let report: ReturnType<typeof createRetainedInputReport>;
+    reg(registry, agentId, "notify failure", {
+      checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        report = createRetainedInputReport({
+          agentId, sessionId: "session:notify", generation: 1, stage: "resumed-cancellation",
+          occurrences: [], guidance: "Inspect effects.",
+        });
+        registry.storeRetainedInputReport(agentId, report);
+        registry.markSettled(agentId, { outcome: "aborted" });
+        return { confirmed: true, attemptId: attempt!.attemptId, report };
+      } },
+    });
+    const tasks: PanelTaskInfo[] = [{ id: "task-notify", status: "failed", checkpointPaused: true, agentId }];
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => tasks,
+      retainedOutcomes: true,
+      stopTask: async () => registry.stopCheckpoint(agentId, "panel"),
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+    const ctx = pi.tuiCtx() as any;
+    ctx.ui.notify = () => { throw new Error("notify failed"); };
+    controller.open(ctx);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(120);
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      invocation.input("x");
+      await vi.waitFor(() => expect(registry.get(agentId)?.checkpointStopState).toBe("confirmed"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+    expect(registry.get(agentId)).toMatchObject({ userStopped: true });
+    expect(registry.get(agentId)?.checkpointQuarantined).toBeUndefined();
+    expect(registry.get(agentId)?.retainedInputReport).toBe(report!);
+    expect(guardSteer(registry.get(agentId)!, "panel")).toMatchObject({
+      ok: false,
+      refusal: expect.stringMatching(/stopped by the user.*not auto-replayed.*TaskOutput with task_id "agent-0123456789ab"/isu),
+    });
+    expect(await report!.claim(async () => true)).toBe(true);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("uses one physical panel steer with source metadata and gives unconfirmed restart guidance", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    const steer = vi.fn(async (_text: string, _metadata?: unknown) => {});
+    reg(registry, agentId, "steer worker", {
+      checkpointPaused: true,
+      session: { steer, stopCheckpoint: async () => {} },
+    });
+    const tasks: PanelTaskInfo[] = [{ id: "task-steer", status: "running", agentId }];
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => tasks,
+      retainedOutcomes: true,
+      stopTask: async () => registry.stopCheckpoint(agentId, "panel"),
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("hello");
+    invocation.input(KEY_ENTER);
+    await Promise.resolve();
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(steer).toHaveBeenCalledWith("hello", { source: "panel" });
+    invocation.input(KEY_CTRL_X);
+    expect(pi.notifications.at(-1)?.text).toBe(panelNoticeStopSettling("coder"));
+    await vi.waitFor(() => expect(pi.notifications.at(-1)?.text).toMatch(/unconfirmed.*fresh process and session.*transcript.*worktree.*No canonical/isu));
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+    invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
   });

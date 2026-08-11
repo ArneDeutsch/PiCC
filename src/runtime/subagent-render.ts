@@ -89,6 +89,12 @@ export interface SubagentRenderDetails {
   note?: string;
   delivery?: "steer" | "resume";
   resumed?: boolean;
+  retainedOutcome?: boolean;
+  reportId?: object;
+  occurrences?: readonly unknown[];
+  representedCount?: number;
+  unrepresentableCount?: number;
+  retainedCount?: number;
 }
 
 const RENDER_SCALAR_LIMIT = 16_385;
@@ -243,6 +249,25 @@ function normalizeSubagentRenderDetails(value: unknown): SubagentRenderDetails |
   ] as const) {
     const flag = safeField(value, key);
     if (typeof flag === "boolean") normalized[key] = flag;
+  }
+
+  const retainedOutcome = safeField(value, "retainedOutcome");
+  const reportId = safeField(value, "reportId");
+  const occurrences = safeField(value, "occurrences");
+  const representedCount = safeField(value, "representedCount");
+  const unrepresentableCount = safeField(value, "unrepresentableCount");
+  const retainedCount = safeField(value, "retainedCount");
+  if (retainedOutcome === true && reportId !== null && typeof reportId === "object" &&
+      safeArray(occurrences) && Number.isSafeInteger(representedCount) && (representedCount as number) >= 0 &&
+      representedCount === occurrences.length && Number.isSafeInteger(unrepresentableCount) &&
+      (unrepresentableCount as number) >= 0 && Number.isSafeInteger(retainedCount) &&
+      retainedCount === Math.min(Number.MAX_SAFE_INTEGER, (representedCount as number) + (unrepresentableCount as number))) {
+    normalized.retainedOutcome = true;
+    normalized.reportId = reportId;
+    normalized.occurrences = occurrences;
+    normalized.representedCount = representedCount as number;
+    normalized.unrepresentableCount = unrepresentableCount as number;
+    normalized.retainedCount = retainedCount as number;
   }
 
   const usage = normalizeUsage(safeField(value, "usage"));
@@ -441,7 +466,8 @@ const AGENT_ACCEPTANCE_KEYS = new Set<PropertyKey>([
 const TASK_OUTPUT_RESULT_KEYS = new Set<PropertyKey>([
   "taskId", "status", "admission", "outcome", "agent", "agentId", "cutOff",
   "transcriptPath", "resumable", "usage", "lastActivity", "diagnostics", "description",
-  "durationMs", "settledAt", "error", "userStopped", "alreadyReported",
+  "durationMs", "settledAt", "error", "userStopped", "alreadyReported", "retainedOutcome",
+  "reportId", "occurrences", "representedCount", "unrepresentableCount", "retainedCount",
 ]);
 const ARRAY_SINGLE_KEYS = new Set<PropertyKey>(["0", "length"]);
 
@@ -518,7 +544,22 @@ function validLifecycleIdentitySnapshot(details: OwnDataSnapshot): boolean {
 function validTaskOutputOptionalsSnapshot(details: OwnDataSnapshot): boolean {
   const optional = (key: string, accepts: (value: unknown) => boolean) =>
     !hasSnapshotField(details, key) || snapshotField(details, key) === undefined || accepts(snapshotField(details, key));
-  return optional("error", (value) => typeof value === "string") &&
+  const retainedKeys = ["retainedOutcome", "reportId", "occurrences", "representedCount", "unrepresentableCount", "retainedCount"];
+  const hasRetained = retainedKeys.some((key) => hasSnapshotField(details, key));
+  const retainedValid = !hasRetained || (() => {
+    const occurrences = snapshotField(details, "occurrences");
+    const represented = snapshotField(details, "representedCount");
+    const unrepresentable = snapshotField(details, "unrepresentableCount");
+    const total = snapshotField(details, "retainedCount");
+    return retainedKeys.every((key) => hasSnapshotField(details, key)) &&
+      snapshotField(details, "retainedOutcome") === true &&
+      snapshotField(details, "reportId") !== null && typeof snapshotField(details, "reportId") === "object" &&
+      safeArray(occurrences) && Number.isSafeInteger(represented) && (represented as number) >= 0 &&
+      represented === occurrences.length && Number.isSafeInteger(unrepresentable) && (unrepresentable as number) >= 0 &&
+      Number.isSafeInteger(total) && total === Math.min(Number.MAX_SAFE_INTEGER,
+        (represented as number) + (unrepresentable as number));
+  })();
+  return retainedValid && optional("error", (value) => typeof value === "string") &&
     optional("userStopped", (value) => typeof value === "boolean") &&
     optional("cutOff", (value) => typeof value === "boolean") &&
     optional("resumable", (value) => typeof value === "boolean") &&
@@ -855,6 +896,21 @@ function lifecycleLine(
   if (options.cue) line += themedFg(theme, "muted", ` · ${options.cue}`);
   if (options.cue && visibleWidth(line) <= columns) metadata && (metadata.cueAppended = true);
   return clampLines([line], columns);
+}
+
+function retainedOutcomeLines(
+  theme: unknown,
+  details: SubagentRenderDetails,
+  width: number,
+): string[] {
+  const agentId = agentIdOf(details);
+  if (details.retainedOutcome !== true || !agentId || details.retainedCount === undefined || width < DETAIL_USABLE_WIDTH) {
+    return [];
+  }
+  const lines: string[] = [];
+  pushColored(theme, "warning", `agent: ${agentId} · ${details.retainedCount} retained input occurrence(s)`, width, lines);
+  pushColored(theme, "muted", `TaskOutput with task_id "${agentId}"`, width, lines);
+  return lines;
 }
 
 function meaningfulIdentityFragment(text: string, width: number): string {
@@ -1395,13 +1451,15 @@ export function renderAgentResult(
       const boundedResizeRecord = (): string[] => {
         const collapsed = collapsedRecordLines(
           theme, details, outcome as "completed" | "failed" | "aborted", undefined, width,
-          expansionCue ?? RECORD_EXPAND_HINT, shellOwnsSymbol, color, semanticTerminal,
+          expansionCue ?? RECORD_EXPAND_HINT, shellOwnsSymbol, color,
+          semanticTerminal || details.retainedOutcome === true,
         );
         const first = collapsed.lines.slice(0, 1);
         if (width >= RESIZE_GUIDANCE.length) first.push(themedFg(theme, "muted", RESIZE_GUIDANCE));
         return clampLines(first, width);
       };
-      if (outcome && width < DETAIL_USABLE_WIDTH && (expanded !== false || !expansionCue)) {
+      if (outcome && width < DETAIL_USABLE_WIDTH &&
+          (details.retainedOutcome === true || expanded !== false || !expansionCue)) {
         return boundedResizeRecord();
       }
       let failOpenCollapsed = false;
@@ -1412,12 +1470,15 @@ export function renderAgentResult(
       // so this only widens compatibility for direct callers.
       if (outcome && expanded === false && expansionCue) {
         const collapsed = collapsedRecordLines(
-          theme, details, outcome, undefined, width, expansionCue, shellOwnsSymbol, color, semanticTerminal,
+          theme, details, outcome, undefined, width, expansionCue, shellOwnsSymbol, color,
+          semanticTerminal || details.retainedOutcome === true,
         );
         const accessible = ensureVisibleExpansionCue(theme, collapsed, expansionCue, width);
-        if (accessible) return clampLines(accessible, width);
+        if (accessible) {
+          return clampLines([...accessible, ...retainedOutcomeLines(theme, details, width)], width);
+        }
         if (width < DETAIL_USABLE_WIDTH) return boundedResizeRecord();
-        lines.push(...collapsed.lines);
+        lines.push(...collapsed.lines, ...retainedOutcomeLines(theme, details, width));
         failOpenCollapsed = true;
       }
       if (!outcome && explicitTarget) {
@@ -1447,6 +1508,7 @@ export function renderAgentResult(
           tone,
           color,
         }, width));
+        lines.push(...retainedOutcomeLines(theme, details, width));
       }
       // SECURITY: the model reads result.content verbatim. The human copy strips
       // the machine-facing identity trailer and sanitizes controls; the applicable

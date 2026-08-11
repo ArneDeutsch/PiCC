@@ -46,13 +46,32 @@ export interface CheckpointRecoveryResult {
   error?: string;
 }
 
+export type SubagentMessageSource = "send-message" | "panel";
+
+export interface CheckpointStopAttemptIdentity {
+  readonly attemptId: object;
+  readonly agentId: string;
+  readonly dispatchGeneration: number;
+}
+
+export interface CheckpointStopTerminalEvidence {
+  readonly confirmed: true;
+  readonly attemptId: object;
+  readonly report: RetainedInputReport;
+}
+
+export interface CheckpointStopDisposition {
+  readonly disposition: "confirmed" | "unconfirmed";
+  readonly report?: RetainedInputReport;
+}
+
 export interface SteerableSession {
   /** Queue a mid-task course correction (delivered before the next LLM call). */
-  steer?(text: string): Promise<void> | void;
+  steer?(text: string, metadata?: { source: SubagentMessageSource }): Promise<void> | void;
   /** Authenticated continuation of this exact retained checkpoint-paused session. */
   recoverCheckpoint?(text: string): Promise<CheckpointRecoveryResult>;
-  /** Stop and join this exact retained checkpoint-paused session. */
-  stopCheckpoint?(): Promise<void>;
+  /** Stop and join this exact retained checkpoint-paused session. Void remains source-compatible but is not confirmation. */
+  stopCheckpoint?(attempt?: CheckpointStopAttemptIdentity): Promise<CheckpointStopTerminalEvidence | void> | void;
   /**
    * Queue a follow-up processed after the agent finishes its current work.
    * Declared for the pi-contract pin; the runtime never calls it — steering
@@ -86,7 +105,7 @@ export class QuarantinedSubagentError extends Error {
     const reportGuidance = hasReport
       ? " Recover represented retained input only from its canonical report; inspect the transcript for any unrepresentable input."
       : " No canonical retained-input report is available; inspect the transcript for retained input.";
-    super(`Agent ${agentId} is quarantined for this process lifetime. The requested dispatch was not performed.${reportGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`);
+    super(`Agent ${agentId} is quarantined for this process lifetime. The requested dispatch was not performed.${reportGuidance} Do not retry in this process. Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`);
     this.name = "QuarantinedSubagentError";
   }
 }
@@ -141,6 +160,8 @@ export interface SubagentRegistryRecord {
   oneShot: boolean;
   /** Whether the dispatch is currently running (steerable) or has settled. */
   state: "running" | "settled";
+  /** Registry-owned dispatch generation; incremented before every deliberate resume. */
+  dispatchGeneration?: number;
   /** Runtime-derived concurrency admission; absent compatibility records are admitted. */
   admission?: SubagentAdmission;
   /**
@@ -161,8 +182,14 @@ export interface SubagentRegistryRecord {
   checkpointPaused?: boolean;
   /** Canonical process-lifetime custody report, retained after ordinary live cleanup. */
   retainedInputReport?: RetainedInputReport;
+  /** Dispatch generation in which the canonical report was stored; stale retained reports never confirm a resumed stop. */
+  retainedInputReportDispatchGeneration?: number;
   /** Process-terminal checkpoint ambiguity; no later lifecycle mutation is authorized. */
   checkpointQuarantined?: boolean;
+  /** Nonterminal ownership while an opted-in consumer joins checkpoint cancellation. */
+  checkpointStopState?: "stopping" | "settling-cancellation" | "confirmed" | "unconfirmed";
+  /** Presentation origin only; it never creates a second cancellation or steering owner. */
+  checkpointStopSource?: "task-stop" | "panel" | "session";
   /**
    * Settled-notice readiness gate. A (re)dispatch re-arms this agent-level
    * gate, but the background-task registry's task-generation collection and
@@ -256,8 +283,17 @@ export interface RegisterInput {
   color?: string;
 }
 
+interface CheckpointStopFlight {
+  readonly record: SubagentRegistryRecord;
+  readonly dispatchGeneration: number;
+  readonly session: SteerableSession;
+  readonly attempt: CheckpointStopAttemptIdentity;
+  readonly settlement: Promise<CheckpointStopDisposition>;
+}
+
 export class SubagentRegistry {
   private readonly records = new Map<string, SubagentRegistryRecord>();
+  private readonly checkpointStopFlights = new Map<string, CheckpointStopFlight>();
   private readonly nameIndex = new Map<
     string,
     { firstId: string; currentId: string; rebound: boolean }
@@ -344,6 +380,7 @@ export class SubagentRegistry {
       resumable: input.resumable,
       oneShot: input.oneShot,
       state: "running",
+      dispatchGeneration: 1,
       admission: "admitted",
       session: input.session,
       checkpointPaused: input.checkpointPaused,
@@ -493,6 +530,9 @@ export class SubagentRegistry {
     record.detailLog = undefined;
     record.liveActivity = undefined;
     record.settledAt = undefined;
+    record.dispatchGeneration = (record.dispatchGeneration ?? 1) + 1;
+    record.checkpointStopState = undefined;
+    record.checkpointStopSource = undefined;
     this.notifyChange();
   }
 
@@ -511,12 +551,88 @@ export class SubagentRegistry {
     this.notifyChange();
   }
 
+  /** Publish provisional stop ownership without claiming a terminal outcome. */
+  markCheckpointStopping(
+    agentId: string,
+    source: "task-stop" | "panel" | "session",
+  ): boolean {
+    const record = this.records.get(agentId);
+    if (!record || record.checkpointQuarantined || record.state !== "running" || !record.checkpointPaused) return false;
+    if (record.checkpointStopState === "stopping" || record.checkpointStopState === "settling-cancellation") return true;
+    record.checkpointStopState = "stopping";
+    record.checkpointStopSource = source;
+    this.notifyChange();
+    return true;
+  }
+
+  /** Acquire or join the one physical stop for the exact active dispatch generation. */
+  stopCheckpoint(
+    agentId: string,
+    source: "task-stop" | "panel" | "session",
+  ): Promise<CheckpointStopDisposition> {
+    const record = this.records.get(agentId);
+    if (!record || record.checkpointQuarantined) {
+      return Promise.resolve({ disposition: "unconfirmed", ...(record?.retainedInputReport ? { report: record.retainedInputReport } : {}) });
+    }
+    const generation = record.dispatchGeneration ?? 1;
+    const existing = this.checkpointStopFlights.get(agentId);
+    if (existing?.record === record && existing.dispatchGeneration === generation) return existing.settlement;
+    const session = record.session;
+    const callback = session?.stopCheckpoint;
+    if (record.state !== "running" || !record.checkpointPaused || !session || !callback) {
+      this.quarantineCheckpoint(agentId);
+      return Promise.resolve({ disposition: "unconfirmed", ...(record.retainedInputReport ? { report: record.retainedInputReport } : {}) });
+    }
+    this.markCheckpointStopping(agentId, source);
+    const attempt = Object.freeze({ attemptId: Object.freeze({}), agentId, dispatchGeneration: generation });
+    let resolveSettlement!: (value: CheckpointStopDisposition) => void;
+    const settlement = new Promise<CheckpointStopDisposition>((resolve) => { resolveSettlement = resolve; });
+    const flight: CheckpointStopFlight = { record, dispatchGeneration: generation, session, attempt, settlement };
+    this.checkpointStopFlights.set(agentId, flight);
+    void Promise.resolve().then(() => callback.call(session, attempt)).then((evidence) => {
+      const current = this.records.get(agentId);
+      const stillCurrent = current === record && (current?.dispatchGeneration ?? 1) === generation &&
+        this.checkpointStopFlights.get(agentId) === flight;
+      if (!stillCurrent) {
+        resolveSettlement({ disposition: "unconfirmed" });
+        return;
+      }
+      const report = evidence && evidence.confirmed === true && evidence.attemptId === attempt.attemptId
+        ? evidence.report
+        : undefined;
+      if (!report || report.agentId !== agentId || current.retainedInputReport !== report ||
+          current.retainedInputReportDispatchGeneration !== generation) {
+        this.quarantineCheckpoint(agentId);
+        resolveSettlement({ disposition: "unconfirmed", ...(current.retainedInputReport ? { report: current.retainedInputReport } : {}) });
+        return;
+      }
+      current.checkpointStopState = "confirmed";
+      current.checkpointPaused = false;
+      this.notifyChange();
+      resolveSettlement({ disposition: "confirmed", report });
+    }, () => {
+      const current = this.records.get(agentId);
+      if (current === record && (current.dispatchGeneration ?? 1) === generation &&
+          this.checkpointStopFlights.get(agentId) === flight) {
+        this.quarantineCheckpoint(agentId);
+        resolveSettlement({ disposition: "unconfirmed", ...(current.retainedInputReport ? { report: current.retainedInputReport } : {}) });
+      } else {
+        resolveSettlement({ disposition: "unconfirmed" });
+      }
+    });
+    return settlement;
+  }
+
   /** Store one canonical report before its occurrences may resolve as reported. */
   storeRetainedInputReport(agentId: string, report: RetainedInputReport): boolean {
     const record = this.records.get(agentId);
     if (!record || report.agentId !== agentId || record.checkpointQuarantined) return false;
     if (record.retainedInputReport) return record.retainedInputReport === report;
     record.retainedInputReport = report;
+    record.retainedInputReportDispatchGeneration = record.dispatchGeneration ?? 1;
+    if (record.checkpointStopState === "stopping") {
+      record.checkpointStopState = "settling-cancellation";
+    }
     this.notifyChange();
     return true;
   }
@@ -527,6 +643,7 @@ export class SubagentRegistry {
     if (!record || record.checkpointQuarantined) return false;
     record.checkpointQuarantined = true;
     record.checkpointPaused = true;
+    record.checkpointStopState = "unconfirmed";
     record.resumable = false;
     this.notifyChange();
     return true;
@@ -631,9 +748,13 @@ export type SteerGuardResult =
  * and the SendMessage resume path so the two seams cannot drift.
  */
 export function userStoppedRefusal(record: SubagentRegistryRecord): string {
+  const report = record.retainedInputReport;
+  const retained = report
+    ? ` Reported input was not auto-replayed; retrieve the unchanged report with ${taskOutputAgentLocator(record.agentId)} and inspect possible existing effects before any deliberate new dispatch.`
+    : "";
   return (
     `Agent ${record.agentId} ("${record.agentName}") was stopped by the user — ` +
-    `a user-stopped agent cannot be steered or resumed. Dispatch a new agent instead.`
+    `a user-stopped agent cannot be steered or resumed.${retained} Dispatch a new agent instead.`
   );
 }
 
@@ -658,11 +779,61 @@ export function oneShotRefusal(record: SubagentRegistryRecord): string {
  * running records without a live steerable handle (the transient
  * minimal-register window, or a fake/older SDK session).
  */
-export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
+export function taskOutputAgentLocator(agentId: string): string {
+  return `TaskOutput with task_id "${agentId}"`;
+}
+
+export function retainedInputCount(report: RetainedInputReport): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, report.occurrences.length + report.unrepresentableCount);
+}
+
+/** One durable textual projection of the immutable canonical report. */
+export function formatRetainedInputReport(report: RetainedInputReport): string {
+  const locator = taskOutputAgentLocator(report.agentId);
+  const lines = [
+    `Retained input report for ${report.agentId}: ${report.occurrences.length} represented, ${report.unrepresentableCount} unrepresentable (${retainedInputCount(report)} total).`,
+    `Locator: ${locator}.`,
+    "Reported input was not auto-replayed. Inspect possible existing files, tools, and external effects before any deliberate retry.",
+    report.guidance,
+  ];
+  for (const [index, occurrence] of report.occurrences.entries()) {
+    lines.push(`${index + 1}. ${occurrence.shadow.delivery}: ${JSON.stringify(occurrence.shadow.content)}`);
+  }
+  if (report.unrepresentableCount > 0) {
+    lines.push(`${report.unrepresentableCount} retained occurrence(s) could not be represented safely; inspect the transcript before retrying.`);
+  }
+  return lines.filter(Boolean).join("\n");
+}
+
+export function guardSteer(
+  record: SubagentRegistryRecord,
+  source: SubagentMessageSource = "send-message",
+): SteerGuardResult {
+  if (record.checkpointQuarantined) {
+    const locator = record.retainedInputReport
+      ? ` Retrieve it with ${taskOutputAgentLocator(record.agentId)}.`
+      : " No canonical retained-input report exists; inspect the transcript for retained input.";
+    return {
+      ok: false,
+      refusal: `Agent ${record.agentId} is quarantined; the message was not sent.${locator} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible existing effects.`,
+    };
+  }
+  if (record.checkpointStopState === "stopping" || record.checkpointStopState === "settling-cancellation") {
+    return {
+      ok: false,
+      refusal: `Agent ${record.agentId} is settling cancellation; the message was not sent. If cancellation is confirmed, retrieve retained input with ${taskOutputAgentLocator(record.agentId)} and inspect possible existing effects before retrying.`,
+    };
+  }
   if (record.oneShot) {
     return { ok: false, refusal: oneShotRefusal(record) };
   }
   if (record.userStopped) {
+    if (source === "panel" && record.retainedInputReport) {
+      return {
+        ok: false,
+        refusal: `Agent ${record.agentId} was stopped by the user permanently; panel message was not sent. Reported input was not auto-replayed. ${taskOutputAgentLocator(record.agentId)}; inspect existing effects.`,
+      };
+    }
     return { ok: false, refusal: userStoppedRefusal(record) };
   }
   if (record.state !== "running") {
@@ -692,5 +863,8 @@ export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
         `only background dispatches are steerable (a foreground Agent call blocks the parent's turn).`,
     };
   }
-  return { ok: true, steer: steer.bind(session) };
+  return {
+    ok: true,
+    steer: (text: string) => steer.call(session, text, { source }),
+  };
 }
