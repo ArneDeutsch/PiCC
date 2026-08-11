@@ -1502,9 +1502,16 @@ describe("lifecycle wiring", () => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    const order: string[] = [];
     picc(shutdownPi.api as never, {
       onInitializationSettled: shutdownPi.captureInitialization,
       onWired: (value) => { internals = value; },
+      mcpRuntime: {
+        whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [],
+        callTool: async () => ({}), getPrompt: async () => ({}), readResource: async () => ({}),
+        diagnostics: () => [], serverStates: () => [],
+        shutdown: async () => { order.push("global-mcp-shutdown"); },
+      },
     });
     await shutdownPi.waitForInitialization();
     const log = path.join(dir, ".claude", ".session-end-log");
@@ -1521,6 +1528,7 @@ describe("lifecycle wiring", () => {
       async () => {
         await cleanup.promise;
         worktreeReleased = true;
+        order.push("child-joined-and-worktree-released");
       },
       agentId,
       "reviewer",
@@ -1548,6 +1556,12 @@ describe("lifecycle wiring", () => {
     await shutdown;
     expect(worktreeReleased).toBe(true);
     expect(fs.existsSync(log)).toBe(true);
+    order.push("session-end-observed");
+    expect(order).toEqual([
+      "child-joined-and-worktree-released",
+      "global-mcp-shutdown",
+      "session-end-observed",
+    ]);
   });
 
   it("PostToolUse exit-2 feedback reaches the model in the tool result (lint-and-fix loop)", async () => {

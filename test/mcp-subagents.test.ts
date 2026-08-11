@@ -1,13 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import picc, { type PiccTestSeam } from "../src/index.js";
+import picc, { formatAgentMcpSetupWarning, type PiccTestSeam } from "../src/index.js";
 import { PermissionEngine } from "../src/engine/permissions.js";
+import { HookRunner } from "../src/engine/hook-runner.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake-sdk.js";
-import { createMcpProcessFixture, type McpProcessFixture } from "./helpers/mcp-process.js";
+import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from "./helpers/mcp-process.js";
 import type { PiSdk } from "../src/runtime/subagents.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
 import { deferred, waitUntil } from "./helpers/async.js";
@@ -134,6 +136,182 @@ afterAll(() => {
   }
 });
 
+describe("agent MCP generation warning mapper", () => {
+  const declaration = {
+    items: [{ kind: "inline", name: "command" }],
+    diagnostics: [],
+    diagnosticOwnership: [],
+  } as never;
+  const overflowWarning = "Agent MCP availability warning: one or more MCP setup issues were omitted; if repairing configuration or policy, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient startup failure with a fresh Agent dispatch.";
+
+  it.each(["enabled", "blocked", "pending-approval", "disabled", "invalid"] as const)(
+    "keeps a published session-route collision quiet for %s inline admission",
+    (status) => {
+      const diagnostic = status === "invalid" ? ["opaque admission finding"] : [];
+      const warning = formatAgentMcpSetupWarning(
+        { borrowedServerNames: () => ["command"], setupOutcomes: () => [] },
+        {
+          servers: [{ name: "command", status, diagnostics: diagnostic }],
+          diagnostics: diagnostic,
+          diagnosticOwnership: diagnostic.map(() => ({ kind: "server", serverName: "command" })),
+        } as never,
+        status === "invalid"
+          ? {
+              items: [{ kind: "inline", name: "command" }],
+              diagnostics: ["wording intentionally opaque"],
+              diagnosticOwnership: [{ kind: "server", serverName: "command" }],
+            } as never
+          : declaration,
+      );
+      expect(warning).toBeUndefined();
+    },
+  );
+
+  it("keeps a collision with a healthy sibling quiet", () => {
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => ["command"], setupOutcomes: () => [] },
+      {
+        servers: [
+          { name: "command", status: "invalid", diagnostics: ["opaque collision finding"] },
+          { name: "healthy", status: "enabled", diagnostics: [] },
+        ],
+        diagnostics: ["opaque aggregate finding"],
+        diagnosticOwnership: [{ kind: "server", serverName: "command" }],
+      } as never,
+      declaration,
+    );
+
+    expect(warning).toBeUndefined();
+  });
+
+  it("warns for a collision named command plus an unrelated missing-command victim", () => {
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => ["command"], setupOutcomes: () => [] },
+      {
+        servers: [{ name: "command", status: "enabled", diagnostics: [] }],
+        diagnostics: ["opaque aggregate finding with no identity tokens"],
+        diagnosticOwnership: [{ kind: "server", serverName: "victim" }],
+      } as never,
+      {
+        items: [{ kind: "inline", name: "command" }],
+        diagnostics: ["opaque parser finding with no identity tokens"],
+        diagnosticOwnership: [{ kind: "server", serverName: "victim" }],
+      } as never,
+    );
+
+    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.");
+  });
+
+  it("warns for a collision plus an unowned malformed sibling", () => {
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => ["command"], setupOutcomes: () => [] },
+      {
+        servers: [{ name: "command", status: "enabled", diagnostics: [] }],
+        diagnostics: ["opaque aggregate finding"],
+        diagnosticOwnership: [{ kind: "unowned" }],
+      } as never,
+      {
+        items: [{ kind: "inline", name: "command" }],
+        diagnostics: ["opaque malformed sibling"],
+        diagnosticOwnership: [{ kind: "unowned", itemIndex: 1 }],
+      } as never,
+    );
+
+    expect(warning).toBe("Agent MCP availability warning: part of the mcpServers declaration is malformed; fix the skipped entries, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.");
+  });
+
+  it.each([
+    ["blocked", "blocked by managed MCP policy"],
+    ["pending-approval", "needs project approval"],
+    ["disabled", "is disabled"],
+    ["invalid", "has no usable definition"],
+  ] as const)("maps non-routed %s admission to fixed bounded guidance", (status, expected) => {
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => [], setupOutcomes: () => [] },
+      { servers: [{ name: `unsafe\\n${status}`, status }], diagnostics: [] } as never,
+      declaration,
+    );
+    expect(warning).toContain(expected);
+    expect(warning).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch");
+    expect(warning).not.toContain("\n");
+    expect(warning!.length).toBeLessThanOrEqual(480);
+  });
+
+  it.each([
+    ["missing-reference", "configure and enable that server, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch"],
+    ["inline-startup-failed", "failed during startup or discovery; review its server logs; if repairing configuration, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch; otherwise retry a transient failure with a fresh Agent dispatch"],
+  ] as const)("maps %s scope outcome without raw diagnostics", (kind, expected) => {
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => [], setupOutcomes: () => [{ serverName: "safe", kind }] },
+      { servers: [], diagnostics: [], diagnosticOwnership: [] }, declaration,
+    );
+    expect(warning).toContain(expected);
+    if (kind === "inline-startup-failed") {
+      expect(warning).toContain("if repairing configuration");
+      expect(warning).toContain("otherwise retry a transient failure");
+    }
+    expect(warning).not.toContain("transport");
+    expect(warning!.length).toBeLessThanOrEqual(480);
+  });
+
+  it("preserves both recovery branches when one max-safe-name startup failure overflows", () => {
+    const warning = formatAgentMcpSetupWarning(
+      {
+        borrowedServerNames: () => [],
+        setupOutcomes: () => [{
+          serverName: "\\".repeat(96),
+          kind: "inline-startup-failed",
+          rawError: "RAW_UNSAFE_DETAIL",
+        } as never],
+      },
+      { servers: [], diagnostics: [], diagnosticOwnership: [] },
+      declaration,
+    )!;
+
+    expect(warning).toBe(overflowWarning);
+    expect(warning.length).toBeLessThanOrEqual(480);
+    expect(warning).not.toContain("multiple");
+    expect(warning).not.toContain("repair the affected declaration or policy");
+    expect(warning).not.toContain("RAW_UNSAFE_DETAIL");
+  });
+
+  it("preserves both recovery branches when multiple startup failures overflow", () => {
+    const warning = formatAgentMcpSetupWarning(
+      {
+        borrowedServerNames: () => [],
+        setupOutcomes: () => Array.from({ length: 12 }, (_, index) => ({
+          serverName: `server-${index}-RAW_UNSAFE_DETAIL-${"x".repeat(80)}`,
+          kind: "inline-startup-failed" as const,
+        })),
+      },
+      { servers: [], diagnostics: [], diagnosticOwnership: [] },
+      declaration,
+    )!;
+
+    expect(warning).toBe(overflowWarning);
+    expect(warning.length).toBeLessThanOrEqual(480);
+    expect(warning).not.toContain("multiple");
+    expect(warning).not.toContain("repair the affected declaration or policy");
+    expect(warning).not.toContain("RAW_UNSAFE_DETAIL");
+  });
+
+  it("bounds overflow, redacts controls, and reports malformed declarations", () => {
+    const servers = Array.from({ length: 20 }, (_, index) => ({
+      name: `server-${index}\u001b[2J${"x".repeat(100)}`, status: "invalid",
+    }));
+    const warning = formatAgentMcpSetupWarning(
+      { borrowedServerNames: () => [], setupOutcomes: () => [] },
+      { servers, diagnostics: ["RAW_SECRET"] } as never,
+      { items: [], diagnostics: ["RAW_SECRET"], diagnosticOwnership: [{ kind: "unowned" }] },
+    )!;
+    expect(warning).toBe(overflowWarning);
+    expect(warning.length).toBeLessThanOrEqual(480);
+    expect(warning).not.toContain("\u001b");
+    expect(warning).not.toContain("RAW_SECRET");
+    expect(warning).not.toContain("multiple");
+  });
+});
+
 describe("subagent MCP identity across remote lifecycle states (fake runtime)", () => {
   type Runtime = NonNullable<PiccTestSeam["mcpRuntime"]>;
 
@@ -186,19 +364,35 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
       { serverName: "remote", toolName: "search", description: "search", inputSchema: { type: "object" } },
     ];
     let state: McpLifecycleState = "connected";
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    const readResource = vi.fn(async () => ({ contents: [{ uri: "test:", text: "resource" }] }));
     const runtime: Runtime = {
       whenSettled: async () => {},
       tools: () => catalog,
       prompts: () => [],
-      resourceServers: () => [{ serverName: "remote", resources: [] }],
+      resourceServers: () => [{ serverName: "remote", resources: [{ serverName: "remote", uri: "test:", name: "test" }] }],
       getPrompt: async () => { throw new Error("unreachable"); },
-      readResource: async () => ({ contents: [{ uri: "test:", text: "resource" }] }),
-      callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      readResource,
+      callTool,
       diagnostics: () => [],
       serverStates: () => [{ name: "remote", transport: "http", state }],
       shutdown: async () => {},
     };
-    const handle = fakeSdk({ onPrompt: async () => "DONE" });
+    let liveExecution: Promise<void> | undefined;
+    const handle = fakeSdk({ onPrompt: async (prompt, session) => {
+      if (prompt === "connected") {
+        liveExecution = (async () => {
+          await session.customTools.find((tool) => tool.name === "mcp__remote__echo")!
+            .execute("remote-call", { text: "dispatch-local" });
+          await session.customTools.find((tool) => tool.name === "ListMcpResourcesTool")!
+            .execute("resource-list", {});
+          await session.customTools.find((tool) => tool.name === "ReadMcpResourceTool")!
+            .execute("resource-read", { server: "remote", uri: "test:" });
+        })();
+        await liveExecution;
+      }
+      return "DONE";
+    } });
     const pi = fakePi();
     let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
     try {
@@ -250,6 +444,9 @@ describe("subagent MCP identity across remote lifecycle states (fake runtime)", 
         expect(childResourceRead).not.toBe(pi.tools.get("ReadMcpResourceTool"));
         childResourceReads.push(childResourceRead);
       }
+      await liveExecution;
+      expect(callTool).toHaveBeenCalledWith("remote", "echo", { text: "dispatch-local" });
+      expect(readResource).toHaveBeenCalledWith("remote", "test:");
       expect(new Set(childEchoes).size).toBe(3);
       expect(new Set(childResourceLists).size).toBe(3);
       expect(new Set(childResourceReads).size).toBe(3);
@@ -422,6 +619,81 @@ describe("subagent fixed resource restrictions", () => {
     expect(names).toContain(resourceNames.find((name) => name !== denied));
   }, 30_000);
 
+  it("runs a captured production resource call through the dispatch guard's session and agent hooks", async () => {
+    const dir = makeTempDir("picc-resource-guard-");
+    const userDir = makeTempDir("picc-resource-guard-user-");
+    writeProjectFile(dir, "CLAUDE.md", "RESOURCE-GUARD\n");
+    writeProjectFile(dir, ".claude/settings.json", JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: "command", command: "session-resource-pre-must-not-launch" }] }],
+        PostToolUse: [{ hooks: [{ type: "command", command: "session-resource-post-must-not-launch" }] }],
+      },
+    }));
+    writeProjectFile(dir, ".claude/agents/resource-guard.md", [
+      "---", "name: resource-guard", "description: guarded resources", "hooks:",
+      "  PreToolUse:", "    - hooks:", "        - type: command", "          command: agent-resource-pre-must-not-launch",
+      "  PostToolUse:", "    - hooks:", "        - type: command", "          command: agent-resource-post-must-not-launch",
+      "---", "Guard resources.", "",
+    ].join("\n"));
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    const loaderOptions: Array<Record<string, unknown>> = [];
+    const hookCalls: string[] = [];
+    const hookSpy = vi.spyOn(HookRunner.prototype, "fire").mockImplementation(async function (this: HookRunner, eventName) {
+      const config = JSON.stringify((this as unknown as { opts: { config: unknown } }).opts.config);
+      const owner = config.includes("agent-resource") ? "agent" : "session";
+      if (eventName === "PreToolUse" || eventName === "PostToolUse") hookCalls.push(`${owner}:${eventName}`);
+      return { block: false, askDowngraded: false, diagnostics: [] };
+    });
+    let exercised = false;
+    const handle = fakeSdk({ onPrompt: async (_text, session) => {
+      const factory = (loaderOptions.at(-1)!.extensionFactories as Array<{ name: string; factory: (pi: unknown) => unknown }>)
+        .find((candidate) => candidate.name.startsWith("picc-guard-"))!;
+      type GuardHandler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
+      const handlers = new Map<string, GuardHandler>();
+      factory.factory({ on: (name: string, handler: GuardHandler) => { handlers.set(name, handler); }, sendMessage: () => {} });
+      const resource = session.customTools.find((tool) => tool.name === "ListMcpResourcesTool")!;
+      const input = { server: "fixture" };
+      const admitted = await handlers.get("tool_call")!({ toolName: resource.name, toolCallId: "resource", input }, {});
+      expect(admitted?.block).not.toBe(true);
+      const result = await resource.execute("resource", input);
+      await handlers.get("tool_result")!({
+        toolName: resource.name, toolCallId: "resource", input, content: result.content, isError: false,
+      }, {});
+      exercised = true;
+      return "RESOURCE-GUARD-DONE";
+    } });
+    const pi = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    try {
+      picc(pi.api as never, {
+        mcpRuntime: resourceRuntime(), sdk: handle.sdk,
+        onWired: (wired) => { internals = wired; },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      await pi.waitForTools(["Agent", ...resourceNames]);
+      internals.subagentRuntime.setSdkForTest({
+        ...handle.sdk,
+        DefaultResourceLoader: class {
+          constructor(options: Record<string, unknown>) { loaderOptions.push(options); }
+          async reload(): Promise<void> {}
+        },
+      });
+      await pi.tools.get("Agent").execute("resource-guard", {
+        subagent_type: "resource-guard", prompt: "exercise", run_in_background: false,
+      });
+      expect(exercised).toBe(true);
+      expect(hookCalls).toEqual(expect.arrayContaining([
+        "session:PreToolUse", "agent:PreToolUse", "session:PostToolUse", "agent:PostToolUse",
+      ]));
+    } finally {
+      hookSpy.mockRestore();
+      await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
+      process.chdir(originalCwd);
+    }
+  }, 30_000);
+
   it("empty and unrelated tools: child rows receive no fixed resource tools", async () => {
     const [emptyNames, unrelatedNames] = await childTools({
       agents: {
@@ -512,6 +784,12 @@ describe("subagent MCP tool provisioning (wired)", () => {
   // fake loader never RUNS extensionFactories, so tests that need the child
   // guard invoke the captured factory themselves (see the deny test below).
   const loaderOptions: Array<Record<string, unknown>> = [];
+  const childPrompts: string[] = [];
+  let backgroundWarningVisibleBeforePrompt = false;
+  let livePinToolResult = "";
+  let nestedParentTools: string[] = [];
+  let nestedChildTools: string[] = [];
+  let runGuardProof: ((session: { customTools: FakeCustomTool[] }) => Promise<void>) | undefined;
 
   const FIXTURE_TOOLS = [
     "mcp__fixture__echo",
@@ -523,6 +801,9 @@ describe("subagent MCP tool provisioning (wired)", () => {
     dir = makeTempDir("picc-mcpsub-");
     fixture = createMcpProcessFixture(makeTempDir("picc-mcpsub-fx-"));
     writeProjectFile(dir, "CLAUDE.md", "MCP-SUB-PROJECT\n");
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "PiCC Test"], { cwd: dir });
     writeProjectFile(
       dir,
       ".mcp.json",
@@ -546,12 +827,26 @@ describe("subagent MCP tool provisioning (wired)", () => {
     writeProjectFile(
       dir,
       ".claude/settings.json",
-      JSON.stringify({ permissions: { deny: ["mcp__denied"] } }),
+      JSON.stringify({
+        subagents: { maxDepth: 2 },
+        permissions: { deny: ["mcp__denied", "mcp__fixture__echo(text:secret*)"] },
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", command: "session-pre-must-not-launch" }] }],
+          PostToolUse: [{ hooks: [{ type: "command", command: "session-post-must-not-launch" }] }],
+          PostToolUseFailure: [{ hooks: [{ type: "command", command: "session-failure-must-not-launch" }] }],
+        },
+      }),
     );
     writeProjectFile(
       dir,
       ".claude/agents/inheritor.md",
-      "---\nname: inheritor\ndescription: inherits every tool\n---\nYou inherit.\n",
+      [
+        "---", "name: inheritor", "description: inherits every tool", "hooks:",
+        "  PreToolUse:", "    - hooks:", "        - type: command", "          command: agent-pre-must-not-launch",
+        "  PostToolUse:", "    - hooks:", "        - type: command", "          command: agent-post-must-not-launch",
+        "  PostToolUseFailure:", "    - hooks:", "        - type: command", "          command: agent-failure-must-not-launch",
+        "---", "You inherit.", "",
+      ].join("\n"),
     );
     writeProjectFile(
       dir,
@@ -568,14 +863,94 @@ describe("subagent MCP tool provisioning (wired)", () => {
       ".claude/agents/dropper.md",
       "---\nname: dropper\ndescription: drops the fixture server\ndisallowedTools: mcp__fixture\n---\nYou dropped MCP.\n",
     );
+    writeProjectFile(
+      dir,
+      ".claude/agents/pending-inline.md",
+      [
+        "---", "name: pending-inline", "description: degraded inline setup", "mcpServers:",
+        "  - pending-server:", `      command: ${JSON.stringify(fixture.nodeCommand)}`,
+        `      args: [${JSON.stringify(fixture.serverScript)}, serve]`,
+        "---", "PENDING-WARNING-SENTINEL", "",
+      ].join("\n"),
+    );
+    writeProjectFile(
+      dir,
+      ".claude/agents/inline-owner.md",
+      [
+        "---",
+        "name: inline-owner",
+        "description: owns an isolated inline server",
+        "mcpServers:",
+        "  - inline:",
+        `      command: ${JSON.stringify(fixture.nodeCommand)}`,
+        `      args: [${JSON.stringify(fixture.serverScript)}, spawn-grandchild]`,
+        "      env:",
+        `        MCP_BARRIER_DIR: ${JSON.stringify(fixture.dir)}`,
+        "---",
+        "Use the inline server.",
+        "",
+      ].join("\n"),
+    );
+    for (const [agentName, serverName] of [["parent-inline", "parent-owned"], ["nested-inline", "nested-owned"]] as const) {
+      writeProjectFile(
+        dir,
+        `.claude/agents/${agentName}.md`,
+        [
+          "---", `name: ${agentName}`, `description: owns ${serverName}`, "mcpServers:",
+          `  - ${serverName}:`, `      command: ${JSON.stringify(fixture.nodeCommand)}`,
+          `      args: [${JSON.stringify(fixture.serverScript)}, serve]`,
+          "---", `Use ${serverName}.`, "",
+        ].join("\n"),
+      );
+    }
     const userDir = makeTempDir("picc-mcpsub-user-");
     // Approval from a user-authored scope — project scope cannot self-approve.
-    writeProjectFile(userDir, "settings.json", JSON.stringify({ enabledMcpjsonServers: ["fixture"] }));
+    writeProjectFile(userDir, "settings.json", JSON.stringify({
+      enabledMcpjsonServers: ["fixture", "inline", "parent-owned", "nested-owned"],
+    }));
     process.env.PICC_CLAUDE_USER_DIR = userDir;
+    execFileSync("git", ["add", "."], { cwd: dir });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: dir, stdio: "ignore" });
     process.chdir(dir);
 
     handle = fakeSdk({
+      stats: { tokens: { input: 7, output: 3 }, cost: 0.01 },
       onPrompt: async (text, session) => {
+        childPrompts.push(text);
+        if (text.includes("PENDING-WARNING")) {
+          backgroundWarningVisibleBeforePrompt = internals?.backgroundTasks.ids().some((id) =>
+            internals.backgroundTasks.get(id)?.lastActivity?.startsWith("Agent MCP availability warning:")) ?? false;
+        }
+        if (text.includes("INLINE-BACKGROUND-CALL")) {
+          const echo = session.customTools.find((tool) => tool.name === "mcp__inline__echo");
+          if (!echo) return "NO-INLINE-TOOL";
+          const result = await echo.execute("inline-background-call", { text: "owned-background" });
+          return `INLINE-BACKGROUND:${result.content[0]?.text ?? ""}`;
+        }
+        if (text.includes("NESTED-CHILD")) {
+          nestedChildTools = session.customTools.map((tool) => tool.name);
+          return "NESTED-CHILD-DONE";
+        }
+        if (text.includes("NESTED-PARENT")) {
+          nestedParentTools = session.customTools.map((tool) => tool.name);
+          const nestedAgent = session.customTools.find((tool) => tool.name === "Agent");
+          if (!nestedAgent) return "NO-NESTED-AGENT";
+          const result = await nestedAgent.execute("nested-dispatch", {
+            subagent_type: "nested-inline", prompt: "NESTED-CHILD", run_in_background: false,
+          });
+          return `NESTED-PARENT:${result.content[0]?.text ?? ""}`;
+        }
+        if (text.includes("GUARD-PROOF")) {
+          await runGuardProof?.(session as unknown as { customTools: FakeCustomTool[] });
+          return "GUARD-DONE";
+        }
+        if (text.includes("ENTER-WORKTREE-PIN")) {
+          const enter = session.customTools.find((tool) => tool.name === "EnterWorktree");
+          if (!enter) return "NO-ENTER-WORKTREE";
+          const result = await enter.execute("enter-pin", { name: "mcp-pin-proof" });
+          livePinToolResult = (result.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n");
+          return "PIN-DONE";
+        }
         if (text.includes("CALL-ECHO")) {
           // In-subagent round-trip: the dispatched session calls its OWN MCP
           // proxy instance, which delegates to the session-global runtime.
@@ -651,6 +1026,96 @@ describe("subagent MCP tool provisioning (wired)", () => {
     expect(custom.filter((n) => n.startsWith("mcp__denied"))).toEqual([]);
   });
 
+  it("threads one canonical degraded-setup warning through the child prompt and foreground/background model surfaces", async () => {
+    const foreground = await dispatch("pending-inline", "PENDING-WARNING foreground");
+    const foregroundText = (foreground.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n");
+    const warning = "Agent MCP availability warning: \"pending-server\" needs project approval in user settings; approve it, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.";
+    expect(foregroundText).toContain(warning);
+    expect(childPrompts.at(-1)).toContain(warning);
+    expect((foreground.details as { diagnostics?: Array<{ message: string }> }).diagnostics
+      ?.filter((diagnostic) => diagnostic.message === warning)).toHaveLength(1);
+
+    const accepted = await pi.tools.get("Agent").execute("pending-background", {
+      subagent_type: "pending-inline", prompt: "PENDING-WARNING background", run_in_background: true,
+    });
+    const taskId = (accepted.details as { taskId: string }).taskId;
+    await internals.backgroundTasks.wait(taskId);
+    expect(backgroundWarningVisibleBeforePrompt).toBe(true);
+    const task = internals.backgroundTasks.get(taskId)!;
+    expect(task.lastActivity).toBe(warning);
+    expect(task.diagnostics.filter((diagnostic) => diagnostic.message === warning)).toHaveLength(1);
+    const taskOutput = pi.tools.get("TaskOutput");
+    const output = await taskOutput.execute("pending-output", { task_id: taskId });
+    const canonicalText = (output.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n");
+    expect(canonicalText).toContain(warning);
+    expect(canonicalText).toMatch(/\nusage:/u);
+    const expanded = taskOutput.renderResult!(
+      output, { expanded: true, isPartial: false }, undefined,
+      { args: { task_id: taskId }, isError: false, state: {} },
+    ).render(200).join("\n");
+    expect(expanded).toContain("SUB-DONE");
+    expect(expanded.match(/Agent MCP availability warning:/gu)).toHaveLength(1);
+    expect(expanded.match(/in 7/gu)).toHaveLength(1);
+    expect(expanded).not.toMatch(/\nusage:/u);
+  });
+
+  it("activates a valid inline server for its background owner and nowhere else", async () => {
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+    const accepted = await pi.tools.get("Agent").execute("inline-background", {
+      subagent_type: "inline-owner", prompt: "INLINE-BACKGROUND-CALL", run_in_background: true,
+    });
+    const taskId = (accepted.details as { taskId: string }).taskId;
+    await internals.backgroundTasks.wait(taskId);
+    const created = handle.created.at(-1)!;
+    expect((created.customTools as FakeCustomTool[]).map((tool) => tool.name)).toContain("mcp__inline__echo");
+    const output = await pi.tools.get("TaskOutput").execute("inline-background-output", { task_id: taskId });
+    expect((output.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n"))
+      .toContain("INLINE-BACKGROUND:owned-background");
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+
+    await dispatch("inheritor", "unrelated after background owner");
+    expect(lastCustomToolNames()).not.toContain("mcp__inline__echo");
+  });
+
+  it("does not propagate parent inline tools to a nested dispatch and activates the nested declaration", async () => {
+    const result = await dispatch("parent-inline", "NESTED-PARENT");
+    expect((result.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n"))
+      .toContain("NESTED-PARENT:NESTED-CHILD-DONE");
+    expect(nestedParentTools).toContain("mcp__parent-owned__echo");
+    expect(nestedParentTools).not.toContain("mcp__nested-owned__echo");
+    expect(nestedChildTools).toContain("mcp__nested-owned__echo");
+    expect(nestedChildTools).not.toContain("mcp__parent-owned__echo");
+    expect(pi.tools.has("mcp__parent-owned__echo")).toBe(false);
+    expect(pi.tools.has("mcp__nested-owned__echo")).toBe(false);
+  });
+
+  it("starts an inline stdio scope only for its owner and closes its process tree before return", async () => {
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+    const result = await dispatch("inline-owner", "ENTER-WORKTREE-PIN inline isolated run");
+    expect((result.content as Array<{ text?: string }>).map((entry) => entry.text ?? "").join("\n"))
+      .toContain("PIN-DONE");
+    expect(livePinToolResult).toContain("Scoped MCP stdio");
+    expect(livePinToolResult).toContain("pinned to its launch directory");
+    expect(livePinToolResult).toMatch(/restart the agent/iu);
+    const pinDiagnostics = (result.details as { diagnostics?: Array<{ message: string }> }).diagnostics ?? [];
+    const retainedPinWarnings = pinDiagnostics.filter((diagnostic) => diagnostic.message.includes("pinned to its launch directory"));
+    expect(retainedPinWarnings).toHaveLength(1);
+    expect(livePinToolResult).toContain(retainedPinWarnings[0]!.message);
+    const ownerTools = lastCustomToolNames();
+    expect(ownerTools).toContain("mcp__inline__echo");
+    await fixture.waitFor(["spawn-grandchild.pid", "grandchild.pid"], "inline MCP process tree publication");
+    const inlinePids = [fixture.pidOf("spawn-grandchild.pid"), fixture.pidOf("grandchild.pid")];
+    await waitUntil({
+      description: "inline MCP process tree to close before dispatch settlement",
+      predicate: () => inlinePids.every((pid) => !processIsAlive(pid)),
+      describeObserved: () => `alive=${inlinePids.filter(processIsAlive).join(",")}`,
+    });
+
+    await dispatch("inheritor", "unrelated sibling");
+    expect(lastCustomToolNames()).not.toContain("mcp__inline__echo");
+    expect(pi.tools.has("mcp__inline__echo")).toBe(false);
+  });
+
   it("a tools: [Read] agent receives no MCP tool (restriction), while its granted built-in survives", async () => {
     await dispatch("reader", "restricted run");
     const custom = lastCustomToolNames();
@@ -675,38 +1140,93 @@ describe("subagent MCP tool provisioning (wired)", () => {
     expect(custom).toContain("bash");
   });
 
-  it("the dispatch-installed guard blocks a denied MCP call inside the subagent", async () => {
-    await dispatch("inheritor", "guard run");
-    const factories = loaderOptions.at(-1)!.extensionFactories as ExtensionFactory[];
-    const guard = factories.find((f) => f.name.startsWith("picc-guard-"));
-    expect(guard).toBeDefined();
+  it("runs captured dispatch-local proxy calls through session-plus-agent guard hooks without launching hook processes", async () => {
+    const hookCalls: string[] = [];
+    const hookSpy = vi.spyOn(HookRunner.prototype, "fire").mockImplementation(async function (this: HookRunner, eventName, payload) {
+      const config = JSON.stringify((this as unknown as { opts: { config: unknown } }).opts.config);
+      const owner = config.includes("agent-") ? "agent" : "session";
+      if (eventName === "PreToolUse" || eventName === "PostToolUse" || eventName === "PostToolUseFailure") {
+        hookCalls.push(`${owner}:${eventName}`);
+      }
+      const input = payload.tool_input as Record<string, unknown> | undefined;
+      if (eventName === "PreToolUse" && owner === "session" && input?.text === "rewrite") {
+        return { block: false, askDowngraded: false, diagnostics: [], updatedInput: { text: "secret-after-hook" } };
+      }
+      if (eventName === "PreToolUse" && owner === "agent" && input?.text === "hook-deny") {
+        return { block: true, blockReason: "agent hook denied", askDowngraded: false, diagnostics: [] };
+      }
+      if (eventName === "PreToolUse" && owner === "session" && input?.text === "timeout") {
+        return {
+          block: false, askDowngraded: false,
+          diagnostics: [{ severity: "warning", message: "session hook timed out safely" }],
+        };
+      }
+      return { block: false, askDowngraded: false, diagnostics: [] };
+    });
+    try {
+      runGuardProof = async (session) => {
+      const factories = loaderOptions.at(-1)!.extensionFactories as ExtensionFactory[];
+      const guard = factories.find((factory) => factory.name.startsWith("picc-guard-"));
+      expect(guard).toBeDefined();
 
-    // Install the REAL guard factory this dispatch built onto a recorder pi and
-    // drive its tool_call handler directly — the fake loader never runs it.
-    type ToolCallHandler = (
-      event: Record<string, unknown>,
-      ctx: Record<string, unknown>,
-    ) => Promise<{ block?: boolean; reason?: string } | undefined>;
-    const handlers = new Map<string, ToolCallHandler>();
-    const recorder = {
-      on: (name: string, handler: ToolCallHandler) => {
-        handlers.set(name, handler);
-      },
-      sendMessage: () => {},
-    };
-    guard!.factory(recorder);
-    const toolCall = handlers.get("tool_call");
-    expect(toolCall).toBeDefined();
+      type GuardHandler = (
+        event: Record<string, unknown>,
+        ctx: Record<string, unknown>,
+      ) => Promise<Record<string, unknown> | undefined>;
+      const handlers = new Map<string, GuardHandler>();
+      guard!.factory({
+        on: (name: string, handler: GuardHandler) => { handlers.set(name, handler); },
+        sendMessage: () => {},
+      });
+      const toolCall = handlers.get("tool_call")!;
+      const toolResult = handlers.get("tool_result")!;
+      const tools = session.customTools;
+      const echo = tools.find((tool) => tool.name === "mcp__fixture__echo")!;
+      let transportCalls = 0;
 
-    const blocked = await toolCall!({ toolName: "mcp__denied__slow", toolCallId: "deny-1", input: {} }, {});
-    expect(blocked).toMatchObject({ block: true });
-    expect(String(blocked?.reason)).toContain("mcp__denied");
+      const bareDenied = await toolCall({ toolName: "mcp__denied__slow", toolCallId: "deny-1", input: {} }, {});
+      expect(bareDenied).toMatchObject({ block: true });
 
-    // Positive control: the granted fixture tool passes the same guard.
-    const allowed = await toolCall!(
-      { toolName: "mcp__fixture__echo", toolCallId: "allow-1", input: { text: "x" } },
-      {},
-    );
-    expect(allowed?.block).not.toBe(true);
+      const rewritten = await toolCall({
+        toolName: echo.name, toolCallId: "rewrite-1", input: { text: "rewrite" },
+      }, {});
+      expect(rewritten).toMatchObject({ block: true });
+      expect(transportCalls).toBe(0);
+
+      const hookDenied = await toolCall({
+        toolName: echo.name, toolCallId: "hook-deny-1", input: { text: "hook-deny" },
+      }, {});
+      expect(hookDenied).toMatchObject({ block: true });
+      expect(String(hookDenied?.reason)).toContain("agent hook denied");
+      expect(transportCalls).toBe(0);
+
+      for (const [id, text] of [["allow-1", "ok"], ["timeout-1", "timeout"]] as const) {
+        const allowed = await toolCall({ toolName: echo.name, toolCallId: id, input: { text } }, {});
+        expect(allowed?.block).not.toBe(true);
+        transportCalls += 1;
+        const result = await echo.execute(id, { text });
+        await toolResult({
+          toolName: echo.name, toolCallId: id, input: { text }, content: result.content, isError: false,
+        }, {});
+      }
+
+      await toolResult({
+        toolName: echo.name, toolCallId: "failure-1", input: { text: "failed" },
+        content: [{ type: "text", text: "failed" }], isError: true,
+      }, {});
+
+      expect(transportCalls).toBe(2);
+      for (const eventName of ["PreToolUse", "PostToolUse", "PostToolUseFailure"]) {
+        expect(hookCalls).toContain(`session:${eventName}`);
+        expect(hookCalls).toContain(`agent:${eventName}`);
+      }
+      expect(tools.map((tool) => tool.name)).toContain(echo.name);
+      };
+      const guarded = await dispatch("inheritor", "GUARD-PROOF run");
+      expect((guarded.content as Array<{ text?: string }>)[0]?.text).toContain("GUARD-DONE");
+    } finally {
+      runGuardProof = undefined;
+      hookSpy.mockRestore();
+    }
   });
 });

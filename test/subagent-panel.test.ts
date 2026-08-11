@@ -7,6 +7,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeSdkHandle } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { waitUntil } from "./helpers/async.js";
+import { renderAgentResult } from "../src/runtime/subagent-render.js";
 import {
   LINGER_FAILURE_MS,
   LINGER_SUCCESS_MS,
@@ -4281,6 +4282,32 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     s.controller.open(s.pi.rpcCtx() as never);
     expect(s.pi.customs).toHaveLength(0);
     expect(s.suppressions).toEqual([]);
+  });
+});
+
+describe("agent/task warning presentation", () => {
+  it("renders canonical MCP qualification exactly once when expanded while retaining collapsed warning access", () => {
+    const warning = "Agent MCP availability warning: inline-db has invalid configuration; repair it, run the canonical /reload in the interactive TUI or exit and relaunch PiCC, then make a fresh Agent dispatch.";
+    const result = {
+      content: [{ type: "text", text: `child body\n\n---\n${warning}\n---` }],
+      details: {
+        status: "completed",
+        outcome: "completed" as const,
+        agent: "reviewer",
+        agentId: "agent-0123456789ab",
+        diagnostics: [{ severity: "warning" as const, message: warning }],
+      },
+    };
+    const expanded = renderAgentResult(result, { expanded: true, isPartial: false }, undefined, {}, { surface: "agent" })
+      .render(200).join("\n");
+    expect(expanded).toContain("child body");
+    expect(expanded.match(/Agent MCP availability warning:/g)).toHaveLength(1);
+
+    const collapsed = renderAgentResult(result, { expanded: false, isPartial: false }, undefined, {}, { surface: "agent" })
+      .render(200).join("\n");
+    expect(collapsed).toContain("diagnostic warning");
+    expect(result.content[0]!.text).toBe(`child body\n\n---\n${warning}\n---`);
+    expect(result.details.diagnostics[0]!.message).toBe(warning);
   });
 });
 

@@ -693,6 +693,56 @@ describe("loadClaudeProject — installed hook provenance", () => {
   });
 });
 
+describe("loadClaudeProject — agent MCP admission assembly", () => {
+  it("publishes captured admission authority and derives provenance only from each declaration", () => {
+    const { repo, userDir } = makeBase();
+    write(path.join(repo, ".claude", "agents", "project-mcp.md"), [
+      "---",
+      "name: project-mcp",
+      "description: project agent",
+      "mcpServers:",
+      "  - approved:",
+      "      command: ${AGENT_BIN}",
+      "  - self-approved:",
+      "      command: self-command",
+      "---",
+      "project prompt",
+    ].join("\n"));
+    write(path.join(userDir, "agents", "user-mcp.md"), [
+      "---",
+      "name: user-mcp",
+      "description: user agent",
+      "mcpServers:",
+      "  - user-inline:",
+      "      command: user-command",
+      "---",
+      "user prompt",
+    ].join("\n"));
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["self-approved"] }));
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["approved"] }));
+
+    const project = loadClaudeProject({
+      cwd: repo,
+      userDir,
+      env: { AGENT_BIN: "frozen-command" },
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+    });
+    expect(project.agentMcpAdmission).toBeDefined();
+    expect(project.agentMcpAdmission!.resolve).toHaveLength(1);
+    const projectAgent = findByName(project.agents, "project-mcp")!;
+    const userAgent = findByName(project.agents, "user-mcp")!;
+
+    expect(project.agentMcpAdmission!.resolve(projectAgent.agentMcp!).servers).toEqual([
+      expect.objectContaining({ name: "approved", source: "subagent-inline", status: "enabled", command: "frozen-command" }),
+      expect.objectContaining({ name: "self-approved", status: "pending-approval", inactiveReason: "mcpjson-unapproved" }),
+    ]);
+    expect(project.agentMcpAdmission!.resolve(userAgent.agentMcp!).servers).toEqual([
+      expect.objectContaining({ name: "user-inline", source: "subagent-inline", status: "enabled", command: "user-command" }),
+    ]);
+  });
+});
+
 describe("loadClaudeProject — multi-scope precedence", () => {
   it("resolves a same-named skill at pkg/root/user scopes to the nearest project one; user-only skills stay usable", () => {
     const { repo, userDir } = makeBase();

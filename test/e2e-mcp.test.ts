@@ -15,6 +15,7 @@ import {
 } from "./helpers/e2e-live.js";
 import { waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from "./helpers/mcp-process.js";
+import type { CapturedRequest } from "./helpers/mock-openai.js";
 
 /**
  * E2E — MCP stdio support: the two headline claims of the feature, proven on
@@ -246,6 +247,80 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
         barrier?.release("prompt-discovery");
         await started?.stop().catch(() => undefined);
         await barrier?.cleanup("prompt-discovery");
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps an inline MCP tool child-only across the real agent loop and closes its process tree",
+    async () => {
+      let barrier: McpProcessFixture | undefined;
+      try {
+        const parent = (request: CapturedRequest) => request.sessionKind === "main";
+        const inlineChild = (request: CapturedRequest) =>
+          request.sessionKind === "child" && systemText(request).includes("INLINE-OWNER-SENTINEL");
+        const unrelatedChild = (request: CapturedRequest) => {
+          const matches = request.sessionKind === "child" && systemText(request).includes("UNRELATED-SENTINEL");
+          if (matches && barrier?.exists("spawn-grandchild.pid") && barrier.exists("grandchild.pid")) {
+            const ownerTree = [barrier.pidOf("spawn-grandchild.pid"), barrier.pidOf("grandchild.pid")];
+            expect(ownerTree.filter(processIsAlive), "owning MCP tree must be dead before the unrelated child starts").toEqual([]);
+          }
+          return matches;
+        };
+        const result = await runPi({
+          classifier: { childSystemMarkers: ["INLINE-OWNER-SENTINEL", "UNRELATED-SENTINEL"] },
+          script: [
+            { when: parent, toolCalls: [{ name: "Agent", args: { subagent_type: "inline-owner", prompt: "use your echo tool", run_in_background: false } }] },
+            { when: inlineChild, toolCalls: [{ name: "mcp__inline__echo", args: { text: "INLINE-CHILD-ROUNDTRIP" } }] },
+            { when: inlineChild, text: "INLINE-CHILD-DONE" },
+            { when: parent, toolCalls: [{ name: "Agent", args: { subagent_type: "unrelated", prompt: "report without MCP", run_in_background: false } }] },
+            { when: unrelatedChild, text: "UNRELATED-DONE" },
+            { when: parent, text: "PARENT-DONE" },
+          ],
+          prompt: "verify agent-scoped MCP isolation",
+          setup(dir) {
+            barrier = createMcpProcessFixture(dir);
+            const agents = path.join(dir, ".claude", "agents");
+            fs.mkdirSync(agents, { recursive: true });
+            fs.writeFileSync(path.join(agents, "inline-owner.md"), [
+              "---", "name: inline-owner", "description: owns inline MCP", "mcpServers:",
+              "  - inline:", `      command: ${JSON.stringify(barrier.nodeCommand)}`,
+              `      args: [${JSON.stringify(barrier.serverScript)}, spawn-grandchild]`,
+              "      env:", `        MCP_BARRIER_DIR: ${JSON.stringify(barrier.dir)}`,
+              "---", "INLINE-OWNER-SENTINEL", "",
+            ].join("\n"));
+            fs.writeFileSync(path.join(agents, "unrelated.md"), [
+              "---", "name: unrelated", "description: unrelated child", "---",
+              "UNRELATED-SENTINEL", "",
+            ].join("\n"));
+            fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"),
+              JSON.stringify({ enabledMcpjsonServers: ["inline"] }, null, 2));
+          },
+        });
+
+        expect(result.code, result.stderr).toBe(0);
+        const parentRequests = result.requests.filter(parent);
+        const inlineRequests = result.requests.filter(inlineChild);
+        const unrelatedRequests = result.requests.filter(unrelatedChild);
+        expect(parentRequests.length).toBeGreaterThanOrEqual(2);
+        expect(inlineRequests).toHaveLength(2);
+        expect(unrelatedRequests).toHaveLength(1);
+        for (const request of parentRequests) expect(toolNames(request)).not.toContain("mcp__inline__echo");
+        expect(toolNames(inlineRequests[0]!)).toContain("mcp__inline__echo");
+        expect(toolResultText(inlineRequests[1]!)).toContain("INLINE-CHILD-ROUNDTRIP");
+        expect(toolNames(unrelatedRequests[0]!)).not.toContain("mcp__inline__echo");
+        expect(barrier!.exists("spawn-grandchild.pid")).toBe(true);
+        expect(barrier!.exists("grandchild.pid")).toBe(true);
+        const pids = [barrier!.pidOf("spawn-grandchild.pid"), barrier!.pidOf("grandchild.pid")];
+        await waitUntil({
+          description: "agent-inline MCP process tree to die before Pi exits",
+          predicate: () => pids.every((pid) => !processIsAlive(pid)),
+          describeObserved: () => `alive=${pids.filter(processIsAlive).join(",")}`,
+          timeoutMs: 10_000,
+        });
+      } finally {
+        await barrier?.cleanup();
       }
     },
     TEST_TIMEOUT_MS,

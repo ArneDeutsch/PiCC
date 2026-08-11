@@ -214,7 +214,7 @@ user-profile base when an override is selected.
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
-| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension; source-specific policy, approval, and disablement apply |
+| MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension, plus `mcpServers:` frontmatter on user/project agents; source-specific policy, approval, and disablement apply |
 | Plugins | enabled qualified identities with matching exact records in imported Claude installed state |
 
 ### Installed plugins
@@ -713,6 +713,29 @@ user profile for user-scoped settings and artifacts, imported installed-plugin s
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
 roots remain in effect.
 
+User/project agent `mcpServers:` lists may reference an eligible session server by name or define an
+inline stdio/HTTP/SSE server. References reuse the main session's published connection; inline servers belong only to
+that dispatch and close before its worktree is released. Managed policy, project approval,
+the `disabledMcpjsonServers` project-decline gate, agent tool filters, permissions, hooks, and timeouts still apply. A published
+session route wins a same-name inline declaration regardless of that declaration's admission status,
+without starting a duplicate or warning. Missing, invalid, blocked, disabled, pending, or
+startup-failed capability produces a bounded warning before the child's first request and around its
+reported result. Cleanup uncertainty is known only after child work, so it preserves and qualifies
+the result and receives one session-shutdown retry. Neither warning shows raw configuration. Inline
+servers do not appear in the parent `/mcp` or `/doctor` live inventory, do not pass to siblings or
+nested children, and keep their launch cwd after a later EnterWorktree. A nested agent with omitted
+or clean-empty `mcpServers` still inherits eligible published main-session routes. When the server must follow,
+enter the desired worktree first and make a fresh `Agent` dispatch; `SendMessage` does not migrate an
+existing agent or its server. In-process resume reuses the original cwd but applies the current loaded definition and policy
+snapshot. Plugin agents diagnose and strip this field; define an equivalent user agent when no project
+change is wanted, define a project agent otherwise, or remove the field from the plugin source.
+Managed agents remain dispatchable, but their `mcpServers` field is retained only as inert evidence
+and ignored. PiCC's non-empty declaration selection and rule that a parent's inline servers do not
+propagate to nested children are inferred, unverified choices. Its cancellation, project approval,
+collision, warning, cwd, and resume rules are likewise PiCC-defined hardening rather than verified
+Claude Code parity. Custom agent definitions cannot execute in the main session; plugin
+MCP/source references, WebSocket, `--strict-mcp-config`, and `--bare` are also unsupported.
+
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →
 project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
 priority, with its existing managed → untracked local → project → user ordering. Fields never merge
@@ -799,8 +822,8 @@ non-protocol HTTP failure bodies/status/redirect targets, and SDK/fetch exceptio
 valid MCP metadata, prompt/resource content, successful tool results, and protocol-level errors
 remain untrusted, server-controlled model content.
 
-Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
-`.claude/settings.json`) are pending by default and never start until you approve them. Approve
+Project-scope MCP servers (`.mcp.json`, `mcpServers` in the committed
+`.claude/settings.json`, or project-agent inline definitions) are pending by default and never start until you approve them. Approve
 selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
 untracked `.claude/settings.local.json`. User approval settings live in `settings.json` inside the
 active user profile directory (`~/.claude/settings.json` by default, or inside the selected override

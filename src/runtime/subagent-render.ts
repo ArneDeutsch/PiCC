@@ -37,6 +37,8 @@ const DETAIL_USABLE_WIDTH = 8;
 const RESIZE_GUIDANCE = "resize";
 /** The condensed fork-degrade warning — NEVER expand-only on a degraded fork. */
 export const RECORD_FORK_MARKER = "⚠ fork degraded";
+const AGENT_MCP_WARNING_PREFIX = "Agent MCP availability warning:";
+const AGENT_MCP_CLEANUP_WARNING_PREFIX = "Agent MCP cleanup warning:";
 
 /** Per-tool-call state shared by Pi across call/result renderer slots. */
 export interface SubagentLifecycleRenderState {
@@ -697,6 +699,23 @@ type LifecycleSegment = {
   /** Summary text may shrink; state, warning markers, and recovery cues may not. */
   elastic?: boolean;
 };
+
+function stripCanonicalMcpQualification(
+  text: string,
+  details: SubagentRenderDetails,
+): string {
+  const qualification = (details.diagnostics ?? [])
+    .map((diagnostic) => diagnostic.message)
+    .filter((message) =>
+      message.startsWith(AGENT_MCP_WARNING_PREFIX) ||
+      message.startsWith(AGENT_MCP_CLEANUP_WARNING_PREFIX),
+    )
+    .filter((message, index, all) => all.indexOf(message) === index)
+    .join("\n");
+  if (!qualification) return text;
+  const frame = `\n\n---\n${qualification}\n---`;
+  return text.endsWith(frame) ? text.slice(0, -frame.length) : text;
+}
 
 function actionableDiagnostics(details: SubagentRenderDetails): Diagnostic[] {
   return (details.diagnostics ?? []).filter((diagnostic) =>
@@ -1459,10 +1478,14 @@ export function renderAgentResult(
       // appends this line) so a FOREGROUND agent whose final message legitimately
       // ends in a `usage:` line is never mutilated; and on details.usage so a
       // background task with none keeps a genuine trailing `usage:` body line.
+      // TaskOutput appends usage after every other canonical frame. Account for
+      // that production envelope first, then strip the exact MCP qualification;
+      // diagnostics render each availability/cleanup warning once for humans.
       let displaySource = boundedBodyText(result);
       if (details.taskId != null && details.usage != null) {
         displaySource = displaySource.replace(/\nusage:[^\n]*$/, "");
       }
+      displaySource = stripCanonicalMcpQualification(displaySource, details);
       // Terminal TaskOutput headers already carry semantic identity, so remove
       // the canonical failed/aborted prose prefix from this display-only body.
       if (chip && (outcome === "failed" || outcome === "aborted")) {
