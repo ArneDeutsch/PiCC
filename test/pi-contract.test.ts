@@ -27,6 +27,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { fakePi } from "./helpers/fake-pi.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import {
   genericCallComponent,
@@ -66,6 +67,63 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isToolCall(block: AssistantMessage["content"][number]): block is ToolCall {
   return block.type === "toolCall";
+}
+
+async function createInstalledContractSession(options: {
+  cwd: string;
+  streamSimple: (model: unknown, context: unknown, options: { signal?: AbortSignal }) => unknown;
+  extensionFactory?: (api: any) => void;
+  sessionManager?: any;
+  enableTools?: boolean;
+}) {
+  const sdk: any = await import("@earendil-works/pi-coding-agent");
+  const settingsManager = sdk.SettingsManager.inMemory();
+  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+  modelRuntime.hasConfiguredAuth = () => true;
+  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
+  modelRuntime.streamSimple = options.streamSimple;
+  const model = {
+    id: "contract-model", name: "Contract Model", api: "openai-completions", provider: "mock",
+    baseUrl: "http://127.0.0.1", reasoning: false, input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+  };
+  const agentDir = join(options.cwd, "agent");
+  const loader = new sdk.DefaultResourceLoader({
+    cwd: options.cwd, agentDir, settingsManager,
+    noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    extensionFactories: options.extensionFactory
+      ? [{ name: "contract-extension", factory: options.extensionFactory }]
+      : [],
+  });
+  await loader.reload();
+  const { session } = await sdk.createAgentSession({
+    cwd: options.cwd, agentDir, settingsManager, modelRuntime, model, resourceLoader: loader,
+    sessionManager: options.sessionManager ?? sdk.SessionManager.inMemory(options.cwd),
+    ...(options.enableTools ? {} : { noTools: "all" }),
+  });
+  return { sdk, session };
+}
+
+function contractAssistantMessage(
+  ai: any,
+  content: any[],
+  stopReason: "stop" | "aborted" | "toolUse" = "stop",
+) {
+  const stream = ai.createAssistantMessageEventStream();
+  const message = {
+    role: "assistant", content,
+    api: "openai-completions", provider: "mock", model: "contract-model",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason, timestamp: Date.now(),
+  };
+  stream.push({ type: "start", partial: message });
+  stream.push({ type: "done", reason: stopReason, message });
+  return stream;
+}
+
+function completedContractMessage(ai: any, text: string, stopReason: "stop" | "aborted" = "stop") {
+  return contractAssistantMessage(ai, text ? [{ type: "text", text }] : [], stopReason);
 }
 
 describe("mock wire request classification", () => {
@@ -1000,6 +1058,518 @@ describe("pi 0.83.0 API contract", () => {
       releaseFirst?.();
       session?.dispose?.();
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("interactive Escape restores real native queues before the prior draft and aborts last", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-interactive-escape-contract-"));
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const ai: any = await import("@earendil-works/pi-ai");
+    const provider = deferred<void>();
+    const operations: string[] = [];
+    let editorText = "prior draft";
+    let run: Promise<void> | undefined;
+    let session: any;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: (_model, _context, options) => {
+          const stream = ai.createAssistantMessageEventStream();
+          void (async () => {
+            await provider.promise;
+            const stopReason = options.signal?.aborted ? "aborted" : "stop";
+            for await (const event of completedContractMessage(ai, "", stopReason)) stream.push(event);
+            stream.end();
+          })();
+          return stream;
+        },
+      }));
+      run = session.prompt("start real streaming queues");
+      await waitUntil({ predicate: () => session.isStreaming, description: "installed session to start streaming" });
+      await session.sendUserMessage("same steering", { deliverAs: "steer" });
+      await session.sendUserMessage("same steering", { deliverAs: "steer" });
+      await session.sendUserMessage("follow-up first", { deliverAs: "followUp" });
+      await session.sendUserMessage("follow-up second", { deliverAs: "followUp" });
+      expect(session.getSteeringMessages()).toEqual(["same steering", "same steering"]);
+      expect(session.getFollowUpMessages()).toEqual(["follow-up first", "follow-up second"]);
+
+      const editor = {
+        getText: () => {
+          operations.push("read:prior draft");
+          return editorText;
+        },
+        setText: (text: string) => {
+          editorText = text;
+          operations.push(`write:${text}`);
+        },
+      };
+      const originalAbort = session.agent.abort.bind(session.agent);
+      vi.spyOn(session.agent, "abort").mockImplementation(() => {
+        operations.push(`abort:${editorText}`);
+        return originalAbort();
+      });
+      const mode: any = Object.create(sdk.InteractiveMode.prototype);
+      mode.runtimeHost = { session };
+      mode.defaultEditor = { onAction: () => undefined };
+      mode.editor = editor;
+      mode.ui = {};
+      mode.compactionQueuedMessages = [];
+      mode.updatePendingMessagesDisplay = () => operations.push("queue-display");
+      mode.setupKeyHandlers();
+
+      mode.defaultEditor.onEscape();
+
+      const restored = "same steering\n\nsame steering\n\nfollow-up first\n\nfollow-up second\n\nprior draft";
+      expect(editorText).toBe(restored);
+      expect(session.getSteeringMessages()).toEqual([]);
+      expect(session.getFollowUpMessages()).toEqual([]);
+      expect(operations).toEqual([
+        "read:prior draft",
+        `write:${restored}`,
+        "queue-display",
+        `abort:${restored}`,
+      ]);
+      provider.resolve();
+      await run;
+    } finally {
+      provider.resolve();
+      await run?.catch(() => undefined);
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("extension sendMessage is fire-and-forget and reports an asynchronous rejection", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-send-message-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    let extensionApi: any;
+    let session: any;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: () => completedContractMessage(ai, "unused"),
+        extensionFactory: (api) => { extensionApi = api; },
+      }));
+      const emitted = vi.spyOn(session.extensionRunner, "emitError");
+      session.sendCustomMessage = async () => {
+        throw new Error("asynchronous delivery rejection");
+      };
+
+      expect(extensionApi.sendMessage(
+        { customType: "contract-fire-and-forget", content: "payload", display: false },
+        { triggerTurn: true },
+      )).toBeUndefined();
+      await waitUntil({
+        predicate: () => emitted.mock.calls.length === 1,
+        description: "sendMessage rejection to reach the extension error channel",
+      });
+      expect(emitted).toHaveBeenCalledWith(expect.objectContaining({
+        event: "send_message",
+        error: "asynchronous delivery rejection",
+      }));
+    } finally {
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("authenticates eligible custom-message consumption and purges child queues before abort", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-custom-queue-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const firstProvider = deferred<void>();
+    const purgeProvider = deferred<void>();
+    const agentEndJoin = deferred<void>();
+    const providerCalls: any[] = [];
+    const authenticatedStarts: any[] = [];
+    const observed: Array<{ type: string; stopReason?: string; streaming?: boolean }> = [];
+    const settledPayloads: any[] = [];
+    const extensionEvents: string[] = [];
+    let holdAgentEnd = false;
+    let purgeUser: any;
+    let purgeAssistant: any;
+    let purgeAgentEnd: any;
+    let holdPurgeProvider = false;
+    let session: any;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: (_model, context, options) => {
+          const stream = ai.createAssistantMessageEventStream();
+          const index = providerCalls.push(structuredClone(context)) - 1;
+          void (async () => {
+            if (index === 0) await firstProvider.promise;
+            if (holdPurgeProvider) {
+              holdPurgeProvider = false;
+              await purgeProvider.promise;
+            }
+            const stopReason = options.signal?.aborted ? "aborted" : "stop";
+            const result = completedContractMessage(ai, stopReason === "aborted" ? "" : `answer-${index}`, stopReason);
+            for await (const event of result) stream.push(event);
+            stream.end();
+          })();
+          return stream;
+        },
+        extensionFactory: (api) => {
+          api.on("message_start", (event: any) => {
+            if (event.message?.role !== "custom") return;
+            authenticatedStarts.push(structuredClone(event.message));
+            if (isRecord(event.message.details)) delete event.message.details.nonce;
+          });
+          api.on("agent_end", async (event: any) => {
+            extensionEvents.push("agent_end-entered");
+            if (holdAgentEnd) {
+              purgeAgentEnd = event;
+              await agentEndJoin.promise;
+            }
+            extensionEvents.push("agent_end-released");
+          });
+        },
+      }));
+      session.subscribe((event: any) => {
+        if (event.type === "message_end" && holdAgentEnd && event.message?.role === "user") {
+          purgeUser = event.message;
+        }
+        if (event.type === "message_end" && event.message?.role === "assistant") {
+          observed.push({ type: "assistant_end", stopReason: event.message.stopReason });
+          if (holdAgentEnd && event.message.stopReason === "aborted") purgeAssistant = event.message;
+        }
+        if (event.type === "agent_end" || event.type === "agent_settled") {
+          observed.push({ type: event.type, streaming: session.isStreaming });
+          if (event.type === "agent_settled") settledPayloads.push(structuredClone(event));
+        }
+      });
+
+      const firstRun = session.prompt("start");
+      await waitUntil({ predicate: () => providerCalls.length === 1, description: "first provider call" });
+      const steerEnvelope = {
+        customType: "picc-retained", content: "same payload", display: false,
+        details: { occurrenceId: "steer-1", mode: "steer", nonce: "steer-secret" },
+      };
+      const implicitOmittedEnvelope = {
+        customType: "picc-implicit", content: "omitted options", display: false,
+        details: { occurrenceId: "implicit-omitted", nonce: "implicit-secret" },
+      };
+      const implicitStreamingTriggerEnvelope = {
+        customType: "picc-implicit", content: "streaming trigger", display: false,
+        details: { occurrenceId: "implicit-stream-trigger", nonce: "implicit-trigger-secret" },
+      };
+      const followEnvelope = {
+        customType: "picc-retained", content: [{ type: "text", text: "follow payload" }], display: false,
+        details: { occurrenceId: "follow-1", mode: "followUp", nonce: "follow-secret" },
+      };
+      const expectedExplicitEnvelopes = structuredClone([steerEnvelope, followEnvelope]);
+      await session.sendCustomMessage(steerEnvelope, { deliverAs: "steer" });
+      await session.sendCustomMessage(implicitOmittedEnvelope);
+      await session.sendCustomMessage(implicitStreamingTriggerEnvelope, { triggerTurn: true });
+      await session.sendCustomMessage(followEnvelope, { deliverAs: "followUp" });
+      expect(providerCalls).toHaveLength(1);
+      expect(authenticatedStarts).toEqual([]);
+      firstProvider.resolve();
+      await firstRun;
+
+      expect(providerCalls).toHaveLength(5);
+      expect(authenticatedStarts.slice(0, 4).map((message) => message.details.occurrenceId)).toEqual([
+        "steer-1",
+        "implicit-omitted",
+        "implicit-stream-trigger",
+        "follow-1",
+      ]);
+      expect(authenticatedStarts[0]).toEqual(expect.objectContaining(expectedExplicitEnvelopes[0]));
+      expect(authenticatedStarts[3]).toEqual(expect.objectContaining(expectedExplicitEnvelopes[1]));
+      const persistedFirstQueue = session.sessionManager.getBranch()
+        .filter((entry: any) => entry.type === "custom_message")
+        .slice(0, 4);
+      expect(persistedFirstQueue.map((entry: any) => entry.details)).toEqual([
+        { occurrenceId: "steer-1", mode: "steer" },
+        { occurrenceId: "implicit-omitted" },
+        { occurrenceId: "implicit-stream-trigger" },
+        { occurrenceId: "follow-1", mode: "followUp" },
+      ]);
+
+      const observedBeforePurge = observed.length;
+      const extensionEventsBeforePurge = extensionEvents.length;
+      holdAgentEnd = true;
+      holdPurgeProvider = true;
+      const providerCallsBeforePurge = providerCalls.length;
+      const purgeRun = session.prompt("purge queued continuations");
+      await waitUntil({
+        predicate: () => providerCalls.length === providerCallsBeforePurge + 1,
+        description: "purge provider call",
+      });
+      await session.sendCustomMessage({
+        customType: "picc-retained", content: "purged steer", display: false,
+        details: { occurrenceId: "purged-steer", mode: "steer", nonce: "purged" },
+      }, { deliverAs: "steer" });
+      await session.sendCustomMessage({
+        customType: "picc-retained", content: "purged follow", display: false,
+        details: { occurrenceId: "purged-follow", mode: "followUp", nonce: "purged" },
+      }, { deliverAs: "followUp" });
+      await session.sendCustomMessage({
+        customType: "picc-retained", content: "next turn survives", display: false,
+        details: { occurrenceId: "next-turn", mode: "nextTurn", nonce: "next-secret" },
+      }, { deliverAs: "nextTurn" });
+
+      expect(session.clearQueue()).toEqual({ steering: [], followUp: [] });
+      const aborting = session.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(observed.slice(observedBeforePurge).filter((event) => event.type === "agent_settled")).toEqual([]);
+      expect(session.isStreaming).toBe(true);
+      expect(providerCalls).toHaveLength(providerCallsBeforePurge + 1);
+
+      purgeProvider.resolve();
+      await waitUntil({
+        predicate: () => extensionEvents.length > extensionEventsBeforePurge
+          && extensionEvents.at(-1) === "agent_end-entered",
+        description: "aborted physical run to enter its final agent_end join",
+      });
+      expect(observed.slice(observedBeforePurge)).toContainEqual({ type: "assistant_end", stopReason: "aborted" });
+      expect(purgeAssistant?.stopReason).toBe("aborted");
+      expect(purgeAgentEnd).toEqual({ type: "agent_end", messages: [purgeUser, purgeAssistant] });
+      expect(purgeAgentEnd.messages.at(-1)).toBe(purgeAssistant);
+      expect(observed.slice(observedBeforePurge).some((event) => event.type === "agent_settled")).toBe(false);
+      expect(session.isStreaming).toBe(true);
+      agentEndJoin.resolve();
+      await Promise.all([purgeRun, aborting]);
+
+      expect(observed.slice(-3)).toEqual([
+        { type: "assistant_end", stopReason: "aborted" },
+        { type: "agent_end", streaming: true },
+        { type: "agent_settled", streaming: false },
+      ]);
+      expect(settledPayloads.at(-1)).toEqual({ type: "agent_settled" });
+      expect(providerCalls).toHaveLength(providerCallsBeforePurge + 1);
+      expect(authenticatedStarts.map((message) => message.details.occurrenceId))
+        .not.toContain("purged-steer");
+      expect(authenticatedStarts.map((message) => message.details.occurrenceId))
+        .not.toContain("purged-follow");
+
+      holdAgentEnd = false;
+      await session.prompt("explicit later turn");
+      expect(providerCalls).toHaveLength(providerCallsBeforePurge + 2);
+      expect(authenticatedStarts.at(-1)).toMatchObject({
+        customType: "picc-retained",
+        content: "next turn survives",
+        details: { occurrenceId: "next-turn", mode: "nextTurn", nonce: "next-secret" },
+      });
+
+      await session.sendCustomMessage({
+        customType: "picc-retained", content: "direct trigger", display: false,
+        details: { occurrenceId: "direct-trigger", mode: "triggerTurn", nonce: "direct-secret" },
+      }, { triggerTurn: true });
+      expect(providerCalls).toHaveLength(providerCallsBeforePurge + 3);
+      expect(authenticatedStarts.at(-1)).toMatchObject({
+        customType: "picc-retained",
+        content: "direct trigger",
+        details: { occurrenceId: "direct-trigger", mode: "triggerTurn", nonce: "direct-secret" },
+      });
+      expect(session.sessionManager.getBranch().at(-2)?.details).toEqual({
+        occurrenceId: "direct-trigger",
+        mode: "triggerTurn",
+      });
+
+      let persistedBeforeEvent = false;
+      const unsubscribe = session.subscribe((event: any) => {
+        if (event.type === "message_start" && event.message?.customType === "picc-no-trigger") {
+          persistedBeforeEvent = session.sessionManager.getBranch().some(
+            (entry: any) => entry.type === "custom_message" && entry.customType === "picc-no-trigger",
+          );
+        }
+      });
+      await session.sendCustomMessage({
+        customType: "picc-no-trigger", content: "persist only", display: false,
+        details: { occurrenceId: "no-trigger", nonce: "not-authenticated" },
+      });
+      unsubscribe();
+      expect(persistedBeforeEvent).toBe(true);
+      expect(providerCalls).toHaveLength(providerCallsBeforePurge + 3);
+      expect(authenticatedStarts.map((message) => message.customType)).not.toContain("picc-no-trigger");
+    } finally {
+      firstProvider.resolve();
+      purgeProvider.resolve();
+      agentEndJoin.resolve();
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for installed deferred tool work before abort and final settlement complete", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-tool-abort-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const { Type } = await import("typebox");
+    const toolEntered = deferred<void>();
+    const toolAborted = deferred<void>();
+    const toolRelease = deferred<void>();
+    const observed: any[] = [];
+    let toolSignal: AbortSignal | undefined;
+    let session: any;
+    let run: Promise<void> | undefined;
+    let aborting: Promise<void> | undefined;
+    try {
+      let providerCall = 0;
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: (_model, _context, options) => {
+          if (providerCall++ === 0) {
+            return contractAssistantMessage(ai, [{
+              type: "toolCall",
+              id: "deferred-tool-call",
+              name: "deferred_contract_tool",
+              arguments: {},
+            }], "toolUse");
+          }
+          return completedContractMessage(ai, "", options.signal?.aborted ? "aborted" : "stop");
+        },
+        enableTools: true,
+        extensionFactory: (api) => {
+          api.registerTool({
+            name: "deferred_contract_tool",
+            label: "Deferred contract tool",
+            description: "Installed deterministic tool join contract",
+            parameters: Type.Object({}),
+            execute: async (
+              _toolCallId: string,
+              _params: unknown,
+              signal: AbortSignal | undefined,
+            ) => {
+              toolSignal = signal;
+              if (signal?.aborted) toolAborted.resolve();
+              else signal?.addEventListener("abort", () => toolAborted.resolve(), { once: true });
+              toolEntered.resolve();
+              await toolRelease.promise;
+              return { content: [{ type: "text", text: "released" }], details: {} };
+            },
+          });
+        },
+      }));
+      session.subscribe((event: any) => {
+        if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+          observed.push({ type: event.type, toolCallId: event.toolCallId });
+        } else if (event.type === "message_end" && event.message?.role === "assistant") {
+          observed.push({ type: "assistant_end", message: event.message });
+        } else if (event.type === "agent_end") {
+          observed.push({ type: "agent_end", messages: event.messages });
+        } else if (event.type === "agent_settled") {
+          observed.push(structuredClone(event));
+        }
+      });
+
+      let runDone = false;
+      let abortDone = false;
+      const activeRun = session.prompt("run deferred installed tool") as Promise<void>;
+      run = activeRun;
+      void activeRun.then(() => { runDone = true; });
+      await toolEntered.promise;
+      expect(toolSignal?.aborted).toBe(false);
+      const activeAbort = session.abort() as Promise<void>;
+      aborting = activeAbort;
+      void activeAbort.then(() => { abortDone = true; });
+      await toolAborted.promise;
+
+      expect(toolSignal?.aborted).toBe(true);
+      expect(runDone).toBe(false);
+      expect(abortDone).toBe(false);
+      expect(session.isStreaming).toBe(true);
+      expect(observed.some((event) => event.type === "tool_execution_end")).toBe(false);
+      expect(observed.some((event) => event.type === "agent_settled")).toBe(false);
+
+      toolRelease.resolve();
+      await Promise.all([activeRun, activeAbort]);
+
+      expect(runDone).toBe(true);
+      expect(abortDone).toBe(true);
+      const toolEndIndex = observed.findIndex((event) => event.type === "tool_execution_end");
+      const terminalIndex = observed.findIndex(
+        (event) => event.type === "assistant_end" && event.message.stopReason === "aborted",
+      );
+      const agentEndIndex = observed.findIndex((event) => event.type === "agent_end");
+      const settledIndex = observed.findIndex((event) => event.type === "agent_settled");
+      expect(toolEndIndex).toBeGreaterThan(-1);
+      expect(terminalIndex).toBeGreaterThan(toolEndIndex);
+      expect(agentEndIndex).toBeGreaterThan(terminalIndex);
+      expect(settledIndex).toBeGreaterThan(agentEndIndex);
+      expect(observed[agentEndIndex].messages.at(-1)).toBe(observed[terminalIndex].message);
+      expect(observed[settledIndex]).toEqual({ type: "agent_settled" });
+      expect(session.isStreaming).toBe(false);
+    } finally {
+      toolRelease.resolve();
+      await Promise.all([run?.catch(() => undefined), aborting?.catch(() => undefined)]);
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("persists an exact ordered shutdown report before return and reopens it durably", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "picc-shutdown-receipt-contract-"));
+    try {
+      const manager = SessionManager.create(dir, dir, { id: "shutdown-receipt" });
+      const firstKept = manager.appendMessage({ role: "user", content: "already complete" } as never);
+      manager.appendMessage({
+        role: "assistant", content: [{ type: "text", text: "flushed" }], stopReason: "stop",
+      } as never);
+      manager.appendCompaction("committed compacted summary", firstKept, 10_000);
+      const sessionFile = manager.getSessionFile();
+      expect(sessionFile).toBeTruthy();
+      expect(SessionManager.open(sessionFile!, dir, dir).getBranch())
+        .toContainEqual(expect.objectContaining({ type: "compaction", summary: "committed compacted summary" }));
+
+      const occurrences = [
+        {
+          id: 1,
+          generation: 7,
+          sessionId: "main-session",
+          delivery: "steer",
+          content: "first retained message",
+        },
+        {
+          id: 2,
+          generation: 7,
+          sessionId: "main-session",
+          delivery: "steer",
+          content: [{ type: "text", text: "second retained message" }],
+        },
+        {
+          id: 3,
+          generation: 7,
+          sessionId: "main-session",
+          delivery: "followUp",
+          content: "third retained message",
+        },
+      ];
+      const marker = `shutdown-report-${randomBytes(8).toString("hex")}`;
+      const exactReportData = { marker, occurrences };
+      let exactPersistedEntry: any;
+      const appendBeforeShutdownReturns = async () => {
+        const entryId = manager.appendCustomEntry("picc-retained-input-report", exactReportData);
+        exactPersistedEntry = structuredClone(
+          manager.getBranch().find((entry: any) => entry.id === entryId),
+        );
+        expect(exactPersistedEntry.data).toEqual(exactReportData);
+        const onDisk = readFileSync(sessionFile!, "utf8")
+          .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+        expect(onDisk.at(-1)).toEqual(exactPersistedEntry);
+      };
+      await appendBeforeShutdownReturns();
+
+      const reopened = SessionManager.open(sessionFile!, dir, dir);
+      expect(reopened.getBranch().at(-1)).toEqual(exactPersistedEntry);
+
+      const ephemeral = SessionManager.inMemory(dir);
+      const ephemeralMarker = `ephemeral-${randomBytes(8).toString("hex")}`;
+      const ephemeralId = ephemeral.appendCustomEntry(
+        "picc-retained-input-report",
+        { marker: ephemeralMarker, occurrences },
+      );
+      const exactEphemeralEntry = structuredClone(
+        ephemeral.getBranch().find((entry: any) => entry.id === ephemeralId),
+      );
+      expect(ephemeral.getBranch().at(-1)).toEqual(exactEphemeralEntry);
+      expect(ephemeral.isPersisted()).toBe(false);
+      expect(ephemeral.getSessionFile()).toBeUndefined();
+      const reopenedWithoutEphemeral = SessionManager.open(sessionFile!, dir, dir);
+      expect(reopenedWithoutEphemeral.getBranch().at(-1)).toEqual(exactPersistedEntry);
+      expect(reopenedWithoutEphemeral.getBranch()).not.toContainEqual(exactEphemeralEntry);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
