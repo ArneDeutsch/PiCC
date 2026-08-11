@@ -67,7 +67,7 @@ disables Pi's checker. An externally configured `PI_SKIP_VERSION_CHECK` remains 
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
 | Env & exec | PiCC resolves its Git executable from the absolute `PICC_GIT` override or PATH. Startup/worktree Git uses `node:child_process.execFile` with sanitized inherited environment because `pi.exec` options do not accept `env`; hooks use `spawn` for their shell/stdin JSON contract. Pi Bash factories default to exposing `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; PiCC passes `exposeSessionEnvironment:false`, then overlays sanitized `setting.env` and the required project-root `CLAUDE_PROJECT_DIR`. Direct RPC Bash traverses the composed `user_bash` event chain once: embedded-launch suppression clears before execution and the Git Bash-pinned local operations execute the command without a model turn. |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
-| Control output, checkpoint records, and status notifications | While the TUI renderer is live, checkpoint preparation uses `ctx.ui.notify` and actionable outcomes use model-inert `pi.appendEntry` records with a `pi.registerEntryRenderer`; after renderer shutdown, actionable outcomes fall back to stderr. In TUI, Pi's native indicator owns temporary physical-compaction progress and its native card owns the sole routine success record. `ctx.ui.setStatus(key, text | undefined)` is persistent keyed footer state used elsewhere. TUI presentation is gated on `ctx.mode === "tui"`; print stderr and JSON/RPC lifecycle entry channels are unchanged. |
+| Control output, checkpoint records, and status notifications | While the TUI renderer is live, checkpoint preparation uses `ctx.ui.notify` and actionable outcomes use model-inert `pi.appendEntry` records with a `pi.registerEntryRenderer`; after renderer shutdown, actionable outcomes fall back to stderr. In TUI, Pi's native indicator owns temporary physical-compaction progress and its native card owns the sole routine success record. `ctx.ui.setStatus(key, text | undefined)` is persistent keyed footer state used elsewhere. TUI presentation is gated on `ctx.mode === "tui"`; print stderr and JSON/RPC lifecycle entry channels are unchanged. Print, JSON, and non-reusable RPC checkpoint endings latch status 3; a reusable live RPC cancellation does not. |
 | Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with `{ expanded: boolean; outputPad: number }`, where `expanded` is controlled by the configured `app.tools.expand` action (Ctrl+O by default); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
 | MCP tool exposure (the transaction is created during extension load; stable proxies and conditional resource tools register later, once non-blocking initial server settlement publishes capability snapshots) | Post-load `pi.registerTool` of a NEW name: with no `tools:` allowlist (the main-session reality) Pi's registry refresh auto-activates the name on the next request, and a snippet-less tool leaves the base system prompt byte-identical. Remote recovery reuses the original proxies, fixed resource definitions, and immutable catalogs rather than registering replacements. No discovered proxies means no proxy schemas; no advertised resource capability in the settled initial snapshots means neither fixed resource schema — the two capability-specific zero-context guarantees. Pinned against the real Pi dist in `test/mcp-registration.test.ts`. |
 | Resource discovery, skill listing, and Claude-format slash commands | We do **not** feed `.claude/skills` or MCP prompts through Pi's own skill discovery or model-facing `SlashCommand` surface (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`; MCP prompts are user-input transforms). PiCC owns the Claude skill pipeline; the later async `resources_discover` event awaits the settled exposure transaction before publishing bounded frontmatter-only prompt paths for eligible skills and MCP prompt commands. Pi's native `.pi/`/`.agents/` discovery stays untouched. |
@@ -150,6 +150,15 @@ token-counted retention policy and can under- or over-retain it. `PreCompact` ru
 SessionStart(compact) and PostCompact run only after commit. Replayed input remains in
 session/generation-bound custody until an authenticated matching `message_start` consumes it or
 settlement reports it for recovery; synchronous enqueue acceptance alone does not release custody.
+Pi 0.83 exposes queued steering before follow-ups, preserves equal occurrences, restores those queues
+around compaction, and reconstructs the outer custom-message object at `message_start` while preserving
+the exact `details` value. PiCC binds one lease to an opaque details-envelope identity for every
+active-generation restoration or continuation send, then scrubs and revokes it at exact start. The
+host send API is fire-and-forget: return, timeout, transcript absence, content equality, or an
+uncorrelated asynchronous rejection proves neither start nor failure. A missing exact start therefore
+expires as unconfirmed host custody rather than successful delivery. The exact authenticated deadline
+exception is `UnconfirmedHostDeadlineError`; `session_shutdown` must propagate it before MCP release,
+SessionEnd, or ordinary cleanup rather than treating it as a normal shutdown.
 
 `proactiveCompactPercent` defaults to 90. A fresh successful tool-requesting assistant
 `message_end` can queue pressure from its final usage; already-requested tools still finish. At
@@ -177,8 +186,18 @@ fresh public in-memory settings with only PiCC's existing compaction and shell o
 effective defaults remain Pi's. A configured summary retry budget changes attempts inside the
 transaction, never the number of PiCC checkpoint transactions. Main cancellation is logical: it
 blocks ordinary work and continuation while joining bounded Pi settlement, which may finish
-configured summary retries. Child cancellation
-physically aborts compaction through the SDK and joins it. Split summarization operations qualify
+configured summary retries. After the first resume, `cancelled` requires the exact selected-branch assistant
+object to end `aborted` and then the same run's `agent_settled`; abort intent, `pending`/`error`, stale
+or replacement settlement, and missing settlement remain unsafe. Confirmed live recovery starts no second
+continuation or retained-input replay, but effects from that first resumed run may exist. Confirmed shutdown
+uses the same exact join but cannot claim a stopped editor or reusable session; unresolved retained input gets
+an explicit possible-loss warning and ordinary shutdown continues. The continuation stage is
+advanced immediately before its hidden trigger, so every terminal record names the stage actually
+reached. Child cancellation
+physically aborts compaction through the SDK and joins it. At confirmed shutdown, each canonical child report
+gets one bounded best-effort persistence attempt before cleanup: exact reopened session-entry or recovery-file
+verification emits a locator, while complete storage failure warns of possible loss and continues cleanup and
+`SessionEnd`. Unconfirmed child work remains quarantined and blocks cleanup. Split summarization operations qualify
 independently under Pi's policy; PiCC neither pools nor multiplies their retry budgets. A blocked
 `PreCompact` remains policy exhaustion and is not made retryable. The settled-idle sample remains a
 non-resuming fallback.
@@ -190,10 +209,11 @@ Pi; deterministic provider, quota, authentication, initial cancellation, and hoo
 fast or terminate by category. Confirmed pre-commit operational or hook exhaustion retains a
 manually recoverable boundary. An unconfirmed-host ending instead is process-terminal: it permits
 neither in-process recovery nor replacement and requires a fresh process and fresh session.
-Authoritative observation of the current generation's `session_compact` marks the summary committed;
-every later callback error, rejection, cancellation ambiguity, stale settlement, restoration, replay,
-provider release, or continuation failure then requires replacement and must not mint recovery
-authority or compact that summary again.
+Authoritative observation of the current generation's `session_compact` marks the summary committed.
+Except for the exact authenticated aborted-terminal/same-branch settlement described above, every later
+callback error, rejection, cancellation ambiguity, stale settlement, restoration, replay, provider
+release, or continuation failure requires replacement and must not mint recovery authority or compact
+that summary again.
 
 Pi's native summary retry callbacks and child `summarization_retry_scheduled`,
 `summarization_retry_attempt_start`, and `summarization_retry_finished` events are observability

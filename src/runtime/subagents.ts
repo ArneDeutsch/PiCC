@@ -1081,7 +1081,9 @@ class ChildCheckpointCoordinator {
       pi.on("agent_settled", async (_event, ctx) => child.settled(ctx));
       pi.on("session_before_compact", async (event) => child.beforeCompact(event));
       pi.on("session_compact", async (event) => child.afterCompact(event));
-      pi.on("session_shutdown", async () => child.cancel("shutdown"));
+      // A child session boundary may confirm cancellation, but parent-session
+      // persistence must authorize retained cleanup separately.
+      pi.on("session_shutdown", async () => child.cancel("shutdown", true));
     };
   }
 
@@ -1156,16 +1158,39 @@ class ChildCheckpointCoordinator {
     attempt?: CheckpointStopAttemptIdentity,
   ): Promise<CheckpointStopTerminalEvidence | void> {
     const controller = this.gate.currentController();
-    const generation = controller.snapshot().generation;
-    await this.cancel("task-stop");
-    if (!attempt || attempt.agentId !== this.agentId) return;
+    const before = controller.snapshot();
+    const generation = before.generation;
+    const retained = this.retained;
+    const safePreCommitCleanup = before.phase === "exhausted" && before.cancellationCommitted !== true &&
+      (before.failureCategory === "operational" || before.failureCategory === "hook-blocked");
+    const deferCleanup = attempt?.deferCleanup === true && !safePreCommitCleanup;
+    await this.cancel(deferCleanup ? "shutdown" : "task-stop", deferCleanup);
+    if (!attempt || attempt.agentId !== this.agentId || attempt.dispatchGeneration !== generation) return;
+    if (this.gate.currentController() !== controller || controller.snapshot().generation !== generation) return;
+    if (safePreCommitCleanup && retained && this.retained === retained && retained.cleanupPromise && !this.isQuarantined()) {
+      return Object.freeze({
+        confirmed: true as const,
+        attemptId: attempt.attemptId,
+        kind: "ordinary-cleanup" as const,
+      });
+    }
     const report = this.cancellationRecovery?.registry.get(this.agentId)?.retainedInputReport;
-    if (this.gate.currentController() !== controller || controller.snapshot().generation !== generation ||
-        !report || report.generation !== generation) return;
-    return Object.freeze({ confirmed: true as const, attemptId: attempt.attemptId, report });
+    if (!report || report.generation !== generation) return;
+    const releaseCleanup = deferCleanup && retained
+      ? async (attemptId: object): Promise<void> => {
+          if (attemptId !== attempt.attemptId || this.retained !== retained || this.isQuarantined()) {
+            throw new Error("checkpoint cleanup authority is stale");
+          }
+          await this.claimRetainedCleanup(retained, "aborted");
+        }
+      : undefined;
+    return Object.freeze({
+      confirmed: true as const, attemptId: attempt.attemptId, report,
+      ...(releaseCleanup ? { releaseCleanup } : {}),
+    });
   }
 
-  async cancel(kind: CancellationKind): Promise<void> {
+  async cancel(kind: CancellationKind, deferRetainedCleanup = false): Promise<void> {
     const retained = this.retained;
     if (retained) retained.stopping = true;
     const session = this.session;
@@ -1186,7 +1211,7 @@ class ChildCheckpointCoordinator {
         if (!this.isQuarantined()) this.cancellationRecovery.registry.quarantineCheckpoint(this.agentId);
         throw error;
       }
-      if (retained) await this.claimRetainedCleanup(retained, "aborted");
+      if (retained && !deferRetainedCleanup) await this.claimRetainedCleanup(retained, "aborted");
       return;
     }
     const cancellation = this.gate.cancel(kind);
@@ -1199,7 +1224,7 @@ class ChildCheckpointCoordinator {
     await retained?.operation?.catch(() => undefined);
     await cancellation;
     await controller.stableBarrier(generation);
-    if (retained) await this.claimRetainedCleanup(retained, "aborted");
+    if (retained && !deferRetainedCleanup) await this.claimRetainedCleanup(retained, "aborted");
   }
 
   private deliverParentInput(
@@ -1826,6 +1851,7 @@ export interface StopAllSubagentOutcome {
   report?: RetainedInputReport;
   stopRequested: boolean;
   persisted?: boolean;
+  cleanupReleased?: boolean;
 }
 
 export interface StopAllSubagentSessionResult {
@@ -1836,7 +1862,9 @@ export interface StopAllSubagentSessionResult {
 
 export class SubagentRuntime {
   private readonly semaphore: Semaphore;
+  private readonly attemptedRetainedPersistence = new WeakSet<object>();
   private readonly persistedRetainedReports = new WeakSet<object>();
+  private readonly releasedRetainedCleanup = new WeakSet<object>();
   /**
    * Per-depth budgets for nested BACKGROUND dispatches. Each `depth ≥ 2`
    * gets its own `Semaphore` sized like the root, created lazily. A dispatch
@@ -1918,7 +1946,8 @@ export class SubagentRuntime {
         // Quarantine is process-terminal authority: never call the adapter again.
       } else if (record?.state === "running" && record.checkpointPaused) {
         stopRequested = true;
-        await registry.stopCheckpoint(record.agentId, "session");
+        const stopped = await registry.stopCheckpoint(record.agentId, "session");
+        if (stopped.disposition === "ordinary-cleanup") continue;
         record = registry.get(initial.agentId);
       } else if (!record?.retainedInputReport) {
         continue;
@@ -1927,33 +1956,56 @@ export class SubagentRuntime {
         record = registry.get(initial.agentId);
       }
       const report = record?.retainedInputReport;
-      const disposition = record?.checkpointQuarantined || record?.checkpointStopState !== "confirmed" || !report
-        ? "unconfirmed"
-        : "confirmed";
-      let persisted: boolean | undefined;
-      if (disposition === "confirmed" && report && options.persist && !this.persistedRetainedReports.has(report.reportId)) {
-        try {
-          persisted = await options.persist(report) === true;
-        } catch {
-          persisted = false;
-        }
-        if (persisted) this.persistedRetainedReports.add(report.reportId);
-      } else if (disposition === "confirmed" && report && this.persistedRetainedReports.has(report.reportId)) {
-        persisted = true;
-      }
       outcomes.push({
         agentId: initial.agentId,
-        disposition,
+        disposition: record?.checkpointQuarantined || record?.checkpointStopState !== "confirmed" || !report
+          ? "unconfirmed" : "confirmed",
         ...(report ? { report } : {}),
         stopRequested,
-        ...(persisted !== undefined ? { persisted } : {}),
       });
     }
-    return {
-      outcomes,
-      confirmed: outcomes.filter((outcome) => outcome.disposition === "confirmed").length,
-      unconfirmed: outcomes.filter((outcome) => outcome.disposition === "unconfirmed").length,
-    };
+
+    // Ambiguous cancellation/ownership is not a storage failure. Establish every
+    // disposition before persistence or destructive cleanup so it remains fail-closed.
+    if (outcomes.some((outcome) => outcome.disposition === "unconfirmed")) {
+      return {
+        outcomes,
+        confirmed: outcomes.filter((outcome) => outcome.disposition === "confirmed").length,
+        unconfirmed: outcomes.filter((outcome) => outcome.disposition === "unconfirmed").length,
+      };
+    }
+
+    for (const outcome of outcomes) {
+      const report = outcome.report!;
+      if (this.persistedRetainedReports.has(report.reportId)) {
+        outcome.persisted = true;
+      } else if (options.persist && !this.attemptedRetainedPersistence.has(report.reportId)) {
+        this.attemptedRetainedPersistence.add(report.reportId);
+        try {
+          outcome.persisted = await options.persist(report) === true;
+        } catch {
+          outcome.persisted = false;
+        }
+        if (outcome.persisted) this.persistedRetainedReports.add(report.reportId);
+      } else if (this.attemptedRetainedPersistence.has(report.reportId)) {
+        outcome.persisted = false;
+      }
+
+      // Confirmed shutdown persistence is best effort. Cleanup still releases exactly
+      // once after the one persistence attempt; only ambiguous cleanup authority blocks.
+      if (this.releasedRetainedCleanup.has(report.reportId)) {
+        outcome.cleanupReleased = true;
+      } else {
+        try {
+          await registry.releaseCheckpointCleanup(outcome.agentId, report);
+          this.releasedRetainedCleanup.add(report.reportId);
+          outcome.cleanupReleased = true;
+        } catch {
+          outcome.cleanupReleased = false;
+        }
+      }
+    }
+    return { outcomes, confirmed: outcomes.length, unconfirmed: 0 };
   }
 
   /** Session-local shutdown barrier for every retained child of this runtime. */

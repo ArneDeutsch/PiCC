@@ -52,16 +52,29 @@ export interface CheckpointStopAttemptIdentity {
   readonly attemptId: object;
   readonly agentId: string;
   readonly dispatchGeneration: number;
+  /** Session shutdown defers destructive cleanup until its one report-persistence attempt completes. */
+  readonly deferCleanup?: true;
 }
 
-export interface CheckpointStopTerminalEvidence {
-  readonly confirmed: true;
-  readonly attemptId: object;
-  readonly report: RetainedInputReport;
-}
+export type CheckpointStopTerminalEvidence =
+  | {
+      readonly confirmed: true;
+      readonly attemptId: object;
+      readonly kind?: "retained-report";
+      readonly report: RetainedInputReport;
+      /** Exact-attempt authority retained until shutdown's one persistence attempt completes. */
+      readonly releaseCleanup?: (attemptId: object) => Promise<void>;
+    }
+  | {
+      readonly confirmed: true;
+      readonly attemptId: object;
+      readonly kind: "ordinary-cleanup";
+      readonly report?: never;
+      readonly releaseCleanup?: never;
+    };
 
 export interface CheckpointStopDisposition {
-  readonly disposition: "confirmed" | "unconfirmed";
+  readonly disposition: "confirmed" | "ordinary-cleanup" | "unconfirmed";
   readonly report?: RetainedInputReport;
 }
 
@@ -184,6 +197,8 @@ export interface SubagentRegistryRecord {
   retainedInputReport?: RetainedInputReport;
   /** Dispatch generation in which the canonical report was stored; stale retained reports never confirm a resumed stop. */
   retainedInputReportDispatchGeneration?: number;
+  /** Exact generation whose non-deferred stop already completed destructive cleanup. */
+  retainedInputCleanupReleasedDispatchGeneration?: number;
   /** Process-terminal checkpoint ambiguity; no later lifecycle mutation is authorized. */
   checkpointQuarantined?: boolean;
   /** Nonterminal ownership while an opted-in consumer joins checkpoint cancellation. */
@@ -291,9 +306,19 @@ interface CheckpointStopFlight {
   readonly settlement: Promise<CheckpointStopDisposition>;
 }
 
+interface CheckpointCleanupAuthority {
+  readonly record: SubagentRegistryRecord;
+  readonly dispatchGeneration: number;
+  readonly report: RetainedInputReport;
+  readonly attemptId: object;
+  readonly release: (attemptId: object) => Promise<void>;
+  settlement?: Promise<void>;
+}
+
 export class SubagentRegistry {
   private readonly records = new Map<string, SubagentRegistryRecord>();
   private readonly checkpointStopFlights = new Map<string, CheckpointStopFlight>();
+  private readonly checkpointCleanupAuthorities = new Map<string, CheckpointCleanupAuthority>();
   private readonly nameIndex = new Map<
     string,
     { firstId: string; currentId: string; rebound: boolean }
@@ -584,7 +609,10 @@ export class SubagentRegistry {
       return Promise.resolve({ disposition: "unconfirmed", ...(record.retainedInputReport ? { report: record.retainedInputReport } : {}) });
     }
     this.markCheckpointStopping(agentId, source);
-    const attempt = Object.freeze({ attemptId: Object.freeze({}), agentId, dispatchGeneration: generation });
+    const attempt = Object.freeze({
+      attemptId: Object.freeze({}), agentId, dispatchGeneration: generation,
+      ...(source === "session" ? { deferCleanup: true as const } : {}),
+    });
     let resolveSettlement!: (value: CheckpointStopDisposition) => void;
     const settlement = new Promise<CheckpointStopDisposition>((resolve) => { resolveSettlement = resolve; });
     const flight: CheckpointStopFlight = { record, dispatchGeneration: generation, session, attempt, settlement };
@@ -597,17 +625,48 @@ export class SubagentRegistry {
         resolveSettlement({ disposition: "unconfirmed" });
         return;
       }
-      const report = evidence && evidence.confirmed === true && evidence.attemptId === attempt.attemptId
-        ? evidence.report
-        : undefined;
+      const authenticated = evidence?.confirmed === true && evidence.attemptId === attempt.attemptId;
+      if (authenticated && evidence.kind === "ordinary-cleanup") {
+        if (current.retainedInputReport || current.checkpointQuarantined) {
+          this.quarantineCheckpoint(agentId);
+          resolveSettlement({ disposition: "unconfirmed", ...(current.retainedInputReport ? { report: current.retainedInputReport } : {}) });
+          return;
+        }
+        current.retainedInputCleanupReleasedDispatchGeneration = generation;
+        current.checkpointStopState = "confirmed";
+        current.checkpointPaused = false;
+        current.resumable = false;
+        this.notifyChange();
+        resolveSettlement({ disposition: "ordinary-cleanup" });
+        return;
+      }
+      const report = authenticated ? evidence.report : undefined;
       if (!report || report.agentId !== agentId || current.retainedInputReport !== report ||
           current.retainedInputReportDispatchGeneration !== generation) {
         this.quarantineCheckpoint(agentId);
         resolveSettlement({ disposition: "unconfirmed", ...(current.retainedInputReport ? { report: current.retainedInputReport } : {}) });
         return;
       }
+      if (attempt.deferCleanup) {
+        if (typeof evidence?.releaseCleanup !== "function") {
+          this.quarantineCheckpoint(agentId);
+          resolveSettlement({ disposition: "unconfirmed", report });
+          return;
+        }
+        this.checkpointCleanupAuthorities.set(agentId, {
+          record, dispatchGeneration: generation, report, attemptId: attempt.attemptId,
+          release: evidence.releaseCleanup,
+        });
+      } else {
+        // The callback returns only after its exact-generation cleanup joins. Preserve
+        // that authenticated fact so a later shutdown does not invent deferred authority.
+        current.retainedInputCleanupReleasedDispatchGeneration = generation;
+      }
       current.checkpointStopState = "confirmed";
       current.checkpointPaused = false;
+      // This post-commit child is terminal; the ordinary model-TaskStop resume
+      // divergence does not turn its canonical retained report into resume authority.
+      current.resumable = false;
       this.notifyChange();
       resolveSettlement({ disposition: "confirmed", report });
     }, () => {
@@ -621,6 +680,27 @@ export class SubagentRegistry {
       }
     });
     return settlement;
+  }
+
+  /** Release the exact confirmed shutdown cleanup, or verify that an ordinary stop already did. */
+  releaseCheckpointCleanup(agentId: string, report: RetainedInputReport): Promise<void> {
+    const authority = this.checkpointCleanupAuthorities.get(agentId);
+    const current = this.records.get(agentId);
+    const generation = current?.dispatchGeneration ?? 1;
+    if (current?.retainedInputReport === report && !current.checkpointQuarantined &&
+        current.retainedInputCleanupReleasedDispatchGeneration === generation) {
+      return Promise.resolve();
+    }
+    if (!authority || authority.record !== current || authority.report !== report ||
+        generation !== authority.dispatchGeneration || current.checkpointQuarantined) {
+      return Promise.reject(new Error("checkpoint cleanup authority is stale or unavailable"));
+    }
+    authority.settlement ??= Promise.resolve().then(() => authority.release(authority.attemptId));
+    return authority.settlement.then(() => {
+      if (this.checkpointCleanupAuthorities.get(agentId) === authority) {
+        this.checkpointCleanupAuthorities.delete(agentId);
+      }
+    });
   }
 
   /** Store one canonical report before its occurrences may resolve as reported. */
@@ -791,7 +871,7 @@ export function retainedInputCount(report: RetainedInputReport): number {
 export function formatRetainedInputReport(report: RetainedInputReport): string {
   const locator = taskOutputAgentLocator(report.agentId);
   const lines = [
-    `Retained input report for ${report.agentId}: ${report.occurrences.length} represented, ${report.unrepresentableCount} unrepresentable (${retainedInputCount(report)} total).`,
+    `Retained input report for ${report.agentId}: ${report.occurrences.length} represented, ${report.unrepresentableCount} unrepresentable (${retainedInputCount(report)} total); stage ${report.stage}; ${retainedInputCount(report)} retained input occurrence(s).`,
     `Locator: ${locator}.`,
     "Reported input was not auto-replayed. Inspect possible existing files, tools, and external effects before any deliberate retry.",
     report.guidance,

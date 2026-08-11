@@ -422,11 +422,11 @@ describe("dispatch outcome classification", () => {
     });
   });
 
-  it("stop-all retries persistence without a second stop and keeps quarantine process-owned", async () => {
+  it("stop-all attempts confirmed persistence once and releases cleanup after failure", async () => {
     const registry = new SubagentRegistry();
     const confirmedId = "agent-0123456789ab";
-    const quarantinedId = "agent-fedcba987654";
     let stops = 0;
+    let cleanups = 0;
     let report: ReturnType<typeof createRetainedInputReport>;
     registry.register({
       agentId: confirmedId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
@@ -439,50 +439,84 @@ describe("dispatch outcome classification", () => {
         });
         registry.storeRetainedInputReport(confirmedId, report);
         registry.markSettled(confirmedId, { outcome: "aborted" });
-        return { confirmed: true, attemptId: attempt!.attemptId, report };
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            cleanups++;
+          },
+        };
       } },
     });
-    registry.register({
-      agentId: quarantinedId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
-      oneShot: false, checkpointPaused: true,
-      session: { stopCheckpoint: async () => { throw new Error("must not run"); } },
-    });
-    registry.quarantineCheckpoint(quarantinedId);
     const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
       subagentRegistry: registry,
       compactionCancellationRecovery: { registry },
     });
-    const first = await runtime.stopAllRetainedSubagents({ persist: async () => false });
-    expect(first).toMatchObject({ confirmed: 1, unconfirmed: 1 });
-    expect(first.outcomes.find((outcome) => outcome.agentId === confirmedId)).toMatchObject({
-      disposition: "confirmed", stopRequested: true, persisted: false,
-    });
-    expect(first.outcomes.find((outcome) => outcome.agentId === quarantinedId)).toMatchObject({
-      disposition: "unconfirmed", stopRequested: false,
-    });
     const persisted: object[] = [];
-    const truthy = await runtime.stopAllRetainedSubagents({ persist: (async (candidate: ReturnType<typeof createRetainedInputReport>) => {
+    const first = await runtime.stopAllRetainedSubagents({ persist: async (candidate) => {
       persisted.push(candidate.reportId);
-      return "yes";
-    }) as never });
-    expect(truthy.outcomes.find((outcome) => outcome.agentId === confirmedId)).toMatchObject({
-      disposition: "confirmed", stopRequested: false, persisted: false,
-    });
-    const thrown = await runtime.stopAllRetainedSubagents({ persist: async () => { throw new Error("disk unavailable"); } });
-    expect(thrown.outcomes.find((outcome) => outcome.agentId === confirmedId)).toMatchObject({
-      disposition: "confirmed", stopRequested: false, persisted: false,
-    });
-    const retry = await runtime.stopAllRetainedSubagents({ persist: async (candidate) => {
-      persisted.push(candidate.reportId);
-      return true;
+      return false;
     } });
-    expect(retry.outcomes.find((outcome) => outcome.agentId === confirmedId)).toMatchObject({
-      disposition: "confirmed", stopRequested: false, persisted: true,
+    expect(first).toMatchObject({ confirmed: 1, unconfirmed: 0 });
+    expect(first.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: true, persisted: false, cleanupReleased: true,
     });
-    await runtime.stopAllRetainedSubagents({ persist: async () => { throw new Error("must not repeat"); } });
-    expect(persisted).toEqual([report!.reportId, report!.reportId]);
+    expect(cleanups).toBe(1);
+
+    const repeated = await runtime.stopAllRetainedSubagents({ persist: async () => {
+      throw new Error("must not repeat");
+    } });
+    expect(repeated.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: false, persisted: false, cleanupReleased: true,
+    });
+    expect(persisted).toEqual([report!.reportId]);
     expect(stops).toBe(1);
+    expect(cleanups).toBe(1);
   });
+
+  it.each(["task-stop", "panel"] as const)(
+    "reuses exact-generation cleanup evidence from ordinary %s before shutdown persistence",
+    async (source) => {
+      const registry = new SubagentRegistry();
+      const agentId = source === "task-stop" ? "agent-111111111111" : "agent-222222222222";
+      let cleanups = 0;
+      let persistenceAttempts = 0;
+      registry.register({
+        agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+        oneShot: false, checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          const report = createRetainedInputReport({
+            agentId, sessionId: `session:${source}`, generation: 1, stage: "resumed-cancellation",
+            occurrences: [], guidance: "Inspect effects.",
+          });
+          registry.storeRetainedInputReport(agentId, report);
+          cleanups++;
+          registry.markSettled(agentId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, report };
+        } },
+      });
+      const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+        subagentRegistry: registry,
+        compactionCancellationRecovery: { registry },
+      });
+
+      await expect(registry.stopCheckpoint(agentId, source)).resolves.toMatchObject({ disposition: "confirmed" });
+      expect(registry.get(agentId)?.retainedInputCleanupReleasedDispatchGeneration).toBe(1);
+      const shutdown = await runtime.stopAllRetainedSubagents({ persist: async () => {
+        persistenceAttempts++;
+        return true;
+      } });
+      expect(shutdown.outcomes[0]).toMatchObject({
+        disposition: "confirmed", persisted: true, cleanupReleased: true,
+      });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+
+      await runtime.stopAllRetainedSubagents({ persist: async () => {
+        throw new Error("must not repeat");
+      } });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+    },
+  );
 
   it("stop-all quarantines missing, void, throw, false, and truthy nonboolean evidence once", async () => {
     const registry = new SubagentRegistry();

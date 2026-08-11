@@ -410,6 +410,7 @@ describe("opted-in retained background outcomes", () => {
     await tasks.wait(taskId);
     const notice = buildSettlementNotice(tasks.get(taskId)!);
     expect(notice).toContain(`1 retained input occurrence(s)`);
+    expect(notice).toContain("stage resumed-cancellation");
     expect(notice).toContain(`TaskOutput with task_id "${AGENT_A}"`);
     expect(notice).toContain("does not consume them");
 
@@ -441,9 +442,11 @@ describe("opted-in retained background outcomes", () => {
       piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
     }
     expect(byTask.details.reportId).toBe(reportA.reportId);
+    expect(byTask.details.stage).toBe("resumed-cancellation");
     expect(byAgent.details).not.toHaveProperty("status");
     expect(byAgent.details).not.toHaveProperty("outcome");
     expect(byAgent.details.reportId).toBe(reportA.reportId);
+    expect(byAgent.details.stage).toBe("resumed-cancellation");
     expect(repeated.details.occurrences).toBe(reportA.occurrences);
     expect(repeated.content).toEqual(byAgent.content);
     await expect(own.execute("foreign", { task_id: AGENT_B })).rejects.toThrow(/Unknown task_id/iu);
@@ -504,6 +507,27 @@ describe("opted-in retained background outcomes", () => {
     expect(stopCalls).toBe(1);
     await tasks.stopAndWait(taskId);
     expect(stopCalls).toBe(1);
+  });
+
+  it("preserves ordinary-cleanup through stop/finalize/wait without a report or quarantine", async () => {
+    const agents = new SubagentRegistry();
+    registerPaused(agents, AGENT_A, undefined, async (attempt) => {
+      agents.markSettled(AGENT_A, { outcome: "aborted" });
+      return { confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup" };
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", Promise.resolve(result({
+      ok: false, outcome: "failed", agentId: AGENT_A, checkpointPaused: true, error: "pre-commit exhausted",
+    })), undefined, AGENT_A, "worker");
+    await tasks.wait(taskId);
+
+    await expect(tasks.stopAndWait(taskId, "panel")).resolves.toMatchObject({ disposition: "ordinary-cleanup" });
+    expect(tasks.get(taskId)).toMatchObject({
+      status: "stopped", checkpointPaused: false, checkpointStopDisposition: "ordinary-cleanup",
+    });
+    expect(tasks.get(taskId)).not.toHaveProperty("retainedInputReport");
+    expect(tasks.get(taskId)).not.toHaveProperty("checkpointQuarantined");
+    expect(tasks.stop(taskId, "session")).toMatchObject({ disposition: "ordinary-cleanup" });
   });
 
   it("keeps TaskOutput and actual TaskStop nonterminal when central evidence precedes linked settlement", async () => {
@@ -590,7 +614,7 @@ describe("opted-in retained background outcomes", () => {
     }
   });
 
-  it("confirmed model TaskStop permits deliberate SendMessage with no-auto-replay locator while panel permanence refuses", async () => {
+  it("confirmed retained model TaskStop remains terminal to SendMessage while panel permanence refuses", async () => {
     const agents = new SubagentRegistry();
     const report = makeReport(AGENT_A);
     agents.register({
@@ -612,9 +636,9 @@ describe("opted-in retained background outcomes", () => {
     const send = createSendMessageToolDefinition(runtime as never, {
       registry: agents, backgroundTasks: tasks,
     }) as unknown as ToolLike;
-    const accepted = await send.execute("resume", { to: AGENT_A, message: "retry deliberately" });
-    expect(accepted.content[0]!.text).toMatch(/resume accepted.*not auto-replayed.*TaskOutput with task_id "agent-111111111111".*existing effects/isu);
-    expect(agents.get(AGENT_A)?.retainedInputReport).toBe(report);
+    await expect(send.execute("resume", { to: AGENT_A, message: "retry deliberately" }))
+      .rejects.toThrow(/not resumable|cannot be resumed/iu);
+    expect(agents.get(AGENT_A)).toMatchObject({ retainedInputReport: report, resumable: false });
 
     const panelAgent = "agent-333333333333";
     agents.register({

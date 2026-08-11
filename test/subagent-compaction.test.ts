@@ -2131,6 +2131,36 @@ describe("subagent mid-run compaction", () => {
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
   });
 
+  it("authenticates real pre-commit shutdown cleanup without persistence or quarantine", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+    );
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    let persistenceAttempts = 0;
+
+    const stopped = await runtime.stopAllRetainedSubagents({
+      persist: () => { persistenceAttempts += 1; return true; },
+    });
+
+    expect(stopped).toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(persistenceAttempts).toBe(0);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+    expect(harness.disposed()).toBe(true);
+    expect(registry.get(exhausted.agentId)).toMatchObject({
+      state: "settled",
+      checkpointPaused: false,
+      checkpointStopState: "confirmed",
+    });
+    expect(registry.get(exhausted.agentId)?.checkpointQuarantined).not.toBe(true);
+
+    await expect(runtime.stopAllRetainedSubagents({ persist: () => { persistenceAttempts += 1; return true; } }))
+      .resolves.toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(persistenceAttempts).toBe(0);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+  });
+
   it("revokes the original paused generation after TaskStop abandonment cleanup", async () => {
     const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();

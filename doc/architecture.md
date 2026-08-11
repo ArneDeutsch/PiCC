@@ -297,9 +297,10 @@ where to start reading, not the extent of its cluster.
   joined into the status panel. Registry addresses, including the stable agent id accepted by
   `TaskStop` for a checkpoint-retained child, exist only for the originating
   process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
-  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
-  `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
-  registry).
+  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from an ordinary
+  model `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
+  registry). A confirmed post-commit retained child remains terminal even when model `TaskStop` owns
+  its abandonment.
 
   `subagent-transcript-retention.ts` owns bounded cleanup of persisted child collections.
   Activation starts detached orphan-worktree reaping; only the startup `session_start` may run the
@@ -362,8 +363,13 @@ where to start reading, not the extent of its cluster.
   may start one physical Pi-owned compaction transaction if the checkpoint is still required, and only
   after no provider response or tool batch remains unresolved; the controller then owns queued-input
   reconciliation, resume, cancellation, and exhaustion. Confirmed pre-commit operational or hook
-  exhaustion remains recoverable in-session;
-  any post-commit restoration, replay, or continuation-start failure is terminal for that session.
+  exhaustion remains recoverable in-session. After a committed summary, the only safe cancellation
+  exception is an exact aborted assistant terminal followed by settlement of that same selected-branch
+  message: the main TUI restores text to the editor, while child input becomes one canonical retained
+  report. Every other post-commit restoration, replay, provider/tool, or continuation failure remains
+  terminal. `SubagentRegistry` is the sole report and quarantine authority; `TaskOutput`, foreground
+  Agent/Task results, settlement notices, and the panel all consume that same immutable report identity.
+  Unconfirmed child records stay quarantined and cannot be stopped, disposed, or released twice.
   If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
   confirm host quiescence: admission and recovery stay closed, and in-process controller replacement
   is unsafe. Clean PiCC-owned tool batches terminate after
@@ -528,13 +534,20 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    character budget; PostCompact output is diagnostic-only, and the system-prompt
    suffix preserves durable instructions. SessionStart(compact) and PostCompact ordinary block output
    is diagnostic-only, while universal hook stop closes the committed-summary session. Confirmed
-   pre-commit operational or hook exhaustion leaves admission paused and recoverable; any post-commit
-   failure closes the session and requires replacement. An unconfirmed-host ending is process-terminal:
+   pre-commit operational or hook exhaustion leaves admission paused and recoverable. An exact
+   aborted-terminal/same-branch settlement after resume may instead reconcile retained main input
+   without replaying work; all ambiguous or other post-commit failures close the session and require
+   replacement. An unconfirmed-host ending is process-terminal:
    neither manual recovery nor in-process replacement is safe. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
    only at a successfully completed logical settlement boundary; logically unsuccessful outcomes
    bypass ordinary Stop handling. `session_shutdown` joins checkpoint work and shuts down the MCP
-   servers before firing `SessionEnd`.
+   servers before firing `SessionEnd`. Confirmed child retained-input reports receive one bounded
+   best-effort persistence attempt before retained cleanup. Exact reopen verification of either one Pi
+   session custom entry or one restrictive atomic recovery file under the verified Pi session owner
+   produces a locator; complete storage failure emits an explicit possible-loss warning and continues
+   ordinary cleanup and `SessionEnd`. Unconfirmed reports remain quarantined and block cleanup rather
+   than being serialized as confirmed data.
 
 ## Mechanical-fidelity decisions (load-bearing)
 

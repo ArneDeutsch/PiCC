@@ -147,7 +147,7 @@ export interface SubagentPanelFocusDeps {
   stopTask: (
     taskId: string,
     metadata?: { source: "panel" },
-  ) => void | Promise<void | { disposition?: "provisional" | "confirmed" | "unconfirmed" }>;
+  ) => void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }>;
   /** Dormant retained-checkpoint stop settlement and presentation; omission preserves shipped panel behavior. */
   retainedOutcomes?: boolean;
   /** The passive widget's suppression seam: hidden while this panel is open. */
@@ -471,7 +471,7 @@ export class SubagentPanelFocusController {
   private stopAgent(
     record: SubagentRegistryRecord,
     taskId: string,
-  ): void | Promise<void | { disposition?: "provisional" | "confirmed" | "unconfirmed" }> {
+  ): void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }> {
     if (this.deps.retainedOutcomes && record.checkpointPaused) {
       return this.deps.stopTask(taskId, { source: "panel" });
     }
@@ -598,30 +598,36 @@ export class SubagentPanelFocusController {
       const bestEffortNotify = (message: string): void => {
         try { notify(message); } catch { /* notification is never lifecycle authority */ }
       };
-      let stopping: void | Promise<void | { disposition?: "provisional" | "confirmed" | "unconfirmed" }>;
+      let stopping: void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }>;
       try {
         stopping = this.stopAgent(record, taskId);
       } catch (error) {
         this.deps.registry.quarantineCheckpoint(record.agentId);
         const report = this.deps.registry.get(record.agentId)?.retainedInputReport;
-        bestEffortNotify(`Stop request for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s); canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+        bestEffortNotify(`Stop request for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
         return;
       }
       const settlement = Promise.resolve(stopping).then((result) => {
         const current = this.deps.registry.get(record.agentId);
         const report = current?.retainedInputReport;
+        if (result?.disposition === "ordinary-cleanup" && current?.checkpointStopState === "confirmed" &&
+            !current.checkpointQuarantined && !report) {
+          this.deps.registry.markUserStopped(record.agentId);
+          bestEffortNotify(`Stop confirmed for ${label}; pre-commit cleanup completed and no retained-input report was required.`);
+          return;
+        }
         if (result?.disposition !== "confirmed" || current?.checkpointStopState !== "confirmed" ||
             current.checkpointQuarantined || !report) {
           this.deps.registry.quarantineCheckpoint(record.agentId);
-          bestEffortNotify(`Stop disposition for ${label} is unconfirmed. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s); canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+          bestEffortNotify(`Stop disposition for ${label} is unconfirmed. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
           return;
         }
         this.deps.registry.markUserStopped(record.agentId);
-        bestEffortNotify(`Stop confirmed for ${label}. ${retainedInputCount(report)} retained input occurrence(s); ${taskOutputAgentLocator(record.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`);
+        bestEffortNotify(`Stop confirmed for ${label} at stage ${report.stage}. ${retainedInputCount(report)} retained input occurrence(s); ${taskOutputAgentLocator(record.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`);
       }, (error) => {
         this.deps.registry.quarantineCheckpoint(record.agentId);
         const report = this.deps.registry.get(record.agentId)?.retainedInputReport;
-        bestEffortNotify(`Stop settlement for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s); canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+        bestEffortNotify(`Stop settlement for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
       });
       void settlement.catch(() => undefined);
       bestEffortNotify(panelNoticeStopSettling(label));

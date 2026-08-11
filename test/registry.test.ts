@@ -369,6 +369,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(proactive).toMatch(boundary);
     }
     expect(proactive).toContain("feature.compaction-summary-recovery");
+    expect(proactive).toMatch(/exact aborted terminal object identity followed by same-run selected-branch settlement/);
+    expect(proactive).toMatch(/TUI steering\/follow-up\/draft order and no automatic replay/);
+    expect(proactive).toMatch(/canonical report shared by all consumers/);
+    expect(proactive).toMatch(/ambiguous records remain quarantined/);
     expect(proactive).not.toMatch(
       /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
     );
@@ -894,6 +898,19 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ["multiline/detail history", "The detail view retains multiline activity history."],
   ])("detects duplicated panel mechanic: %s", (_category, canary) => {
     expect(duplicatesPanelMechanics(canary)).toBe(true);
+  });
+
+  it("pins canonical retained-input custody and shutdown truth across affected capability owners", () => {
+    const expected = ["tool.Agent", "tool.Task", "tool.TaskOutput", "tool.TaskStop", "tool.SendMessage", "feature.background-agents"];
+    for (const id of expected) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).toMatch(/canonical|canonical owner/);
+      expect(note, id).toMatch(/quarantined|quarantine/);
+    }
+    const background = lookupCapability("feature.background-agents")?.note ?? "";
+    expect(background).toMatch(/exactly reopens.*session entry.*recovery file/);
+    expect(background).toMatch(/best-effort.*warns of possible loss.*cleanup continues/);
+    expect(background).toMatch(/unconfirmed work still blocks cleanup/);
   });
 
   it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {

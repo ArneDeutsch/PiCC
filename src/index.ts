@@ -46,6 +46,12 @@ import { SubagentPanelFocusController } from "./runtime/subagent-panel-focus.js"
 import type { PanelTaskInfo } from "./runtime/subagent-panel-model.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
 import { renderSettlementRecord } from "./runtime/subagent-render.js";
+import {
+  persistRetainedInputReport,
+  RetainedInputPersistenceError,
+  type RetainedInputPersistenceFailure,
+  type RetainedInputPersistenceLocator,
+} from "./runtime/retained-input-persistence.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -90,11 +96,17 @@ import { renderMainSessionTool } from "./runtime/main-session-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
+  UnconfirmedHostDeadlineError,
   UNCONFIRMED_HOST_RECOVERY_GUIDANCE,
   callbackCompactionAttempt,
   type CheckpointProgress,
   type CheckpointSnapshot,
+  type CancellationKind,
+  type CancellationOutcome,
+  type CancelledInputHandoff,
+  type CancelledInputResolution,
   type HostDeadlinePolicy,
+  type HostInputLease,
   type MidRunCompactionController,
   type OrdinaryInputDisposition,
   type ResumeToken,
@@ -338,6 +350,8 @@ export interface PiccTestSeam {
      */
     subagentPanelFocus: SubagentPanelFocusController;
     mainCheckpointGate: MainSessionCheckpointGate;
+    /** Observe shutdown ordering at the production MCP ownership boundary. */
+    mcpRuntime: Pick<McpRuntime, "shutdown">;
     /** TEST-ONLY access to the actual input hook multiplexer for boundary spies. */
     inputHooks: { fire: (...args: any[]) => Promise<any> };
   }) => void;
@@ -385,6 +399,8 @@ export interface PiccTestSeam {
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
   checkpointDeadlinePolicy?: HostDeadlinePolicy;
+  /** TEST-ONLY replacement at the secure retained-input persistence boundary. */
+  persistRetainedInputReport?: typeof persistRetainedInputReport;
   /** TEST-ONLY retention I/O and timer replacements; production uses the filesystem and Node timers. */
   retention?: {
     reapSubagentTranscripts?: typeof reapSubagentTranscripts;
@@ -760,6 +776,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     getSessionFile?: () => string | undefined;
     getCwd?: () => string | undefined;
     getSessionDir?: () => string | undefined;
+    getBranch?: () => unknown;
+    appendCustomEntry?: (customType: string, data?: unknown) => unknown;
   };
   let sessionManagerRef: MainSessionManager | undefined;
   const transcriptPath = () => {
@@ -1133,7 +1151,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * has already moved to — a cancellation, a terminalization, a stopped logical run,
    * or the replacement installed by an epoch rotation.
    */
-  type ResumeConclusion = "completed" | "abandoned" | "superseded";
+  type ResumeConclusion = "completed" | "cancelled" | "abandoned" | "superseded";
   let activeMainResume: {
     generation: number;
     token: ResumeToken;
@@ -1141,6 +1159,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     context: any;
     /** The run's own cancellation authority, so a resumed emission can be released. */
     signal: AbortSignal;
+    requestCancellation(kind: CancellationKind): Promise<CancellationOutcome>;
     settled: Promise<void>;
     /**
      * True while some owner is expected to publish `settled`: a physical turn PiCC
@@ -1169,7 +1188,50 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     /** Publishes this run's settlement, whole, exactly once, on every ending. */
     conclude(conclusion: ResumeConclusion): void;
     replayCompleted: boolean;
+    triggerLease?: HostInputLease;
+    triggerStarted: boolean;
+    abortedAssistant?: unknown;
   } | undefined;
+  const mainHostSendLeases = new WeakMap<object, HostInputLease>();
+  const sendCheckpointMessage = (
+    message: Record<string, unknown>,
+    options: Record<string, unknown>,
+    inputClass: "restoration-control" | "continuation-trigger",
+    onLease?: (lease: HostInputLease) => void,
+  ): HostInputLease | undefined => {
+    const admission = mainCheckpointGate.hostInputAdmission(inputClass);
+    if (admission.kind === "refuse-settling") {
+      const controller = mainCheckpointGate.currentController();
+      if (inputClass === "restoration-control" &&
+          controller.recoveryToken(controller.snapshot().generation)) {
+        pi.sendMessage(message, options);
+        return undefined;
+      }
+      throw new Error("checkpoint host send refused while settling");
+    }
+    if (admission.kind === "inactive") {
+      pi.sendMessage(message, options);
+      return undefined;
+    }
+    // Installed Pi creates a fresh outer custom-message wrapper but preserves the
+    // exact `details` value. The opaque details object is therefore the authority;
+    // content and wrapper identity are deliberately irrelevant.
+    const envelope: { piccCheckpointHostInput?: object } = {
+      piccCheckpointHostInput: Object.freeze({}),
+    };
+    message.details = envelope;
+    mainHostSendLeases.set(envelope, admission.lease);
+    onLease?.(admission.lease);
+    try {
+      pi.sendMessage(message, options);
+      return admission.lease;
+    } catch (error) {
+      mainHostSendLeases.delete(envelope);
+      delete envelope.piccCheckpointHostInput;
+      mainCheckpointGate.settleHostInput(admission.lease);
+      throw error;
+    }
+  };
   const quotaHeaders: Record<string, string> = {};
 
   const hookRunnerFacade = {
@@ -1404,14 +1466,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   const taskToolBundle = createTaskTools();
   const claudeNamedTools: Record<string, unknown>[] = [];
-  // Background tasks: one registry per session — run_in_background dispatches
-  // register here; TaskOutput/TaskStop operate on it.
-  const backgroundTasks = new BackgroundTaskRegistry();
-  // Dispatch registry: one per session — every session-creating dispatch
-  // registers here so SendMessage can steer a running background subagent or
-  // resume a finished one. Registry-only resolution keeps a hostile `to` off the
-  // filesystem (SECURITY).
+  // Dispatch registry owns canonical retained reports and quarantine; background
+  // consumers receive that exact owner in the same production composition.
   const subagentRegistry = new SubagentRegistry();
+  const backgroundTasks = new BackgroundTaskRegistry({ registry: subagentRegistry });
   // Status panel: a passive belowEditor widget over the dispatch registry.
   // Constructed unconditionally (cheap, no timer until installed) so the
   // onWired test seam can reach it; it attaches to a UI only from the
@@ -1439,9 +1497,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     registry: subagentRegistry,
     tasks: panelTaskJoin,
     onTasksChange: (listener) => backgroundTasks.onChange(listener),
-    stopTask: (taskId) => {
+    stopTask: (taskId, metadata) => {
+      if (metadata?.source === "panel") {
+        return Promise.resolve(backgroundTasks.stopAndWait(taskId, "panel")).then((result) => {
+          if (result.disposition === "confirmed" || result.disposition === "ordinary-cleanup") {
+            backgroundTasks.markUserStopped(taskId, "panel");
+          }
+          return { disposition: result.disposition };
+        });
+      }
       backgroundTasks.markUserStopped(taskId);
     },
+    retainedOutcomes: true,
     widget: subagentPanel,
   });
   // The chord only works in interactive mode (Pi dispatches extension
@@ -1814,8 +1881,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // moment the child is dispatched, so a worktree the parent enters mid-run
         // is reflected.
         const dispatchCwd = () => (subCwd ?? cwdState).get();
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop, retainedOutcomes: { registry: subagentRegistry } }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop, retainedOutcomes: { registry: subagentRegistry } }));
       }
       return tools;
     },
@@ -1863,6 +1930,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
+    compactionCancellationRecovery: {
+      registry: subagentRegistry,
+      ...(testSeam?.checkpointDeadlinePolicy ? { deadlinePolicy: testSeam.checkpointDeadlinePolicy } : {}),
+    },
     // TEST-ONLY seam: an injected fake SDK reaches every dispatch — including
     // forks, which close over this one runtime instance. Read ONLY
     // from the in-process testSeam argument; unset ⇒ the runtime lazy-loads the
@@ -1872,6 +1943,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const unconfirmedHostText =
     `PiCC could not confirm that checkpoint host work stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+
+  const postCommitFailureText = (stage: CheckpointProgress["stage"]): string => {
+    if (stage === "restoration") {
+      return "Context was compacted, but mandatory restoration failed before continuation startup was confirmed. Work is paused and no continuation was confirmed to begin.";
+    }
+    if (stage === "continuation-start") {
+      return "Context was compacted, but continuation startup failed. Work is paused and continuation was not confirmed to start.";
+    }
+    return "Context was compacted, but replay, resumed work, provider release, or cancellation settlement failed. Work is paused; the first continuation or its files, tools, and external effects may already exist, and no second run will start automatically.";
+  };
 
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
@@ -1886,7 +1967,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       case "checkpoint-exhausted": return event.failureCategory === "hook-blocked"
         ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger; then run /compact and explicitly continue."
         : event.failureCategory === "restoration-paused"
-          ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
+          ? `${postCommitFailureText(event.stage)} Do not compact the committed summary again; start a new session and resend the retained input.`
           : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
       // Each action names a different thing the reader can still do, because for these
       // endings "start a new session" is either impossible or already happening.
@@ -1896,7 +1977,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           ? "Proactive context compaction stopped when the session ended. The paused work did not resume and was not delivered."
           : event.action === "restart-process"
             ? unconfirmedHostText
-            : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
+            : event.action === "session-reusable"
+              ? "The authenticated resumed cancellation settled and the session is reusable."
+              : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
       case "checkpoint-recovered": return "Manual compaction recovered the paused session; explicitly continue when ready.";
     }
   };
@@ -1950,6 +2033,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * reader never received.
    */
   let sessionRenderingStopped = false;
+  let sessionShutdownBoundary = false;
+  let mainShutdownRetainedInputAtRisk = false;
 
   /**
    * `ctx.mode` is a getter that calls Pi's `assertActive()` and throws once the extension
@@ -1965,6 +2050,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const checkpointSurface = (ctx: any): string | undefined => {
     const mode = contextMode(ctx);
     return mode === "tui" && sessionRenderingStopped ? "stderr" : mode;
+  };
+
+  const textFromQueuedContent = (content: import("./runtime/mid-run-compaction.js").QueueContent): string | undefined => {
+    if (typeof content === "string") return content;
+    const text: string[] = [];
+    for (const part of content) {
+      if (!part || typeof part !== "object" || (part as { type?: unknown }).type !== "text" ||
+          typeof (part as { text?: unknown }).text !== "string") return undefined;
+      text.push((part as { text: string }).text);
+    }
+    return text.join("");
   };
 
   const reportRejectedShadows = (rejected: readonly import("./runtime/mid-run-compaction.js").QueuedInputShadow[], ctx: any): void => {
@@ -2075,6 +2171,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }], ctx);
   };
 
+  type ResumedCancellationOutcome = {
+    generation: number;
+    stage: "resumed-cancellation";
+    restoredCount: number;
+    reportedCount: number;
+    unresolvedCount: number;
+    nonTextCount: number;
+    retainedRecordAccessible: boolean;
+  };
+  let resumedCancellationOutcome: ResumedCancellationOutcome | undefined;
+
   const publishCheckpoint = (event: CheckpointProgress, ctx = checkpointContext): void => {
     const progressController = mainCheckpointGate.currentController();
     if (mainCheckpointGate.isLogicalRunStopped() &&
@@ -2092,7 +2199,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const session = transcriptPath();
     const persisted = session !== undefined;
     const headlessCause = postCommit
-      ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran."
+      ? postCommitFailureText(event.stage)
       : event.failureCategory === "hook-blocked"
         ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
         : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
@@ -2104,7 +2211,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : persisted
           ? `If this process exits, reopen the exact persisted session (${session}) before /compact. Run /compact, then explicitly continue.`
           : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
-    const text = headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
+    const cancellationOutcome = event.category === "checkpoint-cancelled" && event.action === "session-reusable" &&
+      resumedCancellationOutcome?.generation === event.generation ? resumedCancellationOutcome : undefined;
+    const reusableSurface = mode === "tui" || mode === "rpc";
+    const presentedAction = cancellationOutcome && !reusableSurface ? "retrieve-and-relaunch" : event.action;
+    const retainedSource = cancellationOutcome?.retainedRecordAccessible
+      ? "client/request history and the retained-input record" : "client/request history";
+    const text = cancellationOutcome
+      ? `Authenticated resumed cancellation settled: action=${presentedAction}, stage=${cancellationOutcome.stage}, ${cancellationOutcome.restoredCount} restored, ${cancellationOutcome.reportedCount} reported, ${cancellationOutcome.unresolvedCount} unresolved, ${cancellationOutcome.nonTextCount} non-text. No additional continuation or retained-input replay was started after cancellation. The first resumed continuation had already started, so prior files, tools, or external effects may exist; inspect them before deliberate resubmission.${mode === "rpc" ? ` Recover retained input from ${retainedSource} before deliberate resubmission.` : reusableSurface ? "" : ` Recover retained input from ${retainedSource}, then start a fresh request/session deliberately.`}`
+      : headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
     if (surface === "tui") {
       try {
         if (event.category === "checkpoint-armed") {
@@ -2124,12 +2239,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     } else if (surface === "print" || surface === "stderr") {
       console.error(`PiCC: ${text}`);
     }
-    if (mode === "json" || mode === "rpc" || event.category === "checkpoint-exhausted") {
+    if (mode === "json" || mode === "rpc" || event.category === "checkpoint-exhausted" || cancellationOutcome) {
       appendCheckpointEntry({
         category: event.category,
         generation: event.generation,
         notice: text,
-        ...(event.action === undefined ? {} : { action: event.action }),
+        ...(presentedAction === undefined ? {} : { action: presentedAction }),
+        ...(event.stage === undefined ? {} : { stage: event.stage }),
+        ...(cancellationOutcome ? {
+          restoredCount: cancellationOutcome.restoredCount,
+          reportedCount: cancellationOutcome.reportedCount,
+          unresolvedCount: cancellationOutcome.unresolvedCount,
+          nonTextCount: cancellationOutcome.nonTextCount,
+          retainedInputSource: mode === "tui"
+            ? "retained-input session record"
+            : cancellationOutcome.retainedRecordAccessible
+              ? "client/request history and the retained-input session record"
+              : "client/request history",
+        } : {}),
         ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
         ...(event.category === "checkpoint-exhausted" ? {
           recovery: event.failureCategory === "restoration-paused"
@@ -2142,12 +2269,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         } : {}),
       });
     }
-    // A non-interactive caller must be able to tell "finished" from "gave up" without
-    // reading prose: both terminal categories mean the paused work never resumed, and a
-    // wrapper that only saw Pi's own status would consume a partial answer as success.
-    // Never in the TUI, where the reader is the one who sees the notice. Not cleared by a
-    // later recovery: the process did give up on that checkpoint, and `/compact` recovery
-    // still leaves the original continuation unrun.
+    // A non-interactive caller must be able to tell "finished" from a partial or abandoned
+    // checkpoint outcome without reading prose. Terminal resumed cancellation may follow
+    // started work and effects, so a wrapper that only saw Pi's own status must not consume
+    // the partial answer as success. Never in the TUI, where the reader sees the notice.
+    // Not cleared by later recovery: the process still gave up on that checkpoint outcome.
     //
     // Named modes rather than "not the TUI", with one deliberate exception: a mode that
     // could not be read at all (a stale runner throws) still sets it, because a give-up
@@ -2155,9 +2281,101 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // status left — and Pi's interactive quit calls `process.exit(0)` explicitly, so a
     // status set from a stale TUI context cannot leak out of an interactive run.
     if ((mode === "print" || mode === "json" || mode === "rpc" || mode === undefined) &&
-        (event.category === "checkpoint-exhausted" || event.category === "checkpoint-cancelled")) {
+        (event.category === "checkpoint-exhausted" || event.category === "checkpoint-cancelled") &&
+        !(event.action === "session-reusable" && mode === "rpc")) {
       process.exitCode = CHECKPOINT_GAVE_UP_EXIT_CODE;
     }
+    if (cancellationOutcome) resumedCancellationOutcome = undefined;
+  };
+
+  const cancelledMainInput = async (
+    handoff: CancelledInputHandoff,
+  ): Promise<CancelledInputResolution> => {
+    const ctx = checkpointContext;
+    const mode = checkpointSurface(ctx);
+    const resolutions = new Map<number, "restored" | "reported" | "unresolved">(
+      handoff.retained.map((shadow) => [shadow.id, "unresolved"]),
+    );
+    const textById = new Map<number, string>();
+    for (const shadow of handoff.retained) {
+      const text = textFromQueuedContent(shadow.content);
+      if (text !== undefined) textById.set(shadow.id, text);
+    }
+    const acceptedIds = new Set(handoff.acceptedToHostIds);
+    const acceptedText = (["steer", "followUp"] as const).flatMap((delivery) => handoff.retained
+      .filter((shadow) => acceptedIds.has(shadow.id) && shadow.delivery === delivery)
+      .map((shadow) => textById.get(shadow.id))
+      .filter((text): text is string => text !== undefined));
+    let editorCustody = false;
+    if (mode === "tui" && typeof ctx?.ui?.getEditorText === "function" &&
+        typeof ctx?.ui?.setEditorText === "function") {
+      try {
+        const restored = String(ctx.ui.getEditorText());
+        const prefix = acceptedText.join("\n\n");
+        const priorDraft = prefix.length === 0
+          ? restored
+          : restored === prefix ? "" : restored.startsWith(`${prefix}\n\n`) ? restored.slice(prefix.length + 2) : undefined;
+        if (priorDraft !== undefined) {
+          const steering = handoff.retained.filter((shadow) => shadow.delivery === "steer")
+            .map((shadow) => textById.get(shadow.id)).filter((text): text is string => text !== undefined);
+          const followUp = handoff.retained.filter((shadow) => shadow.delivery === "followUp")
+            .map((shadow) => textById.get(shadow.id)).filter((text): text is string => text !== undefined);
+          ctx.ui.setEditorText([...steering, ...followUp, ...(priorDraft ? [priorDraft] : [])].join("\n\n"));
+          editorCustody = true;
+          for (const id of textById.keys()) resolutions.set(id, "restored");
+        }
+      } catch {
+        editorCustody = false;
+      }
+    }
+    let reportCustody = false;
+    try {
+      // At every active shutdown boundary append acceptance is only prospective:
+      // it cannot prove that the outgoing main report survives. A still-live non-quit
+      // TUI editor may independently retain exact text, but not non-text occurrences.
+      if (sessionShutdownBoundary) throw new Error("durable shutdown sink required");
+      pi.appendEntry("picc-checkpoint-retained-input", {
+        version: 1,
+        sessionId: handoff.sessionId,
+        generation: handoff.generation,
+        stage: "resumed-cancellation",
+        occurrences: handoff.retained.map((shadow) => ({
+          id: shadow.id, mode: shadow.delivery, content: shadow.content,
+        })),
+        restoredTextCount: editorCustody ? textById.size : 0,
+        nonTextCount: handoff.retained.length - textById.size,
+        notice: mode !== "tui"
+          ? "Retained input was not auto-replayed. Retrieve accepted input from client/request history and this session record, inspect possible existing files, tools, and external effects, then deliberately resubmit if appropriate."
+          : "Retained input was not auto-replayed. Inspect possible existing files, tools, and external effects before deliberate resubmission.",
+      });
+      reportCustody = true;
+    } catch {
+      reportCustody = false;
+    }
+    if (reportCustody) {
+      for (const shadow of handoff.retained) {
+        if (resolutions.get(shadow.id) === "unresolved") resolutions.set(shadow.id, "reported");
+      }
+    }
+    const restoredCount = [...resolutions.values()].filter((value) => value === "restored").length;
+    const reportedCount = [...resolutions.values()].filter((value) => value === "reported").length;
+    const unresolvedCount = handoff.retained.length - restoredCount - reportedCount;
+    if (sessionShutdownBoundary && unresolvedCount > 0) mainShutdownRetainedInputAtRisk = true;
+    resumedCancellationOutcome = {
+      generation: handoff.generation,
+      stage: "resumed-cancellation",
+      restoredCount,
+      reportedCount,
+      unresolvedCount,
+      nonTextCount: handoff.retained.length - textById.size,
+      retainedRecordAccessible: reportCustody && (mode === "rpc" || transcriptPath() !== undefined),
+    };
+    return {
+      sessionId: handoff.sessionId,
+      generation: handoff.generation,
+      token: handoff.token,
+      resolutions: handoff.retained.map((shadow) => ({ id: shadow.id, disposition: resolutions.get(shadow.id)! })),
+    };
   };
 
   mainCheckpointGate.attachExecution({
@@ -2165,6 +2383,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // The controller drains a terminal generation's queue and hands it here; nothing
     // else names those shadows, so this is the single reporter for every ending.
     inputDropped: (rejected) => reportRejectedShadows(rejected, checkpointContext),
+    cancelledInput: cancelledMainInput,
     compact: async (signal) => {
       const ctx = checkpointContext;
       const epoch = checkpointSessionEpoch;
@@ -2265,6 +2484,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           // Success is claimed here and nowhere else, and only for a turn that ran.
           owner.resumedSettled(resumeContext.token);
           openProvider();
+        } else if (conclusion === "cancelled") {
+          owner.resumedSettled(resumeContext.token, "cancelled");
+          rejectProvider(new Error("checkpoint resume cancelled"));
         } else {
           // `defensiveLatch` captured the promise itself, so dropping the gate's
           // reference is not enough — the barrier has to be settled as well.
@@ -2287,7 +2509,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // against a future awaited terminalization rather than a present necessity.
         if (conclusion === "abandoned" && mainCheckpointGate.currentController() === owner &&
             owner.snapshot().generation === resumeContext.generation) {
-          void owner.failAfterCommittedSummary(resumeContext.generation).catch(() => undefined);
+          void owner.failAfterCommittedSummary(resumeContext.generation, "resumed-work").catch(() => undefined);
         }
       };
       activeMainResume = {
@@ -2296,6 +2518,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         epoch: checkpointSessionEpoch,
         context: ctx,
         signal: resumeContext.signal,
+        requestCancellation: resumeContext.requestCancellation,
         settled,
         // The continuation below is delivered with `triggerTurn`, which reaches Pi's
         // agent run whose settlement is always announced — but only while Pi is not
@@ -2306,6 +2529,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         joinParked: false,
         conclude,
         replayCompleted: false,
+        triggerStarted: false,
       };
       const resume = activeMainResume;
       const isCurrent = () => {
@@ -2317,15 +2541,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       };
       try {
         if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
-        pi.sendMessage(
+        if (!resumeContext.advancePostCommitStage("continuation-start")) {
+          throw new Error("checkpoint continuation lost stage authority");
+        }
+        sendCheckpointMessage(
           {
             customType: "picc-checkpoint-continuation",
             content: "Continue the paused work.",
             display: false,
           },
           { triggerTurn: true },
+          "continuation-trigger",
+          (lease) => { resume.triggerLease = lease; },
         );
       } catch (error) {
+        if (resume.triggerLease) mainCheckpointGate.settleHostInput(resume.triggerLease);
         // resumeOrFinish turns this throw into the post-commit terminal, so publish
         // the settlement without claiming a second one here.
         conclude("superseded");
@@ -2372,6 +2602,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           if (!resume.settlementOwned) conclude("abandoned");
           await settled;
           if (activeMainResume === resume) activeMainResume = undefined;
+          if (!resume.triggerStarted) return { ending: "pre-start" as const };
+          if (resume.abortedAssistant) return { ending: "aborted" as const };
+          return undefined;
         },
       };
     },
@@ -2392,6 +2625,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentPanel,
       subagentPanelFocus,
       mainCheckpointGate,
+      mcpRuntime,
       inputHooks: hooks,
     });
   } catch (err) {
@@ -2606,8 +2840,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // The built-in agent types guarantee dispatchable agents even when the
     // project defines none — so Agent/Task always register when subagents are on.
     claudeNamedTools.push(
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop(), retainedOutcomes: { registry: subagentRegistry } }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop(), retainedOutcomes: { registry: subagentRegistry } }),
       // SendMessage: the coordinator's channel back into its subagents —
       // resume a finished one (same id, full context, background) or steer a
       // running background one. Parent-session only (never in customToolsFor).
@@ -3140,6 +3374,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // to reach the reader's editor. Pi never starts a session after a `quit` teardown, so
     // this only ever clears a latch that no longer describes anything.
     sessionRenderingStopped = false;
+    sessionShutdownBoundary = false;
+    mainShutdownRetainedInputAtRisk = false;
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
     rotateCheckpointSessionEpoch();
@@ -3253,9 +3489,32 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("message_end", (event: any, ctx: any) => {
     mainCheckpointGate.assistantMessageEnded(event?.message, ctx);
+    const resume = activeMainResume;
+    if (resume?.triggerStarted && event?.message?.role === "assistant" && event.message.stopReason === "aborted" &&
+        mainCheckpointGate.currentController().resumedAborted(resume.token)) {
+      resume.abortedAssistant = event.message;
+    }
   });
 
   pi.on("message_start", (event: any) => {
+    const resume = activeMainResume;
+    const message = event?.message;
+    if (message && typeof message === "object") {
+      const envelope = message.details;
+      if (envelope && typeof envelope === "object") {
+        const lease = mainHostSendLeases.get(envelope);
+        if (lease) {
+          mainHostSendLeases.delete(envelope);
+          let scrubbed = false;
+          try {
+            scrubbed = delete envelope.piccCheckpointHostInput && !("piccCheckpointHostInput" in envelope);
+          } catch { /* an unsrubbable envelope is not authenticated */ }
+          const settled = scrubbed && mainCheckpointGate.settleHostInput(lease);
+          if (!scrubbed) mainCheckpointGate.settleHostInput(lease);
+          if (resume?.triggerLease === lease) resume.triggerStarted = settled;
+        }
+      }
+    }
     mainCheckpointGate.userMessageStarted(
       event?.message,
       event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
@@ -3279,6 +3538,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     await mainCheckpointGate.beforeProviderRequest(ctx);
   });
 
+  const retainedPersistenceLocators = new WeakMap<object, RetainedInputPersistenceLocator>();
+
   pi.on("session_shutdown", async (event: any) => {
     clearRetentionHeartbeat();
     // `quit` is the one reason Pi has already stopped the renderer for (`dispose()`); the
@@ -3286,23 +3547,91 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Latched before the cancellation, because the cancellation is what announces the
     // ending and hands back the input this session will never deliver.
     if (event?.reason === "quit") sessionRenderingStopped = true;
+    sessionShutdownBoundary = true;
+    let custodyFailure: Error | undefined;
     try {
-      // Cancellation owns abort-before-join; never manufacture nested settlement.
+      // Main cancellation owns its abort and exact join. If that join cannot prove
+      // quiescence, no unrelated cleanup may release process/session custody.
       try {
-        await mainCheckpointGate.cancel("shutdown");
-      } catch {
-        // A cancellation that could not confirm quiescence rejects. That is a checkpoint
-        // outcome, not a licence to skip the retained subagent joins, MCP shutdown, and
-        // the project's SessionEnd hook below. Caught here rather than with a `.catch()`
-        // on the call: the latter inserts an extra microtask before the joins, and
-        // `test/lifecycle-wiring.test.ts` pins that this handler claims a paused child's
-        // settlement notice before yielding.
+        const controller = mainCheckpointGate.currentController();
+        const snapshot = controller.snapshot();
+        const resume = activeMainResume;
+        if (resume && resume.epoch === checkpointSessionEpoch && resume.generation === snapshot.generation &&
+            resume.token.generation === snapshot.generation &&
+            (snapshot.phase === "resuming" || snapshot.phase === "terminalizing")) {
+          const outcome = await resume.requestCancellation("shutdown");
+          if (!outcome.cancelled) throw new Error("Main resumed shutdown cancellation became stale");
+          await controller.stableBarrier(snapshot.generation);
+        } else {
+          await mainCheckpointGate.cancel("shutdown");
+        }
+      } catch (error) {
+        if (error instanceof UnconfirmedHostDeadlineError) {
+          error.message = `Main checkpoint shutdown could not confirm host quiescence. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+          throw error;
+        }
+        throw new Error(`Main checkpoint shutdown custody could not be confirmed. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`, { cause: error });
       }
-      // This registry/runtime pair is session-local: claim any linked background
-      // generations first (suppressing stale output/notices), then join every
-      // retained child before SessionEnd and process shutdown proceed.
+      const mainShutdown = mainCheckpointGate.currentController().snapshot();
+      if (mainCheckpointGate.currentController().isProcessTerminal()) {
+        throw new UnconfirmedHostDeadlineError();
+      }
+      if ((mainShutdown.cancellationKind === "shutdown" && mainShutdown.cancellationCommitted &&
+           mainShutdown.phase !== "idle") || mainShutdownRetainedInputAtRisk) {
+        console.error("PiCC: confirmed main-session shutdown could not establish a durable retained-input locator; shutdown continues and undelivered input may be lost.");
+      }
+      const persistenceFailures = new Set<RetainedInputPersistenceFailure | "storage-unavailable">();
+      const retained = await subagentRuntime.stopAllRetainedSubagents({
+        persist: (report) => {
+          if (retainedPersistenceLocators.has(report)) return true;
+          if (!sessionManagerRef) {
+            persistenceFailures.add("storage-unavailable");
+            return false;
+          }
+          try {
+            const locator = (testSeam?.persistRetainedInputReport ?? persistRetainedInputReport)(report, {
+              session: sessionManagerRef as import("./runtime/retained-input-persistence.js").RetainedInputPersistenceSession,
+            });
+            retainedPersistenceLocators.set(report, locator);
+            return true;
+          } catch (error) {
+            persistenceFailures.add(error instanceof RetainedInputPersistenceError ? error.category : "storage-unsafe");
+            return false;
+          }
+        },
+      });
+      if (retained.unconfirmed > 0 || retained.outcomes.some((outcome) => outcome.disposition === "unconfirmed")) {
+        throw new Error("Unconfirmed child shutdown disposition blocked cleanup. Exit PiCC completely, start a fresh process and session, then inspect the child transcript, worktree, possible files/tools/external effects, and canonical TaskOutput detail when available; do not resume or retry the affected child in this process.");
+      }
+      const persistedLocators = retained.outcomes.flatMap((outcome) => {
+        const locator = outcome.report && retainedPersistenceLocators.get(outcome.report);
+        return locator ? [locator] : [];
+      });
+      if (persistedLocators.length > 0) {
+        const locators = persistedLocators.map((locator) => locator.kind === "session-entry"
+          ? `session ${locator.sessionFile}, entry ${locator.entryId}. Open/search that named JSONL for exact entry id ${locator.entryId} and customType picc-retained-input-report, then read ordered data.report.occurrences`
+          : `recovery file ${locator.path} for session ${locator.sessionFile}. Open that named JSON and read ordered report.occurrences`);
+        console.error(`PiCC: persisted retained input for restart recovery: ${locators.join("; ")} before deliberate resubmission.`);
+      }
+      const failedPersistence = retained.outcomes.some((outcome) =>
+        outcome.disposition === "confirmed" && outcome.report !== undefined && outcome.persisted !== true);
+      const failedCleanup = retained.outcomes.some((outcome) =>
+        outcome.disposition === "confirmed" && outcome.report !== undefined && outcome.cleanupReleased !== true);
+      if (failedPersistence) {
+        const categories = [
+          persistenceFailures.has("report-incomplete") ? "incomplete or unrepresentable report" : undefined,
+          persistenceFailures.has("storage-unsafe") || persistenceFailures.has("storage-unavailable")
+            ? "storage unavailable or unsafe" : undefined,
+        ].filter((value): value is string => value !== undefined);
+        console.error(`PiCC: confirmed retained-input shutdown persistence failed${categories.length ? ` (${categories.join("; ")})` : ""}; shutdown continues and undelivered input may be lost. No durable locator exists for the failed report(s).`);
+      }
+      if (failedCleanup) {
+        throw new Error("Confirmed child cleanup release could not be authenticated. Cleanup remains blocked; exit PiCC completely, start a fresh process and session, and inspect the child transcript, worktree, canonical TaskOutput report, and possible files/tools/external effects.");
+      }
+      // Pre-commit paused records have no retained report and keep their established
+      // shutdown join. Enhanced confirmed records were already joined above.
       await Promise.allSettled(subagentRegistry.list()
-        .filter((record) => record.state === "running" && record.checkpointPaused)
+        .filter((record) => record.state === "running" && record.checkpointPaused && !record.retainedInputReport)
         .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
       await subagentRuntime.shutdownCheckpointPaused();
       // MCP servers die with the session — after the subagent joins above
@@ -3311,11 +3640,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       await mcpRuntime.shutdown();
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
-    } catch {
-      /* floor */
+    } catch (error) {
+      if (error instanceof UnconfirmedHostDeadlineError) {
+        if (!error.message.includes("fresh PiCC process")) {
+          error.message = `Main checkpoint shutdown could not confirm host quiescence. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+        }
+        custodyFailure = error;
+      } else if (error instanceof Error &&
+          (error.message.startsWith("Main checkpoint shutdown custody could not be confirmed") ||
+           error.message.startsWith("Unconfirmed child shutdown disposition") ||
+           error.message.startsWith("Confirmed child cleanup release"))) {
+        custodyFailure = error;
+      }
+      // Other shutdown integrations retain the existing never-crash floor.
     } finally {
       if (event?.reason === "quit") await joinScheduledRetentionJobs();
     }
+    if (custodyFailure) throw custodyFailure;
   });
 
   const MCP_PROMPT_FAILURE_MESSAGE_MAX_CHARS = 4_096;
@@ -4023,7 +4364,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     )) {
       // The authoritative stop has joined and rotated its controller. The physical
       // resumed terminal is nevertheless post-commit and closes that successor.
-      await controller.failAfterCommittedSummary(controller.snapshot().generation);
+      await controller.failAfterCommittedSummary(controller.snapshot().generation, "resumed-work");
     }
     if (matchingNativeOperation && activeCompactionOperation === physicalOperation) {
       // Pi publishes no failure event for a native operation. A later true settlement
@@ -4036,10 +4377,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const resume = activeMainResume;
       if (resume && resume.epoch === checkpointSessionEpoch &&
           resume.generation === snapshot.generation && resume.token.generation === snapshot.generation &&
-          snapshot.phase === "resuming") {
-        // Resumed work is post-commit. An unsuccessful physical terminal must use
-        // the existing abandonment path, which terminalizes instead of publishing success.
-        resume.conclude("abandoned");
+          (snapshot.phase === "resuming" || snapshot.phase === "terminalizing")) {
+        // Exact aborted message_end identity followed by this same branch settlement is
+        // the sole safe resumed-cancellation exception. Every other unsuccessful ending
+        // remains stage-attributed post-commit exhaustion.
+        resume.conclude(terminalAssistant.stopReason === "aborted" && resume.abortedAssistant === terminalAssistant
+          ? "cancelled"
+          : "abandoned");
       } else {
         if (resume === undefined && !mainCheckpointGate.isLogicalRunStopped() &&
             terminalAssistant.stopReason !== "aborted" && snapshot.phase === "awaiting-settlement") {
@@ -4336,9 +4680,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const startedContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
       if (!universalStop && startedContext) {
         if (!isCurrent()) return;
-        pi.sendMessage(
+        sendCheckpointMessage(
           { customType: "picc-hook-context", content: startedContext, display: true },
           { deliverAs: "steer" },
+          "restoration-control",
         );
       }
     } catch {
@@ -4369,13 +4714,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
         if (budgeted.text) {
           if (!isCurrent()) return;
-          pi.sendMessage(
+          sendCheckpointMessage(
             {
               customType: "picc-preserved",
               content: `Context preserved across compaction (PiCC):\n\n${budgeted.text}`,
               display: false,
             },
             { deliverAs: "steer" },
+            "restoration-control",
           );
         }
       }
@@ -4391,7 +4737,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // The terminalization reports its own drained queue now, so forwarding the
         // return value here would report the same shadows twice — and restore the same
         // text into the TUI editor twice.
-        await controller.failAfterCommittedSummary(generation);
+        await controller.failAfterCommittedSummary(generation, "restoration");
       } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
         if (recovered.recovered) {

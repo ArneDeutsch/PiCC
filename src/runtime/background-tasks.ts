@@ -28,6 +28,7 @@ import {
   formatRetainedInputReport,
   retainedInputCount,
   taskOutputAgentLocator,
+  type CheckpointStopDisposition,
   type SubagentAdmission,
   type SubagentRegistry,
 } from "./subagent-registry.js";
@@ -225,7 +226,7 @@ export interface BackgroundTaskRecord {
   /** Unconfirmed host quiescence overrides any provisional/terminal task state. */
   checkpointQuarantined?: boolean;
   /** Exact registry-owned checkpoint-stop settlement for repeatable TaskStop reads. */
-  checkpointStopDisposition?: "confirmed" | "unconfirmed";
+  checkpointStopDisposition?: "ordinary-cleanup" | "confirmed" | "unconfirmed";
   /** Settled dispatch-result disposition, frozen generation-locally. */
   recoveryDisposition?: SubagentRecoveryDisposition;
   /**
@@ -265,7 +266,7 @@ export interface BackgroundTaskView {
   /** Subscribe only to this owned task's presentation-relevant mutations. */
   subscribe?(id: string, listener: () => void): () => void;
   /** Acquire or join the canonical registry-owned checkpoint stop. */
-  stopCheckpoint?(agentId: string, source: "task-stop" | "panel" | "session"): Promise<{ disposition: "confirmed" | "unconfirmed"; report?: RetainedInputReport }> | undefined;
+  stopCheckpoint?(agentId: string, source: "task-stop" | "panel" | "session"): Promise<CheckpointStopDisposition> | undefined;
   /** Opted-in report-only lookup by stable agent identity. */
   retainedReport?(agentId: string): RetainedInputReport | undefined;
   /** Authorized report locators for helpful unknown-id guidance. */
@@ -276,7 +277,7 @@ export interface RetainedOutcomeRegistryOptions {
   registry: SubagentRegistry;
 }
 
-export type StopDisposition = "provisional" | "confirmed" | "unconfirmed";
+export type StopDisposition = "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed";
 
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
@@ -783,7 +784,7 @@ export class BackgroundTaskRegistry {
 
   private finalizeCheckpointStop(
     task: BackgroundTaskRecord,
-    outcome: { disposition: "confirmed" | "unconfirmed"; report?: RetainedInputReport },
+    outcome: CheckpointStopDisposition,
   ): StopDisposition {
     const custody = task.agentId ? this.retainedOutcomes?.registry.get(task.agentId) : undefined;
     if (outcome.disposition === "unconfirmed" || custody?.checkpointQuarantined) {
@@ -798,15 +799,16 @@ export class BackgroundTaskRegistry {
       return "unconfirmed";
     }
     const report = outcome.report;
-    if (outcome.disposition === "confirmed" && report && custody?.retainedInputReport === report) {
-      task.retainedInputReport = report;
-      task.checkpointStopDisposition = "confirmed";
+    if (outcome.disposition === "ordinary-cleanup" ||
+        (outcome.disposition === "confirmed" && report && custody?.retainedInputReport === report)) {
+      if (report) task.retainedInputReport = report;
+      task.checkpointStopDisposition = outcome.disposition;
       task.checkpointStopState = undefined;
       task.status = "stopped";
       task.checkpointPaused = false;
       task.error = undefined;
       this.notifyChange(task.id);
-      return "confirmed";
+      return outcome.disposition;
     }
     if (task.agentId && custody) this.retainedOutcomes?.registry.quarantineCheckpoint(task.agentId);
     task.checkpointQuarantined = true;
@@ -1143,7 +1145,7 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   if (task.retainedInputReport) {
     const report = task.retainedInputReport;
     lines.push(
-      `${retainedInputCount(report)} retained input occurrence(s) are available in the canonical report. ` +
+      `${retainedInputCount(report)} retained input occurrence(s) are available in the canonical report at stage ${report.stage}. ` +
       `Retrieve the unchanged details with ${taskOutputAgentLocator(report.agentId)}; this notice does not consume them.`,
     );
   }
@@ -1317,6 +1319,7 @@ function retainedReportOutput(report: RetainedInputReport, task?: BackgroundTask
       representedCount: report.occurrences.length,
       unrepresentableCount: report.unrepresentableCount,
       retainedCount: retainedInputCount(report),
+      stage: report.stage,
       agentId: report.agentId,
       ...(task ? { taskId: task.id, status: task.status } : {}),
     },
@@ -1362,7 +1365,13 @@ export function createTaskOutputTool(
         ? Object.freeze({ taskId: correlatedId, description })
         : undefined;
       const resolveAgentColor = presentation.resolveAgentColor;
-      return renderAgentResult(result, options, theme, context, {
+      // `stage` is structured TaskOutput custody detail; the existing shared human
+      // renderer has a closed details schema, so keep that machine field out of its
+      // validation snapshot without changing the canonical tool result.
+      const renderInput = result.details && "stage" in result.details
+        ? { ...result, details: Object.fromEntries(Object.entries(result.details).filter(([key]) => key !== "stage")) as SubagentRenderDetails }
+        : result;
+      return renderAgentResult(renderInput, options, theme, context, {
         surface: "task-output",
         ...(resolveAgentColor ? { resolveAgentColor } : {}),
         ...(awaitedTaskOutputFallback ? { awaitedTaskOutputFallback } : {}),
@@ -1612,6 +1621,7 @@ export function createTaskOutputTool(
             representedCount: canonicalReport.occurrences.length,
             unrepresentableCount: canonicalReport.unrepresentableCount,
             retainedCount: retainedInputCount(canonicalReport),
+            stage: canonicalReport.stage,
           } : {}),
         } satisfies SubagentRenderDetails,
       };
@@ -1726,7 +1736,7 @@ export function createTaskStopTool(
           return {
             content: [{
               type: "text",
-              text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
+              text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement at stage ${paused.retainedInputReport.stage}. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
             }],
             details: {
               agentId: paused.agentId,
@@ -1735,6 +1745,7 @@ export function createTaskStopTool(
               disposition: "confirmed",
               reportId: paused.retainedInputReport.reportId,
               retainedCount: count,
+              stage: paused.retainedInputReport.stage,
             },
           };
         }
@@ -1774,7 +1785,7 @@ export function createTaskStopTool(
         return {
           content: [{
             type: "text",
-            text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
+            text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement${report ? ` at stage ${report.stage}` : ""}. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
           }],
           details: {
             agentId: paused.agentId,
@@ -1783,6 +1794,7 @@ export function createTaskStopTool(
             disposition: "confirmed",
             reportId: report?.reportId,
             retainedCount: report ? retainedInputCount(report) : undefined,
+            ...(report ? { stage: report.stage } : {}),
           },
         };
       }
@@ -1798,7 +1810,7 @@ export function createTaskStopTool(
       const text = stopped.disposition === "unconfirmed"
         ? `${identity} — host quiescence is unconfirmed; no stopped/aborted outcome is claimed. ${report && task.agentId ? `Canonical report: ${taskOutputAgentLocator(task.agentId)}.` : "No canonical report exists; inspect the transcript for retained input."} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.`
         : stopped.disposition === "confirmed"
-          ? `${identity} — stop confirmed after settlement. ${report ? retainedInputCount(report) : 0} retained input occurrence(s)${task.agentId ? `; ${taskOutputAgentLocator(task.agentId)}` : ""}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`
+          ? `${identity} — stop confirmed after settlement${report ? ` at stage ${report.stage}` : ""}. ${report ? retainedInputCount(report) : 0} retained input occurrence(s)${task.agentId ? `; ${taskOutputAgentLocator(task.agentId)}` : ""}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`
           : stopped.alreadySettled
             ? `${identity} — already finished with status "${task.status}"; nothing to stop.`
             : stopped.abortRequested
@@ -1815,6 +1827,7 @@ export function createTaskStopTool(
             retainedCount: retainedInputCount(report),
             representedCount: report.occurrences.length,
             unrepresentableCount: report.unrepresentableCount,
+            stage: report.stage,
           } : {}),
         } satisfies SubagentRenderDetails,
       };

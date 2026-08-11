@@ -3400,7 +3400,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
         });
         expect(registry.get(checkpointId)?.checkpointQuarantined).toBeUndefined();
         expect(await report.claim(async () => true)).toBe(true);
-        const confirmation = `Stop confirmed for coder. 0 retained input occurrence(s); TaskOutput with task_id "${checkpointId}". Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`;
+        const confirmation = `Stop confirmed for coder at stage resumed-cancellation. 0 retained input occurrence(s); TaskOutput with task_id "${checkpointId}". Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`;
         expect(pi.notifications.map((notice) => notice.text)).toEqual(throwAggregate
           ? [panelNoticeStopAllArmed(2), panelNoticeStopSettling("coder"), confirmation]
           : [
@@ -3507,7 +3507,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await vi.waitFor(() => expect(registry.get(agentId)?.checkpointQuarantined).toBe(true));
     expect(registry.get(agentId)?.userStopped).toBeUndefined();
     expect(pi.notifications.at(-1)?.text).toMatch(/unconfirmed.*Do not retry in this process.*fresh process and session.*transcript.*worktree/isu);
-    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s); canonical report: TaskOutput with task_id "${agentId}"`);
+    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s) at stage resumed-cancellation; canonical report: TaskOutput with task_id "${agentId}"`);
     invocation.render(12);
     expect(pi.notifications.at(-1)?.text).toContain(`TaskOutput with task_id "${agentId}"`);
     invocation.input(ESC);
@@ -3551,7 +3551,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await vi.waitFor(() => expect(registry.get(agentId)?.checkpointQuarantined).toBe(true));
     expect(registry.get(agentId)?.userStopped).toBeUndefined();
     expect(pi.notifications.at(-1)?.text).toMatch(/unconfirmed.*Do not retry in this process.*fresh process and session.*transcript.*worktree/isu);
-    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s); canonical report: TaskOutput with task_id "${agentId}"`);
+    expect(pi.notifications.at(-1)?.text).toContain(`1 retained input occurrence(s) at stage resumed-cancellation; canonical report: TaskOutput with task_id "${agentId}"`);
     invocation.input("x");
     await Promise.resolve();
     expect(physicalStops).toBe(1);
@@ -4716,6 +4716,123 @@ describe("panel focus (offline integration: fake-pi + fake-sdk)", () => {
     });
     return { taskId: String(started.details.taskId), agentId: String(started.details.agentId) };
   }
+
+  it("production precommit panel stop marks linked task and agent without report or later shutdown block", async () => {
+    const handle = fakeSdk({ replies: ["unused"] });
+    const { pi, internals } = await boot(handle);
+    try {
+      const ctx = pi.tuiCtx();
+      await pi.fire("session_start", { reason: "startup" }, ctx);
+      const agentId = "agent-808080808080";
+      const taskId = internals.backgroundTasks.start(
+        "agent:reviewer",
+        Promise.resolve({
+          ok: false, outcome: "failed" as const, finalMessage: "", agentId,
+          agentName: "reviewer", checkpointPaused: true, error: "pre-commit exhausted",
+        }),
+        async () => undefined,
+        agentId,
+        "reviewer",
+      );
+      await internals.backgroundTasks.wait(taskId);
+      internals.subagentRegistry.register({
+        agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup" };
+        } },
+      });
+
+      pi.shortcuts.get(PANEL_ENTRY_CHORD)!.handler(ctx);
+      const invocation = pi.customs.at(-1)!;
+      await invocation.ready;
+      invocation.render(120);
+      invocation.input("x");
+      await waitUntil({
+        description: "production precommit panel stop settlement",
+        predicate: () => internals.subagentRegistry.get(agentId)?.userStopped === true &&
+          internals.backgroundTasks.get(taskId)?.userStopped === true,
+        describeObserved: () => JSON.stringify({
+          agent: internals.subagentRegistry.get(agentId), task: internals.backgroundTasks.get(taskId),
+        }),
+      });
+
+      expect(internals.backgroundTasks.get(taskId)).toMatchObject({
+        status: "stopped", userStopped: true, checkpointStopDisposition: "ordinary-cleanup",
+      });
+      expect(internals.subagentRegistry.get(agentId)).toMatchObject({
+        state: "settled", userStopped: true, checkpointPaused: false,
+      });
+      expect(internals.subagentRegistry.get(agentId)).not.toHaveProperty("retainedInputReport");
+      expect(internals.subagentRegistry.get(agentId)).not.toHaveProperty("checkpointQuarantined");
+      invocation.input(ESC);
+      await invocation.result;
+      await expect(pi.fire("session_shutdown", { reason: "other" }, ctx)).resolves.toBeUndefined();
+    } finally {
+      internals.subagentPanel.setSuppressed(true);
+    }
+  });
+
+  it("production panel stop links canonical stage and both task/agent stop markers", async () => {
+    const handle = fakeSdk({ replies: ["unused"] });
+    const { pi, internals } = await boot(handle);
+    try {
+      const ctx = pi.tuiCtx();
+      await pi.fire("session_start", { reason: "startup" }, ctx);
+      const agentId = "agent-909090909090";
+      const taskId = internals.backgroundTasks.start(
+        "agent:reviewer",
+        Promise.resolve({
+          ok: false, outcome: "failed" as const, finalMessage: "", agentId,
+          agentName: "reviewer", checkpointPaused: true, error: "paused",
+        }),
+        async () => undefined,
+        agentId,
+        "reviewer",
+      );
+      await internals.backgroundTasks.wait(taskId);
+      let report: ReturnType<typeof createRetainedInputReport>;
+      internals.subagentRegistry.register({
+        agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          report = createRetainedInputReport({
+            agentId, sessionId: "session:production-panel", generation: 1,
+            stage: "resumed-cancellation", occurrences: [], guidance: "Inspect effects.",
+          });
+          internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+          internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, report };
+        } },
+      });
+
+      pi.shortcuts.get(PANEL_ENTRY_CHORD)!.handler(ctx);
+      const invocation = pi.customs.at(-1)!;
+      await invocation.ready;
+      invocation.render(120);
+      invocation.input("x");
+      await waitUntil({
+        description: "production panel retained stop settlement",
+        predicate: () => internals.subagentRegistry.get(agentId)?.userStopped === true,
+        describeObserved: () => JSON.stringify({
+          agent: internals.subagentRegistry.get(agentId),
+          task: internals.backgroundTasks.get(taskId),
+          notices: pi.notifications,
+        }),
+      });
+
+      expect(internals.backgroundTasks.get(taskId)).toMatchObject({ status: "stopped", userStopped: true });
+      expect(internals.subagentRegistry.get(agentId)).toMatchObject({
+        state: "settled", userStopped: true, retainedInputReport: report!,
+      });
+      expect(pi.notifications.at(-1)?.text).toContain("stage resumed-cancellation");
+      invocation.input(ESC);
+      await invocation.result;
+    } finally {
+      internals.subagentPanel.setSuppressed(true);
+    }
+  });
 
   it("chord → component; x applies the paired stop; the model gets the NORMAL aborted settlement notice; resume refused", async () => {
     const gate = new Promise<void>(() => {}); // never resolves — only abort ends the run
