@@ -1181,6 +1181,7 @@ describe("pi 0.83.0 API contract", () => {
     const agentEndJoin = deferred<void>();
     const providerCalls: any[] = [];
     const authenticatedStarts: any[] = [];
+    const customStartEventKeys: string[][] = [];
     const observed: Array<{ type: string; stopReason?: string; streaming?: boolean }> = [];
     const settledPayloads: any[] = [];
     const extensionEvents: string[] = [];
@@ -1212,6 +1213,7 @@ describe("pi 0.83.0 API contract", () => {
         extensionFactory: (api) => {
           api.on("message_start", (event: any) => {
             if (event.message?.role !== "custom") return;
+            customStartEventKeys.push(Object.keys(event).sort());
             authenticatedStarts.push(structuredClone(event.message));
             if (isRecord(event.message.details)) delete event.message.details.nonce;
           });
@@ -1276,6 +1278,9 @@ describe("pi 0.83.0 API contract", () => {
       ]);
       expect(authenticatedStarts[0]).toEqual(expect.objectContaining(expectedExplicitEnvelopes[0]));
       expect(authenticatedStarts[3]).toEqual(expect.objectContaining(expectedExplicitEnvelopes[1]));
+      expect(customStartEventKeys.slice(0, 4)).toEqual([
+        ["message", "type"], ["message", "type"], ["message", "type"], ["message", "type"],
+      ]);
       const persistedFirstQueue = session.sessionManager.getBranch()
         .filter((entry: any) => entry.type === "custom_message")
         .slice(0, 4);
@@ -1387,6 +1392,60 @@ describe("pi 0.83.0 API contract", () => {
       firstProvider.resolve();
       purgeProvider.resolve();
       agentEndJoin.resolve();
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an invoked trigger through delayed agent_start, queue purge, and abort until physical settlement", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-delayed-agent-start-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const agentStartEntered = deferred<void>();
+    const releaseAgentStart = deferred<void>();
+    const triggerStarted = deferred<void>();
+    const observed: string[] = [];
+    let session: any;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: (_model, _context, options) =>
+          completedContractMessage(ai, "", options.signal?.aborted ? "aborted" : "stop"),
+        extensionFactory: (api) => {
+          api.on("agent_start", async () => {
+            observed.push("agent_start-entered");
+            agentStartEntered.resolve();
+            await releaseAgentStart.promise;
+            observed.push("agent_start-released");
+          });
+          api.on("message_start", (event: any) => {
+            if (event.message?.customType === "picc-delayed-trigger") {
+              observed.push("message_start");
+              triggerStarted.resolve();
+            }
+          });
+          api.on("agent_end", () => { observed.push("agent_end"); });
+          api.on("agent_settled", () => { observed.push("agent_settled"); });
+        },
+      }));
+      let sendSettled = false;
+      const sending = session.sendCustomMessage({
+        customType: "picc-delayed-trigger", content: "continue", display: false,
+      }, { triggerTurn: true }) as Promise<void>;
+      void sending.then(() => { sendSettled = true; });
+      await agentStartEntered.promise;
+      expect(session.clearQueue()).toEqual({ steering: [], followUp: [] });
+      const aborting = session.abort() as Promise<void>;
+      expect(sendSettled).toBe(false);
+      releaseAgentStart.resolve();
+      await triggerStarted.promise;
+      expect(sendSettled).toBe(false);
+      await Promise.all([sending, aborting]);
+      expect(observed).toEqual([
+        "agent_start-entered", "agent_start-released", "message_start", "agent_end", "agent_settled",
+      ]);
+      expect(sendSettled).toBe(true);
+    } finally {
+      releaseAgentStart.resolve();
       session?.dispose?.();
       rmSync(cwd, { recursive: true, force: true });
     }

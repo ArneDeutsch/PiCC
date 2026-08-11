@@ -15,14 +15,17 @@ import { deferred, waitUntil } from "./helpers/async.js";
 
 const usage = { tokens: 900, contextWindow: 1000, percent: 90 };
 
-function manualClock(): HostDeadlineClock & { pending(): boolean; expire(): void } {
+function manualClock(): HostDeadlineClock & { pending(): boolean; schedules(): number; expire(): void } {
   let callback: (() => void) | undefined;
+  let scheduleCount = 0;
   return {
     schedule(_delayMs, expired) {
+      scheduleCount += 1;
       callback = expired;
       return { clear: () => { callback = undefined; } };
     },
     pending: () => callback !== undefined,
+    schedules: () => scheduleCount,
     expire() {
       const current = callback;
       callback = undefined;
@@ -55,6 +58,255 @@ function terminalActions(progress: readonly CheckpointProgress[]): CheckpointPro
 }
 
 describe("settled resumed cancellation protocol", () => {
+  it("uses one explicit-request deadline across phased leases, adapter invocation, and evidence", async () => {
+    const clock = manualClock();
+    const ordering: string[] = [];
+    let context!: ResumeContext;
+    let controller!: MidRunCompactionController;
+    let triggerLease!: HostInputLease;
+    controller = new MidRunCompactionController({
+      sessionId: "session",
+      threshold: 90,
+      compact: async () => {
+        controller.observeCompactionCommit(controller.snapshot().generation);
+        return { ok: true };
+      },
+      resume: (candidate) => {
+        context = candidate;
+        const trigger = controller.admitHostInput("continuation-trigger");
+        expect(trigger.kind).toBe("lease");
+        triggerLease = (trigger as { kind: "lease"; lease: HostInputLease }).lease;
+        return {
+          replay: async () => ({ delivered: true }),
+          cancelAndJoin: async () => {
+            ordering.push("adapter");
+            expect(controller.settleHostInput(triggerLease)).toBe(true);
+            expect(controller.resumedAborted(candidate.token)).toBe(true);
+            expect(controller.resumedSettled(candidate.token, "cancelled")).toBe(true);
+            return { ending: "aborted" as const };
+          },
+        };
+      },
+      cancelledInput: (handoff) => {
+        ordering.push("handoff");
+        return resolution(handoff, "reported");
+      },
+      deadlinePolicy: { clock, resumedJoinMs: 10 },
+    });
+    const generation = arm(controller);
+    controller.shadowInput(generation, "retained", "steer");
+    const checkpoint = controller.checkpoint(generation);
+    await waitUntil({ description: "explicit resume ownership", predicate: () => context !== undefined && !!triggerLease });
+    await Promise.resolve();
+    const prejoin = controller.admitHostInput("subagent-input");
+    expect(prejoin.kind).toBe("lease");
+    const request = context.requestCancellation("task-stop");
+    expect(controller.snapshot().phase).toBe("terminalizing");
+    expect(clock.pending()).toBe(true);
+    expect(clock.schedules()).toBe(1);
+    await Promise.resolve();
+    expect(ordering).toEqual([]);
+    expect(controller.settleHostInput((prejoin as { kind: "lease"; lease: HostInputLease }).lease)).toBe(true);
+    await expect(request).resolves.toEqual({ cancelled: true, rejected: [] });
+    await checkpoint;
+    expect(ordering).toEqual(["adapter", "handoff"]);
+    expect(clock.pending()).toBe(false);
+    expect(controller.snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+  });
+
+  it.each(["requested-first", "observed-first"] as const)(
+    "converges %s duplicate and stale resumed requests on one owner",
+    async (order) => {
+      const clock = manualClock();
+      const handoffGate = deferred<CancelledInputResolution>();
+      let context!: ResumeContext;
+      let captured!: CancelledInputHandoff;
+      let adapterCalls = 0;
+      let handoffCalls = 0;
+      let controller!: MidRunCompactionController;
+      controller = new MidRunCompactionController({
+        sessionId: "session", threshold: 90,
+        compact: async () => {
+          controller.observeCompactionCommit(controller.snapshot().generation);
+          return { ok: true };
+        },
+        resume: (candidate) => {
+          context = candidate;
+          return {
+            replay: async () => ({ delivered: true }),
+            cancelAndJoin: async () => {
+              adapterCalls += 1;
+              expect(controller.resumedAborted(candidate.token)).toBe(true);
+              expect(controller.resumedSettled(candidate.token, "cancelled")).toBe(true);
+              return { ending: "aborted" as const };
+            },
+          };
+        },
+        cancelledInput: (handoff) => {
+          handoffCalls += 1;
+          captured = handoff;
+          return handoffGate.promise;
+        },
+        deadlinePolicy: { clock, resumedJoinMs: 10 },
+      });
+      const generation = arm(controller);
+      controller.shadowInput(generation, "retained", "steer");
+      const checkpoint = controller.checkpoint(generation);
+      await waitUntil({ description: "overlap resume context", predicate: () => context !== undefined });
+      await Promise.resolve();
+
+      let first: Promise<CancellationOutcome>;
+      if (order === "observed-first") {
+        expect(controller.resumedAborted(context.token)).toBe(true);
+        expect(controller.resumedSettled(context.token, "cancelled")).toBe(true);
+        first = context.requestCancellation("task-stop");
+      } else {
+        first = context.requestCancellation("task-stop");
+      }
+      const duplicate = context.requestCancellation("shutdown");
+      expect(duplicate).toBe(first);
+      await waitUntil({ description: "single overlap handoff", predicate: () => handoffCalls === 1 && clock.pending() });
+      await expect(controller.requestResumedCancellation({ generation, token: {} }, "replacement"))
+        .resolves.toEqual({ cancelled: false, rejected: [] });
+      handoffGate.resolve(resolution(captured, "reported"));
+      await expect(Promise.all([first, duplicate])).resolves.toEqual([
+        { cancelled: true, rejected: [] }, { cancelled: true, rejected: [] },
+      ]);
+      await checkpoint;
+      expect(adapterCalls).toBe(order === "requested-first" ? 1 : 0);
+      expect(handoffCalls).toBe(1);
+      expect(clock.pending()).toBe(false);
+      expect(clock.schedules()).toBe(1);
+    },
+  );
+
+  it("identity-invalidates an in-flight shared request before late success can hand off custody", async () => {
+    const adapter = deferred<{ ending: "aborted" }>();
+    const progress: CheckpointProgress[] = [];
+    let context!: ResumeContext;
+    let handoffs = 0;
+    let controller!: MidRunCompactionController;
+    controller = new MidRunCompactionController({
+      sessionId: "session",
+      threshold: 90,
+      compact: async () => {
+        controller.observeCompactionCommit(controller.snapshot().generation);
+        return { ok: true };
+      },
+      resume: (candidate) => {
+        context = candidate;
+        return {
+          replay: async () => ({ delivered: true, pendingHostStart: true }),
+          cancelAndJoin: async () => await adapter.promise,
+        };
+      },
+      cancelledInput: (handoff) => {
+        handoffs += 1;
+        return resolution(handoff);
+      },
+      progress: (event) => progress.push(event),
+    });
+    const generation = arm(controller);
+    controller.shadowInput(generation, "retained", "steer");
+    const checkpoint = controller.checkpoint(generation);
+    await waitUntil({ description: "shared invalidation context", predicate: () => context !== undefined });
+    const request = context.requestCancellation("task-stop");
+    await Promise.resolve();
+    expect(controller.invalidateResumedCancellation(context.token)).toBe(true);
+    expect(controller.invalidateResumedCancellation(context.token)).toBe(true);
+    await expect(request).rejects.toThrow(/contradictory/iu);
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", failureCategory: "unconfirmed-host", queuedInputs: 1,
+    });
+    adapter.resolve({ ending: "aborted" });
+    await checkpoint;
+    await Promise.resolve();
+    expect(handoffs).toBe(0);
+    expect(controller.queuedInputSnapshot()).toHaveLength(1);
+    expect(progress.filter((event) => event.failureCategory === "unconfirmed-host")).toHaveLength(1);
+    expect(controller.invalidateResumedCancellation({ generation, token: {} })).toBe(false);
+  });
+
+  it("bounds an explicit cancellation adapter by default and quarantines without a second deadline", async () => {
+    const clock = manualClock();
+    const adapter = deferred<void>();
+    const replay = deferred<{ delivered: true }>();
+    let context!: ResumeContext;
+    let controller!: MidRunCompactionController;
+    controller = new MidRunCompactionController({
+      sessionId: "session",
+      threshold: 90,
+      compact: async () => {
+        controller.observeCompactionCommit(controller.snapshot().generation);
+        return { ok: true };
+      },
+      resume: (candidate) => {
+        context = candidate;
+        return {
+          replay: () => replay.promise,
+          cancelAndJoin: () => adapter.promise,
+        };
+      },
+      cancelledInput: (handoff) => resolution(handoff),
+      deadlinePolicy: { clock },
+    });
+    const generation = arm(controller);
+    controller.shadowInput(generation, "retained", "followUp");
+    const checkpoint = controller.checkpoint(generation);
+    await waitUntil({ description: "explicit cancellation context", predicate: () => context !== undefined });
+    await Promise.resolve();
+    const request = context.requestCancellation("shutdown");
+    await waitUntil({ description: "single explicit deadline", predicate: () => clock.pending() });
+    clock.expire();
+    await expect(request).rejects.toThrow(/deadline/iu);
+    await checkpoint;
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", queuedInputs: 1, failureCategory: "unconfirmed-host", stage: "cancellation-join",
+    });
+    adapter.resolve();
+    await Promise.resolve();
+    expect(controller.snapshot()).toMatchObject({ phase: "exhausted", queuedInputs: 1 });
+    expect(clock.pending()).toBe(false);
+    expect(clock.schedules()).toBe(1);
+  });
+
+  it("keeps legacy generic cancellation unbounded when no deadline policy is configured", async () => {
+    const adapter = deferred<void>();
+    const run = deferred<void>();
+    let context!: ResumeContext;
+    let adapterCalls = 0;
+    const controller = new MidRunCompactionController({
+      sessionId: "session",
+      threshold: 90,
+      compact: async () => ({ ok: true }),
+      resume: (candidate) => {
+        context = candidate;
+        return {
+          replay: async () => ({ delivered: true }),
+          settled: run.promise,
+          cancelAndJoin: async () => {
+            adapterCalls += 1;
+            await adapter.promise;
+          },
+        };
+      },
+    });
+    const generation = arm(controller);
+    const checkpoint = controller.checkpoint(generation);
+    await waitUntil({ description: "legacy generic resume context", predicate: () => context !== undefined });
+    const cancellation = controller.cancel(generation, "shutdown");
+    let finished = false;
+    void cancellation.then(() => { finished = true; });
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+    expect(adapterCalls).toBe(1);
+    expect(finished).toBe(false);
+    expect(controller.snapshot()).toMatchObject({ phase: "cancelled" });
+    adapter.resolve();
+    run.resolve();
+    await expect(cancellation).resolves.toMatchObject({ cancelled: true });
+    await checkpoint;
+  });
+
   it("revokes admission, joins every send-class lease, then performs one authenticated handoff", async () => {
     const classes: HostInputClass[] = [
       "restoration-control",
@@ -425,55 +677,72 @@ describe("settled resumed cancellation protocol", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
-  it("bounds an all-lease join without claiming handoff or quiescence and ignores late receipts", async () => {
-    const clock = manualClock();
-    const replay = deferred<{ delivered: true }>();
-    let context!: ResumeContext;
-    let handoffs = 0;
-    let controller!: MidRunCompactionController;
-    controller = new MidRunCompactionController({
-      sessionId: "session",
-      threshold: 90,
-      compact: async () => {
-        controller.observeCompactionCommit(controller.snapshot().generation);
-        return { ok: true };
-      },
-      resume: (candidate) => {
-        context = candidate;
-        return { replay: () => replay.promise, cancelAndJoin: async () => undefined };
-      },
-      cancelledInput: (handoff) => {
-        handoffs += 1;
-        return resolution(handoff);
-      },
-      deadlinePolicy: { clock, resumedJoinMs: 10 },
-    });
-    const generation = arm(controller);
-    controller.shadowInput(generation, "retained", "steer");
-    const checkpoint = controller.checkpoint(generation);
-    await waitUntil({ description: "resume context", predicate: () => context !== undefined });
-    const admission = controller.admitHostInput("retained-replay");
-    expect(admission.kind).toBe("lease");
-    const lease = (admission as { kind: "lease"; lease: HostInputLease }).lease;
-    expect(controller.resumedAborted(context.token)).toBe(true);
-    expect(controller.resumedSettled(context.token, "cancelled")).toBe(true);
-    await waitUntil({ description: "lease join deadline to arm", predicate: () => clock.pending() });
-    clock.expire();
-    await checkpoint;
+  it.each([true, false] as const)(
+    "bounds an all-lease join without claiming handoff or quiescence and ignores late receipts delivered=%s",
+    async (delivered) => {
+      const clock = manualClock();
+      const replay = deferred<{ delivered: true } | { delivered: false }>();
+      let context!: ResumeContext;
+      let handoffs = 0;
+      let controller!: MidRunCompactionController;
+      controller = new MidRunCompactionController({
+        sessionId: "session",
+        threshold: 90,
+        compact: async () => {
+          controller.observeCompactionCommit(controller.snapshot().generation);
+          return { ok: true };
+        },
+        resume: (candidate) => {
+          context = candidate;
+          return { replay: () => replay.promise, cancelAndJoin: async () => undefined };
+        },
+        cancelledInput: (handoff) => {
+          handoffs += 1;
+          return resolution(handoff);
+        },
+        deadlinePolicy: { clock, resumedJoinMs: 10 },
+      });
+      const generation = arm(controller);
+      controller.shadowInput(generation, "retained", "steer");
+      const checkpoint = controller.checkpoint(generation);
+      await waitUntil({ description: "resume context", predicate: () => context !== undefined });
+      const admission = controller.admitHostInput("retained-replay");
+      expect(admission.kind).toBe("lease");
+      const lease = (admission as { kind: "lease"; lease: HostInputLease }).lease;
+      expect(controller.resumedAborted(context.token)).toBe(true);
+      expect(controller.resumedSettled(context.token, "cancelled")).toBe(true);
+      await waitUntil({ description: "lease join deadline to arm", predicate: () => clock.pending() });
+      clock.expire();
+      await checkpoint;
 
-    expect(handoffs).toBe(0);
-    expect(controller.snapshot()).toMatchObject({
-      phase: "exhausted",
-      admission: "closed",
-      queuedInputs: 1,
-      failureCategory: "unconfirmed-host",
-      stage: "cancellation-join",
-    });
-    expect(controller.ordinaryInputDisposition()).toBe("reject-closed");
-    expect(controller.settleHostInput(lease)).toBe(false);
-    await expect(controller.cancel(generation, "replacement")).resolves.toEqual({ cancelled: false, rejected: [] });
-    expect(controller.queuedInputSnapshot()).toHaveLength(1);
-  });
+      expect(handoffs).toBe(0);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted",
+        admission: "closed",
+        queuedInputs: 1,
+        failureCategory: "unconfirmed-host",
+        stage: "cancellation-join",
+      });
+      expect(controller.ordinaryInputDisposition()).toBe("reject-closed");
+      const exhaustedSnapshot = controller.snapshot();
+      const retainedQueue = controller.queuedInputSnapshot();
+      const deadlineSchedules = clock.schedules();
+      expect(controller.settleHostInput(lease)).toBe(false);
+      await expect(controller.cancel(generation, "replacement")).resolves.toEqual({ cancelled: false, rejected: [] });
+
+      replay.resolve(delivered ? { delivered: true } : { delivered: false });
+      await replay.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(controller.queuedInputSnapshot()).toEqual(retainedQueue);
+      expect(controller.snapshot()).toEqual(exhaustedSnapshot);
+      expect(controller.ordinaryInputDisposition()).toBe("reject-closed");
+      expect(handoffs).toBe(0);
+      expect(clock.schedules()).toBe(deadlineSchedules);
+      expect(deadlineSchedules).toBe(1);
+    },
+  );
 
   it("bounds a cancellation handoff that never settles and preserves controller custody", async () => {
     const clock = manualClock();
@@ -540,6 +809,7 @@ describe("settled resumed cancellation protocol", () => {
     expect(controller.resumedAborted(context.token)).toBe(false);
     expect(controller.resumedSettled(context.token, "cancelled")).toBe(false);
     await expect(controller.cancel(generation, "replacement")).resolves.toEqual({ cancelled: false, rejected: [] });
+    expect(clock.schedules()).toBe(1);
   });
 
   it.each([
@@ -569,7 +839,10 @@ describe("settled resumed cancellation protocol", () => {
         resumeCalls += 1;
         context = candidate;
         if (stage === "restoration") throw new Error("restore failed");
-        if (stage === "continuation-start") return {} as never;
+        if (stage === "continuation-start") {
+          expect(candidate.advancePostCommitStage("continuation-start")).toBe(true);
+          return {} as never;
+        }
         return {
           replay: async () => {
             replayCalls += 1;

@@ -6,6 +6,7 @@ import {
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
@@ -36,6 +37,172 @@ const CALL_SHAPED_RESULT = `{
 }`;
 
 describe("dispatch outcome classification", () => {
+  it("keeps retained reports deeply immutable, finite, and claimable after failed delivery", async () => {
+    const nestedContent = [{ type: "text", text: "same retained text", nested: { value: 1 } }];
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab",
+      sessionId: "session:agent-0123456789ab",
+      generation: 4,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 7,
+        generation: 4,
+        sessionId: "session:agent-0123456789ab",
+        content: nestedContent,
+        delivery: "followUp",
+      }],
+      guidance: "Files, tools, and external effects may already exist; inspect them before explicit resend.",
+    });
+    nestedContent[0]!.text = "mutated after capture";
+    (nestedContent[0]!.nested as { value: number }).value = 2;
+    let deliveries = 0;
+    expect(await report.claim(async () => { deliveries += 1; return false; })).toBe(false);
+    const foreground = report.claim(async () => { deliveries += 1; await Promise.resolve(); return true; });
+    const settlementNotice = report.claim(async () => { deliveries += 1; return true; });
+
+    expect(await Promise.all([foreground, settlementNotice])).toEqual([true, false]);
+    expect(deliveries).toBe(2);
+    expect(report.occurrences).toEqual([expect.objectContaining({
+      disposition: "reported",
+      shadow: expect.objectContaining({
+        id: 7,
+        content: [{ type: "text", text: "same retained text", nested: { value: 1 } }],
+      }),
+    })]);
+    expect(report.guidance).toMatch(/files, tools, and external effects/iu);
+    expect(Object.isFrozen(report)).toBe(true);
+    expect(Object.isFrozen(report.occurrences)).toBe(true);
+    expect(Object.isFrozen(report.occurrences[0]!.shadow.content)).toBe(true);
+    expect(Object.isFrozen((report.occurrences[0]!.shadow.content as any[])[0]!.nested)).toBe(true);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: Number.NaN,
+      stage: "resumed-cancellation", occurrences: [], guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], unrepresentableCount: Number.POSITIVE_INFINITY,
+      guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+  });
+
+  it("counts unsupported retained content while preserving bounded immutable JSON-like values", () => {
+    const mutable = { type: "text", text: "safe", nested: [1, true, null] };
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const exotic = [
+      new Map([["text", "lost"]]), new Set([1]), new Date(), new Uint8Array([1]),
+      () => undefined, Symbol("lost"), cycle, Number.NaN, Number.POSITIVE_INFINITY,
+    ];
+    const occurrences = [mutable, ...exotic].map((content, index) => ({
+      id: index + 1, generation: 2, sessionId: "session", delivery: "steer" as const,
+      content: [content] as never,
+    }));
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences, unrepresentableCount: 3, guidance: "recover\u0000 safely",
+    });
+    mutable.text = "changed";
+    mutable.nested[0] = 9;
+    expect(report.occurrences).toHaveLength(1);
+    expect(report.occurrences[0]!.shadow.content).toEqual([{
+      type: "text", text: "safe", nested: [1, true, null],
+    }]);
+    expect(report.unrepresentableCount).toBe(3 + exotic.length);
+    expect(report.guidance).toBe("recover  safely");
+
+    const tooDeep: unknown[] = [];
+    let cursor = tooDeep;
+    for (let index = 0; index < 25; index += 1) {
+      const next: unknown[] = [];
+      cursor.push(next);
+      cursor = next;
+    }
+    const capped = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences: [{
+        id: 99, generation: 2, sessionId: "session", delivery: "followUp", content: tooDeep,
+      }], guidance: "recover",
+    });
+    expect(capped.occurrences).toEqual([]);
+    expect(capped.unrepresentableCount).toBe(1);
+
+    const overflowSafe = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 100, generation: 2, sessionId: "wrong-session", delivery: "steer", content: "lost",
+      }],
+      unrepresentableCount: Number.MAX_SAFE_INTEGER,
+      guidance: `\u0000${"g".repeat(2_100)}\u007f`,
+    });
+    expect(overflowSafe.unrepresentableCount).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(overflowSafe.unrepresentableCount)).toBe(true);
+    expect(overflowSafe.guidance).not.toMatch(/[\u0000\u007f]/u);
+    expect(overflowSafe.guidance.length).toBeLessThanOrEqual(2_000);
+    expect(overflowSafe.guidance).toMatch(/\[truncated\]$/u);
+  });
+
+  it("stores one canonical report before cleanup and makes quarantine authoritative", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-0123456789ab", agentName: "reviewer", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "Inspect side effects before resend.",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    const differentReport = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "different object",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", differentReport)).toBe(false);
+    registry.markSettled("agent-0123456789ab", { outcome: "aborted" });
+    expect(registry.get("agent-0123456789ab")?.retainedInputReport).toBe(report);
+    expect(registry.quarantineCheckpoint("agent-0123456789ab")).toBe(true);
+    expect(() => registry.assertDispatchAdmission("agent-0123456789ab")).toThrow(
+      /requested dispatch was not performed.*canonical report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+
+    registry.register({
+      agentId: "agent-fedcba987654", agentName: "worker", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(true);
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(false);
+    const quarantined = registry.get("agent-fedcba987654")!;
+    registry.noteProgress("agent-fedcba987654", { tail: ["late"], activity: "late" });
+    registry.noteAdmission("agent-fedcba987654", "waiting");
+    registry.markCheckpointPaused("agent-fedcba987654");
+    registry.markUserStopped("agent-fedcba987654");
+    registry.markSettled("agent-fedcba987654", { outcome: "aborted" });
+    registry.markResuming("agent-fedcba987654");
+    const forbiddenReport = createRetainedInputReport({
+      agentId: "agent-fedcba987654", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "late",
+    });
+    expect(registry.storeRetainedInputReport("agent-fedcba987654", forbiddenReport)).toBe(false);
+    expect(() => registry.register({
+      agentId: "agent-fedcba987654", agentName: "replacement", depth: 2, cwd: "/other",
+      resumable: true, oneShot: false,
+    })).toThrow(/quarantined/iu);
+    expect(registry.get("agent-fedcba987654")).toBe(quarantined);
+    expect(registry.get("agent-fedcba987654")).toMatchObject({
+      agentName: "worker", state: "running", checkpointPaused: true,
+      checkpointQuarantined: true, resumable: false,
+    });
+    expect(registry.get("agent-fedcba987654")?.userStopped).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.progress).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.admission).toBe("admitted");
+    expect(registry.isSettledNoticeArmed("agent-fedcba987654")).toBe(false);
+    expect(registry.consumeSettledNotice("agent-fedcba987654")).toBe(false);
+    expect(() => registry.assertDispatchAdmission("agent-fedcba987654")).toThrow(
+      /requested dispatch was not performed.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+  });
+
   it("stopReason 'error' with no prior output → failed with the error named, never an empty success", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 rate limit exceeded (mock provider)" }],

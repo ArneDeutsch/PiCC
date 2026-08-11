@@ -1,5 +1,6 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
 import { normalizeAgentColor, type AgentColorName } from "./agent-color.js";
+import type { RetainedInputReport } from "./retained-input-report.js";
 import {
   assistantTextFingerprint,
   sanitizeLine,
@@ -78,6 +79,18 @@ export type SubagentAdmission = "waiting" | "admitted";
 /** Settled fate of a dispatch, recorded for the /usage report. */
 export type SubagentOutcome = "completed" | "failed" | "aborted";
 
+export class QuarantinedSubagentError extends Error {
+  readonly code = "PICC_SUBAGENT_QUARANTINED";
+
+  constructor(readonly agentId: string, hasReport: boolean) {
+    const reportGuidance = hasReport
+      ? " Recover represented retained input only from its canonical report; inspect the transcript for any unrepresentable input."
+      : " No canonical retained-input report is available; inspect the transcript for retained input.";
+    super(`Agent ${agentId} is quarantined for this process lifetime. The requested dispatch was not performed.${reportGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`);
+    this.name = "QuarantinedSubagentError";
+  }
+}
+
 /**
  * Caps for stored conversation content, applied at capture. Both fields hold
  * model conversation text: they exist for the status panel's drill-down and
@@ -146,6 +159,10 @@ export interface SubagentRegistryRecord {
   session?: SteerableSession;
   /** The running record is retained solely at a settled checkpoint exhaustion boundary. */
   checkpointPaused?: boolean;
+  /** Canonical process-lifetime custody report, retained after ordinary live cleanup. */
+  retainedInputReport?: RetainedInputReport;
+  /** Process-terminal checkpoint ambiguity; no later lifecycle mutation is authorized. */
+  checkpointQuarantined?: boolean;
   /**
    * Settled-notice readiness gate. A (re)dispatch re-arms this agent-level
    * gate, but the background-task registry's task-generation collection and
@@ -274,6 +291,14 @@ export class SubagentRegistry {
     }
   }
 
+  /** Refuse before a dispatch can create a session, transcript, or worktree for a quarantined identity. */
+  assertDispatchAdmission(agentId: string): void {
+    const record = this.records.get(agentId);
+    if (record?.checkpointQuarantined) {
+      throw new QuarantinedSubagentError(agentId, record.retainedInputReport !== undefined);
+    }
+  }
+
   /**
    * Register a dispatch at session-creation time, or UPDATE an existing record
    * on resume (same agent ID). New IDs also (re)bind the name index; a resume of
@@ -282,6 +307,7 @@ export class SubagentRegistry {
    * the live session handle, and RE-ARMS the settled notice.
    */
   register(input: RegisterInput): SubagentRegistryRecord {
+    this.assertDispatchAdmission(input.agentId);
     const existing = this.records.get(input.agentId);
     if (existing) {
       existing.agentName = input.agentName;
@@ -361,7 +387,7 @@ export class SubagentRegistry {
     liveActivityUpdate?: { value: SubagentLiveActivity | undefined },
   ): void {
     const record = this.records.get(agentId);
-    if (!record || record.state !== "running") return;
+    if (!record || record.checkpointQuarantined || record.state !== "running") return;
     if (snapshot) {
       record.progress = {
         ...snapshot,
@@ -381,7 +407,7 @@ export class SubagentRegistry {
   /** Mirror runtime concurrency admission without changing lifecycle state. */
   noteAdmission(agentId: string, admission: SubagentAdmission): void {
     const record = this.records.get(agentId);
-    if (!record || record.state !== "running") return;
+    if (!record || record.checkpointQuarantined || record.state !== "running") return;
     record.admission = admission;
     this.notifyChange();
   }
@@ -389,7 +415,7 @@ export class SubagentRegistry {
   /** Mark a running record as the exact live checkpoint-paused recovery target. */
   markCheckpointPaused(agentId: string): void {
     const record = this.records.get(agentId);
-    if (!record || record.state !== "running" || !record.session?.recoverCheckpoint) return;
+    if (!record || record.checkpointQuarantined || record.state !== "running" || !record.session?.recoverCheckpoint) return;
     record.checkpointPaused = true;
     this.notifyChange();
   }
@@ -417,7 +443,7 @@ export class SubagentRegistry {
     },
   ): void {
     const record = this.records.get(agentId);
-    if (!record) return;
+    if (!record || record.checkpointQuarantined) return;
     record.state = "settled";
     record.session = undefined;
     record.liveActivity = undefined;
@@ -455,7 +481,7 @@ export class SubagentRegistry {
    */
   markResuming(agentId: string): void {
     const record = this.records.get(agentId);
-    if (!record || record.userStopped) return;
+    if (!record || record.userStopped || record.checkpointQuarantined) return;
     record.state = "running";
     record.admission = "admitted";
     record.settledNoticeConsumed = false;
@@ -480,9 +506,30 @@ export class SubagentRegistry {
    */
   markUserStopped(agentId: string): void {
     const record = this.records.get(agentId);
-    if (!record) return;
+    if (!record || record.checkpointQuarantined) return;
     record.userStopped = true;
     this.notifyChange();
+  }
+
+  /** Store one canonical report before its occurrences may resolve as reported. */
+  storeRetainedInputReport(agentId: string, report: RetainedInputReport): boolean {
+    const record = this.records.get(agentId);
+    if (!record || report.agentId !== agentId || record.checkpointQuarantined) return false;
+    if (record.retainedInputReport) return record.retainedInputReport === report;
+    record.retainedInputReport = report;
+    this.notifyChange();
+    return true;
+  }
+
+  /** Latch process-terminal ambiguity before any cleanup or replacement can acquire authority. */
+  quarantineCheckpoint(agentId: string): boolean {
+    const record = this.records.get(agentId);
+    if (!record || record.checkpointQuarantined) return false;
+    record.checkpointQuarantined = true;
+    record.checkpointPaused = true;
+    record.resumable = false;
+    this.notifyChange();
+    return true;
   }
 
   get(agentId: string): SubagentRegistryRecord | undefined {
@@ -522,7 +569,7 @@ export class SubagentRegistry {
    */
   consumeSettledNotice(agentId: string): boolean {
     const record = this.records.get(agentId);
-    if (!record || record.state !== "settled" || record.settledNoticeConsumed) return false;
+    if (!record || record.checkpointQuarantined || record.state !== "settled" || record.settledNoticeConsumed) return false;
     record.settledNoticeConsumed = true;
     return true;
   }
