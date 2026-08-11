@@ -340,6 +340,9 @@ export function routeCatalogPluginSource(
   input: unknown,
   context: CatalogSourceContext,
 ): ContractResult<SourceRoute<CatalogPluginSource, PluginSourceAdapter, PluginRootRule>> {
+  if (object(input)?.["source"] === "relative") {
+    return lifecycleError("unsupported-source", "Relative catalog plugin sources must use the documented string declaration");
+  }
   const matrixInput = typeof input === "string" ? { source: "relative", path: input } : input;
   const result = parseObjectSource<CatalogPluginSource, PluginSourceAdapter, PluginRootRule>(
     "plugin",

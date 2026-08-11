@@ -73,6 +73,7 @@ interface StagingAuthority {
 
 const plans = new WeakMap<ValidatedPluginTree, ValidatedTreeDetails>();
 const stagingAuthorities = new WeakMap<PrivateStagingParent, StagingAuthority>();
+const materializedAuthorities = new WeakMap<MaterializedPluginTree, { readonly staging: string; readonly identity: Identity }>();
 const ENTRY_KEYS = new Set(["path", "kind", "data", "executable", "target", "sparse"]);
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\..*)?$/i;
 const INVALID_PATH_CHARACTER = /[\\<>:"|?*]|[\p{Cc}\p{Cf}]/u;
@@ -382,6 +383,30 @@ async function postvalidate(staging: string, details: ValidatedTreeDetails): Pro
   return { treeDigest, rootDigest };
 }
 
+export interface MaterializedPluginTreeDiscard {
+  readonly removed: boolean;
+  readonly inactive: true;
+  readonly uncertain: boolean;
+}
+
+export async function discardMaterializedPluginTree(
+  tree: MaterializedPluginTree,
+): Promise<MaterializedPluginTreeDiscard> {
+  const authority = materializedAuthorities.get(tree);
+  if (authority === undefined) return Object.freeze({ removed: false, inactive: true, uncertain: true });
+  materializedAuthorities.delete(tree);
+  try {
+    const current = await ordinaryDirectory(authority.staging);
+    if (!sameIdentity(authority.identity, current)) {
+      return Object.freeze({ removed: false, inactive: true, uncertain: true });
+    }
+    await fs.rm(authority.staging, { recursive: true, force: true });
+    return Object.freeze({ removed: true, inactive: true, uncertain: false });
+  } catch {
+    return Object.freeze({ removed: false, inactive: true, uncertain: true });
+  }
+}
+
 export async function materializePluginTree(
   plan: ValidatedPluginTree,
   privateStagingParent: PrivateStagingParent,
@@ -406,7 +431,7 @@ export async function materializePluginTree(
     if (!sameIdentity(stagingIdentity, finalStaging)) throw new Error("staging authority identity changed");
     const root = details.rootSelection.path.length === 0 ? staging : nativePath(staging, details.rootSelection.path);
     await ordinaryDirectory(root);
-    return { ok: true, value: Object.freeze({
+    const materialized = Object.freeze({
       stagingDirectory: staging,
       pluginRoot: root,
       treeDigest: observedDigests.treeDigest,
@@ -415,7 +440,9 @@ export async function materializePluginTree(
       entryCount: details.entries.length,
       fileCount: details.fileCount,
       totalBytes: details.totalBytes,
-    }) as MaterializedPluginTree };
+    }) as MaterializedPluginTree;
+    materializedAuthorities.set(materialized, { staging, identity: stagingIdentity });
+    return { ok: true, value: materialized };
   } catch {
     await removeIfStillOwned(staging, stagingIdentity);
     return lifecycleError("unsafe-descriptor", "Plugin tree could not be safely materialized in the private staging parent");

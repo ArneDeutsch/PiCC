@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bindPrivateStagingParentForTrustedCode,
+  discardMaterializedPluginTree,
   materializePluginTree as materializeWithCapability,
   type PrivateStagingParent,
 } from "../src/plugin-lifecycle/tree-materializer.js";
@@ -351,6 +352,29 @@ describe("private staging materialization", () => {
     expect(result.ok).toBe(false);
     expect(fs.readFileSync(canary, "utf8")).toBe("untouched");
     expect(fs.readdirSync(parent).filter((name) => name.startsWith(".picc-staging-"))).toEqual([]);
+  });
+
+  it("discards only the exact issued materialized staging identity", async () => {
+    const parent = privateParent();
+    const issued = await materializePluginTree(validated([file("payload")]), parent);
+    expect(issued.ok).toBe(true);
+    if (!issued.ok) return;
+    expect(await discardMaterializedPluginTree(issued.value)).toEqual({ removed: true, inactive: true, uncertain: false });
+    expect(fs.existsSync(issued.value.stagingDirectory)).toBe(false);
+    expect(await discardMaterializedPluginTree(issued.value)).toEqual({ removed: false, inactive: true, uncertain: true });
+  });
+
+  it("retains replacement content when discard identity is uncertain", async () => {
+    const parent = privateParent();
+    const issued = await materializePluginTree(validated([file("payload")]), parent);
+    expect(issued.ok).toBe(true);
+    if (!issued.ok) return;
+    fs.renameSync(issued.value.stagingDirectory, `${issued.value.stagingDirectory}.old`);
+    fs.mkdirSync(issued.value.stagingDirectory);
+    const canary = path.join(issued.value.stagingDirectory, "replacement");
+    fs.writeFileSync(canary, "untouched");
+    expect(await discardMaterializedPluginTree(issued.value)).toEqual({ removed: false, inactive: true, uncertain: true });
+    expect(fs.readFileSync(canary, "utf8")).toBe("untouched");
   });
 
   it("removes staging after an ordinary materialization failure", async () => {

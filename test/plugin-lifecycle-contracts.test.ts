@@ -151,6 +151,11 @@ describe("executable declaration source matrix", () => {
   });
 
   it("enforces ./ versus bare-relative grammar and direct-descriptor root restrictions", () => {
+    expect(routeCatalogPluginSource({ source: "relative", path: "./plugins/tool" }, localContext)).toMatchObject({
+      ok: false,
+      error: { code: "unsupported-source" },
+    });
+    expect(routeCatalogPluginSource({ source: "relative", path: "./plugins/tool", canary: "must-not-copy" }, localContext)).toMatchObject({ ok: false });
     expect(routeCatalogPluginSource("./plugins/tool", localContext)).toMatchObject({
       ok: true,
       value: { descriptor: { kind: "relative", path: "plugins/tool" } },
