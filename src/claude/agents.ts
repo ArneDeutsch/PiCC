@@ -20,6 +20,7 @@ import type {
   PluginComponentSource,
   Scope,
 } from "../types.js";
+import { normalizeAgentMcpDeclaration } from "./agent-mcp.js";
 import type { PluginPathFailure, ValidatedPluginPath } from "./plugin-paths.js";
 import { revalidatePluginPath, walkPluginFiles } from "./plugin-paths.js";
 import { listDirSafe, readTextSafe } from "../util/fs.js";
@@ -364,6 +365,17 @@ function loadAgentFile(
   }
 
   const hooks = pluginProvided ? undefined : normalizeHooks(fm["hooks"], agentDiagnostics, filePath);
+  const hasMcpServers = Object.hasOwn(fm, "mcpServers");
+  const agentMcp = hasMcpServers && (scope === "user" || scope === "project")
+    ? normalizeAgentMcpDeclaration(fm["mcpServers"], scope)
+    : undefined;
+  if (hasMcpServers && scope === "managed") {
+    agentDiagnostics.push({
+      severity: "warning",
+      message: 'Managed agent field "mcpServers" is unsupported and was ignored',
+      source: filePath,
+    });
+  }
 
   // background: true (Claude 2.1.198) forces background dispatch; the runtime
   // routes it through the run_in_background path.
@@ -390,7 +402,9 @@ function loadAgentFile(
     metadata,
     // Retained deferred memory configuration is preserved raw for later interpretation.
     memory: fm["memory"],
-    ...(pluginProvided ? {} : { mcpServers: fm["mcpServers"], hooks }),
+    ...(scope === "user" || scope === "project"
+      ? { mcpServers: fm["mcpServers"], ...(agentMcp === undefined ? {} : { agentMcp }), hooks }
+      : pluginProvided ? {} : { mcpServers: fm["mcpServers"], hooks }),
     body: parsed.body,
     source: { path: filePath, scope, ...plugin },
     unknownKeys,

@@ -1,10 +1,12 @@
 ---
 name: future-agent
-description: Uses deferred/unknown features (memory, mcpServers, unknown keys) to prove graceful degradation.
+description: Uses parser-normalized, runtime-deferred agent MCP declarations plus unknown features to prove graceful degradation.
 memory: project
 mcpServers:
-  some-server:
-    command: "npx some-mcp"
+  - fixture-session
+  - fixture-inline:
+      command: "picc-inert-mcp-fixture"
+      args: ["--inert"]
 hooks:
   PreToolUse:
     - hooks:
@@ -13,4 +15,4 @@ hooks:
 unknownFutureAgentField: 42
 ---
 
-Agent that declares deferred features. It must still be dispatchable.
+Agent with bounded parser-only MCP evidence. Runtime MCP remains deferred; the agent must still be dispatchable.
