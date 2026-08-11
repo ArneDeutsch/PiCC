@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { expandEnvVars } from "./settings.js";
+import { expandEnvVars } from "../util/expand-env.js";
+import { AGENT_MCP_LIMITS } from "../claude/agent-mcp.js";
 import { normalizeMcpServerBlock, type McpJsonResult, type RawMcpEntry } from "../claude/mcp-config.js";
 import type { ClaudeMcpStateResult } from "../claude/claude-mcp-state.js";
 import { resolveRemoteMcpFields, type RemoteMcpWorkHooks } from "../claude/mcp-remote-config.js";
@@ -10,6 +11,9 @@ import { compileMcpPolicy, evaluateMcpPolicy, MCP_POLICY_LIMITS } from "../engin
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { sanitizedSubprocessEnv } from "../util/env.js";
 import type {
+  AgentMcpAdmissionContext,
+  AgentMcpDeclaration,
+  CompiledMcpPolicy,
   McpInactiveReason,
   McpPolicyInactiveReason,
   McpPolicySettingsEntry,
@@ -17,6 +21,9 @@ import type {
   McpServerStatus,
   McpSettingsEntry,
   McpSourceClass,
+  NormalizedAgentMcpEntry,
+  ResolvedAgentMcpConfig,
+  ResolvedAgentMcpServer,
   ResolvedMcpConfig,
   ResolvedMcpServer,
 } from "../types.js";
@@ -82,6 +89,8 @@ export interface ResolveMcpConfigOptions {
   isGitTracked?: GitTrackedProbe;
   /** Deterministic counters for enabled-only remote work. */
   remoteWorkHooksForTest?: RemoteMcpWorkHooks;
+  /** Production handoff of captured authority; callback failure cannot affect ordinary resolution. */
+  captureAgentMcpAdmission?: (context: AgentMcpAdmissionContext) => void;
 }
 
 type McpOrigin =
@@ -175,6 +184,410 @@ function snapshotEnvironment(source: NodeJS.ProcessEnv): {
   }
 }
 
+function agentPolicyReason(reason: ReturnType<typeof evaluateMcpPolicy>["reason"]): McpPolicyInactiveReason | undefined {
+  switch (reason) {
+    case "denied": return "policy-denied";
+    case "allow-miss": return "policy-allow-miss";
+    case "managed-only": return "policy-managed-only";
+    case "candidate-invalid": return "policy-candidate-invalid";
+    case "exclusive-control":
+    case "fail-closed":
+    case "allowed": return undefined;
+  }
+}
+
+const AGENT_ADMISSION_DIAGNOSTIC_LIMITS = Object.freeze({
+  aggregate: AGENT_MCP_LIMITS.diagnostics,
+  perServer: 16,
+  messageChars: AGENT_MCP_LIMITS.diagnosticChars,
+});
+const AGENT_ADMISSION_OMISSION = "Additional agent MCP admission diagnostics omitted";
+const AGENT_SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+type AgentStdioOverflowCategory = "command" | "argument" | "environment value";
+
+function agentStdioOverflowDiagnostic(category: AgentStdioOverflowCategory): string {
+  return `Agent MCP stdio ${category} exceeds the ${AGENT_MCP_LIMITS.stringChars}-character limit; shorten the declaration or referenced environment value. Server remains inactive.`;
+}
+
+function findAgentStdioIdentityOverflow(
+  entry: NormalizedAgentMcpEntry,
+  env: NodeJS.ProcessEnv,
+): Exclude<AgentStdioOverflowCategory, "environment value"> | undefined {
+  if (expandEnvVars(entry.command, env, undefined, AGENT_MCP_LIMITS.stringChars).length > AGENT_MCP_LIMITS.stringChars) {
+    return "command";
+  }
+  for (const argument of entry.args) {
+    if (expandEnvVars(argument, env, undefined, AGENT_MCP_LIMITS.stringChars).length > AGENT_MCP_LIMITS.stringChars) {
+      return "argument";
+    }
+  }
+  return undefined;
+}
+
+function safeAdmissionDiagnostic(message: string): string {
+  const clean = neutralizeControlChars(message).replace(/[\r\n\t]+/gu, " ");
+  return clean.length <= AGENT_ADMISSION_DIAGNOSTIC_LIMITS.messageChars
+    ? clean
+    : `${clean.slice(0, AGENT_ADMISSION_DIAGNOSTIC_LIMITS.messageChars - 1)}…`;
+}
+
+function ownData(record: object, key: string): unknown | typeof missingData {
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : missingData;
+}
+const missingData = Symbol("missing-agent-mcp-data");
+
+function safeRecord(value: unknown, allowedKeys: ReadonlySet<string>): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  return keys.length <= AGENT_MCP_LIMITS.entryFields && keys.every((key) => {
+    if (typeof key !== "string" || key.length > AGENT_MCP_LIMITS.fieldNameChars || !allowedKeys.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && descriptor.enumerable && "value" in descriptor;
+  });
+}
+
+function validatedArrayLength(value: unknown, maxItems: number): number | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const keys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (lengthDescriptor === undefined || lengthDescriptor.enumerable || !("value" in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 || lengthDescriptor.value > maxItems || keys.length !== lengthDescriptor.value + 1) return undefined;
+  for (let index = 0; index < lengthDescriptor.value; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) return undefined;
+  }
+  return keys.every((key) => key === "length" ||
+    (typeof key === "string" && /^(0|[1-9][0-9]*)$/u.test(key) && Number(key) < lengthDescriptor.value))
+    ? lengthDescriptor.value
+    : undefined;
+}
+
+function copyStringArray(value: unknown): string[] | undefined {
+  const length = validatedArrayLength(value, AGENT_MCP_LIMITS.collectionItems);
+  if (length === undefined) return undefined;
+  const copy: string[] = [];
+  for (let index = 0; index < length; index++) {
+    const item = ownData(value as object, String(index));
+    if (typeof item !== "string" || item.length > AGENT_MCP_LIMITS.stringChars) return undefined;
+    copy.push(item);
+  }
+  return copy;
+}
+
+function copyStringRecord(value: unknown, keyLimit: number): Record<string, string> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > AGENT_MCP_LIMITS.collectionItems) return undefined;
+  const copy = Object.create(null) as Record<string, string>;
+  for (const key of keys) {
+    if (typeof key !== "string" || key.length > keyLimit) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor) ||
+      typeof descriptor.value !== "string" || descriptor.value.length > AGENT_MCP_LIMITS.stringChars) return undefined;
+    copy[key] = descriptor.value;
+  }
+  return copy;
+}
+
+const RAW_ENTRY_KEYS = new Set(["command", "args", "env", "type", "timeout", "url", "headers", "headersHelper", "alwaysLoad", "role", "oauth"]);
+function copyDeferredRawEntry(value: unknown): Record<string, unknown> | undefined {
+  if (!safeRecord(value, RAW_ENTRY_KEYS)) return undefined;
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.keys(value)) {
+    const item = ownData(value, key);
+    if (key === "command" || key === "type" || key === "url") {
+      if (typeof item !== "string" || item.length > AGENT_MCP_LIMITS.stringChars) return undefined;
+      copy[key] = item;
+    } else if (key === "timeout") {
+      if (typeof item !== "number" || !Number.isFinite(item)) return undefined;
+      copy[key] = item;
+    } else if (key === "args") {
+      const projected = copyStringArray(item);
+      if (projected === undefined) return undefined;
+      copy[key] = projected;
+    } else if (key === "env" || key === "headers") {
+      const projected = copyStringRecord(item, key === "headers" ? AGENT_MCP_LIMITS.headerNameChars : AGENT_MCP_LIMITS.fieldNameChars);
+      if (projected === undefined) return undefined;
+      copy[key] = projected;
+    } else {
+      if (item !== null) return undefined;
+      copy[key] = null;
+    }
+  }
+  return copy;
+}
+
+const REMOTE_KEYS = new Set(["configuredType", "transportKind", "rawUrl", "rawEntry", "rawHeaders", "sseDeprecation"]);
+function copyRemote(value: unknown): NormalizedAgentMcpEntry["remote"] | undefined {
+  if (!safeRecord(value, REMOTE_KEYS)) return undefined;
+  const configuredType = ownData(value, "configuredType");
+  const transportKind = ownData(value, "transportKind");
+  const rawUrl = ownData(value, "rawUrl");
+  const rawHeaders = copyStringRecord(ownData(value, "rawHeaders"), AGENT_MCP_LIMITS.headerNameChars);
+  if ((configuredType !== "http" && configuredType !== "streamable-http" && configuredType !== "sse") ||
+    (transportKind !== "http" && transportKind !== "sse") ||
+    transportKind !== (configuredType === "sse" ? "sse" : "http") ||
+    typeof rawUrl !== "string" || rawUrl.length > AGENT_MCP_LIMITS.stringChars || rawHeaders === undefined) return undefined;
+  const rawEntryValue = ownData(value, "rawEntry");
+  const rawEntry = rawEntryValue === missingData ? undefined : copyDeferredRawEntry(rawEntryValue);
+  if (rawEntryValue !== missingData && rawEntry === undefined) return undefined;
+  const deprecationValue = ownData(value, "sseDeprecation");
+  let sseDeprecation: { deprecated: true; replacement: "http" } | undefined;
+  if (deprecationValue !== missingData) {
+    const keys = new Set(["deprecated", "replacement"]);
+    if (!safeRecord(deprecationValue, keys) || ownData(deprecationValue, "deprecated") !== true || ownData(deprecationValue, "replacement") !== "http") return undefined;
+    sseDeprecation = { deprecated: true, replacement: "http" };
+  }
+  if ((configuredType === "sse") !== (sseDeprecation !== undefined)) return undefined;
+  return { configuredType, transportKind, rawUrl, ...(rawEntry === undefined ? {} : { rawEntry }), rawHeaders, ...(sseDeprecation === undefined ? {} : { sseDeprecation }) };
+}
+
+const NORMALIZED_ENTRY_KEYS = new Set(["name", "command", "args", "env", "timeoutMs", "remote", "notConfigured", "skipped"]);
+function copyNormalizedEntry(value: unknown, expectedName: string): NormalizedAgentMcpEntry | undefined {
+  if (!safeRecord(value, NORMALIZED_ENTRY_KEYS)) return undefined;
+  const name = ownData(value, "name");
+  const command = ownData(value, "command");
+  const args = copyStringArray(ownData(value, "args"));
+  const env = copyStringRecord(ownData(value, "env"), AGENT_MCP_LIMITS.fieldNameChars);
+  const skipped = ownData(value, "skipped");
+  if (name !== expectedName || typeof command !== "string" || command.length > AGENT_MCP_LIMITS.stringChars ||
+    args === undefined || env === undefined || skipped !== false) return undefined;
+  const timeoutValue = ownData(value, "timeoutMs");
+  if (timeoutValue !== missingData && (typeof timeoutValue !== "number" || !Number.isSafeInteger(timeoutValue) || timeoutValue < 1000)) return undefined;
+  const remoteValue = ownData(value, "remote");
+  const remote = remoteValue === missingData ? undefined : copyRemote(remoteValue);
+  if (remoteValue !== missingData && remote === undefined) return undefined;
+  const notConfiguredValue = ownData(value, "notConfigured");
+  if (notConfiguredValue !== missingData && notConfiguredValue !== true) return undefined;
+  if (notConfiguredValue === true && (remote === undefined || remote.rawUrl !== "")) return undefined;
+  return { name, command, args, env, ...(timeoutValue === missingData ? {} : { timeoutMs: timeoutValue }), ...(remote === undefined ? {} : { remote }), ...(notConfiguredValue === missingData ? {} : { notConfigured: true }), skipped: false };
+}
+
+interface ValidatedAgentDeclaration {
+  scope: "user" | "project";
+  hasDeclarationIssues: boolean;
+  items: Array<{ kind: "reference"; name: string } | { kind: "inline"; name: string; entry?: NormalizedAgentMcpEntry }>;
+}
+const DECLARATION_KEYS = new Set(["scope", "items", "diagnostics"]);
+const ITEM_KEYS = new Set(["kind", "name", "entry"]);
+function validateAgentDeclaration(value: unknown): ValidatedAgentDeclaration | undefined {
+  if (!safeRecord(value, DECLARATION_KEYS)) return undefined;
+  const scope = ownData(value, "scope");
+  const itemsValue = ownData(value, "items");
+  const diagnosticsValue = ownData(value, "diagnostics");
+  const itemCount = validatedArrayLength(itemsValue, AGENT_MCP_LIMITS.items);
+  const diagnosticCount = validatedArrayLength(diagnosticsValue, AGENT_MCP_LIMITS.diagnostics);
+  if ((scope !== "user" && scope !== "project") || itemCount === undefined || diagnosticCount === undefined) return undefined;
+  for (let index = 0; index < diagnosticCount; index++) {
+    const message = ownData(diagnosticsValue as object, String(index));
+    if (typeof message !== "string" || message.length > AGENT_MCP_LIMITS.diagnosticChars) return undefined;
+  }
+  const items: ValidatedAgentDeclaration["items"] = [];
+  for (let index = 0; index < itemCount; index++) {
+    const item = ownData(itemsValue as object, String(index));
+    if (!safeRecord(item, ITEM_KEYS)) {
+      items.push({ kind: "inline", name: "invalid-agent-server" });
+      continue;
+    }
+    const kind = ownData(item, "kind");
+    const nameValue = ownData(item, "name");
+    const nameValid = typeof nameValue === "string" && nameValue.length <= AGENT_MCP_LIMITS.serverNameChars &&
+      AGENT_SERVER_NAME_RE.test(nameValue) && !nameValue.includes("__");
+    const name = nameValid ? nameValue : "invalid-agent-server";
+    if (kind === "reference" && nameValid && ownData(item, "entry") === missingData) {
+      items.push({ kind, name });
+    } else if (kind === "inline") {
+      const entryValue = ownData(item, "entry");
+      items.push({ kind, name, ...(!nameValid || entryValue === missingData ? {} : { entry: copyNormalizedEntry(entryValue, name) }) });
+    } else {
+      items.push({ kind: "inline", name });
+    }
+  }
+  return { scope, hasDeclarationIssues: diagnosticCount > 0, items };
+}
+
+// Normalized declarations are inert parser output. Captured authority resolves them
+// into unstarted config without filesystem, process, DNS, or transport effects.
+function createAgentMcpAdmissionContext(input: {
+  policy: CompiledMcpPolicy;
+  env: NodeJS.ProcessEnv;
+  enabledNames?: ReadonlySet<string>;
+  disabledNames?: ReadonlySet<string>;
+  enableAll?: boolean;
+  unavailable?: boolean;
+  remoteWorkHooksForTest?: RemoteMcpWorkHooks;
+}): AgentMcpAdmissionContext {
+  const enabledNames = input.enabledNames ?? new Set<string>();
+  const disabledNames = input.disabledNames ?? new Set<string>();
+  const unavailable = input.unavailable === true;
+  const resolve = (declaration: AgentMcpDeclaration): ResolvedAgentMcpConfig => {
+    const diagnostics: string[] = [];
+    const servers: ResolvedAgentMcpServer[] = [];
+    let diagnosticCount = 0;
+    let diagnosticsOmitted = false;
+    const collectDiagnostics = (messages: readonly string[], perServer = false): string[] => {
+      const retained: string[] = [];
+      for (const message of messages) {
+        if (retained.length >= (perServer ? AGENT_ADMISSION_DIAGNOSTIC_LIMITS.perServer : AGENT_ADMISSION_DIAGNOSTIC_LIMITS.aggregate - 1) ||
+          diagnosticCount >= AGENT_ADMISSION_DIAGNOSTIC_LIMITS.aggregate - 1) {
+          diagnosticsOmitted = true;
+          continue;
+        }
+        retained.push(safeAdmissionDiagnostic(message));
+        diagnosticCount++;
+      }
+      return retained;
+    };
+    const finish = (): ResolvedAgentMcpConfig => {
+      if (diagnosticsOmitted) diagnostics.push(AGENT_ADMISSION_OMISSION);
+      return { servers, diagnostics };
+    };
+    try {
+      const validated = validateAgentDeclaration(declaration);
+      if (validated === undefined) {
+        diagnostics.push("Agent MCP admission declaration is malformed; inline servers remain inactive");
+        return finish();
+      }
+      if (validated.hasDeclarationIssues) {
+        diagnostics.push(...collectDiagnostics([
+          "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.",
+        ]));
+      }
+      for (const item of validated.items) {
+        if (item.kind === "reference") continue;
+        if (item.entry === undefined || unavailable) {
+          servers.push({
+            name: item.name,
+            source: "subagent-inline",
+            status: "skipped",
+            inactiveReason: "admission-unavailable",
+            diagnostics: collectDiagnostics([item.entry === undefined
+              ? "Agent MCP inline entry is malformed; server remains inactive"
+              : "Agent MCP admission authority is unavailable; server remains inactive"], true),
+          });
+          continue;
+        }
+        const entry = item.entry;
+        const transportIdentity = entry.remote === undefined
+          ? { transport: "stdio" as const }
+          : { transport: entry.remote.transportKind, configuredType: entry.remote.configuredType };
+        if (entry.notConfigured) {
+          servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "not-configured", diagnostics: [] });
+          continue;
+        }
+
+        const decision = evaluateMcpPolicy(input.policy, entry.remote === undefined
+          ? { name: entry.name, source: "subagent-inline", transport: "stdio", command: entry.command, args: entry.args }
+          : { name: entry.name, source: "subagent-inline", transport: entry.remote.transportKind, url: entry.remote.rawUrl });
+        if (decision.status === "blocked") {
+          const inactiveReason = agentPolicyReason(decision.reason);
+          const overflowCategory = entry.remote === undefined && decision.reason === "candidate-invalid"
+            ? findAgentStdioIdentityOverflow(entry, input.env)
+            : undefined;
+          servers.push({
+            name: entry.name,
+            source: "subagent-inline",
+            ...transportIdentity,
+            status: "blocked",
+            ...(inactiveReason === undefined ? {} : { inactiveReason }),
+            diagnostics: overflowCategory === undefined
+              ? []
+              : collectDiagnostics([agentStdioOverflowDiagnostic(overflowCategory)], true),
+          });
+          continue;
+        }
+        if (disabledNames.has(sanitizeForListMatch(entry.name))) {
+          servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "disabled", inactiveReason: "mcpjson-rejected", diagnostics: [] });
+          continue;
+        }
+        if (validated.scope === "project" && input.enableAll !== true && !enabledNames.has(sanitizeForListMatch(entry.name))) {
+          servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "pending-approval", inactiveReason: "mcpjson-unapproved", diagnostics: [] });
+          continue;
+        }
+
+        if (entry.remote !== undefined) {
+          const resolved = resolveRemoteMcpFields(entry.remote, input.env, () => undefined, entry.name, "agent mcpServers declaration", input.remoteWorkHooksForTest);
+          const perDiagnostics = collectDiagnostics(resolved.diagnostics, true);
+          if (resolved.kind === "skipped") {
+            servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "skipped", diagnostics: perDiagnostics });
+          } else {
+            servers.push({ name: entry.name, source: "subagent-inline", ...(entry.timeoutMs === undefined ? {} : { timeoutMs: entry.timeoutMs }), status: "enabled", transport: resolved.fields.transportKind, configuredType: resolved.fields.configuredType, url: resolved.fields.url, headers: resolved.fields.headers, ...(resolved.fields.sseDeprecation === undefined ? {} : { sseDeprecation: resolved.fields.sseDeprecation }), diagnostics: perDiagnostics });
+          }
+          continue;
+        }
+
+        const unset = new Set<string>();
+        const expand = (value: string): string => expandEnvVars(
+          value,
+          input.env,
+          (name) => { unset.add(name); },
+          AGENT_MCP_LIMITS.stringChars,
+        );
+        const command = expand(entry.command);
+        const args: string[] = [];
+        const expandedEnv = Object.create(null) as Record<string, string>;
+        let overflowCategory: AgentStdioOverflowCategory | undefined =
+          command.length > AGENT_MCP_LIMITS.stringChars ? "command" : undefined;
+        if (overflowCategory === undefined) {
+          for (const arg of entry.args) {
+            const expanded = expand(arg);
+            if (expanded.length > AGENT_MCP_LIMITS.stringChars) {
+              overflowCategory = "argument";
+              break;
+            }
+            args.push(expanded);
+          }
+        }
+        if (overflowCategory === undefined) {
+          for (const [key, value] of Object.entries(entry.env)) {
+            const expanded = expand(value);
+            if (expanded.length > AGENT_MCP_LIMITS.stringChars) {
+              overflowCategory = "environment value";
+              break;
+            }
+            expandedEnv[key] = expanded;
+          }
+        }
+        if (overflowCategory !== undefined) {
+          servers.push({
+            name: entry.name,
+            source: "subagent-inline",
+            transport: "stdio",
+            status: "skipped",
+            inactiveReason: "admission-unavailable",
+            diagnostics: collectDiagnostics([agentStdioOverflowDiagnostic(overflowCategory)], true),
+          });
+          continue;
+        }
+        const perDiagnostics = collectDiagnostics(Array.from(unset, (name) =>
+          `environment variable ${JSON.stringify(name)} is not set and has no default; literal retained`), true);
+        servers.push({ name: entry.name, source: "subagent-inline", ...(entry.timeoutMs === undefined ? {} : { timeoutMs: entry.timeoutMs }), status: "enabled", transport: "stdio", command, args, env: expandedEnv, rawCommand: entry.command, diagnostics: perDiagnostics });
+      }
+    } catch {
+      return { servers: [], diagnostics: ["Agent MCP admission failed safely; inline servers remain inactive"] };
+    }
+    return finish();
+  };
+  return Object.freeze({ resolve });
+}
+
+function publishAgentAdmission(
+  capture: ResolveMcpConfigOptions["captureAgentMcpAdmission"],
+  context: AgentMcpAdmissionContext,
+): void {
+  try {
+    capture?.(context);
+  } catch {
+    // Capturing authority is a production handoff, but ordinary MCP remains independently usable.
+  }
+}
+
 /** Resolve precedence + the enablement gate into the runtime's data contract. */
 export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConfig {
   const environment = snapshotEnvironment(opts.env ?? process.env);
@@ -230,9 +643,19 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     ...(managedMcp.status === "absent" ? {} : { policyOrdinarySourcesSuppressed: true as const }),
   };
   if (policy.posture === "fail-closed") {
+    publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
+      policy,
+      env,
+      ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
+    }));
     return { servers: [], diagnostics, ...policySnapshot };
   }
   if (policy.posture === "exclusive-empty") {
+    publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
+      policy,
+      env,
+      ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
+    }));
     return { servers: [], diagnostics, ...policySnapshot };
   }
 
@@ -246,6 +669,12 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     ? { kind: "absent" as const, diagnostics: [] }
     : ordinary?.nativeState ?? opts.nativeState ?? { kind: "absent" as const, diagnostics: [] };
   if (nativeState.kind === "unusable") {
+    publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
+      policy,
+      env,
+      unavailable: true,
+      ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
+    }));
     return {
       servers: [],
       diagnostics: nativeState.diagnostics.map(neutralizeControlChars),
@@ -374,6 +803,32 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
       enabledNames.add(sanitizeForListMatch(name));
     }
   }
+
+  // Agent project approvals use the same authority rules without mutating the
+  // ordinary resolution result. Local provenance is classified before capture;
+  // resolving the captured authority performs no filesystem or Git I/O.
+  let agentEnableAll: boolean | undefined;
+  const agentEnabledNames = new Set<string>();
+  if (opts.captureAgentMcpAdmission !== undefined) {
+    for (const entry of ordinarySettings) {
+      let honored = entry.scope === "managed" || entry.scope === "user";
+      if (entry.scope === "local" &&
+        (entry.enableAllProjectMcpServers !== undefined || (entry.enabledMcpjsonServers?.length ?? 0) > 0)) {
+        honored = classifyTracked(entry.sourcePath) !== true;
+      }
+      if (!honored) continue;
+      if (entry.enableAllProjectMcpServers !== undefined) agentEnableAll = entry.enableAllProjectMcpServers;
+      for (const name of entry.enabledMcpjsonServers ?? []) agentEnabledNames.add(sanitizeForListMatch(name));
+    }
+  }
+  publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
+    policy,
+    env,
+    enabledNames: agentEnabledNames,
+    disabledNames,
+    ...(agentEnableAll === undefined ? {} : { enableAll: agentEnableAll }),
+    ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
+  }));
 
   // --- Candidates & whole-entry precedence ---------------------------------
   let order = 0;

@@ -395,7 +395,7 @@ export type AgentMcpItem =
       readonly entry: DeepReadonly<NormalizedAgentMcpEntry>;
     };
 
-/** Parsed agent frontmatter only; policy admission and runtime ownership happen later. */
+/** Parsed agent frontmatter only; the declaration itself confers neither admission nor runtime ownership. */
 export interface AgentMcpDeclaration {
   readonly scope: AgentMcpScope;
   readonly items: readonly AgentMcpItem[];
@@ -939,7 +939,7 @@ export interface ResolvedAgentMcpConfig {
   readonly diagnostics: readonly string[];
 }
 
-/** Project-captured authority used to admit one declaration at dispatch time. */
+/** Project-captured authority for resolving one declaration into unstarted configuration. */
 export interface AgentMcpAdmissionContext {
   readonly resolve: (declaration: AgentMcpDeclaration) => ResolvedAgentMcpConfig;
 }
