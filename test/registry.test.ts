@@ -614,8 +614,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const predicate of [
       /standalone `managed-mcp\.json`[\s\S]*exclusive administrator authority/,
       /managed-settings[\s\S]*policy and admits each raw effective winner before expansion, approval, native disablement, or[\s\S]*runtime materialization/,
-      /future[\s\S]*plugin, agent-inline, or explicit runtime\/CLI adapter must do the same/,
-      /those adapters do not exist today/,
+      /Agent-inline\s+admission and dispatch-local runtime composition primitives now cross it without widening ordinary\s+MCP sources/,
+      /not wired into dispatch lifecycle or tool registration[\s\S]*agent-scoped MCP\s+remains unsupported[\s\S]*Future plugin or explicit runtime\/CLI adapters must cross the same seam before\s+their sources can be claimed as supported/,
     ]) expect(discoverySection).toMatch(predicate);
     const loaderSection = section(architecture, "### `claude/` — parse each artifact format (loaders only, no runtime)");
     expect(loaderSection).toMatch(/MCP server entries \(standalone `managed-mcp\.json`[\s\S]*`managed-mcp\.ts`/);

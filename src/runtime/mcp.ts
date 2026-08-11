@@ -2,8 +2,12 @@ import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js
 import { killProcessTreeByPid, listDescendantPids } from "../util/process-tree.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type {
+  EnabledRemoteAgentMcpServer,
   EnabledRemoteMcpServer,
+  EnabledStdioAgentMcpServer,
   EnabledStdioMcpServer,
+  ResolvedAgentMcpConfig,
+  ResolvedAgentMcpServer,
   ResolvedMcpConfig,
   ResolvedMcpServer,
 } from "../types.js";
@@ -17,18 +21,13 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 /**
- * MCP runtime manager.
+ * MCP transport and capability runtime manager.
  *
- * Starts the ENABLED servers of a {@link ResolvedMcpConfig} through the
- * `@modelcontextprotocol/sdk` client, exposes immutable initial tool, prompt,
- * and resource catalogs plus live operations, and at shutdown closes owned remote clients and
- * transports while killing owned stdio process trees (Windows too). Session-global
- * and non-blocking: `start()`
- * returns immediately, connects run in the background bounded by
- * `MCP_TIMEOUT`, and startup or connection failures degrade to diagnostics
- * rather than crashing the harness. Live operations reject on failure. With
- * zero enabled servers nothing is imported and nothing is spawned: the
- * zero-cost path.
+ * Session `start(ResolvedMcpConfig)` and dispatch-owned
+ * `startAgent(ResolvedAgentMcpConfig)` start enabled servers through the MCP SDK, expose immutable
+ * initial catalogs plus live operations, and own shutdown. Both are non-blocking and bounded by
+ * `MCP_TIMEOUT`; failures degrade to diagnostics rather than crashing the harness. The agent entry
+ * point preserves inline provenance but has no dispatch consumer yet.
  *
  * Model-facing registration is NOT here — this class only owns processes,
  * connections, capability metadata, and bounded live protocol operations.
@@ -156,13 +155,19 @@ export interface McpTimeoutPolicy {
 }
 
 export type McpDelay = (delayMs: number, signal: AbortSignal) => Promise<void>;
+export type McpCleanupRace = (
+  completion: Promise<boolean>,
+  maxWaitMs: number,
+) => Promise<boolean>;
 
 export interface McpRuntimeDeps {
-  /**
-   * Spawn cwd and `CLAUDE_PROJECT_DIR` — deliberately the project root, never
-   * the live cwd: worktree drift must not change command resolution.
-   */
+  /** Canonical project root injected as `CLAUDE_PROJECT_DIR`. */
   projectRoot: string;
+  /**
+   * Transport process cwd. Session runtimes default to `projectRoot` so live worktree cwd drift
+   * cannot change command resolution; agent runtimes may supply their dispatch-resolved cwd.
+   */
+  spawnCwd?: string;
   /** `CLAUDE_CODE_SESSION_ID` for the servers — binary-verified Claude behavior (2.1.218; undocumented). */
   sessionId: string;
   /**
@@ -182,6 +187,8 @@ export interface McpRuntimeDeps {
   createRemoteTransport?: typeof createRemoteMcpTransport;
   /** Abortable injected scheduler for retry policy tests; production uses unref'd timers. */
   delay?: McpDelay;
+  /** Deterministic cleanup-grace seam; production uses one bounded race. */
+  raceCleanup?: McpCleanupRace;
 }
 
 export type McpLifecycleState =
@@ -213,7 +220,18 @@ export interface McpServerState {
   statusSummary?: string;
 }
 
-type EnabledMcpServer = Extract<ResolvedMcpServer, { status: "enabled" }>;
+type RuntimeMcpServer = ResolvedMcpServer | ResolvedAgentMcpServer;
+type EnabledSessionMcpServer = Extract<ResolvedMcpServer, { status: "enabled" }>;
+type EnabledAgentMcpServer = Extract<ResolvedAgentMcpServer, { status: "enabled" }>;
+type EnabledMcpServer = EnabledSessionMcpServer | EnabledAgentMcpServer;
+type EnabledStdioRuntimeServer = EnabledStdioMcpServer | EnabledStdioAgentMcpServer;
+type EnabledRemoteRuntimeServer = EnabledRemoteMcpServer | EnabledRemoteAgentMcpServer;
+
+export interface McpCleanupOutcome {
+  readonly confirmed: readonly string[];
+  readonly unconfirmed: readonly string[];
+  readonly diagnostics: readonly string[];
+}
 
 interface DiscoverySnapshot {
   toolsAdvertised: boolean;
@@ -258,6 +276,8 @@ interface ServerHandle {
   stopped: boolean;
   /** True once this handle has counted toward whenSettled(). */
   settled: boolean;
+  /** Every remote close begun after references were detached, retained for owner confirmation. */
+  remoteCloseCompletion?: Promise<boolean>;
 }
 
 export class McpRuntime {
@@ -270,6 +290,8 @@ export class McpRuntime {
   private readonly settlePromise: Promise<void>;
   private unsettledCount = 0;
   private shutdownPromise: Promise<void> | undefined;
+  private agentShutdownPromise: Promise<McpCleanupOutcome> | undefined;
+  private readonly cleanupRetries = new Map<string, () => Promise<boolean>>();
   private exitHookRegistered = false;
   private remoteClientCtorPromise?: Promise<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>;
 
@@ -292,7 +314,7 @@ export class McpRuntime {
     }
   };
 
-  private constructor(config: ResolvedMcpConfig, deps: McpRuntimeDeps) {
+  private constructor(config: { readonly servers: readonly RuntimeMcpServer[] }, deps: McpRuntimeDeps) {
     this.deps = deps;
     const timeoutResolution = resolveMcpTimeoutPolicyInternal(
       sanitizedSubprocessEnv(deps.env ?? process.env, deps.settingsEnv),
@@ -328,6 +350,18 @@ export class McpRuntime {
 
   /** Returns immediately; enabled servers connect in the background. */
   static start(config: ResolvedMcpConfig, deps: McpRuntimeDeps): McpRuntime {
+    return McpRuntime.startConfig(config, deps);
+  }
+
+  /** Starts a dispatch-owned runtime without relabeling its agent-inline provenance. */
+  static startAgent(config: ResolvedAgentMcpConfig, deps: McpRuntimeDeps): McpRuntime {
+    return McpRuntime.startConfig(config, deps);
+  }
+
+  private static startConfig(
+    config: { readonly servers: readonly RuntimeMcpServer[] },
+    deps: McpRuntimeDeps,
+  ): McpRuntime {
     const runtime = new McpRuntime(config, deps);
     if (runtime.handles.length > 0) {
       // Detached background connect; connectAll never rejects.
@@ -529,8 +563,32 @@ export class McpRuntime {
 
   /** Idempotent; closes clients and kills process trees; grace-bounded, never throws. */
   shutdown(): Promise<void> {
-    this.shutdownPromise ??= this.doShutdown();
+    this.shutdownPromise ??= this.shutdownAgent().then(() => undefined);
     return this.shutdownPromise;
+  }
+
+  /** Agent-owner cleanup with bounded, identity-only confirmation evidence. */
+  shutdownAgent(): Promise<McpCleanupOutcome> {
+    this.agentShutdownPromise ??= this.doShutdown();
+    return this.agentShutdownPromise;
+  }
+
+  /** Re-evaluates cleanup confirmation for the requested identities after shared shutdown settles. */
+  async retryAgentShutdown(serverNames: readonly string[]): Promise<McpCleanupOutcome> {
+    await this.shutdownAgent();
+    const requested = new Set(serverNames);
+    const settled = await Promise.all(this.handles
+      .filter((handle) => requested.has(handle.server.name))
+      .map(async (handle) => {
+        const retry = this.cleanupRetries.get(handle.server.name);
+        const confirmed = retry ? await retry().catch(() => false) : true;
+        if (confirmed) this.cleanupRetries.delete(handle.server.name);
+        return { name: handle.server.name, confirmed };
+      }));
+    return cleanupOutcome(
+      settled.filter((entry) => entry.confirmed).map((entry) => entry.name),
+      settled.filter((entry) => !entry.confirmed).map((entry) => entry.name),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -539,11 +597,11 @@ export class McpRuntime {
 
   private async connectAll(): Promise<void> {
     const stdioHandles = this.handles.filter(
-      (handle): handle is ServerHandle & { server: EnabledStdioMcpServer } =>
+      (handle): handle is ServerHandle & { server: EnabledStdioRuntimeServer } =>
         handle.server.transport === "stdio",
     );
     const remoteHandles = this.handles.filter(
-      (handle): handle is ServerHandle & { server: EnabledRemoteMcpServer } =>
+      (handle): handle is ServerHandle & { server: EnabledRemoteRuntimeServer } =>
         handle.server.transport !== "stdio",
     );
     let stdioSdk: McpSdk | undefined;
@@ -577,7 +635,7 @@ export class McpRuntime {
   }
 
   private async connectStdio(
-    handle: ServerHandle & { server: EnabledStdioMcpServer },
+    handle: ServerHandle & { server: EnabledStdioRuntimeServer },
     sdk: McpSdk,
   ): Promise<void> {
     const server = handle.server;
@@ -606,9 +664,9 @@ export class McpRuntime {
       });
       const transport = new sdk.StdioClientTransport({
         command: server.command,
-        args: server.args,
+        args: [...server.args],
         env,
-        cwd: this.deps.projectRoot,
+        cwd: this.deps.spawnCwd ?? this.deps.projectRoot,
         stderr: "pipe",
       });
       handle.transport = transport;
@@ -750,7 +808,7 @@ export class McpRuntime {
   }
 
   private async connectRemoteInitial(
-    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
   ): Promise<void> {
     const epoch = ++handle.generation;
     const controller = new AbortController();
@@ -773,7 +831,7 @@ export class McpRuntime {
   }
 
   private async remoteInitialSequence(
-    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
     epoch: number,
     signal: AbortSignal,
   ): Promise<void> {
@@ -820,7 +878,7 @@ export class McpRuntime {
   }
 
   private async openRemote(
-    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
     epoch: number,
     signal: AbortSignal,
     initialDiscovery: boolean,
@@ -1158,14 +1216,14 @@ export class McpRuntime {
     const controller = new AbortController();
     handle.remoteAbort = controller;
     void this.closeRemoteParts(handle).then(() => this.recoveryLoop(
-      handle as ServerHandle & { server: EnabledRemoteMcpServer },
+      handle as ServerHandle & { server: EnabledRemoteRuntimeServer },
       epoch,
       controller.signal,
     ));
   }
 
   private async recoveryLoop(
-    handle: ServerHandle & { server: EnabledRemoteMcpServer },
+    handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
     epoch: number,
     signal: AbortSignal,
   ): Promise<void> {
@@ -1260,23 +1318,24 @@ export class McpRuntime {
     const transport = handle.transport;
     handle.client = undefined;
     handle.transport = undefined;
-    const closing: Promise<unknown>[] = [];
-    if (client) {
-      try {
-        closing.push(client.close().catch(() => undefined));
-      } catch {
-        /* cleanup remains best-effort */
-      }
+    if (client || (transport && "abort" in transport)) {
+      this.retainRemoteClose(handle, beginCleanup([
+        () => client?.close(),
+        () => transport && "abort" in transport ? transport.abort() : undefined,
+      ]));
     }
-    if (transport && "abort" in transport) {
-      try {
-        closing.push(transport.abort().catch(() => undefined));
-      } catch {
-        /* cleanup remains best-effort */
-      }
-    }
-    if (closing.length === 0 || maxWaitMs === 0) return;
-    await Promise.race([Promise.all(closing), sleep(maxWaitMs)]);
+    const completion = handle.remoteCloseCompletion;
+    if (!completion || maxWaitMs === 0) return;
+    await Promise.race([completion, sleep(maxWaitMs)]);
+  }
+
+  private retainRemoteClose(handle: ServerHandle, next: Promise<boolean>): Promise<boolean> {
+    const prior = handle.remoteCloseCompletion;
+    const combined = prior
+      ? Promise.all([prior, next]).then((results) => results.every(Boolean), () => false)
+      : next;
+    handle.remoteCloseCompletion = combined;
+    return combined;
   }
 
   /**
@@ -1348,19 +1407,21 @@ export class McpRuntime {
   // Shutdown path
   // -------------------------------------------------------------------------
 
-  private async doShutdown(): Promise<void> {
-    try {
-      this.removeExitHook();
-      // stopServer settles every still-connecting handle before its first
-      // await, so nothing can remain unsettled after this.
-      await Promise.all(this.handles.map((handle) => this.stopServer(handle)));
-    } catch {
-      /* shutdown never throws; kills are individually guarded */
-    }
+  private async doShutdown(): Promise<McpCleanupOutcome> {
+    this.removeExitHook();
+    // stopServer settles every still-connecting handle before its first await.
+    const settled = await Promise.all(this.handles.map(async (handle) => ({
+      name: handle.server.name,
+      confirmed: await this.stopServer(handle).catch(() => false),
+    })));
+    return cleanupOutcome(
+      settled.filter((entry) => entry.confirmed).map((entry) => entry.name),
+      settled.filter((entry) => !entry.confirmed).map((entry) => entry.name),
+    );
   }
 
-  private async stopServer(handle: ServerHandle): Promise<void> {
-    if (handle.stopped) return;
+  private async stopServer(handle: ServerHandle): Promise<boolean> {
+    if (handle.stopped) return !this.cleanupRetries.has(handle.server.name);
     handle.stopped = true;
     handle.generation += 1;
     handle.remoteAbort?.abort();
@@ -1374,13 +1435,26 @@ export class McpRuntime {
       );
     }
     if (handle.server.transport !== "stdio") {
-      await this.closeRemoteParts(handle, SHUTDOWN_GRACE_MS);
+      const client = handle.client;
+      const transport = handle.transport;
+      let closeCompletion: Promise<boolean> | undefined;
+      const close = async (): Promise<boolean> => {
+        closeCompletion ??= this.retainRemoteClose(handle, beginCleanup([
+          () => client?.close(),
+          () => transport && "abort" in transport ? transport.abort() : undefined,
+        ]));
+        return await this.raceCleanup(closeCompletion);
+      };
+      handle.client = undefined;
+      handle.transport = undefined;
+      const confirmed = await close();
+      if (!confirmed) this.cleanupRetries.set(handle.server.name, close);
       if (handle.state === "connected" || handle.state === "reconnecting") {
         handle.state = "failed";
         handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
         handle.statusSummary = "Connection closed because the session shut down.";
       }
-      return;
+      return confirmed;
     }
     // Backstop for the sub-poll-tick window: prefer the captured pid, fall
     // back to the transport's live value.
@@ -1395,11 +1469,9 @@ export class McpRuntime {
       killProcessTreeByPid(pid);
     }
     const client = handle.client;
-    if (client) {
-      // SDK close: stdin-end → grace → SIGTERM → grace → SIGKILL on the direct
-      // process. Raced with a failsafe so shutdown can never hang.
-      await Promise.race([client.close().catch(() => {}), sleep(SHUTDOWN_GRACE_MS)]);
-    }
+    // Keep the observable completion promise: a no-PID transport that misses the first grace can
+    // become confirmable before the owner retries, without issuing close twice.
+    const closeCompletion = beginCleanup([() => client?.close()]);
     // Sweep the pre-close snapshot (POSIX grandchildren; win32 backstop).
     // pid-reuse inside the grace window could kill an unrelated process —
     // accepted, same class as the hook-runner taskkill pattern.
@@ -1419,6 +1491,25 @@ export class McpRuntime {
       handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
       handle.statusSummary = "Connection closed because the session shut down.";
     }
+    const confirmStopped = async (): Promise<boolean> => {
+      for (const target of snapshot) {
+        try {
+          process.kill(target, 0);
+          try { process.kill(target, "SIGKILL"); } catch { /* confirmation below remains false */ }
+          return false;
+        } catch {
+          /* absent is confirmed */
+        }
+      }
+      return snapshot.length > 0 ? true : await this.raceCleanup(closeCompletion);
+    };
+    const confirmed = await confirmStopped();
+    if (!confirmed) this.cleanupRetries.set(handle.server.name, confirmStopped);
+    return confirmed;
+  }
+
+  private raceCleanup(completion: Promise<boolean>): Promise<boolean> {
+    return (this.deps.raceCleanup ?? boundedCleanup)(completion, SHUTDOWN_GRACE_MS);
   }
 
   // -------------------------------------------------------------------------
@@ -1466,7 +1557,7 @@ export class McpRuntime {
   private ensureExitHook(): void {
     // A connect racing shutdown() must not re-register the listener
     // removeExitHook just took off.
-    if (this.shutdownPromise) return;
+    if (this.shutdownPromise || this.agentShutdownPromise) return;
     if (this.exitHookRegistered) return;
     this.exitHookRegistered = true;
     process.on("exit", this.exitListener);
@@ -1482,6 +1573,47 @@ export class McpRuntime {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function cleanupOutcome(
+  confirmed: readonly string[],
+  unconfirmed: readonly string[],
+): McpCleanupOutcome {
+  const safeConfirmed = Object.freeze([...confirmed].map(cleanupIdentity));
+  const safeUnconfirmed = Object.freeze([...unconfirmed].map(cleanupIdentity));
+  return Object.freeze({
+    confirmed: safeConfirmed,
+    unconfirmed: safeUnconfirmed,
+    diagnostics: Object.freeze(safeUnconfirmed.length === 0
+      ? []
+      : [`Cleanup could not be confirmed for ${safeUnconfirmed.length} agent MCP server(s).`]),
+  });
+}
+
+function cleanupIdentity(value: string): string {
+  return neutralizeControlChars(value).slice(0, 200);
+}
+
+function beginCleanup(
+  operations: ReadonlyArray<() => Promise<unknown> | undefined>,
+): Promise<boolean> {
+  const pending: Promise<unknown>[] = [];
+  let synchronousFailure = false;
+  for (const operation of operations) {
+    try {
+      const result = operation();
+      if (result) pending.push(result);
+    } catch {
+      synchronousFailure = true;
+    }
+  }
+  return pending.length === 0
+    ? Promise.resolve(!synchronousFailure)
+    : Promise.all(pending).then(() => !synchronousFailure, () => false);
+}
+
+async function boundedCleanup(completion: Promise<boolean>, maxWaitMs: number): Promise<boolean> {
+  return await Promise.race([completion, sleep(maxWaitMs).then(() => false)]);
+}
 
 type McpDiscoveryCapability = "tools" | "prompts" | "resources";
 

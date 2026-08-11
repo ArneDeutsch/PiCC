@@ -1960,7 +1960,8 @@ describe("McpRuntime kill discipline", () => {
       const grandchildPid = fixture.pidOf("grandchild.pid");
       expect(processIsAlive(serverPid)).toBe(true);
       expect(processIsAlive(grandchildPid)).toBe(true);
-      await runtime.shutdown();
+      const cleanupOutcome = await runtime.shutdownAgent();
+      expect(cleanupOutcome).toEqual({ confirmed: ["family"], unconfirmed: [], diagnostics: [] });
       await waitForDeath(serverPid, "grandchild-spawning server after shutdown");
       await waitForDeath(grandchildPid, "grandchild after shutdown");
     } finally {
@@ -2005,6 +2006,88 @@ describe("McpRuntime kill discipline", () => {
       await fixture.cleanup();
     }
   }, 25_000);
+
+  it("re-evaluates no-PID stdio close completion and reports only safe identities", async () => {
+    const closeGate = deferred<void>();
+    let cleanupRaces = 0;
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = undefined;
+    }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      async listTools(): Promise<{ tools: never[] }> { return { tools: [] }; }
+      async close(): Promise<void> { await closeGate.promise; }
+    }
+    const runtime = McpRuntime.start(
+      makeConfig(makeServer({
+        name: "safe-identity",
+        rawCommand: "RAW_COMMAND_SECRET",
+        env: { TOKEN: "ENV_SECRET" },
+      })),
+      makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+        raceCleanup: async (completion) => ++cleanupRaces === 1 ? false : await completion,
+      }),
+    );
+    await runtime.whenSettled();
+    const first = await runtime.shutdownAgent();
+    expect(first).toEqual({
+      confirmed: [],
+      unconfirmed: ["safe-identity"],
+      diagnostics: ["Cleanup could not be confirmed for 1 agent MCP server(s)."],
+    });
+    expect(first.diagnostics.join(" ")).not.toMatch(/RAW_COMMAND_SECRET|ENV_SECRET/u);
+    closeGate.resolve();
+    await expect(runtime.retryAgentShutdown(["safe-identity"])).resolves.toEqual({
+      confirmed: ["safe-identity"], unconfirmed: [], diagnostics: [],
+    });
+    expect(cleanupRaces).toBe(2);
+  });
+
+  it("retries uncertain servers concurrently within one injected aggregate grace", async () => {
+    const retryGrace = deferred<boolean>();
+    let cleanupRaces = 0;
+    let retryEntrants = 0;
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = undefined;
+    }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      async listTools(): Promise<{ tools: never[] }> { return { tools: [] }; }
+      async close(): Promise<never> { return await new Promise<never>(() => {}); }
+    }
+    const runtime = McpRuntime.start(
+      makeConfig(
+        makeServer({ name: "first-uncertain" }),
+        makeServer({ name: "second-uncertain" }),
+      ),
+      makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+        raceCleanup: async () => {
+          cleanupRaces += 1;
+          if (cleanupRaces <= 2) return false;
+          retryEntrants += 1;
+          return await retryGrace.promise;
+        },
+      }),
+    );
+    await runtime.whenSettled();
+    expect((await runtime.shutdownAgent()).unconfirmed).toEqual(["first-uncertain", "second-uncertain"]);
+    const retry = runtime.retryAgentShutdown(["first-uncertain", "second-uncertain"]);
+    await waitUntil({
+      description: "all uncertain cleanup retries to enter the shared grace concurrently",
+      predicate: () => retryEntrants === 2,
+    });
+    retryGrace.resolve(false);
+    await expect(retry).resolves.toEqual({
+      confirmed: [],
+      unconfirmed: ["first-uncertain", "second-uncertain"],
+      diagnostics: ["Cleanup could not be confirmed for 2 agent MCP server(s)."],
+    });
+    expect(cleanupRaces).toBe(4);
+  });
 
   it("a shutdown racing the SDK import prevents any spawn and restores the exit listener", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
@@ -2157,6 +2240,49 @@ describe("McpRuntime remote retry and recovery", () => {
       callCount: () => callCount,
     };
   }
+
+  it("joins a delayed remote close begun by recovery before confirming agent shutdown", async () => {
+    const priorClose = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok"], closes: [priorClose.promise] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "delayed-prior-close" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      raceCleanup: async (completion) => await completion,
+    }));
+    await runtime.whenSettled();
+    harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+    await waitUntil({ description: "recovery to begin prior remote close", predicate: () => harness.closed.includes(0) });
+    let settled = false;
+    const shutdown = runtime.shutdownAgent().finally(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    priorClose.resolve();
+    await expect(shutdown).resolves.toEqual({
+      confirmed: ["delayed-prior-close"], unconfirmed: [], diagnostics: [],
+    });
+  });
+
+  it("retains a hung prior remote close as unconfirmed across shutdown and retry", async () => {
+    const harness = remoteHarness({ connect: ["ok"], closes: [new Promise<void>(() => {})] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "hung-prior-close" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      raceCleanup: async () => false,
+    }));
+    await runtime.whenSettled();
+    harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+    await waitUntil({ description: "recovery to begin hung remote close", predicate: () => harness.closed.includes(0) });
+    await expect(runtime.shutdownAgent()).resolves.toEqual({
+      confirmed: [],
+      unconfirmed: ["hung-prior-close"],
+      diagnostics: ["Cleanup could not be confirmed for 1 agent MCP server(s)."],
+    });
+    await expect(runtime.retryAgentShutdown(["hung-prior-close"])).resolves.toEqual({
+      confirmed: [],
+      unconfirmed: ["hung-prior-close"],
+      diagnostics: ["Cleanup could not be confirmed for 1 agent MCP server(s)."],
+    });
+  });
 
   it("classifies fatal initial tools/list discovery identically for remote startup", async () => {
     const harness = remoteHarness({

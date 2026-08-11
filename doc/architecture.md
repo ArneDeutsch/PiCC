@@ -134,9 +134,11 @@ and no further classification occurs after a blocked winner is known. Present-bu
 authoritative native state or standalone managed MCP fails MCP closed, while absence preserves the
 applicable lower inputs.
 
-Every current MCP source crosses this admission seam before post-admission materialization. A future
-plugin, agent-inline, or explicit runtime/CLI adapter must do the same before its source can be
-claimed as supported; those adapters do not exist today.
+Every current MCP source crosses this admission seam before post-admission materialization. Agent-inline
+admission and dispatch-local runtime composition primitives now cross it without widening ordinary
+MCP sources, but they are not wired into dispatch lifecycle or tool registration and agent-scoped MCP
+remains unsupported. Future plugin or explicit runtime/CLI adapters must cross the same seam before
+their sources can be claimed as supported.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -353,6 +355,9 @@ where to start reading, not the extent of its cluster.
   The enablement gate is enforced by construction: no enabled server means no MCP context; no
   published prompt means no prompt metadata; and no advertised resource capability in the settled
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
+  `agent-mcp.ts` can compose immutable dispatch-local catalogs and routing from borrowed session
+  servers plus an owned agent-inline runtime, with live scoped state and ownership-aware cleanup; no
+  dispatch path consumes that primitive yet, so it creates no registered or model-visible capability.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
