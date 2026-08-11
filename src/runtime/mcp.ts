@@ -80,6 +80,7 @@ const TOOL_TIMEOUT_MIN_MS = 1_000;
 const TOOL_TIMEOUT_MAX_MS = 2_147_483_647;
 /** Poll cadence while capturing the transport's pid during connect. */
 const PID_POLL_MS = 25;
+const PROCESS_CLEANUP_TEST_DEPS = Symbol.for("picc.test.mcp-process-cleanup");
 /** SDK McpError code accepted only with independent local closure provenance. */
 const MCP_ERROR_CONNECTION_CLOSED = -32_000;
 /** SDK McpError code for a timed-out request. */
@@ -246,6 +247,14 @@ interface DiscoverySnapshot {
   diagnostics: readonly string[];
 }
 
+interface ProcessCleanupDeps {
+  snapshot(pid: number): readonly number[];
+  killTree(pid: number): void;
+  kill(pid: number, signal: 0 | "SIGKILL"): void;
+  now(): number;
+  delay(delayMs: number): Promise<void>;
+}
+
 interface ServerHandle {
   server: EnabledMcpServer;
   state: McpLifecycleState;
@@ -282,6 +291,7 @@ interface ServerHandle {
 
 export class McpRuntime {
   private readonly deps: McpRuntimeDeps;
+  private readonly processCleanup: ProcessCleanupDeps;
   private readonly handles: ServerHandle[] = [];
   private readonly diags: string[] = [];
   private readonly connectTimeoutMs: number;
@@ -316,6 +326,7 @@ export class McpRuntime {
 
   private constructor(config: { readonly servers: readonly RuntimeMcpServer[] }, deps: McpRuntimeDeps) {
     this.deps = deps;
+    this.processCleanup = resolveProcessCleanupDeps(deps);
     const timeoutResolution = resolveMcpTimeoutPolicyInternal(
       sanitizedSubprocessEnv(deps.env ?? process.env, deps.settingsEnv),
     );
@@ -1462,11 +1473,11 @@ export class McpRuntime {
     const pid = handle.pid ?? (typeof transportPid === "number" ? transportPid : undefined);
     // Snapshot the tree BEFORE the graceful close: once the direct child exits
     // on stdin-EOF its children reparent and no later walk can find them.
-    const snapshot = pid !== undefined ? [pid, ...listDescendantPids(pid)] : [];
+    const snapshot = pid !== undefined ? this.processCleanup.snapshot(pid) : [];
     if (process.platform === "win32" && pid !== undefined) {
       // Windows has no graceful SIGTERM (process.kill is already a hard
       // terminate) — tree-kill immediately, while the tree is still intact.
-      killProcessTreeByPid(pid);
+      this.processCleanup.killTree(pid);
     }
     const client = handle.client;
     // Keep the observable completion promise: a no-PID transport that misses the first grace can
@@ -1477,7 +1488,7 @@ export class McpRuntime {
     // accepted, same class as the hook-runner taskkill pattern.
     for (const target of snapshot) {
       try {
-        process.kill(target, "SIGKILL");
+        this.processCleanup.kill(target, "SIGKILL");
       } catch {
         /* already gone */
       }
@@ -1491,18 +1502,9 @@ export class McpRuntime {
       handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
       handle.statusSummary = "Connection closed because the session shut down.";
     }
-    const confirmStopped = async (): Promise<boolean> => {
-      for (const target of snapshot) {
-        try {
-          process.kill(target, 0);
-          try { process.kill(target, "SIGKILL"); } catch { /* confirmation below remains false */ }
-          return false;
-        } catch {
-          /* absent is confirmed */
-        }
-      }
-      return snapshot.length > 0 ? true : await this.raceCleanup(closeCompletion);
-    };
+    const confirmStopped = async (): Promise<boolean> => snapshot.length > 0
+      ? await confirmProcessSnapshotAbsent(snapshot, SHUTDOWN_GRACE_MS, this.processCleanup)
+      : await this.raceCleanup(closeCompletion);
     const confirmed = await confirmStopped();
     if (!confirmed) this.cleanupRetries.set(handle.server.name, confirmStopped);
     return confirmed;
@@ -1613,6 +1615,41 @@ function beginCleanup(
 
 async function boundedCleanup(completion: Promise<boolean>, maxWaitMs: number): Promise<boolean> {
   return await Promise.race([completion, sleep(maxWaitMs).then(() => false)]);
+}
+
+async function confirmProcessSnapshotAbsent(
+  snapshot: readonly number[],
+  maxWaitMs: number,
+  deps: ProcessCleanupDeps,
+): Promise<boolean> {
+  const deadline = deps.now() + maxWaitMs;
+  while (true) {
+    if (snapshot.every((pid) => processIsConfirmedAbsent(pid, deps))) return true;
+    const remainingMs = deadline - deps.now();
+    if (remainingMs <= 0) return false;
+    await deps.delay(Math.min(PID_POLL_MS, remainingMs));
+  }
+}
+
+function processIsConfirmedAbsent(pid: number, deps: ProcessCleanupDeps): boolean {
+  try {
+    deps.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return err instanceof Error && "code" in err && err.code === "ESRCH";
+  }
+}
+
+function resolveProcessCleanupDeps(deps: McpRuntimeDeps): ProcessCleanupDeps {
+  const injected = (deps as McpRuntimeDeps & Record<symbol, unknown>)[PROCESS_CLEANUP_TEST_DEPS];
+  if (injected !== undefined) return injected as ProcessCleanupDeps;
+  return {
+    snapshot: (pid) => [pid, ...listDescendantPids(pid)],
+    killTree: killProcessTreeByPid,
+    kill: (pid, signal) => { process.kill(pid, signal); },
+    now: () => performance.now(),
+    delay: sleep,
+  };
 }
 
 type McpDiscoveryCapability = "tools" | "prompts" | "resources";

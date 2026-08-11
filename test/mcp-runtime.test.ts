@@ -1970,6 +1970,102 @@ describe("McpRuntime kill discipline", () => {
     }
   }, 25_000);
 
+  it("confirms PID cleanup only after absence and retains bounded uncertainty for retry", async () => {
+    const testDepsKey = Symbol.for("picc.test.mcp-process-cleanup");
+    type TestProcessCleanup = {
+      snapshot(pid: number): readonly number[];
+      killTree(pid: number): void;
+      kill(pid: number, signal: 0 | "SIGKILL"): void;
+      now(): number;
+      delay(delayMs: number): Promise<void>;
+    };
+    const startRuntime = async (pid: number, cleanup: TestProcessCleanup): Promise<McpRuntime> => {
+      class FakeTransport {
+        readonly pid = pid;
+        readonly stderr = undefined;
+      }
+      class FakeClient {
+        async connect(): Promise<void> {}
+        async listTools(): Promise<{ tools: never[] }> { return { tools: [] }; }
+        async close(): Promise<void> {}
+      }
+      const deps = makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      });
+      Object.defineProperty(deps, testDepsKey, { value: cleanup });
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: `policy-${pid}` })), deps);
+      await runtime.whenSettled();
+      return runtime;
+    };
+
+    const settlingCalls: Array<0 | "SIGKILL"> = [];
+    let settlingProbe = 0;
+    const settlingRuntime = await startRuntime(4_000_001, {
+      snapshot: (pid) => [pid],
+      killTree: () => {},
+      kill: (_pid, signal) => {
+        settlingCalls.push(signal);
+        if (signal === "SIGKILL") return;
+        if (settlingProbe++ === 0) return;
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      },
+      now: () => 0,
+      delay: async () => {},
+    });
+    await expect(settlingRuntime.shutdownAgent()).resolves.toEqual({
+      confirmed: ["policy-4000001"], unconfirmed: [], diagnostics: [],
+    });
+    expect(settlingCalls).toEqual(["SIGKILL", 0, 0]);
+
+    const retainedCalls: Array<0 | "SIGKILL"> = [];
+    const retainedProbeKinds: string[] = [];
+    let policyNow = 0;
+    let retrying = false;
+    const retainedRuntime = await startRuntime(4_000_002, {
+      snapshot: (pid) => [pid],
+      killTree: () => {},
+      kill: (_pid, signal) => {
+        retainedCalls.push(signal);
+        if (signal === "SIGKILL") return;
+        if (retrying) {
+          retainedProbeKinds.push("absent");
+          throw Object.assign(new Error("gone"), { code: "ESRCH" });
+        }
+        const probe = retainedProbeKinds.length;
+        if (probe === 0) {
+          retainedProbeKinds.push("present");
+          return;
+        }
+        if (probe === 1) {
+          retainedProbeKinds.push("eperm");
+          throw Object.assign(new Error("denied"), { code: "EPERM" });
+        }
+        retainedProbeKinds.push("unknown");
+        throw new Error("unclassified probe failure");
+      },
+      now: () => policyNow,
+      delay: async () => { policyNow += 2_000; },
+    });
+    await expect(retainedRuntime.shutdownAgent()).resolves.toEqual({
+      confirmed: [],
+      unconfirmed: ["policy-4000002"],
+      diagnostics: ["Cleanup could not be confirmed for 1 agent MCP server(s)."],
+    });
+    expect(retainedProbeKinds).toEqual(["present", "eperm", "unknown", "unknown"]);
+    expect(retainedCalls.filter((signal) => signal === "SIGKILL")).toHaveLength(1);
+
+    retrying = true;
+    await expect(retainedRuntime.retryAgentShutdown(["policy-4000002"])).resolves.toEqual({
+      confirmed: ["policy-4000002"], unconfirmed: [], diagnostics: [],
+    });
+    const callsAfterConfirmation = [...retainedCalls];
+    await expect(retainedRuntime.retryAgentShutdown(["policy-4000002"])).resolves.toEqual({
+      confirmed: ["policy-4000002"], unconfirmed: [], diagnostics: [],
+    });
+    expect(retainedCalls).toEqual(callsAfterConfirmation);
+    expect(retainedCalls.filter((signal) => signal === "SIGKILL")).toHaveLength(1);
+  });
+
   it("shutdown is idempotent, safe to call twice concurrently, and truthful afterwards", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const config = makeConfig(
