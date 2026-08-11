@@ -65,7 +65,8 @@ export type CheckpointAction =
   | "manual-recovery"
   | "new-session"
   | "session-ended"
-  | "restart-process";
+  | "restart-process"
+  | "session-reusable";
 
 export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
@@ -73,6 +74,7 @@ export interface CheckpointProgress {
   source?: CheckpointSource;
   action?: CheckpointAction;
   failureCategory?: CompactionFailureCategory;
+  stage?: PostCommitStage;
 }
 
 /** Whether a cancellation established that the host stopped; `unconfirmed` is terminal. */
@@ -85,6 +87,7 @@ export interface CheckpointSnapshot {
   queuedInputs: number;
   admission: "open" | "checkpoint-only" | "recoverable-rejection" | "closed";
   failureCategory?: CompactionFailureCategory;
+  stage?: PostCommitStage;
   /** Present only while a cancellation owns this generation; all three fields travel together. */
   cancellationKind?: CancellationKind;
   cancellationQuiescence?: CancellationQuiescence;
@@ -119,6 +122,61 @@ export interface ResumeToken {
   readonly token: object;
 }
 
+export type ResumedSettlementOutcome = "completed" | "cancelled";
+
+export type PostCommitStage =
+  | "restoration"
+  | "continuation-start"
+  | "input-replay"
+  | "provider-release"
+  | "resumed-work"
+  | "resumed-cancellation"
+  | "cancellation-join";
+
+export type HostInputClass =
+  | "restoration-control"
+  | "continuation-trigger"
+  | "retained-replay"
+  | "ordinary-input"
+  | "subagent-input"
+  | "panel-steer";
+
+/** Identity-authenticated custody for one host-bound operation. */
+export interface HostInputLease {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly inputClass: HostInputClass;
+  readonly token: object;
+}
+
+export type HostInputAdmission =
+  | { kind: "inactive" }
+  | { kind: "refuse-settling" }
+  | { kind: "lease"; lease: HostInputLease };
+
+export interface CancelledInputHandoff {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly token: object;
+  readonly retained: readonly QueuedInputShadow[];
+  readonly acceptedToHostIds: readonly number[];
+  readonly piccOwnedIds: readonly number[];
+}
+
+export type CancelledInputDisposition = "restored" | "reported" | "unresolved";
+
+export interface CancelledInputResolutionEntry {
+  readonly id: number;
+  readonly disposition: CancelledInputDisposition;
+}
+
+export interface CancelledInputResolution {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly token: object;
+  readonly resolutions: readonly CancelledInputResolutionEntry[];
+}
+
 /** Identity-authenticated permission for one controller-owned summary request. */
 export interface CompactionSummaryToken {
   readonly generation: number;
@@ -129,6 +187,8 @@ export interface ResumeContext {
   generation: number;
   token: ResumeToken;
   signal: AbortSignal;
+  /** Authenticate the adapter's transition from restoration into continuation startup. */
+  advancePostCommitStage(stage: "continuation-start"): boolean;
 }
 
 export type ReplayDeliveryResult =
@@ -219,7 +279,7 @@ export interface ResumedRunOwnership {
   cancelAndJoin(kind: CancellationKind, context: ResumeContext): void | Promise<void>;
 }
 
-export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed" | "reject-stopped";
+export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed" | "reject-stopped" | "reject-settling";
 export type ManualCompactionDisposition = "allow" | "already-active" | "unavailable";
 
 export interface CancellationOutcome {
@@ -232,6 +292,10 @@ export interface MidRunCompactionOptions {
   threshold: number;
   compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
+  cancelledInput?(
+    handoff: CancelledInputHandoff,
+    context: ResumeContext,
+  ): CancelledInputResolution | Promise<CancelledInputResolution>;
   progress?(event: CheckpointProgress): void;
   /**
    * Report input a terminal transition has taken out of the queue. Every splice that
@@ -294,6 +358,11 @@ interface RunOwnership {
   settled: Deferred<void>;
 }
 
+interface ActiveHostInputLease {
+  lease: HostInputLease;
+  settled: Deferred<void>;
+}
+
 function usageIsKnown(usage: ContextUsageShape | undefined): usage is ContextUsageShape & { percent: number } {
   return typeof usage?.percent === "number" && Number.isFinite(usage.percent);
 }
@@ -318,7 +387,9 @@ export class MidRunCompactionController {
   private runOwnership: RunOwnership | undefined;
   private fallback = false;
   private resumeToken: ResumeToken | undefined;
-  private resumedSettlement: Deferred<void> | undefined;
+  private resumedSettlement: Deferred<ResumedSettlementOutcome> | undefined;
+  private resumedCancellationEvidence: ResumeToken | undefined;
+  private resumedSettlementRecorded = false;
   private queueChanged = deferred();
   private recovery: RecoveryToken | undefined;
   private resumedOwnership: ResumedRunOwnership | undefined;
@@ -328,7 +399,12 @@ export class MidRunCompactionController {
   private committedGeneration: number | undefined;
   private terminalFailure: CompactionFailureCategory | undefined;
   private terminalization: Promise<readonly QueuedInputShadow[]> | undefined;
+  private terminalStage: PostCommitStage | undefined;
+  private postCommitStage: PostCommitStage | undefined;
   private pendingHostStarts = new Set<number>();
+  private hostInputLeases = new Map<HostInputLease, ActiveHostInputLease>();
+  private hostAdmissionRevoked = false;
+  private cancellationHandoff: CancelledInputHandoff | undefined;
 
   constructor(private readonly options: MidRunCompactionOptions) {
     this.sessionId = options.sessionId;
@@ -350,6 +426,7 @@ export class MidRunCompactionController {
             ? "open"
             : "checkpoint-only",
       ...(this.terminalFailure === undefined ? {} : { failureCategory: this.terminalFailure }),
+      ...(this.terminalStage === undefined ? {} : { stage: this.terminalStage }),
       // Read by the admission-refusal notice: "wait for the cancellation to settle" is
       // true only for a `user` cancellation that is still pending, and no wait ever
       // helps once a join has reported `unconfirmed`. `cancellationCommitted` is what
@@ -377,6 +454,8 @@ export class MidRunCompactionController {
     this.fallback = source === "settled";
     this.resumeToken = undefined;
     this.resumedSettlement = undefined;
+    this.resumedCancellationEvidence = undefined;
+    this.resumedSettlementRecorded = false;
     this.queueChanged = deferred();
     this.recovery = undefined;
     this.resumedOwnership = undefined;
@@ -386,7 +465,12 @@ export class MidRunCompactionController {
     this.committedGeneration = undefined;
     this.terminalFailure = undefined;
     this.terminalization = undefined;
+    this.terminalStage = undefined;
+    this.postCommitStage = undefined;
     this.pendingHostStarts.clear();
+    this.hostInputLeases.clear();
+    this.hostAdmissionRevoked = false;
+    this.cancellationHandoff = undefined;
     this.emit("checkpoint-armed", this.generation, { source });
     return this.generation;
   }
@@ -493,8 +577,8 @@ export class MidRunCompactionController {
     delivery: QueueDeliveryMode,
     sessionId = this.sessionId,
   ): QueuedInputShadow | undefined {
-    if (generation !== this.generation || sessionId !== this.sessionId || this.fallback ||
-        this.phase === "idle" || this.phase === "exhausted" || this.phase === "cancelled") {
+    if (generation !== this.generation || sessionId !== this.sessionId || this.fallback || this.hostAdmissionRevoked ||
+        this.phase === "idle" || this.phase === "terminalizing" || this.phase === "exhausted" || this.phase === "cancelled") {
       return undefined;
     }
     const entry = { id: this.nextQueueId++, generation, sessionId, content, delivery };
@@ -504,7 +588,7 @@ export class MidRunCompactionController {
   }
 
   consumeShadow(generation: number, id: number, sessionId = this.sessionId): QueuedInputShadow | undefined {
-    if (generation !== this.generation || sessionId !== this.sessionId) return undefined;
+    if (generation !== this.generation || sessionId !== this.sessionId || this.hostAdmissionRevoked) return undefined;
     const index = this.queue.findIndex((entry) => entry.id === id && entry.generation === generation && entry.sessionId === sessionId);
     if (index < 0) return undefined;
     const [consumed] = this.queue.splice(index, 1);
@@ -536,12 +620,17 @@ export class MidRunCompactionController {
   ordinaryInputDisposition(): OrdinaryInputDisposition {
     if (this.phase === "idle") return "accept";
     if (this.phase === "exhausted") {
-      return this.terminalFailure === "restoration-paused"
-        ? "reject-restoration"
-        : this.terminalFailure === "unconfirmed-host" ? "reject-closed" : "reject-recoverable";
+      if (this.terminalFailure === "restoration-paused") return "reject-restoration";
+      if (this.terminalFailure === "unconfirmed-host" || !this.recovery) return "reject-closed";
+      return "reject-recoverable";
     }
     if (this.phase === "cancelled") return "reject-closed";
+    if (this.hostAdmissionRevoked) return "reject-settling";
     return "quarantine";
+  }
+
+  providerAdmissionAllowed(generation: number): boolean {
+    return generation === this.generation && this.phase === "resuming" && !this.hostAdmissionRevoked;
   }
 
   isProcessTerminal(): boolean {
@@ -594,9 +683,53 @@ export class MidRunCompactionController {
     return generationBarrier.promise;
   }
 
-  resumedSettled(token: ResumeToken): boolean {
-    if (token !== this.resumeToken || token.generation !== this.generation || this.phase !== "resuming") return false;
-    this.resumedSettlement?.resolve();
+  /** Record run-bound terminal-aborted evidence before the physical run settles. */
+  resumedAborted(token: ResumeToken): boolean {
+    if (token !== this.resumeToken || token.generation !== this.generation || this.phase !== "resuming" ||
+        this.resumedCancellationEvidence) return false;
+    this.resumedCancellationEvidence = token;
+    return true;
+  }
+
+  resumedSettled(token: ResumeToken, outcome: ResumedSettlementOutcome = "completed"): boolean {
+    if (token !== this.resumeToken || token.generation !== this.generation || this.phase !== "resuming" ||
+        this.resumedSettlementRecorded) return false;
+    if (outcome === "cancelled" && this.resumedCancellationEvidence !== token) return false;
+    this.resumedSettlementRecorded = true;
+    if (outcome === "cancelled") {
+      this.hostAdmissionRevoked = true;
+      const context = this.resumeContext;
+      if (context) void this.settleResumedCancellation(token.generation, context);
+    }
+    this.resumedSettlement?.resolve(outcome);
+    return true;
+  }
+
+  admitHostInput(inputClass: HostInputClass): HostInputAdmission {
+    if (this.phase === "idle" && this.queue.length === 0 && !this.hostAdmissionRevoked) {
+      return { kind: "inactive" };
+    }
+    if (this.hostAdmissionRevoked || this.phase === "terminalizing" || this.phase === "exhausted" ||
+        this.phase === "cancelled") return { kind: "refuse-settling" };
+    const lease = { sessionId: this.sessionId, generation: this.generation, inputClass, token: {} };
+    this.hostInputLeases.set(lease, { lease, settled: deferred() });
+    return { kind: "lease", lease };
+  }
+
+  settleHostInput(
+    lease: HostInputLease,
+    acceptedShadow?: QueuedInputShadow,
+  ): boolean {
+    const active = this.hostInputLeases.get(lease);
+    if (!active || active.lease !== lease || lease.sessionId !== this.sessionId ||
+        lease.generation !== this.generation) return false;
+    if (acceptedShadow) {
+      if (acceptedShadow.sessionId !== this.sessionId || acceptedShadow.generation !== this.generation ||
+          !this.queue.some((entry) => entry === acceptedShadow)) return false;
+      this.pendingHostStarts.add(acceptedShadow.id);
+    }
+    this.hostInputLeases.delete(lease);
+    active.settled.resolve();
     return true;
   }
 
@@ -676,8 +809,11 @@ export class MidRunCompactionController {
   }
 
   /** Close a generation after its summary committed; no recovery capability survives. */
-  failAfterCommittedSummary(generation: number): Promise<readonly QueuedInputShadow[]> {
-    return this.terminalizeAfterCommittedSummary(generation);
+  failAfterCommittedSummary(
+    generation: number,
+    stage?: PostCommitStage,
+  ): Promise<readonly QueuedInputShadow[]> {
+    return this.terminalizeAfterCommittedSummary(generation, stage);
   }
 
   private currentBatch(handle: ToolBatchHandle): ActiveBatch | undefined {
@@ -701,11 +837,15 @@ export class MidRunCompactionController {
       this.compactionSummary = undefined;
     }
     if (!result.ok && result.category === "unconfirmed-host") {
-      this.exhaustUnconfirmed(generation);
+      this.exhaustUnconfirmed(
+        generation,
+        this.stable,
+        this.committedGeneration === generation ? "restoration" : undefined,
+      );
       return;
     }
     if (!result.ok && this.committedGeneration === generation) {
-      await this.terminalizeAfterCommittedSummary(generation);
+      await this.terminalizeAfterCommittedSummary(generation, "restoration");
       return;
     }
     if (!this.isCurrent(generation)) return;
@@ -720,7 +860,7 @@ export class MidRunCompactionController {
     if (result.category === "cancelled" || result.category === "shutdown") {
       void this.cancel(generation, result.category === "shutdown" ? "shutdown" : "user");
     } else if (result.category === "restoration-paused") {
-      await this.terminalizeAfterCommittedSummary(generation);
+      await this.terminalizeAfterCommittedSummary(generation, "restoration");
     } else {
       this.exhaust(generation, result.category);
     }
@@ -742,26 +882,39 @@ export class MidRunCompactionController {
     const token = { generation, token: {} };
     this.resumeToken = token;
     this.resumedSettlement = deferred();
-    const context = { generation, token, signal: this.runAbort.signal };
+    let context!: ResumeContext;
+    context = {
+      generation,
+      token,
+      signal: this.runAbort.signal,
+      advancePostCommitStage: (stage) => this.advanceAdapterPostCommitStage(context, stage),
+    };
     this.resumeContext = context;
+    this.postCommitStage = "restoration";
     try {
       const ownership = await this.options.resume(context);
+      if (generation !== this.generation || this.resumeContext !== context || this.resumeToken !== token ||
+          (this.phase !== "resuming" && this.phase !== "cancelled")) return;
+      this.advanceInternalPostCommitStage("continuation-start");
       if (!ownership || typeof ownership.replay !== "function" || typeof ownership.cancelAndJoin !== "function") {
         throw new Error("invalid resume ownership");
       }
       this.resumedOwnership = ownership;
+      this.advanceInternalPostCommitStage("input-replay");
       if (this.isCancelled()) {
         this.startCancelAndJoin(generation);
         return;
       }
-      const settlement = ownership.settled ?? this.resumedSettlement.promise;
+      const settlement: Promise<ResumedSettlementOutcome> = ownership.settled
+        ? ownership.settled.then(() => "completed" as const)
+        : this.resumedSettlement.promise;
       await this.replayUntilSettled(generation, ownership, context, settlement);
     } catch {
       if (this.isCancelled()) return;
       // The summary is already committed before resume ownership begins. Any
       // restoration, replay, startup, or settlement failure is terminal for
       // this session and must never mint a token that permits re-compaction.
-      await this.terminalizeAfterCommittedSummary(generation);
+      await this.terminalizeAfterCommittedSummary(generation, this.postCommitStage ?? "restoration");
     }
   }
 
@@ -769,19 +922,20 @@ export class MidRunCompactionController {
     generation: number,
     ownership: ResumedRunOwnership,
     context: ResumeContext,
-    settlement: Promise<void>,
+    settlement: Promise<ResumedSettlementOutcome>,
   ): Promise<void> {
-    let settled = false;
+    let settlementOutcome: ResumedSettlementOutcome | undefined;
     let replayCompleted = false;
-    const settlementEvent = settlement.then(() => {
-      settled = true;
+    const settlementEvent = settlement.then((outcome) => {
+      settlementOutcome = outcome;
       return "settled" as const;
     });
 
     while (this.isCurrent(generation)) {
       while (this.queue.length > 0 && this.isCurrent(generation)) {
-        if (settled) {
-          await this.terminalizeAfterCommittedSummary(generation);
+        if (settlementOutcome) {
+          if (settlementOutcome === "cancelled") await this.settleResumedCancellation(generation, context);
+          else await this.terminalizeAfterCommittedSummary(generation, "resumed-work");
           return;
         }
         // Pending host starts retain custody but do not head-of-line block later
@@ -791,7 +945,20 @@ export class MidRunCompactionController {
         if (!entry) break;
         let result: ReplayDeliveryResult = { delivered: false };
         try {
-          const candidate = await ownership.replay(entry, context);
+          const replayEvent = Promise.resolve(ownership.replay(entry, context)).then((candidate) => ({
+            kind: "replay" as const,
+            candidate,
+          }));
+          const event = await Promise.race([
+            replayEvent,
+            settlementEvent.then(() => ({ kind: "settled" as const })),
+          ]);
+          if (event.kind === "settled") {
+            if (settlementOutcome === "cancelled") await this.settleResumedCancellation(generation, context);
+            else await this.terminalizeAfterCommittedSummary(generation, "input-replay");
+            return;
+          }
+          const candidate = event.candidate;
           if (candidate?.delivered === true || candidate?.delivered === false) result = candidate;
         } catch {
           // A throwing adapter has not demonstrated delivery, so controller ownership remains.
@@ -802,23 +969,26 @@ export class MidRunCompactionController {
         }
         if (this.isCancelled()) return;
         if (!result.delivered) {
-          await this.terminalizeAfterCommittedSummary(generation);
+          await this.terminalizeAfterCommittedSummary(generation, "input-replay");
           return;
         }
       }
       if (!this.isCurrent(generation)) break;
       if (!replayCompleted && ownership.replayComplete) {
+        this.advanceInternalPostCommitStage("provider-release");
         try {
           await ownership.replayComplete(context);
           replayCompleted = true;
         } catch {
-          if (!this.isCancelled()) await this.terminalizeAfterCommittedSummary(generation);
+          if (!this.isCancelled()) await this.terminalizeAfterCommittedSummary(generation, "provider-release");
           return;
         }
       }
       if (!this.isCurrent(generation)) return;
-      if (settled) {
-        this.finishGeneration(generation);
+      this.advanceInternalPostCommitStage("resumed-work");
+      if (settlementOutcome) {
+        if (settlementOutcome === "cancelled") await this.settleResumedCancellation(generation, context);
+        else this.finishGeneration(generation);
         return;
       }
       this.queueChanged = deferred();
@@ -828,16 +998,196 @@ export class MidRunCompactionController {
         this.queueChanged.promise.then(() => "queue" as const),
       ]);
       if (event === "settled") {
-        // A terminalization started while this race was parked owns the ending, and
-        // `finishGeneration` declines it; the queued branch joins that same promise.
-        if (this.queue.length === 0) this.finishGeneration(generation);
-        else await this.terminalizeAfterCommittedSummary(generation);
+        // A competing terminalization can own the ending while this race is parked.
+        // The completed branch then declines to finish, while the cancelled branch
+        // joins that owner; neither publishes a second ending or handoff.
+        if (settlementOutcome === "cancelled") await this.settleResumedCancellation(generation, context);
+        else if (this.queue.length === 0) this.finishGeneration(generation);
+        else await this.terminalizeAfterCommittedSummary(generation, "resumed-work");
         return;
       }
     }
   }
 
-  private terminalizeAfterCommittedSummary(generation: number): Promise<readonly QueuedInputShadow[]> {
+  private settleResumedCancellation(
+    generation: number,
+    context: ResumeContext,
+  ): Promise<readonly QueuedInputShadow[]> {
+    if (generation !== this.generation || context !== this.resumeContext ||
+        this.resumedCancellationEvidence !== context.token) return Promise.resolve([]);
+    if (this.phase === "terminalizing") return this.terminalization ?? Promise.resolve([]);
+    if (this.phase !== "resuming") return Promise.resolve([]);
+
+    const generationBarrier = this.stable;
+    this.phase = "terminalizing";
+    this.hostAdmissionRevoked = true;
+    this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
+    this.terminalFailure = "restoration-paused";
+    this.terminalStage = "resumed-cancellation";
+    this.recovery = undefined;
+    this.queueChanged.resolve();
+
+    const terminalization = (async (): Promise<readonly QueuedInputShadow[]> => {
+      const leases = [...this.hostInputLeases.values()];
+      try {
+        await withHostDeadline(
+          Promise.all(leases.map((entry) => entry.settled.promise)).then(() => undefined),
+          resumedJoinDeadline(this.options.deadlinePolicy),
+          deadlineClock(this.options.deadlinePolicy),
+        );
+      } catch {
+        this.terminalStage = "cancellation-join";
+        this.terminalFailure = "unconfirmed-host";
+        this.phase = "exhausted";
+        this.clearResumeAuthority();
+        this.emit("checkpoint-cancelled", generation, {
+          action: "restart-process",
+          failureCategory: "unconfirmed-host",
+          stage: "cancellation-join",
+        });
+        return [];
+      }
+
+      const retained = this.queuedInputSnapshot();
+      const acceptedToHostIds = retained.filter((entry) => this.pendingHostStarts.has(entry.id)).map((entry) => entry.id);
+      const piccOwnedIds = retained.filter((entry) => !this.pendingHostStarts.has(entry.id)).map((entry) => entry.id);
+      const handoff: CancelledInputHandoff = Object.freeze({
+        sessionId: this.sessionId,
+        generation,
+        token: {},
+        retained: Object.freeze([...retained]),
+        acceptedToHostIds: Object.freeze(acceptedToHostIds),
+        piccOwnedIds: Object.freeze(piccOwnedIds),
+      });
+      this.cancellationHandoff = handoff;
+
+      let resolution: CancelledInputResolution | undefined;
+      try {
+        const cancelledInput = this.options.cancelledInput;
+        if (!cancelledInput) throw new Error("Cancelled-input adapter is not attached");
+        resolution = await withHostDeadline(
+          Promise.resolve(cancelledInput(handoff, context)),
+          resumedJoinDeadline(this.options.deadlinePolicy),
+          deadlineClock(this.options.deadlinePolicy),
+        );
+      } catch (error) {
+        if (error instanceof UnconfirmedHostDeadlineError) {
+          this.terminalStage = "cancellation-join";
+          this.terminalFailure = "unconfirmed-host";
+          this.phase = "exhausted";
+          this.clearResumeAuthority();
+          this.emit("checkpoint-cancelled", generation, {
+            action: "restart-process",
+            failureCategory: "unconfirmed-host",
+            stage: "cancellation-join",
+          });
+          return [];
+        }
+        resolution = undefined;
+      }
+      const validated = this.validateCancelledInputResolution(handoff, resolution);
+      const resolvedIds = new Set([...validated.dispositions]
+        .filter(([, disposition]) => disposition !== "unresolved")
+        .map(([id]) => id));
+      if (resolvedIds.size > 0) {
+        this.queue = this.queue.filter((entry) => !resolvedIds.has(entry.id));
+        for (const id of resolvedIds) this.pendingHostStarts.delete(id);
+      }
+      this.clearResumeAuthority();
+
+      if (validated.authenticated && this.queue.length === 0) {
+        this.phase = "idle";
+        this.committedGeneration = undefined;
+        this.terminalFailure = undefined;
+        this.terminalStage = undefined;
+        this.hostAdmissionRevoked = false;
+        this.emit("checkpoint-cancelled", generation, {
+          action: "session-reusable",
+          failureCategory: "restoration-paused",
+          stage: "resumed-cancellation",
+        });
+        return [];
+      }
+
+      this.phase = "exhausted";
+      this.terminalStage = "cancellation-join";
+      this.emit("checkpoint-exhausted", generation, {
+        action: "new-session",
+        failureCategory: "restoration-paused",
+        stage: "cancellation-join",
+      });
+      return [];
+    })().finally(() => this.publishExit(generation, generationBarrier));
+    this.terminalization = terminalization;
+    return terminalization;
+  }
+
+  private validateCancelledInputResolution(
+    handoff: CancelledInputHandoff,
+    resolution: CancelledInputResolution | undefined,
+  ): { authenticated: boolean; dispositions: ReadonlyMap<number, CancelledInputDisposition> } {
+    const unresolved = new Map(handoff.retained.map((entry) => [entry.id, "unresolved" as const]));
+    try {
+      if (!resolution || resolution.sessionId !== handoff.sessionId || resolution.generation !== handoff.generation ||
+          resolution.token !== handoff.token || !Array.isArray(resolution.resolutions)) {
+        return { authenticated: false, dispositions: unresolved };
+      }
+      const expected = new Set(handoff.retained.map((entry) => entry.id));
+      const validated = new Map<number, CancelledInputDisposition>();
+      for (const entry of resolution.resolutions) {
+        if (!entry || typeof entry !== "object" || !expected.has(entry.id) || validated.has(entry.id) ||
+            (entry.disposition !== "restored" && entry.disposition !== "reported" && entry.disposition !== "unresolved")) {
+          return { authenticated: false, dispositions: unresolved };
+        }
+        validated.set(entry.id, entry.disposition);
+      }
+      if (validated.size !== expected.size) return { authenticated: false, dispositions: unresolved };
+      return { authenticated: true, dispositions: validated };
+    } catch {
+      return { authenticated: false, dispositions: unresolved };
+    }
+  }
+
+  private advanceAdapterPostCommitStage(
+    context: ResumeContext,
+    stage: "continuation-start",
+  ): boolean {
+    if (context !== this.resumeContext || context.token !== this.resumeToken ||
+        context.generation !== this.generation || this.phase !== "resuming" ||
+        this.postCommitStage !== "restoration") return false;
+    this.postCommitStage = stage;
+    return true;
+  }
+
+  private advanceInternalPostCommitStage(stage: PostCommitStage): void {
+    const order: readonly PostCommitStage[] = [
+      "restoration",
+      "continuation-start",
+      "input-replay",
+      "provider-release",
+      "resumed-work",
+    ];
+    const current = this.postCommitStage === undefined ? -1 : order.indexOf(this.postCommitStage);
+    const next = order.indexOf(stage);
+    if (next >= 0 && next > current) this.postCommitStage = stage;
+  }
+
+  private clearResumeAuthority(): void {
+    this.resumedOwnership = undefined;
+    this.resumeContext = undefined;
+    this.resumeToken = undefined;
+    this.resumedSettlement = undefined;
+    this.resumedCancellationEvidence = undefined;
+    this.resumedSettlementRecorded = false;
+    this.postCommitStage = undefined;
+    this.hostInputLeases.clear();
+  }
+
+  private terminalizeAfterCommittedSummary(
+    generation: number,
+    stage?: PostCommitStage,
+  ): Promise<readonly QueuedInputShadow[]> {
     if (generation !== this.generation ||
         (this.phase === "exhausted" && this.terminalFailure === "restoration-paused")) return Promise.resolve([]);
     if (this.phase === "terminalizing") return this.terminalization ?? Promise.resolve([]);
@@ -849,6 +1199,7 @@ export class MidRunCompactionController {
     this.checkpointAbortRequested = false;
     this.compactionSummary = undefined;
     this.terminalFailure = "restoration-paused";
+    this.terminalStage = stage;
     this.recovery = undefined;
     this.runAbort.abort("post-commit failure");
     this.queueChanged.resolve();
@@ -868,7 +1219,7 @@ export class MidRunCompactionController {
               : joining);
           } catch (error) {
             if (error instanceof UnconfirmedHostDeadlineError) {
-              return this.exhaustUnconfirmed(generation, generationBarrier);
+              return this.exhaustUnconfirmed(generation, generationBarrier, "cancellation-join");
             }
             // The adapter revoked provider/replay authority before this join. An ordinary
             // settled rejection still confirms host quiescence and keeps the post-commit
@@ -891,6 +1242,7 @@ export class MidRunCompactionController {
         this.emit("checkpoint-exhausted", generation, {
           action: "new-session",
           failureCategory: "restoration-paused",
+          ...(stage === undefined ? {} : { stage }),
         });
         // The ending tells the reader to resend the retained input; this is what names
         // it. Every internal caller of this transition discards the return value, so the
@@ -1054,7 +1406,7 @@ export class MidRunCompactionController {
         return;
       }
       if (this.committedGeneration === generation) {
-        await this.terminalizeAfterCommittedSummary(generation);
+        await this.terminalizeAfterCommittedSummary(generation, "cancellation-join");
         return;
       }
       if (this.phase === "exhausted") return;
@@ -1079,6 +1431,7 @@ export class MidRunCompactionController {
   private exhaustUnconfirmed(
     generation: number,
     generationBarrier = this.stable,
+    stage?: PostCommitStage,
   ): readonly QueuedInputShadow[] {
     if (generation !== this.generation) return [];
     const rejected = this.queue.splice(0);
@@ -1091,10 +1444,12 @@ export class MidRunCompactionController {
     this.resumeToken = undefined;
     this.resumedSettlement = undefined;
     this.terminalFailure = "unconfirmed-host";
+    this.terminalStage = stage;
     this.recovery = undefined;
     this.emit("checkpoint-cancelled", generation, {
       action: "restart-process",
       failureCategory: "unconfirmed-host",
+      ...(stage === undefined ? {} : { stage }),
     });
     this.reportDropped(rejected);
     this.publishExit(generation, generationBarrier, rejected);
@@ -1113,7 +1468,7 @@ export class MidRunCompactionController {
   private emit(
     category: CheckpointDiagnosticCategory,
     generation = this.generation,
-    details: Pick<CheckpointProgress, "source" | "action" | "failureCategory"> = {},
+    details: Pick<CheckpointProgress, "source" | "action" | "failureCategory" | "stage"> = {},
   ): void {
     try {
       this.options.progress?.({ category, generation, ...details });
@@ -1160,6 +1515,10 @@ interface ToolObservationAuthority {
 export interface CheckpointExecutionAdapter {
   compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
+  cancelledInput?(
+    handoff: CancelledInputHandoff,
+    context: ResumeContext,
+  ): CancelledInputResolution | Promise<CancelledInputResolution>;
   progress?(event: CheckpointProgress): void;
   /** Input an ending, or the replacement of this gate's controller, can no longer deliver. */
   inputDropped?(rejected: readonly QueuedInputShadow[]): void;
@@ -1276,11 +1635,20 @@ interface ExpectedInput {
   delivery: QueueDeliveryMode;
 }
 
+export interface RetainedInputOccurrenceEnvelope {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly id: number;
+  readonly delivery: QueueDeliveryMode;
+  readonly nonce: object;
+}
+
 interface TrackedInputOccurrence extends ExpectedInput {
   epoch: object;
   sessionId: string;
   generation: number;
   shadow: QueuedInputShadow;
+  envelope: RetainedInputOccurrenceEnvelope;
   pendingHostStart: boolean;
 }
 
@@ -1292,6 +1660,8 @@ interface ReplayAuthorization {
   reconciliation: ReconciliationContent;
   source: string;
   mode: QueueDeliveryMode;
+  envelope: RetainedInputOccurrenceEnvelope;
+  envelopeRequired: boolean;
   used: boolean;
 }
 
@@ -1566,7 +1936,7 @@ export class MainSessionCheckpointGate {
       // controller generation and resuming phase before it may return to Pi.
       const current = this.controller.snapshot();
       if (this.generation !== generation || this.resumeBarrier !== barrier ||
-          current.generation !== generation || current.phase !== "resuming") {
+          current.generation !== generation || !this.controller.providerAdmissionAllowed(generation)) {
         this.abortAfterBatch(ctx);
       }
       return;
@@ -1618,6 +1988,18 @@ export class MainSessionCheckpointGate {
     return this.logicalRunStop ? "reject-stopped" : this.controller.ordinaryInputDisposition();
   }
 
+  hostInputAdmission(inputClass: HostInputClass): HostInputAdmission {
+    if (this.logicalRunStop) return { kind: "refuse-settling" };
+    return this.controller.admitHostInput(inputClass);
+  }
+
+  settleHostInput(lease: HostInputLease, acceptedShadow?: QueuedInputShadow): boolean {
+    const occurrence = acceptedShadow && this.trackedOccurrences.find((entry) => entry.shadow === acceptedShadow);
+    const settled = this.controller.settleHostInput(lease, acceptedShadow);
+    if (settled && occurrence) occurrence.pendingHostStart = true;
+    return settled;
+  }
+
   async cancel(kind: CancellationKind): Promise<CancellationOutcome> {
     const snapshot = this.controller.snapshot();
     return snapshot.phase === "idle"
@@ -1648,8 +2030,38 @@ export class MainSessionCheckpointGate {
       reconciliation,
       source,
       mode: input.delivery,
+      envelope: occurrence.envelope,
+      envelopeRequired: false,
       used: false,
     }, operation);
+  }
+
+  withRetainedReplayAuthorization<T>(
+    input: QueuedInputShadow,
+    operation: (details: { piccCheckpointInput: RetainedInputOccurrenceEnvelope }) => T,
+    source = "extension",
+  ): T {
+    const current = this.controller.queuedInputSnapshot().find((entry) => entry === input);
+    const occurrence = this.trackedOccurrences.find((entry) => entry.shadow === input && !entry.pendingHostStart);
+    const reconciliation = reconciliationContent(input.content);
+    if (this.controller.snapshot().phase !== "resuming" || !current || !occurrence || !reconciliation ||
+        occurrence.epoch !== this.sessionEpoch || occurrence.sessionId !== this.controller.sessionId ||
+        occurrence.generation !== this.generation || input.sessionId !== this.controller.sessionId ||
+        input.generation !== this.generation) {
+      throw new Error("Cannot authorize stale checkpoint replay");
+    }
+    return replayAuthorization.run({
+      gate: this.sessionEpoch,
+      sessionId: input.sessionId,
+      generation: input.generation,
+      shadow: input,
+      reconciliation,
+      source,
+      mode: input.delivery,
+      envelope: occurrence.envelope,
+      envelopeRequired: true,
+      used: false,
+    }, () => operation({ piccCheckpointInput: occurrence.envelope }));
   }
 
   authorizeReplay(event: {
@@ -1657,6 +2069,7 @@ export class MainSessionCheckpointGate {
     images?: readonly unknown[];
     source?: unknown;
     streamingBehavior?: unknown;
+    details?: unknown;
   }): QueuedInputShadow | undefined {
     const authorization = replayAuthorization.getStore();
     const phase = this.controller.snapshot().phase;
@@ -1670,6 +2083,8 @@ export class MainSessionCheckpointGate {
         occurrence.sessionId !== this.controller.sessionId || occurrence.generation !== this.generation ||
         authorization.sessionId !== this.controller.sessionId || authorization.generation !== this.generation ||
         event.source !== authorization.source || event.streamingBehavior !== authorization.mode ||
+        (authorization.envelopeRequired &&
+          (event.details as { piccCheckpointInput?: unknown } | undefined)?.piccCheckpointInput !== authorization.envelope) ||
         !reconciliationContentEqual(observed, authorization.reconciliation) ||
         !this.controller.queuedInputSnapshot().some((entry) => entry === authorization.shadow)) return undefined;
     authorization.used = true;
@@ -1753,6 +2168,13 @@ export class MainSessionCheckpointGate {
       sessionId: shadow.sessionId,
       generation: shadow.generation,
       shadow,
+      envelope: Object.freeze({
+        sessionId: shadow.sessionId,
+        generation: shadow.generation,
+        id: shadow.id,
+        delivery: shadow.delivery,
+        nonce: {},
+      }),
       pendingHostStart: false,
     });
     return shadow;
@@ -1876,6 +2298,11 @@ export class MainSessionCheckpointGate {
         const resume = this.execution?.resume;
         if (!resume) throw new Error("Checkpoint resume adapter is not attached");
         return resume(context);
+      },
+      cancelledInput: (handoff, context) => {
+        const cancelledInput = this.execution?.cancelledInput;
+        if (!cancelledInput) throw new Error("Cancelled-input adapter is not attached");
+        return cancelledInput(handoff, context);
       },
       progress: (event) => this.execution?.progress?.(event),
       inputDropped: (rejected) => this.execution?.inputDropped?.(rejected),
