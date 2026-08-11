@@ -1861,6 +1861,7 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     const result = admission!.resolve({
       scope: "user",
       diagnostics: [],
+      diagnosticOwnership: [],
       items: [
         { kind: "inline", name: "safe-name", entry: accessorEntry },
         { ...normalized.items[0]!, name: "other-name" },
@@ -1884,6 +1885,7 @@ describe("resolveMcpConfig — agent-inline admission", () => {
       expect(admission!.resolve(malformed as never)).toEqual({
         servers: [],
         diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+        diagnosticOwnership: [{ kind: "unowned" }],
       });
     }
   });
@@ -1898,9 +1900,65 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     let admission: AgentMcpAdmissionContext | undefined;
     resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
     const canary = "SECRET_DIAGNOSTIC_CANARY";
-    const forged = admission!.resolve({ scope: "user", items: [], diagnostics: [canary] });
+    const forged = admission!.resolve({
+      scope: "user",
+      items: [],
+      diagnostics: [canary],
+      diagnosticOwnership: [{ kind: "unowned" }],
+    });
     expect(forged.diagnostics).toEqual([expected]);
+    expect(forged.diagnosticOwnership).toEqual([{ kind: "unowned" }]);
     expect(JSON.stringify(forged)).not.toContain(canary);
+  });
+
+  it("validates, detaches, and preserves only exact structured diagnostic ownership", () => {
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    const mutableOwner = { kind: "server", serverName: "command" };
+    const accepted = admission!.resolve({
+      scope: "user",
+      items: [],
+      diagnostics: ["opaque parser finding"],
+      diagnosticOwnership: [mutableOwner],
+    } as never);
+    mutableOwner.serverName = "victim";
+
+    expect(accepted.diagnostics).toEqual([
+      "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.",
+    ]);
+    expect(accepted.diagnosticOwnership).toEqual([{ kind: "server", serverName: "command" }]);
+    expect(Object.isFrozen(accepted.diagnosticOwnership)).toBe(true);
+    expect(Object.isFrozen(accepted.diagnosticOwnership[0])).toBe(true);
+    expect(Object.getPrototypeOf(accepted.diagnosticOwnership[0]!)).toBeNull();
+
+    let getterCalls = 0;
+    const accessorOwner = Object.create(null) as Record<string, unknown>;
+    Object.defineProperties(accessorOwner, {
+      kind: { value: "server", enumerable: true },
+      serverName: { get: () => { getterCalls++; return "command"; }, enumerable: true },
+    });
+    const malformedOwners: unknown[] = [
+      [],
+      [{ kind: "server", serverName: "unsafe/name" }],
+      [{ kind: "server", serverName: "command", extra: true }],
+      [{ kind: "unowned", itemIndex: AGENT_MCP_LIMITS.items }],
+      [accessorOwner],
+    ];
+    for (const diagnosticOwnership of malformedOwners) {
+      const rejected = admission!.resolve({
+        scope: "user",
+        items: [],
+        diagnostics: ["FORGED_PROSE"],
+        diagnosticOwnership,
+      } as never);
+      expect(rejected).toEqual({
+        servers: [],
+        diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+        diagnosticOwnership: [{ kind: "unowned" }],
+      });
+      expect(JSON.stringify(rejected)).not.toContain("FORGED_PROSE");
+    }
+    expect(getterCalls).toBe(0);
   });
 
   it("bounds per-server and aggregate admission diagnostics", () => {
@@ -1915,6 +1973,7 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     const corrupted = {
       ...declaration,
       diagnostics: Array.from({ length: AGENT_MCP_LIMITS.diagnostics }, (_, index) => `safe-${index}`),
+      diagnosticOwnership: Array.from({ length: AGENT_MCP_LIMITS.diagnostics }, () => ({ kind: "unowned" as const })),
       items: declaration.items.map((item) => ({ ...item, entry: undefined })),
     };
     const aggregate = admission!.resolve(corrupted as never);
@@ -1983,10 +2042,12 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     expect(malformedDeclaration).toEqual({
       servers: [],
       diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+      diagnosticOwnership: [{ kind: "unowned" }],
     });
     expect(malformedItems).toEqual({
       servers: [],
       diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+      diagnosticOwnership: [{ kind: "unowned" }],
     });
     expect(getterCalls).toBe(0);
   });

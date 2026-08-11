@@ -494,7 +494,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(oauth).toContain("server still runs when otherwise usable");
     expect(oauth).toContain("must not rely on `oauth` under PiCC");
     expect(oauth).toContain("static headers are PiCC's supported alternative");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
+    expect(lookupCapability("agent.frontmatter.mcpServers")).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("string references borrow them without duplicate clients");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("disabledMcpjsonServers project-decline gate");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).not.toContain("runtime disablement");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
@@ -510,7 +513,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "URL rules take precedence over names",
       "one frozen launch-environment snapshot",
       "PiCC additionally makes over-limit allow material active-empty",
-      "deferred plugin/agent-inline/explicit-runtime sources",
+      "deferred plugin/explicit-runtime sources",
       "silently hidden blocked UI",
     ]) expect(allowed?.note, phrase).toContain(phrase);
 
@@ -529,7 +532,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(managedOnly?.note).toContain("does not turn an ordinary soft allowlist into an immutable administrator list");
 
     for (const setting of [allowed, denied, managedOnly]) {
-      expect(setting?.note).toContain("all currently loaded ordinary and standalone-managed");
+      expect(setting?.note).toContain("all currently loaded ordinary");
+      expect(setting?.note).toContain("agent-inline");
     }
 
     const managedConfig = lookupCapability("feature.mcp-managed-config");
@@ -544,14 +548,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "single startup notice",
       "not Claude UI parity",
       "server-managed delivery is absent",
-      "deferred plugin/agent-inline/explicit-runtime sources are not loaded",
+      "deferred plugin/explicit-runtime sources are not loaded",
     ]) expect(managedConfig?.note, phrase).toContain(phrase);
 
     expect(lookupCapability("setting.strictPluginOnlyCustomization.mcp")?.note).toContain(
       "manual/CLI/runtime source delivery are themselves unsupported rather than governed",
     );
     expect(lookupCapability("feature.mcp-plugin-servers")?.note).toContain("plugin-bundled MCP servers are deferred");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("per-agent MCP server configs are a deferred surface");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inline stdio/HTTP/SSE servers are dispatch-owned");
     expect(lookupCapability("feature.mcp-cli-invocation-controls")?.note).toContain("Claude CLI invocation/loading controls");
   });
 
@@ -614,8 +618,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const predicate of [
       /standalone `managed-mcp\.json`[\s\S]*exclusive administrator authority/,
       /managed-settings[\s\S]*policy and admits each raw effective winner before expansion, approval, native disablement, or[\s\S]*runtime materialization/,
-      /Agent-inline\s+admission and dispatch-local runtime composition primitives now cross it without widening ordinary\s+MCP sources/,
-      /not wired into dispatch lifecycle or tool registration[\s\S]*agent-scoped MCP\s+remains unsupported[\s\S]*Future plugin or explicit runtime\/CLI adapters must cross the same seam before\s+their sources can be claimed as supported/,
+      /Agent-inline\s+admission uses the same immutable policy and approval snapshot[\s\S]*materializes only inside its named\s+dispatch/,
+      /never widens ordinary MCP sources or the parent inventory[\s\S]*Future plugin or explicit\s+runtime\/CLI adapters must cross the same seam before their sources can be claimed as supported/,
     ]) expect(discoverySection).toMatch(predicate);
     const loaderSection = section(architecture, "### `claude/` — parse each artifact format (loaders only, no runtime)");
     expect(loaderSection).toMatch(/MCP server entries \(standalone `managed-mcp\.json`[\s\S]*`managed-mcp\.ts`/);
@@ -737,7 +741,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it("qualifies plugin-agent global fields, retained managed-policy sources, and unsupported Windows registry delivery", () => {
     expect(lookupCapability("agent.frontmatter.hooks")?.note).toContain("for non-plugin agents");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("for non-plugin agents");
+    const agentMcp = lookupCapability("agent.frontmatter.mcpServers")?.note;
+    expect(agentMcp).toContain("Plugin agents diagnose and strip the field");
+    expect(agentMcp).toContain("managed agents may retain parsed data but PiCC ignores it");
+    expect(agentMcp).toContain("every published session route win quietly");
     expect(lookupCapability("agent.frontmatter.permissionMode")?.note).toContain("for non-plugin agents");
     const managed = lookupCapability("feature.managed-policy");
     expect(managed?.tier).toBe("partial");
@@ -1574,6 +1581,10 @@ describe("buildCompatReport", () => {
       expect(finding, id).toBeDefined();
       expect(finding?.evidence).toContain('agent "stateful"');
     }
+    const mcpFinding = report.findings.find((finding) => finding.capability.id === "agent.frontmatter.mcpServers");
+    expect(mcpFinding?.evidence).toContain('agent "stateful" declares dispatch-local mcpServers');
+    expect(mcpFinding?.evidence).toContain("Agent/TaskOutput dispatch diagnostics");
+    expect(mcpFinding?.evidence).not.toContain("effective dispatch-local");
   });
 
   it("classifies agent-scoped mcp_tool handlers by their effective events", () => {

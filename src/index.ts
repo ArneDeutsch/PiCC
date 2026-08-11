@@ -11,6 +11,8 @@ import {
   type HookOutcome,
   type HookPayload,
   type PluginRuntimeContext,
+  type ResolvedAgentMcpConfig,
+  type AgentMcpDeclaration,
   type ResolvedMcpConfig,
   type ToolCallDescriptor,
 } from "./types.js";
@@ -33,7 +35,7 @@ import {
   createSendMessageToolDefinition,
   presentDispatchResult,
 } from "./runtime/subagents.js";
-import type { PiSdk } from "./runtime/subagents.js";
+import type { DispatchMcpContext, PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
 import {
@@ -110,6 +112,7 @@ import { loadSkillBodyResult, substituteToolRules, substituteVariables } from ".
 import { resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
+import { createAgentMcpScope, type AgentMcpScope } from "./runtime/agent-mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import {
   buildMcpPromptCatalog,
@@ -657,6 +660,61 @@ function createBoundedTuiDiagnosticSurface(fingerprintCap = 20): (
       }
     }
   };
+}
+
+export function formatAgentMcpSetupWarning(
+  scope: Pick<AgentMcpScope, "borrowedServerNames" | "setupOutcomes">,
+  inlineConfig: ResolvedAgentMcpConfig,
+  declaration?: Pick<AgentMcpDeclaration, "items" | "diagnostics" | "diagnosticOwnership">,
+): string | undefined {
+  const findings = new Map<string, string>();
+  const safeIdentity = (name: string) => JSON.stringify(sanitizeDisplayText(name, 96, true) || "server");
+  const borrowedNames = new Set(scope.borrowedServerNames?.() ?? []);
+  for (const server of inlineConfig.servers) {
+    if (server.status === "enabled" || borrowedNames.has(server.name)) continue;
+    const identity = safeIdentity(server.name);
+    const guidance = server.status === "pending-approval"
+      ? `${identity} needs project approval in user settings; approve it and restart the agent`
+      : server.status === "disabled"
+        ? `${identity} is disabled; enable it and restart the agent`
+        : server.status === "blocked"
+          ? `${identity} is blocked by managed MCP policy; ask the policy owner to allow it, then restart the agent`
+          : `${identity} has no usable definition; fix its agent mcpServers entry and restart the agent`;
+    findings.set(server.name, guidance);
+  }
+  for (const outcome of scope.setupOutcomes()) {
+    if (borrowedNames.has(outcome.serverName)) continue;
+    const identity = safeIdentity(outcome.serverName);
+    findings.set(outcome.serverName, outcome.kind === "missing-reference"
+      ? `${identity} is not available in the main session; configure and enable that server, restart the main PiCC session, then dispatch the agent again`
+      : `${identity} failed during startup or discovery; review its configuration and server logs, then restart the agent`);
+  }
+  const ownerIsBorrowed = (owner: AgentMcpDeclaration["diagnosticOwnership"][number] | undefined): boolean =>
+    owner?.kind === "server" && borrowedNames.has(owner.serverName);
+  // Diagnostic prose is opaque. Only a validated exact structured owner can make a finding
+  // suppressible, and only when that owner is a published session-won collision.
+  const hasVisibleDeclarationDiagnostic = (declaration?.diagnostics ?? []).some(
+    (_diagnostic, index) => !ownerIsBorrowed(declaration?.diagnosticOwnership?.[index]),
+  );
+  const hasVisibleAdmissionDiagnostic = inlineConfig.diagnostics.some(
+    (_diagnostic, index) => !ownerIsBorrowed(inlineConfig.diagnosticOwnership?.[index]),
+  );
+  const hasVisibleServerDiagnostic = inlineConfig.servers.some(
+    (server) => (server.diagnostics?.length ?? 0) > 0 && !borrowedNames.has(server.name),
+  );
+  if (hasVisibleDeclarationDiagnostic || hasVisibleAdmissionDiagnostic || hasVisibleServerDiagnostic) {
+    findings.set("\u0000declaration", declaration?.items.length === 0
+      ? "the explicit mcpServers declaration is malformed and selected no MCP servers; fix it and restart the agent"
+      : "part of the mcpServers declaration is malformed; fix the skipped entries and restart the agent");
+  }
+  const retained = [...findings.values()].slice(0, 8);
+  if (findings.size > retained.length) retained.push(`${findings.size - retained.length} additional MCP setup issue(s) were omitted`);
+  const body = retained.join("; ");
+  if (!body) return undefined;
+  const warning = `Agent MCP availability warning: ${body}.`;
+  if (warning.length <= 480) return warning;
+  const overflow = " Additional MCP setup issue(s) were omitted.";
+  return `${warning.slice(0, 480 - overflow.length - 1)}…${overflow}`;
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
@@ -1487,6 +1545,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     taskBundle: { tools: unknown[] },
     notebookSession: NotebookSessionSource,
     captureUniversalStop?: () => () => boolean,
+    activeOwnedStdioServerNames: () => readonly string[] = () => [],
+    onScopedMcpPinWarning?: (warning: string) => void,
   ): Record<string, unknown>[] {
     const get = () => cwdRef.get();
     return [
@@ -1497,7 +1557,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createMultiEditTool(get) as unknown as Record<string, unknown>,
       createNotebookEditTool(get, notebookSession) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
-      ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade, captureUniversalStop }),
+      ...createWorktreeTools({
+        worktrees,
+        cwdState: cwdRef,
+        hookRunner: hookRunnerFacade,
+        captureUniversalStop,
+        ownedStdioServerNames: activeOwnedStdioServerNames,
+        onScopedMcpPinWarning,
+      }),
       ...DEGRADED_TOOLS.map(
         (d) =>
           createDegradeStub(d.name, d.note, { redirect: d.redirect }) as unknown as Record<
@@ -1680,7 +1747,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     settingsEnv: project.settings.env,
   });
 
-  function allKnownToolNames(): string[] {
+  function allKnownToolNames(scope?: AgentMcpScope): string[] {
+    const scopedMcpNames = scope
+      ? [...scope.knownToolNames()]
+      : [
+          ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
+          ...(mcpRuntime.resourceServers().length > 0
+            ? [ListMcpResourcesTool, ReadMcpResourceTool]
+            : []),
+        ];
     return [
       "Read",
       "Write",
@@ -1707,15 +1782,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "MultiEdit",
       "NotebookEdit",
       ...DEGRADED_TOOLS.map((d) => d.name),
-      // The runtime publishes only initial catalogs and retains them across
-      // remote recovery, so this permission universe cannot widen or shrink
-      // after the first-turn settlement barrier. An over-long name (>64 chars)
-      // remains in the universe but has no proxy instance (the builder drops it
-      // from the wire), so granting it is inert.
-      ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
-      ...(mcpRuntime.resourceServers().length > 0
-        ? [ListMcpResourcesTool, ReadMcpResourceTool]
-        : []),
+      // The exact settled dispatch scope supplies its immutable MCP universe;
+      // callers without a scope retain the main-session published universe.
+      // In that fallback, a registered MCP name over the 64-character model-tool
+      // limit may remain permission-matchable after proxy creation drops it, so
+      // granting that otherwise valid name is intentionally inert.
+      ...scopedMcpNames,
     ];
   }
 
@@ -1738,27 +1810,36 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       notebookSession: NotebookSessionState,
       activation: SkillActivationState,
       captureUniversalStop?: () => () => boolean,
+      mcpContext?: DispatchMcpContext,
     ) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
       // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
-      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), notebookSession, captureUniversalStop)) {
+      for (const tool of buildCwdBoundTools(
+        subCwd ?? cwdState,
+        createTaskTools(),
+        notebookSession,
+        captureUniversalStop,
+        mcpContext?.activeOwnedStdioServerNames,
+        mcpContext?.reportPinWarning,
+      )) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
       }
-      // Fresh per-dispatch MCP proxy instances over the session-global runtime:
-      // ToolDefinitions are dispatch-local while transport/client state is
-      // shared. The same
+      // Fresh per-dispatch MCP proxy instances over the exact settled scope:
+      // ToolDefinitions and inline routes are dispatch-local; borrowed routes
+      // share only their already-published session transport/client. The same
       // granted-name filter as the cwd-bound tools applies: `granted` already
       // went through gateTools over the MCP-extended universe, so `tools:`
       // restriction (incl. bare `mcp__server` fan-out), `disallowedTools:`, and
       // bare-name deny removal have all been decided by the time we get here.
-      for (const proxy of buildMcpProxyTools(mcpRuntime)) {
+      const dispatchMcpRuntime = mcpContext?.scope ?? mcpRuntime;
+      for (const proxy of buildMcpProxyTools(dispatchMcpRuntime)) {
         if (granted.includes(proxy.name)) tools.push(proxy as unknown as Record<string, unknown>);
       }
-      for (const resourceTool of buildMcpResourceTools(mcpRuntime, {
+      for (const resourceTool of buildMcpResourceTools(dispatchMcpRuntime, {
         clipMaxTokens: config.compaction.clipMaxTokens,
       })) {
         if (granted.includes(resourceTool.name)) {
@@ -1818,6 +1899,41 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
       }
       return tools;
+    },
+    validateMcpAgent: (agent) => {
+      if (agent.agentMcp?.items.some((item) => item.kind === "inline") && !project.agentMcpAdmission) {
+        throw new Error(`Agent ${JSON.stringify(agent.name)} requests inline MCP, but project MCP admission authority is unavailable.`);
+      }
+    },
+    prepareMcpFor: async (agent, spawnCwd, signal) => {
+      const declaration = agent.agentMcp;
+      const inlineConfig = declaration
+        ? project.agentMcpAdmission?.resolve(declaration) ?? { servers: Object.freeze([]), diagnostics: Object.freeze([]), diagnosticOwnership: Object.freeze([]) }
+        : { servers: Object.freeze([]), diagnostics: Object.freeze([]), diagnosticOwnership: Object.freeze([]) };
+      const scope = await createAgentMcpScope({
+        sessionRuntime: mcpRuntime,
+        declaration,
+        inlineConfig,
+        signal,
+        inlineDeps: {
+          projectRoot: project.root,
+          spawnCwd,
+          sessionId: `${sessionId}:agent`,
+          env: process.env,
+          settingsEnv: project.settings.env,
+        },
+      });
+
+      // One generation-local, globally capped warning is built only from fixed
+      // outcome classes and safe identities. Raw config, diagnostics, and enum
+      // spellings never become model or renderer content. Published session
+      // routes suppress same-identity inline degradation regardless of admission.
+      const setupWarning = formatAgentMcpSetupWarning(scope, inlineConfig, declaration);
+      return {
+        scope,
+        setupWarning,
+        activeOwnedStdioServerNames: () => scope.activeOwnedStdioServerNames?.() ?? [],
+      };
     },
     allKnownToolNames,
     permissionEngine,
@@ -3301,10 +3417,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // This registry/runtime pair is session-local: claim any linked background
       // generations first (suppressing stale output/notices), then join every
       // retained child before SessionEnd and process shutdown proceed.
-      await Promise.allSettled(subagentRegistry.list()
+      const checkpointAgentIds = new Set(subagentRegistry.list()
         .filter((record) => record.state === "running" && record.checkpointPaused)
-        .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
+        .map((record) => record.agentId));
+      await Promise.allSettled([...checkpointAgentIds]
+        .map((agentId) => backgroundTasks.stopAgentAndWait(agentId)));
+      await Promise.allSettled(backgroundTasks.ids()
+        .filter((id) => {
+          const task = backgroundTasks.get(id);
+          return task?.status === "running" && !checkpointAgentIds.has(task.agentId ?? "");
+        })
+        .map((id) => backgroundTasks.stopAndWait(id)));
+      await subagentRuntime.shutdownActiveGenerations();
       await subagentRuntime.shutdownCheckpointPaused();
+      await subagentRuntime.shutdownMcpScopes();
       // MCP servers die with the session — after the subagent joins above
       // (an in-flight subagent MCP call must not lose its server mid-call),
       // before SessionEnd fires. Never throws; grace-bounded per server.

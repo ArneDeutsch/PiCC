@@ -27,7 +27,7 @@ import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdi
  * `startAgent(ResolvedAgentMcpConfig)` start enabled servers through the MCP SDK, expose immutable
  * initial catalogs plus live operations, and own shutdown. Both are non-blocking and bounded by
  * `MCP_TIMEOUT`; failures degrade to diagnostics rather than crashing the harness. The agent entry
- * point preserves inline provenance but has no dispatch consumer yet.
+ * point preserves inline provenance for the named-dispatch scope consumer.
  *
  * Model-facing registration is NOT here — this class only owns processes,
  * connections, capability metadata, and bounded live protocol operations.

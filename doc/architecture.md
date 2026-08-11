@@ -135,10 +135,9 @@ authoritative native state or standalone managed MCP fails MCP closed, while abs
 applicable lower inputs.
 
 Every current MCP source crosses this admission seam before post-admission materialization. Agent-inline
-admission and dispatch-local runtime composition primitives now cross it without widening ordinary
-MCP sources, but they are not wired into dispatch lifecycle or tool registration and agent-scoped MCP
-remains unsupported. Future plugin or explicit runtime/CLI adapters must cross the same seam before
-their sources can be claimed as supported.
+admission uses the same immutable policy and approval snapshot, then materializes only inside its named
+dispatch; it never widens ordinary MCP sources or the parent inventory. Future plugin or explicit
+runtime/CLI adapters must cross the same seam before their sources can be claimed as supported.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -355,9 +354,15 @@ where to start reading, not the extent of its cluster.
   The enablement gate is enforced by construction: no enabled server means no MCP context; no
   published prompt means no prompt metadata; and no advertised resource capability in the settled
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
-  `agent-mcp.ts` can compose immutable dispatch-local catalogs and routing from borrowed session
-  servers plus an owned agent-inline runtime, with live scoped state and ownership-aware cleanup; no
-  dispatch path consumes that primitive yet, so it creates no registered or model-visible capability.
+  `agent-mcp.ts` composes immutable named-dispatch catalogs and routing from borrowed eligible session
+  servers plus one owned agent-inline runtime; a published session route quietly wins any same-name
+  inline admission result. Dispatch starts the scope after initial worktree admission and before tool
+  gating or the first provider request. It retains the scope through scoped stop hooks and checkpoint
+  recovery, then awaits shutdown before worktree release and terminal settlement. A successful later
+  EnterWorktree queries live published owned-stdio routes at that boundary before adding pin guidance.
+  Session shutdown first stops and joins active generations, retries uncertain agent
+  cleanup, closes the global runtime, and only then fires SessionEnd. Agent-local capabilities never
+  enter the parent inventory or a sibling/nested agent unless that agent declares them independently.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
@@ -510,12 +515,15 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    run through PreToolUse hooks, and — on file-touching tools — triggers nested-CLAUDE.md and
    path-scoped rule/skill injection. PostToolUse / PostToolUseFailure hooks fire on the result.
 
-6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
-   session with the gated tool set and returns either the final message verbatim or a loud,
-   classified failure. Dispatch is background-by-default: the call returns a task id, and
-   `TaskOutput`/`TaskStop` manage the lifecycle. `SendMessage` (parent-only) resumes a finished
-   subagent by agent id or steers a running background one — never a user-stopped one; a panel stop
-   is permanent.
+6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`. A supported named
+   agent resolves its admitted MCP declaration after SubagentStart and initial worktree admission;
+   startup settles before the combined tool universe is gated and before the first child request.
+   The runtime then returns either the final message verbatim or a loud, classified failure, with
+   bounded MCP qualification outside that body when setup or cleanup degraded. Dispatch is
+   background-by-default: the call returns a task id, and `TaskOutput`/`TaskStop` manage the lifecycle.
+   `SendMessage` (parent-only) resumes a finished agent only from its captured canonical definition
+   provenance, using the current definition/policy and original cwd, or steers a running background
+   one — never a user-stopped one; a panel stop is permanent.
 
 7. **Cycle boundary / compaction / shutdown.** On supported model APIs, final usage from a fresh
    successful assistant response that requests tools can queue threshold pressure while the requested

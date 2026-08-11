@@ -1,5 +1,6 @@
 import type {
   AgentMcpDeclaration,
+  AgentMcpDiagnosticOwnership,
   AgentMcpItem,
   AgentMcpScope,
   DeepReadonly,
@@ -26,6 +27,32 @@ export const AGENT_MCP_LIMITS = Object.freeze({
 
 const SOURCE_LABEL = "agent mcpServers declaration";
 const STRING_FIELDS = new Set(["command", "type", "url"]);
+const SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+
+function canonicalServerName(name: string): string | undefined {
+  return name.length <= AGENT_MCP_LIMITS.serverNameChars && SERVER_NAME_RE.test(name) && !name.includes("__")
+    ? name
+    : undefined;
+}
+
+function diagnosticOwnership(
+  serverName?: string,
+  itemIndex?: number,
+): AgentMcpDiagnosticOwnership {
+  const ownership = Object.create(null) as {
+    kind: "server" | "unowned";
+    serverName?: string;
+    itemIndex?: number;
+  };
+  if (serverName !== undefined) {
+    ownership.kind = "server";
+    ownership.serverName = serverName;
+  } else {
+    ownership.kind = "unowned";
+    if (itemIndex !== undefined) ownership.itemIndex = itemIndex;
+  }
+  return Object.freeze(ownership) as AgentMcpDiagnosticOwnership;
+}
 
 function safeDiagnostic(message: string): string {
   const clean = neutralizeControlChars(message).replace(/[\r\n\t]+/gu, " ");
@@ -238,10 +265,15 @@ export function normalizeAgentMcpDeclaration(
 ): AgentMcpDeclaration {
   const items: AgentMcpItem[] = [];
   const diagnostics: string[] = [];
+  const ownership: AgentMcpDiagnosticOwnership[] = [];
   let omittedDiagnostics = 0;
-  const pushDiagnostic = (message: string): void => {
+  const pushDiagnostic = (
+    message: string,
+    owner: AgentMcpDiagnosticOwnership = diagnosticOwnership(),
+  ): void => {
     if (diagnostics.length < AGENT_MCP_LIMITS.diagnostics - 1) {
       diagnostics.push(safeDiagnostic(message));
+      ownership.push(owner);
     } else {
       omittedDiagnostics++;
     }
@@ -250,13 +282,37 @@ export function normalizeAgentMcpDeclaration(
   if (!Array.isArray(value)) {
     pushDiagnostic("Agent mcpServers must be a list of server-name references or one-key inline mappings; declaration ignored");
   } else {
-    if (value.length > AGENT_MCP_LIMITS.items) {
-      pushDiagnostic(`Agent mcpServers has more than ${AGENT_MCP_LIMITS.items} items; later items ignored`);
+    let count = 0;
+    try {
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+      const length = lengthDescriptor !== undefined && "value" in lengthDescriptor
+        ? lengthDescriptor.value
+        : undefined;
+      if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+        pushDiagnostic("Agent mcpServers list shape could not be inspected safely; declaration ignored");
+      } else {
+        if (length > AGENT_MCP_LIMITS.items) {
+          pushDiagnostic(`Agent mcpServers has more than ${AGENT_MCP_LIMITS.items} items; later items ignored`);
+        }
+        count = Math.min(length, AGENT_MCP_LIMITS.items);
+      }
+    } catch {
+      pushDiagnostic("Agent mcpServers list shape could not be inspected safely; declaration ignored");
     }
     const seenNames = new Set<string>();
-    const count = Math.min(value.length, AGENT_MCP_LIMITS.items);
     for (let index = 0; index < count; index++) {
-      const rawItem = value[index];
+      let rawItem: unknown;
+      try {
+        const itemDescriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (itemDescriptor === undefined || !("value" in itemDescriptor)) {
+          pushDiagnostic(`Agent mcpServers item ${index + 1} contains an invalid or accessor element; item ignored`, diagnosticOwnership(undefined, index));
+          continue;
+        }
+        rawItem = itemDescriptor.value;
+      } catch {
+        pushDiagnostic(`Agent mcpServers item ${index + 1} could not be inspected safely; item ignored`, diagnosticOwnership(undefined, index));
+        continue;
+      }
       try {
         let kind: "reference" | "inline";
         let rawName: string;
@@ -267,42 +323,44 @@ export function normalizeAgentMcpDeclaration(
           rawEntry = { command: "agent-reference-validation-only" };
         } else if (isPlainRecord(rawItem)) {
           if (Object.getOwnPropertySymbols(rawItem).length > 0) {
-            pushDiagnostic(`Agent mcpServers item ${index + 1} contains invalid symbol properties; item ignored`);
+            pushDiagnostic(`Agent mcpServers item ${index + 1} contains invalid symbol properties; item ignored`, diagnosticOwnership(undefined, index));
             continue;
           }
           const keys = Object.keys(rawItem);
           if (keys.length !== 1) {
-            pushDiagnostic(`Agent mcpServers item ${index + 1} must be a one-key mapping; item ignored`);
+            pushDiagnostic(`Agent mcpServers item ${index + 1} must be a one-key mapping; item ignored`, diagnosticOwnership(undefined, index));
             continue;
           }
           const rawNameDescriptor = Object.getOwnPropertyDescriptor(rawItem, keys[0]!);
           if (rawNameDescriptor === undefined || !("value" in rawNameDescriptor)) {
-            pushDiagnostic(`Agent mcpServers item ${index + 1} contains an accessor mapping property; item ignored`);
+            pushDiagnostic(`Agent mcpServers item ${index + 1} contains an accessor mapping property; item ignored`, diagnosticOwnership(undefined, index));
             continue;
           }
           kind = "inline";
           rawName = keys[0]!;
           rawEntry = rawNameDescriptor.value;
         } else {
-          pushDiagnostic(`Agent mcpServers item ${index + 1} must be a string or one-key mapping; item ignored`);
+          pushDiagnostic(`Agent mcpServers item ${index + 1} must be a string or one-key mapping; item ignored`, diagnosticOwnership(undefined, index));
           continue;
         }
 
         if (rawName.length > AGENT_MCP_LIMITS.serverNameChars) {
-          pushDiagnostic(`Agent mcpServers item ${index + 1} has a server name exceeding the 128-character limit; item ignored`);
+          pushDiagnostic(`Agent mcpServers item ${index + 1} has a server name exceeding the 128-character limit; item ignored`, diagnosticOwnership(undefined, index));
           continue;
         }
 
+        const knownName = canonicalServerName(rawName);
+        const findingOwner = diagnosticOwnership(knownName, index);
         const projection = projectEntry(rawEntry);
         if (!projection.ok) {
-          pushDiagnostic(`Agent mcpServers item ${index + 1} ${projection.reason}; item ignored`);
+          pushDiagnostic(`Agent mcpServers item ${index + 1} ${projection.reason}; item ignored`, findingOwner);
           continue;
         }
         const normalized = normalizeOne(rawName, projection.value);
-        for (const diagnostic of normalized.diagnostics) pushDiagnostic(diagnostic);
+        for (const diagnostic of normalized.diagnostics) pushDiagnostic(diagnostic, findingOwner);
         if (normalized.skipped) continue;
         if (seenNames.has(normalized.name)) {
-          pushDiagnostic(`Duplicate agent MCP server name ${JSON.stringify(normalized.name)} at item ${index + 1}; first valid occurrence retained`);
+          pushDiagnostic(`Duplicate agent MCP server name ${JSON.stringify(normalized.name)} at item ${index + 1}; first valid occurrence retained`, diagnosticOwnership(normalized.name));
           continue;
         }
         seenNames.add(normalized.name);
@@ -310,17 +368,19 @@ export function normalizeAgentMcpDeclaration(
           ? Object.freeze({ kind, name: normalized.name })
           : Object.freeze({ kind, name: normalized.name, entry: retainedEntry(normalized) }));
       } catch {
-        pushDiagnostic(`Agent mcpServers item ${index + 1} could not be normalized safely; item ignored`);
+        pushDiagnostic(`Agent mcpServers item ${index + 1} could not be normalized safely; item ignored`, diagnosticOwnership(undefined, index));
       }
     }
   }
 
   if (omittedDiagnostics > 0) {
     diagnostics.push(safeDiagnostic(`Additional agent MCP diagnostics omitted (${omittedDiagnostics})`));
+    ownership.push(diagnosticOwnership());
   }
   return Object.freeze({
     scope,
     items: Object.freeze(items),
     diagnostics: Object.freeze(diagnostics),
+    diagnosticOwnership: Object.freeze(ownership),
   });
 }

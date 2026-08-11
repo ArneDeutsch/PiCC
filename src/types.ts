@@ -395,11 +395,17 @@ export type AgentMcpItem =
       readonly entry: DeepReadonly<NormalizedAgentMcpEntry>;
     };
 
+/** Safe structured ownership parallel to an agent MCP diagnostic string. */
+export type AgentMcpDiagnosticOwnership =
+  | { readonly kind: "server"; readonly serverName: string }
+  | { readonly kind: "unowned"; readonly itemIndex?: number };
+
 /** Parsed agent frontmatter only; the declaration itself confers neither admission nor runtime ownership. */
 export interface AgentMcpDeclaration {
   readonly scope: AgentMcpScope;
   readonly items: readonly AgentMcpItem[];
   readonly diagnostics: readonly string[];
+  readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
 }
 
 export interface ClaudeAgent {
@@ -937,6 +943,7 @@ export type ResolvedAgentMcpServer =
 export interface ResolvedAgentMcpConfig {
   readonly servers: readonly ResolvedAgentMcpServer[];
   readonly diagnostics: readonly string[];
+  readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
 }
 
 /** Project-captured authority for resolving one declaration into unstarted configuration. */

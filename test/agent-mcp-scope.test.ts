@@ -18,6 +18,7 @@ import type {
   AgentMcpDeclaration,
   EnabledStdioAgentMcpServer,
   ResolvedAgentMcpConfig,
+  ResolvedAgentMcpServer,
 } from "../src/types.js";
 import { deferred } from "./helpers/async.js";
 import { createMcpProcessFixture } from "./helpers/mcp-process.js";
@@ -114,8 +115,8 @@ function inlineServer(name: string): EnabledStdioAgentMcpServer {
   };
 }
 
-function config(...servers: EnabledStdioAgentMcpServer[]): ResolvedAgentMcpConfig {
-  return { servers, diagnostics: [] };
+function config(...servers: ResolvedAgentMcpServer[]): ResolvedAgentMcpConfig {
+  return { servers, diagnostics: [], diagnosticOwnership: [] };
 }
 
 function declaration(...items: Array<{ kind: "reference" | "inline"; name: string }>): Pick<AgentMcpDeclaration, "items"> {
@@ -149,18 +150,62 @@ describe("agent MCP scope composition", () => {
     expect(startInline).not.toHaveBeenCalled();
   });
 
-  it("lets a settled session server win an inline collision before runtime construction", async () => {
+  it("inherits only for omitted or clean-empty declarations and fails malformed-empty closed", async () => {
+    const session = fakeRuntime({ names: ["shared"], tools: [tool("shared", "read")] });
+    const cleanEmpty = await createAgentMcpScope({
+      sessionRuntime: session,
+      declaration: { items: [], diagnostics: [] },
+      inlineConfig: config(), inlineDeps: deps,
+    });
+    expect(cleanEmpty.knownToolNames()).toEqual(["mcp__shared__read"]);
+
+    const malformedEmpty = await createAgentMcpScope({
+      sessionRuntime: session,
+      declaration: { items: [], diagnostics: ["redacted malformed item"] },
+      inlineConfig: { servers: [], diagnostics: ["redacted malformed item"], diagnosticOwnership: [{ kind: "unowned" }] }, inlineDeps: deps,
+    });
+    expect(malformedEmpty.knownToolNames()).toEqual([]);
+    await expect(malformedEmpty.callTool("shared", "read", {})).rejects.toThrow("not available");
+  });
+
+  it.each([
+    "enabled", "blocked", "pending-approval", "disabled", "invalid",
+  ] as const)("lets a published session route quietly win an inline %s collision", async (status) => {
     const session = fakeRuntime({ names: ["same"], tools: [tool("same", "borrowed")] });
     const startInline = vi.fn();
+    const server = { ...inlineServer("same"), status } as ResolvedAgentMcpConfig["servers"][number];
     const scope = await createAgentMcpScope({
       sessionRuntime: session,
       declaration: declaration({ kind: "inline", name: "same" }),
-      inlineConfig: config(inlineServer("same")), inlineDeps: deps, startInline,
+      inlineConfig: config(server), inlineDeps: deps, startInline,
     });
     expect(scope.knownToolNames()).toEqual(["mcp__same__borrowed"]);
-    expect(scope.diagnostics()).toEqual([expect.stringContaining("owns that name")]);
-    expect(scope.setupOutcomes()).toEqual([{ serverName: "same", kind: "session-wins-collision" }]);
+    expect(scope.borrowedServerNames?.()).toEqual(["same"]);
+    expect(scope.activeOwnedStdioServerNames?.()).toEqual([]);
+    expect(scope.diagnostics()).toEqual([]);
+    expect(scope.setupOutcomes()).toEqual([]);
     expect(startInline).not.toHaveBeenCalled();
+  });
+
+  it("suppresses only exact collision-owned admission findings in retained scope diagnostics", async () => {
+    const scope = await createAgentMcpScope({
+      sessionRuntime: fakeRuntime({ names: ["command"], tools: [tool("command", "borrowed")] }),
+      declaration: declaration({ kind: "inline", name: "command" }),
+      inlineConfig: {
+        servers: [inlineServer("command")],
+        diagnostics: ["opaque collision finding", "opaque malformed sibling"],
+        diagnosticOwnership: [
+          { kind: "server", serverName: "command" },
+          { kind: "unowned", itemIndex: 1 },
+        ],
+      },
+      inlineDeps: deps,
+      startInline: vi.fn(),
+    });
+
+    expect(scope.diagnostics()).toEqual([
+      "An admitted agent MCP definition produced a redacted setup diagnostic.",
+    ]);
   });
 
   it("combines copied immutable tool/resource catalogs and routes both operation families consistently", async () => {
@@ -168,8 +213,9 @@ describe("agent MCP scope composition", () => {
     const inlineCalls: string[] = [];
     const schema = { type: "object", properties: { nested: { type: "string" } } };
     const sessionTools: McpToolInfo[] = [{ ...tool("borrowed", "read"), inputSchema: schema }];
+    const localStates: McpServerState[] = [{ name: "local", transport: "stdio", state: "connected" }];
     const owned = fakeRuntime({
-      names: ["local"], tools: [tool("local", "write")],
+      names: ["local"], tools: [tool("local", "write")], states: localStates,
       resources: [{ serverName: "local", uri: "local://one" }], calls: inlineCalls,
     });
     const session = fakeRuntime({
@@ -198,6 +244,10 @@ describe("agent MCP scope composition", () => {
     expect(Object.isFrozen(scope.resourceServers()[0]?.resources)).toBe(true);
     expect(Object.isFrozen(scope.resourceServers()[0]?.resources[0])).toBe(true);
     expect(scope.resourceServers()[0]?.resources[0]?.uri).toBe("borrowed://one");
+    expect(scope.activeOwnedStdioServerNames?.()).toEqual(["local"]);
+    localStates[0] = { name: "local", transport: "stdio", state: "failed" };
+    expect(scope.activeOwnedStdioServerNames?.()).toEqual([]);
+    localStates[0] = { name: "local", transport: "stdio", state: "connected" };
     await scope.callTool("borrowed", "read", {});
     await scope.callTool("local", "write", {});
     await scope.readResource("borrowed", "borrowed://one");
@@ -233,6 +283,7 @@ describe("agent MCP scope composition", () => {
       serverName: "failed-local",
       kind: "inline-startup-failed",
     }]);
+    expect(scope.activeOwnedStdioServerNames?.()).toEqual([]);
     expect(scope.diagnostics().join(" ")).toContain("failed-local");
     expect(scope.diagnostics().join(" ")).not.toMatch(/RAW_ERROR_SECRET|STDERR_SECRET|CONFIG_SECRET/u);
     expect(scope.serverStates()).toHaveLength(2);
@@ -308,7 +359,11 @@ describe("agent MCP scope composition", () => {
         { kind: "reference", name: sessionStates[0]!.name },
         ...hostileNames.map((name) => ({ kind: "reference" as const, name })),
       ),
-      inlineConfig: { servers: [], diagnostics: Array.from({ length: 140 }, () => "RAW_CONFIG_SECRET" + "d".repeat(1_000)) },
+      inlineConfig: {
+        servers: [],
+        diagnostics: Array.from({ length: 140 }, () => "RAW_CONFIG_SECRET" + "d".repeat(1_000)),
+        diagnosticOwnership: Array.from({ length: 140 }, () => ({ kind: "unowned" as const })),
+      },
       inlineDeps: deps,
     });
 

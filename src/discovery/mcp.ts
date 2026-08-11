@@ -13,6 +13,7 @@ import { sanitizedSubprocessEnv } from "../util/env.js";
 import type {
   AgentMcpAdmissionContext,
   AgentMcpDeclaration,
+  AgentMcpDiagnosticOwnership,
   CompiledMcpPolicy,
   McpInactiveReason,
   McpPolicyInactiveReason,
@@ -371,22 +372,51 @@ function copyNormalizedEntry(value: unknown, expectedName: string): NormalizedAg
 
 interface ValidatedAgentDeclaration {
   scope: "user" | "project";
-  hasDeclarationIssues: boolean;
+  diagnosticOwnership: AgentMcpDiagnosticOwnership[];
   items: Array<{ kind: "reference"; name: string } | { kind: "inline"; name: string; entry?: NormalizedAgentMcpEntry }>;
 }
-const DECLARATION_KEYS = new Set(["scope", "items", "diagnostics"]);
+const DECLARATION_KEYS = new Set(["scope", "items", "diagnostics", "diagnosticOwnership"]);
 const ITEM_KEYS = new Set(["kind", "name", "entry"]);
+const SERVER_DIAGNOSTIC_OWNERSHIP_KEYS = new Set(["kind", "serverName"]);
+const UNOWNED_DIAGNOSTIC_OWNERSHIP_KEYS = new Set(["kind", "itemIndex"]);
+function copyDiagnosticOwnership(value: unknown): AgentMcpDiagnosticOwnership | undefined {
+  const kind = value !== null && typeof value === "object" ? ownData(value, "kind") : missingData;
+  if (kind === "server") {
+    if (!safeRecord(value, SERVER_DIAGNOSTIC_OWNERSHIP_KEYS)) return undefined;
+    const serverName = ownData(value, "serverName");
+    if (typeof serverName !== "string" || serverName.length > AGENT_MCP_LIMITS.serverNameChars ||
+      !AGENT_SERVER_NAME_RE.test(serverName) || serverName.includes("__")) return undefined;
+    return Object.freeze(Object.assign(Object.create(null), { kind, serverName })) as AgentMcpDiagnosticOwnership;
+  }
+  if (kind === "unowned") {
+    if (!safeRecord(value, UNOWNED_DIAGNOSTIC_OWNERSHIP_KEYS)) return undefined;
+    const itemIndex = ownData(value, "itemIndex");
+    if (itemIndex !== missingData && (!Number.isSafeInteger(itemIndex) || (itemIndex as number) < 0 ||
+      (itemIndex as number) >= AGENT_MCP_LIMITS.items)) return undefined;
+    return Object.freeze(Object.assign(Object.create(null), {
+      kind,
+      ...(itemIndex === missingData ? {} : { itemIndex }),
+    })) as AgentMcpDiagnosticOwnership;
+  }
+  return undefined;
+}
 function validateAgentDeclaration(value: unknown): ValidatedAgentDeclaration | undefined {
   if (!safeRecord(value, DECLARATION_KEYS)) return undefined;
   const scope = ownData(value, "scope");
   const itemsValue = ownData(value, "items");
   const diagnosticsValue = ownData(value, "diagnostics");
+  const ownershipValue = ownData(value, "diagnosticOwnership");
   const itemCount = validatedArrayLength(itemsValue, AGENT_MCP_LIMITS.items);
   const diagnosticCount = validatedArrayLength(diagnosticsValue, AGENT_MCP_LIMITS.diagnostics);
-  if ((scope !== "user" && scope !== "project") || itemCount === undefined || diagnosticCount === undefined) return undefined;
+  const ownershipCount = validatedArrayLength(ownershipValue, AGENT_MCP_LIMITS.diagnostics);
+  if ((scope !== "user" && scope !== "project") || itemCount === undefined || diagnosticCount === undefined ||
+    ownershipCount !== diagnosticCount) return undefined;
+  const diagnosticOwnership: AgentMcpDiagnosticOwnership[] = [];
   for (let index = 0; index < diagnosticCount; index++) {
     const message = ownData(diagnosticsValue as object, String(index));
-    if (typeof message !== "string" || message.length > AGENT_MCP_LIMITS.diagnosticChars) return undefined;
+    const owner = copyDiagnosticOwnership(ownData(ownershipValue as object, String(index)));
+    if (typeof message !== "string" || message.length > AGENT_MCP_LIMITS.diagnosticChars || owner === undefined) return undefined;
+    diagnosticOwnership.push(owner);
   }
   const items: ValidatedAgentDeclaration["items"] = [];
   for (let index = 0; index < itemCount; index++) {
@@ -409,7 +439,7 @@ function validateAgentDeclaration(value: unknown): ValidatedAgentDeclaration | u
       items.push({ kind: "inline", name });
     }
   }
-  return { scope, hasDeclarationIssues: diagnosticCount > 0, items };
+  return { scope, diagnosticOwnership, items };
 }
 
 // Normalized declarations are inert parser output. Captured authority resolves them
@@ -428,6 +458,7 @@ function createAgentMcpAdmissionContext(input: {
   const unavailable = input.unavailable === true;
   const resolve = (declaration: AgentMcpDeclaration): ResolvedAgentMcpConfig => {
     const diagnostics: string[] = [];
+    const diagnosticOwnership: AgentMcpDiagnosticOwnership[] = [];
     const servers: ResolvedAgentMcpServer[] = [];
     let diagnosticCount = 0;
     let diagnosticsOmitted = false;
@@ -444,20 +475,35 @@ function createAgentMcpAdmissionContext(input: {
       }
       return retained;
     };
+    const unowned = (): AgentMcpDiagnosticOwnership =>
+      Object.freeze(Object.assign(Object.create(null), { kind: "unowned" as const })) as AgentMcpDiagnosticOwnership;
     const finish = (): ResolvedAgentMcpConfig => {
-      if (diagnosticsOmitted) diagnostics.push(AGENT_ADMISSION_OMISSION);
-      return { servers, diagnostics };
+      if (diagnosticsOmitted) {
+        diagnostics.push(AGENT_ADMISSION_OMISSION);
+        diagnosticOwnership.push(unowned());
+      }
+      return Object.freeze({
+        servers: Object.freeze(servers),
+        diagnostics: Object.freeze(diagnostics),
+        diagnosticOwnership: Object.freeze(diagnosticOwnership),
+      });
     };
     try {
       const validated = validateAgentDeclaration(declaration);
       if (validated === undefined) {
         diagnostics.push("Agent MCP admission declaration is malformed; inline servers remain inactive");
+        diagnosticOwnership.push(unowned());
         return finish();
       }
-      if (validated.hasDeclarationIssues) {
+      if (validated.diagnosticOwnership.length > 0) {
         diagnostics.push(...collectDiagnostics([
           "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.",
         ]));
+        const first = validated.diagnosticOwnership[0]!;
+        const sameServerOwner = first.kind === "server" && validated.diagnosticOwnership.every(
+          (owner) => owner.kind === "server" && owner.serverName === first.serverName,
+        );
+        diagnosticOwnership.push(sameServerOwner ? first : unowned());
       }
       for (const item of validated.items) {
         if (item.kind === "reference") continue;
@@ -570,7 +616,11 @@ function createAgentMcpAdmissionContext(input: {
         servers.push({ name: entry.name, source: "subagent-inline", ...(entry.timeoutMs === undefined ? {} : { timeoutMs: entry.timeoutMs }), status: "enabled", transport: "stdio", command, args, env: expandedEnv, rawCommand: entry.command, diagnostics: perDiagnostics });
       }
     } catch {
-      return { servers: [], diagnostics: ["Agent MCP admission failed safely; inline servers remain inactive"] };
+      return Object.freeze({
+        servers: Object.freeze([]),
+        diagnostics: Object.freeze(["Agent MCP admission failed safely; inline servers remain inactive"]),
+        diagnosticOwnership: Object.freeze([unowned()]),
+      });
     }
     return finish();
   };

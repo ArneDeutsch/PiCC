@@ -89,9 +89,11 @@ describe("MCP prompt and resource capability registry", () => {
   it("owns capability discovery retries and immutable catalogs at the cross-transport level", () => {
     const proxy = note("tool.mcp__*");
     expect(proxy).toContain("catalog across remote outages and terminal failure remains immutable");
-    expect(proxy).toContain("After aggregate initial settlement, one immutable tool universe is registered");
-    expect(proxy).toContain("fresh proxy objects per dispatch over that same universe");
-    expect(proxy).toContain("Reconnect never widens it");
+    expect(proxy).toContain("After aggregate initial settlement, the main session registers one immutable universe");
+    expect(proxy).toContain("Named agents compose an immutable dispatch-local universe from borrowed eligible session servers and their own admitted inline runtime");
+    expect(proxy).toContain("then restrict/drop it via tools:/disallowedTools:");
+    expect(proxy).toContain("parent and sibling inline capabilities do not propagate");
+    expect(proxy).toContain("Reconnect never widens either universe");
 
     const aggregate = note("feature.mcp");
     expect(aggregate).toContain("Every advertised tools, prompts, or resources capability list");
@@ -141,11 +143,12 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-sampling")).toContain("cannot ask PiCC to run model generations");
   });
 
-  it("distinguishes inherited resource tools from user-only prompt commands", () => {
+  it("pins named-agent gating, background resources, and main-session-only prompt commands", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
-    expect(frontmatter).toContain("gated MCP tool proxies and conditional resource tools");
-    expect(frontmatter).toContain("non-fork background subagents");
-    expect(frontmatter).toContain("MCP prompt commands are user-input-only");
+    expect(frontmatter).toContain("string references borrow them without duplicate clients");
+    expect(frontmatter).toContain("inline stdio/HTTP/SSE servers are dispatch-owned and isolated from parents and siblings");
+    expect(frontmatter).toContain("The combined universe is gated by agent tools:/disallowedTools:, permissions, hooks, timeouts, managed policy, project approval, the disabledMcpjsonServers project-decline gate, and background resource filtering");
+    expect(frontmatter).toContain("prompt commands remain main-session-only");
   });
 });
 
@@ -170,7 +173,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
     "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
   "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf share PiCC's immutable initial catalogs and the same non-safety remedy.",
   "feature.mcp-max-result-size-chars": "The metadata and persistence behavior are the same unsupported per-tool text-threshold contract, distinct from generic clipping.",
-  "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share the same absent model-visible evidence channel and human-only PiCC remedy.",
+  "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share PiCC's partial boundary: main-session failures remain human-only, while bounded named-agent setup and cleanup degradation qualifies child or parent model surfaces at its lifecycle boundary.",
   "feature.mcp-server-instructions": "Instruction forwarding and its truncation rule share one absent model-context behavior and non-safety conclusion.",
   "feature.mcp-managed-config": "The standalone managed source, exclusive/empty behavior, fail-closed hardening, and deferred delivery/source limits form one partial administrator-control boundary." ,
   "feature.mcp-oauth": "OAuth login, logout, and dynamic registration share the absent credential flow, non-safety tier, and static-header remedy.",
@@ -314,7 +317,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("invocation.bare", "CLI reference", "--bare", "CLI flags", "feature.mcp-cli-invocation-controls", "not-supported"),
   s("invocation.safe-mode", "CLI reference", "--safe-mode", "CLI flags", "feature.mcp-cli-invocation-controls", "not-supported"),
   s("connection.capability-discovery", "MCP reference", "Connection and capability discovery", "Scale with MCP tool search", "feature.mcp-capability-discovery", "partial"),
-  s("connection.failure-visibility", "MCP reference", "Model-visible failed-server and error reporting through ToolSearch", "Scale with MCP tool search", "feature.mcp-model-failure-visibility", "not-supported"),
+  s("connection.failure-visibility", "MCP reference", "Model-visible failed-server and error reporting through ToolSearch", "Scale with MCP tool search", "feature.mcp-model-failure-visibility", "partial"),
   s("connection.automatic-reconnection", "MCP reference", "Automatic reconnection", "Automatic reconnection", "feature.mcp-remote-transports", "partial"),
   s("connection.wait-tool", "MCP reference", "WaitForMcpServers", "Scale with MCP tool search", "tool.WaitForMcpServers", "not-supported"),
   s("dynamic.tools-list-changed", "MCP reference", "tools/list_changed", "Dynamic tool updates", "feature.mcp-list-changed", "not-supported", false),
@@ -431,7 +434,7 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("tools.search-default", "MCP reference", "tool search is default where supported", "Scale with MCP tool search", "feature.mcp-tool-search", "not-supported", false),
   s("tools.search-unsupported-paths", "MCP reference", "unsupported model, provider, deployment, and upfront-loading paths", "Scale with MCP tool search", "feature.mcp-tool-search", "not-supported", false),
   s("tools.search-wait-selection", "MCP reference", "ToolSearch versus WaitForMcpServers selection and fallback", "Scale with MCP tool search", "feature.mcp-tool-search", "not-supported", false),
-  s("tools.search-failure-dependency", "MCP reference", "tool-search connection-failure visibility dependency", "Scale with MCP tool search", "feature.mcp-model-failure-visibility", "not-supported", false),
+  s("tools.search-failure-dependency", "MCP reference", "tool-search connection-failure visibility dependency", "Scale with MCP tool search", "feature.mcp-model-failure-visibility", "partial", false),
   s("managed.strict-plugin-membership", "Settings reference", "strictPluginOnlyCustomization includes mcp", "Available settings", "setting.strictPluginOnlyCustomization.mcp", "not-supported", true),
   s("managed.strict-plugin-restriction", "Settings reference", "plugin-only result excludes user, local, project, manual, and CLI-configured MCP sources", "Available settings", "setting.strictPluginOnlyCustomization.mcp", "not-supported", true),
   s("sampling.server-request", "MCP reference", "Sampling", "Scale with MCP tool search", "feature.mcp-sampling", "not-supported", false),
@@ -593,9 +596,13 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(note("feature.mcp-runtime-disabled")).toContain("final pre-expansion deny");
     expect(note("feature.mcp-runtime-disabled")).toContain("does not disable settings-extension winners");
     expect(lookupCapability("feature.mcp-runtime-enabled")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
-    expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
-    expect(note("feature.mcp-model-failure-visibility")).toContain("only to humans through `/mcp`, `/doctor`");
-    expect(note("feature.mcp-model-failure-visibility")).toContain("none is model-visible");
+    expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "partial", safetyRelevant: false });
+    const failureVisibility = note("feature.mcp-model-failure-visibility");
+    expect(failureVisibility).toContain("Main-session startup failures remain human-visible through /mcp, /doctor, warnings, and stderr rather than Claude's ToolSearch/WaitForMcpServers model path");
+    expect(failureVisibility).toContain("Named-agent setup degradation settles before the first child provider request");
+    expect(failureVisibility).toContain("one bounded PiCC-defined warning reaches that child and later qualifies Agent/TaskOutput");
+    expect(failureVisibility).toContain("Cleanup degradation is discovered only after child work and therefore qualifies the parent-facing result, not the already-finished child request");
+    expect(failureVisibility).toContain("No warning exposes raw config or runtime errors");
     expect(note("feature.mcp-websocket")).toContain("stdio, HTTP, and SSE alternatives");
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");

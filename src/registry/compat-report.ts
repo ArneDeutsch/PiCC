@@ -717,7 +717,12 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
     if (agent.mcpServers !== undefined) {
       const cap = lookupCapability("agent.frontmatter.mcpServers");
-      if (cap) addFinding(cap, `agent "${agent.name}" sets mcpServers:`);
+      if (cap) {
+        const guidance = agent.source.scope === "managed"
+          ? `managed agent "${agent.name}" retains mcpServers as parsed data, but managed-agent execution is unsupported and PiCC ignores it. Define an equivalent user/project agent when dispatch-local MCP is required.`
+          : `agent "${agent.name}" declares dispatch-local mcpServers; consult its bounded Agent/TaskOutput dispatch diagnostics for admission, startup, and cleanup outcomes.`;
+        addFinding(cap, guidance);
+      }
     }
     if (agent.hooks !== undefined) {
       const cap = lookupCapability("agent.frontmatter.hooks");

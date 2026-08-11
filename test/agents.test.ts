@@ -646,7 +646,12 @@ describe("agent MCP declaration normalization", () => {
     writeAgent("empty.md", "---\ndescription: empty\nmcpServers: []\n---\nbody");
     const byName = Object.fromEntries(load().agents.map((agent) => [agent.name, agent]));
     expect(Object.hasOwn(byName["omitted"]!, "agentMcp")).toBe(false);
-    expect(byName["empty"]!.agentMcp).toEqual({ scope: "project", items: [], diagnostics: [] });
+    expect(byName["empty"]!.agentMcp).toEqual({
+      scope: "project",
+      items: [],
+      diagnostics: [],
+      diagnosticOwnership: [],
+    });
   });
 
   it.each([
@@ -680,6 +685,47 @@ describe("agent MCP declaration normalization", () => {
     expect(declaration.diagnostics.length).toBeGreaterThanOrEqual(9);
     expect(declaration.diagnostics.join("\n")).not.toContain("wss://secret.invalid/socket");
     expect(declaration.diagnostics.every((message) => !/[\r\n]/u.test(message))).toBe(true);
+  });
+
+  it("assigns exact structured ownership without depending on diagnostic prose", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      { command: { args: ["missing-command"] } },
+      "owned-duplicate",
+      "owned-duplicate",
+      null,
+      { "unsafe/name": { command: "secret-command" } },
+    ], "project");
+
+    expect(declaration.diagnosticOwnership).toEqual([
+      { kind: "server", serverName: "command" },
+      { kind: "server", serverName: "owned-duplicate" },
+      { kind: "unowned", itemIndex: 3 },
+      { kind: "unowned", itemIndex: 4 },
+    ]);
+    expect(declaration.diagnosticOwnership).toHaveLength(declaration.diagnostics.length);
+    expect(Object.isFrozen(declaration.diagnosticOwnership)).toBe(true);
+    for (const owner of declaration.diagnosticOwnership) {
+      expect(Object.isFrozen(owner)).toBe(true);
+      expect(Object.getPrototypeOf(owner)).toBeNull();
+    }
+    const opaqueMessages = declaration.diagnostics.map(() => "opaque finding");
+    expect(opaqueMessages.map((_message, index) => declaration.diagnosticOwnership[index])).toEqual(
+      declaration.diagnosticOwnership,
+    );
+    expect(JSON.stringify(declaration.diagnosticOwnership)).not.toContain("secret-command");
+
+    let getterCalls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, "0", {
+      enumerable: true,
+      configurable: true,
+      get: () => { getterCalls++; return { leaked: { command: "ACCESSOR_SECRET" } }; },
+    });
+    accessorList.length = 1;
+    const accessorDeclaration = normalizeAgentMcpDeclaration(accessorList, "project");
+    expect(getterCalls).toBe(0);
+    expect(accessorDeclaration.diagnosticOwnership).toEqual([{ kind: "unowned", itemIndex: 0 }]);
+    expect(JSON.stringify(accessorDeclaration)).not.toContain("ACCESSOR_SECRET");
   });
 
   it("retains the first valid same-name occurrence across reference and inline kinds", () => {
@@ -723,6 +769,8 @@ describe("agent MCP declaration normalization", () => {
     expect(declaration.items).toEqual([]);
     expect(declaration.diagnostics).toHaveLength(128);
     expect(declaration.diagnostics[127]).toBe("Additional agent MCP diagnostics omitted (1)");
+    expect(declaration.diagnosticOwnership).toHaveLength(128);
+    expect(declaration.diagnosticOwnership[127]).toEqual({ kind: "unowned" });
     expect(declaration.diagnostics.every((message) => message.length <= 192)).toBe(true);
     const rendered = declaration.diagnostics.join("\n");
     expect(rendered).not.toMatch(/[\u001b\r\t]/u);
@@ -776,6 +824,10 @@ describe("agent MCP declaration normalization", () => {
       .toHaveProperty("url")
       .toBeString();
     expectTypeOf<ResolvedAgentMcpConfig["servers"]>().toEqualTypeOf<readonly ResolvedAgentMcpServer[]>();
+    expectTypeOf<AgentMcpDeclaration["diagnosticOwnership"][number]>().toEqualTypeOf<
+      | { readonly kind: "server"; readonly serverName: string }
+      | { readonly kind: "unowned"; readonly itemIndex?: number }
+    >();
 
     // @ts-expect-error Managed provenance cannot enter an effective declaration.
     const invalidDeclaration: AgentMcpDeclaration = { scope: "managed", items: [], diagnostics: [] };

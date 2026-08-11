@@ -431,7 +431,11 @@ export class BackgroundTaskRegistry {
         // Usage mirror: recorded before the stopped-branch early return
         // below, so an aborted task still reports what its partial run cost.
         record.usage = result.usage;
-        record.diagnostics.push(...(result.diagnostics ?? []));
+        for (const diagnostic of result.diagnostics ?? []) {
+          if (!record.diagnostics.some((current) => current.severity === diagnostic.severity && current.message === diagnostic.message)) {
+            record.diagnostics.push(diagnostic);
+          }
+        }
         if (record.status === "stopped") {
           // TaskStop contract: a stopped task's result is discarded.
           record.diagnostics.push({
@@ -484,6 +488,17 @@ export class BackgroundTaskRegistry {
     const task = this.tasks.get(id);
     if (!task || task.status !== "running") return;
     task.admission = admission;
+    this.notifyChange(id);
+  }
+
+  noteSetupWarning(id: string, warning: string): void {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return;
+    const safe = sanitizeLine(warning, 512);
+    task.lastActivity = safe;
+    if (!task.diagnostics.some((diagnostic) => diagnostic.message === safe)) {
+      task.diagnostics.push({ severity: "warning", message: safe });
+    }
     this.notifyChange(id);
   }
 
@@ -689,10 +704,11 @@ export class BackgroundTaskRegistry {
     // ignore abort indefinitely). A checkpoint-paused record is different: its
     // dispatch already settled and the abort callback owns finite retained
     // cleanup, which TaskStop must join before reporting success.
-    if (joinRetainedCheckpoint || pendingStop) {
-      await abortSettlement;
-      await task?.settled;
-    }
+    if (joinRetainedCheckpoint || pendingStop) await abortSettlement;
+    // Ordinary running tasks may ignore cooperative abort indefinitely. Only a
+    // checkpoint-paused task has already settled its dispatch and transfers a
+    // finite retained-cleanup join to TaskStop.
+    if (joinRetainedCheckpoint) await task?.settled;
     return result;
   }
 
@@ -953,6 +969,11 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   }
   const guidance = outcome === "failed" ? recoveryGuidance(task) : undefined;
   if (guidance) lines.push(guidance);
+  const mcpQualification = task.diagnostics
+    .map((diagnostic) => diagnostic.message)
+    .filter((message) => message.startsWith("Agent MCP availability warning:") || message.startsWith("Agent MCP cleanup warning:"))
+    .filter((message, index, all) => all.indexOf(message) === index);
+  lines.push(...mcpQualification);
   // Excerpt only for outcomes that carry output (completed, or failed with
   // best-effort partial output). Aborted/stopped runs discard their result.
   const raw = outcome === "aborted" ? "" : task.result ?? "";
@@ -1295,6 +1316,14 @@ export function createTaskOutputTool(
               (task.lastActivity ? ` — ${task.lastActivity}` : "") +
               ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
+      }
+      const mcpQualification = task.diagnostics
+        .map((diagnostic) => diagnostic.message)
+        .filter((message) => message.startsWith("Agent MCP availability warning:") || message.startsWith("Agent MCP cleanup warning:"))
+        .filter((message, index, all) => all.indexOf(message) === index)
+        .join("\n");
+      if (task.status !== "running" && mcpQualification) {
+        text += `\n\n---\n${mcpQualification}\n---`;
       }
       // Usage line: a compact, clearly-separated metadata line for any settled
       // task that has usage — including a stopped one (what the aborted run

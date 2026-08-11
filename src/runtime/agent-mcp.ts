@@ -37,7 +37,6 @@ export interface OwnedAgentMcpRuntime extends AgentMcpRuntimeSource {
 
 export type AgentMcpSetupOutcomeKind =
   | "missing-reference"
-  | "session-wins-collision"
   | "inline-startup-failed";
 
 export interface AgentMcpSetupOutcome {
@@ -49,19 +48,26 @@ export interface AgentMcpScope extends AgentMcpRuntimeSource {
   diagnostics(): readonly string[];
   setupOutcomes(): readonly AgentMcpSetupOutcome[];
   knownToolNames(): readonly string[];
+  /** Settled identities routed through the already-published session runtime. */
+  borrowedServerNames?(): readonly string[];
+  /** Live, published stdio servers owned by this scope; safe identities only. */
+  activeOwnedStdioServerNames?(): readonly string[];
   shutdown(): Promise<McpCleanupOutcome>;
   retryUnconfirmedShutdown(): Promise<McpCleanupOutcome>;
 }
 
 export interface CreateAgentMcpScopeOptions {
   readonly sessionRuntime: AgentMcpRuntimeSource;
-  readonly declaration?: Pick<AgentMcpDeclaration, "items">;
+  readonly declaration?: Pick<AgentMcpDeclaration, "items"> &
+    Partial<Pick<AgentMcpDeclaration, "diagnostics">>;
   readonly inlineConfig: ResolvedAgentMcpConfig;
   readonly inlineDeps: McpRuntimeDeps;
   readonly startInline?: (
     config: ResolvedAgentMcpConfig,
     deps: McpRuntimeDeps,
   ) => OwnedAgentMcpRuntime;
+  /** Generation cancellation; startup never outlives its dispatch owner. */
+  readonly signal?: AbortSignal;
 }
 
 type RouteSource = "session" | "inline";
@@ -74,7 +80,7 @@ type Route = { readonly kind: RouteSource; readonly source: AgentMcpRuntimeSourc
 export async function createAgentMcpScope(
   options: CreateAgentMcpScopeOptions,
 ): Promise<AgentMcpScope> {
-  await options.sessionRuntime.whenSettled();
+  await abortable(options.sessionRuntime.whenSettled(), options.signal);
 
   const sessionTools = options.sessionRuntime.tools();
   const sessionResources = options.sessionRuntime.resourceServers();
@@ -85,7 +91,10 @@ export async function createAgentMcpScope(
     ...sessionResources.map((entry) => entry.serverName),
   ]);
   const declarationItems = options.declaration?.items ?? [];
-  const inheritAll = declarationItems.length === 0;
+  // Omission and a genuinely clean empty list inherit. An explicitly malformed
+  // declaration with no valid survivors must not widen into the session universe.
+  const inheritAll = options.declaration === undefined ||
+    (declarationItems.length === 0 && (options.declaration.diagnostics?.length ?? 0) === 0);
   const selectedSessionNames = new Set<string>();
   const diagnostics: string[] = [];
   const outcomes: AgentMcpSetupOutcome[] = [];
@@ -107,15 +116,11 @@ export async function createAgentMcpScope(
   }
 
   const retainedInline: ResolvedAgentMcpServer[] = [];
-  const collisionNames = new Set<string>();
   for (const server of options.inlineConfig.servers) {
     if (sessionNames.has(server.name)) {
+      // Session-wins is the successful collision rule: borrow the published
+      // session server and neither start nor warn about the duplicate inline item.
       selectedSessionNames.add(server.name);
-      if (!collisionNames.has(server.name)) {
-        collisionNames.add(server.name);
-        retainOutcome(outcomes, server.name, "session-wins-collision");
-        diagnostics.push(`Agent MCP inline server ${quotedSafeName(server.name)} was skipped because the session server owns that name.`);
-      }
       continue;
     }
     retainedInline.push(server);
@@ -124,12 +129,26 @@ export async function createAgentMcpScope(
   const inlineConfig: ResolvedAgentMcpConfig = {
     servers: Object.freeze(retainedInline),
     diagnostics: options.inlineConfig.diagnostics,
+    diagnosticOwnership: options.inlineConfig.diagnosticOwnership,
   };
   const hasEnabledInline = retainedInline.some((server) => server.status === "enabled");
+  let setupAbortCleanup: McpCleanupOutcome | undefined;
   const owned = hasEnabledInline
     ? (options.startInline ?? McpRuntime.startAgent)(inlineConfig, options.inlineDeps)
     : undefined;
-  if (owned) await owned.whenSettled();
+  if (owned) {
+    try {
+      await abortable(owned.whenSettled(), options.signal);
+    } catch (error) {
+      if (!options.signal?.aborted) {
+        await owned.shutdown().catch(() => undefined);
+        throw error;
+      }
+      setupAbortCleanup = owned.shutdownAgent
+        ? freezeCleanupOutcome(await owned.shutdownAgent())
+        : await owned.shutdown().then(emptyCleanupOutcome);
+    }
+  }
 
   const routes = new Map<string, Route>();
   for (const name of selectedSessionNames) routes.set(name, { kind: "session", source: options.sessionRuntime });
@@ -178,10 +197,17 @@ export async function createAgentMcpScope(
     ...tools.map(mcpProxyToolName).filter((name): name is string => name !== undefined),
     ...(resourceServers.length > 0 ? [ListMcpResourcesTool, ReadMcpResourceTool] : []),
   ]);
+  const visibleAdmissionDiagnostics = options.inlineConfig.diagnostics.filter((_diagnostic, index) => {
+    const owner = options.inlineConfig.diagnosticOwnership[index];
+    return owner?.kind !== "server" || !sessionNames.has(owner.serverName);
+  });
   const safeDiagnostics = Object.freeze(boundDiagnostics([
-    ...options.inlineConfig.diagnostics.map(() => "An admitted agent MCP definition produced a redacted setup diagnostic."),
+    ...visibleAdmissionDiagnostics.map(() => "An admitted agent MCP definition produced a redacted setup diagnostic."),
     ...diagnostics,
   ]));
+  const ownedStdioNames = new Set(retainedInline
+    .filter((server) => server.status === "enabled" && server.transport === "stdio")
+    .map((server) => server.name));
   const setupOutcomes = immutableSnapshot(outcomes.slice(0, DIAGNOSTIC_LIMIT));
 
   let shuttingDown = false;
@@ -209,6 +235,10 @@ export async function createAgentMcpScope(
     generation += 1;
     shutdownPromise = (async () => {
       if (!owned) return emptyCleanupOutcome();
+      if (setupAbortCleanup) {
+        unconfirmed = setupAbortCleanup.unconfirmed;
+        return setupAbortCleanup;
+      }
       const outcome = owned.shutdownAgent
         ? await owned.shutdownAgent()
         : await owned.shutdown().then(emptyCleanupOutcome);
@@ -231,6 +261,12 @@ export async function createAgentMcpScope(
     diagnostics: () => safeDiagnostics,
     setupOutcomes: () => setupOutcomes,
     knownToolNames: () => knownToolNames,
+    borrowedServerNames: () => Object.freeze([...routes.entries()]
+      .filter(([, route]) => route.kind === "session")
+      .map(([name]) => safeName(name))),
+    activeOwnedStdioServerNames: () => Object.freeze((owned?.serverStates() ?? [])
+      .filter((state) => state.state === "connected" && ownedStdioNames.has(state.name) && routes.get(state.name)?.kind === "inline")
+      .map((state) => safeName(state.name))),
     callTool: (serverName: string, toolName: string, args: unknown) =>
       routed(serverName, (source) => source.callTool(serverName, toolName, args)),
     readResource: (serverName: string, uri: string) =>
@@ -397,6 +433,20 @@ function deepFreeze<T>(value: T, seen = new Set<object>()): T {
   seen.add(value);
   for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested, seen);
   return Object.freeze(value);
+}
+
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw new Error("Agent MCP setup aborted");
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(new Error("Agent MCP setup aborted"));
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function emptyCleanupOutcome(): McpCleanupOutcome {

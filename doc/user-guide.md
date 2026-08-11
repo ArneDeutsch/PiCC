@@ -713,6 +713,23 @@ user profile for user-scoped settings and artifacts, imported installed-plugin s
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
 roots remain in effect.
 
+User/project agent `mcpServers:` lists may reference an eligible session server by name or define an
+inline stdio/HTTP/SSE server. References reuse the main session's published connection; inline servers belong only to
+that dispatch and close before its worktree is released. Managed policy, project approval,
+the `disabledMcpjsonServers` project-decline gate, agent tool filters, permissions, hooks, and timeouts still apply. A published
+session route wins a same-name inline declaration regardless of that declaration's admission status,
+without starting a duplicate or warning. Missing, invalid, blocked, disabled, pending, or
+startup-failed capability produces a bounded warning before the child's first request and around its
+reported result. Cleanup uncertainty is known only after child work, so it preserves and qualifies
+the result and receives one session-shutdown retry. Neither warning shows raw configuration. Inline
+servers do not appear in the parent `/mcp` inventory, do not pass to siblings or nested children, and
+keep their launch cwd after a later EnterWorktree; restart the agent in the desired worktree when the
+server must follow. In-process resume reuses the original cwd but applies the current authored
+definition and policy. Plugin agents diagnose and strip this field; managed-agent definitions may
+retain it as parsed data, but PiCC ignores it because managed-agent execution is unsupported. PiCC's
+cancellation, project approval, collision, warning, cwd, and resume rules are hardening choices rather
+than verified Claude Code parity.
+
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →
 project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
 priority, with its existing managed → untracked local → project → user ordering. Fields never merge
