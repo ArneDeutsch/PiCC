@@ -52,10 +52,11 @@ export async function previewRecovery(inputs: { readonly store: OwnedStateStore;
   }
   const validated = await validatedJournal(inputs); if (!validated.ok) return validated; const journal = validated.value.journal;
   const decoded = validated.value.codec.decodeSummary(journal.confirmationSummary); if (!decoded.ok) return fail("invalid-summary", "Pending operation summary is invalid");
+  const hasCreatedParent = journal.createdParents.some((created) => created !== null);
   return { ok: true, value: Object.freeze({ operationId: journal.operationId, producerSchema: journal.producerSchema, producerVersion: journal.producerVersion,
     confirmationSummary: decoded.value, confirmationDigest: journal.confirmationDigest, planDigest: journal.planDigest,
     completed: journal.completed, rolledBack: journal.rolledBack, remaining: journal.participants.length - journal.completed,
-    actions: Object.freeze(journal.state === "rolling-back" ? ["rollback"] as const : journal.completed === 0 ? ["complete"] as const : ["complete", "rollback"] as const),
+    actions: Object.freeze(journal.state === "rolling-back" ? ["rollback"] as const : journal.completed === 0 && !hasCreatedParent ? ["complete"] as const : ["complete", "rollback"] as const),
     ...(completedGenerationId(journal, journal.completed - journal.rolledBack) === undefined ? {} : { generationId: completedGenerationId(journal, journal.completed - journal.rolledBack) }) }) };
 }
 
@@ -73,7 +74,7 @@ export async function recoverTransaction(inputs: { readonly store: OwnedStateSto
   if (journal.producerSchema !== inputs.confirmedProducerSchema || journal.producerVersion !== inputs.confirmedProducerVersion
     || journal.planDigest !== inputs.confirmedPlanDigest || journal.confirmationDigest !== inputs.confirmedConfirmationDigest) return fail("confirmation-mismatch", "Recovery confirmation does not bind the pending producer and operation");
   if (journal.state === "rolling-back" && inputs.action !== "rollback") return fail("invalid-recovery", "Interrupted rollback is rollback-only");
-  if (inputs.action === "rollback" && journal.completed === 0) return fail("invalid-recovery", "An uncommitted operation has no rollback prefix");
+  if (inputs.action === "rollback" && journal.completed === 0 && !journal.createdParents.some((created) => created !== null)) return fail("invalid-recovery", "An uncommitted operation has no rollback prefix or journaled created parent");
   const leaseValid = await validateLifecycleLockLease(inputs.store, inputs.lease, inputs.operationId, journal.lockBindings, journal.requiredLocks); if (!leaseValid.ok) return leaseValid;
   const rebound = await persistReconciledJournal(inputs.store, journal, inputs.lease); if (!rebound.ok) return rebound;
   return inputs.action === "complete"

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   expandEnvVars,
@@ -227,6 +228,14 @@ function inertPolicyIo(
 }
 
 describe("loadSettings — precedence & merging", () => {
+  it("loads legacy linked-worktree local settings below the verified main-checkout local file", () => {
+    const base = makeTmp(); const main = path.join(base, "main"); const linked = path.join(base, "linked"); const userDir = path.join(base, "user"); fs.mkdirSync(main); fs.mkdirSync(userDir);
+    for (const args of [["init"], ["config", "user.email", "test@example.com"], ["config", "user.name", "Test"]]) expect(spawnSync("git", args, { cwd: main }).status).toBe(0);
+    fs.writeFileSync(path.join(main, "seed"), "seed"); expect(spawnSync("git", ["add", "."], { cwd: main }).status).toBe(0); expect(spawnSync("git", ["commit", "-m", "seed"], { cwd: main }).status).toBe(0); expect(spawnSync("git", ["worktree", "add", "-b", "discovery-linked", linked], { cwd: main }).status).toBe(0);
+    const nested = path.join(linked, "nested"); fs.mkdirSync(path.join(linked, ".claude")); fs.mkdirSync(path.join(nested, ".claude"), { recursive: true }); fs.mkdirSync(path.join(main, ".claude"));
+    writeJson(path.join(linked, ".claude", "settings.local.json"), { enabledPlugins: { "shared@official": false, "active@official": true } }); writeJson(path.join(nested, ".claude", "settings.local.json"), { enabledPlugins: { "nested@official": true } }); writeJson(path.join(main, ".claude", "settings.local.json"), { enabledPlugins: { "shared@official": true } });
+    const loaded = loadSettings({ cwd: nested, projectRoot: linked, userDir, managedPaths: [] }); expect(loaded.effectivePluginEnablement?.["shared@official"]).toMatchObject({ enabled: true, source: path.join(fs.realpathSync.native(main), ".claude", "settings.local.json") }); expect(loaded.effectivePluginEnablement?.["active@official"]?.enabled).toBe(true); expect(loaded.effectivePluginEnablement?.["nested@official"]?.enabled).toBe(true);
+  });
   it("applies scalar precedence: local over project over user", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), { model: "user-model", cleanupPeriodDays: 10 });

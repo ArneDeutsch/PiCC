@@ -19,9 +19,14 @@ import {
 } from "../src/runtime/skill-activation.js";
 import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
+import { loadSettings } from "../src/discovery/settings.js";
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection } from "../src/plugin-lifecycle/admission.js";
-import { canonicalJsonBytes, createRecordEnvelope, ownedRecordPartition, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { canonicalJsonBytes, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { acquireLifecycleLocks, releaseLifecycleLocks } from "../src/plugin-lifecycle/locks.js";
+import { executeTransaction } from "../src/plugin-lifecycle/transaction.js";
+import { planPluginSettingsWrite } from "../src/plugin-lifecycle/settings-plan.js";
+import { preparePluginSettingsWrite } from "../src/plugin-lifecycle/settings-writer.js";
 import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
 import { ownedPluginDataDeletionEligible } from "../src/claude/plugin-paths.js";
 import { PORTABLE_TREE_LIMITS } from "../src/plugin-lifecycle/tree-validator.js";
@@ -1135,6 +1140,38 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const project = load(worktree, userDir);
     expect(project.plugins.map((plugin) => plugin.pluginId)).toContain("owned@official");
     expect(project.pluginAdmissions).toEqual(expect.arrayContaining([expect.objectContaining({ ownership: "picc-owned", projectPath: fs.realpathSync.native(worktree) })]));
+  });
+
+  it("writes and assembles settings from the active linked worktree rather than its main checkout", async () => {
+    const base = makeTmp(); const main = path.join(base, "main"); const worktree = path.join(base, "linked"); const homeDir = path.join(base, "home"); const userDir = path.join(homeDir, ".claude");
+    fs.mkdirSync(main, { recursive: true }); fs.mkdirSync(userDir, { recursive: true });
+    for (const args of [["init"], ["config", "user.email", "test@example.com"], ["config", "user.name", "Test"]]) expect(spawnSync("git", args, { cwd: main }).status).toBe(0);
+    write(path.join(main, "seed.txt"), "seed"); expect(spawnSync("git", ["add", "."], { cwd: main }).status).toBe(0); expect(spawnSync("git", ["commit", "-m", "seed"], { cwd: main }).status).toBe(0);
+    expect(spawnSync("git", ["worktree", "add", "-b", "settings-linked", worktree], { cwd: main }).status).toBe(0); fs.mkdirSync(path.join(worktree, ".claude")); fs.mkdirSync(path.join(main, ".claude")); fs.mkdirSync(path.join(worktree, "nested"));
+    const active = fs.realpathSync.native(worktree); const family = fs.realpathSync.native(main); const locations = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family } }); if (!locations.ok) throw new Error("locations");
+    const plan = await planPluginSettingsWrite({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family }, projectRoot: active, cwd: path.join(active, "nested"), managedPaths: [], scope: "project", mutation: { kind: "enabled-plugin", key: "linked@official", value: false } }); if (!plan.ok) throw new Error(plan.message);
+    expect(process.platform === "win32" ? plan.value.targetPath.toLowerCase() : plan.value.targetPath).toBe(process.platform === "win32" ? path.join(active, ".claude", "settings.json").toLowerCase() : path.join(active, ".claude", "settings.json")); const store = await establishOwnedStateStore(locations.value, homeDir); if (!store.ok) throw new Error(store.message);
+    const prepared = await preparePluginSettingsWrite({ store: store.value, operationId: "linked_settings", profilePath: userDir, plan: plan.value }); if (!prepared.ok) throw new Error(prepared.message);
+    const lease = await acquireLifecycleLocks({ store: store.value, operationId: "linked_settings", identities: prepared.value.transaction.requiredLocks }); if (!lease.ok) throw new Error(lease.message);
+    try { expect((await executeTransaction(store.value, prepared.value.transaction, { lease: lease.value })).state).toBe("committed"); } finally { await releaseLifecycleLocks(lease.value); }
+    expect(fs.existsSync(path.join(main, ".claude", "settings.json"))).toBe(false);
+    const assembled = load(active, userDir).settings.effectivePluginEnablement?.["linked@official"]; expect(assembled).toMatchObject({ enabled: false, scope: "project" });
+    expect(process.platform === "win32" ? assembled?.source.toLowerCase() : assembled?.source).toBe(process.platform === "win32" ? plan.value.targetPath.toLowerCase() : plan.value.targetPath);
+    fs.writeFileSync(path.join(worktree, ".claude", "settings.local.json"), JSON.stringify({ enabledPlugins: { "shared@official": false, "legacy@official": true } }));
+    fs.writeFileSync(path.join(worktree, "nested", ".claude-settings-canary"), "untouched");
+    fs.writeFileSync(path.join(main, ".claude", "settings.local.json"), JSON.stringify({ enabledPlugins: { "shared@official": true } }));
+    const legacyBytes = fs.readFileSync(path.join(worktree, ".claude", "settings.local.json"));
+    const localPlan = await planPluginSettingsWrite({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family }, projectRoot: active, cwd: path.join(active, "nested"), managedPaths: [], scope: "local", mutation: { kind: "enabled-plugin", key: "main-write@official", value: true } }); if (!localPlan.ok) throw new Error(localPlan.message);
+    expect(process.platform === "win32" ? localPlan.value.targetPath.toLowerCase() : localPlan.value.targetPath).toBe(process.platform === "win32" ? path.join(main, ".claude", "settings.local.json").toLowerCase() : path.join(main, ".claude", "settings.local.json"));
+    const localPrepared = await preparePluginSettingsWrite({ store: store.value, operationId: "linked_local_settings", profilePath: userDir, plan: localPlan.value }); if (!localPrepared.ok) throw new Error(localPrepared.message); const localLease = await acquireLifecycleLocks({ store: store.value, operationId: "linked_local_settings", identities: localPrepared.value.transaction.requiredLocks }); if (!localLease.ok) throw new Error(localLease.message);
+    try { expect((await executeTransaction(store.value, localPrepared.value.transaction, { lease: localLease.value })).state).toBe("committed"); } finally { await releaseLifecycleLocks(localLease.value); }
+    expect(fs.readFileSync(path.join(worktree, ".claude", "settings.local.json"))).toEqual(legacyBytes); expect(fs.readFileSync(path.join(main, ".claude", "settings.local.json"), "utf8")).toContain('"main-write@official": true');
+    const linkedSettings = loadSettings({ cwd: path.join(active, "nested"), projectRoot: active, userDir, managedPaths: [] });
+    expect(linkedSettings.effectivePluginEnablement?.["shared@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(main, ".claude", "settings.local.json") });
+    expect(linkedSettings.effectivePluginEnablement?.["legacy@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(worktree, ".claude", "settings.local.json") });
+    expect(linkedSettings.effectivePluginEnablement?.["main-write@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(main, ".claude", "settings.local.json") });
+    expect(load(active, userDir).settings.effectivePluginEnablement?.["main-write@official"]).toMatchObject({ enabled: true, scope: "local" });
+    expect(fs.readFileSync(path.join(worktree, "nested", ".claude-settings-canary"), "utf8")).toBe("untouched");
   });
 
   it("stores lifecycle state under the configured home independently of a custom Claude profile", () => {

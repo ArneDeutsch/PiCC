@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import fsSync, { constants, promises as fs, type BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import {
   canonicalJsonBytes, isContainedPath, ownedRecordPartition, revalidateOwnedStateStore, sha256,
@@ -21,6 +22,13 @@ export interface PathEvidence {
   readonly targetDev?: string;
   readonly targetIno?: string;
 }
+export interface MissingParentRequest {
+  readonly path: string;
+  readonly canonicalAncestor: string;
+  readonly ancestorDev: string;
+  readonly ancestorIno: string;
+}
+export interface CreatedParentEvidence { readonly temporaryPath: string; readonly finalPath: string; readonly dev: string; readonly ino: string }
 export interface TransactionParticipant {
   readonly kind: string;
   readonly key: string;
@@ -36,10 +44,18 @@ export interface TransactionParticipant {
   readonly targetEvidence?: PathEvidence;
   readonly stagedEvidence?: PathEvidence;
   readonly backupEvidence?: PathEvidence;
+  readonly missingParent?: MissingParentRequest;
   readonly generationId?: string;
 }
-export type ExternalMutation = "replace" | "delete" | "rollback";
-export interface ExternalMutationContext { readonly operationId: string; readonly participant: TransactionParticipant; readonly mutation: ExternalMutation }
+export type ExternalMutation = "replace" | "delete" | "rollback" | "create-parent" | "remove-parent" | "revalidate";
+export interface AdjacentTemporaryEvidence { readonly path: string; readonly dev: string; readonly ino: string; readonly digest: Sha256 }
+export interface ExternalMutationContext {
+  readonly operationId: string;
+  readonly participant: TransactionParticipant;
+  readonly mutation: ExternalMutation;
+  readonly temporary?: AdjacentTemporaryEvidence;
+}
+export interface ExternalAuthorization { readonly temporaryMode?: number }
 export interface TransactionProducerCodec<T = unknown> {
   readonly schema: string;
   readonly version: number;
@@ -48,7 +64,7 @@ export interface TransactionProducerCodec<T = unknown> {
   /** Trusted derivation of the complete canonical profile/checkout/settings lock vector. */
   readonly requiredLocks: (summary: unknown, participants: readonly TransactionParticipant[]) => StoreResult<readonly LifecycleLockIdentity[]>;
   /** Required for external participants and reconstructed from this trusted registry during recovery. */
-  readonly authorizeExternal?: (context: ExternalMutationContext) => StoreResult<void> | Promise<StoreResult<void>>;
+  readonly authorizeExternal?: (context: ExternalMutationContext) => StoreResult<void | ExternalAuthorization> | Promise<StoreResult<void | ExternalAuthorization>>;
 }
 export interface TransactionCodecRegistry { readonly lookup: (schema: string, version: number) => TransactionProducerCodec | undefined }
 function fail(code: string, message: string): StoreResult<never> { return { ok: false, code, message }; }
@@ -109,6 +125,21 @@ async function captureEvidence(candidate: string, targetMayBeAbsent: boolean): P
   return Object.freeze({ path: resolved, canonicalParent, parentDev: parentStat.dev.toString(), parentIno: parentStat.ino.toString(),
     ...(target === undefined ? {} : { targetDev: target.dev.toString(), targetIno: target.ino.toString() }) });
 }
+function validMissingParent(value: unknown): value is MissingParentRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return exactKeys(item, ["ancestorDev", "ancestorIno", "canonicalAncestor", "path"])
+    && typeof item.path === "string" && path.isAbsolute(item.path) && typeof item.canonicalAncestor === "string" && path.isAbsolute(item.canonicalAncestor)
+    && typeof item.ancestorDev === "string" && /^\d+$/.test(item.ancestorDev) && typeof item.ancestorIno === "string" && /^\d+$/.test(item.ancestorIno);
+}
+function validCreatedParent(value: unknown): value is CreatedParentEvidence {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return exactKeys(item, ["dev", "finalPath", "ino", "temporaryPath"]) && typeof item.temporaryPath === "string" && path.isAbsolute(item.temporaryPath)
+    && typeof item.finalPath === "string" && path.isAbsolute(item.finalPath) && !samePath(item.temporaryPath, item.finalPath)
+    && samePath(path.dirname(item.temporaryPath), path.dirname(item.finalPath))
+    && typeof item.dev === "string" && /^\d+$/.test(item.dev) && typeof item.ino === "string" && /^\d+$/.test(item.ino);
+}
 function validEvidenceShape(value: unknown): value is PathEvidence {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>; const withTarget = "targetDev" in item || "targetIno" in item;
@@ -140,6 +171,7 @@ function participantForDigest(participant: TransactionParticipant): unknown {
     stagedPath: participant.stagedPath, stagedDigest: participant.stagedDigest, rollback: participant.rollback,
     producerEvidence: participant.producerEvidence, targetEvidence: participant.targetEvidence, stagedEvidence: participant.stagedEvidence,
     ...(participant.backupEvidence === undefined ? {} : { backupEvidence: participant.backupEvidence }),
+    ...(participant.missingParent === undefined ? {} : { missingParent: participant.missingParent }),
     ...(participant.generationId === undefined ? {} : { generationId: participant.generationId }) };
 }
 
@@ -154,11 +186,20 @@ async function normalizeParticipant(store: OwnedStateStore, raw: TransactionPart
     if (raw.targetClass === "owned" && !isContainedPath(partition.value, target)) return fail("unsafe-target", "Owned target is outside its producer owner/scope partition");
     if (raw.targetClass === "generation" && (!isContainedPath(store.generationsRoot, target) || samePath(target, store.generationsRoot))) return fail("unsafe-target", "Generation target is outside this profile");
     if (raw.targetClass === "external" && raw.generationId !== undefined) return fail("invalid-participant", "External participant cannot identify a generation");
+    if (raw.missingParent !== undefined) {
+      const request = raw.missingParent;
+      if (raw.targetClass !== "external" || raw.precondition.state !== "absent" || !validMissingParent(request) || !samePath(request.path, path.dirname(target)) || !samePath(request.canonicalAncestor, path.dirname(request.path))) return fail("invalid-participant", "Only an absent external target may request one exact missing direct parent");
+      const ancestor = await ordinaryDirectory(request.canonicalAncestor);
+      if (!samePath(await fs.realpath(request.canonicalAncestor), request.canonicalAncestor) || ancestor.dev.toString() !== request.ancestorDev || ancestor.ino.toString() !== request.ancestorIno) return fail("unsafe-target", "Missing-parent ancestor authority changed");
+      try { await fs.lstat(request.path); return fail("unsafe-target", "A planned missing parent already exists"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
     if (raw.precondition.state !== "absent" && (raw.precondition.state !== "present" || !/^sha256:[a-f0-9]{64}$/.test(raw.precondition.digest))) throw new Error("precondition");
-    if (raw.precondition.state === "absent" ? raw.rollback.kind !== "delete-new-target" : raw.rollback.kind !== "restore-backup") return fail("invalid-rollback", "CAS state and rollback evidence disagree");
+    if (raw.precondition.state === "absent" ? raw.rollback.kind !== "delete-new-target" : raw.rollback.kind !== "restore-backup" || raw.rollback.digest !== raw.precondition.digest) return fail("invalid-rollback", "CAS state and exact rollback evidence disagree");
     if (raw.targetClass === "generation" && (typeof raw.generationId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(raw.generationId))) return fail("invalid-participant", "Generation participant requires a bounded id");
     if (raw.targetClass !== "generation" && raw.generationId !== undefined) return fail("invalid-participant", "Generation ids are confined to the generation participant");
-    const targetEvidence = await captureEvidence(target, raw.precondition.state === "absent");
+    const targetEvidence = raw.missingParent === undefined
+      ? await captureEvidence(target, raw.precondition.state === "absent")
+      : Object.freeze({ path: target, canonicalParent: raw.missingParent.path, parentDev: raw.missingParent.ancestorDev, parentIno: raw.missingParent.ancestorIno });
     if (raw.precondition.state === "present" && await fileDigest(target) !== raw.precondition.digest) return fail("stale-precondition", "Present target no longer matches its CAS digest");
     const stagedEvidence = await captureEvidence(staged, false);
     let backupEvidence: PathEvidence | undefined;
@@ -227,7 +268,7 @@ export async function prepareTransaction<T>(inputs: { readonly store: OwnedState
 function validParticipantShape(raw: unknown): raw is TransactionParticipant {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
   const value = raw as Record<string, unknown>; const keys = ["key", "kind", "ownerKey", "precondition", "producerEvidence", "rollback", "scopeKey", "stagedDigest", "stagedEvidence", "stagedPath", "targetClass", "targetEvidence", "targetPath"];
-  if ("backupEvidence" in value) keys.push("backupEvidence"); if ("generationId" in value) keys.push("generationId");
+  if ("backupEvidence" in value) keys.push("backupEvidence"); if ("missingParent" in value) keys.push("missingParent"); if ("generationId" in value) keys.push("generationId");
   if (!exactKeys(value, keys) || typeof value.kind !== "string" || !/^[a-z][a-z0-9.-]{0,63}$/.test(value.kind)
     || typeof value.key !== "string" || !/^[A-Za-z0-9._-]{1,256}$/.test(value.key)
     || typeof value.ownerKey !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(value.ownerKey)
@@ -236,13 +277,15 @@ function validParticipantShape(raw: unknown): raw is TransactionParticipant {
     || (value.targetClass !== "owned" && value.targetClass !== "external" && value.targetClass !== "generation")
     || typeof value.stagedDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.stagedDigest)
     || !validEvidenceShape(value.targetEvidence) || !validEvidenceShape(value.stagedEvidence)
-    || !samePath(value.targetEvidence.path, value.targetPath) || !samePath(value.stagedEvidence.path, value.stagedPath)) return false;
+    || !samePath(value.targetEvidence.path, value.targetPath) || !samePath(value.stagedEvidence.path, value.stagedPath)
+    || (value.missingParent !== undefined && (!validMissingParent(value.missingParent) || value.targetClass !== "external" || !samePath(value.missingParent.path, path.dirname(value.targetPath))))) return false;
   const pre = value.precondition as Record<string, unknown>; const rollback = value.rollback as Record<string, unknown>;
   if (typeof pre !== "object" || pre === null || Array.isArray(pre) || (pre.state === "absent" ? !exactKeys(pre, ["state"]) : pre.state !== "present" || !exactKeys(pre, ["digest", "state"]) || typeof pre.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(pre.digest))) return false;
   if (typeof rollback !== "object" || rollback === null || Array.isArray(rollback)) return false;
   if (rollback.kind === "delete-new-target") { if (!exactKeys(rollback, ["kind"]) || pre.state !== "absent" || "backupEvidence" in value) return false; }
-  else if (rollback.kind === "restore-backup") { if (!exactKeys(rollback, ["digest", "kind", "path"]) || pre.state !== "present" || typeof rollback.path !== "string" || !path.isAbsolute(rollback.path) || typeof rollback.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(rollback.digest) || !validEvidenceShape(value.backupEvidence) || !samePath(value.backupEvidence.path, rollback.path)) return false; }
+  else if (rollback.kind === "restore-backup") { if (!exactKeys(rollback, ["digest", "kind", "path"]) || pre.state !== "present" || rollback.digest !== pre.digest || typeof rollback.path !== "string" || !path.isAbsolute(rollback.path) || typeof rollback.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(rollback.digest) || !validEvidenceShape(value.backupEvidence) || !samePath(value.backupEvidence.path, rollback.path)) return false; }
   else return false;
+  if (value.missingParent !== undefined && (pre.state !== "absent" || value.targetClass !== "external")) return false;
   return value.targetClass === "generation" ? typeof value.generationId === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.generationId) : !("generationId" in value);
 }
 
@@ -252,6 +295,10 @@ export async function revalidatePersistedTransaction(store: OwnedStateStore, tra
   const generation = validateGenerationRelationship(transaction.participants); if (!generation.ok) return generation;
   if (transaction.participants.some((item) => item.targetClass === "external") && codec.authorizeExternal === undefined) return fail("unknown-producer", "External target callback is unavailable; operation remains inert");
   if (!codec.validatePlan(transaction.participants).ok) return fail("invalid-producer-data", "Producer rejected persisted plan");
+  for (const participant of transaction.participants) if (participant.targetClass === "external") {
+    const authorized = await codec.authorizeExternal?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
+    if (authorized === undefined || !authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted external authority");
+  }
   const derivedLocks = codec.requiredLocks(transaction.confirmationSummary, transaction.participants);
   if (!derivedLocks.ok || !lockIdentitiesEqual(derivedLocks.value, transaction.requiredLocks)) return fail("invalid-producer-data", "Producer required-lock derivation changed");
   const summary = canonicalJsonBytes(transaction.confirmationSummary); const plan = canonicalJsonBytes({ participants: transaction.participants.map(participantForDigest), requiredLocks: transaction.requiredLocks });
@@ -261,23 +308,24 @@ export async function revalidatePersistedTransaction(store: OwnedStateStore, tra
     if (participant.targetClass === "owned" && !isContainedPath(partition.value, participant.targetPath)) return fail("unsafe-target", "Owned participant escaped its partition");
     if (participant.targetClass === "generation" && !isContainedPath(store.generationsRoot, participant.targetPath)) return fail("unsafe-target", "Generation escaped this profile");
     if (!isContainedPath(store.stagingRoot, participant.stagedPath) || !await validateEvidence(participant.stagedEvidence!, false) || await fileDigest(participant.stagedPath) !== participant.stagedDigest) return fail("changed-staged", "Persisted staged payload changed or lost canonical authority");
-    if (!await validateEvidence(participant.targetEvidence!, false)) return fail("unsafe-target", "Target parent identity or canonical authority changed");
+    if (participant.missingParent === undefined && !await validateEvidence(participant.targetEvidence!, false)) return fail("unsafe-target", "Target parent identity or canonical authority changed");
+    if (participant.missingParent !== undefined) { const ancestor = participant.missingParent; try { const stat = await ordinaryDirectory(ancestor.canonicalAncestor); if (stat.dev.toString() !== ancestor.ancestorDev || stat.ino.toString() !== ancestor.ancestorIno || !samePath(await fs.realpath(ancestor.canonicalAncestor), ancestor.canonicalAncestor)) return fail("unsafe-target", "Missing-parent ancestor authority changed"); } catch { return fail("unsafe-target", "Missing-parent ancestor authority changed"); } }
     if (participant.rollback.kind === "restore-backup" && (!isContainedPath(store.stagingRoot, participant.rollback.path) || participant.backupEvidence === undefined || !await validateEvidence(participant.backupEvidence, false) || await fileDigest(participant.rollback.path) !== participant.rollback.digest)) return fail("invalid-rollback", "Rollback backup changed or escaped");
   }
   return { ok: true, value: undefined };
 }
 
-export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement";
+export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-parent-creation" | "after-parent-creation" | "before-parent-identity-journal" | "after-parent-identity-journal" | "before-parent-publication" | "after-parent-publication" | "before-parent-removal" | "after-parent-removal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement";
 export interface TransactionFaultSeam { readonly hit: (phase: TransactionFaultPhase, participantIndex?: number) => void | Promise<void> }
 const NO_FAULTS: TransactionFaultSeam = Object.freeze({ hit: () => undefined });
 export interface TransactionJournal extends PreparedTransaction {
   readonly format: "picc-transaction-journal"; readonly formatVersion: 1; readonly lockBindings: readonly JournalLockBinding[];
-  readonly completed: number; readonly rolledBack: number; readonly state: "prepared" | "pending" | "rolling-back";
+  readonly completed: number; readonly rolledBack: number; readonly createdParents: readonly (CreatedParentEvidence | null)[]; readonly state: "prepared" | "pending" | "rolling-back";
 }
 export type PrecommitFailureCategory = "cancelled" | "stale-precondition" | "changed-staged" | "storage-failure";
 export interface TransactionReceipt extends PreparedTransaction {
   readonly format: "picc-transaction-receipt"; readonly formatVersion: 1; readonly lockBindings: readonly JournalLockBinding[];
-  readonly outcome: "committed" | "rolled-back" | "failed-before-commit"; readonly completed: number;
+  readonly outcome: "committed" | "rolled-back" | "failed-before-commit"; readonly completed: number; readonly createdParents: readonly (CreatedParentEvidence | null)[];
   readonly failureCategory?: PrecommitFailureCategory; readonly generationId?: string;
 }
 export type TransactionOutcome =
@@ -334,34 +382,145 @@ async function persistReceipt(store: OwnedStateStore, receipt: TransactionReceip
   await leaseBoundary(store, lease, receipt.operationId, receipt.lockBindings, receipt.requiredLocks); await faults.hit("after-receipt");
   await leaseBoundary(store, lease, receipt.operationId, receipt.lockBindings, receipt.requiredLocks);
 }
-async function authorize(codec: TransactionProducerCodec, operationId: string, participant: TransactionParticipant, mutation: ExternalMutation): Promise<void> {
-  if (participant.targetClass !== "external") return;
-  const result = await codec.authorizeExternal?.({ operationId, participant, mutation }); if (result === undefined || !result.ok) throw new Error("external-authority");
+async function authorize(codec: TransactionProducerCodec, operationId: string, participant: TransactionParticipant, mutation: ExternalMutation, temporary?: AdjacentTemporaryEvidence): Promise<ExternalAuthorization | undefined> {
+  if (participant.targetClass !== "external") return undefined;
+  const result = await codec.authorizeExternal?.({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
+  if (result === undefined || !result.ok) throw new Error("external-authority");
+  return result.value === undefined ? undefined : result.value;
 }
-async function validateFinalMutationTarget(participant: TransactionParticipant, mutation: ExternalMutation): Promise<void> {
+async function captureTemporary(handle: FileHandle, temporary: string, digest: Sha256): Promise<AdjacentTemporaryEvidence> {
+  const opened = await handle.stat({ bigint: true }); const pathname = await fs.lstat(temporary, { bigint: true });
+  if (!opened.isFile() || opened.nlink !== 1n || !pathname.isFile() || pathname.isSymbolicLink() || opened.dev !== pathname.dev || opened.ino !== pathname.ino || !samePath(await fs.realpath(temporary), temporary)) throw new Error("temporary-identity");
+  return Object.freeze({ path: temporary, dev: opened.dev.toString(), ino: opened.ino.toString(), digest });
+}
+async function validateTemporary(temporary: AdjacentTemporaryEvidence): Promise<boolean> {
+  try {
+    const handle = await fs.open(temporary.path, constants.O_RDONLY);
+    try {
+      const opened = await handle.stat({ bigint: true }); const pathname = await fs.lstat(temporary.path, { bigint: true });
+      if (!opened.isFile() || opened.nlink !== 1n || !pathname.isFile() || pathname.isSymbolicLink() || opened.dev !== pathname.dev || opened.ino !== pathname.ino
+        || opened.dev.toString() !== temporary.dev || opened.ino.toString() !== temporary.ino || !samePath(await fs.realpath(temporary.path), temporary.path)) return false;
+      const bytes = await handle.readFile(); const after = await fs.lstat(temporary.path, { bigint: true });
+      return after.dev === opened.dev && after.ino === opened.ino && sha256(bytes) === temporary.digest;
+    } finally { await handle.close(); }
+  } catch { return false; }
+}
+async function createdParentLocation(participant: TransactionParticipant, created: CreatedParentEvidence | null | undefined): Promise<string | undefined> {
+  if (participant.missingParent === undefined || created === null || created === undefined || !samePath(created.finalPath, participant.missingParent.path)) return undefined;
+  try {
+    const ancestor = await ordinaryDirectory(participant.missingParent.canonicalAncestor);
+    if (ancestor.dev.toString() !== participant.missingParent.ancestorDev || ancestor.ino.toString() !== participant.missingParent.ancestorIno || !samePath(await fs.realpath(participant.missingParent.canonicalAncestor), participant.missingParent.canonicalAncestor)) return undefined;
+    for (const candidate of [created.finalPath, created.temporaryPath]) {
+      try { const parent = await ordinaryDirectory(candidate); if (parent.dev.toString() === created.dev && parent.ino.toString() === created.ino && samePath(await fs.realpath(candidate), candidate)) return candidate; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
+    }
+    return undefined;
+  } catch { return undefined; }
+}
+async function validateCreatedParent(participant: TransactionParticipant, created: CreatedParentEvidence | null | undefined, requireFinal = true): Promise<boolean> {
+  const location = await createdParentLocation(participant, created); return location !== undefined && (!requireFinal || samePath(location, created!.finalPath));
+}
+async function validateParticipantTarget(participant: TransactionParticipant, requireOriginalTarget: boolean, created?: CreatedParentEvidence | null): Promise<boolean> {
+  if (participant.missingParent !== undefined && !await validateCreatedParent(participant, created)) return false;
+  if (participant.missingParent === undefined && !await validateEvidence(participant.targetEvidence!, requireOriginalTarget)) return false;
+  if (requireOriginalTarget) { const target = await ordinaryFile(participant.targetPath); return participant.targetEvidence?.targetDev === target.dev.toString() && participant.targetEvidence?.targetIno === target.ino.toString(); }
+  return true;
+}
+async function validateFinalMutationTarget(participant: TransactionParticipant, mutation: ExternalMutation, created?: CreatedParentEvidence | null): Promise<void> {
   const requireOriginalTarget = mutation === "replace" && participant.precondition.state === "present";
-  if (!await validateEvidence(participant.targetEvidence!, requireOriginalTarget)) throw new Error("target-authority");
+  if (!await validateParticipantTarget(participant, requireOriginalTarget, created)) throw new Error("target-authority");
   if (mutation === "replace") { if (!await casMatches(participant)) throw new Error("stale-precondition"); }
   else if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
 }
-async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, operationId: string, bindings: readonly JournalLockBinding[], requiredLocks: readonly LifecycleLockIdentity[], codec: TransactionProducerCodec, participant: TransactionParticipant, bytes: Uint8Array, faults: TransactionFaultSeam, index: number, mutation: ExternalMutation): Promise<void> {
+async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, operationId: string, bindings: readonly JournalLockBinding[], requiredLocks: readonly LifecycleLockIdentity[], codec: TransactionProducerCodec, participant: TransactionParticipant, bytes: Uint8Array, faults: TransactionFaultSeam, index: number, mutation: ExternalMutation, created?: CreatedParentEvidence | null): Promise<void> {
   const generation = participant.targetClass === "generation"; if (generation) { await faults.hit("before-generation-marker", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); }
-  await faults.hit("before-temp-write", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); const temporary = `${participant.targetPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  await faults.hit("before-temp-write", index); const temporaryPath = `${participant.targetPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let temporary: AdjacentTemporaryEvidence | undefined;
   try {
-    const handle = await fs.open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    try { await handle.writeFile(bytes); await faults.hit("after-temp-write", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); await handle.sync(); await faults.hit("after-flush", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); }
-    finally { await handle.close(); }
+    await validateFinalMutationTarget(participant, mutation, created);
+    await authorize(codec, operationId, participant, mutation);
     await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
-    if (!await validateEvidence(participant.targetEvidence!, mutation === "replace" && participant.precondition.state === "present")) throw new Error("target-authority");
-    if (mutation === "replace" && !await casMatches(participant)) throw new Error("stale-precondition");
-    if (mutation === "rollback" && await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
-    await authorize(codec, operationId, participant, mutation); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); await faults.hit("before-replacement", index);
-    await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
-    await renameReplace(temporary, participant.targetPath, async () => { await leaseBoundary(store, lease, operationId, bindings, requiredLocks); await validateFinalMutationTarget(participant, mutation); });
+    const handle = await fs.open(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    try {
+      temporary = await captureTemporary(handle, temporaryPath, sha256(bytes));
+      await handle.writeFile(bytes); await faults.hit("after-temp-write", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); await handle.sync(); await faults.hit("after-flush", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
+    } finally { await handle.close(); }
+    await faults.hit("before-replacement", index);
+    await renameReplace(temporaryPath, participant.targetPath, async () => {
+      if (!await validateTemporary(temporary!) || !await validateParticipantTarget(participant, mutation === "replace" && participant.precondition.state === "present", created)) throw new Error("temporary-identity");
+      if (mutation === "replace" && !await casMatches(participant)) throw new Error("stale-precondition");
+      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
+      const authorization = await authorize(codec, operationId, participant, mutation, temporary);
+      if (authorization?.temporaryMode === undefined) {
+        await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
+        return;
+      }
+      await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
+      await fs.chmod(temporaryPath, authorization.temporaryMode);
+      if (!await validateTemporary(temporary!) || !await validateParticipantTarget(participant, mutation === "replace" && participant.precondition.state === "present", created)) throw new Error("temporary-identity");
+      if (mutation === "replace" && !await casMatches(participant)) throw new Error("stale-precondition");
+      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
+      await authorize(codec, operationId, participant, mutation, temporary);
+      await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
+    });
     await syncDirectory(path.dirname(participant.targetPath)); await faults.hit("after-replacement", index);
     await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
     if (generation) { await faults.hit("after-generation-marker", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); }
-  } catch (error) { if (await validateEvidence(participant.targetEvidence!, false)) await fs.rm(temporary, { force: true }).catch(() => undefined); throw error; }
+  } catch (error) {
+    try {
+      if (temporary === undefined || !await validateTemporary(temporary) || !await validateParticipantTarget(participant, false, created)) throw new Error("uncertain-temporary");
+      await authorize(codec, operationId, participant, mutation, temporary);
+      await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
+      await fs.rm(temporaryPath);
+    } catch { /* Uncertain adjacent residue is inactive and retained. */ }
+    throw error;
+  }
+}
+async function ensureMissingParent(store: OwnedStateStore, lease: LifecycleLockLease, journal: TransactionJournal, codec: TransactionProducerCodec, index: number, faults: TransactionFaultSeam, onJournal?: (updated: TransactionJournal) => void): Promise<{ readonly journal: TransactionJournal; readonly created?: CreatedParentEvidence }> {
+  const participant = journal.participants[index]!; if (participant.missingParent === undefined) return { journal };
+  let updated = journal; let recorded = journal.createdParents[index];
+  if (recorded === null) {
+    const request = participant.missingParent; const ancestor = await ordinaryDirectory(request.canonicalAncestor);
+    if (ancestor.dev.toString() !== request.ancestorDev || ancestor.ino.toString() !== request.ancestorIno || !samePath(await fs.realpath(request.canonicalAncestor), request.canonicalAncestor)) throw new Error("target-authority");
+    try { await fs.lstat(request.path); throw new Error("parent-preexisting"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    await faults.hit("before-parent-creation", index);
+    const temporaryPath = `${request.path}.parent-tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+    const before = await ordinaryDirectory(request.canonicalAncestor); if (before.dev.toString() !== request.ancestorDev || before.ino.toString() !== request.ancestorIno || !samePath(await fs.realpath(request.canonicalAncestor), request.canonicalAncestor)) throw new Error("target-authority");
+    try { await fs.lstat(temporaryPath); throw new Error("parent-temporary-preexisting"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    await authorize(codec, journal.operationId, participant, "create-parent");
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    await fs.mkdir(temporaryPath); const stat = await ordinaryDirectory(temporaryPath); recorded = Object.freeze({ temporaryPath, finalPath: request.path, dev: stat.dev.toString(), ino: stat.ino.toString() });
+    await faults.hit("after-parent-creation", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    await faults.hit("before-parent-identity-journal", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    const createdParents = [...journal.createdParents]; createdParents[index] = recorded; updated = Object.freeze({ ...journal, createdParents: Object.freeze(createdParents) });
+    await persistJournal(store, updated, lease, NO_FAULTS); onJournal?.(updated);
+    await faults.hit("after-parent-identity-journal", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+  }
+  if (recorded === undefined) throw new Error("target-authority");
+  const location = await createdParentLocation(participant, recorded); if (location === undefined) throw new Error("target-authority");
+  if (samePath(location, recorded.finalPath)) return { journal: updated, created: recorded };
+  await faults.hit("before-parent-publication", index);
+  if (!samePath(await createdParentLocation(participant, recorded) ?? "", recorded.temporaryPath)) throw new Error("target-authority");
+  try { await fs.lstat(recorded.finalPath); throw new Error("parent-preexisting"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  await authorize(codec, journal.operationId, participant, "create-parent");
+  await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+  await fs.rename(recorded.temporaryPath, recorded.finalPath); await syncDirectory(path.dirname(recorded.finalPath));
+  await faults.hit("after-parent-publication", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+  if (!await validateCreatedParent(participant, recorded)) throw new Error("target-authority");
+  return { journal: updated, created: recorded };
+}
+async function removeCreatedParent(store: OwnedStateStore, lease: LifecycleLockLease, journal: TransactionJournal, codec: TransactionProducerCodec, index: number, faults: TransactionFaultSeam): Promise<void> {
+  const participant = journal.participants[index]!; const created = journal.createdParents[index]; if (participant.missingParent === undefined || created === null || created === undefined) return;
+  let location = await createdParentLocation(participant, created); if (location === undefined) return;
+  await faults.hit("before-parent-removal", index);
+  try {
+    if (!samePath(await createdParentLocation(participant, created) ?? "", location)) throw new Error("target-authority");
+    await authorize(codec, journal.operationId, participant, "remove-parent");
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    await fs.rmdir(location); await syncDirectory(path.dirname(location));
+  }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" && (error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  await faults.hit("after-parent-removal", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
 }
 async function casMatches(participant: TransactionParticipant): Promise<boolean> { const digest = await fileDigest(participant.targetPath); return participant.precondition.state === "absent" ? digest === undefined : digest === participant.precondition.digest; }
 export function completedGenerationId(transaction: PreparedTransaction, completed: number): string | undefined {
@@ -371,10 +530,10 @@ function receiptFrom(journal: TransactionJournal, outcome: TransactionReceipt["o
   const terminalCompleted = outcome === "committed" ? journal.participants.length : 0; const generationId = outcome === "committed" ? completedGenerationId(journal, journal.participants.length) : undefined;
   return Object.freeze({ format: "picc-transaction-receipt", formatVersion: 1, operationId: journal.operationId, producerSchema: journal.producerSchema, producerVersion: journal.producerVersion,
     confirmationSummary: journal.confirmationSummary, confirmationDigest: journal.confirmationDigest, participants: journal.participants, requiredLocks: journal.requiredLocks, planDigest: journal.planDigest,
-    lockBindings: journal.lockBindings, outcome, completed: terminalCompleted, ...(failureCategory === undefined ? {} : { failureCategory }), ...(generationId === undefined ? {} : { generationId }) });
+    lockBindings: journal.lockBindings, outcome, completed: terminalCompleted, createdParents: journal.createdParents, ...(failureCategory === undefined ? {} : { failureCategory }), ...(generationId === undefined ? {} : { generationId }) });
 }
 
-const JOURNAL_KEYS = ["completed", "confirmationDigest", "confirmationSummary", "format", "formatVersion", "lockBindings", "operationId", "participants", "planDigest", "producerSchema", "producerVersion", "requiredLocks", "rolledBack", "state"];
+const JOURNAL_KEYS = ["completed", "confirmationDigest", "confirmationSummary", "createdParents", "format", "formatVersion", "lockBindings", "operationId", "participants", "planDigest", "producerSchema", "producerVersion", "requiredLocks", "rolledBack", "state"];
 function validBindings(raw: unknown): raw is readonly JournalLockBinding[] {
   return Array.isArray(raw) && raw.length > 0 && raw.length <= 128 && raw.every((entry) => typeof entry === "object" && entry !== null && !Array.isArray(entry)
     && exactKeys(entry as Record<string, unknown>, ["generation", "key", "kind", "nonce"])
@@ -440,17 +599,21 @@ function readCanonicalObjectSync(candidate: string): StoreResult<Record<string, 
     const canonical = canonicalJsonBytes(parsed); return canonical.ok && Buffer.from(canonical.value).equals(bytes) ? { ok: true, value: parsed as Record<string, unknown> } : fail("invalid-data", "Persisted transaction artifact is invalid");
   } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { ok: true, value: undefined } : fail("invalid-data", "Persisted transaction artifact is invalid"); }
 }
+function validCreatedParents(raw: unknown, participants: readonly TransactionParticipant[]): raw is readonly (CreatedParentEvidence | null)[] {
+  return Array.isArray(raw) && raw.length === participants.length && raw.every((item, index) => item === null
+    || validCreatedParent(item) && participants[index]?.missingParent !== undefined && samePath(item.finalPath, participants[index]!.missingParent!.path));
+}
 function decodeReceiptStructure(store: OwnedStateStore, operationId: string, parsed: Record<string, unknown>): StoreResult<TransactionReceipt> {
-  const optional = ["failureCategory", "generationId"].filter((key) => key in parsed); const expected = ["completed", "confirmationDigest", "confirmationSummary", "format", "formatVersion", "lockBindings", "operationId", "outcome", "participants", "planDigest", "producerSchema", "producerVersion", "requiredLocks", ...optional];
+  const optional = ["failureCategory", "generationId"].filter((key) => key in parsed); const expected = ["completed", "confirmationDigest", "confirmationSummary", "createdParents", "format", "formatVersion", "lockBindings", "operationId", "outcome", "participants", "planDigest", "producerSchema", "producerVersion", "requiredLocks", ...optional];
   const base = parsePreparedBase(parsed, operationId);
-  if (!exactKeys(parsed, expected) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-receipt" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || (parsed.outcome !== "committed" && parsed.outcome !== "rolled-back" && parsed.outcome !== "failed-before-commit") || !Number.isSafeInteger(parsed.completed)) return fail("invalid-receipt", "Stored transaction receipt is invalid");
+  if (!exactKeys(parsed, expected) || !base.ok || !validCreatedParents(parsed.createdParents, base.value.participants) || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-receipt" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || (parsed.outcome !== "committed" && parsed.outcome !== "rolled-back" && parsed.outcome !== "failed-before-commit") || !Number.isSafeInteger(parsed.completed)) return fail("invalid-receipt", "Stored transaction receipt is invalid");
   const complete = parsed.outcome === "committed"; const generation = completedGenerationId(base.value, base.value.participants.length);
   if ((complete ? parsed.completed !== base.value.participants.length : parsed.completed !== 0) || (parsed.outcome === "failed-before-commit" ? !(["cancelled", "stale-precondition", "changed-staged", "storage-failure"] as unknown[]).includes(parsed.failureCategory) : "failureCategory" in parsed) || (complete ? (generation === undefined ? "generationId" in parsed : parsed.generationId !== generation) : "generationId" in parsed)) return fail("invalid-receipt", "Receipt outcome/completion/generation relationship is invalid");
   return { ok: true, value: parsed as unknown as TransactionReceipt };
 }
 function decodeJournalStructure(store: OwnedStateStore, operationId: string, parsed: Record<string, unknown>): StoreResult<TransactionJournal> {
   const base = parsePreparedBase(parsed, operationId);
-  if (!exactKeys(parsed, JOURNAL_KEYS) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-journal" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || !Number.isSafeInteger(parsed.completed) || !Number.isSafeInteger(parsed.rolledBack) || typeof parsed.completed !== "number" || typeof parsed.rolledBack !== "number" || parsed.completed < 0 || parsed.completed > base.value.participants.length || parsed.rolledBack < 0 || parsed.rolledBack > parsed.completed || (parsed.state !== "prepared" && parsed.state !== "pending" && parsed.state !== "rolling-back") || (parsed.state === "prepared" && (parsed.completed !== 0 || parsed.rolledBack !== 0)) || (parsed.state !== "rolling-back" && parsed.rolledBack !== 0)) return fail("invalid-journal", "Stored transaction journal relationships are invalid");
+  if (!exactKeys(parsed, JOURNAL_KEYS) || !base.ok || !validCreatedParents(parsed.createdParents, base.value.participants) || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-journal" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || !Number.isSafeInteger(parsed.completed) || !Number.isSafeInteger(parsed.rolledBack) || typeof parsed.completed !== "number" || typeof parsed.rolledBack !== "number" || parsed.completed < 0 || parsed.completed > base.value.participants.length || parsed.rolledBack < 0 || parsed.rolledBack > parsed.completed || (parsed.state !== "prepared" && parsed.state !== "pending" && parsed.state !== "rolling-back") || (parsed.state === "prepared" && (parsed.completed !== 0 || parsed.rolledBack !== 0)) || (parsed.state !== "rolling-back" && parsed.rolledBack !== 0)) return fail("invalid-journal", "Stored transaction journal relationships are invalid");
   return { ok: true, value: parsed as unknown as TransactionJournal };
 }
 export interface PassiveTransactionObservation {
@@ -477,7 +640,7 @@ export async function readTransactionJournal(store: OwnedStateStore, operationId
   const raw = await readCanonicalObject(journalPath(store, operationId)); if (!raw.ok || raw.value === undefined) return fail("invalid-journal", "Stored transaction journal is missing or invalid");
   const structural = decodeJournalStructure(store, operationId, raw.value); if (!structural.ok) return structural; const parsed = structural.value;
   let completed = parsed.completed; let rolledBack = parsed.rolledBack;
-  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const p = parsed.participants[completed - rolledBack - 1]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; rolledBack += 1; } }
+  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const index = completed - rolledBack - 1; const p = parsed.participants[index]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; const created = parsed.createdParents[index]; if (created !== null && await createdParentLocation(p, created) !== undefined) break; rolledBack += 1; } }
   else { while (completed < parsed.participants.length && await fileDigest(parsed.participants[completed]!.targetPath) === parsed.participants[completed]!.stagedDigest) completed += 1; }
   return { ok: true, value: Object.freeze({ ...parsed, completed, rolledBack, state: parsed.state === "rolling-back" ? "rolling-back" : completed > 0 ? "pending" : parsed.state }) };
 }
@@ -521,14 +684,15 @@ export async function executeTransaction(store: OwnedStateStore, prepared: Prepa
   const pending = await listPendingJournals(store); if (!pending.ok || pending.value.length > 0) return { state: "pending-recovery", operationId: prepared.operationId, completed: 0, cause: pending.ok ? `Pending operation ${pending.value[0]} requires explicit recovery` : pending.message };
   // Preparation captured immutable data and callback references, but publication still reruns the
   // producer and digest bindings. Filesystem CAS/staging checks follow the journal so failures are durable.
-  let journal: TransactionJournal = Object.freeze({ ...prepared, format: "picc-transaction-journal", formatVersion: 1, lockBindings: lease.bindings, completed: 0, rolledBack: 0, state: "prepared" }); const faults = options.faults ?? NO_FAULTS;
+  let journal: TransactionJournal = Object.freeze({ ...prepared, format: "picc-transaction-journal", formatVersion: 1, lockBindings: lease.bindings, completed: 0, rolledBack: 0, createdParents: Object.freeze(prepared.participants.map(() => null)), state: "prepared" }); const faults = options.faults ?? NO_FAULTS;
   try {
     await persistJournal(store, journal, lease, faults, true, undefined, () => revalidatePreparedAuthority(store, prepared, capability.codec));
     for (let index = 0; index < journal.participants.length; index += 1) {
       if (options.signal?.aborted === true) throw new Error("cancelled"); const participant = journal.participants[index]!;
-      await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks); if (!await validateEvidence(participant.targetEvidence!, participant.precondition.state === "present")) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("stale-precondition");
+      const parent = await ensureMissingParent(store, lease, journal, capability.codec, index, faults, (updated) => { journal = updated; }); journal = parent.journal;
+      await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks); if (!await validateParticipantTarget(participant, participant.precondition.state === "present", parent.created)) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("stale-precondition");
       const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest || !await validateEvidence(participant.stagedEvidence!, false)) throw new Error("changed-staged");
-      try { await atomicReplace(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks, capability.codec, participant, payload, faults, index, "replace"); }
+      try { await atomicReplace(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks, capability.codec, participant, payload, faults, index, "replace", parent.created); }
       catch (error) { if (await fileDigest(participant.targetPath) === participant.stagedDigest) { journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
       journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, faults, false, index);
     }
@@ -538,6 +702,7 @@ export async function executeTransaction(store: OwnedStateStore, prepared: Prepa
   } catch (error) {
     const stored = await readTransactionReceipt(store, journal.operationId); if (stored.ok && stored.value !== undefined) return deliver(outcomeFromReceipt(stored.value), options);
     if (journal.completed > 0) return deliver({ state: "pending-recovery", operationId: journal.operationId, completed: journal.completed, cause: "Transaction interrupted after a committed safe prefix" }, options);
+    for (let index = 0; index < journal.participants.length; index += 1) if (journal.createdParents[index] !== null) await removeCreatedParent(store, lease, journal, capability.codec, index, NO_FAULTS).catch(() => undefined);
     const receipt = receiptFrom(journal, "failed-before-commit", classify(error, options.signal));
     try { await persistReceipt(store, receipt, lease, NO_FAULTS); await retireJournal(store, journal, lease, NO_FAULTS).catch(() => undefined); const reread = await readTransactionReceipt(store, journal.operationId); if (reread.ok && reread.value !== undefined) return deliver(outcomeFromReceipt(reread.value), options); }
     catch { const reread = await readTransactionReceipt(store, journal.operationId); if (reread.ok && reread.value !== undefined) return deliver(outcomeFromReceipt(reread.value), options); }
@@ -563,8 +728,8 @@ export async function completeJournal(store: OwnedStateStore, journal: Transacti
   let current = journal;
   try {
     for (let index = 0; index < current.completed; index += 1) if (await fileDigest(current.participants[index]!.targetPath) !== current.participants[index]!.stagedDigest) throw new Error("prefix changed");
-    for (let index = current.completed; index < current.participants.length; index += 1) { const participant = current.participants[index]!; await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateEvidence(participant.targetEvidence!, participant.precondition.state === "present")) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("CAS"); const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest) throw new Error("staged");
-      try { await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, payload, faults, index, "replace"); } catch (error) { if (await fileDigest(participant.targetPath) === participant.stagedDigest) { current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
+    for (let index = current.completed; index < current.participants.length; index += 1) { const participant = current.participants[index]!; const parent = await ensureMissingParent(store, lease, current, codec, index, faults, (updated) => { current = updated; }); current = parent.journal; await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateParticipantTarget(participant, participant.precondition.state === "present", parent.created)) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("CAS"); const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest) throw new Error("staged");
+      try { await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, payload, faults, index, "replace", parent.created); } catch (error) { if (await fileDigest(participant.targetPath) === participant.stagedDigest) { current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
       current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, faults, false, index); }
     const receipt = receiptFrom(current, "committed"); await persistReceipt(store, receipt, lease, faults); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
   } catch { const receipt = await readTransactionReceipt(store, current.operationId); return receipt.ok && receipt.value !== undefined ? { ok: true, value: receipt.value } : fail("recovery-interrupted", "Explicit completion remains pending"); }
@@ -576,10 +741,14 @@ export async function rollbackJournal(store: OwnedStateStore, journal: Transacti
     // durably rollback-only, including a fault before the first progress-journal update.
     await persistJournal(store, current, lease, NO_FAULTS);
     for (let index = current.completed - current.rolledBack - 1; index >= 0; index -= 1) { const participant = current.participants[index]!; const rollbackDigest = participant.rollback.kind === "delete-new-target" ? undefined : participant.rollback.digest; const observed = await fileDigest(participant.targetPath); if (observed !== participant.stagedDigest && observed !== rollbackDigest) throw new Error("target changed");
-      if (observed === participant.stagedDigest) { await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateEvidence(participant.targetEvidence!, false)) throw new Error("target-authority");
-        if (participant.rollback.kind === "delete-new-target") { if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed"); await authorize(codec, current.operationId, participant, "delete"); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await faults.hit("before-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await validateFinalMutationTarget(participant, "delete"); await fs.rm(participant.targetPath); await syncDirectory(path.dirname(participant.targetPath)); await faults.hit("after-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); }
-        else { const backup = await fs.readFile(participant.rollback.path); if (sha256(backup) !== participant.rollback.digest) throw new Error("backup"); await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, backup, faults, index, "rollback"); } }
+      if (observed === participant.stagedDigest) { await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateParticipantTarget(participant, false, current.createdParents[index])) throw new Error("target-authority");
+        if (participant.rollback.kind === "delete-new-target") { if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed"); await faults.hit("before-replacement", index); await validateFinalMutationTarget(participant, "delete", current.createdParents[index]); await authorize(codec, current.operationId, participant, "delete"); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await fs.rm(participant.targetPath); await syncDirectory(path.dirname(participant.targetPath)); await faults.hit("after-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); }
+        else { const backup = await fs.readFile(participant.rollback.path); if (participant.precondition.state !== "present" || sha256(backup) !== participant.precondition.digest || participant.rollback.digest !== participant.precondition.digest) throw new Error("backup"); await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, backup, faults, index, "rollback", current.createdParents[index]); } }
+      await removeCreatedParent(store, lease, current, codec, index, faults);
       current = Object.freeze({ ...current, rolledBack: current.rolledBack + 1 }); await persistJournal(store, current, lease, faults, false, index); }
+    // A process may die after journaling a created parent but before committing its participant.
+    // Reconcile every remaining identity before publishing terminal rollback truth.
+    for (let index = 0; index < current.createdParents.length; index += 1) if (current.createdParents[index] !== null) await removeCreatedParent(store, lease, current, codec, index, faults);
     const receipt = receiptFrom(current, "rolled-back"); await persistReceipt(store, receipt, lease, faults); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
   } catch { const receipt = await readTransactionReceipt(store, current.operationId); return receipt.ok && receipt.value !== undefined ? { ok: true, value: receipt.value } : fail("recovery-interrupted", "Explicit rollback remains pending"); }
 }

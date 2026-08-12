@@ -111,7 +111,10 @@ function registrationSource(rawRecord: unknown, scope?: Scope): PluginMarketplac
     const descriptor = own(rawRecord, "descriptor");
     raw = plain(descriptor) ? normalizedRawDescriptor(descriptor) : undefined;
   } else if (plain(rawRecord) && plain(own(rawRecord, "source"))) {
-    raw = own(rawRecord, "source") as Record<string, unknown>;
+    if (own(rawRecord, "autoUpdate") !== undefined && typeof own(rawRecord, "autoUpdate") !== "boolean") return { validity: "invalid" };
+    const selected = own(rawRecord, "source") as Record<string, unknown>;
+    if (own(selected, "skipLfs") !== undefined && typeof own(selected, "skipLfs") !== "boolean") return { validity: "invalid" };
+    raw = Object.fromEntries(Object.entries(selected).filter(([key]) => key !== "skipLfs"));
   }
   if (raw === undefined) return { validity: "invalid" };
 
