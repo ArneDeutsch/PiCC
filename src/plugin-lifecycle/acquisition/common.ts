@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { normalizePortableRelativePath, routeCatalogPluginSource, routeMarketplaceSource } from "../source-matrix.js";
 import type { OwnedStateStore } from "../state-store.js";
 import type { MaterializedPluginTree, PluginTreeEntry } from "../tree-materializer.js";
-import { PLUGIN_LIFECYCLE_LIMITS, type CatalogPluginSource, type MarketplaceRegistrationSource, type Sha256 } from "../types.js";
+import { PLUGIN_LIFECYCLE_LIMITS, type CatalogPluginSource, type MarketplaceRegistrationSource, type QualifiedPluginIdentity, type Sha256 } from "../types.js";
+import { MAX_QUALIFIED_PLUGIN_ID_LENGTH, parseQualifiedPluginId } from "../../util/plugin-id.js";
+import { isDocumentedMarketplaceName } from "../../util/plugin-marketplace-descriptor.js";
 
 export const ACQUISITION_LIMITS = Object.freeze({
   maximumCatalogBytes: 1024 * 1024,
@@ -44,9 +46,19 @@ export interface ReviewedHttpIdentity {
   readonly redirected: boolean;
 }
 
+export interface ReviewedRetainedMarketplaceIdentity {
+  readonly kind: "retained-marketplace-snapshot";
+  readonly marketplaceName: string;
+  readonly snapshotId: `marketplace-${string}`;
+  readonly source: MarketplaceRegistrationSource;
+  readonly catalogDigest: Sha256;
+  readonly artifactDigest: Sha256;
+  readonly treeDigest: Sha256;
+}
+
 export interface AcquisitionProvenance {
   readonly adapter: "local-directory-snapshot" | "local-catalog-snapshot" | "public-https-catalog" | "public-https-zip" | "marketplace-relative-tree";
-  readonly reviewed: ReviewedLocalIdentity | ReviewedHttpIdentity;
+  readonly reviewed: ReviewedLocalIdentity | ReviewedHttpIdentity | ReviewedRetainedMarketplaceIdentity;
   readonly artifactDigest: Sha256;
   readonly selectedRoot: MaterializedPluginTree["rootSelection"] | { readonly requested: "catalog-document"; readonly path: ""; readonly usedSingleWrapper: false };
   readonly marketplaceSnapshotId?: `marketplace-${string}`;
@@ -67,15 +79,66 @@ export interface MarketplaceSnapshotEvidence {
 }
 
 declare const pluginEvidenceBrand: unique symbol;
-export interface PluginAcquisitionEvidence {
+interface PluginAcquisitionEvidenceBase {
   readonly [pluginEvidenceBrand]: true;
   readonly kind: "plugin-acquisition";
-  readonly source: CatalogPluginSource;
   readonly artifactDigest: Sha256;
   readonly treeDigest: Sha256;
   readonly rootDigest: Sha256;
   readonly materialized: MaterializedPluginTree;
-  readonly provenance: AcquisitionProvenance;
+}
+export type PluginAcquisitionEvidence = PluginAcquisitionEvidenceBase & (
+  | {
+    readonly source: Extract<CatalogPluginSource, { readonly kind: "relative" }>;
+    readonly requestedPluginId: QualifiedPluginIdentity;
+    readonly provenance: AcquisitionProvenance & { readonly adapter: "marketplace-relative-tree"; readonly reviewed: ReviewedRetainedMarketplaceIdentity | ReviewedLocalIdentity };
+  }
+  | {
+    readonly source: Extract<CatalogPluginSource, { readonly kind: "https-zip" }>;
+    readonly provenance: AcquisitionProvenance & { readonly adapter: "public-https-zip"; readonly reviewed: ReviewedHttpIdentity };
+  }
+);
+
+export interface RetainedMarketplaceGenerationEvidence {
+  readonly marketplaceName: string;
+  readonly source: MarketplaceRegistrationSource;
+  readonly snapshotId: `marketplace-${string}`;
+  readonly catalogDigest: Sha256;
+  readonly catalog: Uint8Array;
+  readonly entries: readonly PluginTreeEntry[];
+  readonly reviewed: ReviewedRetainedMarketplaceIdentity;
+}
+declare const retainedMarketplaceGenerationBrand: unique symbol;
+export interface RetainedMarketplaceGenerationAuthority { readonly [retainedMarketplaceGenerationBrand]: true }
+interface RetainedMarketplaceGenerationIssuer {
+  readonly identity: Pick<RetainedMarketplaceGenerationEvidence, "source" | "snapshotId" | "catalogDigest">;
+  readonly store: OwnedStateStore;
+  readonly reopen: () => Promise<AcquisitionResult<RetainedMarketplaceGenerationEvidence>>;
+}
+const retainedMarketplaceGenerationAuthorities = new WeakMap<RetainedMarketplaceGenerationAuthority, RetainedMarketplaceGenerationIssuer>();
+export function issueRetainedMarketplaceGenerationAuthority(
+  identity: RetainedMarketplaceGenerationIssuer["identity"],
+  store: OwnedStateStore,
+  reopen: RetainedMarketplaceGenerationIssuer["reopen"],
+): RetainedMarketplaceGenerationAuthority {
+  const authority = Object.freeze({}) as RetainedMarketplaceGenerationAuthority;
+  retainedMarketplaceGenerationAuthorities.set(authority, Object.freeze({ identity: Object.freeze(identity), store, reopen }));
+  return authority;
+}
+export function inspectRetainedMarketplaceGenerationAuthority(
+  authority: RetainedMarketplaceGenerationAuthority,
+): RetainedMarketplaceGenerationIssuer["identity"] | undefined {
+  return retainedMarketplaceGenerationAuthorities.get(authority)?.identity;
+}
+export async function consumeRetainedMarketplaceGenerationAuthority(
+  authority: RetainedMarketplaceGenerationAuthority,
+  store: OwnedStateStore | undefined,
+): Promise<AcquisitionResult<RetainedMarketplaceGenerationEvidence>> {
+  const issuer = retainedMarketplaceGenerationAuthorities.get(authority);
+  if (issuer === undefined) return acquisitionFailure("unsafe-source", "Retained marketplace generation authority is unavailable or already consumed");
+  retainedMarketplaceGenerationAuthorities.delete(authority);
+  if (store !== issuer.store) return acquisitionFailure("unsafe-source", "Retained marketplace generation authority belongs to a different store");
+  return issuer.reopen();
 }
 
 interface MarketplacePrivate {
@@ -244,18 +307,28 @@ export function readMarketplaceSnapshotEvidence(evidence: MarketplaceSnapshotEvi
   };
 }
 
+type IssuablePluginAcquisitionEvidence<T> = T extends unknown ? Omit<T, typeof pluginEvidenceBrand> : never;
 export function issuePluginAcquisitionEvidence(
-  value: Omit<PluginAcquisitionEvidence, typeof pluginEvidenceBrand>,
+  value: IssuablePluginAcquisitionEvidence<PluginAcquisitionEvidence>,
   authority: AcquisitionAuthority,
 ): PluginAcquisitionEvidence {
   const adapter = acquisitionAuthorities.get(authority);
   const source = adapter === "public-https-zip" ? exactZipSource(value.source) : exactRelativeSource(value.source);
-  if (adapter !== value.provenance.adapter || (adapter !== "public-https-zip" && adapter !== "marketplace-relative-tree") || source === undefined) {
-    throw new Error("Plugin evidence requires exact adapter acquisition authority");
+  const relative = adapter === "marketplace-relative-tree";
+  const requestedPluginId = "requestedPluginId" in value ? value.requestedPluginId : undefined;
+  const requested = parseQualifiedPluginId(requestedPluginId, MAX_QUALIFIED_PLUGIN_ID_LENGTH);
+  const reviewed = value.provenance.reviewed;
+  if (adapter !== value.provenance.adapter || (adapter !== "public-https-zip" && !relative) || source === undefined
+    || (relative && (requested === undefined || !isDocumentedMarketplaceName(requested.lifecycleName)
+      || !isDocumentedMarketplaceName(requested.marketplaceName)
+      || (reviewed.kind !== "retained-marketplace-snapshot" && reviewed.kind !== "local-path")
+      || (reviewed.kind === "retained-marketplace-snapshot" && reviewed.marketplaceName !== requested.marketplaceName)))
+    || (!relative && requestedPluginId !== undefined)) {
+    throw new Error("Plugin evidence requires exact source-specific adapter acquisition authority");
   }
   acquisitionAuthorities.delete(authority);
   const evidence = Object.freeze({
-    kind: "plugin-acquisition" as const, source, artifactDigest: value.artifactDigest,
+    kind: "plugin-acquisition" as const, source, ...(relative ? { requestedPluginId } : {}), artifactDigest: value.artifactDigest,
     treeDigest: value.treeDigest, rootDigest: value.rootDigest,
     materialized: value.materialized, provenance: value.provenance,
   }) as PluginAcquisitionEvidence;

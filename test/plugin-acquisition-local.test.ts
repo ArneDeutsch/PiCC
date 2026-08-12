@@ -5,9 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { acquireLocalMarketplaceSnapshot } from "../src/plugin-lifecycle/acquisition/local.js";
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
-import { createMarketplaceGeneration, acquireMarketplaceRelativePlugin } from "../src/plugin-lifecycle/marketplace-generation.js";
+import { createMarketplaceGeneration, acquireMarketplaceRelativePlugin, issueMarketplaceGenerationFromOwnedAdmission } from "../src/plugin-lifecycle/marketplace-generation.js";
 import { establishOwnedStateStore, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
-import type { MarketplaceSnapshotEvidence } from "../src/plugin-lifecycle/acquisition/common.js";
+import { isPluginAcquisitionEvidence, type MarketplaceSnapshotEvidence } from "../src/plugin-lifecycle/acquisition/common.js";
 
 function probeNativeLinks(): { readonly directoryAlias: boolean; readonly hardlink: boolean } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-acquire-link-probe-"));
@@ -76,6 +76,7 @@ describe("local marketplace acquisition", () => {
       { store },
     );
     expect(result.ok).toBe(true);
+    expect(issueMarketplaceGenerationFromOwnedAdmission(Object.freeze({}) as never)).toMatchObject({ ok: false, error: { code: "unsafe-source" } });
     if (!result.ok) return;
     fs.writeFileSync(path.join(marketplace, "runtime", "plugins", "tool", "payload.txt"), "changed-source");
     fs.writeFileSync(path.join(marketplace, ".claude-plugin", "marketplace.json"), "{}");
@@ -85,24 +86,48 @@ describe("local marketplace acquisition", () => {
     if (!generation.ok) return;
     const plugin = await acquireMarketplaceRelativePlugin(
       generation.value,
+      "tool@local",
       { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" },
       { store },
     );
     expect(plugin.ok).toBe(true);
     if (!plugin.ok) return;
     expect(fs.readFileSync(path.join(plugin.value.materialized.pluginRoot, "payload.txt"), "utf8")).toBe("snapshot-one");
-    expect(plugin.value.provenance).toMatchObject({
-      adapter: "marketplace-relative-tree", marketplaceSnapshotId: result.value.snapshotId,
-      catalogDigest: result.value.catalogDigest, treeDigest: plugin.value.treeDigest,
-      rootDigest: plugin.value.rootDigest,
-      selectedRoot: { requested: "relative-subtree", path: "runtime/plugins/tool", usedSingleWrapper: false },
+    expect(isPluginAcquisitionEvidence(plugin.value)).toBe(true);
+    expect(plugin.value).toMatchObject({
+      requestedPluginId: "tool@local",
+      source: { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" },
+      artifactDigest: plugin.value.treeDigest,
+      provenance: {
+        adapter: "marketplace-relative-tree", marketplaceSnapshotId: result.value.snapshotId,
+        catalogDigest: result.value.catalogDigest, treeDigest: plugin.value.treeDigest,
+        rootDigest: plugin.value.rootDigest,
+        reviewed: { kind: "local-path" },
+        selectedRoot: { requested: "relative-subtree", path: "runtime/plugins/tool", usedSingleWrapper: false },
+      },
     });
     expect(plugin.value.rootDigest).not.toBe(plugin.value.treeDigest);
     expect((await acquireMarketplaceRelativePlugin(
       generation.value,
+      "tool@local",
       { kind: "relative", path: "plugins", pluginRoot: "runtime" },
       { store },
     )).ok).toBe(false);
+    expect((await acquireMarketplaceRelativePlugin(generation.value, "other@local", { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" }, { store })).ok).toBe(false);
+    expect((await acquireMarketplaceRelativePlugin(generation.value, "tool@other", { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" }, { store })).ok).toBe(false);
+    for (const invalidIdentity of ["Tool@local", "tool@Local", "tool.name@local", "tool_name@local", "con@local", "tool@local.name", "tool@local_name", "tool@con", `${"a".repeat(257)}@local`, `tool@${"a".repeat(257)}`]) {
+      expect((await acquireMarketplaceRelativePlugin(generation.value, invalidIdentity as never, { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" }, { store })).ok).toBe(false);
+    }
+
+    const duplicateRoot = temporaryRoot(); const duplicateMarketplace = path.join(duplicateRoot, "marketplace"); const duplicateCatalog = writeCatalog(duplicateMarketplace); writePlugin(duplicateMarketplace);
+    const duplicateValue = JSON.parse(fs.readFileSync(duplicateCatalog, "utf8")) as { plugins: unknown[] }; duplicateValue.plugins.push({ name: "tool", source: { source: "archive", url: "https://archive.example.org/tool.zip" } }); fs.writeFileSync(duplicateCatalog, JSON.stringify(duplicateValue));
+    const duplicateSnapshot = await acquireLocalMarketplaceSnapshot({ kind: "local-directory", path: duplicateMarketplace }, { store: await ownedStore(duplicateRoot) });
+    expect(duplicateSnapshot.ok).toBe(true);
+    if (duplicateSnapshot.ok) {
+      const duplicateGeneration = createMarketplaceGeneration(duplicateSnapshot.value);
+      expect(duplicateGeneration.ok).toBe(true);
+      if (duplicateGeneration.ok) expect((await acquireMarketplaceRelativePlugin(duplicateGeneration.value, "tool@local", { kind: "relative", path: "plugins/tool", pluginRoot: "runtime" }, { store })).ok).toBe(false);
+    }
   });
 
   it("snapshots a direct catalog file plus only its declared contained relative subtree", async () => {

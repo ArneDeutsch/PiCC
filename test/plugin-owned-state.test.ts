@@ -3,12 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createExecutableAdmissionGenerationCodec, createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, type MarketplaceSnapshotTrustTarget, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
+import { createExecutableAdmissionGenerationCodec, createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, readOwnedAdmissionRecords, reopenAdmittedMarketplaceSnapshot, type MarketplaceSnapshotTrustTarget, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
 import { assembledEnablement, ownedMarketplaceProjection, projectOwnedAndImportedInstallations } from "../src/plugin-lifecycle/projection.js";
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { admitDependencyGraph, type DependencyAdmissionCandidate } from "../src/plugin-lifecycle/dependency-admission.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
 import type { LifecycleProfileKey, Sha256 } from "../src/plugin-lifecycle/types.js";
+import { createProducerCodecRegistry, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition } from "../src/plugin-lifecycle/state-store.js";
+import { acquireMarketplaceRelativePlugin } from "../src/plugin-lifecycle/marketplace-generation.js";
 
 const digest = (character: string): Sha256 => `sha256:${character.repeat(64)}` as Sha256;
 const marketplaceSnapshotId = (...parts: readonly string[]): `marketplace-${string}` => `marketplace-${createHash("sha256").update(parts.join("\0")).digest("base64url")}`;
@@ -249,6 +251,97 @@ describe("owned durable admission", () => {
       expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "other" }, plugins: [{ name: "tool", source: "./tool" }] });
       expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: { source: "github", repo: "owner/tool" } }] });
       expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: "./tool" }, { name: "tool", source: "./tool" }] });
+    } finally { fs.rmSync(parent, { recursive: true, force: true }); }
+  });
+
+  it("reopens only an authentic freshly revalidated retained materialized snapshot", async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-retained-snapshot-"));
+    try {
+      const home = path.join(parent, "home"); fs.mkdirSync(home, { mode: 0o700 });
+      const locations = createLifecycleLocations({ homeDir: home, profilePath: path.join(home, ".claude"), platform: process.platform === "win32" ? "win32" : "posix" });
+      if (!locations.ok) throw new Error(locations.error.message);
+      const established = await establishOwnedStateStore(locations.value, home); if (!established.ok) throw new Error(established.message); const store = established.value;
+      const mutableSource = path.join(parent, "mutable-source"); fs.mkdirSync(mutableSource);
+      const catalog = Buffer.from(JSON.stringify({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: "./tool" }] }));
+      const entries: ArtifactDigestEntry[] = [
+        { path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: catalog },
+        { path: "plugins", kind: "directory" }, { path: "plugins/tool", kind: "directory" }, { path: "plugins/tool/payload.txt", kind: "file", data: Buffer.from("retained") },
+      ];
+      const treeDigest = digestArtifactEntries(entries); const artifactRoot = path.join(store.artifactsRoot, treeDigest.slice(7));
+      fs.mkdirSync(path.join(artifactRoot, ".claude-plugin"), { recursive: true }); fs.mkdirSync(path.join(artifactRoot, "plugins", "tool"), { recursive: true });
+      fs.writeFileSync(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog); fs.writeFileSync(path.join(artifactRoot, "plugins", "tool", "payload.txt"), "retained");
+      const catalogDigest = `sha256:${createHash("sha256").update(catalog).digest("hex")}` as Sha256;
+      const source = { kind: "local-directory", path: mutableSource } as const; const snapshotId = marketplaceSnapshotId(catalogDigest, treeDigest);
+      const target: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source, catalogDigest, artifactDigest: treeDigest, treeDigest, rootDigest: treeDigest, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: treeDigest } };
+      const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+      const snapshot = { ownership: "picc-owned", profileKey: store.profileKey as LifecycleProfileKey, ...target, trust: trust.value } as const;
+      const snapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey: snapshot.profileKey, artifactsRoot: store.artifactsRoot });
+      const envelope = createRecordEnvelope(snapshotCodec, "picc-owned", ownedMarketplaceSnapshotScopeKey(snapshot), snapshot); if (!envelope.ok) throw new Error(envelope.message);
+      const partition = ownedRecordPartition(store, "picc-owned", ownedMarketplaceSnapshotScopeKey(snapshot)); if (!partition.ok) throw new Error(partition.message);
+      fs.mkdirSync(partition.value, { recursive: true }); const recordPath = path.join(partition.value, "snapshot.json"); fs.writeFileSync(recordPath, envelope.value.bytes);
+      const registry = createProducerCodecRegistry([snapshotCodec]); if (!registry.ok) throw new Error(registry.message);
+      const admitted = readOwnedAdmissionRecords(store, registry.value, undefined).marketplaceSnapshots[0]; if (admitted === undefined) throw new Error("snapshot was not admitted");
+
+      const acquire = async (generation: Awaited<ReturnType<typeof reopenAdmittedMarketplaceSnapshot>>) => generation.ok
+        ? acquireMarketplaceRelativePlugin(generation.value, "tool@official", { kind: "relative", path: "tool", pluginRoot: "plugins" }, { store })
+        : undefined;
+      fs.rmSync(mutableSource, { recursive: true, force: true });
+
+      const otherHome = path.join(parent, "other-home"); fs.mkdirSync(otherHome, { mode: 0o700 });
+      const otherLocations = createLifecycleLocations({ homeDir: otherHome, profilePath: path.join(otherHome, ".claude"), platform: process.platform === "win32" ? "win32" : "posix" });
+      if (!otherLocations.ok) throw new Error(otherLocations.error.message);
+      const otherEstablished = await establishOwnedStateStore(otherLocations.value, otherHome); if (!otherEstablished.ok) throw new Error(otherEstablished.message); const otherStore = otherEstablished.value;
+      const otherStoreBefore = {
+        artifacts: fs.readdirSync(otherStore.artifactsRoot),
+        records: fs.readdirSync(otherStore.recordsRoot),
+        staging: fs.readdirSync(otherStore.stagingRoot),
+      };
+      const wrongStoreGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); if (!wrongStoreGeneration.ok) throw new Error(wrongStoreGeneration.message);
+      expect(await acquireMarketplaceRelativePlugin(wrongStoreGeneration.value, "tool@official", { kind: "relative", path: "tool", pluginRoot: "plugins" }, { store: otherStore })).toMatchObject({ ok: false, error: { code: "unsafe-source" } });
+      expect({
+        artifacts: fs.readdirSync(otherStore.artifactsRoot),
+        records: fs.readdirSync(otherStore.recordsRoot),
+        staging: fs.readdirSync(otherStore.stagingRoot),
+      }).toEqual(otherStoreBefore);
+      expect(await acquireMarketplaceRelativePlugin(wrongStoreGeneration.value, "tool@official", { kind: "relative", path: "tool", pluginRoot: "plugins" }, { store })).toMatchObject({ ok: false, error: { code: "unsafe-source" } });
+
+      const reopened = await reopenAdmittedMarketplaceSnapshot(admitted, store); expect(reopened).toMatchObject({ ok: true, value: { snapshotId } });
+      const acquired = await acquire(reopened);
+      expect(acquired?.ok && fs.readFileSync(path.join(acquired.value.materialized.pluginRoot, "payload.txt"), "utf8")).toBe("retained");
+      expect(acquired).toMatchObject({ ok: true, value: {
+        requestedPluginId: "tool@official", source: { kind: "relative", path: "tool", pluginRoot: "plugins" },
+        artifactDigest: acquired?.ok ? acquired.value.treeDigest : undefined,
+        provenance: { adapter: "marketplace-relative-tree", marketplaceSnapshotId: snapshotId, catalogDigest,
+          reviewed: { kind: "retained-marketplace-snapshot", marketplaceName: "official", snapshotId, source, catalogDigest, artifactDigest: treeDigest, treeDigest } },
+      } });
+      if (reopened.ok) expect(await acquireMarketplaceRelativePlugin(reopened.value, "tool@official", { kind: "relative", path: "tool", pluginRoot: "plugins" }, { store })).toMatchObject({ ok: false, error: { code: "unsafe-source" } });
+      expect(await reopenAdmittedMarketplaceSnapshot(structuredClone(admitted), store)).toMatchObject({ ok: false, code: "invalid-retained-snapshot" });
+      expect(await reopenAdmittedMarketplaceSnapshot(admitted, { ...store } as never)).toMatchObject({ ok: false, code: "invalid-retained-snapshot" });
+
+      const catalogSource = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const;
+      const catalogTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "catalog-only", snapshotId: marketplaceSnapshotId(catalogDigest, catalogSource.url), source: catalogSource, catalogDigest, provenance: { adapter: "public-https-catalog", canonicalUrl: catalogSource.url } };
+      const catalogTrust = createMarketplaceSnapshotTrustGrant(catalogTarget); if (!catalogTrust.ok) throw new Error(catalogTrust.message);
+      const catalogSnapshot = { ownership: "picc-owned", profileKey: store.profileKey as LifecycleProfileKey, ...catalogTarget, trust: catalogTrust.value } as const;
+      const catalogEnvelope = createRecordEnvelope(snapshotCodec, "picc-owned", ownedMarketplaceSnapshotScopeKey(catalogSnapshot), catalogSnapshot); if (!catalogEnvelope.ok) throw new Error(catalogEnvelope.message);
+      const catalogPartition = ownedRecordPartition(store, "picc-owned", ownedMarketplaceSnapshotScopeKey(catalogSnapshot)); if (!catalogPartition.ok) throw new Error(catalogPartition.message);
+      fs.mkdirSync(catalogPartition.value, { recursive: true }); fs.writeFileSync(path.join(catalogPartition.value, "snapshot.json"), catalogEnvelope.value.bytes);
+      const admittedCatalog = readOwnedAdmissionRecords(store, registry.value, undefined).marketplaceSnapshots.find((item) => item.authorityKind === "catalog-only");
+      if (admittedCatalog === undefined) throw new Error("catalog-only snapshot was not admitted");
+      expect(await reopenAdmittedMarketplaceSnapshot(admittedCatalog, store)).toMatchObject({ ok: false, code: "invalid-retained-snapshot" });
+
+      const removedGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); fs.rmSync(recordPath);
+      expect(await acquire(removedGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } }); fs.writeFileSync(recordPath, envelope.value.bytes);
+      const replacedGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); fs.writeFileSync(recordPath, catalogEnvelope.value.bytes);
+      expect(await acquire(replacedGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } }); fs.writeFileSync(recordPath, envelope.value.bytes);
+      const duplicateGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); fs.copyFileSync(recordPath, path.join(partition.value, "duplicate.json"));
+      expect(await acquire(duplicateGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } }); fs.rmSync(path.join(partition.value, "duplicate.json"));
+      const malformedGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); fs.writeFileSync(path.join(partition.value, "malformed.json"), "{");
+      expect(await acquire(malformedGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } }); fs.rmSync(path.join(partition.value, "malformed.json"));
+
+      const catalogGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); fs.writeFileSync(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), Buffer.concat([catalog, Buffer.from(" ")]));
+      expect(await acquire(catalogGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } }); fs.writeFileSync(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog);
+      const aliasGeneration = await reopenAdmittedMarketplaceSnapshot(admitted, store); const payload = path.join(artifactRoot, "plugins", "tool", "payload.txt"); const external = path.join(parent, "external-payload"); fs.writeFileSync(external, "retained"); fs.rmSync(payload); fs.linkSync(external, payload);
+      expect(await acquire(aliasGeneration)).toMatchObject({ ok: false, error: { code: "unsafe-source" } });
     } finally { fs.rmSync(parent, { recursive: true, force: true }); }
   });
 

@@ -5,10 +5,12 @@ import semver from "semver";
 import { normalizePortableRelativePath, routeCatalogPluginSource, routeMarketplaceSource } from "./source-matrix.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "./artifact-digest.js";
 import { PORTABLE_TREE_LIMITS } from "./tree-validator.js";
-import { canonicalJsonBytes, isContainedPath, ownedRecordPartition, readRecordEnvelope, sha256, type OwnedStateStore, type ProducerCodec, type ProducerCodecRegistry, type StoreResult } from "./state-store.js";
+import { canonicalJsonBytes, createProducerCodecRegistry, isContainedPath, ownedRecordPartition, readRecordEnvelope, revalidateOwnedStateStore, sha256, type OwnedStateStore, type ProducerCodec, type ProducerCodecRegistry, type StoreResult } from "./state-store.js";
 import type { CatalogPluginSource, CheckoutFamilyKey, LifecycleProfileKey, MarketplaceRegistrationSource, MutablePluginScope, QualifiedPluginIdentity, Sha256 } from "./types.js";
 import type { PluginRootSelection } from "./plugin-root.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
+import { issueMarketplaceGenerationFromOwnedAdmission, type MarketplaceGeneration } from "./marketplace-generation.js";
+import { acquisitionFailure, issueRetainedMarketplaceGenerationAuthority, type RetainedMarketplaceGenerationEvidence } from "./acquisition/common.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const GENERATION = /^admission-[A-Za-z0-9_-]{1,96}$/;
@@ -96,6 +98,8 @@ export interface MarketplaceSnapshotTrustGrant { readonly kind: "marketplace-sna
 interface OwnedMarketplaceSnapshotRecordBase { readonly ownership: "picc-owned"; readonly profileKey: LifecycleProfileKey; readonly trust: MarketplaceSnapshotTrustGrant }
 export type OwnedMarketplaceSnapshotRecord = OwnedMarketplaceSnapshotRecordBase & MarketplaceSnapshotTrustTarget;
 export type MarketplaceSnapshotAuthority = OwnedMarketplaceSnapshotRecord;
+
+const admittedMarketplaceSnapshots = new WeakMap<OwnedMarketplaceSnapshotRecord, OwnedStateStore>();
 
 export function ownedInstallationScopeKey(record: Pick<OwnedPluginInstallationRecord, "scope" | "profileKey" | "projectKey">): string { return record.scope === "user" ? `user-${record.profileKey}` : `${record.scope}-${record.projectKey ?? "invalid"}`; }
 function partitionSegment(value: string): string { return `${Buffer.byteLength(value, "utf8")}-${value}`; }
@@ -336,12 +340,68 @@ export function readOwnedAdmissionRecords(store: OwnedStateStore, registry: Prod
   const uncertainSnapshotCandidates = new Set(snapshotCandidates.filter((candidate) => partitionUncertain(ownedMarketplaceSnapshotScopeKey(candidate.record))));
   for (const candidate of snapshotCandidates) if (conflictingSnapshotAuthorities.has(ownedMarketplaceSnapshotScopeKey(candidate.record))) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "snapshot-authority-conflict" }; else if (uncertainSnapshotCandidates.has(candidate)) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "authority-uncertain" };
   const marketplaceSnapshots = snapshotCandidates.filter((candidate) => !conflictingSnapshotAuthorities.has(ownedMarketplaceSnapshotScopeKey(candidate.record)) && !uncertainSnapshotCandidates.has(candidate)).map((candidate) => candidate.record);
+  for (const snapshot of marketplaceSnapshots) admittedMarketplaceSnapshots.set(snapshot, store);
   const uncertainInstallationRecord = generation?.members.some((member) => { const scopeKey = member.scope === "user" ? `user-${store.profileKey}` : `${member.scope}-${member.projectKey ?? "invalid"}`; return partitionUncertain(scopeKey); }) ?? false;
   const complete = generation !== undefined && !uncertainInstallationRecord && installationEnvelopeCount === generation.members.length && candidates.length === generation.members.length && generation.members.every((member) => candidates.some(({ installation }) => sameMember(installation.record, member) && installation.recordDigest === member.recordDigest));
   if (!complete) for (const candidate of candidates) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "generation-incomplete" };
   const installations = Object.freeze(complete ? candidates.map((item) => item.installation) : []); const completeReference = complete ? Object.freeze({ installations }) : undefined; if (completeReference) completeReferences.add(completeReference);
   return Object.freeze({ installations, marketplaces: Object.freeze(marketplaces), marketplaceSnapshots: Object.freeze(marketplaceSnapshots), records: Object.freeze(records), ...(completeReference === undefined ? {} : { completeReference }) });
 }
+export async function reopenAdmittedMarketplaceSnapshot(
+  snapshot: OwnedMarketplaceSnapshotRecord,
+  store: OwnedStateStore,
+): Promise<StoreResult<MarketplaceGeneration>> {
+  if (snapshot.authorityKind !== "materialized" || admittedMarketplaceSnapshots.get(snapshot) !== store) {
+    return fail("invalid-retained-snapshot", "Retained marketplace snapshot authority is not authentic materialized admission");
+  }
+  const authority = issueRetainedMarketplaceGenerationAuthority({
+    source: snapshot.source,
+    snapshotId: snapshot.snapshotId,
+    catalogDigest: snapshot.catalogDigest,
+  }, store, async () => {
+    const storeStatus = await revalidateOwnedStateStore(store);
+    if (!storeStatus.ok || store.profileKey !== snapshot.profileKey) return acquisitionFailure("unsafe-source", "Retained marketplace snapshot store authority changed");
+    const registry = createProducerCodecRegistry([createOwnedMarketplaceSnapshotCodec({ profileKey: snapshot.profileKey, artifactsRoot: store.artifactsRoot })]);
+    if (!registry.ok) return acquisitionFailure("unsafe-source", "Retained marketplace snapshot codec authority is unavailable");
+    const fresh = readOwnedAdmissionRecords(store, registry.value, undefined).marketplaceSnapshots
+      .filter((candidate) => candidate.authorityKind === "materialized" && sameCanonical(candidate, snapshot));
+    if (fresh.length !== 1) return acquisitionFailure("unsafe-source", "Retained marketplace snapshot is stale, conflicting, or authority-uncertain");
+    try {
+      const entries = readPersistedTree(snapshot.artifactRoot);
+      if (digestArtifactEntries(entries) !== snapshot.treeDigest || !verifyMaterializedMarketplaceSnapshot(snapshot, store.artifactsRoot)) throw new Error("changed");
+      const catalogEntries = entries.filter((entry) => entry.kind === "file" && entry.path === snapshot.catalogRelativePath);
+      const catalog = catalogEntries[0]?.data;
+      if (catalogEntries.length !== 1 || catalog === undefined || sha256(catalog) !== snapshot.catalogDigest) throw new Error("catalog");
+      const evidence: RetainedMarketplaceGenerationEvidence = Object.freeze({
+        marketplaceName: snapshot.marketplaceName,
+        source: snapshot.source,
+        snapshotId: snapshot.snapshotId,
+        catalogDigest: snapshot.catalogDigest,
+        catalog: Uint8Array.from(catalog),
+        entries: Object.freeze(entries.map((entry) => {
+          if (entry.kind === "directory") return Object.freeze({ path: entry.path, kind: "directory" as const });
+          if (entry.data === undefined) throw new Error("file-data");
+          return Object.freeze({ path: entry.path, kind: "file" as const, data: Uint8Array.from(entry.data), ...(entry.executable === undefined ? {} : { executable: entry.executable }) });
+        })),
+        reviewed: Object.freeze({
+          kind: "retained-marketplace-snapshot",
+          marketplaceName: snapshot.marketplaceName,
+          snapshotId: snapshot.snapshotId,
+          source: snapshot.source,
+          catalogDigest: snapshot.catalogDigest,
+          artifactDigest: snapshot.artifactDigest,
+          treeDigest: snapshot.treeDigest,
+        }),
+      });
+      return { ok: true, value: evidence };
+    } catch {
+      return acquisitionFailure("unsafe-source", "Retained marketplace snapshot artifact or catalog changed");
+    }
+  });
+  const issued = issueMarketplaceGenerationFromOwnedAdmission(authority);
+  return issued.ok ? issued : fail("invalid-retained-snapshot", issued.error.message);
+}
+
 export type GenerationMarkerObservation = { readonly status: "absent" } | { readonly status: "valid"; readonly generation: ExecutableAdmissionGeneration } | { readonly status: "membership-invalid"; readonly code: string; readonly generation: ExecutableAdmissionGeneration } | { readonly status: "malformed" | "noncanonical" | "unreadable"; readonly code: string };
 export function observeExecutableGenerationFile(file: string, codec: ProducerCodec<ExecutableAdmissionGeneration>): GenerationMarkerObservation { try { const parent = path.dirname(file); try { const parentStat = fs.lstatSync(parent); if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || !samePath(fs.realpathSync.native(parent), path.resolve(parent))) return { status: "unreadable", code: "invalid-generation-root" }; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" }; return { status: "unreadable", code: "invalid-generation-root" }; } const bytes = readOpenedOrdinaryFile(file, MAX_RECORD_BYTES).bytes; let parsed: unknown; try { parsed = JSON.parse(bytes.toString("utf8")); } catch { return { status: "malformed", code: "invalid-generation" }; } const canonical = canonicalJsonBytes(parsed); if (!canonical.ok) return { status: "malformed", code: canonical.code }; if (!Buffer.from(canonical.value).equals(bytes)) return { status: "noncanonical", code: "invalid-generation" }; const decoded = codec.decode(parsed); return decoded.ok ? { status: "valid", generation: decoded.value } : { status: "malformed", code: decoded.code }; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { status: "absent" } : { status: "unreadable", code: "invalid-generation" }; } }
 export function decodeExecutableGenerationFile(file: string, codec: ProducerCodec<ExecutableAdmissionGeneration>): StoreResult<ExecutableAdmissionGeneration | undefined> { const observed = observeExecutableGenerationFile(file, codec); return observed.status === "absent" ? { ok: true, value: undefined } : observed.status === "valid" ? { ok: true, value: observed.generation } : fail(observed.code, `Generation marker is ${observed.status}`); }
