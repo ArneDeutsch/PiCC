@@ -3675,7 +3675,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       action: "retrieve-and-relaunch", stage: "resumed-cancellation",
       retainedInputSource: "client/request history",
     });
-    expect(String(terminal[0]?.data.notice)).toMatch(/session became non-reusable.*relaunch deliberately/isu);
+    expect(String(terminal[0]?.data.notice)).toMatch(/session became non-reusable.*deliberate resubmission in a fresh request\/session/isu);
     expect(pi.entries.some((entry) => entry.data.action === "session-reusable")).toBe(false);
     expect(process.exitCode).toBe(3);
     expect(errors.join("\n")).not.toContain("could not confirm host quiescence");
