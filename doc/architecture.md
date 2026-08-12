@@ -178,8 +178,10 @@ awareness, no I/O beyond reading the artifact.
 #### Installed-plugin assembly boundary
 
 `claude/plugin-installed-state.ts` adapts the captured Claude installed-state v2 fixture layout into
-normalized records; the upstream format is undocumented and is not a permanent PiCC API. Exact-record
-selection and no-fallback failure are PiCC-defined; the generated
+normalized imported records; the upstream format is undocumented and is not a permanent PiCC API.
+`plugin-lifecycle/admission.ts` independently validates one complete committed PiCC-owned profile
+generation before active-project projection. Exact-record selection and no-fallback failure are
+PiCC-defined; the generated
 [capability matrix](supported-features.md) owns exhaustive tiers and limits. The adapter does not scan
 storage for candidates. `claude/plugins.ts` owns qualified-identity selection and turns one
 applicable record into normalized component loader inputs. `claude/plugin-paths.ts` owns the canonical
@@ -191,9 +193,9 @@ The qualified `name@marketplace` identity owns root authorization, installed ver
 persistent-data context. A valid manifest `name` owns the visible skill, command, and agent namespace;
 manifestless content uses the installed identity's lifecycle name.
 
-`src/project.ts` is the commit point: it combines source-aware settings enablement with imported
-records, then merges successful contributions into the ordinary project registries while preserving
-qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
+`src/project.ts` is the composition point: it combines applicable owned and imported installations,
+resolves source-aware settings enablement and winning ownership, then merges successful contributions
+into the ordinary project registries while preserving qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
 containment, or component-source failures reject the plugin as a unit. Safe component parse or
 loader warnings may instead omit only affected content while the plugin remains loaded. Runtime
 activation and subagent construction use qualified context for root/data/project substitution and

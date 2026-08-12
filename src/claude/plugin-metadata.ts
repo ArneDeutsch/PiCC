@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Diagnostic } from "../types.js";
+import type { Diagnostic, PluginManifestDefaultEnabledEvidence } from "../types.js";
 import { parseJsonSafe } from "../util/fs.js";
 import { observeUnsupportedPluginComponents } from "./plugin-component-observation.js";
 
@@ -24,6 +24,8 @@ export interface SafePluginManifestDependency {
   readonly itemIndex: number;
 }
 
+export type PluginDependencyDeclarationEvidence = "absent" | "complete" | "invalid" | "truncated";
+
 export interface SafePluginManifestProjection {
   readonly manifestName?: string;
   readonly version?: string;
@@ -34,6 +36,8 @@ export interface SafePluginManifestProjection {
   readonly license?: string;
   readonly keywords: readonly string[];
   readonly dependencies?: readonly SafePluginManifestDependency[];
+  readonly dependencyDeclaration?: PluginDependencyDeclarationEvidence;
+  readonly defaultEnabled?: PluginManifestDefaultEnabledEvidence;
   readonly components: readonly { field: SafePluginManifestComponentField; declaration: "path" | "paths" | "object" | "shape"; count: number }[];
   readonly omissions?: Readonly<{ keywords: number; dependencies?: number; components: number; diagnostics: number }>;
 }
@@ -101,7 +105,7 @@ function dependencyName(value: unknown): string | undefined {
 }
 
 /** Project only the allowlisted, display-safe fields while the resolver's manifest object is in hand. */
-export function projectPluginManifest(manifest: Readonly<Record<string, unknown>>): { projection: SafePluginManifestProjection; diagnostics: Diagnostic[] } {
+export function projectPluginManifest(manifest: Readonly<Record<string, unknown>>, sourcePath = "plugin manifest"): { projection: SafePluginManifestProjection; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
   let keywordOmissions = 0;
   let dependencyOmissions = 0;
@@ -132,10 +136,15 @@ export function projectPluginManifest(manifest: Readonly<Record<string, unknown>
       }
     }
   }
+  const defaultEnabled: PluginManifestDefaultEnabledEvidence = Object.hasOwn(manifest, "defaultEnabled") && typeof manifest["defaultEnabled"] === "boolean"
+    ? { presence: "explicit", value: manifest["defaultEnabled"], sourcePath }
+    : { presence: "absent", sourcePath };
+  if (Object.hasOwn(manifest, "defaultEnabled") && typeof manifest["defaultEnabled"] !== "boolean") wrong("defaultEnabled");
   const dependencies: SafePluginManifestDependency[] = [];
+  let dependencyInvalid = false;
   if (Object.hasOwn(manifest, "dependencies")) {
     const raw = manifest["dependencies"];
-    if (!Array.isArray(raw)) wrong("dependencies");
+    if (!Array.isArray(raw)) { wrong("dependencies"); dependencyInvalid = true; }
     else {
       dependencyOmissions += Math.max(0, raw.length - MAX_DEPENDENCIES);
       for (let itemIndex = 0; itemIndex < Math.min(raw.length, MAX_DEPENDENCIES); itemIndex++) {
@@ -149,7 +158,7 @@ export function projectPluginManifest(manifest: Readonly<Record<string, unknown>
           if (Object.hasOwn(item, "version")) dependencyVersion = safeText(item["version"]);
           if (Object.hasOwn(item, "marketplace")) dependencyMarketplace = dependencyName(item["marketplace"]);
         }
-        if (name === undefined || (plain(item) && Object.hasOwn(item, "version") && dependencyVersion === undefined) || (plain(item) && Object.hasOwn(item, "marketplace") && dependencyMarketplace === undefined)) wrong("dependencies");
+        if (name === undefined || (plain(item) && Object.hasOwn(item, "version") && dependencyVersion === undefined) || (plain(item) && Object.hasOwn(item, "marketplace") && dependencyMarketplace === undefined)) { wrong("dependencies"); dependencyInvalid = true; }
         else dependencies.push(Object.freeze({ name, ...(dependencyVersion === undefined ? {} : { version: dependencyVersion }), ...(dependencyMarketplace === undefined ? {} : { marketplace: dependencyMarketplace }), itemIndex }));
       }
     }
@@ -178,7 +187,8 @@ export function projectPluginManifest(manifest: Readonly<Record<string, unknown>
       ...(manifestName === undefined ? {} : { manifestName }), ...(version === undefined ? {} : { version }),
       ...(description === undefined ? {} : { description }), ...(manifestAuthor === undefined ? {} : { author: manifestAuthor }),
       ...(homepage === undefined ? {} : { homepage }), ...(repo === undefined ? {} : { repository: repo }),
-      ...(license === undefined ? {} : { license }), keywords: Object.freeze(keywords),
+      ...(license === undefined ? {} : { license }), keywords: Object.freeze(keywords), defaultEnabled: Object.freeze(defaultEnabled),
+      dependencyDeclaration: !Object.hasOwn(manifest, "dependencies") ? "absent" : dependencyOmissions > 0 ? "truncated" : dependencyInvalid ? "invalid" : "complete",
       ...(Object.hasOwn(manifest, "dependencies") ? { dependencies: Object.freeze(dependencies) } : {}),
       components: Object.freeze(components.map((item) => Object.freeze({ ...item }))),
       omissions: Object.freeze({ keywords: keywordOmissions, ...(Object.hasOwn(manifest, "dependencies") ? { dependencies: dependencyOmissions } : {}), components: componentOmissions, diagnostics: diagnosticOmissions }),

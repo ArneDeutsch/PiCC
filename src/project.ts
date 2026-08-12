@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, HookHandler, PluginRuntimeContext, ResolvedMcpConfig } from "./types.js";
 import { SUPPORTED_HOOK_EVENTS } from "./types.js";
@@ -30,6 +31,11 @@ import {
 } from "./claude/plugins.js";
 import { projectIdentities } from "./util/project-identity.js";
 import type { PluginResolutionOutcome } from "./types.js";
+import { createLifecycleLocations } from "./plugin-lifecycle/locations.js";
+import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, observeExecutableGenerationFile, readOwnedAdmissionRecords, type AdmittedOwnedInstallation, type CompleteOwnedProfileReference, type GenerationMarkerObservation, type MarketplaceSnapshotAuthority, type OwnedMarketplaceRecord } from "./plugin-lifecycle/admission.js";
+import { createProducerCodecRegistry, type OwnedStateStore } from "./plugin-lifecycle/state-store.js";
+import { assembledEnablement, observeLifecycleEnvelope, ownedMarketplaceProjection, projectOwnedAndImportedInstallations, uniquelySelectedApplicableOwnedWinner, type InstallationProjection, type LifecycleObservationEnvelope } from "./plugin-lifecycle/projection.js";
+import { admitDependencyGraph } from "./plugin-lifecycle/dependency-admission.js";
 
 /**
  * Assemble the full Claude-artifact model of a project: settings with
@@ -45,6 +51,11 @@ export interface LoadedProject extends ClaudeProject {
   pluginResolutionOutcomes: PluginResolutionOutcome[];
   pluginContexts: ReadonlyMap<string, PluginRuntimeContext>;
   pluginInventory: PluginInventorySnapshot;
+  pluginAdmissions: readonly InstallationProjection[];
+  ownedMarketplaces: readonly OwnedMarketplaceRecord[];
+  lifecycleObservation: LifecycleObservationEnvelope;
+  executableGenerationObservation: GenerationMarkerObservation;
+  ownedProfileReference?: CompleteOwnedProfileReference;
   /** Auto memory: dir + truncated MEMORY.md; undefined when disabled. */
   autoMemory?: MemorySnapshot;
 }
@@ -110,14 +121,63 @@ export function loadClaudeProject(opts: {
     env,
   });
   diagnostics.push(...marketplaceState.diagnostics);
-  const pluginResult = resolveInstalledPlugins({
-    userDir,
-    projectRoot: root,
-    enablement: settings.effectivePluginEnablement ?? {},
-    installations: installedState.installations,
-    installedStateStatus: installedState.status,
-    env,
-  });
+
+  const lifecycleHome = path.resolve(opts.homeDir ?? os.homedir());
+  const lifecycleProjectIdentities = projectIdentities(root);
+  const activeCheckoutPath = lifecycleProjectIdentities.at(-1);
+  const checkoutFamilyPath = lifecycleProjectIdentities[0];
+  const lifecycleLocationsResult = activeCheckoutPath === undefined || checkoutFamilyPath === undefined
+    ? { ok: false as const }
+    : createLifecycleLocations({
+      homeDir: lifecycleHome, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix",
+      project: { activeCheckoutPath, checkoutFamilyPath },
+    });
+  let pluginAdmissions: readonly InstallationProjection[] = installedState.installations.map((installation) => Object.freeze({ ownership: "claude-imported-readonly" as const, installation }));
+  let ownedMarketplaces: readonly OwnedMarketplaceRecord[] = Object.freeze([]);
+  let lifecycleObservation: LifecycleObservationEnvelope = Object.freeze({ records: Object.freeze([]), receipts: Object.freeze([]), pending: Object.freeze([]) });
+  let executableGenerationObservation: GenerationMarkerObservation = Object.freeze({ status: "absent" });
+  let ownedProfileReference: CompleteOwnedProfileReference | undefined;
+  if (lifecycleLocationsResult.ok) {
+    const locations = lifecycleLocationsResult.value;
+    const store: OwnedStateStore = Object.freeze({ root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey,
+      artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"),
+      generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"),
+      locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine") });
+    const marketplaceCodec = createOwnedMarketplaceCodec(locations.profileKey);
+    const marketplaceSnapshotCodec = createOwnedMarketplaceSnapshotCodec(locations.profileKey);
+    const preliminaryRegistry = createProducerCodecRegistry([marketplaceCodec, marketplaceSnapshotCodec]);
+    const preliminary = preliminaryRegistry.ok ? readOwnedAdmissionRecords(store, preliminaryRegistry.value, undefined) : { marketplaces: [], marketplaceSnapshots: [], records: [], installations: [] };
+    const snapshotAuthorities = new Map<string, MarketplaceSnapshotAuthority>(); const conflictingSnapshots = new Set<string>();
+    for (const record of preliminary.marketplaceSnapshots) {
+      const authority: MarketplaceSnapshotAuthority = { marketplaceName: record.marketplaceName, catalogDigest: record.catalogDigest, source: record.source, provenance: record.provenance };
+      const existing = snapshotAuthorities.get(record.snapshotId);
+      if (existing === undefined) snapshotAuthorities.set(record.snapshotId, authority);
+      else if (JSON.stringify(existing) !== JSON.stringify(authority)) conflictingSnapshots.add(record.snapshotId);
+    }
+    const snapshots = Object.fromEntries([...snapshotAuthorities].filter(([snapshotId]) => !conflictingSnapshots.has(snapshotId)));
+    const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: snapshots });
+    const generationCodec = createExecutableAdmissionGenerationCodec(locations.profileKey);
+    executableGenerationObservation = observeExecutableGenerationFile(path.join(store.generationsRoot, "current.json"), generationCodec);
+    const registry = createProducerCodecRegistry([marketplaceCodec, marketplaceSnapshotCodec, installationCodec]);
+    const admission = registry.ok ? readOwnedAdmissionRecords(store, registry.value, executableGenerationObservation.status === "valid" ? executableGenerationObservation.generation : undefined) : { marketplaces: [], marketplaceSnapshots: [], records: [], installations: [] as AdmittedOwnedInstallation[] };
+    if (executableGenerationObservation.status === "valid" && admission.completeReference === undefined) executableGenerationObservation = { status: "membership-invalid", code: "generation-incomplete", generation: executableGenerationObservation.generation };
+    ownedProfileReference = admission.completeReference;
+    ownedMarketplaces = ownedMarketplaceProjection(admission.marketplaces, admission.marketplaceSnapshots);
+    const projected = projectOwnedAndImportedInstallations({ imported: installedState.installations, owned: admission.installations, locations, projectPath: root });
+    pluginAdmissions = projected.projections;
+    for (const conflict of projected.conflicts) diagnostics.push({ severity: "warning", message: `Owned/imported plugin authority conflict for ${conflict}; all conflicting records remained inert` });
+    lifecycleObservation = observeLifecycleEnvelope(store, admission.records);
+  }
+  const runtimeInstallations = pluginAdmissions.map((projection) => projection.ownership === "picc-owned" ? projection : projection.installation);
+  let effectivePluginEnablement = assembledEnablement({ projections: pluginAdmissions, explicit: settings.effectivePluginEnablement ?? {}, projectPath: root });
+  let pluginResult = resolveInstalledPlugins({ userDir, projectRoot: root, enablement: effectivePluginEnablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
+  const manifestDisabled = pluginResult.outcomes.filter((outcome) => outcome.manifestDefaultEnabled?.presence === "explicit" && outcome.manifestDefaultEnabled.value === false
+    && !Object.hasOwn(settings.effectivePluginEnablement ?? {}, outcome.pluginId)
+    && uniquelySelectedApplicableOwnedWinner(pluginAdmissions, outcome.pluginId, root)?.marketplaceDefaultEnabled === undefined);
+  if (manifestDisabled.length > 0) {
+    effectivePluginEnablement = Object.freeze({ ...effectivePluginEnablement, ...Object.fromEntries(manifestDisabled.map((outcome) => [outcome.pluginId, { enabled: false, scope: "user" as const, source: outcome.manifestDefaultEnabled!.sourcePath }])) });
+    pluginResult = resolveInstalledPlugins({ userDir, projectRoot: root, enablement: effectivePluginEnablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
+  }
   diagnostics.push(...pluginResult.diagnostics);
   const selectedPlugins = pluginResult.plugins;
   let plugins = selectedPlugins;
@@ -191,6 +251,20 @@ export function loadClaudeProject(opts: {
     finalLoadedComponents[plugin.pluginId] = { skills: 0, commands: 0, agents: 0, hooks: 0 };
   }
   if (rejectedAtLoad.size > 0) {
+    const finalDependencyDecisions = admitDependencyGraph(selectedPlugins.map((plugin) => ({
+      pluginId: plugin.pluginId, version: plugin.version, enabled: true, available: !rejectedAtLoad.has(plugin.pluginId),
+      ownership: plugin.ownership ?? "claude-imported-readonly", dependencies: plugin.manifestProjection.dependencies,
+      dependencyDeclaration: plugin.manifestProjection.dependencyDeclaration,
+      ...(plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: plugin.allowedCrossMarketplaceDependencies }),
+    })));
+    for (const decision of finalDependencyDecisions) {
+      if (decision.admitted || rejectedAtLoad.has(decision.pluginId) || selectedPlugins.find((plugin) => plugin.pluginId === decision.pluginId)?.ownership !== "picc-owned") continue;
+      rejectedAtLoad.add(decision.pluginId);
+      const outcome = pluginResolutionOutcomes.find((item) => item.pluginId === decision.pluginId);
+      const rejection = { severity: "warning" as const, message: `Installed owned plugin failed final dependency admission (${decision.reasons.join(", ")}); all contributions were rejected` };
+      if (outcome !== undefined) outcome.diagnostics = boundedOutcomeDiagnostics(outcome.diagnostics, [], [rejection]);
+      diagnostics.push(rejection);
+    }
     plugins = plugins.filter((plugin) => !rejectedAtLoad.has(plugin.pluginId));
     for (const outcome of pluginResolutionOutcomes) {
       if (rejectedAtLoad.has(outcome.pluginId)) {
@@ -329,7 +403,7 @@ export function loadClaudeProject(opts: {
     metadataReadCapability: createPluginMetadataReadCapability(authorizedCacheRoots(userDir, env)),
     enablementDiagnostics: settings.diagnostics,
     marketplaceState,
-    enablement: settings.effectivePluginEnablement ?? {},
+    enablement: effectivePluginEnablement,
     outcomes: pluginResolutionOutcomes,
     selectedPlugins,
     finalLoadedComponents,
@@ -353,6 +427,11 @@ export function loadClaudeProject(opts: {
     pluginResolutionOutcomes,
     pluginContexts: new Map(plugins.map((plugin) => [plugin.pluginId, plugin.context])),
     pluginInventory,
+    pluginAdmissions,
+    ownedMarketplaces,
+    lifecycleObservation,
+    executableGenerationObservation,
+    ...(ownedProfileReference === undefined ? {} : { ownedProfileReference }),
     autoMemory,
   };
 }

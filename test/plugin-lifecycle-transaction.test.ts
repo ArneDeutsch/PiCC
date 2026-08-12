@@ -9,7 +9,7 @@ import { acquireLifecycleLocks, heartbeatLifecycleLocks, lifecycleLockDirectory,
 import { previewRecovery, recoverTransaction } from "../src/plugin-lifecycle/recovery.js";
 import { canonicalJsonBytes, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore, type StoreResult } from "../src/plugin-lifecycle/state-store.js";
 import {
-  createTransactionCodecRegistry, executeTransaction, prepareTransaction, readTransactionJournal, readTransactionReceipt,
+  createTransactionCodecRegistry, executeTransaction, observePersistedTransactionsSync, prepareTransaction, readTransactionJournal, readTransactionReceipt,
   type TransactionFaultPhase, type TransactionParticipant, type TransactionProducerCodec,
 } from "../src/plugin-lifecycle/transaction.js";
 
@@ -76,13 +76,36 @@ describe("owned lifecycle transactions", () => {
   it("refuses a same-id pending journal byte-identically and completes only through explicit plan-bound recovery", async () => {
     const store = await fixture(); const parts = [await participant(store, "first", "one"), await participant(store, "second", "two")]; const plan = await prepared(store, "pending", parts); const held = await lease(store, "pending");
     expect(await executeTransaction(store, plan, { lease: held, faults: { hit(phase, index) { if (phase === "before-temp-write" && index === 1) throw new Error("fault"); } } })).toMatchObject({ state: "pending-recovery", completed: 1 });
-    const journalPath = path.join(store.journalsRoot, "pending.json"); const before = await fs.readFile(journalPath); expect(await executeTransaction(store, plan, { lease: held })).toMatchObject({ state: "pending-recovery", completed: 1 }); expect(await fs.readFile(journalPath)).toEqual(before);
+    const journalPath = path.join(store.journalsRoot, "pending.json"); const before = await fs.readFile(journalPath); expect(observePersistedTransactionsSync(store).journals).toEqual([expect.objectContaining({ operationId: "pending", status: "pending" })]); expect(await executeTransaction(store, plan, { lease: held })).toMatchObject({ state: "pending-recovery", completed: 1 }); expect(await fs.readFile(journalPath)).toEqual(before);
     const projectingCodec: TransactionProducerCodec = { ...codec, decodeSummary(value) { const decoded = codec.decodeSummary(value); return decoded.ok ? { ok: true, value: { display: decoded.value.label.toUpperCase() } } : decoded; } }; const projectingRegistry = registry(projectingCodec);
     const preview = await previewRecovery({ store, operationId: "pending", registry: projectingRegistry }); expect(preview).toMatchObject({ ok: true, value: { confirmationSummary: { display: "PENDING" }, completed: 1, rolledBack: 0, remaining: 1, actions: ["complete", "rollback"] } }); if (!preview.ok) return;
     expect(await recoverTransaction({ store, operationId: "pending", action: "complete", confirmedProducerSchema: "test.transaction", confirmedProducerVersion: 1, confirmedPlanDigest: "sha256:wrong", confirmedConfirmationDigest: preview.value.confirmationDigest, registry: projectingRegistry, lease: held })).toMatchObject({ ok: false, code: "confirmation-mismatch" });
     expect(await recoverTransaction({ store, operationId: "pending", action: "complete", confirmedProducerSchema: "test.transaction", confirmedProducerVersion: 1, confirmedPlanDigest: preview.value.planDigest, confirmedConfirmationDigest: preview.value.confirmationDigest, registry: projectingRegistry, lease: held })).toMatchObject({ ok: true, value: { outcome: "committed" } });
     expect(await previewRecovery({ store, operationId: "pending", registry: projectingRegistry })).toMatchObject({ ok: true, value: { confirmationSummary: { display: "PENDING" }, terminalOutcome: "committed" } });
+    await fs.writeFile(journalPath, before); expect(observePersistedTransactionsSync(store).journals).toEqual([expect.objectContaining({ operationId: "pending", status: "terminal-residue" })]); await fs.writeFile(journalPath, Buffer.concat([before, Buffer.from("\n")])); expect(observePersistedTransactionsSync(store).journals).toEqual([expect.objectContaining({ operationId: "pending", status: "invalid" })]);
     expect(await recoverTransaction({ store, operationId: "pending", action: "complete", confirmedProducerSchema: "test.wrong", confirmedProducerVersion: 1, confirmedPlanDigest: preview.value.planDigest, confirmedConfirmationDigest: preview.value.confirmationDigest, registry: projectingRegistry, lease: held })).toMatchObject({ ok: false, code: "confirmation-mismatch" }); await releaseLifecycleLocks(held);
+  });
+
+  it("surfaces invalid passive transaction parent roots instead of reporting empty state", async () => {
+    const store = await fixture(); await fs.rm(store.journalsRoot, { recursive: true }); await fs.writeFile(store.journalsRoot, "not-a-directory");
+    await fs.rm(store.receiptsRoot, { recursive: true }); await fs.writeFile(store.receiptsRoot, "not-a-directory");
+    const observed = observePersistedTransactionsSync(store);
+    expect(observed.journals).toEqual([{ operationId: "invalid-root", status: "invalid" }]);
+    expect(observed.receipts).toEqual([{ path: store.receiptsRoot, status: "invalid" }]);
+  });
+
+  it("observes temp/non-JSON residue, caps total entries once, and rejects mismatched same-id terminal binding", async () => {
+    const residueStore = await fixture(); await fs.writeFile(path.join(residueStore.journalsRoot, "crash.tmp-1"), "partial"); await fs.mkdir(path.join(residueStore.receiptsRoot, "unexpected.json"));
+    const residue = observePersistedTransactionsSync(residueStore); expect(residue.journals).toEqual([{ operationId: "invalid-entry-0", status: "invalid" }]); expect(residue.receipts).toEqual([{ path: path.join(residueStore.receiptsRoot, "unexpected.json"), status: "invalid" }]);
+
+    const overflowStore = await fixture(); for (let index = 0; index < 1025; index += 1) await fs.writeFile(path.join(overflowStore.journalsRoot, `temp-${String(index).padStart(4, "0")}`), "");
+    const overflow = observePersistedTransactionsSync(overflowStore); expect(overflow.journals.filter((item) => item.operationId === "overflow")).toHaveLength(1); expect(overflow.journals.filter((item) => item.status === "invalid")).toHaveLength(1025);
+
+    const bindingStore = await fixture(); const otherPlan = await prepared(bindingStore, "other-binding", [await participant(bindingStore, "other", "other")]); const otherLease = await lease(bindingStore, "other-binding"); expect(await executeTransaction(bindingStore, otherPlan, { lease: otherLease })).toMatchObject({ state: "committed" }); await releaseLifecycleLocks(otherLease);
+    const pendingParts = [await participant(bindingStore, "pending-first", "one"), await participant(bindingStore, "pending-second", "two")]; const pendingPlan = await prepared(bindingStore, "same-id-binding", pendingParts); const pendingLease = await lease(bindingStore, "same-id-binding");
+    expect(await executeTransaction(bindingStore, pendingPlan, { lease: pendingLease, faults: { hit(phase, index) { if (phase === "before-temp-write" && index === 1) throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery" }); await releaseLifecycleLocks(pendingLease);
+    const otherReceipt = JSON.parse(await fs.readFile(path.join(bindingStore.receiptsRoot, "other-binding.json"), "utf8")) as Record<string, unknown>; const forged = canonicalJsonBytes({ ...otherReceipt, operationId: "same-id-binding" }); if (!forged.ok) throw new Error(forged.message); await fs.writeFile(path.join(bindingStore.receiptsRoot, "same-id-binding.json"), forged.value);
+    expect(observePersistedTransactionsSync(bindingStore).journals.find((item) => item.operationId === "same-id-binding")?.status).toBe("invalid");
   });
 
   it("revalidates lease ownership after an awaited fault immediately before target publication", async () => {

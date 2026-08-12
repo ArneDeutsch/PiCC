@@ -107,7 +107,7 @@ import {
   type CompatReport,
 } from "./registry/compat-report.js";
 import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
-import { resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
+import { pluginRuntimeDataAuthorization, prepareAuthorizedPluginDataLocation, resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
@@ -554,11 +554,14 @@ export function preparePluginDataDir(opts: {
     return { ok: false, code: "project-context-mismatch" };
   }
   try {
+    const authorized = pluginRuntimeDataAuthorization(context);
+    if (authorized !== undefined) {
+      const prepared = prepareAuthorizedPluginDataLocation(authorized);
+      return prepared.ok ? { ok: true } : { ok: false, code: prepared.code };
+    }
     const location = resolvePluginDataLocation(opts.userDir, context.pluginId);
     if (!location.ok) return { ok: false, code: location.code };
-    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) {
-      return { ok: false, code: "qualified-projection-mismatch" };
-    }
+    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) return { ok: false, code: "qualified-projection-mismatch" };
     fs.mkdirSync(location.value.lexicalPath, { recursive: true });
     const current = revalidatePluginDataLocation(location.value);
     return current.ok ? { ok: true } : { ok: false, code: current.code };

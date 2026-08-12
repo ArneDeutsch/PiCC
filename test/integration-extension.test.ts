@@ -22,8 +22,12 @@ import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/f
 import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadSkills } from "../src/claude/skills.js";
-import { sanitizePluginDataKey } from "../src/claude/plugin-paths.js";
 import type { NotebookSessionState } from "../src/runtime/notebook-session.js";
+import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
+import { createLifecycleLocations, pluginDataPath } from "../src/plugin-lifecycle/locations.js";
+import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection } from "../src/plugin-lifecycle/admission.js";
+import { canonicalJsonBytes, createRecordEnvelope, ownedRecordPartition, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -964,24 +968,26 @@ describe("skill activation", () => {
   });
 
   it("installed plugin skill resolves exact variables and creates persistent data lazily", async () => {
-    const skillTool = pi.tools.get("Skill");
-    const dataDir = path.join(
-      dir,
-      ".claude-user",
-      "plugins",
-      "data",
-      sanitizePluginDataKey("bundled-fixture-plugin@fixture-market"),
-    );
-    expect(fs.existsSync(dataDir)).toBe(false);
-    const result = await skillTool.execute("t5", { name: "plugin-skill" });
-    const text = result.content[0].text as string;
-    expect(text).toContain("FS-PLUGIN-SKILL-BODY");
-    expect(text).not.toContain("${CLAUDE_PLUGIN_ROOT}");
-    expect(text).not.toContain("${CLAUDE_PLUGIN_DATA}");
-    expect(text).not.toContain("FS-REPOSITORY-PLUGIN-INERT");
-    expect(text).toContain(path.join(dir, ".claude-user", "plugins", "cache", "fixture-market", "bundled-fixture-plugin", "1.0.0"));
-    expect(text).toContain(dataDir);
-    expect(fs.statSync(dataDir).isDirectory()).toBe(true);
+    const fixture = materializeFixture("hello-claude"); const previousCwd = process.cwd();
+    const home = path.join(fixture, "home"); const userDir = path.join(home, ".claude"); fs.mkdirSync(userDir, { recursive: true });
+    const manifest = JSON.stringify({ name: "owned-bundled", version: "1.0.0" });
+    const skill = "---\ndescription: owned integration skill\n---\nFS-OWNED-PLUGIN ${CLAUDE_PLUGIN_ROOT} ${CLAUDE_PLUGIN_DATA}";
+    const entries: ArtifactDigestEntry[] = [{ path: "owned-bundled", kind: "directory" }, { path: "owned-bundled/.claude-plugin", kind: "directory" }, { path: "owned-bundled/.claude-plugin/plugin.json", kind: "file", data: Buffer.from(manifest) }, { path: "owned-bundled/skills", kind: "directory" }, { path: "owned-bundled/skills/plugin-skill", kind: "directory" }, { path: "owned-bundled/skills/plugin-skill/SKILL.md", kind: "file", data: Buffer.from(skill) }];
+    const treeDigest = digestArtifactEntries(entries); const locationsResult = createLifecycleLocations({ homeDir: home, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: fixture, checkoutFamilyPath: fixture } });
+    if (!locationsResult.ok) throw new Error("owned integration locations"); const locations = locationsResult.value;
+    const artifactRoot = path.join(locations.profileRoot, "artifacts", "sha256", treeDigest.slice(7)); const root = path.join(artifactRoot, "owned-bundled"); const rootDigest = digestArtifactEntries(entries, "owned-bundled"); fs.mkdirSync(path.join(root, ".claude-plugin"), { recursive: true }); fs.mkdirSync(path.join(root, "skills", "plugin-skill"), { recursive: true }); fs.writeFileSync(path.join(root, ".claude-plugin", "plugin.json"), manifest); fs.writeFileSync(path.join(root, "skills", "plugin-skill", "SKILL.md"), skill);
+    const store: OwnedStateStore = { root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey, artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"), generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"), locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine") };
+    const source = { kind: "local-directory", path: path.join(fixture, "catalog") } as const; const snapshotId = "marketplace-integration" as const; const catalogDigest = `sha256:${"a".repeat(64)}` as const;
+    const writeRecord = (codec: Parameters<typeof createRecordEnvelope>[0], scopeKey: string, payload: never): string => { const envelope = createRecordEnvelope(codec, "picc-owned", scopeKey, payload); if (!envelope.ok) throw new Error(envelope.message); const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); fs.mkdirSync(partition.value, { recursive: true }); const file = path.join(partition.value, `${codec.schema}.json`); fs.writeFileSync(file, envelope.value.bytes); return envelope.value.envelope.payloadDigest; };
+    writeRecord(createOwnedMarketplaceCodec(locations.profileKey), "marketplace-fixture-market", { ownership: "picc-owned", name: "fixture-market", profileKey: locations.profileKey, source, selectedSnapshotId: snapshotId } as never);
+    const provenance = { adapter: "local-directory-snapshot", immutableIdentity: source.path } as const; writeRecord(createOwnedMarketplaceSnapshotCodec(locations.profileKey), "marketplace-snapshot-fixture-market", { ownership: "picc-owned", marketplaceName: "fixture-market", profileKey: locations.profileKey, snapshotId, catalogDigest, source, provenance } as never);
+    const executable = executableDigestForProjection(projectPluginManifest(JSON.parse(manifest) as Record<string, unknown>, path.join(root, ".claude-plugin", "plugin.json")).projection); if (!executable.ok) throw new Error(executable.message);
+    const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: { [snapshotId]: { marketplaceName: "fixture-market", catalogDigest, source, provenance } } });
+    const installation = { ownership: "picc-owned", pluginId: "owned-bundled@fixture-market", scope: "project", profileKey: locations.profileKey, checkoutFamilyKey: locations.checkoutFamilyKey, projectKey: locations.checkoutFamilyKey, version: "1.0.0", source: { kind: "marketplace-relative", marketplaceName: "fixture-market", path: "owned-bundled", marketplaceSnapshotId: snapshotId, catalogDigest }, artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: "owned-bundled", usedSingleWrapper: false }, installRoot: root, dataIdentity: { profileKey: locations.profileKey, identity: "owned-bundled@fixture-market" }, executableGenerationId: "admission-integration", trust: { target: "owned-bundled@fixture-market", artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: "owned-bundled", usedSingleWrapper: false }, allowedCrossMarketplaceDependencies: [] }, allowedCrossMarketplaceDependencies: [] } as const;
+    const recordDigest = writeRecord(installationCodec, `project-${locations.checkoutFamilyKey}`, installation as never); const generation = createExecutableAdmissionGenerationCodec(locations.profileKey).decode({ ownership: "picc-owned", profileKey: locations.profileKey, generationId: "admission-integration", members: [{ pluginId: installation.pluginId, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey, projectKey: locations.checkoutFamilyKey, recordDigest }] }); if (!generation.ok) throw new Error(generation.message); const generationBytes = canonicalJsonBytes(generation.value); if (!generationBytes.ok) throw new Error(generationBytes.message); fs.mkdirSync(store.generationsRoot, { recursive: true }); fs.writeFileSync(path.join(store.generationsRoot, "current.json"), generationBytes.value);
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { [installation.pluginId]: true } }));
+    try { process.chdir(fixture); vi.stubEnv("PICC_CLAUDE_USER_DIR", userDir); vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", home); const ownedPi = fakePi(); picc(ownedPi.api as never, { managedSettingsPaths: [], managedArtifactDirs: [], onInitializationSettled: ownedPi.captureInitialization }); await ownedPi.waitForInitialization(); const dataDir = pluginDataPath(locations, installation.pluginId); expect(fs.existsSync(dataDir)).toBe(false); const result = await ownedPi.tools.get("Skill").execute("owned-t5", { name: "owned-bundled:plugin-skill" }); const text = result.content[0].text as string; expect(text).toContain("FS-OWNED-PLUGIN"); expect(text).not.toContain("${CLAUDE_PLUGIN_ROOT}"); expect(text).not.toContain("${CLAUDE_PLUGIN_DATA}"); expect(text).toContain(root); expect(text).toContain(dataDir); expect(fs.statSync(dataDir).isDirectory()).toBe(true); }
+    finally { vi.unstubAllEnvs(); process.env.PICC_CLAUDE_USER_DIR = path.join(dir, ".claude-user"); process.chdir(previousCwd); cleanupFixture(fixture); }
   });
 
   it("`/skill args` expands into the user turn via the input event (Claude slash semantics)", async () => {

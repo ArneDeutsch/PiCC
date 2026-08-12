@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { Diagnostic } from "../types.js";
+import type { Diagnostic, PluginRuntimeContext } from "../types.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
+import { isCompleteOwnedProfileReference, type CompleteOwnedProfileReference } from "../plugin-lifecycle/admission.js";
 
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?$/i;
 const authorizedPluginRootBrand: unique symbol = Symbol("AuthorizedPluginRoot");
 const claudeUserDirectoryBrand: unique symbol = Symbol("ClaudeUserDirectory");
 const validatedPluginPathBrand: unique symbol = Symbol("ValidatedPluginPath");
 const pluginDataLocationBrand: unique symbol = Symbol("PluginDataLocation");
+const ownedPluginDataLocationBrand: unique symbol = Symbol("OwnedPluginDataLocation");
 
 export type PluginPathKind = "file" | "directory" | "either";
 export type PluginPathInputKind = "explicit" | "generated";
@@ -68,6 +70,24 @@ export interface PluginDataLocation {
   readonly canonicalPath: string;
   readonly [pluginDataLocationBrand]: true;
 }
+
+export interface OwnedPluginDataLocation {
+  readonly ownership: "picc-owned";
+  readonly qualifiedIdentity: string;
+  readonly profileKey: string;
+  readonly profileRoot: AuthorizedPluginRoot;
+  readonly lexicalBasePath: string;
+  readonly canonicalBasePath: string;
+  readonly lexicalPath: string;
+  readonly canonicalPath: string;
+  readonly [ownedPluginDataLocationBrand]: true;
+}
+
+export type AuthorizedPluginDataLocation =
+  | { readonly ownership: "claude-imported-readonly"; readonly location: PluginDataLocation }
+  | OwnedPluginDataLocation;
+
+const runtimeDataAuthorities = new WeakMap<PluginRuntimeContext, AuthorizedPluginDataLocation>();
 
 function failure(
   code: PluginPathFailureCode,
@@ -452,6 +472,87 @@ export function resolvePluginDataLocation(
       [pluginDataLocationBrand]: true,
     },
   };
+}
+
+export function authorizeOwnedPluginDataLocation(options: {
+  profileRoot: string;
+  dataRoot: string;
+  profileKey: string;
+  qualifiedIdentity: string;
+}): PluginPathResult<OwnedPluginDataLocation> {
+  if (!/^profile-[A-Za-z0-9_-]+$/.test(options.profileKey) || !isQualifiedPluginId(options.qualifiedIdentity)) {
+    return failure("invalid-path", "Owned plugin data requires exact profile and qualified identities");
+  }
+  const profileRoot = authorizePluginRoot(options.profileRoot);
+  if (!profileRoot.ok) return profileRoot;
+  const lexicalBasePath = path.normalize(options.dataRoot);
+  if (!isContained(profileRoot.value.lexicalPath, lexicalBasePath) || lexicalBasePath === profileRoot.value.lexicalPath) {
+    return failure("path-escape", "Owned plugin data base escapes its profile root", lexicalBasePath);
+  }
+  const key = `plugin-${createHash("sha256").update(options.qualifiedIdentity, "utf8").digest("base64url")}`;
+  const projectedBase = resolveOwnedProjectedPath(profileRoot.value, lexicalBasePath);
+  if (!projectedBase.ok) return projectedBase;
+  const lexicalPath = path.join(lexicalBasePath, key);
+  const projected = resolveOwnedProjectedPath(profileRoot.value, lexicalPath);
+  if (!projected.ok) return projected;
+  if (!isContained(projectedBase.value.canonicalPath, projected.value.canonicalPath) || projected.value.canonicalPath === projectedBase.value.canonicalPath) {
+    return failure("path-escape", "Owned plugin data identity escapes its data base", lexicalPath);
+  }
+  return { ok: true, value: {
+    ownership: "picc-owned", qualifiedIdentity: options.qualifiedIdentity, profileKey: options.profileKey,
+    profileRoot: profileRoot.value, lexicalBasePath, canonicalBasePath: projectedBase.value.canonicalPath,
+    lexicalPath, canonicalPath: projected.value.canonicalPath, [ownedPluginDataLocationBrand]: true,
+  } };
+}
+
+function resolveOwnedProjectedPath(root: AuthorizedPluginRoot, candidate: string): PluginPathResult<{ lexicalPath: string; canonicalPath: string }> {
+  const rootCurrent = revalidateDirectoryRoot(root); if (!rootCurrent.ok) return rootCurrent;
+  const relative = path.relative(root.lexicalPath, candidate);
+  if (relative === "" || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) return failure("path-escape", "Owned plugin data path escapes its profile root", candidate);
+  let lexicalPath = root.lexicalPath; let canonicalPath = root.canonicalPath; let missing = false;
+  for (const segment of relative.split(path.sep)) {
+    lexicalPath = path.join(lexicalPath, segment);
+    if (!missing) {
+      try { fs.lstatSync(lexicalPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("unreadable-path", "Owned plugin data path is unreadable", lexicalPath); missing = true; }
+      if (!missing) {
+        try { canonicalPath = realpathNative(lexicalPath); } catch { return failure("unreadable-path", "Owned plugin data path is unreadable", lexicalPath); }
+        if (!isContained(root.canonicalPath, canonicalPath) || actualKind(canonicalPath) !== "directory") return failure("path-escape", "Owned plugin data path changed or escaped", lexicalPath);
+        continue;
+      }
+    }
+    canonicalPath = path.join(canonicalPath, segment);
+  }
+  return { ok: true, value: { lexicalPath: candidate, canonicalPath } };
+}
+
+export function bindPluginRuntimeDataAuthorization(context: PluginRuntimeContext, authorization: AuthorizedPluginDataLocation): boolean {
+  if (context.pluginId !== (authorization.ownership === "picc-owned" ? authorization.qualifiedIdentity : authorization.location.qualifiedIdentity)
+    || path.resolve(context.dataDir) !== path.resolve(authorization.ownership === "picc-owned" ? authorization.lexicalPath : authorization.location.lexicalPath)) return false;
+  runtimeDataAuthorities.set(context, authorization); return true;
+}
+
+export function pluginRuntimeDataAuthorization(context: PluginRuntimeContext): AuthorizedPluginDataLocation | undefined {
+  return runtimeDataAuthorities.get(context);
+}
+
+export function prepareAuthorizedPluginDataLocation(authorization: AuthorizedPluginDataLocation): PluginPathResult<AuthorizedPluginDataLocation> {
+  try {
+    if (authorization.ownership === "claude-imported-readonly") {
+      const current = revalidatePluginDataLocation(authorization.location); if (!current.ok) return current;
+      fs.mkdirSync(current.value.lexicalPath, { recursive: true });
+      const prepared = revalidatePluginDataLocation(current.value); return prepared.ok ? { ok: true, value: { ownership: "claude-imported-readonly", location: prepared.value } } : prepared;
+    }
+    if (authorization[ownedPluginDataLocationBrand] !== true) return failure("invalid-path", "Owned plugin data authority is not authentic");
+    const current = authorizeOwnedPluginDataLocation({ profileRoot: authorization.profileRoot.lexicalPath, dataRoot: authorization.lexicalBasePath, profileKey: authorization.profileKey, qualifiedIdentity: authorization.qualifiedIdentity });
+    if (!current.ok || current.value.profileRoot.canonicalPath !== authorization.profileRoot.canonicalPath || current.value.canonicalPath !== authorization.canonicalPath) return failure("changed-path", "Owned plugin data authority changed before use", authorization.lexicalPath);
+    fs.mkdirSync(authorization.lexicalPath, { recursive: true });
+    const prepared = authorizeOwnedPluginDataLocation({ profileRoot: authorization.profileRoot.lexicalPath, dataRoot: authorization.lexicalBasePath, profileKey: authorization.profileKey, qualifiedIdentity: authorization.qualifiedIdentity });
+    return prepared.ok ? { ok: true, value: prepared.value } : prepared;
+  } catch { return failure("unreadable-path", "Authorized plugin data directory could not be prepared"); }
+}
+
+export function ownedPluginDataDeletionEligible(pluginId: string, reference: CompleteOwnedProfileReference): boolean {
+  return isQualifiedPluginId(pluginId) && isCompleteOwnedProfileReference(reference) && !reference.installations.some((item) => item.record.pluginId === pluginId);
 }
 
 export function revalidatePluginDataLocation(

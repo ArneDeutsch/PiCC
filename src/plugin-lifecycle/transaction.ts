@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { constants, promises as fs, type BigIntStats } from "node:fs";
+import fsSync, { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import {
   canonicalJsonBytes, isContainedPath, ownedRecordPartition, revalidateOwnedStateStore, sha256,
@@ -402,37 +402,84 @@ function parsePreparedBase(parsed: Record<string, unknown>, operationId: string)
   if (!summary.ok || !plan.ok || sha256(summary.value) !== parsed.confirmationDigest || sha256(plan.value) !== parsed.planDigest) return fail("digest-mismatch", "Persisted transaction digest relationship is invalid");
   return { ok: true, value: parsed as unknown as PreparedTransaction };
 }
+const PASSIVE_ARTIFACT_LIMIT = 1024 * 1024;
+async function readOpenedOrdinaryFile(candidate: string, limit: number): Promise<Buffer> {
+  const resolved = path.resolve(candidate); const handle = await fs.open(resolved, constants.O_RDONLY);
+  try {
+    const stat = await handle.stat({ bigint: true }); const pathname = await fs.lstat(resolved, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n || !pathname.isFile() || pathname.isSymbolicLink() || stat.dev !== pathname.dev || stat.ino !== pathname.ino || !samePath(await fs.realpath(resolved), resolved)) throw new Error("ordinary");
+    const bytes = Buffer.allocUnsafe(limit + 1); let total = 0;
+    while (total <= limit) { const read = await handle.read(bytes, total, limit + 1 - total, null); if (read.bytesRead === 0) break; total += read.bytesRead; }
+    const after = await fs.lstat(resolved, { bigint: true });
+    if (after.dev !== stat.dev || after.ino !== stat.ino || !after.isFile() || after.isSymbolicLink() || !samePath(await fs.realpath(resolved), resolved) || total > limit) throw new Error("changed-or-over-limit");
+    return bytes.subarray(0, total);
+  } finally { await handle.close(); }
+}
+function readOpenedOrdinaryFileSync(candidate: string, limit: number): Buffer {
+  const resolved = path.resolve(candidate); const descriptor = fsSync.openSync(resolved, constants.O_RDONLY);
+  try {
+    const stat = fsSync.fstatSync(descriptor, { bigint: true }); const pathname = fsSync.lstatSync(resolved, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n || !pathname.isFile() || pathname.isSymbolicLink() || stat.dev !== pathname.dev || stat.ino !== pathname.ino || !samePath(fsSync.realpathSync.native(resolved), resolved)) throw new Error("ordinary");
+    const bytes = Buffer.allocUnsafe(limit + 1); let total = 0;
+    while (total <= limit) { const count = fsSync.readSync(descriptor, bytes, total, limit + 1 - total, null); if (count === 0) break; total += count; }
+    const after = fsSync.lstatSync(resolved, { bigint: true });
+    if (after.dev !== stat.dev || after.ino !== stat.ino || !after.isFile() || after.isSymbolicLink() || !samePath(fsSync.realpathSync.native(resolved), resolved) || total > limit) throw new Error("changed-or-over-limit");
+    return bytes.subarray(0, total);
+  } finally { fsSync.closeSync(descriptor); }
+}
 async function readCanonicalObject(candidate: string): Promise<StoreResult<Record<string, unknown> | undefined>> {
-  try { const bytes = await fs.readFile(candidate); if (bytes.byteLength > 1024 * 1024) throw new Error("oversize"); const parsed = JSON.parse(bytes.toString("utf8"));
+  try { const bytes = await readOpenedOrdinaryFile(candidate, PASSIVE_ARTIFACT_LIMIT); const parsed = JSON.parse(bytes.toString("utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("shape"); const canonical = canonicalJsonBytes(parsed); if (!canonical.ok || !Buffer.from(canonical.value).equals(bytes)) throw new Error("canonical"); return { ok: true, value: parsed as Record<string, unknown> };
   } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { ok: true, value: undefined } : fail("invalid-data", "Persisted transaction artifact is invalid"); }
 }
 
-export async function readTransactionReceipt(store: OwnedStateStore, operationId: string): Promise<StoreResult<TransactionReceipt | undefined>> {
-  const raw = await readCanonicalObject(receiptPath(store, operationId)); if (!raw.ok || raw.value === undefined) return raw as StoreResult<TransactionReceipt | undefined>; const parsed = raw.value;
+function readCanonicalObjectSync(candidate: string): StoreResult<Record<string, unknown> | undefined> {
+  try {
+    const bytes = readOpenedOrdinaryFileSync(candidate, PASSIVE_ARTIFACT_LIMIT); const parsed = JSON.parse(bytes.toString("utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return fail("invalid-data", "Persisted transaction artifact is invalid");
+    const canonical = canonicalJsonBytes(parsed); return canonical.ok && Buffer.from(canonical.value).equals(bytes) ? { ok: true, value: parsed as Record<string, unknown> } : fail("invalid-data", "Persisted transaction artifact is invalid");
+  } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { ok: true, value: undefined } : fail("invalid-data", "Persisted transaction artifact is invalid"); }
+}
+function decodeReceiptStructure(store: OwnedStateStore, operationId: string, parsed: Record<string, unknown>): StoreResult<TransactionReceipt> {
   const optional = ["failureCategory", "generationId"].filter((key) => key in parsed); const expected = ["completed", "confirmationDigest", "confirmationSummary", "format", "formatVersion", "lockBindings", "operationId", "outcome", "participants", "planDigest", "producerSchema", "producerVersion", "requiredLocks", ...optional];
   const base = parsePreparedBase(parsed, operationId);
-  if (!exactKeys(parsed, expected) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-receipt" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings)
-    || (parsed.outcome !== "committed" && parsed.outcome !== "rolled-back" && parsed.outcome !== "failed-before-commit") || !Number.isSafeInteger(parsed.completed)) return fail("invalid-receipt", "Stored transaction receipt is invalid");
+  if (!exactKeys(parsed, expected) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-receipt" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || (parsed.outcome !== "committed" && parsed.outcome !== "rolled-back" && parsed.outcome !== "failed-before-commit") || !Number.isSafeInteger(parsed.completed)) return fail("invalid-receipt", "Stored transaction receipt is invalid");
   const complete = parsed.outcome === "committed"; const generation = completedGenerationId(base.value, base.value.participants.length);
-  if ((complete ? parsed.completed !== base.value.participants.length : parsed.completed !== 0)
-    || (parsed.outcome === "failed-before-commit" ? !(["cancelled", "stale-precondition", "changed-staged", "storage-failure"] as unknown[]).includes(parsed.failureCategory) : "failureCategory" in parsed)
-    || (complete ? (generation === undefined ? "generationId" in parsed : parsed.generationId !== generation) : "generationId" in parsed)) return fail("invalid-receipt", "Receipt outcome/completion/generation relationship is invalid");
+  if ((complete ? parsed.completed !== base.value.participants.length : parsed.completed !== 0) || (parsed.outcome === "failed-before-commit" ? !(["cancelled", "stale-precondition", "changed-staged", "storage-failure"] as unknown[]).includes(parsed.failureCategory) : "failureCategory" in parsed) || (complete ? (generation === undefined ? "generationId" in parsed : parsed.generationId !== generation) : "generationId" in parsed)) return fail("invalid-receipt", "Receipt outcome/completion/generation relationship is invalid");
   return { ok: true, value: parsed as unknown as TransactionReceipt };
+}
+function decodeJournalStructure(store: OwnedStateStore, operationId: string, parsed: Record<string, unknown>): StoreResult<TransactionJournal> {
+  const base = parsePreparedBase(parsed, operationId);
+  if (!exactKeys(parsed, JOURNAL_KEYS) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-journal" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings) || !Number.isSafeInteger(parsed.completed) || !Number.isSafeInteger(parsed.rolledBack) || typeof parsed.completed !== "number" || typeof parsed.rolledBack !== "number" || parsed.completed < 0 || parsed.completed > base.value.participants.length || parsed.rolledBack < 0 || parsed.rolledBack > parsed.completed || (parsed.state !== "prepared" && parsed.state !== "pending" && parsed.state !== "rolling-back") || (parsed.state === "prepared" && (parsed.completed !== 0 || parsed.rolledBack !== 0)) || (parsed.state !== "rolling-back" && parsed.rolledBack !== 0)) return fail("invalid-journal", "Stored transaction journal relationships are invalid");
+  return { ok: true, value: parsed as unknown as TransactionJournal };
+}
+export interface PassiveTransactionObservation {
+  readonly receipts: readonly { readonly path: string; readonly status: "present" | "invalid"; readonly receipt?: TransactionReceipt }[];
+  readonly journals: readonly { readonly operationId: string; readonly status: "pending" | "terminal-residue" | "invalid"; readonly journal?: TransactionJournal }[];
+}
+export function observePersistedTransactionsSync(store: OwnedStateStore): PassiveTransactionObservation {
+  const list = (root: string): { names: string[]; invalid: boolean; overflow: boolean } => { try { const rootStat = fsSync.lstatSync(root); if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !samePath(fsSync.realpathSync.native(root), path.resolve(root))) return { names: [], invalid: true, overflow: false }; const names: string[] = []; let overflow = false; const directory = fsSync.opendirSync(root); try { for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) { if (names.length === 1024) { overflow = true; break; } names.push(entry.name); } } finally { directory.closeSync(); } return { names: names.sort(), invalid: false, overflow }; } catch (error) { return { names: [], invalid: (error as NodeJS.ErrnoException).code !== "ENOENT", overflow: false }; } };
+  const receiptListing = list(store.receiptsRoot); const receiptNames = receiptListing.names; const receipts = receiptNames.map((name) => { const candidate = path.join(store.receiptsRoot, name); const match = /^([A-Za-z0-9_-]{1,128})\.json$/.exec(name); const raw = match ? readCanonicalObjectSync(candidate) : fail("invalid-data", "Invalid receipt filename"); const decoded = raw.ok && raw.value !== undefined && match ? decodeReceiptStructure(store, match[1]!, raw.value) : fail("invalid-receipt", "Stored transaction receipt is invalid"); return Object.freeze({ path: candidate, status: decoded.ok ? "present" as const : "invalid" as const, ...(decoded.ok ? { receipt: decoded.value } : {}) }); });
+  const validReceipts = new Map(receipts.flatMap((item) => item.status === "present" && item.receipt ? [[item.receipt.operationId, item.receipt] as const] : []));
+  const sameTerminalAuthority = (journal: TransactionJournal, receipt: TransactionReceipt): boolean => receipt.operationId === journal.operationId && receipt.producerSchema === journal.producerSchema && receipt.producerVersion === journal.producerVersion && receipt.planDigest === journal.planDigest && receipt.confirmationDigest === journal.confirmationDigest && JSON.stringify(receipt.participants) === JSON.stringify(journal.participants) && JSON.stringify(receipt.requiredLocks) === JSON.stringify(journal.requiredLocks) && JSON.stringify(receipt.lockBindings) === JSON.stringify(journal.lockBindings);
+  const journalListing = list(store.journalsRoot); const journalNames = journalListing.names; const journals = journalNames.map((name, index) => { const match = /^([A-Za-z0-9_-]{1,128})\.json$/.exec(name); const operationId = match?.[1] ?? `invalid-entry-${index}`; const raw = match ? readCanonicalObjectSync(path.join(store.journalsRoot, name)) : fail("invalid-data", "Invalid journal filename"); const decoded = raw.ok && raw.value !== undefined && match ? decodeJournalStructure(store, operationId, raw.value) : fail("invalid-journal", "Stored transaction journal is invalid"); const receipt = validReceipts.get(operationId); const status = !decoded.ok ? "invalid" as const : receipt === undefined ? "pending" as const : sameTerminalAuthority(decoded.value, receipt) ? "terminal-residue" as const : "invalid" as const; return Object.freeze({ operationId, status, ...(decoded.ok ? { journal: decoded.value } : {}) }); });
+  if (receiptListing.invalid || receiptListing.overflow) receipts.push({ path: receiptListing.invalid ? store.receiptsRoot : path.join(store.receiptsRoot, "<overflow>"), status: "invalid" });
+  if (journalListing.invalid || journalListing.overflow) journals.push({ operationId: journalListing.invalid ? "invalid-root" : "overflow", status: "invalid" });
+  return Object.freeze({ receipts: Object.freeze(receipts), journals: Object.freeze(journals) });
+}
+
+export async function readTransactionReceipt(store: OwnedStateStore, operationId: string): Promise<StoreResult<TransactionReceipt | undefined>> {
+  const raw = await readCanonicalObject(receiptPath(store, operationId)); if (!raw.ok || raw.value === undefined) return raw as StoreResult<TransactionReceipt | undefined>;
+  return decodeReceiptStructure(store, operationId, raw.value);
 }
 
 export async function readTransactionJournal(store: OwnedStateStore, operationId: string): Promise<StoreResult<TransactionJournal>> {
-  const raw = await readCanonicalObject(journalPath(store, operationId)); if (!raw.ok || raw.value === undefined) return fail("invalid-journal", "Stored transaction journal is missing or invalid"); const parsed = raw.value; const base = parsePreparedBase(parsed, operationId);
-  if (!exactKeys(parsed, JOURNAL_KEYS) || !base.ok || !validLockBindingIdentityRelationship(store, parsed.requiredLocks, parsed.lockBindings) || parsed.format !== "picc-transaction-journal" || parsed.formatVersion !== 1 || !validBindings(parsed.lockBindings) || !validBindingRelationships(store, parsed.lockBindings)
-    || !Number.isSafeInteger(parsed.completed) || !Number.isSafeInteger(parsed.rolledBack) || typeof parsed.completed !== "number" || typeof parsed.rolledBack !== "number"
-    || parsed.completed < 0 || parsed.completed > base.value.participants.length || parsed.rolledBack < 0 || parsed.rolledBack > parsed.completed
-    || (parsed.state !== "prepared" && parsed.state !== "pending" && parsed.state !== "rolling-back")
-    || (parsed.state === "prepared" && (parsed.completed !== 0 || parsed.rolledBack !== 0))
-    || (parsed.state !== "rolling-back" && parsed.rolledBack !== 0)) return fail("invalid-journal", "Stored transaction journal relationships are invalid");
+  const raw = await readCanonicalObject(journalPath(store, operationId)); if (!raw.ok || raw.value === undefined) return fail("invalid-journal", "Stored transaction journal is missing or invalid");
+  const structural = decodeJournalStructure(store, operationId, raw.value); if (!structural.ok) return structural; const parsed = structural.value;
   let completed = parsed.completed; let rolledBack = parsed.rolledBack;
-  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const p = base.value.participants[completed - rolledBack - 1]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; rolledBack += 1; } }
-  else { while (completed < base.value.participants.length && await fileDigest(base.value.participants[completed]!.targetPath) === base.value.participants[completed]!.stagedDigest) completed += 1; }
-  return { ok: true, value: Object.freeze({ ...(parsed as unknown as TransactionJournal), completed, rolledBack, state: parsed.state === "rolling-back" ? "rolling-back" : completed > 0 ? "pending" : parsed.state }) };
+  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const p = parsed.participants[completed - rolledBack - 1]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; rolledBack += 1; } }
+  else { while (completed < parsed.participants.length && await fileDigest(parsed.participants[completed]!.targetPath) === parsed.participants[completed]!.stagedDigest) completed += 1; }
+  return { ok: true, value: Object.freeze({ ...parsed, completed, rolledBack, state: parsed.state === "rolling-back" ? "rolling-back" : completed > 0 ? "pending" : parsed.state }) };
 }
 
 export async function listPendingJournals(store: OwnedStateStore): Promise<StoreResult<readonly string[]>> {
