@@ -220,29 +220,49 @@ describe("retained input persistence", () => {
     for (const replace of ["session", "owner"] as const) {
       const { root, manager, report } = fixture();
       const sessionFile = manager.getSessionFile()!;
+      const blocker = path.join(root, `.picc-retained-${report.agentId}-${report.generation}.json`);
+      let callbackReached = false;
+      let replacementCompleted = false;
+      let replacementRefused = false;
       const session: RetainedInputPersistenceSession = {
         getSessionFile: () => sessionFile,
         getSessionDir: () => root,
         getCwd: () => root,
         getBranch: () => [],
         appendCustomEntry: () => {
+          callbackReached = true;
+          const destructiveReplacement = (operation: () => void): void => {
+            try { operation(); } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code !== "EACCES" && code !== "EBUSY" && code !== "EPERM") throw error;
+              replacementRefused = true;
+              fs.writeFileSync(blocker, "replacement-test-blocker", { mode: 0o600 });
+              throw error;
+            }
+          };
           if (replace === "session") {
             const bytes = fs.readFileSync(sessionFile);
-            fs.unlinkSync(sessionFile);
+            destructiveReplacement(() => fs.unlinkSync(sessionFile));
             fs.writeFileSync(sessionFile, bytes, { mode: 0o600 });
           } else {
             const moved = `${root}-moved`;
-            fs.renameSync(root, moved);
+            destructiveReplacement(() => fs.renameSync(root, moved));
+            roots.push(moved);
             fs.mkdirSync(root);
             fs.copyFileSync(path.join(moved, path.basename(sessionFile)), sessionFile);
             fs.chmodSync(sessionFile, 0o600);
-            roots.push(moved);
           }
+          replacementCompleted = true;
           return "unverified";
         },
       };
       expect(() => persistRetainedInputReport(report, { session, reopenSession: (file) => ({ getSessionFile: () => file, getBranch: () => [] }) }))
         .toThrow(RetainedInputPersistenceError);
+      expect(callbackReached).toBe(true);
+      expect(replacementCompleted || replacementRefused).toBe(true);
+      expect(replacementCompleted && replacementRefused).toBe(false);
+      expect(fs.existsSync(blocker)).toBe(replacementRefused);
+      if (replacementRefused) expect(fs.readFileSync(blocker, "utf8")).toBe("replacement-test-blocker");
     }
   });
 
@@ -253,6 +273,9 @@ describe("retained input persistence", () => {
       getCwd: () => manager.getCwd(), getBranch: () => [], appendCustomEntry: () => "unverified",
     };
     const destination = path.join(manager.getSessionDir(), `.picc-retained-${report.agentId}-${report.generation}.json`);
+    const canonicalDestination = path.join(
+      fs.realpathSync.native(manager.getSessionDir()), path.basename(destination),
+    );
     let verificationReads = 0;
     expect(() => persistRetainedInputReport(report, {
       session,
@@ -269,7 +292,7 @@ describe("retained input persistence", () => {
       report: { agentId: report.agentId, sessionId: report.sessionId, generation: report.generation },
     });
     expect(persistRetainedInputReport(report, { session, reopenSession: (file) => ({ getSessionFile: () => file, getBranch: () => [] }) }))
-      .toEqual({ kind: "recovery-file", sessionFile: manager.getSessionFile(), path: destination });
+      .toEqual({ kind: "recovery-file", sessionFile: manager.getSessionFile(), path: canonicalDestination });
     expect(fs.readFileSync(destination)).toEqual(published);
   });
 

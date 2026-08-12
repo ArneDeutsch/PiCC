@@ -134,7 +134,7 @@ function safeRecord(report: RetainedInputReport): { record: RetainedInputPersist
 }
 
 type Identity = { dev: bigint; ino: bigint };
-type Owner = { path: string; identity: Identity; sessionIdentity: Identity };
+type Owner = { path: string; directoryHandle: number; sessionHandle: number };
 
 function sameIdentity(left: Identity, right: Identity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
@@ -143,6 +143,13 @@ function sameIdentity(left: Identity, right: Identity): boolean {
 function regularIdentity(file: string, restrictive = false): Identity {
   const stat = fs.lstatSync(file, { bigint: true });
   if (!stat.isFile() || stat.isSymbolicLink()) fail();
+  if (restrictive && process.platform !== "win32" && (stat.mode & 0o077n) !== 0n) fail();
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function handleIdentity(handle: number, shape: "file" | "directory", restrictive = false): Identity {
+  const stat = fs.fstatSync(handle, { bigint: true });
+  if ((shape === "file" && !stat.isFile()) || (shape === "directory" && !stat.isDirectory())) fail();
   if (restrictive && process.platform !== "win32" && (stat.mode & 0o077n) !== 0n) fail();
   return { dev: stat.dev, ino: stat.ino };
 }
@@ -161,21 +168,35 @@ function contained(owner: string, candidate: string): boolean {
 function verifiedOwner(sessionFile: string, managerDir: string | undefined): Owner {
   const sessionAbsolute = path.resolve(sessionFile);
   const ownerInput = managerDir ? path.resolve(managerDir) : path.dirname(sessionAbsolute);
-  const originalSession = fs.lstatSync(sessionAbsolute);
-  if (!originalSession.isFile() || originalSession.isSymbolicLink()) fail();
-  const identity = directoryIdentity(ownerInput);
-  const owner = fs.realpathSync.native(ownerInput);
-  const sessionReal = fs.realpathSync.native(sessionAbsolute);
-  if (!contained(owner, sessionReal)) fail();
-  return { path: owner, identity, sessionIdentity: regularIdentity(sessionAbsolute) };
+  let directoryHandle: number | undefined;
+  let sessionHandle: number | undefined;
+  try {
+    directoryIdentity(ownerInput);
+    const owner = fs.realpathSync.native(ownerInput);
+    const sessionReal = fs.realpathSync.native(sessionAbsolute);
+    if (!contained(owner, sessionReal)) fail();
+    directoryHandle = fs.openSync(owner, fs.constants.O_RDONLY);
+    const directoryHandleIdentity = handleIdentity(directoryHandle, "directory");
+    if (!sameIdentity(directoryHandleIdentity, directoryIdentity(owner)) ||
+        !sameIdentity(directoryHandleIdentity, directoryIdentity(ownerInput))) fail();
+    sessionHandle = fs.openSync(sessionAbsolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    if (!sameIdentity(handleIdentity(sessionHandle, "file"), regularIdentity(sessionAbsolute))) fail();
+    return { path: owner, directoryHandle, sessionHandle };
+  } catch (error) {
+    if (sessionHandle !== undefined) try { fs.closeSync(sessionHandle); } catch { /* best effort */ }
+    if (directoryHandle !== undefined) try { fs.closeSync(directoryHandle); } catch { /* best effort */ }
+    throw error;
+  }
 }
 
 function verifySessionOwner(sessionFile: string, owner: Owner, permissionSafe = false): void {
   const ownerReal = fs.realpathSync.native(path.dirname(path.resolve(sessionFile)));
-  if (ownerReal !== owner.path || !sameIdentity(owner.identity, directoryIdentity(owner.path))) fail();
+  const directoryHandleIdentity = handleIdentity(owner.directoryHandle, "directory");
+  if (ownerReal !== owner.path || !sameIdentity(directoryHandleIdentity, directoryIdentity(owner.path))) fail();
   const real = fs.realpathSync.native(sessionFile);
+  const sessionHandleIdentity = handleIdentity(owner.sessionHandle, "file", permissionSafe);
   if (!contained(owner.path, real) ||
-      !sameIdentity(owner.sessionIdentity, regularIdentity(sessionFile, permissionSafe))) fail();
+      !sameIdentity(sessionHandleIdentity, regularIdentity(sessionFile, permissionSafe))) fail();
 }
 
 function dataProperty(record: object, key: string): unknown {
@@ -250,16 +271,10 @@ function fallback(report: RetainedInputReport, sessionFile: string, owner: Owner
     verifySessionOwner(sessionFile, owner);
     fs.linkSync(temporary, destination);
     published = true;
-    if (process.platform !== "win32") {
-      const directory = fs.openSync(owner.path, fs.constants.O_RDONLY);
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-    }
+    if (process.platform !== "win32") fs.fsyncSync(owner.directoryHandle);
     if (!sameIdentity(tempIdentity, regularIdentity(destination, true))) fail();
     fs.unlinkSync(temporary);
-    if (process.platform !== "win32") {
-      const directory = fs.openSync(owner.path, fs.constants.O_RDONLY);
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-    }
+    if (process.platform !== "win32") fs.fsyncSync(owner.directoryHandle);
     if (!verifyRecoveryFile(destination, sessionFile, owner, bytes, expectedJson, readRecoveryFile)) fail();
     return { kind: "recovery-file", sessionFile, path: destination };
   } catch { fail(); } finally {
@@ -283,7 +298,12 @@ export function persistRetainedInputReport(report: RetainedInputReport, options:
   }
   const reopen = options.reopenSession ?? ((file, sessionDir, cwd) => SessionManager.open(file, sessionDir, cwd));
   const readRecoveryFile = options.readRecoveryFileForVerification ?? ((file: string) => fs.readFileSync(file));
-  try { return primary(options.session, sessionFile, owner, record, expectedJson, reopen); } catch {
-    return fallback(report, sessionFile, owner, bytes, expectedJson, readRecoveryFile);
+  try {
+    try { return primary(options.session, sessionFile, owner, record, expectedJson, reopen); } catch {
+      return fallback(report, sessionFile, owner, bytes, expectedJson, readRecoveryFile);
+    }
+  } finally {
+    try { fs.closeSync(owner.sessionHandle); } catch { /* best effort */ }
+    try { fs.closeSync(owner.directoryHandle); } catch { /* best effort */ }
   }
 }
