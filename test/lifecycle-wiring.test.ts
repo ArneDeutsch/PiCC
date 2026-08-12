@@ -1540,6 +1540,7 @@ describe("lifecycle wiring", () => {
     await shutdownPi.waitForInitialization();
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
+    let scopedMcpReleased = false;
     let mcpReleased = false;
     let childStops = 0;
     internals.subagentRegistry.register({
@@ -1547,12 +1548,14 @@ describe("lifecycle wiring", () => {
       resumable: true, oneShot: false, checkpointPaused: true,
       session: { stopCheckpoint: async () => { childStops++; } },
     });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
     internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
     internals.mainCheckpointGate.cancel = async () => { throw new UnconfirmedHostDeadlineError(); };
     const shutdown = shutdownPi.fire("session_shutdown", { reason: "new" });
     await expect(shutdown).rejects.toBeInstanceOf(UnconfirmedHostDeadlineError);
     await expect(shutdown).rejects.toThrow(/fresh PiCC process.*fresh session/iu);
     expect(childStops).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
     expect(mcpReleased).toBe(false);
     expect(fs.existsSync(log)).toBe(false);
   });
@@ -1568,6 +1571,7 @@ describe("lifecycle wiring", () => {
     await shutdownPi.waitForInitialization();
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
+    let scopedMcpReleased = false;
     let mcpReleased = false;
     let childStops = 0;
     let ordinaryCleanup = 0;
@@ -1577,6 +1581,7 @@ describe("lifecycle wiring", () => {
       session: { stopCheckpoint: async () => { childStops++; } },
     });
     internals.backgroundTasks.start("agent:reviewer", new Promise(() => {}), () => { ordinaryCleanup++; });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
     internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
     internals.mainCheckpointGate.cancel = async () => { throw new Error("stale shutdown cancellation evidence"); };
 
@@ -1585,6 +1590,7 @@ describe("lifecycle wiring", () => {
     );
     expect(childStops).toBe(0);
     expect(ordinaryCleanup).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
     expect(mcpReleased).toBe(false);
     expect(fs.existsSync(log)).toBe(false);
   });
@@ -1607,6 +1613,7 @@ describe("lifecycle wiring", () => {
     const noPathAgentId = "agent-332222222223";
     const transcriptPath = `C:\\safe dir\\child [review] "quoted"\\${"long segment ".repeat(30)}transcript.jsonl`;
     let destructiveCleanup = 0;
+    let scopedMcpReleased = false;
     let mcpReleased = false;
     const taskId = internals.backgroundTasks.start(
       "agent:reviewer",
@@ -1645,6 +1652,7 @@ describe("lifecycle wiring", () => {
       resumable: true, oneShot: false, transcriptPath: "C:/secret/unaffected.jsonl",
     });
     internals.subagentRegistry.markSettled("agent-339999999999", { outcome: "completed" });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
     internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
 
     const failure = await shutdownPi.fire("session_shutdown", { reason }).then(
@@ -1666,64 +1674,106 @@ describe("lifecycle wiring", () => {
       expect(failure).not.toMatch(/attempt TaskOutput/iu);
     }
     expect(destructiveCleanup).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
     expect(mcpReleased).toBe(false);
     expect(fs.existsSync(log)).toBe(false);
   });
 
-  it("production session_shutdown joins retained child cleanup before worktree release and SessionEnd", async () => {
+  it("production session_shutdown fences active generations before its one retained scan and completes confirmed cleanup in order", async () => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    const order: string[] = [];
     picc(shutdownPi.api as never, {
       onInitializationSettled: shutdownPi.captureInitialization,
       onWired: (value) => { internals = value; },
+      persistRetainedInputReport: (() => {
+        order.push("retained-persist");
+        return { kind: "session-entry", sessionFile: path.join(dir, "shutdown-order.jsonl"), entryId: "entry-order" };
+      }) as never,
+      mcpRuntime: {
+        whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [],
+        callTool: async () => ({}), getPrompt: async () => ({}), readResource: async () => ({}),
+        diagnostics: () => [], serverStates: () => [],
+        shutdown: async () => { order.push("global-mcp-shutdown"); },
+      },
     });
     await shutdownPi.waitForInitialization();
+    await shutdownPi.fire("session_start", { reason: "startup" }, shutdownPi.printCtx({
+      sessionManager: persistedManager(path.join(dir, "shutdown-order.jsonl")),
+    }));
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
-    const cleanup = deferred<void>();
-    let worktreeReleased = false;
     const agentId = "agent-444444444444";
-    const taskId = internals.backgroundTasks.start(
-      "agent:reviewer",
-      Promise.resolve({
-        ok: false, outcome: "failed" as const, finalMessage: "", agentId,
-        agentName: "reviewer", checkpointPaused: true, error: "paused",
-      }),
-      async () => {
-        await cleanup.promise;
-        worktreeReleased = true;
-      },
-      agentId,
-      "reviewer",
-    );
-    await internals.backgroundTasks.wait(taskId);
-    internals.subagentRegistry.register({
-      agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
-      checkpointPaused: true,
-      session: {
-        recoverCheckpoint: async () => { throw new Error("unused"); },
-        stopCheckpoint: async (attempt) => {
-          await cleanup.promise;
-          worktreeReleased = true;
-          internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
-          return { confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup" };
-        },
-      },
-    });
+    const linkedAgentId = "agent-444444444446";
+    internals.backgroundTasks.start("agent:linked", new Promise(() => {}), undefined, linkedAgentId, "reviewer");
+    internals.backgroundTasks.start("agent:ordinary", new Promise(() => {}), undefined, "agent-444444444445", "reviewer");
 
-    let shutdownSettled = false;
-    const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" })
-      .then(() => { shutdownSettled = true; });
-    await Promise.resolve();
-    expect(shutdownSettled).toBe(false);
-    expect(worktreeReleased).toBe(false);
-    expect(fs.existsSync(log)).toBe(false);
+    internals.subagentRuntime.shutdownActiveGenerations = async () => {
+      order.push("active-generations-fenced-and-joined");
+      internals.subagentRegistry.register({
+        agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          const report = createRetainedInputReport({
+            agentId, sessionId: "session-order", generation: 1, stage: "resumed-cancellation",
+            occurrences: [{ id: 1, sessionId: "session-order", generation: 1, delivery: "steer", content: "retained" }],
+            guidance: "Inspect effects.",
+          });
+          internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+          return {
+            confirmed: true, attemptId: attempt!.attemptId, report,
+            releaseCleanup: async () => { order.push("retained-cleanup-released"); },
+          };
+        } },
+      });
+      await internals.subagentRegistry.stopCheckpoint(agentId, "session");
+      internals.subagentRegistry.register({
+        agentId: linkedAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => ({
+          confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup",
+        }) },
+      });
+    };
+    const stopAll = internals.subagentRuntime.stopAllRetainedSubagents.bind(internals.subagentRuntime);
+    internals.subagentRuntime.stopAllRetainedSubagents = async (...args) => {
+      order.push("retained-scan-start");
+      const result = await stopAll(...args);
+      order.push("retained-scan-finished");
+      return result;
+    };
+    internals.backgroundTasks.stopAgentAndWait = async () => {
+      order.push("linked-background-joined");
+      return { found: true, alreadySettled: false, abortRequested: true };
+    };
+    internals.backgroundTasks.stopAndWait = async () => {
+      order.push("ordinary-background-joined");
+      return { found: true, alreadySettled: false, abortRequested: true };
+    };
+    internals.subagentRuntime.shutdownCheckpointPaused = async () => { order.push("checkpoint-paused-cleanup"); };
+    internals.subagentRuntime.shutdownMcpScopes = async () => { order.push("scoped-mcp-shutdown"); };
+    const fireHook = internals.inputHooks.fire.bind(internals.inputHooks);
+    internals.inputHooks.fire = async (...args: any[]) => {
+      if (args[0] === "SessionEnd") order.push("session-end");
+      return fireHook(...args);
+    };
 
-    cleanup.resolve();
-    await shutdown;
-    expect(worktreeReleased).toBe(true);
+    await shutdownPi.fire("session_shutdown", { reason: "other" });
     expect(fs.existsSync(log)).toBe(true);
+    expect(order).toEqual([
+      "active-generations-fenced-and-joined",
+      "retained-scan-start",
+      "retained-persist",
+      "retained-cleanup-released",
+      "retained-scan-finished",
+      "linked-background-joined",
+      "ordinary-background-joined",
+      "checkpoint-paused-cleanup",
+      "scoped-mcp-shutdown",
+      "global-mcp-shutdown",
+      "session-end",
+    ]);
   });
 
   it("joins and persists an active resumed child before cleanup and SessionEnd", async () => {
@@ -1791,13 +1841,12 @@ describe("lifecycle wiring", () => {
       });
       expect(internals.subagentRegistry.get(agentId)?.checkpointPaused).not.toBe(true);
       expect(internals.subagentRegistry.checkpointStopEligible(agentId)).toBe(false);
-      const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" });
-      await Promise.resolve();
       expect(stopCalls).toBe(1);
       expect(persisted).toHaveLength(0);
       expect(order).toEqual([]);
       releaseStop();
       await alreadySettling;
+      const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" });
       await shutdown;
       order.push("shutdown");
       expect(stopCalls).toBe(1);

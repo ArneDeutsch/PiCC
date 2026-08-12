@@ -370,6 +370,44 @@ export interface ClaudeSkill {
 // Agents
 // ---------------------------------------------------------------------------
 
+/** Recursively immutable view used for normalized configuration crossing runtime seams. */
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends readonly (infer Item)[]
+    ? readonly DeepReadonly<Item>[]
+    : T extends object
+      ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+      : T;
+
+export type AgentMcpScope = "user" | "project";
+
+/** Valid normalized entry retained for later admission, without a parallel diagnostic path. */
+export type NormalizedAgentMcpEntry = Omit<
+  import("./claude/mcp-config.js").RawMcpEntry,
+  "diagnostics" | "skipped"
+> & { skipped: false };
+
+export type AgentMcpItem =
+  | { readonly kind: "reference"; readonly name: string }
+  | {
+      readonly kind: "inline";
+      readonly name: string;
+      readonly entry: DeepReadonly<NormalizedAgentMcpEntry>;
+    };
+
+/** Safe structured ownership parallel to an agent MCP diagnostic string. */
+export type AgentMcpDiagnosticOwnership =
+  | { readonly kind: "server"; readonly serverName: string }
+  | { readonly kind: "unowned"; readonly itemIndex?: number };
+
+/** Parsed agent frontmatter only; the declaration itself confers neither admission nor runtime ownership. */
+export interface AgentMcpDeclaration {
+  readonly scope: AgentMcpScope;
+  readonly items: readonly AgentMcpItem[];
+  readonly diagnostics: readonly string[];
+  readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
+}
+
 export interface ClaudeAgent {
   name: string;
   description: string;
@@ -391,9 +429,12 @@ export interface ClaudeAgent {
   background?: boolean;
   initialPrompt?: string;
   metadata: Record<string, unknown>;
-  /** Parsed but deferred: memory, mcpServers, hooks. */
+  /** Parsed but deferred memory configuration. */
   memory?: unknown;
+  /** Inert lexical/reporting evidence; runtime code must consume agentMcp instead. */
   mcpServers?: unknown;
+  /** Effective immutable MCP declaration for user- and project-defined agents only. */
+  agentMcp?: AgentMcpDeclaration;
   hooks?: HookConfig;
   /** System prompt body. Loaded eagerly (agent bodies are the routing/system surface). */
   body: string;
@@ -861,6 +902,55 @@ export interface ResolvedMcpConfig {
   policyOrdinarySourcesSuppressed?: boolean;
 }
 
+interface ResolvedAgentMcpServerCommon {
+  readonly name: string;
+  readonly source: "subagent-inline";
+  readonly timeoutMs?: number;
+  readonly diagnostics: readonly string[];
+}
+
+export interface InactiveResolvedAgentMcpServer extends ResolvedAgentMcpServerCommon {
+  readonly status: Exclude<McpServerStatus, "enabled">;
+  readonly inactiveReason?: McpInactiveReason | McpPolicyInactiveReason | "admission-unavailable";
+  readonly transport?: "stdio" | "http" | "sse";
+  readonly configuredType?: "http" | "streamable-http" | "sse";
+}
+
+export interface EnabledStdioAgentMcpServer extends ResolvedAgentMcpServerCommon {
+  readonly status: "enabled";
+  readonly transport: "stdio";
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env: Readonly<Record<string, string>>;
+  readonly rawCommand: string;
+}
+
+export interface EnabledRemoteAgentMcpServer extends ResolvedAgentMcpServerCommon {
+  readonly status: "enabled";
+  readonly transport: "http" | "sse";
+  readonly configuredType: "http" | "streamable-http" | "sse";
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly sseDeprecation?: { readonly deprecated: true; readonly replacement: "http" };
+}
+
+/** Distinct agent-local result; it never enters ordinary MCP source/reporting unions. */
+export type ResolvedAgentMcpServer =
+  | InactiveResolvedAgentMcpServer
+  | EnabledStdioAgentMcpServer
+  | EnabledRemoteAgentMcpServer;
+
+export interface ResolvedAgentMcpConfig {
+  readonly servers: readonly ResolvedAgentMcpServer[];
+  readonly diagnostics: readonly string[];
+  readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
+}
+
+/** Project-captured authority for resolving one declaration into unstarted configuration. */
+export interface AgentMcpAdmissionContext {
+  readonly resolve: (declaration: AgentMcpDeclaration) => ResolvedAgentMcpConfig;
+}
+
 // ---------------------------------------------------------------------------
 // Permission matching
 // ---------------------------------------------------------------------------
@@ -941,5 +1031,7 @@ export interface ClaudeProject {
    * optional only so hand-built test literals stay valid.
    */
   mcp?: ResolvedMcpConfig;
+  /** Optional so hand-built project fixtures remain source-compatible. */
+  agentMcpAdmission?: AgentMcpAdmissionContext;
   diagnostics: Diagnostic[];
 }

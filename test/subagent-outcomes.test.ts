@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { validateAgentMcpAdmission } from "../src/index.js";
+import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import { createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
 import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
+  createTaskStopTool,
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry, type SteerableSession } from "../src/runtime/subagent-registry.js";
 import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
@@ -1058,6 +1062,239 @@ describe("dispatch outcome classification", () => {
     expect(exits).toEqual([{ worktreePath: result.worktreePath, action: "keep" }]);
   });
 
+  it("passes the admitted worktree path to MCP preparation", async () => {
+    const h = fakeSdk({ replies: ["done"] });
+    const preparedCwds: string[] = [];
+    const admittedWorktree = path.join(process.cwd(), ".claude", "worktrees", "admitted");
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
+      worktrees: {
+        enter: async () => ({ ok: true, worktreePath: admittedWorktree, diagnostics: [] }),
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async (_agent, cwd) => {
+        preparedCwds.push(cwd);
+        return { scope, activeOwnedStdioServerNames: () => [] };
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("completed");
+    expect(preparedCwds).toEqual([admittedWorktree]);
+    expect(h.created[0]?.cwd).toBe(admittedWorktree);
+  });
+
+  it("rejects inline MCP without project admission before hooks, worktree, provider, or MCP activity", async () => {
+    const effects: string[] = [];
+    const h = fakeSdk({ replies: ["must not run"] });
+    const agent = makeAgent({
+      isolation: "worktree",
+      agentMcp: normalizeAgentMcpDeclaration([{ inline: { command: "unused" } }], "project"),
+    });
+    const runtime = makeSubagentRuntime([agent], h.sdk, {
+      validateMcpAgent: (candidate) => validateAgentMcpAdmission(candidate, {}),
+      hookRunner: {
+        fire: async () => {
+          effects.push("hook");
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async () => {
+          effects.push("worktree");
+          return { ok: true, worktreePath: "/must-not-enter", diagnostics: [] };
+        },
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async () => {
+        effects.push("mcp");
+        throw new Error("must not prepare MCP");
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("project MCP admission authority is unavailable");
+    expect(effects).toEqual([]);
+    expect(h.created).toHaveLength(0);
+    expect(h.promptCalls()).toBe(0);
+  });
+
+  it("orders SubagentStop before scoped MCP shutdown, worktree release, and terminal return", async () => {
+    const order: string[] = [];
+    const h = fakeSdk({ replies: ["ordered result"] });
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => {
+        order.push("mcp-shutdown");
+        return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] };
+      },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
+      hookRunner: {
+        fire: async (event: string) => {
+          if (event === "SubagentStop") order.push("subagent-stop");
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async () => ({ ok: true, worktreePath: "/worktrees/ordered", diagnostics: [] }),
+        exit: async () => { order.push("worktree-release"); return {}; },
+      },
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    order.push("terminal-return");
+    expect(result.outcome).toBe("completed");
+    expect(order).toEqual(["subagent-stop", "mcp-shutdown", "worktree-release", "terminal-return"]);
+  });
+
+  it("preserves and qualifies output on unconfirmed cleanup, then transfers one retry to shutdown", async () => {
+    const h = fakeSdk({ replies: ["VERBATIM CHILD BODY"] });
+    let shutdowns = 0;
+    let retries = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => {
+        shutdowns += 1;
+        return { confirmed: [], unconfirmed: ["inline"], diagnostics: ["RAW cleanup detail"] };
+      },
+      retryUnconfirmedShutdown: async () => {
+        retries += 1;
+        return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] };
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async () => ({ scope, activeOwnedStdioServerNames: () => [] }),
+    });
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as any;
+    const result = await tool.execute("uncertain", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    });
+    const canonical = result.content[0].text as string;
+    expect(canonical).toContain("VERBATIM CHILD BODY");
+    expect(canonical.match(/Agent MCP cleanup warning:/gu)).toHaveLength(1);
+    expect(canonical).not.toContain("RAW cleanup detail");
+    const expanded = tool.renderResult(
+      result, { expanded: true, isPartial: false }, undefined, { isError: false, state: {} },
+    ).render(200).join("\n");
+    expect(expanded).toContain("VERBATIM CHILD BODY");
+    expect(expanded.match(/Agent MCP cleanup warning:/gu)).toHaveLength(1);
+    expect(shutdowns).toBe(1);
+    expect(retries).toBe(0);
+    await runtime.shutdownMcpScopes();
+    await runtime.shutdownMcpScopes();
+    expect(shutdowns).toBe(1);
+    expect(retries).toBe(1);
+  });
+
+  it("closes an owned MCP scope exactly once across provider, construction, startup, hook-stop, and max-turn endings", async () => {
+    const scenarios: Array<{
+      name: string;
+      build: (h: ReturnType<typeof fakeSdk>) => { sdk: PiSdk; overrides?: Parameters<typeof makeSubagentRuntime>[2]; agent?: ReturnType<typeof makeAgent> };
+      outcome: "completed" | "failed" | "aborted";
+    }> = [
+      { name: "provider", build: (h) => ({ sdk: h.sdk }), outcome: "failed" },
+      {
+        name: "construction",
+        build: (h) => ({ sdk: { ...h.sdk, createAgentSession: async () => { throw new Error("construction failed"); } } }),
+        outcome: "failed",
+      },
+      {
+        name: "startup",
+        build: (h) => ({
+          sdk: {
+            ...h.sdk,
+            DefaultResourceLoader: class {
+              constructor(_options: Record<string, unknown>) {}
+              async reload() { throw new Error("startup failed"); }
+            },
+          },
+        }),
+        outcome: "failed",
+      },
+      {
+        name: "hook-stop",
+        build: (h) => ({
+          sdk: h.sdk,
+          overrides: {
+            hookRunner: {
+              fire: async (event: string) => event === "SubagentStop"
+                ? { block: false, stop: true, stopReason: "hook stopped", askDowngraded: false, diagnostics: [] }
+                : { block: false, stop: false, askDowngraded: false, diagnostics: [] },
+            },
+          },
+        }),
+        outcome: "aborted",
+      },
+      { name: "max-turn", build: (h) => ({ sdk: h.sdk, agent: makeAgent({ maxTurns: 1 }) }), outcome: "completed" },
+    ];
+
+    for (const scenario of scenarios) {
+      const h = fakeSdk({ replies: scenario.name === "provider"
+        ? [{ stopReason: "error", errorMessage: "provider failed" }]
+        : ["done"] });
+      let closes = 0;
+      const scope = {
+        whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+        diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+        callTool: async () => ({}), readResource: async () => ({}),
+        shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      };
+      const built = scenario.build(h);
+      const runtime = makeSubagentRuntime([built.agent ?? makeAgent()], built.sdk, {
+        ...built.overrides,
+        prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+      });
+      const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(result.outcome, scenario.name).toBe(scenario.outcome);
+      expect(closes, scenario.name).toBe(1);
+    }
+  });
+
+  it("session shutdown aborts and joins a blocked MCP preparation before provider construction", async () => {
+    const h = fakeSdk({ replies: ["must not run"] });
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    let releaseResolve!: () => void;
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let shutdownCalls = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { shutdownCalls++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async (_agent, _cwd, signal) => {
+        enteredResolve();
+        signal.addEventListener("abort", releaseResolve, { once: true });
+        await release;
+        return { scope, ownedStdioServerNames: [] };
+      },
+    });
+    const dispatch = runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    await entered;
+    await runtime.shutdownActiveGenerations();
+    const result = await dispatch;
+    expect(result.outcome).toBe("aborted");
+    expect(shutdownCalls).toBe(1);
+    expect(h.created).toHaveLength(0);
+  });
+
   it("an API death during a SubagentStop-forced continuation classifies failed, not a stale success", async () => {
     const h = fakeSdk({
       replies: ["first answer", { stopReason: "error", errorMessage: "429 rate limit exceeded" }],
@@ -1075,6 +1312,81 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toMatch(API_DEATH); // the pinned API-error wording
     expect(result.error).toContain("429 rate limit exceeded");
     expect(h.promptCalls()).toBe(2); // initial reply + the one forced continuation
+  });
+
+  it("session shutdown fences admission and drains a live holder plus its queued generation without another provider request", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { concurrency: 1 });
+
+    const live = runtime.dispatch({ subagentType: "reviewer", prompt: "live", depth: 1 });
+    await h.waitForPromptCalls(1);
+    const queued = runtime.dispatch({ subagentType: "reviewer", prompt: "queued", depth: 1 });
+
+    await runtime.shutdownActiveGenerations();
+    const [liveResult, queuedResult] = await Promise.all([live, queued]);
+    expect(liveResult.outcome).toBe("aborted");
+    expect(queuedResult.outcome).toBe("aborted");
+    expect(h.promptCalls()).toBe(1);
+
+    const afterStop = await runtime.dispatch({ subagentType: "reviewer", prompt: "too late", depth: 1 });
+    expect(afterStop.outcome).toBe("aborted");
+    expect(h.promptCalls()).toBe(1);
+  });
+
+  it("session shutdown force-aborts and joins live foreground, background, and nested generations", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { concurrency: 2, maxDepth: 3 });
+    const foreground = runtime.dispatch({ subagentType: "reviewer", prompt: "fg", depth: 1 });
+    const background = runtime.dispatch({ subagentType: "reviewer", prompt: "bg", depth: 2, background: true });
+    const nested = runtime.dispatch({ subagentType: "reviewer", prompt: "nested", depth: 2 });
+    await h.waitForPromptCalls(3);
+
+    await runtime.shutdownActiveGenerations();
+    const results = await Promise.all([foreground, background, nested]);
+    expect(results.map((result) => result.outcome)).toEqual(["aborted", "aborted", "aborted"]);
+    expect(h.abortCalls()).toBeGreaterThanOrEqual(3);
+    expect(h.promptCalls()).toBe(3);
+  });
+
+  it("post-MCP construction cancellation closes the scope and never reaches provider/session creation", async () => {
+    const h = fakeSdk({ replies: ["must not run"] });
+    let reloadEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { reloadEntered = resolve; });
+    let releaseReload!: () => void;
+    const release = new Promise<void>((resolve) => { releaseReload = resolve; });
+    let closes = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const sdk: PiSdk = {
+      ...h.sdk,
+      DefaultResourceLoader: class {
+        constructor(_options: Record<string, unknown>) {}
+        async reload() { reloadEntered(); await release; }
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+
+    const dispatch = runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    await entered;
+    const shutdown = runtime.shutdownActiveGenerations();
+    releaseReload();
+    await shutdown;
+    const result = await dispatch;
+    expect(result.outcome).toBe("aborted");
+    expect(result.error).toContain("aborted before completing");
+    expect(result.error).not.toContain("during MCP setup");
+    expect(closes).toBe(1);
+    expect(h.created).toHaveLength(0);
+    expect(h.promptCalls()).toBe(0);
   });
 
   it("signal fired during SubagentStop-hook evaluation classifies aborted, not completed (abort-race consistency)", async () => {
@@ -1429,6 +1741,21 @@ describe("Agent tool failure mapping (Claude 2.1.200 semantics)", () => {
 });
 
 describe("background dispatch failure mapping (through dispatch — not registry literals)", () => {
+  it("stopAndWait joins a stop already pending after the task status flipped to stopped", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let releaseAbort!: () => void;
+    const abortPending = new Promise<void>((resolve) => { releaseAbort = resolve; });
+    const taskPending = new Promise<never>(() => {});
+    const id = registry.start("agent:reviewer", taskPending, () => abortPending);
+    expect(registry.stop(id)).toMatchObject({ found: true, abortRequested: true });
+
+    let joined = false;
+    const joining = registry.stopAndWait(id).then((result) => { joined = true; return result; });
+    await Promise.resolve();
+    expect(joined).toBe(false);
+    releaseAbort();
+    await expect(joining).resolves.toMatchObject({ found: true, abortRequested: true });
+  });
   it("a rate-limit death lands as status 'failed' with the error in TaskOutput — never 'completed' + empty", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 too many requests" }],
@@ -1520,6 +1847,32 @@ describe("background dispatch failure mapping (through dispatch — not registry
     expect(out.content[0]!.text).toContain("500 exploded");
     expect(out.content[0]!.text).toContain("Partial output before the failure:");
     expect(out.content[0]!.text).toContain("work in progress");
+  });
+
+  it("TaskStop's background stop path aborts the live generation and closes its owned MCP scope once", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    let closes = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+    const registry = new BackgroundTaskRegistry();
+    const tool = createAgentToolDefinition(runtime, { depth: 0, backgroundTasks: registry }) as unknown as ToolLike;
+    const accepted = await tool.execute("start", { subagent_type: "reviewer", prompt: "p", run_in_background: true });
+    const taskId = String(accepted.details.taskId);
+    await h.waitForPromptCalls(1);
+    const taskStop = createTaskStopTool(registry) as unknown as ToolLike;
+    await taskStop.execute("stop", { task_id: taskId });
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.status).toBe("stopped");
+    expect(closes).toBe(1);
   });
 
   it("an aborted background run lands as status 'stopped', not failed or completed", async () => {

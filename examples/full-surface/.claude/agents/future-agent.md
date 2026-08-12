@@ -1,10 +1,12 @@
 ---
 name: future-agent
-description: Uses deferred/unknown features (memory, mcpServers, unknown keys) to prove graceful degradation.
+description: Uses supported agent MCP declarations that stay intentionally inert when a reference is absent and an inline server is unapproved, plus unknown features.
 memory: project
 mcpServers:
-  some-server:
-    command: "npx some-mcp"
+  - fixture-session
+  - fixture-inline:
+      command: "picc-inert-mcp-fixture"
+      args: ["--inert"]
 hooks:
   PreToolUse:
     - hooks:
@@ -13,4 +15,4 @@ hooks:
 unknownFutureAgentField: 42
 ---
 
-Agent that declares deferred features. It must still be dispatchable.
+Agent with a supported absent-reference and unapproved-inline MCP topology. The declarations remain intentionally inert in this fixture, and the agent must still be dispatchable.

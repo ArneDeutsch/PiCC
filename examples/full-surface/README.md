@@ -26,7 +26,7 @@ Coverage map (each canary string is asserted by tests):
 | Background dispatch + collection-aware `TaskOutput` delivery (terminal collection suppresses a redundant notice; running poll does not) | `agents/async-researcher.md`, `.claude/commands/bg-research.md` | `FS-BG-TASKOUTPUT` |
 | Read-only gating / web tools / locked YAML | `agents/reviewer.md`, `researcher.md` | — |
 | isolation: worktree | `agents/isolated-worker.md` | — |
-| Deferred agent fields degrade | `agents/future-agent.md` | — |
+| Agent MCP declaration syntax and inert topology | `agents/future-agent.md` | `fixture-session` reference + `fixture-inline` definition |
 | Permissions: allow globs, deny, ask (`/doctor` report) | `.claude/settings.json` | — |
 | Hook events incl. unknown event + degraded handler type | `.claude/settings.json` | `FS-*-HOOK*` |
 | stdin JSON + additionalContext hook | `tools/write-guard.sh` | `FS-WRITE-GUARD` |
@@ -36,6 +36,12 @@ Coverage map (each canary string is asserted by tests):
 | MCP pending-approval gate (unapproved project server) | `.mcp.json` (`example-server`) | compat report + pending notice |
 | Installed-plugin source copied into a hermetic cache/state layout | `.claude-plugin/` → test-created installed root | `FS-PLUGIN-SKILL-BODY` |
 | Notebook read/edit workflow | `analysis.ipynb`, `test/e2e-notebook.test.ts` | real and fallback cell IDs |
+
+`future-agent` declares one shared reference and one inline stdio server in the documented list
+shape. Both names are intentionally inert in this fixture: `fixture-session` has no configured
+session server and project-inline `fixture-inline` is unapproved. The fixture proves
+loading, static reporting, and topology only; focused runtime tests own connection reuse, dispatch
+isolation, and cleanup behavior.
 
 The background command documents the directional settlement guidance (focused runtime tests prove the
 behavior): an eligible uncollected current task gets one bounded next-turn notice, but a terminal

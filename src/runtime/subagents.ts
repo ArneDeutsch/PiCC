@@ -32,6 +32,7 @@ import type {
   SubagentRegistryRecord,
   SubagentUsage,
   SubagentMessageSource,
+  SubagentAgentProvenance,
   ActiveCheckpointStopEligibility,
   CheckpointStopAttemptIdentity,
   CheckpointStopTerminalEvidence,
@@ -107,6 +108,18 @@ import {
   SubagentRecoveryProgress,
   type SubagentRecoveryDisposition,
 } from "./subagent-recovery.js";
+import type { AgentMcpScope } from "./agent-mcp.js";
+
+const AGENT_MCP_WARNING_PREFIX = "Agent MCP availability warning:";
+const AGENT_MCP_CLEANUP_WARNING_PREFIX = "Agent MCP cleanup warning:";
+
+export interface DispatchMcpContext {
+  readonly scope: AgentMcpScope;
+  readonly setupWarning?: string;
+  /** Queried at successful EnterWorktree time; startup snapshots can outlive the server. */
+  readonly activeOwnedStdioServerNames?: () => readonly string[];
+  readonly reportPinWarning?: (warning: string) => void;
+}
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -140,6 +153,7 @@ export type SubagentCustomToolsFactory = (
   notebookSession: NotebookSessionState,
   activation: SkillActivationState,
   captureUniversalStop?: () => () => boolean,
+  mcp?: DispatchMcpContext,
 ) => unknown[];
 
 export interface SubagentRuntimeDeps {
@@ -173,8 +187,12 @@ export interface SubagentRuntimeDeps {
    * NotebookEdit tools; it is never reconstructed by the factory.
    */
   customToolsFor: SubagentCustomToolsFactory;
-  /** All Claude tool names the harness knows (for gateTools' allKnown). */
-  allKnownToolNames: () => string[];
+  /** Builds the effectful dispatch-local MCP scope after initial worktree admission. */
+  prepareMcpFor?: (agent: ClaudeAgent, spawnCwd: string, signal: AbortSignal) => Promise<DispatchMcpContext>;
+  /** Fail-closed admission dependency check performed before hooks/worktrees/effects. */
+  validateMcpAgent?: (agent: ClaudeAgent) => void;
+  /** All known Claude tool names, using the exact dispatch MCP scope when supplied. */
+  allKnownToolNames: (scope?: AgentMcpScope) => string[];
   permissionEngine: PermissionEngine;
   hookRunner: HookRunner;
   getCwd: () => string;
@@ -627,6 +645,23 @@ const CAPTURED_LINE_CAP = 120;
  * `resolved`/`agent`; `opts.agentOverride` stays undefined (so `overrideDispatch`
  * is false and the fork isn't mistaken for a skill override).
  */
+function agentProvenance(agent: ClaudeAgent): SubagentAgentProvenance {
+  return Object.freeze({
+    kind: agent.builtin === true ? "builtin" : "authored",
+    sourcePath: agent.source.path,
+    sourceScope: agent.source.scope,
+    ...(agent.source.pluginId === undefined ? {} : { pluginId: agent.source.pluginId }),
+  });
+}
+
+function sameAgentProvenance(
+  current: SubagentAgentProvenance,
+  original: SubagentAgentProvenance,
+): boolean {
+  return current.kind === original.kind && current.sourcePath === original.sourcePath &&
+    current.sourceScope === original.sourceScope && current.pluginId === original.pluginId;
+}
+
 function buildForkAgent(): ClaudeAgent {
   return {
     name: FORK_SUBAGENT_TYPE,
@@ -2056,6 +2091,19 @@ export class SubagentRuntime {
     return { outcomes, confirmed: outcomes.length, unconfirmed: 0 };
   }
 
+  private readonly activeMcpScopes = new Set<AgentMcpScope>();
+  private readonly closedMcpScopes = new WeakSet<AgentMcpScope>();
+  private readonly retryMcpScopes = new Set<AgentMcpScope>();
+  private readonly activeMcpPreparations = new Set<{
+    readonly abort: () => void;
+    readonly settled: Promise<void>;
+  }>();
+  private readonly activeGenerations = new Set<{
+    readonly abort: () => void;
+    readonly settled: Promise<void>;
+  }>();
+  private shuttingDown = false;
+
   /** Session-local shutdown barrier for every retained child of this runtime. */
   async shutdownCheckpointPaused(): Promise<void> {
     const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
@@ -2068,6 +2116,44 @@ export class SubagentRuntime {
       .map((record) => recoveryRegistry
         ? recoveryRegistry.stopCheckpoint(record.agentId, "session")
         : record.session?.stopCheckpoint?.() ?? Promise.resolve()));
+  }
+
+  /** Stop every admitted generation and join through hooks, scope close, and worktree release. */
+  async shutdownActiveGenerations(): Promise<void> {
+    // Fence synchronously so a dispatch invoked while shutdown is draining can
+    // never enter admission after the active-generation snapshot.
+    this.shuttingDown = true;
+    const generations = [...this.activeGenerations];
+    for (const generation of generations) generation.abort();
+    await Promise.allSettled(generations.map((generation) => generation.settled));
+  }
+
+  /** Abort and join setup before closing scopes; no preparation may outlive SessionEnd. */
+  async shutdownMcpScopes(): Promise<void> {
+    const preparations = [...this.activeMcpPreparations];
+    for (const preparation of preparations) preparation.abort();
+    await Promise.allSettled(preparations.map((preparation) => preparation.settled));
+    const active = [...this.activeMcpScopes];
+    await Promise.allSettled(active.map((scope) => this.closeMcpScope(scope)));
+    const retries = [...this.retryMcpScopes];
+    await Promise.allSettled(retries.map(async (scope) => {
+      const outcome = await scope.retryUnconfirmedShutdown();
+      if (outcome.unconfirmed.length === 0) this.retryMcpScopes.delete(scope);
+    }));
+  }
+
+  private async closeMcpScope(scope: AgentMcpScope, diagnostics?: Diagnostic[]): Promise<void> {
+    this.activeMcpScopes.delete(scope);
+    if (this.closedMcpScopes.has(scope)) return;
+    this.closedMcpScopes.add(scope);
+    const outcome = await scope.shutdown();
+    if (outcome.unconfirmed.length > 0) {
+      this.retryMcpScopes.add(scope);
+      diagnostics?.push({
+        severity: "warning",
+        message: `${AGENT_MCP_CLEANUP_WARNING_PREFIX} cleanup could not be confirmed for ${outcome.unconfirmed.length} scoped server(s); preserved output is qualified and session shutdown will retry.`,
+      });
+    }
   }
 
   /**
@@ -2131,7 +2217,56 @@ export class SubagentRuntime {
     return this.resolveAgentDefinition(requested)?.color;
   }
 
-  async dispatch(opts: {
+  dispatch(opts: Parameters<SubagentRuntime["dispatchGeneration"]>[0]): Promise<DispatchResult> {
+    if (this.shuttingDown) {
+      const agentId = opts.agentId && isAgentId(opts.agentId) ? opts.agentId : mintAgentId();
+      const result: DispatchResult = {
+        ok: false,
+        outcome: "aborted",
+        finalMessage: "",
+        agentId,
+        resumable: false,
+        error: "Subagent dispatch was cancelled because the session is shutting down.",
+        diagnostics: [],
+      };
+      if (opts.resume) this.deps.subagentRegistry?.markSettled(agentId, { outcome: "aborted" });
+      return Promise.resolve(result);
+    }
+
+    // Mint generation cancellation before resolution, semaphore admission, or
+    // preparation can yield. TaskStop and session shutdown therefore own every
+    // queued, preparing, foreground, background, and nested run.
+    const generation = new AbortController();
+    const signal = opts.abortSignal
+      ? AbortSignal.any([opts.abortSignal, generation.signal])
+      : generation.signal;
+    let settle!: () => void;
+    const owner = {
+      abort: () => generation.abort(),
+      settled: new Promise<void>((resolve) => { settle = resolve; }),
+    };
+    this.activeGenerations.add(owner);
+    const run = this.dispatchGeneration({ ...opts, abortSignal: signal });
+    void run.then(
+      (result) => {
+        // A resumed dispatch has owned settlement since markResuming. This
+        // backstop closes every pre-construction validation/admission return;
+        // retained checkpoints deliberately transfer ownership instead.
+        if (opts.resume && !result.checkpointPaused) {
+          this.deps.subagentRegistry?.markSettled(result.agentId, { outcome: result.outcome });
+        }
+      },
+      () => {
+        if (opts.resume) this.deps.subagentRegistry?.markSettled(opts.agentId!, { outcome: "failed" });
+      },
+    ).finally(() => {
+      this.activeGenerations.delete(owner);
+      settle();
+    });
+    return run;
+  }
+
+  private async dispatchGeneration(opts: {
     subagentType: string;
     prompt: string;
     model?: string;
@@ -2201,6 +2336,8 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /** Generation-local setup warning sink, delivered immediately after MCP settlement. */
+    onMcpWarning?: (warning: string) => void;
     /** Runtime-only concurrency admission sink for task-record mirroring. */
     onAdmission?: (admission: SubagentAdmission) => void;
     /** Opaque dispatcher-run stop authority captured before the Agent tool awaits. */
@@ -2215,6 +2352,8 @@ export class SubagentRuntime {
      * the identical dispatch code. The caller passes the SAME `agentId`.
      */
     resume?: {
+      /** Canonical source identity captured from the original definition. */
+      agentProvenance?: SubagentAgentProvenance;
       /** The persisted transcript to reopen (from the registry record, never `to`). */
       transcriptPath: string;
       /** The cwd the original run used (worktree path when isolated) — reused as-is. */
@@ -2412,9 +2551,27 @@ export class SubagentRuntime {
         emitForkDegrade(forkDegrade!.tone, forkDegrade!.modelReason, forkDegrade!.devReason);
       }
     } else {
-      // Shared resolver: one home for the resolution order so
-      // isOneShotBuiltin() can't desync from this dispatch's settled resumability.
-      resolved = opts.agentOverride ?? this.resolveAgentDefinition(requested);
+      // A resume must reconstruct the original canonical identity. Missing current
+      // definitions fail before hook/provider/MCP/worktree activity; never widen to
+      // general-purpose through the ordinary unknown-name fallback.
+      resolved = opts.agentOverride ?? (opts.resume
+        ? [...agents, ...builtins].find((candidate) =>
+            candidate.name === requested &&
+            (opts.resume?.agentProvenance === undefined ||
+              sameAgentProvenance(agentProvenance(candidate), opts.resume.agentProvenance)))
+        : this.resolveAgentDefinition(requested));
+      if (opts.resume && !resolved) {
+        this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
+        return {
+          ok: false,
+          outcome: "failed",
+          finalMessage: "",
+          agentId,
+          resumable: false,
+          error: `Cannot resume agent ${agentId}: original agent definition ${JSON.stringify(requested)} is no longer available.`,
+          diagnostics,
+        };
+      }
     }
     // Claude fallback: an unknown subagent_type runs as
     // general-purpose instead of hard-erroring — with a VISIBLE degrade in
@@ -2503,7 +2660,9 @@ export class SubagentRuntime {
 
     try {
       agent = this.deps.prepareAgent?.(agent) ?? agent;
+      this.deps.validateMcpAgent?.(agent);
     } catch (err) {
+      if (opts.resume) this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
       return {
         ok: false,
         outcome: "failed",
@@ -2538,6 +2697,7 @@ export class SubagentRuntime {
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
+        agentProvenance: agentProvenance(agent),
         depth: opts.depth,
         cwd: this.deps.getCwd(),
         resumable: false,
@@ -2688,6 +2848,15 @@ export class SubagentRuntime {
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
     let dispatchCwd: CwdState | undefined;
+    let mcpContext: DispatchMcpContext | undefined;
+    let mcpPreparationController: AbortController | undefined;
+    let removeMcpPreparationAbort = () => {};
+    let preparingMcp = false;
+    let mcpSetupCancelled = false;
+    const generationAborted = () => opts.abortSignal?.aborted === true;
+    const requireActiveGeneration = () => {
+      if (generationAborted()) throw new Error("subagent generation cancelled");
+    };
     let started = false;
     let stopFired = false;
     let abortListener: (() => void) | undefined;
@@ -2889,6 +3058,58 @@ export class SubagentRuntime {
       // with the orchestrator or a sibling dispatch.
       const subCwd = new CwdState(cwd);
       dispatchCwd = subCwd;
+      // Inline startup belongs after initial worktree admission and its abort gate,
+      // but before gateTools freezes the child universe or any child session exists.
+      if (!isFork && !agent.builtin && this.deps.prepareMcpFor) {
+        preparingMcp = true;
+        const prepController = new AbortController();
+        mcpPreparationController = prepController;
+        const abortPreparation = () => prepController.abort();
+        if (generationAborted()) abortPreparation();
+        else opts.abortSignal?.addEventListener("abort", abortPreparation, { once: true });
+        removeMcpPreparationAbort = () => opts.abortSignal?.removeEventListener("abort", abortPreparation);
+        const preparationPromise = this.deps.prepareMcpFor(agent, cwd, prepController.signal)
+          .then(async (prepared) => {
+            // Claim a newly established scope synchronously in the promise continuation,
+            // before dispatch code can await another lifecycle boundary.
+            this.activeMcpScopes.add(prepared.scope);
+            mcpContext = {
+              ...prepared,
+              reportPinWarning: (warning) => collectPreloadDiagnostic({ severity: "warning", message: warning }),
+            };
+            if (prepController.signal.aborted) await this.closeMcpScope(prepared.scope, diagnostics);
+            return mcpContext;
+          });
+        let settlePreparation!: () => void;
+        const settled = new Promise<void>((resolve) => { settlePreparation = resolve; });
+        const preparationOwner = {
+          abort: () => prepController.abort(),
+          settled,
+        };
+        this.activeMcpPreparations.add(preparationOwner);
+        try {
+          await preparationPromise;
+        } finally {
+          this.activeMcpPreparations.delete(preparationOwner);
+          settlePreparation();
+          removeMcpPreparationAbort();
+          mcpSetupCancelled = generationAborted() || prepController.signal.aborted;
+          preparingMcp = false;
+        }
+        if (generationAborted() || prepController.signal.aborted) {
+          settledOutcome = "aborted";
+          return {
+            ok: false, outcome: "aborted", finalMessage: "", agentId, resumable: false,
+            agentName: agent.name, worktreePath,
+            error: `Subagent "${agent.name}" was stopped during MCP setup.`, diagnostics,
+          };
+        }
+        if (mcpContext?.setupWarning) {
+          collectPreloadDiagnostic({ severity: "warning", message: mcpContext.setupWarning });
+          try { opts.onMcpWarning?.(mcpContext.setupWarning); } catch { /* presentation only */ }
+          prompt = `[${mcpContext.setupWarning}]\n\n${prompt}`;
+        }
+      }
       let notebookSessionManager: PiSessionManagerLike | undefined;
       const notebookSession = new NotebookSessionState({
         onChange: (snapshot) => {
@@ -2923,7 +3144,7 @@ export class SubagentRuntime {
       let granted = this.deps.permissionEngine.gateTools(
         agent.tools,
         agent.disallowedTools,
-        this.deps.allKnownToolNames(),
+        this.deps.allKnownToolNames(mcpContext?.scope),
       );
       if (opts.background && !isFork) {
         // Claude excludes these built-in resource surfaces only from real
@@ -2954,9 +3175,11 @@ export class SubagentRuntime {
         notebookSession,
         checkpoint.activation,
         customToolsStop,
+        mcpContext,
       );
 
       const sdk = await this.sdk();
+      requireActiveGeneration();
 
       // Subagent built-ins from the SHARED factory: the exact same seven tool
       // implementations the main session builds (index.ts), constructed here
@@ -3036,6 +3259,7 @@ export class SubagentRuntime {
         extensionFactories,
       });
       await loader.reload();
+      requireActiveGeneration();
 
       // Model resolution order: CLAUDE_CODE_SUBAGENT_MODEL env beats
       // the per-invocation `model` param, which beats agent frontmatter `model:`,
@@ -3206,8 +3430,10 @@ export class SubagentRuntime {
       if (model) sessionOptions.model = model;
       if (thinking) sessionOptions.thinkingLevel = thinking;
 
+      requireActiveGeneration();
       const created = await sdk.createAgentSession(sessionOptions);
       session = created.session;
+      requireActiveGeneration();
       checkpoint.attach(session);
       const recoveryProgress = new SubagentRecoveryProgress(session.messages, !isFork);
       if (typeof session.subscribe === "function") {
@@ -3232,6 +3458,7 @@ export class SubagentRuntime {
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
+        agentProvenance: agentProvenance(agent),
         depth: opts.depth,
         cwd,
         worktreePath,
@@ -3421,6 +3648,11 @@ export class SubagentRuntime {
           // Session statistics must be sampled while the public session is live.
           captureUsage();
           try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
+          if (started && !stopFired) {
+            stopFired = true;
+            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
+          }
+          if (mcpContext) await this.closeMcpScope(mcpContext.scope, diagnostics);
           this.deps.subagentRegistry?.markSettled(agentId, {
             outcome,
             usage: capturedUsage,
@@ -3431,10 +3663,6 @@ export class SubagentRuntime {
           // recovery generation must not independently release that same checkout.
           if (worktreePath && this.deps.worktrees && !opts.resume) {
             await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-          }
-          if (started && !stopFired) {
-            stopFired = true;
-            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
           }
         } finally {
           // A paused dispatch remains authoritative through its final retained
@@ -3499,6 +3727,7 @@ export class SubagentRuntime {
         // Retry only a genuinely successful empty reply. terminalOutcome() above
         // has already classified API errors/aborts, which must not be re-prompted.
         if (!finalMessage.trim()) {
+          requireActiveGeneration();
           await session!.prompt(
             "Your previous reply was empty. Reply now with your final answer in the requested format.",
           );
@@ -3551,6 +3780,7 @@ export class SubagentRuntime {
             });
             break;
           }
+          requireActiveGeneration();
           await session!.prompt(
             `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
           );
@@ -3580,6 +3810,7 @@ export class SubagentRuntime {
         };
       }
 
+      requireActiveGeneration();
       const promptRun = session.prompt(fullPrompt);
       const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
       if (recoveryRegistry) {
@@ -3616,14 +3847,17 @@ export class SubagentRuntime {
       }
       return await classifyCompletedTurn();
     } catch (err) {
-      // Catch-all: covers createAgentSession itself throwing — the "API dead
-      // before the session exists" case — and any other dispatch-internal error.
-      // Conservative: not resumable (the session may never have run), but the
-      // transcript path (when one was allocated) stays visible for diagnosis.
-      settledOutcome = "failed";
+      // Cancellation during setup is an intentional stop, not a construction
+      // failure. The preparation owner above has already joined any scope cleanup.
+      // Other failures here include createAgentSession() construction failures:
+      // retain any transcript path for diagnosis, but conservatively keep them
+      // non-resumable because no usable live session was established.
+      const cancelled = generationAborted() || mcpPreparationController?.signal.aborted === true;
+      const setupAborted = cancelled && (preparingMcp || mcpSetupCancelled);
+      settledOutcome = cancelled ? "aborted" : "failed";
       return {
         ok: false,
-        outcome: "failed",
+        outcome: cancelled ? "aborted" : "failed",
         finalMessage: "",
         agentId,
         transcriptPath,
@@ -3636,13 +3870,19 @@ export class SubagentRuntime {
         ...(dispatchCheckpoint?.isQuarantined()
           ? { retainedInputReport: dispatchCheckpoint.report() }
           : {}),
-        error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
+        error: setupAborted
+          ? `Subagent "${agent.name}" was stopped during MCP setup.`
+          : cancelled
+            ? `Subagent "${agent.name}" was aborted before completing its task.`
+            : `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
         diagnostics,
       };
     } finally {
       // Capture while the public session is still live: dispose may release the
       // aggregate stats that failed/aborted results still need to report.
       captureUsage();
+      removeMcpPreparationAbort();
+      mcpPreparationController?.abort();
       if (!checkpointPaused) {
         if (abortListener && opts.abortSignal) {
           try {
@@ -3666,19 +3906,6 @@ export class SubagentRuntime {
         } catch {
           // dispose failures must not mask results
         }
-        this.deps.subagentRegistry?.markSettled(agentId, {
-          outcome: settledOutcome,
-          usage: capturedUsage,
-          // Sanitized+capped by the registry; conversation content, never for
-          // error/log interpolation.
-          finalText: settledFinalText,
-          assistantIdentityText: settledAssistantIdentityText,
-        });
-        // A resumed run reused a worktree owned by its original dispatch and
-        // must not unlock or release ownership it never acquired.
-        if (worktreePath && this.deps.worktrees && !opts.resume) {
-          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-        }
         // Error/abort paths still fire SubagentStop once for observability;
         // blocking is moot because no continuation can safely recover this dispatch.
         if (started && !stopFired) {
@@ -3686,6 +3913,20 @@ export class SubagentRuntime {
             subagent_type: agent.name,
             cwd: dispatchCwd?.get() ?? this.deps.getCwd(),
           }).catch(() => undefined);
+        }
+        if (mcpContext) await this.closeMcpScope(mcpContext.scope, diagnostics).catch(() => {
+          diagnostics.push({ severity: "warning", message: `${AGENT_MCP_CLEANUP_WARNING_PREFIX} scoped cleanup failed unexpectedly; preserved output is qualified.` });
+        });
+        this.deps.subagentRegistry?.markSettled(agentId, {
+          outcome: settledOutcome,
+          usage: capturedUsage,
+          finalText: settledFinalText,
+          assistantIdentityText: settledAssistantIdentityText,
+        });
+        // A resumed run reused a worktree owned by its original dispatch and
+        // must not unlock or release ownership it never acquired.
+        if (worktreePath && this.deps.worktrees && !opts.resume) {
+          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
         }
         // The dispatch and its final lifecycle hooks are now truly settled.
         // Physical agent_settled events during checkpoint/reentry never rotate it.
@@ -3803,6 +4044,13 @@ export function presentDispatchResult(
   const recoveryGuidance = guidanceInput
     ? formatSubagentRecoveryGuidance(guidanceInput)
     : undefined;
+  const mcpQualification = result.diagnostics
+    .map((diagnostic) => diagnostic.message)
+    .filter((message) => message.startsWith(AGENT_MCP_WARNING_PREFIX) || message.startsWith(AGENT_MCP_CLEANUP_WARNING_PREFIX))
+    .filter((message, index, all) => all.indexOf(message) === index)
+    .join("\n");
+  const qualify = (text: string, separator = "\n\n") =>
+    mcpQualification ? `${text}${separator}---\n${mcpQualification}\n---` : text;
   const neutralIdentity = result.outcome === "failed" && result.terminalAssistantError === true &&
       result.resumable && agentId && !recoveryGuidance
     ? `Agent ID: ${agentId}.`
@@ -3814,11 +4062,11 @@ export function presentDispatchResult(
     const cut = appendCutOffNote(finalMessage, result.error ?? DEFAULT_CUT_OFF_NOTE);
     return {
       kind: "result",
-      text: recoveryGuidance
+      text: qualify(recoveryGuidance
         ? `${cut}\n${recoveryGuidance}`
         : neutralIdentity
           ? `${cut}\n${neutralIdentity}`
-          : cut,
+          : cut),
       cutOff: true,
     };
   }
@@ -3828,11 +4076,11 @@ export function presentDispatchResult(
     const base = result.error ?? "subagent failed";
     return {
       kind: "failure",
-      message: recoveryGuidance
+      message: qualify(recoveryGuidance
         ? `${base}\n\n${recoveryGuidance}`
         : neutralIdentity
           ? `${base}\n\n${neutralIdentity}`
-          : base,
+          : base),
     };
   }
 
@@ -3848,7 +4096,7 @@ export function presentDispatchResult(
   } else {
     text = `${finalMessage}${agentTrailerFrame(result.agentId, { completed: true })}`;
   }
-  return { kind: "result", text, cutOff: result.truncated === true };
+  return { kind: "result", text: qualify(text), cutOff: result.truncated === true };
 }
 
 /**
@@ -4070,6 +4318,9 @@ export function createAgentToolDefinition(
             agentId,
             abortSignal: controller.signal,
             onProgress,
+            onMcpWarning: (warning) => {
+              if (taskId) registry.noteSetupWarning(taskId, warning);
+            },
             onAdmission: (next) => {
               admission = next;
               if (taskId) registry.noteAdmission(taskId, next);
@@ -4131,6 +4382,12 @@ export function createAgentToolDefinition(
         ...dispatchOpts,
         abortSignal: signal,
         onProgress,
+        onMcpWarning: onUpdate
+          ? (warning) => onUpdate({
+              content: [{ type: "text", text: warning }],
+              details: { agent: label, live: true, diagnostics: [{ severity: "warning", message: warning }] } satisfies SubagentRenderDetails,
+            })
+          : undefined,
       });
       const settledAt = Date.now();
       const durationMs = settledAt - dispatchedAtMs;
@@ -4463,6 +4720,7 @@ export function createSendMessageToolDefinition(
           background: true,
           agentId: record.agentId,
           resume: {
+            agentProvenance: record.agentProvenance,
             transcriptPath: record.transcriptPath,
             cwd: record.cwd,
             worktreePath: record.worktreePath,

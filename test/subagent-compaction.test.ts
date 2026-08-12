@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
 import type { ClaudeAgent } from "../src/types.js";
-import type { PiSdk, PiSessionMessage } from "../src/runtime/subagents.js";
+import type { PiSdk, PiSessionMessage, SubagentRuntimeDeps } from "../src/runtime/subagents.js";
 import type {
   CheckpointProgress,
   HostDeadlineClock,
@@ -677,7 +677,7 @@ function runtimeFor(
   customHookRunner?: { fire(eventName: string): Promise<any> },
   capturedStopFactories?: Array<() => () => boolean>,
   enableResume = false,
-  enableCancellationRecovery = false,
+  cancellationRecoveryOrPrepareMcp: boolean | SubagentRuntimeDeps["prepareMcpFor"] = false,
   cancellationTestOptions?: {
     deadlinePolicy?: HostDeadlinePolicy;
     onTriggerScheduledForTest?: () => void;
@@ -689,6 +689,10 @@ function runtimeFor(
     worktrees?: any;
   },
 ) {
+  const enableCancellationRecovery = cancellationRecoveryOrPrepareMcp === true;
+  const prepareMcpFor = typeof cancellationRecoveryOrPrepareMcp === "function"
+    ? cancellationRecoveryOrPrepareMcp
+    : undefined;
   let postCompactAttempts = 0;
   const transcriptPath = path.join(process.cwd(), "package.json");
   const sdk = enableResume
@@ -721,6 +725,7 @@ function runtimeFor(
             : {}),
         } }
       : {}),
+    ...(prepareMcpFor === undefined ? {} : { prepareMcpFor }),
     hookRunner: customHookRunner ?? (failPostCompactAttempt === undefined ? undefined : {
       async fire(eventName: string) {
         const block = eventName === "PostCompact" && ++postCompactAttempts === failPostCompactAttempt;
@@ -749,6 +754,34 @@ function runtimeFor(
     ];
     },
   });
+}
+
+function trackedCheckpointMcp() {
+  let preparations = 0;
+  let closes = 0;
+  let retries = 0;
+  const scope = {
+    whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+    diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+    callTool: async () => ({}), readResource: async () => ({}),
+    shutdown: async () => {
+      closes += 1;
+      return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] };
+    },
+    retryUnconfirmedShutdown: async () => {
+      retries += 1;
+      return { confirmed: [], unconfirmed: [], diagnostics: [] };
+    },
+  };
+  return {
+    prepareMcpFor: async () => {
+      preparations += 1;
+      return { scope };
+    },
+    preparations: () => preparations,
+    closes: () => closes,
+    retries: () => retries,
+  };
 }
 
 describe("subagent mid-run compaction", () => {
@@ -1822,6 +1855,71 @@ describe("subagent mid-run compaction", () => {
     expect(harness.sessionCreations()).toBe(1);
     expect(harness.disposed()).toBe(false);
     expect(harness.aborted()).toBe(false);
+  });
+
+  it("retains the production-prepared MCP scope through exhaustion until SendMessage recovery closes it once", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const mcp = trackedCheckpointMcp();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, mcp.prepareMcpFor);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+
+    expect(exhausted.checkpointPaused).toBe(true);
+    expect(mcp.preparations()).toBe(1);
+    expect(mcp.closes()).toBe(0);
+
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    const recovered = await (send.execute as Function)("send", {
+      to: exhausted.agentId,
+      message: "finish recovery",
+    });
+
+    expect(recovered.details).toMatchObject({ outcome: "completed", recovered: true });
+    expect(mcp.preparations()).toBe(1);
+    expect(mcp.closes()).toBe(1);
+    await runtime.shutdownMcpScopes();
+    expect(mcp.closes()).toBe(1);
+    expect(mcp.retries()).toBe(0);
+  });
+
+  it("retains the production-prepared MCP scope through exhaustion until TaskStop abandonment closes it once", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const mcp = trackedCheckpointMcp();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, mcp.prepareMcpFor);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+
+    expect(exhausted.checkpointPaused).toBe(true);
+    expect(mcp.closes()).toBe(0);
+    await (createTaskStopTool(new BackgroundTaskRegistry(), registry).execute as Function)("stop", {
+      task_id: exhausted.agentId,
+    });
+
+    expect(mcp.preparations()).toBe(1);
+    expect(mcp.closes()).toBe(1);
+    await runtime.shutdownMcpScopes();
+    expect(mcp.closes()).toBe(1);
+  });
+
+  it("keeps exhausted production-prepared MCP ownership until session shutdown closes it once", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const mcp = trackedCheckpointMcp();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, mcp.prepareMcpFor);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+
+    expect(exhausted.checkpointPaused).toBe(true);
+    expect(mcp.closes()).toBe(0);
+    await runtime.shutdownActiveGenerations();
+    await runtime.shutdownMcpScopes();
+
+    expect(mcp.preparations()).toBe(1);
+    expect(mcp.closes()).toBe(1);
+    await runtime.shutdownMcpScopes();
+    expect(mcp.closes()).toBe(1);
   });
 
   it("makes awaited SendMessage own and return the classified retained recovery result", async () => {

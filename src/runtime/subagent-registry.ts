@@ -165,11 +165,20 @@ function boundedDescription(description: string | undefined): string | undefined
   return sanitizeLine(description, DESCRIPTION_CAP) || undefined;
 }
 
+export interface SubagentAgentProvenance {
+  readonly kind: "builtin" | "authored";
+  readonly sourcePath: string;
+  readonly sourceScope: string;
+  readonly pluginId?: string;
+}
+
 export interface SubagentRegistryRecord {
   /** Opaque, minted `agent-<12 hex>` identity — the primary key. */
   agentId: string;
   /** The resolved agent definition name (re-resolved on resume for construction). */
   agentName: string;
+  /** Canonical authored/built-in source identity captured by the original dispatch. */
+  agentProvenance?: SubagentAgentProvenance;
   /** Original nesting depth — a resume reuses it (subagents keep their depth). */
   depth: number;
   /** The cwd the dispatch ran in (worktree path when isolated) — reused on resume. */
@@ -291,6 +300,7 @@ export type ResolveResult =
 export interface RegisterInput {
   agentId: string;
   agentName: string;
+  agentProvenance?: SubagentAgentProvenance;
   depth: number;
   cwd: string;
   worktreePath?: string;
@@ -383,6 +393,9 @@ export class SubagentRegistry {
     const existing = this.records.get(input.agentId);
     if (existing) {
       existing.agentName = input.agentName;
+      existing.agentProvenance ??= input.agentProvenance === undefined
+        ? undefined
+        : Object.freeze({ ...input.agentProvenance });
       existing.depth = input.depth;
       existing.cwd = input.cwd;
       existing.worktreePath = input.worktreePath;
@@ -409,6 +422,9 @@ export class SubagentRegistry {
     const record: SubagentRegistryRecord = {
       agentId: input.agentId,
       agentName: input.agentName,
+      agentProvenance: input.agentProvenance === undefined
+        ? undefined
+        : Object.freeze({ ...input.agentProvenance }),
       depth: input.depth,
       cwd: input.cwd,
       worktreePath: input.worktreePath,

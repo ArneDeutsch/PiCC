@@ -8,6 +8,7 @@ import {
   normalizeMcpServerBlock,
   type McpJsonResult,
 } from "../src/claude/mcp-config.js";
+import { AGENT_MCP_LIMITS, normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import { resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
 import { MCP_POLICY_LIMITS } from "../src/engine/mcp-policy.js";
 import type { RemoteMcpWorkHooks } from "../src/claude/mcp-remote-config.js";
@@ -15,6 +16,7 @@ import { loadClaudeProject } from "../src/project.js";
 import type { ClaudeMcpStateResult } from "../src/claude/claude-mcp-state.js";
 import type { ManagedMcpIo, ManagedMcpResult } from "../src/claude/managed-mcp.js";
 import type {
+  AgentMcpAdmissionContext,
   EnabledStdioMcpServer,
   McpPolicySettingsEntry,
   McpPolicySourceFailure,
@@ -66,6 +68,14 @@ function entry(scope: Scope, sourcePath: string, fields: Partial<McpSettingsEntr
   return { scope, sourcePath, ...fields };
 }
 
+function mcpPolicyEntry(
+  scope: Scope,
+  order: number,
+  fields: Partial<McpPolicySettingsEntry>,
+): McpPolicySettingsEntry {
+  return { scope, order, sourcePath: `/${scope}-${order}`, valid: true, ...fields };
+}
+
 function nativeState(options: {
   user?: Record<string, unknown>;
   local?: Record<string, unknown>;
@@ -90,11 +100,12 @@ function resolve(opts: {
   env?: NodeJS.ProcessEnv;
   probe?: GitTrackedProbe;
   nativeState?: ClaudeMcpStateResult;
-  policy?: McpPolicySettingsEntry[];
+  policy?: readonly McpPolicySettingsEntry[];
   policyFailures?: McpPolicySourceFailure[];
   restrictiveMaterialOmitted?: boolean;
   managedMcp?: ManagedMcpResult;
   remoteWorkHooks?: RemoteMcpWorkHooks;
+  captureAgentMcpAdmission?: (context: AgentMcpAdmissionContext) => void;
 }): ResolvedMcpConfig {
   return resolveMcpConfig({
     projectRoot: FAKE_ROOT,
@@ -108,7 +119,15 @@ function resolve(opts: {
     env: opts.env ?? ({} as NodeJS.ProcessEnv),
     isGitTracked: opts.probe ?? (() => false),
     ...(opts.remoteWorkHooks === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooks }),
+    ...(opts.captureAgentMcpAdmission === undefined ? {} : { captureAgentMcpAdmission: opts.captureAgentMcpAdmission }),
   });
+}
+
+function resolveAgent(opts: Parameters<typeof resolve>[0], declaration: unknown, scope: "user" | "project" = "user") {
+  let admission: AgentMcpAdmissionContext | undefined;
+  resolve({ ...opts, captureAgentMcpAdmission: (context) => { admission = context; } });
+  expect(admission).toBeDefined();
+  return admission!.resolve(normalizeAgentMcpDeclaration(declaration, scope));
 }
 
 function server(cfg: ResolvedMcpConfig, name: string): EnabledStdioMcpServer | undefined {
@@ -1634,6 +1653,502 @@ describe("resolveMcpConfig — managed policy admission", () => {
 // ---------------------------------------------------------------------------
 // Assembly (loadClaudeProject)
 // ---------------------------------------------------------------------------
+
+describe("resolveMcpConfig — agent-inline admission", () => {
+  it("keeps ordinary resolution identical with admission capture and when the production handoff throws", () => {
+    const opts = {
+      mcpJson: mcpJsonOf({ project: { command: "${BIN}", args: ["${MISSING}"] } }),
+      entries: [entry("user", "/home/settings.json", { enabledMcpjsonServers: ["project"] })],
+      env: { BIN: "node" },
+    };
+    const ordinary = resolve(opts);
+    const captured = resolve({ ...opts, captureAgentMcpAdmission: () => undefined });
+    const throwing = resolve({ ...opts, captureAgentMcpAdmission: () => { throw new Error("handoff failed"); } });
+    expect(captured).toEqual(ordinary);
+    expect(throwing).toEqual(ordinary);
+  });
+
+  it("materializes admitted user stdio and remote entries from the resolver's frozen environment", () => {
+    const env = { BIN: "node-a", TOKEN: "secret-a", URL: "https://example.test/a" } as NodeJS.ProcessEnv;
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ env, captureAgentMcpAdmission: (context) => { admission = context; } });
+    env.BIN = "node-b";
+    env.TOKEN = "secret-b";
+    env.URL = "https://example.test/b";
+
+    const result = admission!.resolve(normalizeAgentMcpDeclaration([
+      { local: { command: "${BIN}", args: ["--token", "${TOKEN}"], env: { TOKEN: "${TOKEN}" }, timeout: 2000 } },
+      { remote: { type: "http", url: "${URL}", headers: { Authorization: "Bearer ${TOKEN}" } } },
+      "shared-reference",
+    ], "user"));
+
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "local", source: "subagent-inline", status: "enabled", command: "node-a", args: ["--token", "secret-a"], env: { TOKEN: "secret-a" }, timeoutMs: 2000 }),
+      expect.objectContaining({ name: "remote", source: "subagent-inline", status: "enabled", transport: "http", url: "https://example.test/a", headers: { Authorization: "Bearer secret-a" } }),
+    ]);
+  });
+
+  it("uses frozen transport-specific identities for policy and subsequent materialization", () => {
+    const env = { BIN: "node-a", ARG: "serve-a", HOST: "allowed.test", TOKEN: "token-a" } as NodeJS.ProcessEnv;
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({
+      env,
+      policy: [mcpPolicyEntry("managed", 0, {
+        allowedMcpServers: [
+          { serverCommand: ["${BIN}", "${ARG}"] },
+          { serverUrl: "https://${HOST}/api*" },
+        ],
+        deniedMcpServers: [
+          { serverCommand: ["${BIN}", "denied"] },
+          { serverUrl: "https://${HOST}/denied*" },
+        ],
+      })],
+      captureAgentMcpAdmission: (context) => { admission = context; },
+    });
+    Object.assign(env, { BIN: "node-b", ARG: "serve-b", HOST: "mutated.invalid", TOKEN: "token-b" });
+
+    const result = admission!.resolve(normalizeAgentMcpDeclaration([
+      { stdioAllowed: { command: "${BIN}", args: ["${ARG}"], env: { TOKEN: "${TOKEN}" } } },
+      { stdioDenied: { command: "${BIN}", args: ["denied"] } },
+      { remoteAllowed: { type: "http", url: "https://${HOST}/api", headers: { Authorization: "${TOKEN}" } } },
+      { remoteDenied: { type: "sse", url: "https://${HOST}/denied" } },
+    ], "user"));
+
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "stdioAllowed", status: "enabled", command: "node-a", args: ["serve-a"], env: { TOKEN: "token-a" } }),
+      expect.objectContaining({ name: "stdioDenied", status: "blocked", inactiveReason: "policy-denied", transport: "stdio" }),
+      expect.objectContaining({ name: "remoteAllowed", status: "enabled", transport: "http", url: "https://allowed.test/api", headers: { Authorization: "token-a" } }),
+      expect.objectContaining({ name: "remoteDenied", status: "blocked", inactiveReason: "policy-denied", transport: "sse", configuredType: "sse" }),
+    ]);
+  });
+
+  it("admits the legal fallback-spelling name without conflating it with invalid names", () => {
+    const result = resolveAgent({}, [{ "invalid-agent-server": { command: "node" } }]);
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "invalid-agent-server", status: "enabled", command: "node" }),
+    ]);
+  });
+
+  it("rejects forged double-separator names before remote materialization", () => {
+    const work = { materialize: 0, inspect: 0, validate: 0 };
+    const declaration = normalizeAgentMcpDeclaration([
+      { valid: { type: "http", url: "https://safe.test" } },
+    ], "user");
+    const item = declaration.items[0]!;
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({
+      remoteWorkHooks: {
+        onMaterialization: () => { work.materialize++; },
+        onHelperInspection: () => { work.inspect++; },
+        onHeaderValidation: () => { work.validate++; },
+      },
+      captureAgentMcpAdmission: (context) => { admission = context; },
+    });
+    const result = admission!.resolve({
+      ...declaration,
+      items: [{ ...item, name: "a__b", entry: item.kind === "inline" ? { ...item.entry, name: "a__b" } : undefined }],
+    } as never);
+
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "invalid-agent-server", status: "skipped" }),
+    ]);
+    expect(work).toEqual({ materialize: 0, inspect: 0, validate: 0 });
+  });
+
+  it("runs policy, disablement, and project approval before remote materialization", () => {
+    const work = { materialize: 0, inspect: 0, validate: 0 };
+    const declaration = [
+      { denied: { type: "http", url: "https://denied.test/${SECRET}", headersHelper: "never", headers: { Safe: "value" } } },
+      { disabled: { type: "http", url: "https://disabled.test/${SECRET}", headersHelper: "never", headers: { Safe: "value" } } },
+      { pending: { type: "http", url: "https://pending.test/${SECRET}", headersHelper: "never", headers: { Safe: "value" } } },
+    ];
+    const result = resolveAgent({
+      env: { SECRET: "must-not-escape" },
+      entries: [
+        entry("project", "/repo/.claude/settings.json", { enabledMcpjsonServers: ["pending"] }),
+        entry("user", "/home/settings.json", { disabledMcpjsonServers: ["disabled"] }),
+      ],
+      policy: [mcpPolicyEntry("managed", 0, { deniedMcpServers: [{ serverName: "denied" }] })],
+      remoteWorkHooks: {
+        onMaterialization: () => { work.materialize++; },
+        onHelperInspection: () => { work.inspect++; },
+        onHeaderValidation: () => { work.validate++; },
+      },
+    }, declaration, "project");
+
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "denied", status: "blocked", inactiveReason: "policy-denied" }),
+      expect.objectContaining({ name: "disabled", status: "disabled", inactiveReason: "mcpjson-rejected" }),
+      expect.objectContaining({ name: "pending", status: "pending-approval", inactiveReason: "mcpjson-unapproved" }),
+    ]);
+    for (const server of result.servers) {
+      expect(server).not.toHaveProperty("url");
+      expect(server).not.toHaveProperty("headers");
+    }
+    expect(work).toEqual({ materialize: 0, inspect: 0, validate: 0 });
+  });
+
+  it.each([
+    [true, "pending-approval"],
+    [false, "enabled"],
+  ] as const)("treats local approval as %s-tracked provenance", (tracked, status) => {
+    const result = resolveAgent({
+      entries: [entry("local", "/repo/.claude/settings.local.json", { enabledMcpjsonServers: ["candidate"] })],
+      probe: () => tracked,
+    }, [{ candidate: { command: "candidate-command" } }], "project");
+    expect(result.servers[0]).toMatchObject({ name: "candidate", status });
+  });
+
+  it.each([
+    [
+      "local false overrides user true",
+      [entry("user", "/home/settings.json", { enableAllProjectMcpServers: true }), entry("local", "/repo/settings.local.json", { enableAllProjectMcpServers: false })],
+      "pending-approval",
+    ],
+    [
+      "managed false overrides local true",
+      [entry("local", "/repo/settings.local.json", { enableAllProjectMcpServers: true }), entry("managed", "/managed/settings.json", { enableAllProjectMcpServers: false })],
+      "pending-approval",
+    ],
+    [
+      "managed true overrides nearer lower-authority false",
+      [entry("user", "/home/settings.json", { enableAllProjectMcpServers: false }), entry("managed", "/managed/settings.json", { enableAllProjectMcpServers: true })],
+      "enabled",
+    ],
+  ] as const)("applies nearest-wins blanket approval precedence: %s", (_label, entries, status) => {
+    const result = resolveAgent({ entries: [...entries] }, [{ candidate: { command: "candidate" } }], "project");
+    expect(result.servers[0]).toMatchObject({ name: "candidate", status });
+  });
+
+  it("honors only user-authored project approvals and lets disablement dominate approval", () => {
+    const declaration = [
+      { approved: { command: "approved-command" } },
+      { rejected: { command: "rejected-command" } },
+    ];
+    const result = resolveAgent({ entries: [
+      entry("project", "/repo/settings.json", { enabledMcpjsonServers: ["approved", "rejected"] }),
+      entry("user", "/home/settings.json", { enableAllProjectMcpServers: true, enabledMcpjsonServers: ["approved"], disabledMcpjsonServers: ["rejected"] }),
+    ] }, declaration, "project");
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "approved", status: "enabled", command: "approved-command" }),
+      expect.objectContaining({ name: "rejected", status: "disabled", inactiveReason: "mcpjson-rejected" }),
+    ]);
+  });
+
+  it("fails closed on corrupted bounded declarations without invoking accessors or reflecting material", () => {
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    let accessorCalls = 0;
+    const accessorEntry = Object.create(null) as Record<string, unknown>;
+    Object.defineProperties(accessorEntry, {
+      name: { value: "safe-name", enumerable: true },
+      command: { get: () => { accessorCalls++; return "SECRET_COMMAND"; }, enumerable: true },
+      args: { value: [], enumerable: true },
+      env: { value: {}, enumerable: true },
+      skipped: { value: false, enumerable: true },
+    });
+    const normalized = normalizeAgentMcpDeclaration([{ valid: { command: "node" } }], "user");
+    const remoteNormalized = normalizeAgentMcpDeclaration([{ remote: { type: "http", url: "https://safe.test", headers: { Safe: "value" } } }], "user");
+    const remoteItem = remoteNormalized.items[0]!;
+    expect(remoteItem.kind).toBe("inline");
+    const remoteEntry = remoteItem.kind === "inline" ? remoteItem.entry : undefined;
+    const rawEntry = Object.create(null) as Record<string, unknown>;
+    Object.defineProperties(rawEntry, {
+      type: { value: "http", enumerable: true },
+      url: { value: "https://safe.test", enumerable: true },
+      headers: { get: () => { accessorCalls++; return { Authorization: "SECRET_HEADER" }; }, enumerable: true },
+    });
+    const result = admission!.resolve({
+      scope: "user",
+      diagnostics: [],
+      diagnosticOwnership: [],
+      items: [
+        { kind: "inline", name: "safe-name", entry: accessorEntry },
+        { ...normalized.items[0]!, name: "other-name" },
+        { kind: "inline", name: "remote", entry: { ...remoteEntry!, remote: { ...remoteEntry!.remote!, rawEntry } } },
+      ],
+    } as never);
+    expect(accessorCalls).toBe(0);
+    expect(result.servers).toEqual([
+      expect.objectContaining({ name: "safe-name", status: "skipped", diagnostics: ["Agent MCP inline entry is malformed; server remains inactive"] }),
+      expect.objectContaining({ name: "other-name", status: "skipped", diagnostics: ["Agent MCP inline entry is malformed; server remains inactive"] }),
+      expect.objectContaining({ name: "remote", status: "skipped", diagnostics: ["Agent MCP inline entry is malformed; server remains inactive"] }),
+    ]);
+    expect(JSON.stringify(result)).not.toContain("SECRET_COMMAND");
+
+    for (const malformed of [
+      { scope: "project", items: "bad", diagnostics: [] },
+      { scope: "project", items: Array.from({ length: AGENT_MCP_LIMITS.items + 1 }, () => "x"), diagnostics: [] },
+      { scope: "project", items: [], diagnostics: Array.from({ length: AGENT_MCP_LIMITS.diagnostics + 1 }, () => "x") },
+      { scope: "project", items: [], diagnostics: ["x".repeat(AGENT_MCP_LIMITS.diagnosticChars + 1)] },
+    ]) {
+      expect(admission!.resolve(malformed as never)).toEqual({
+        servers: [],
+        diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+        diagnosticOwnership: [{ kind: "unowned" }],
+      });
+    }
+  });
+
+  it("canonicalizes declaration findings as actionable outcomes without forwarding forged diagnostic text", () => {
+    const expected = "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.";
+    const parserProduced = resolveAgent({}, [42, { valid: { command: "node" } }]);
+    expect(parserProduced.diagnostics).toEqual([expected]);
+    expect(expected.length).toBeLessThanOrEqual(AGENT_MCP_LIMITS.diagnosticChars);
+    expect(parserProduced.servers[0]).toMatchObject({ name: "valid", status: "enabled" });
+
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    const canary = "SECRET_DIAGNOSTIC_CANARY";
+    const forged = admission!.resolve({
+      scope: "user",
+      items: [],
+      diagnostics: [canary],
+      diagnosticOwnership: [{ kind: "unowned" }],
+    });
+    expect(forged.diagnostics).toEqual([expected]);
+    expect(forged.diagnosticOwnership).toEqual([{ kind: "unowned" }]);
+    expect(JSON.stringify(forged)).not.toContain(canary);
+  });
+
+  it("validates, detaches, and preserves only exact structured diagnostic ownership", () => {
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    const mutableOwner = { kind: "server", serverName: "command" };
+    const accepted = admission!.resolve({
+      scope: "user",
+      items: [],
+      diagnostics: ["opaque parser finding"],
+      diagnosticOwnership: [mutableOwner],
+    } as never);
+    mutableOwner.serverName = "victim";
+
+    expect(accepted.diagnostics).toEqual([
+      "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.",
+    ]);
+    expect(accepted.diagnosticOwnership).toEqual([{ kind: "server", serverName: "command" }]);
+    expect(Object.isFrozen(accepted.diagnosticOwnership)).toBe(true);
+    expect(Object.isFrozen(accepted.diagnosticOwnership[0])).toBe(true);
+    expect(Object.getPrototypeOf(accepted.diagnosticOwnership[0]!)).toBeNull();
+
+    let getterCalls = 0;
+    const accessorOwner = Object.create(null) as Record<string, unknown>;
+    Object.defineProperties(accessorOwner, {
+      kind: { value: "server", enumerable: true },
+      serverName: { get: () => { getterCalls++; return "command"; }, enumerable: true },
+    });
+    const malformedOwners: unknown[] = [
+      [],
+      [{ kind: "server", serverName: "unsafe/name" }],
+      [{ kind: "server", serverName: "command", extra: true }],
+      [{ kind: "unowned", itemIndex: AGENT_MCP_LIMITS.items }],
+      [accessorOwner],
+    ];
+    for (const diagnosticOwnership of malformedOwners) {
+      const rejected = admission!.resolve({
+        scope: "user",
+        items: [],
+        diagnostics: ["FORGED_PROSE"],
+        diagnosticOwnership,
+      } as never);
+      expect(rejected).toEqual({
+        servers: [],
+        diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+        diagnosticOwnership: [{ kind: "unowned" }],
+      });
+      expect(JSON.stringify(rejected)).not.toContain("FORGED_PROSE");
+    }
+    expect(getterCalls).toBe(0);
+  });
+
+  it("bounds per-server and aggregate admission diagnostics", () => {
+    const placeholders = Array.from({ length: 24 }, (_, index) => `\${MISSING_${index}}`);
+    const perServer = resolveAgent({}, [{ noisy: { command: "node", args: placeholders } }]);
+    expect(perServer.servers[0]!.diagnostics).toHaveLength(16);
+    expect(perServer.diagnostics).toEqual(["Additional agent MCP admission diagnostics omitted"]);
+
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    const declaration = normalizeAgentMcpDeclaration(Array.from({ length: AGENT_MCP_LIMITS.items }, (_, index) => ({ [`s${index}`]: { command: "node" } })), "user");
+    const corrupted = {
+      ...declaration,
+      diagnostics: Array.from({ length: AGENT_MCP_LIMITS.diagnostics }, (_, index) => `safe-${index}`),
+      diagnosticOwnership: Array.from({ length: AGENT_MCP_LIMITS.diagnostics }, () => ({ kind: "unowned" as const })),
+      items: declaration.items.map((item) => ({ ...item, entry: undefined })),
+    };
+    const aggregate = admission!.resolve(corrupted as never);
+    expect(aggregate.diagnostics).toEqual([
+      "Some agent MCP entries were invalid and ignored; valid entries remain available. Review the agent mcpServers declaration.",
+      "Additional agent MCP admission diagnostics omitted",
+    ]);
+    expect(aggregate.servers.filter((item) => item.diagnostics.length > 0)).toHaveLength(AGENT_MCP_LIMITS.diagnostics - 2);
+  });
+
+  it("fails optional and nested non-enumerable or accessor properties closed without invoking getters", () => {
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { admission = context; } });
+    let getterCalls = 0;
+    const normalized = normalizeAgentMcpDeclaration([{ safe: { command: "node", args: ["ok"], env: { SAFE: "yes" } } }], "user");
+    const item = normalized.items[0]!;
+    expect(item.kind).toBe("inline");
+    if (item.kind !== "inline") throw new Error("expected inline fixture");
+
+    const optionalAccessor = { ...item.entry };
+    Object.defineProperty(optionalAccessor, "timeoutMs", {
+      enumerable: false,
+      get: () => { getterCalls++; return 2000; },
+    });
+    const nestedEnv = { ...item.entry.env };
+    Object.defineProperty(nestedEnv, "SECRET", {
+      enumerable: false,
+      get: () => { getterCalls++; return "must-not-escape"; },
+    });
+    const nestedRecord = { ...item.entry, env: nestedEnv };
+    const nestedArgs = [...item.entry.args];
+    Object.defineProperty(nestedArgs, "extra", {
+      enumerable: false,
+      get: () => { getterCalls++; return "must-not-escape"; },
+    });
+    const nestedArray = { ...item.entry, args: nestedArgs };
+    const itemWithHiddenExtra = { ...item };
+    Object.defineProperty(itemWithHiddenExtra, "hidden", { value: "must-not-escape", enumerable: false });
+
+    const result = admission!.resolve({
+      ...normalized,
+      items: [
+        { ...item, entry: optionalAccessor },
+        { ...item, name: "nested-record", entry: { ...nestedRecord, name: "nested-record" } },
+        { ...item, name: "nested-array", entry: { ...nestedArray, name: "nested-array" } },
+        itemWithHiddenExtra,
+      ],
+    } as never);
+
+    expect(getterCalls).toBe(0);
+    expect(result.servers).toHaveLength(4);
+    expect(result.servers.every((server) => server.status === "skipped")).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("must-not-escape");
+
+    const declarationWithSymbol = { ...normalized };
+    Object.defineProperty(declarationWithSymbol, Symbol("secret"), {
+      get: () => { getterCalls++; return "must-not-escape"; },
+    });
+    const itemsWithHiddenExtra = [...normalized.items];
+    Object.defineProperty(itemsWithHiddenExtra, "hidden", {
+      enumerable: false,
+      get: () => { getterCalls++; return "must-not-escape"; },
+    });
+    const malformedDeclaration = admission!.resolve(declarationWithSymbol as never);
+    const malformedItems = admission!.resolve({ ...normalized, items: itemsWithHiddenExtra } as never);
+    expect(malformedDeclaration).toEqual({
+      servers: [],
+      diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+      diagnosticOwnership: [{ kind: "unowned" }],
+    });
+    expect(malformedItems).toEqual({
+      servers: [],
+      diagnostics: ["Agent MCP admission declaration is malformed; inline servers remain inactive"],
+      diagnosticOwnership: [{ kind: "unowned" }],
+    });
+    expect(getterCalls).toBe(0);
+  });
+
+  it.each([
+    ["command", "COMMAND_SECRET", { command: "${COMMAND_SECRET}" }, "blocked"],
+    ["argument", "ARGUMENT_SECRET", { command: "node", args: ["${ARGUMENT_SECRET}"] }, "blocked"],
+    ["environment value", "ENVIRONMENT_SECRET", { command: "node", env: { TOP_SECRET_KEY: "${ENVIRONMENT_SECRET}" } }, "skipped"],
+  ] as const)("reports only the safe %s category when bounded stdio interpolation overflows", (category, variableName, config, status) => {
+    const secretValue = `${category}-secret-value-`.repeat(AGENT_MCP_LIMITS.stringChars);
+    const result = resolveAgent({ env: Object.freeze({ [variableName]: secretValue }) }, [{ oversized: config }]);
+    const expected = `Agent MCP stdio ${category} exceeds the 8192-character limit; shorten the declaration or referenced environment value. Server remains inactive.`;
+
+    expect(result.servers[0]).toEqual(expect.objectContaining({
+      name: "oversized",
+      status,
+      diagnostics: [expected],
+    }));
+    expect(expected.length).toBeLessThanOrEqual(AGENT_MCP_LIMITS.diagnosticChars);
+    expect(result.servers[0]).not.toHaveProperty("command");
+    expect(result.servers[0]).not.toHaveProperty("args");
+    expect(result.servers[0]).not.toHaveProperty("env");
+    expect(result.servers[0]).not.toHaveProperty("rawCommand");
+    expect(JSON.stringify(result)).not.toContain(variableName);
+    expect(JSON.stringify(result)).not.toContain("TOP_SECRET_KEY");
+    expect(JSON.stringify(result)).not.toContain(`${category}-secret-value-`);
+  });
+
+  it("preserves enabled stdio leaves at or below the interpolation limit", () => {
+    const large = "x".repeat(Math.floor(AGENT_MCP_LIMITS.stringChars / 3));
+    const result = resolveAgent({ env: Object.freeze({ LARGE: large }) }, [
+      { ordinary: { command: "${LARGE}", args: ["${LARGE}"], env: { COPY: "${LARGE}" } } },
+    ]);
+
+    expect(result.servers[0]).toEqual(expect.objectContaining({
+      name: "ordinary",
+      status: "enabled",
+      command: large,
+      args: [large],
+      env: { COPY: large },
+    }));
+  });
+
+  it.each([
+    ["allow miss", { policy: [mcpPolicyEntry("managed", 0, { allowedMcpServers: [{ serverName: "other" }] })] }, "policy-allow-miss"],
+    ["managed only", { policy: [mcpPolicyEntry("managed", 0, { allowManagedMcpServersOnly: true, allowedMcpServers: [{ serverName: "other" }] })] }, "policy-managed-only"],
+    ["standalone fail closed", { managedMcp: { status: "unusable", reason: "unreadable" } as ManagedMcpResult }, undefined],
+    ["exclusive empty", { managedMcp: { status: "loaded", servers: [] } as ManagedMcpResult }, undefined],
+    ["exclusive populated", { managedMcp: { status: "loaded", servers: normalizeMcpServerBlock({ managed: { command: "x" } }, "managed").map((server) => ({ ...server, source: "managed-mcp" as const })) } as ManagedMcpResult }, undefined],
+    ["native state unusable", { nativeState: { kind: "unusable", reason: "malformed", diagnostics: [] } as ClaudeMcpStateResult }, "admission-unavailable"],
+  ] as const)("does no remote work before admission under %s", (_label, branch, reason) => {
+    const work = { materialize: 0, inspect: 0, validate: 0, construct: 0 };
+    const result = resolveAgent({
+      ...branch,
+      env: { SECRET: "must-not-escape" },
+      remoteWorkHooks: {
+        onMaterialization: () => { work.materialize++; },
+        onHelperInspection: () => { work.inspect++; },
+        onHeaderValidation: () => { work.validate++; },
+        onHeadersConstruction: () => { work.construct++; },
+      },
+    }, [{ candidate: { type: "http", url: "https://blocked.test/${SECRET}", headers: { Authorization: "${SECRET}" } } }]);
+    expect(result.servers[0]).toMatchObject({ name: "candidate", status: reason === "admission-unavailable" ? "skipped" : "blocked", ...(reason === undefined ? {} : { inactiveReason: reason }) });
+    expect(result.servers[0]).not.toHaveProperty("url");
+    expect(result.servers[0]).not.toHaveProperty("headers");
+    expect(work).toEqual({ materialize: 0, inspect: 0, validate: 0, construct: 0 });
+  });
+
+  it.each([
+    ["malformed inline", { scope: "user", items: [{ kind: "inline", name: "candidate", entry: { name: "candidate" } }], diagnostics: [] }],
+    ["supported not configured", normalizeAgentMcpDeclaration([{ candidate: { type: "http", url: "" } }], "user")],
+    ["parser-produced unsupported inert", normalizeAgentMcpDeclaration([{ candidate: { type: "ws", url: "https://unsupported.test" } }], "user")],
+  ] as const)("does no remote work for %s declarations", (_label, declaration) => {
+    const work = { materialize: 0, inspect: 0, validate: 0, construct: 0 };
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ remoteWorkHooks: {
+      onMaterialization: () => { work.materialize++; },
+      onHelperInspection: () => { work.inspect++; },
+      onHeaderValidation: () => { work.validate++; },
+      onHeadersConstruction: () => { work.construct++; },
+    }, captureAgentMcpAdmission: (context) => { admission = context; } });
+    admission!.resolve(declaration as never);
+    expect(work).toEqual({ materialize: 0, inspect: 0, validate: 0, construct: 0 });
+  });
+
+  it("keeps equivalent ordinary and agent stdio/remote materialization in parity", () => {
+    const block = {
+      stdio: { command: "${BIN}", args: ["${ARG}"], env: { TOKEN: "${TOKEN}" }, timeout: 2000 },
+      remote: { type: "streamable-http", url: "https://${HOST}/api", headers: { Authorization: "${TOKEN}" } },
+    };
+    const env = { BIN: "node", ARG: "serve", TOKEN: "token", HOST: "example.test" };
+    const ordinary = resolve({ entries: [entry("user", "/home/settings.json", { servers: block })], env });
+    const agent = resolveAgent({ env }, Object.entries(block).map(([name, config]) => ({ [name]: config })));
+    const comparable = (value: Record<string, unknown>) => {
+      const { source: _source, ...rest } = value;
+      return rest;
+    };
+    expect(agent.servers.map((item) => comparable(item as unknown as Record<string, unknown>)))
+      .toEqual(ordinary.servers.map((item) => comparable(item as unknown as Record<string, unknown>)));
+  });
+});
 
 describe("loadClaudeProject — mcp assembly", () => {
   function loadFrom(root: string) {

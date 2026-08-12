@@ -6,6 +6,7 @@ import type { HookRunner } from "../../engine/hook-runner.js";
 import type { HookOutcome } from "../../types.js";
 import type { CwdState } from "../cwd-state.js";
 import type { WorktreeManagerLike } from "../subagents.js";
+import { neutralizeControlChars } from "../../util/neutralize-text.js";
 
 /**
  * EnterWorktree / ExitWorktree tool definitions.
@@ -19,6 +20,10 @@ export function createWorktreeTools(deps: {
   cwdState: CwdState;
   hookRunner: HookRunner;
   captureUniversalStop?: () => () => boolean;
+  /** Dispatch-owned stdio scopes stay pinned to their initial launch cwd. */
+  ownedStdioServerNames?: () => readonly string[];
+  /** Retains the exact bounded successful-entry warning in generation diagnostics. */
+  onScopedMcpPinWarning?: (warning: string) => void;
 }): Record<string, unknown>[] {
   const applyUniversalStop = (
     outcome: HookOutcome,
@@ -86,12 +91,22 @@ export function createWorktreeTools(deps: {
         stopReason = applyUniversalStop(outcome, stopRun, ctx);
       }
       const seeded = (result as { seededFiles?: string[] }).seededFiles ?? [];
+      const pinnedNames = deps.ownedStdioServerNames?.() ?? [];
+      const pinned = [...new Set(pinnedNames)].slice(0, 8)
+        .map((name) => JSON.stringify(neutralizeControlChars(name).slice(0, 128)));
+      const pinnedWarning = pinned.length
+        ? `Scoped MCP stdio remains pinned to its launch directory (${pinned.join(", ")}${pinnedNames.length > pinned.length ? ", additional servers omitted" : ""}). Restart the agent in the desired worktree if those servers must follow.`
+        : undefined;
+      if (pinnedWarning) {
+        try { deps.onScopedMcpPinWarning?.(pinnedWarning); } catch { /* diagnostics are presentation-only */ }
+      }
       const lines = [
         `${created ? "Created and entered" : "Entered"} worktree: ${result.worktreePath}`,
         (result as { branch?: string }).branch ? `Branch: ${(result as { branch?: string }).branch}` : undefined,
         seeded.length ? `Seeded from .worktreeinclude: ${seeded.join(", ")}` : undefined,
         releasedLine,
         "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
+        pinnedWarning,
         stopReason ? `WorktreeCreate hook stopped further model processing: ${stopReason}` : undefined,
       ].filter(Boolean);
       return {
@@ -109,6 +124,7 @@ export function createWorktreeTools(deps: {
                 ...(previousKeepError !== undefined ? { previousKeepError } : {}),
               }
             : {}),
+          ...(pinnedWarning ? { scopedMcpPinned: true, scopedMcpPinnedWarning: pinnedWarning } : {}),
           ...(stopReason ? { stoppedByHook: true, stopReason } : {}),
         },
       };

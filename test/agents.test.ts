@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import {
   builtinAgents,
   loadAgents,
@@ -11,7 +12,14 @@ import {
   type PluginAgentLoaderSource,
 } from "../src/claude/agents.js";
 import { authorizePluginRoot, resolvePluginPath } from "../src/claude/plugin-paths.js";
-import type { ClaudeAgent } from "../src/types.js";
+import type {
+  AgentMcpAdmissionContext,
+  AgentMcpDeclaration,
+  AgentMcpItem,
+  ClaudeAgent,
+  ResolvedAgentMcpConfig,
+  ResolvedAgentMcpServer,
+} from "../src/types.js";
 
 function supportsDirectoryLink(): boolean {
   const probe = fs.mkdtempSync(path.join(os.tmpdir(), "picc-agent-dir-link-"));
@@ -109,8 +117,7 @@ describe("loadAgents", () => {
         "  priority: 1",
         "memory: project",
         "mcpServers:",
-        "  github:",
-        "    command: gh-mcp",
+        "  - github",
         "hooks:",
         "  PreToolUse:",
         "    - matcher: Bash",
@@ -147,17 +154,18 @@ describe("loadAgents", () => {
     expect(a.source.scope).toBe("project");
   });
 
-  it("keeps deferred fields (memory, mcpServers, hooks) parsed and not lost", () => {
+  it("normalizes documented MCP list syntax while preserving inert lexical evidence and hooks", () => {
     writeAgent(
-      "deferred.md",
+      "scoped.md",
       [
         "---",
-        "description: deferred fields",
+        "description: scoped fields",
         "memory: user",
         "mcpServers:",
-        "  gh:",
-        "    command: gh-mcp",
-        "    args: [serve]",
+        "  - shared",
+        "  - local:",
+        "      command: local-mcp",
+        "      args: [serve]",
         "hooks:",
         "  SubagentStop:",
         "    - hooks:",
@@ -171,19 +179,30 @@ describe("loadAgents", () => {
     const { agents } = load();
     const a = agents[0]!;
     expect(a.memory).toBe("user");
-    expect(a.mcpServers).toEqual({ gh: { command: "gh-mcp", args: ["serve"] } });
+    expect(a.mcpServers).toEqual(["shared", { local: { command: "local-mcp", args: ["serve"] } }]);
+    expect(a.agentMcp?.items).toEqual([
+      { kind: "reference", name: "shared" },
+      expect.objectContaining({
+        kind: "inline",
+        name: "local",
+        entry: expect.objectContaining({ command: "local-mcp", args: ["serve"], skipped: false }),
+      }),
+    ]);
+    expect(a.agentMcp?.scope).toBe("project");
+    expect(a.agentMcp?.diagnostics).toEqual([]);
+    expect(Object.isFrozen(a.agentMcp)).toBe(true);
+    expect(Object.isFrozen(a.agentMcp?.items)).toBe(true);
+    expect(Object.isFrozen(a.agentMcp?.items[1])).toBe(true);
+    expect(Object.isFrozen(a.agentMcp?.diagnostics)).toBe(true);
+    expect(Object.isFrozen(a.agentMcp?.items[1]?.kind === "inline" ? a.agentMcp.items[1].entry.env : undefined)).toBe(true);
     expect(a.hooks).toBeDefined();
     const entries = a.hooks!["SubagentStop"]!;
     expect(entries).toHaveLength(1);
-    expect(entries[0]!.hooks[0]!.type).toBe("command");
-    expect(entries[0]!.hooks[0]!.command).toBe("notify.sh");
-    // Raw handler definition preserved so nothing is lost.
     expect(entries[0]!.hooks[0]!.raw).toEqual({
       type: "command",
       command: "notify.sh",
       extraField: "kept",
     });
-    // Deferred fields are not unknown keys.
     expect(a.unknownKeys).toEqual([]);
   });
 
@@ -367,6 +386,531 @@ describe("loadAgents", () => {
   });
 });
 
+describe("agent MCP declaration normalization", () => {
+  it("accepts references plus stdio and supported remote inline forms in deterministic order", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      "session-server",
+      { stdio: { type: "stdio", command: "local-command", env: { TOKEN: "secret-value" } } },
+      { http: { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "secret-header" } } },
+      { stream: { type: "streamable-http", url: "https://example.invalid/stream" } },
+      { events: { type: "sse", url: "https://example.invalid/events" } },
+    ], "project");
+
+    expect(declaration.items.map((item) => [item.kind, item.name])).toEqual([
+      ["reference", "session-server"],
+      ["inline", "stdio"],
+      ["inline", "http"],
+      ["inline", "stream"],
+      ["inline", "events"],
+    ]);
+    const inline = declaration.items.filter((item) => item.kind === "inline");
+    expect(inline.map((item) => item.entry.remote?.configuredType ?? "stdio")).toEqual([
+      "stdio", "http", "streamable-http", "sse",
+    ]);
+    expect(Object.getPrototypeOf(inline[0]!.entry.env)).toBeNull();
+    expect(Object.getPrototypeOf(inline[1]!.entry.remote!.rawEntry!)).toBeNull();
+    expect(Object.isFrozen(inline[1]!.entry.remote!.rawEntry)).toBe(true);
+    expect(inline.every((item) => !Object.hasOwn(item.entry, "diagnostics"))).toBe(true);
+    expect(declaration).toMatchObject({ scope: "project", diagnostics: [] });
+  });
+
+  it("preflights very large names while preserving the shared 128-character contract", () => {
+    const boundaryName = "a".repeat(128);
+    const overBoundaryName = "b".repeat(129);
+    const hugeReference = "r".repeat(100_000);
+    const hugeMappingName = "m".repeat(100_000);
+    const declaration = normalizeAgentMcpDeclaration([
+      boundaryName,
+      overBoundaryName,
+      hugeReference,
+      { [hugeMappingName]: { command: "safe" } },
+      "bad/name",
+    ], "project");
+
+    expect(declaration.items).toEqual([{ kind: "reference", name: boundaryName }]);
+    expect(declaration.diagnostics).toEqual([
+      "Agent mcpServers item 2 has a server name exceeding the 128-character limit; item ignored",
+      "Agent mcpServers item 3 has a server name exceeding the 128-character limit; item ignored",
+      "Agent mcpServers item 4 has a server name exceeding the 128-character limit; item ignored",
+      expect.stringContaining("allowed: letters, digits"),
+    ]);
+    expect(declaration.diagnostics.join(" ")).not.toMatch(/r{64}|m{64}/u);
+  });
+
+  it("deep-freezes detached projected entries and discards unknown nested payloads", () => {
+    const hidden = { payload: { canary: "UNKNOWN_NESTED_SECRET" } };
+    const source = {
+      command: "before-command",
+      args: ["before-arg"],
+      env: { TOKEN: "before-env" },
+      unknownField: hidden,
+    };
+    const remote = {
+      type: "http",
+      url: "https://before.invalid/mcp",
+      headers: { Authorization: "before-header" },
+    };
+    const declaration = normalizeAgentMcpDeclaration([
+      { local: source },
+      { remote },
+    ], "user");
+    source.command = "after-command";
+    source.args[0] = "after-arg";
+    source.env.TOKEN = "after-env";
+    hidden.payload.canary = "after-secret";
+    remote.url = "https://after.invalid/mcp";
+    remote.headers.Authorization = "after-header";
+
+    const inline = declaration.items[0];
+    expect(inline?.kind).toBe("inline");
+    if (inline?.kind !== "inline") throw new Error("expected inline declaration");
+    expect(inline.entry).toMatchObject({
+      command: "before-command",
+      args: ["before-arg"],
+      env: { TOKEN: "before-env" },
+    });
+    expect(JSON.stringify(inline.entry)).not.toMatch(/after-|UNKNOWN_NESTED_SECRET/u);
+    expect(inline.entry).not.toHaveProperty("unknownField");
+    const retainedRemote = declaration.items[1];
+    expect(retainedRemote?.kind === "inline" ? retainedRemote.entry.remote?.rawEntry : undefined)
+      .toMatchObject({ url: "https://before.invalid/mcp", headers: { Authorization: "before-header" } });
+
+    const pending: unknown[] = [declaration];
+    const visited = new Set<object>();
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (value === null || typeof value !== "object" || visited.has(value)) continue;
+      visited.add(value);
+      expect(Object.isFrozen(value)).toBe(true);
+      pending.push(...Object.values(value));
+    }
+  });
+
+  it("bounds over-deep and over-wide entry graphs before normalization", () => {
+    let deep: Record<string, unknown> = { canary: "DEEP_GRAPH_SECRET" };
+    for (let index = 0; index < 10_000; index++) deep = { child: deep };
+    const wide = Object.create(null) as Record<string, unknown>;
+    wide.command = "would-run-if-truncated";
+    for (let index = 0; index <= 64; index++) {
+      wide[`unknown-${index}`] = { canary: `WIDE_GRAPH_SECRET_${index}` };
+    }
+
+    const declaration = normalizeAgentMcpDeclaration([
+      { deepUnknown: { command: "safe", unknownField: deep } },
+      { deepKnown: { command: "safe", env: { TOKEN: deep } } },
+      { tooWide: wide },
+    ], "project");
+
+    expect(declaration.items.map((item) => item.name)).toEqual(["deepUnknown"]);
+    expect(declaration.diagnostics.join(" ")).toContain('unknown field "unknownField" ignored');
+    expect(declaration.diagnostics.join(" ")).toContain("more than 64 entry fields");
+    const serialized = JSON.stringify(declaration);
+    expect(serialized).not.toMatch(/DEEP_GRAPH_SECRET|WIDE_GRAPH_SECRET|would-run-if-truncated/u);
+    const retained = declaration.items[0];
+    expect(retained?.kind === "inline" ? retained.entry.remote?.rawEntry : undefined).toBeUndefined();
+  });
+
+  it("never invokes or retains callbacks and does not traverse malformed schema leaves", () => {
+    let callbacks = 0;
+    const callbackLeaf = Object.create(null) as Record<string, unknown>;
+    callbackLeaf.toJSON = () => {
+      callbacks++;
+      return "CALLBACK_SECRET";
+    };
+    Object.defineProperty(callbackLeaf, "getter", {
+      enumerable: true,
+      get: () => {
+        callbacks++;
+        return "GETTER_SECRET";
+      },
+    });
+    let deepLeaf: Record<string, unknown> = callbackLeaf;
+    for (let index = 0; index < 10_000; index++) deepLeaf = { child: deepLeaf };
+    const broadLeaf = Object.fromEntries(Array.from({ length: 10_000 }, (_, index) => [
+      `leaf-${index}`,
+      callbackLeaf,
+    ]));
+    const accessorEntry = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessorEntry, "command", {
+      enumerable: true,
+      get: () => {
+        callbacks++;
+        return "must-not-run";
+      },
+    });
+    const accessorHeaders = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessorHeaders, "Authorization", {
+      enumerable: true,
+      get: () => {
+        callbacks++;
+        return "must-not-read";
+      },
+    });
+
+    const declaration = normalizeAgentMcpDeclaration([
+      { scalar: { command: deepLeaf } },
+      { args: { command: "safe", args: [callbackLeaf] } },
+      { env: { command: "safe", env: { TOKEN: broadLeaf } } },
+      { headers: { type: "http", url: "https://example.invalid", headers: { Authorization: deepLeaf } } },
+      { accessorEntry },
+      { accessorHeaders: { type: "http", url: "https://example.invalid", headers: accessorHeaders } },
+      { unknown: { command: "safe", unknownPayload: callbackLeaf } },
+      { nonPlain: new Date(0) },
+    ], "project");
+
+    expect(callbacks).toBe(0);
+    expect(declaration.items.map((item) => item.name)).toEqual(["unknown"]);
+    expect(declaration.diagnostics.join(" ")).toMatch(/invalid property|accessor|plain entry object/u);
+    expect(JSON.stringify(declaration)).not.toMatch(/CALLBACK_SECRET|GETTER_SECRET|must-not/u);
+    expect(callbacks).toBe(0);
+  });
+
+  it("enforces literal collection and combined graph budgets", () => {
+    const args = Array.from({ length: 65 }, (_, index) => `arg-${index}`);
+    const env = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`ENV_${index}`, `value-${index}`]));
+    const headers = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`Header-${index}`, `value-${index}`]));
+    const combined: Record<string, unknown> = {
+      command: "safe",
+      args: Array.from({ length: 64 }, () => "arg"),
+      env: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`ENV_${index}`, "value"])),
+      headers: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`Header-${index}`, "value"])),
+    };
+    for (let index = 0; index < 60; index++) combined[`unknown-${index}`] = null;
+
+    const declaration = normalizeAgentMcpDeclaration([
+      { tooManyArgs: { command: "safe", args } },
+      { tooManyEnv: { command: "safe", env } },
+      { tooManyHeaders: { type: "http", url: "https://example.invalid", headers } },
+      { tooManyCombinedNodes: combined },
+    ], "project");
+
+    expect(declaration.items).toEqual([]);
+    expect(declaration.diagnostics).toEqual([
+      expect.stringContaining('property "args" has more than 64 entries'),
+      expect.stringContaining('property "env" has more than 64 entries'),
+      expect.stringContaining('property "headers" has more than 64 entries'),
+      expect.stringContaining("exceeds the 256-node projected graph limit"),
+    ]);
+  });
+
+  it("aligns header names to 256 while retaining narrower field and env name bounds", () => {
+    const headerAtBoundary = "H".repeat(256);
+    const declaration = normalizeAgentMcpDeclaration([
+      { acceptedHeader: {
+        type: "http",
+        url: "https://example.invalid",
+        headers: { [headerAtBoundary]: "value" },
+      } },
+      { rejectedHeader: {
+        type: "http",
+        url: "https://example.invalid",
+        headers: { ["H".repeat(257)]: "HEADER_VALUE" },
+      } },
+      { rejectedEnv: { command: "safe", env: { ["E".repeat(129)]: "ENV_VALUE" } } },
+      { rejectedField: { command: "safe", ["f".repeat(129)]: null } },
+    ], "project");
+
+    const accepted = declaration.items[0];
+    expect(accepted?.kind === "inline" ? accepted.entry.remote?.rawEntry?.headers : undefined)
+      .toEqual({ [headerAtBoundary]: "value" });
+    expect(declaration.diagnostics).toEqual([
+      expect.stringContaining('property "headers" has a key exceeding the 256-character name limit'),
+      expect.stringContaining('property "env" has a key exceeding the 128-character name limit'),
+      expect.stringContaining("field name exceeding the 128-character limit"),
+    ]);
+    expect(declaration.diagnostics.join(" ")).not.toMatch(/HEADER_VALUE|ENV_VALUE/u);
+  });
+
+  it("identifies literal field, string, and scalar projection violations without values", () => {
+    const accessor = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessor, "command", { enumerable: true, get: () => "ACCESSOR_VALUE" });
+    const declaration = normalizeAgentMcpDeclaration([
+      { tooManyFields: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`field-${index}`, null])) },
+      { tooLongString: { command: "S".repeat(8193) } },
+      { invalidTimeout: { command: "safe", timeout: Number.POSITIVE_INFINITY } },
+      { accessor },
+    ], "project");
+
+    expect(declaration.items).toEqual([]);
+    expect(declaration.diagnostics).toEqual([
+      expect.stringContaining("more than 64 entry fields"),
+      expect.stringContaining('property "command" exceeds the 8192-character string limit'),
+      expect.stringContaining('invalid property "timeout" (must be a finite number)'),
+      expect.stringContaining("contains an accessor entry property"),
+    ]);
+    expect(declaration.diagnostics.join(" ")).not.toMatch(/ACCESSOR_VALUE|SSSSSSSS/u);
+  });
+
+  it("distinguishes omission from a valid empty declaration", () => {
+    writeAgent("omitted.md", "---\ndescription: omitted\n---\nbody");
+    writeAgent("empty.md", "---\ndescription: empty\nmcpServers: []\n---\nbody");
+    const byName = Object.fromEntries(load().agents.map((agent) => [agent.name, agent]));
+    expect(Object.hasOwn(byName["omitted"]!, "agentMcp")).toBe(false);
+    expect(byName["empty"]!.agentMcp).toEqual({
+      scope: "project",
+      items: [],
+      diagnostics: [],
+      diagnosticOwnership: [],
+    });
+  });
+
+  it.each([
+    ["mapping outer shape", { server: { command: "x" } }],
+    ["null outer shape", null],
+    ["scalar outer shape", "server"],
+  ])("keeps a wrong %s inert and diagnostic", (_label, value) => {
+    const declaration = normalizeAgentMcpDeclaration(value, "project");
+    expect(declaration.items).toEqual([]);
+    expect(declaration.diagnostics).toEqual([
+      "Agent mcpServers must be a list of server-name references or one-key inline mappings; declaration ignored",
+    ]);
+  });
+
+  it("skips malformed items, names, configs, and unsupported transports while retaining valid siblings", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      null,
+      7,
+      {},
+      { one: { command: "x" }, two: { command: "y" } },
+      "bad/name\nwith-control",
+      { "bad__name": { command: "x" } },
+      { missing: { args: ["no-command"] } },
+      { badArgs: { command: "x", args: ["ok", 7] } },
+      { websocket: { type: "ws", url: "wss://secret.invalid/socket" } },
+      "valid-reference",
+      { validInline: { command: "safe-command" } },
+    ], "project");
+
+    expect(declaration.items.map((item) => item.name)).toEqual(["valid-reference", "validInline"]);
+    expect(declaration.diagnostics.length).toBeGreaterThanOrEqual(9);
+    expect(declaration.diagnostics.join("\n")).not.toContain("wss://secret.invalid/socket");
+    expect(declaration.diagnostics.every((message) => !/[\r\n]/u.test(message))).toBe(true);
+  });
+
+  it("assigns exact structured ownership without depending on diagnostic prose", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      { command: { args: ["missing-command"] } },
+      "owned-duplicate",
+      "owned-duplicate",
+      null,
+      { "unsafe/name": { command: "secret-command" } },
+    ], "project");
+
+    expect(declaration.diagnosticOwnership).toEqual([
+      { kind: "server", serverName: "command" },
+      { kind: "server", serverName: "owned-duplicate" },
+      { kind: "unowned", itemIndex: 3 },
+      { kind: "unowned", itemIndex: 4 },
+    ]);
+    expect(declaration.diagnosticOwnership).toHaveLength(declaration.diagnostics.length);
+    expect(Object.isFrozen(declaration.diagnosticOwnership)).toBe(true);
+    for (const owner of declaration.diagnosticOwnership) {
+      expect(Object.isFrozen(owner)).toBe(true);
+      expect(Object.getPrototypeOf(owner)).toBeNull();
+    }
+    const opaqueMessages = declaration.diagnostics.map(() => "opaque finding");
+    expect(opaqueMessages.map((_message, index) => declaration.diagnosticOwnership[index])).toEqual(
+      declaration.diagnosticOwnership,
+    );
+    expect(JSON.stringify(declaration.diagnosticOwnership)).not.toContain("secret-command");
+
+    let getterCalls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, "0", {
+      enumerable: true,
+      configurable: true,
+      get: () => { getterCalls++; return { leaked: { command: "ACCESSOR_SECRET" } }; },
+    });
+    accessorList.length = 1;
+    const accessorDeclaration = normalizeAgentMcpDeclaration(accessorList, "project");
+    expect(getterCalls).toBe(0);
+    expect(accessorDeclaration.diagnosticOwnership).toEqual([{ kind: "unowned", itemIndex: 0 }]);
+    expect(JSON.stringify(accessorDeclaration)).not.toContain("ACCESSOR_SECRET");
+  });
+
+  it("retains the first valid same-name occurrence across reference and inline kinds", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      "same",
+      { same: { command: "not-retained" } },
+      { other: { command: "retained" } },
+      "other",
+      "same",
+    ], "project");
+    expect(declaration.items.map((item) => [item.kind, item.name])).toEqual([
+      ["reference", "same"],
+      ["inline", "other"],
+    ]);
+    expect(declaration.diagnostics.filter((message) => message.includes("first valid occurrence retained"))).toHaveLength(3);
+    expect(declaration.diagnostics.join("\n")).not.toContain("not-retained");
+  });
+
+  it("retains valid item 128 and omits distinct item 129", () => {
+    const items = Array.from({ length: 128 }, (_, index) => `server-${index + 1}`);
+    items.push("item-129-canary");
+    const declaration = normalizeAgentMcpDeclaration(items, "project");
+
+    expect(declaration.items).toHaveLength(128);
+    expect(declaration.items[127]).toEqual({ kind: "reference", name: "server-128" });
+    expect(declaration.items.some((item) => item.name === "item-129-canary")).toBe(false);
+    expect(declaration.diagnostics).toEqual([
+      "Agent mcpServers has more than 128 items; later items ignored",
+    ]);
+  });
+
+  it("reaches exactly 128 single-line diagnostics including the omission summary", () => {
+    const hostile: unknown[] = Array.from({ length: 128 }, (_, index) => ({
+      [`bad/name-${index}\u001b[31m`]: {
+        command: `COMMAND_SECRET_${index}`,
+        env: { TOKEN: `ENV_SECRET_${index}` },
+      },
+    }));
+    const declaration = normalizeAgentMcpDeclaration(hostile, "project");
+
+    expect(declaration.items).toEqual([]);
+    expect(declaration.diagnostics).toHaveLength(128);
+    expect(declaration.diagnostics[127]).toBe("Additional agent MCP diagnostics omitted (1)");
+    expect(declaration.diagnosticOwnership).toHaveLength(128);
+    expect(declaration.diagnosticOwnership[127]).toEqual({ kind: "unowned" });
+    expect(declaration.diagnostics.every((message) => message.length <= 192)).toBe(true);
+    const rendered = declaration.diagnostics.join("\n");
+    expect(rendered).not.toMatch(/[\u001b\r\t]/u);
+    expect(rendered).not.toContain("COMMAND_SECRET_");
+    expect(rendered).not.toContain("ENV_SECRET_");
+  });
+
+  it("collapses raw controls and caps diagnostics at the character boundary", () => {
+    const capCanary = `${"/".repeat(107)}\r\n\tRAW_CONTROL_CANARY`;
+    const declaration = normalizeAgentMcpDeclaration([capCanary], "project");
+    expect(declaration.items).toEqual([]);
+    expect(declaration.diagnostics).toHaveLength(1);
+    expect(declaration.diagnostics[0]).toHaveLength(192);
+    expect(declaration.diagnostics[0]!.endsWith("…")).toBe(true);
+    expect(declaration.diagnostics[0]).not.toMatch(/[\r\n\t]/u);
+    expect(declaration.diagnostics[0]).toContain("RAW_CONTROL_CANARY");
+
+    const overlong = normalizeAgentMcpDeclaration([
+      `${"a".repeat(129)}\r\n\tOVERLONG_CONTROL_CANARY`,
+    ], "project");
+    expect(overlong.items).toEqual([]);
+    expect(overlong.diagnostics.every((message) => message.length <= 192)).toBe(true);
+    expect(overlong.diagnostics.join("")).not.toMatch(/[\r\n\t]/u);
+  });
+
+  it("redacts command, env, and header values on post-name-validation failures", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      { badStdio: { command: "COMMAND_SECRET", args: ["ok", 7], env: { TOKEN: "ENV_SECRET" } } },
+      { badRemote: {
+        type: "http",
+        url: "https://example.invalid",
+        env: { TOKEN: "ENV_SECRET_REMOTE" },
+        headers: { Authorization: "HEADER_SECRET" },
+      } },
+    ], "project");
+    expect(declaration.items).toEqual([]);
+    expect(JSON.stringify(declaration)).not.toMatch(/COMMAND_SECRET|ENV_SECRET|HEADER_SECRET/u);
+  });
+
+  it("fixes declaration/admission/result provenance in the compile-time contracts", () => {
+    expectTypeOf<AgentMcpDeclaration["scope"]>().toEqualTypeOf<"user" | "project">();
+    expectTypeOf<Parameters<AgentMcpAdmissionContext["resolve"]>>()
+      .toEqualTypeOf<[declaration: AgentMcpDeclaration]>();
+    expectTypeOf<ReturnType<AgentMcpAdmissionContext["resolve"]>>()
+      .toEqualTypeOf<ResolvedAgentMcpConfig>();
+    expectTypeOf<ResolvedAgentMcpServer["source"]>().toEqualTypeOf<"subagent-inline">();
+    expectTypeOf<Extract<ResolvedAgentMcpServer, { status: "enabled"; transport: "stdio" }>>()
+      .toHaveProperty("command")
+      .toBeString();
+    expectTypeOf<Extract<ResolvedAgentMcpServer, { status: "enabled"; transport: "http" | "sse" }>>()
+      .toHaveProperty("url")
+      .toBeString();
+    expectTypeOf<ResolvedAgentMcpConfig["servers"]>().toEqualTypeOf<readonly ResolvedAgentMcpServer[]>();
+    expectTypeOf<AgentMcpDeclaration["diagnosticOwnership"][number]>().toEqualTypeOf<
+      | { readonly kind: "server"; readonly serverName: string }
+      | { readonly kind: "unowned"; readonly itemIndex?: number }
+    >();
+
+    // @ts-expect-error Managed provenance cannot enter an effective declaration.
+    const invalidDeclaration: AgentMcpDeclaration = { scope: "managed", items: [], diagnostics: [] };
+    // @ts-expect-error Enabled stdio rows cannot carry a remote URL.
+    const invalidStdioUrl: ResolvedAgentMcpServer = { name: "x", source: "subagent-inline", status: "enabled", transport: "stdio", command: "x", rawCommand: "x", args: [], env: {}, diagnostics: [], url: "https://invalid.example" };
+    // @ts-expect-error Enabled remote rows cannot carry a stdio command.
+    const invalidRemoteCommand: ResolvedAgentMcpServer = { name: "x", source: "subagent-inline", status: "enabled", transport: "http", configuredType: "http", url: "https://example.invalid", headers: {}, diagnostics: [], command: "x" };
+    // @ts-expect-error Inactive rows cannot carry enabled stdio runtime fields.
+    const invalidInactiveRuntime: ResolvedAgentMcpServer = { name: "x", source: "subagent-inline", status: "skipped", diagnostics: [], command: "x", rawCommand: "x", args: [], env: {} };
+    // @ts-expect-error Ordinary MCP provenance cannot enter an agent-local result.
+    const invalidConfig: ResolvedAgentMcpConfig = { servers: [{ name: "x", source: "settings-user", status: "skipped", diagnostics: [] }], diagnostics: [] };
+    if (false) {
+      const readonlyDeclaration = null as unknown as AgentMcpDeclaration;
+      // @ts-expect-error Declaration provenance is immutable after normalization.
+      readonlyDeclaration.scope = "user";
+      // @ts-expect-error Declaration items are immutable.
+      readonlyDeclaration.items.push({ kind: "reference", name: "x" });
+      // @ts-expect-error Declaration diagnostics are immutable.
+      readonlyDeclaration.diagnostics.push("x");
+      const readonlyItem = null as unknown as AgentMcpItem;
+      // @ts-expect-error Item fields are immutable.
+      readonlyItem.name = "x";
+
+      const readonlyInline = null as unknown as Extract<AgentMcpItem, { kind: "inline" }>;
+      // @ts-expect-error Normalized args are deeply immutable.
+      readonlyInline.entry.args[0] = "x";
+      // @ts-expect-error Normalized env is deeply immutable.
+      readonlyInline.entry.env.TOKEN = "x";
+      if (readonlyInline.entry.remote !== undefined) {
+        // @ts-expect-error Normalized remote headers are deeply immutable.
+        readonlyInline.entry.remote.rawHeaders.Authorization = "x";
+      }
+
+      const readonlyConfig = null as unknown as ResolvedAgentMcpConfig;
+      // @ts-expect-error Resolved config diagnostics are immutable.
+      readonlyConfig.diagnostics.push("x");
+      const readonlyServer = readonlyConfig.servers[0]!;
+      // @ts-expect-error Resolved server fields are immutable.
+      readonlyServer.name = "x";
+      if (readonlyServer.status === "enabled" && readonlyServer.transport === "stdio") {
+        // @ts-expect-error Resolved stdio args are immutable.
+        readonlyServer.args[0] = "x";
+      }
+      if (readonlyServer.status === "enabled" && readonlyServer.transport !== "stdio") {
+        // @ts-expect-error Resolved remote headers are immutable.
+        readonlyServer.headers.Authorization = "x";
+      }
+    }
+    void invalidDeclaration;
+    void invalidStdioUrl;
+    void invalidRemoteCommand;
+    void invalidInactiveRuntime;
+    void invalidConfig;
+  });
+
+  it("retains user/project provenance but managed agents ignore MCP with a diagnostic", () => {
+    const userDir = path.join(tmpDir, "user");
+    const projectDir = path.join(tmpDir, "project");
+    const managedDir = path.join(tmpDir, "managed");
+    for (const [dir, name] of [[userDir, "user-agent"], [projectDir, "project-agent"], [managedDir, "managed-agent"]] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${name}.md`), `---\ndescription: ${name}\nmcpServers: [shared]\n---\nbody`);
+    }
+    const result = loadAgents([
+      { dir: userDir, scope: "user" },
+      { dir: projectDir, scope: "project" },
+      { dir: managedDir, scope: "managed" },
+    ]);
+    const byName = Object.fromEntries(result.agents.map((agent) => [agent.name, agent]));
+    expect(byName["user-agent"]!.source.scope).toBe("user");
+    expect(byName["project-agent"]!.source.scope).toBe("project");
+    expect(byName["user-agent"]!.agentMcp?.items).toEqual([{ kind: "reference", name: "shared" }]);
+    expect(byName["project-agent"]!.agentMcp?.items).toEqual([{ kind: "reference", name: "shared" }]);
+    expect(byName["user-agent"]!.agentMcp?.scope).toBe("user");
+    expect(byName["project-agent"]!.agentMcp?.scope).toBe("project");
+    expect(Object.hasOwn(byName["managed-agent"]!, "agentMcp")).toBe(false);
+    expect(byName["managed-agent"]!.mcpServers).toEqual(["shared"]);
+    expect(byName["managed-agent"]!.diagnostics).toEqual([
+      expect.objectContaining({ message: 'Managed agent field "mcpServers" is unsupported and was ignored' }),
+    ]);
+  });
+});
+
 describe("loadPluginAgents", () => {
   it("loads explicit files and validated directories deterministically with trusted identity", () => {
     const pluginRoot = path.join(tmpDir, "plugin");
@@ -522,6 +1066,7 @@ describe("loadPluginAgents", () => {
     const agent = result.agents[0]!;
     expect(Object.hasOwn(agent, "permissionMode")).toBe(false);
     expect(Object.hasOwn(agent, "mcpServers")).toBe(false);
+    expect(Object.hasOwn(agent, "agentMcp")).toBe(false);
     expect(Object.hasOwn(agent, "hooks")).toBe(false);
     expect(agent.skills).toEqual(["safe-skill"]);
     const expectedDiagnostics = expected.map((field) => ({
@@ -531,6 +1076,36 @@ describe("loadPluginAgents", () => {
     }));
     expect(agent.diagnostics).toEqual(expectedDiagnostics);
     expect(result.diagnostics).toEqual(expectedDiagnostics);
+  });
+
+  it("rejects a valid mixed plugin MCP declaration without retaining raw or effective forms", () => {
+    const pluginRoot = path.join(tmpDir, "forbidden-valid-mcp");
+    const file = writeAgent(
+      "forbidden-valid-mcp/agent.md",
+      [
+        "---",
+        "description: plugin agent",
+        "mcpServers:",
+        "  - shared-reference",
+        "  - harmless-inline:",
+        "      command: picc-harmless-inline-fixture",
+        "      args: [--inert]",
+        "---",
+        "body",
+      ].join("\n"),
+    );
+
+    const result = loadPluginAgents([pluginSource(pluginRoot, "./agent.md", "file")]);
+    expect(result.agents).toHaveLength(1);
+    const agent = result.agents[0]!;
+    expect(Object.hasOwn(agent, "mcpServers")).toBe(false);
+    expect(Object.hasOwn(agent, "agentMcp")).toBe(false);
+    expect(agent.diagnostics).toEqual([{
+      severity: "warning",
+      message: 'Plugin agent field "mcpServers" is forbidden and was removed',
+      source: file,
+    }]);
+    expect(result.diagnostics).toEqual(agent.diagnostics);
   });
 
   it("reports forbidden fields once when a plugin agent is skipped", () => {
@@ -552,16 +1127,17 @@ describe("loadPluginAgents", () => {
     ]);
   });
 
-  it("preserves forbidden plugin fields for an ordinary user agent", () => {
+  it("preserves forbidden plugin fields as effective configuration for an ordinary user agent", () => {
     const file = writeAgent(
       "ordinary-user/agent.md",
-      "---\ndescription: user\npermissionMode: default\nmcpServers: false\nhooks: {}\n---\nbody",
+      "---\ndescription: user\npermissionMode: default\nmcpServers: [shared]\nhooks: {}\n---\nbody",
     );
     const result = loadAgents([{ dir: path.dirname(file), scope: "user" }]);
     expect(result.diagnostics).toEqual([]);
     expect(result.agents[0]).toMatchObject({
       permissionMode: "default",
-      mcpServers: false,
+      mcpServers: ["shared"],
+      agentMcp: { scope: "user", items: [{ kind: "reference", name: "shared" }], diagnostics: [] },
       hooks: {},
     });
   });
