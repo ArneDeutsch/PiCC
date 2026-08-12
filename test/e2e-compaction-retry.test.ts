@@ -90,7 +90,17 @@ interface PiccLifecycleRecord extends JsonLineObject {
   type: "entry_appended";
   entry: {
     customType: "picc-checkpoint-lifecycle";
-    data: { category: string; notice?: string; action?: string; recovery?: string };
+    data: {
+      category: string;
+      notice?: string;
+      action?: string;
+      recovery?: string;
+      stage?: string;
+      restoredCount?: number;
+      reportedCount?: number;
+      unresolvedCount?: number;
+      nonTextCount?: number;
+    };
   };
 }
 
@@ -154,6 +164,29 @@ function expectPersistedContinuation(
     entry.type === "custom_message" && entry.customType === customType);
   expect(continuations).toHaveLength(1);
   expect(continuations[0]).toMatchObject({ content });
+}
+
+function installOneShotResumedCancellation(fixtureDir: string): void {
+  writeCheckpointConfig(fixtureDir);
+  const extensionsDir = path.join(fixtureDir, ".pi", "extensions");
+  fs.mkdirSync(extensionsDir, { recursive: true });
+  fs.writeFileSync(path.join(extensionsDir, "cancel-first-resumed-assistant.ts"), [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+    "export default function cancelFirstResumedAssistant(pi: ExtensionAPI) {",
+    "  let committed = false;",
+    "  let cancelled = false;",
+    '  const counter = path.join(process.cwd(), "resumed-cancellation-count.txt");',
+    '  pi.on("session_compact", () => { committed = true; });',
+    '  pi.on("message_start", (event, ctx) => {',
+    '    if (!committed || cancelled || event.message.role !== "assistant") return;',
+    "    cancelled = true;",
+    '    fs.writeFileSync(counter, "1\\n");',
+    "    ctx.abort();",
+    "  });",
+    "}",
+  ].join("\n"));
 }
 
 describe.skipIf(cliMissing)("e2e compaction retries through the real Pi stack", () => {
@@ -288,6 +321,52 @@ describe.skipIf(cliMissing)("e2e compaction retries through the real Pi stack", 
       occurrences(entry.message, "main-exhaust.txt") === 1);
     expect(writeResults).toHaveLength(1);
     for (const file of allSessionFiles) expect(fs.readFileSync(file, "utf8")).not.toContain(sentinel);
+  }, TEST_TIMEOUT_MS);
+
+  it("reports a post-commit resumed cancellation as a non-reusable one-shot partial outcome", async () => {
+    const result = await runPi({
+      persistSession: true,
+      modeArgs: ["--mode", "json", "-p", "run one-shot resumed cancellation"],
+      prompt: "unused",
+      contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+      piSettings: CHECKPOINT_PI_SETTINGS,
+      setup: installOneShotResumedCancellation,
+      script: [
+        { toolCalls: [{ name: "write", args: { path: "one-shot-before-cancel.txt", content: "existing-effect" } }], usage: CHECKPOINT_USAGE },
+        { when: (request) => request.requestKind === "compaction", text: "ONE_SHOT_CANCEL_SUMMARY" },
+        { text: "ONE_SHOT_RESUMED_MUST_ABORT" },
+      ],
+    });
+
+    expect(result.code, result.stderr).toBe(3);
+    expect(result.requests.map((request) => request.requestKind)).toEqual([
+      "ordinary", "compaction", "ordinary",
+    ]);
+    expect(fs.readFileSync(path.join(result.fixture, "resumed-cancellation-count.txt"), "utf8")).toBe("1\n");
+    expect(fs.readFileSync(path.join(result.fixture, "one-shot-before-cancel.txt"), "utf8")).toBe("existing-effect");
+
+    const records = readJsonLines(result.stdout);
+    const lifecycle = piCCLifecycle(records);
+    expect(lifecycle.map((record) => record.entry.data.category)).toEqual([
+      "checkpoint-armed", "checkpoint-complete", "checkpoint-resumed", "checkpoint-cancelled",
+    ]);
+    const cancellation = lifecycle.at(-1)!.entry.data;
+    expect(cancellation).toMatchObject({
+      action: "retrieve-and-relaunch",
+      stage: "resumed-cancellation",
+      restoredCount: 0,
+      reportedCount: 0,
+      unresolvedCount: 0,
+      nonTextCount: 0,
+    });
+    expect(cancellation.notice).toMatch(/client\/request history/iu);
+    expect(cancellation.notice).toMatch(/deliberate resubmission/iu);
+    expect(cancellation.notice).toMatch(/files, tools, or external effects/iu);
+    expect(cancellation.notice).toMatch(/fresh request\/session/iu);
+    expect(cancellation.notice).not.toMatch(/same-session|session-reusable/iu);
+    expect(lifecycle.some((record) => record.entry.data.action === "session-reusable")).toBe(false);
+    expect(records.filter((record) => record.type === "message_end" &&
+      JSON.stringify(record.message).includes("ONE_SHOT_RESUMED_MUST_ABORT"))).toHaveLength(1);
   }, TEST_TIMEOUT_MS);
 
   it("recovers one child summary transport failure with production in-memory retry defaults", async () => {

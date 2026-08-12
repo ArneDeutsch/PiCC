@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import net, { type Socket } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -16,7 +17,8 @@ import {
   writeCheckpointConfig,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
-import type { CapturedRequest } from "./helpers/mock-openai.js";
+import { deferred, waitUntil } from "./helpers/async.js";
+import { createResponseGate, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
 import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
 import { RECORD_EXPAND_HINT, RECORD_FORK_MARKER } from "../src/runtime/subagent-render.js";
 
@@ -26,7 +28,7 @@ import { RECORD_EXPAND_HINT, RECORD_FORK_MARKER } from "../src/runtime/subagent-
  * failure, and on-disk transcript persistence. See test/helpers/e2e-live.ts.
  */
 
-const { runPi, cleanup } = createE2ELive({ runtime: "compiled" });
+const { startPi, runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 /** Canonicalize a path for cross-form comparison (backslashes, casing, trailing slash). */
@@ -114,7 +116,13 @@ function cumulativeParentHistory(requests: CapturedRequest[], callIds: string[])
   for (let index = requests.length - 1; index >= 0; index -= 1) {
     const request = requests[index]!;
     if (request.sessionKind !== "main") continue;
-    const ids = new Set(assistantToolCalls(request, "TaskOutput").map((call) => call.id));
+    const ids = new Set(request.messages.flatMap((message) =>
+      message.role === "assistant" && Array.isArray(message.tool_calls)
+        ? message.tool_calls.flatMap((value) =>
+          typeof value === "object" && value !== null && typeof (value as Record<string, unknown>).id === "string"
+            ? [(value as Record<string, unknown>).id as string]
+            : [])
+        : []));
     if (callIds.every((id) => ids.has(id)) && callIds.every((id) =>
       request.messages.some((message) => message.role === "tool" && message.tool_call_id === id))) {
       history = request;
@@ -241,6 +249,252 @@ describe.skipIf(cliMissing)(
           event.type === "message_end" && event.message?.role === "assistant" &&
           JSON.stringify(event.message.content).includes("PARENT_RECEIVED_CHILD_FAILURE_T05"));
         expect(terminalParentMessages).toHaveLength(1);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      "joins an active resumed child stop and preserves its canonical retained report",
+      async () => {
+        const child = (request: CapturedRequest) => request.sessionKind === "child";
+        const parent = (request: CapturedRequest) => request.sessionKind === "main";
+        const resumedGate = createResponseGate();
+        const parentControlGate = createResponseGate();
+        const agentIdOutputTurn: Turn = {
+          when(request) {
+            const locator = /TaskOutput with task_id "(agent-[0-9a-f]{12})"/u.exec(toolResultText(request));
+            if (!locator) return false;
+            agentIdOutputTurn.toolCalls = [{ name: "TaskOutput", args: { task_id: locator[1]! } }];
+            return true;
+          },
+        };
+        let fixtureDir = "";
+        const stopObserverConnected = deferred<Socket>();
+        let stopObserverSocket: Socket | undefined;
+        const stopObserverServer = net.createServer((socket) => {
+          stopObserverSocket = socket;
+          stopObserverConnected.resolve(socket);
+        });
+        await new Promise<void>((resolve, reject) => {
+          stopObserverServer.once("error", reject);
+          stopObserverServer.listen(0, "127.0.0.1", resolve);
+        });
+        const stopObserverAddress = stopObserverServer.address();
+        if (!stopObserverAddress || typeof stopObserverAddress === "string") throw new Error("TaskStop observer did not bind TCP");
+        const stopObserverPort = stopObserverAddress.port;
+        const resultPromise = runPiWithActiveStop();
+
+        async function runPiWithActiveStop() {
+          const started = await startPi({
+            persistSession: true,
+            classifier: {
+              childUserMessages: ["commit and resume the cancellation witness"],
+              childSystemMarkers: ["You are a general-purpose agent"],
+            },
+            contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+            piSettings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
+            setup(dir) {
+              fixtureDir = dir;
+              writeCheckpointConfig(dir);
+              const extensionsDir = path.join(dir, ".pi", "extensions");
+              fs.mkdirSync(extensionsDir, { recursive: true });
+              for (const name of ["a", "b", "c", "d"]) {
+                fs.writeFileSync(path.join(dir, `active-stop-${name}.txt`), name.repeat(24_000));
+              }
+              fs.writeFileSync(path.join(extensionsDir, "observe-task-stop.ts"), [
+                'import fs from "node:fs";',
+                'import net from "node:net";',
+                'import path from "node:path";',
+                'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+                "export default function observeTaskStop(pi: ExtensionAPI) {",
+                '  const marker = (name: string) => fs.writeFileSync(path.join(process.cwd(), name), "1\\n");',
+                `  pi.on("tool_call", async (event) => { if (event.toolName === "TaskStop") { marker("task-stop-started.txt"); await new Promise<void>((resolve, reject) => { const socket = net.connect(${stopObserverPort}, "127.0.0.1"); socket.once("end", resolve); socket.once("error", reject); }); } });`,
+                '  pi.on("tool_result", (event) => { if (event.toolName === "TaskStop") marker("task-stop-settled.txt"); });',
+                "}",
+              ].join("\n"));
+            },
+            script: [
+              {
+                when: parent,
+                toolCalls: [{ name: "Agent", args: {
+                  subagent_type: "general-purpose",
+                  prompt: "commit and resume the cancellation witness",
+                  run_in_background: true,
+                } }],
+              },
+              {
+                when: child,
+                toolCalls: [
+                  { name: "write", args: { path: "subagent-stop-effect.txt", content: "one-effect" } },
+                  { name: "read", args: { path: "active-stop-a.txt" } },
+                  { name: "read", args: { path: "active-stop-b.txt" } },
+                ],
+              },
+              {
+                when: child,
+                toolCalls: [
+                  { name: "read", args: { path: "active-stop-c.txt" } },
+                  { name: "read", args: { path: "active-stop-d.txt" } },
+                ],
+                usage: CHECKPOINT_USAGE,
+              },
+              {
+                when: (request) => child(request) && request.requestKind === "compaction",
+                text: "ACTIVE_STOP_CHILD_SUMMARY",
+              },
+              {
+                when: (request) => child(request) && request.requestKind === "ordinary",
+                text: "ACTIVE_STOP_RESUMED_MUST_NOT_COMPLETE",
+                gate: resumedGate,
+              },
+              {
+                when: parent,
+                toolCalls: [{ name: "SendMessage", args: {
+                  to: "general-purpose",
+                  message: "retained before stop",
+                } }],
+                gate: parentControlGate,
+              },
+              {
+                when: parent,
+                toolCalls: [
+                  { name: "TaskStop", args: { task_id: "task-1" } },
+                  { name: "SendMessage", args: {
+                    to: "general-purpose",
+                    message: "must be refused during stop",
+                  } },
+                ],
+              },
+              { when: parent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1", wait: false } }] },
+              { when: parent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
+              agentIdOutputTurn,
+              { when: parent, text: "active child stop verified" },
+            ],
+            prompt: "exercise active resumed child cancellation",
+          });
+
+          const resumed = await Promise.race([
+            resumedGate.entered.then(() => undefined, async () => {
+              const early = await started.completion;
+              throw new Error(`Pi exited before resumed gate: ${JSON.stringify(early.requests.map((request) => `${request.sessionKind}/${request.requestKind}`))}\n${early.stderr}`);
+            }),
+            started.completion.then((early) => {
+              throw new Error(`Pi exited before resumed gate: ${JSON.stringify(early.requests.map((request) => `${request.sessionKind}/${request.requestKind}`))}\n${early.stderr}`);
+            }),
+          ]);
+          void resumed;
+          await parentControlGate.entered;
+          const stopStarted = path.join(fixtureDir, "task-stop-started.txt");
+          const stopSettled = path.join(fixtureDir, "task-stop-settled.txt");
+          const stopStartedWait = waitUntil({
+            description: "TaskStop tool call to start",
+            predicate: () => fs.existsSync(stopStarted),
+            describeObserved: () => `started=${fs.existsSync(stopStarted)}, settled=${fs.existsSync(stopSettled)}`,
+          });
+          parentControlGate.release();
+          await stopStartedWait;
+          const observerSocket = await stopObserverConnected.promise;
+          expect(fs.existsSync(stopSettled), "TaskStop must publish an in-progress interval").toBe(false);
+          observerSocket.end();
+          await waitUntil({
+            description: "TaskStop tool result to settle",
+            predicate: () => fs.existsSync(stopSettled),
+            describeObserved: () => `started=${fs.existsSync(stopStarted)}, settled=${fs.existsSync(stopSettled)}`,
+          });
+          resumedGate.release();
+          return started.completion;
+        }
+
+        const result = await resultPromise.finally(async () => {
+          stopObserverSocket?.destroy();
+          await new Promise<void>((resolve) => stopObserverServer.close(() => resolve()));
+        });
+        expect(result.code, result.stderr).toBe(0);
+        expect(fs.readFileSync(path.join(result.fixture, "subagent-stop-effect.txt"), "utf8")).toBe("one-effect");
+        expect(result.requests.filter(child).map((request) => request.requestKind)).toEqual([
+          "ordinary", "ordinary", "compaction", "ordinary",
+        ]);
+        expect(result.requests.filter(child).every((request) => request.authorizationValid)).toBe(true);
+        const childWriteIds = new Set(result.requests.filter(child).flatMap((request) =>
+          assistantToolCalls(request, "write").map((call) => call.id)));
+        expect(childWriteIds.size).toBe(1);
+        expect(result.requests.filter(child).some((request) =>
+          JSON.stringify(request.body).includes("must be refused during stop"))).toBe(false);
+
+        const sendCalls = uniqueAssistantToolCalls(result.requests, "SendMessage");
+        const stopCalls = uniqueAssistantToolCalls(result.requests, "TaskStop");
+        const outputCalls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
+        expect(sendCalls).toHaveLength(2);
+        expect(stopCalls).toHaveLength(1);
+        expect(outputCalls).toHaveLength(3);
+        const allCallIds = [...sendCalls, ...stopCalls, ...outputCalls].map((call) => call.id);
+        const history = cumulativeParentHistory(result.requests, allCallIds);
+        const sendExchanges = orderedToolExchanges(history, "SendMessage");
+        const accepted = sendExchanges.find((exchange) =>
+          JSON.parse(exchange.call.arguments).message === "retained before stop");
+        const refused = sendExchanges.find((exchange) =>
+          JSON.parse(exchange.call.arguments).message === "must be refused during stop");
+        expect(accepted?.result).toMatch(/delivered to running agent/iu);
+        expect(refused?.result).toMatch(/settling cancellation; the message was not sent/iu);
+
+        const stopExchange = orderedToolExchanges(history, "TaskStop")[0]!;
+        expect(stopExchange.call.id).toBe(stopCalls[0]!.id);
+        expect(JSON.parse(stopExchange.call.arguments)).toEqual({ task_id: "task-1" });
+        expect(stopExchange.result).toMatch(/stop confirmed after settlement at stage resumed-cancellation/iu);
+        expect(stopExchange.result).toMatch(/1 retained input occurrence\(s\)/iu);
+        const locatorMatch = /TaskOutput with task_id "(agent-[0-9a-f]{12})"/u.exec(stopExchange.result);
+        expect(locatorMatch, "TaskStop must advertise the stable agent-ID locator").not.toBeNull();
+        const agentId = locatorMatch![1]!;
+        const locator = `TaskOutput with task_id "${agentId}"`;
+        expect(stopExchange.result).toContain(locator);
+        expect(stopExchange.result).not.toContain("Retained input report for");
+        expect(stopExchange.result).not.toContain("retained before stop");
+
+        const outputExchanges = orderedToolExchanges(history, "TaskOutput");
+        expect(outputExchanges.map((exchange) => JSON.parse(exchange.call.arguments))).toEqual([
+          { task_id: "task-1", wait: false },
+          { task_id: "task-1" },
+          { task_id: agentId },
+        ]);
+        const outputs = outputExchanges.map((exchange) => exchange.result);
+        const reportHeader = `Retained input report for ${agentId}: 1 represented, 0 unrepresentable (1 total); stage resumed-cancellation; 1 retained input occurrence(s).`;
+        const canonicalReports = outputs.map((output) => output.slice(output.indexOf(reportHeader)));
+        for (const report of canonicalReports) {
+          expect(report).toContain(reportHeader);
+          expect(report).toContain(`Locator: ${locator}.`);
+          expect(report).toContain("Reported input was not auto-replayed. Inspect possible existing files, tools, and external effects before any deliberate retry.");
+          expect(report).toContain('1. steer: "retained before stop"');
+          expect(report).toContain("No retained input was replayed automatically.");
+        }
+        expect(outputs[1]).toBe(outputs[0]);
+        expect(canonicalReports[1]).toBe(canonicalReports[0]);
+        expect(canonicalReports[2]).toBe(canonicalReports[0]);
+
+        const mainSessionFiles: string[] = [];
+        const collectMainSessions = (directory: string): void => {
+          for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+            const full = path.join(directory, entry.name);
+            if (entry.isDirectory()) collectMainSessions(full);
+            else if (entry.name.endsWith(".jsonl") && !full.includes(".subagents")) mainSessionFiles.push(full);
+          }
+        };
+        collectMainSessions(path.join(result.agentDir, "sessions"));
+        expect(mainSessionFiles).toHaveLength(1);
+        const childTranscript = resolveSubagentTranscript(mainSessionFiles[0]!, agentId);
+        expect(childTranscript, "advertised agent ID must resolve to the originating child transcript").toBeDefined();
+        const childTranscriptText = fs.readFileSync(childTranscript!, "utf8");
+        const childEntries = SessionManager.open(childTranscript!).getEntries();
+        const abortedTerminalResults = childEntries.filter((entry) =>
+          JSON.stringify(entry).includes("ACTIVE_STOP_RESUMED_MUST_NOT_COMPLETE"));
+        expect(abortedTerminalResults).toHaveLength(0);
+        const terminalSurfaces = [
+          childTranscriptText,
+          result.stdout,
+          result.stderr,
+          JSON.stringify(history.messages),
+        ].join("\n");
+        expect(terminalSurfaces).not.toContain("ACTIVE_STOP_RESUMED_MUST_NOT_COMPLETE");
+        expect(result.stdout).toContain("active child stop verified");
       },
       TEST_TIMEOUT_MS,
     );
