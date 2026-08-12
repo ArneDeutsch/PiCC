@@ -45,6 +45,8 @@ export interface RetainedInputPersistenceOptions {
   session: RetainedInputPersistenceSession;
   /** Test-only bounded I/O replacement. Production uses the pinned Pi SessionManager. */
   reopenSession?: (file: string, sessionDir: string, cwd: string) => RetainedInputPersistenceSession;
+  /** Test-only recovery-file verification read. Production uses fs.readFileSync. */
+  readRecoveryFileForVerification?: (file: string) => Buffer;
 }
 
 export type RetainedInputPersistenceFailure = "report-incomplete" | "storage-unsafe";
@@ -209,24 +211,26 @@ function primary(session: RetainedInputPersistenceSession, sessionFile: string, 
   return { kind: "session-entry", sessionFile, entryId };
 }
 
-function verifyRecoveryFile(destination: string, sessionFile: string, owner: Owner, bytes: Buffer, expectedJson: string): boolean {
+function verifyRecoveryFile(destination: string, sessionFile: string, owner: Owner, bytes: Buffer, expectedJson: string,
+  readRecoveryFile: NonNullable<RetainedInputPersistenceOptions["readRecoveryFileForVerification"]>): boolean {
   try {
     verifySessionOwner(sessionFile, owner);
     const identity = regularIdentity(destination, true);
     const real = fs.realpathSync.native(destination);
     if (!contained(owner.path, real)) return false;
-    const reopened = fs.readFileSync(destination);
+    const reopened = readRecoveryFile(destination);
     if (!reopened.equals(bytes) || JSON.stringify(normalizeJson(JSON.parse(reopened.toString("utf8")))) !== expectedJson) return false;
     return sameIdentity(identity, regularIdentity(destination, true));
   } catch { return false; }
 }
 
-function fallback(report: RetainedInputReport, sessionFile: string, owner: Owner, bytes: Buffer, expectedJson: string): RetainedInputPersistenceLocator {
+function fallback(report: RetainedInputReport, sessionFile: string, owner: Owner, bytes: Buffer, expectedJson: string,
+  readRecoveryFile: NonNullable<RetainedInputPersistenceOptions["readRecoveryFileForVerification"]>): RetainedInputPersistenceLocator {
   const base = `.picc-retained-${report.agentId}-${report.generation}.json`;
   if (path.basename(base) !== base || base.includes("..") || path.isAbsolute(base)) fail();
   const destination = path.join(owner.path, base);
   if (fs.existsSync(destination)) {
-    if (verifyRecoveryFile(destination, sessionFile, owner, bytes, expectedJson)) {
+    if (verifyRecoveryFile(destination, sessionFile, owner, bytes, expectedJson, readRecoveryFile)) {
       return { kind: "recovery-file", sessionFile, path: destination };
     }
     fail();
@@ -256,7 +260,7 @@ function fallback(report: RetainedInputReport, sessionFile: string, owner: Owner
       const directory = fs.openSync(owner.path, fs.constants.O_RDONLY);
       try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
     }
-    if (!verifyRecoveryFile(destination, sessionFile, owner, bytes, expectedJson)) fail();
+    if (!verifyRecoveryFile(destination, sessionFile, owner, bytes, expectedJson, readRecoveryFile)) fail();
     return { kind: "recovery-file", sessionFile, path: destination };
   } catch { fail(); } finally {
     if (handle !== undefined) try { fs.closeSync(handle); } catch { /* best effort */ }
@@ -278,7 +282,8 @@ export function persistRetainedInputReport(report: RetainedInputReport, options:
     fail();
   }
   const reopen = options.reopenSession ?? ((file, sessionDir, cwd) => SessionManager.open(file, sessionDir, cwd));
+  const readRecoveryFile = options.readRecoveryFileForVerification ?? ((file: string) => fs.readFileSync(file));
   try { return primary(options.session, sessionFile, owner, record, expectedJson, reopen); } catch {
-    return fallback(report, sessionFile, owner, bytes, expectedJson);
+    return fallback(report, sessionFile, owner, bytes, expectedJson, readRecoveryFile);
   }
 }

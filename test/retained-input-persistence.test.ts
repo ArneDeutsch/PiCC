@@ -253,24 +253,24 @@ describe("retained input persistence", () => {
       getCwd: () => manager.getCwd(), getBranch: () => [], appendCustomEntry: () => "unverified",
     };
     const destination = path.join(manager.getSessionDir(), `.picc-retained-${report.agentId}-${report.generation}.json`);
-    const originalRead = fs.readFileSync;
-    let failedAfterPublication = false;
-    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
-      if (!failedAfterPublication && path.resolve(String(file)) === path.resolve(destination)) {
-        failedAfterPublication = true;
+    let verificationReads = 0;
+    expect(() => persistRetainedInputReport(report, {
+      session,
+      reopenSession: (file) => ({ getSessionFile: () => file, getBranch: () => [] }),
+      readRecoveryFileForVerification: () => {
+        verificationReads += 1;
         return Buffer.from("mismatch");
-      }
-      return (originalRead as (...values: unknown[]) => unknown)(file, ...args);
-    }) as never);
-    try {
-      expect(() => persistRetainedInputReport(report, { session, reopenSession: (file) => ({ getSessionFile: () => file, getBranch: () => [] }) }))
-        .toThrow(RetainedInputPersistenceError);
-    } finally {
-      spy.mockRestore();
-    }
-    expect(fs.existsSync(destination)).toBe(true);
+      },
+    })).toThrow(RetainedInputPersistenceError);
+    expect(verificationReads).toBe(1);
+    const published = fs.readFileSync(destination);
+    expect(JSON.parse(published.toString("utf8"))).toMatchObject({
+      version: 1,
+      report: { agentId: report.agentId, sessionId: report.sessionId, generation: report.generation },
+    });
     expect(persistRetainedInputReport(report, { session, reopenSession: (file) => ({ getSessionFile: () => file, getBranch: () => [] }) }))
       .toEqual({ kind: "recovery-file", sessionFile: manager.getSessionFile(), path: destination });
+    expect(fs.readFileSync(destination)).toEqual(published);
   });
 
   it("bounds each invocation to one primary append and one exclusive fallback attempt", () => {
