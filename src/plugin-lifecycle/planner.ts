@@ -13,7 +13,7 @@ import { isDocumentedMarketplaceName, type MarketplaceCatalogDeclarationSummary 
 import { isQualifiedPluginId } from "../util/plugin-id.js";
 import { canonicalJsonBytes, createRecordEnvelope, ownedRecordPartition, sha256, type OwnedStateStore, type StoreResult } from "./state-store.js";
 import type { PluginSettingsEffectSummary } from "./settings-plan.js";
-import type { TransactionParticipant, TransactionProducerCodec, TransactionReceipt } from "./transaction.js";
+import { isOwnedDataRetirementParticipant, type OrdinaryTransactionParticipant, type TransactionParticipant, type TransactionProducerCodec, type TransactionReceipt } from "./transaction.js";
 import type { CatalogPluginSource, LifecycleProfileKey, Sha256 } from "./types.js";
 
 export type MarketplaceMutationAction = "add" | "refresh" | "remove";
@@ -119,11 +119,11 @@ export function createMarketplaceMutationPreview(value: Omit<MarketplaceMutation
   return decodeMarketplaceMutationPreview({ ...base, confirmationDigest: digest.value }, context);
 }
 
-function decodeEvidence(participant: TransactionParticipant): MarketplaceEvidence | undefined {
+function decodeEvidence(participant: OrdinaryTransactionParticipant): MarketplaceEvidence | undefined {
   const raw = participant.producerEvidence;
   return plain(raw) && exact(raw, ["payload", "role"]) && (raw.role === "snapshot" || raw.role === "registration") && plain(raw.payload) ? raw as unknown as MarketplaceEvidence : undefined;
 }
-function participantProjection(participant: TransactionParticipant, order: number, role: MarketplaceParticipantSummary["role"], payloadDigest: Sha256): MarketplaceParticipantSummary {
+function participantProjection(participant: OrdinaryTransactionParticipant, order: number, role: MarketplaceParticipantSummary["role"], payloadDigest: Sha256): MarketplaceParticipantSummary {
   return { order, role, target: participant.targetPath, effect: participant.effect ?? "replace", scopeKey: participant.scopeKey, stagedDigest: participant.stagedDigest, payloadDigest };
 }
 
@@ -131,7 +131,8 @@ export function createMarketplaceTransactionCodec(inputs: { readonly store: Owne
   const context: MarketplaceCodecContext = { profileKey: inputs.store.profileKey as LifecycleProfileKey, artifactsRoot: inputs.store.artifactsRoot };
   const registrationCodec = createOwnedMarketplaceCodec(context.profileKey);
   const snapshotCodec = createOwnedMarketplaceSnapshotCodec(context);
-  const validateMarketplaceParticipant = (participant: TransactionParticipant): StoreResult<{ readonly evidence: MarketplaceEvidence; readonly payloadDigest: Sha256 }> => {
+  const validateMarketplaceParticipant = (participant: TransactionParticipant): StoreResult<{ readonly participant: OrdinaryTransactionParticipant; readonly evidence: MarketplaceEvidence; readonly payloadDigest: Sha256 }> => {
+    if (isOwnedDataRetirementParticipant(participant)) return fail("invalid-plan", "Marketplace operations cannot authorize data retirement");
     const evidence = decodeEvidence(participant); if (evidence === undefined) return fail("invalid-plan", "Marketplace participant semantic evidence is missing");
     const codec = evidence.role === "snapshot" ? snapshotCodec : registrationCodec; const decoded = codec.decode(evidence.payload as never); if (!decoded.ok) return decoded;
     const scopeKey = evidence.role === "snapshot" ? ownedMarketplaceSnapshotScopeKey(decoded.value as OwnedMarketplaceSnapshotRecord) : ownedMarketplaceScopeKey(decoded.value as OwnedMarketplaceRecord);
@@ -139,13 +140,14 @@ export function createMarketplaceTransactionCodec(inputs: { readonly store: Owne
     if (!envelope.ok || !partition.ok || participant.ownerKey !== "picc-owned" || participant.scopeKey !== scopeKey || participant.targetPath !== path.join(partition.value, "record.json")
       || participant.stagedDigest !== sha256(envelope.value.bytes) || participant.key !== `${evidence.role}-${(evidence.payload as OwnedMarketplaceRecord).name ?? (evidence.payload as OwnedMarketplaceSnapshotRecord).marketplaceName}`)
       return fail("invalid-plan", "Marketplace participant target, payload, or digest is invalid");
-    return { ok: true, value: { evidence, payloadDigest: envelope.value.envelope.payloadDigest } };
+    return { ok: true, value: { participant, evidence, payloadDigest: envelope.value.envelope.payloadDigest } };
   };
   const validateDomain = (summary: MarketplaceMutationPreview, participants: readonly TransactionParticipant[]): StoreResult<void> => {
-    if (participants.length !== summary.participants.length || !inputs.settingsCodec.validatePlan([participants[0]!]).ok) return fail("invalid-plan", "Marketplace summary and exact ordered participant plan disagree");
-    const settingsPayload = canonicalJsonBytes(participants[0]!.producerEvidence);
-    if (!settingsPayload.ok || !same(summary.participants[0], participantProjection(participants[0]!, 0, "settings", sha256(settingsPayload.value)))) return fail("invalid-plan", "Settings participant bytes and summary disagree");
-    const settingsEvidence = participants[0]!.producerEvidence as { authorityFingerprints?: unknown };
+    const settingsParticipant = participants[0];
+    if (participants.length !== summary.participants.length || settingsParticipant === undefined || isOwnedDataRetirementParticipant(settingsParticipant) || !inputs.settingsCodec.validatePlan([settingsParticipant]).ok) return fail("invalid-plan", "Marketplace summary and exact ordered participant plan disagree");
+    const settingsPayload = canonicalJsonBytes(settingsParticipant.producerEvidence);
+    if (!settingsPayload.ok || !same(summary.participants[0], participantProjection(settingsParticipant, 0, "settings", sha256(settingsPayload.value)))) return fail("invalid-plan", "Settings participant bytes and summary disagree");
+    const settingsEvidence = settingsParticipant.producerEvidence as { authorityFingerprints?: unknown };
     const fingerprintBytes = canonicalJsonBytes(settingsEvidence.authorityFingerprints);
     if (!fingerprintBytes.ok || summary.settingsFingerprint !== sha256(fingerprintBytes.value)) return fail("invalid-plan", "Settings authority fingerprint does not bind authentic producer evidence");
     for (let index = 1; index < participants.length; index++) {
@@ -153,8 +155,8 @@ export function createMarketplaceTransactionCodec(inputs: { readonly store: Owne
       const expectedRole = summary.action === "remove" ? "registration" : index === 1 ? "snapshot" : "registration";
       const expectedPayload = expectedRole === "snapshot" ? summary.snapshot : summary.registration;
       if (validated.value.evidence.role !== expectedRole || !same(validated.value.evidence.payload, expectedPayload)
-        || !same(summary.participants[index], participantProjection(participants[index]!, index, expectedRole, validated.value.payloadDigest))
-        || (summary.action === "remove" ? participants[index]!.effect !== "delete" : participants[index]!.effect === "delete")) return fail("invalid-plan", "Marketplace participant semantics disagree with the preview");
+        || !same(summary.participants[index], participantProjection(validated.value.participant, index, expectedRole, validated.value.payloadDigest))
+        || (summary.action === "remove" ? validated.value.participant.effect !== "delete" : validated.value.participant.effect === "delete")) return fail("invalid-plan", "Marketplace participant semantics disagree with the preview");
     }
     return { ok: true, value: undefined };
   };

@@ -10,6 +10,8 @@ import {
   prepareTransaction,
   type ExternalAuthorization,
   type ExternalMutationContext,
+  isOwnedDataRetirementParticipant,
+  type OrdinaryTransactionParticipant,
   type TransactionParticipant,
   type TransactionProducerCodec,
   type PreparedTransaction,
@@ -46,7 +48,7 @@ interface SettingsProducerEvidence {
 }
 
 export interface PreparedPluginSettingsWrite {
-  readonly transaction: PreparedTransaction;
+  readonly transaction: PreparedTransaction & { readonly participants: readonly OrdinaryTransactionParticipant[] };
   readonly summary: PluginSettingsEffectSummary;
   readonly codec: TransactionProducerCodec<PluginSettingsEffectSummary>;
 }
@@ -105,6 +107,7 @@ function validFingerprint(item: unknown): item is SettingsAuthorityFingerprint {
   return item.status === "text" ? exactKeys(item, ["digest", "kind", "path", "status"]) && typeof item.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(item.digest) : exactKeys(item, ["kind", "path", "status"]);
 }
 function decodeEvidence(participant: TransactionParticipant): StoreResult<SettingsProducerEvidence> {
+  if (isOwnedDataRetirementParticipant(participant)) return fail("invalid-participant", "Settings operations cannot authorize data retirement");
   const raw = participant.producerEvidence;
   if (!plain(raw) || !exactKeys(raw, ["anchors", "authorityFingerprints", "checkoutFamilyPath", "hierarchyAnchors", "homePath", "key", "operationId", "precondition", "profileKey", "profilePath", "requested", "rollbackPosture", "scope", "setting", "stagedDigest", "summary", "targetPath"], ["activeCheckoutPath", "checkoutFamilyKey", "fileMode", "missingParent", "targetIdentity"])) return fail("invalid-participant", "Settings participant semantic evidence has an inexact shape");
   const summary = decodeSummary(raw.summary); if (!summary.ok) return summary;
@@ -123,7 +126,7 @@ function decodeEvidence(participant: TransactionParticipant): StoreResult<Settin
 
 function validatePlan(participants: readonly TransactionParticipant[]): StoreResult<void> {
   if (participants.length !== 1) return fail("invalid-plan", "A settings transaction must contain exactly one per-file participant");
-  const participant = participants[0]!; const evidence = decodeEvidence(participant); if (!evidence.ok) return evidence;
+  const participant = participants[0]!; if (isOwnedDataRetirementParticipant(participant)) return fail("invalid-plan", "Settings operations require one ordinary file participant"); const evidence = decodeEvidence(participant); if (!evidence.ok) return evidence;
   const item = evidence.value;
   const hierarchyPaths = [item.homePath, item.profilePath, item.checkoutFamilyPath!, item.activeCheckoutPath!]
     .filter((candidate, index, values) => values.findIndex((value) => samePath(value, candidate)) === index);
@@ -202,7 +205,7 @@ async function observedFingerprint(item: SettingsAuthorityFingerprint): Promise<
     return { path: item.path, kind: item.kind, status: "text", digest: sha256(Buffer.from(JSON.stringify(names), "utf8")) };
   } catch (error) { return { path: item.path, kind: item.kind, status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable" }; }
 }
-async function reconstructStaged(item: SettingsProducerEvidence, participant: TransactionParticipant, persistedRecovery = false): Promise<StoreResult<Buffer>> {
+async function reconstructStaged(item: SettingsProducerEvidence, participant: OrdinaryTransactionParticipant, persistedRecovery = false): Promise<StoreResult<Buffer>> {
   let original: Buffer | undefined;
   if (participant.precondition.state === "present") {
     const source = persistedRecovery && participant.rollback.kind === "restore-backup" ? participant.rollback.path : participant.targetPath;
@@ -257,7 +260,7 @@ export async function preparePluginSettingsWrite(inputs: { readonly store: Owned
   const suffix = randomBytes(12).toString("hex"); const stagedPath = path.join(inputs.store.stagingRoot, `settings-${inputs.operationId}-${suffix}.new`);
   if (!isContainedPath(inputs.store.stagingRoot, stagedPath)) return fail("staging-failure", "Settings staging path escaped owned storage");
   const staged = await writePrivateFile(stagedPath, inputs.plan.replacementBytes); if (!staged.ok) return staged;
-  const created = [stagedPath]; let rollback: TransactionParticipant["rollback"];
+  const created = [stagedPath]; let rollback: OrdinaryTransactionParticipant["rollback"];
   try {
     if (inputs.plan.precondition.state === "absent") rollback = { kind: "delete-new-target" };
     else {
@@ -271,12 +274,12 @@ export async function preparePluginSettingsWrite(inputs: { readonly store: Owned
   const evidence: SettingsProducerEvidence = Object.freeze({ operationId: inputs.operationId, scope: inputs.plan.summary.scope, setting: inputs.plan.summary.setting, key: inputs.plan.summary.key, requested: inputs.plan.summary.requested,
     homePath: inputs.plan.homePath, profilePath: path.resolve(inputs.profilePath), profileKey: inputs.plan.profileKey, ...(inputs.plan.activeCheckoutPath === undefined ? {} : { activeCheckoutPath: inputs.plan.activeCheckoutPath }), ...(inputs.plan.checkoutFamilyPath === undefined ? {} : { checkoutFamilyPath: inputs.plan.checkoutFamilyPath }), ...(inputs.plan.checkoutFamilyKey === undefined ? {} : { checkoutFamilyKey: inputs.plan.checkoutFamilyKey }),
     targetPath: inputs.plan.targetPath, anchors: inputs.plan.anchors, hierarchyAnchors: inputs.plan.hierarchyAnchors, authorityFingerprints: inputs.plan.authorityFingerprints, ...(inputs.plan.missingParent === undefined ? {} : { missingParent: inputs.plan.missingParent }), stagedDigest: inputs.plan.replacementDigest, precondition: inputs.plan.precondition, rollbackPosture: rollback.kind, ...(inputs.plan.fileMode === undefined ? {} : { fileMode: inputs.plan.fileMode }), ...(inputs.plan.targetIdentity === undefined ? {} : { targetIdentity: inputs.plan.targetIdentity }), summary: inputs.plan.summary });
-  const participant: TransactionParticipant = Object.freeze({ kind: "plugin-settings", key: digestKey(`${inputs.plan.summary.setting}\0${inputs.plan.summary.key}`), ownerKey: "plugin-settings", scopeKey: `${inputs.plan.summary.scope}-${digestKey(inputs.plan.targetPath)}`,
+  const participant: OrdinaryTransactionParticipant = Object.freeze({ kind: "plugin-settings", key: digestKey(`${inputs.plan.summary.setting}\0${inputs.plan.summary.key}`), ownerKey: "plugin-settings", scopeKey: `${inputs.plan.summary.scope}-${digestKey(inputs.plan.targetPath)}`,
     targetPath: inputs.plan.targetPath, targetClass: "external", precondition: inputs.plan.precondition, stagedPath, stagedDigest: inputs.plan.replacementDigest, rollback, producerEvidence: evidence,
     ...(inputs.plan.missingParent === undefined ? {} : { missingParent: { path: inputs.plan.missingParent.path, canonicalAncestor: path.dirname(inputs.plan.missingParent.path), ancestorDev: inputs.plan.missingParent.dev, ancestorIno: inputs.plan.missingParent.ino } }) });
   const reconstructed = await reconstructStaged(evidence, participant);
   if (!reconstructed.ok || reconstructed.value.length !== inputs.plan.replacementBytes.length || !Buffer.from(reconstructed.value).equals(inputs.plan.replacementBytes) || sha256(reconstructed.value) !== inputs.plan.replacementDigest) { await Promise.all(created.map((candidate) => fs.rm(candidate, { force: true }).catch(() => undefined))); return fail("changed-staged", "Settings plan bytes do not match authentic semantic reconstruction"); }
   const prepared = await prepareTransaction({ store: inputs.store, codec, operationId: inputs.operationId, confirmationSummary: inputs.plan.summary, participants: [participant] });
   if (!prepared.ok) { await Promise.all(created.map((candidate) => fs.rm(candidate, { force: true }).catch(() => undefined))); return prepared; }
-  return { ok: true, value: Object.freeze({ transaction: prepared.value, summary: inputs.plan.summary, codec }) };
+  return { ok: true, value: Object.freeze({ transaction: prepared.value as PreparedTransaction & { readonly participants: readonly OrdinaryTransactionParticipant[] }, summary: inputs.plan.summary, codec }) };
 }

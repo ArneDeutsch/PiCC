@@ -10,14 +10,21 @@ import { previewRecovery, recoverTransaction } from "../src/plugin-lifecycle/rec
 import { createPluginSettingsTransactionCodec } from "../src/plugin-lifecycle/settings-writer.js";
 import { canonicalJsonBytes, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore, type StoreResult } from "../src/plugin-lifecycle/state-store.js";
 import {
-  completeJournal, createTransactionCodecRegistry, executeTransaction, observePersistedTransactionsSync, prepareTransaction, readTransactionJournal, readTransactionReceipt,
-  type TransactionFaultPhase, type TransactionParticipant, type TransactionProducerCodec,
+  cleanupCommittedOwnedDataRetirement, completeJournal, createOwnedDataRetirementParticipant, createTransactionCodecRegistry, executeTransaction, observePersistedTransactionsSync, prepareTransaction, readTransactionJournal, readTransactionReceipt, rollbackJournal,
+  isOwnedDataRetirementParticipant, type OrdinaryTransactionParticipant, type OwnedDataRetirementParticipant, type PreparedTransaction, type TransactionFaultPhase, type TransactionParticipant, type TransactionProducerCodec,
 } from "../src/plugin-lifecycle/transaction.js";
 
 const roots: string[] = [];
+const LINK_AVAILABLE = await (async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "picc-link-probe-"));
+  try { const target = path.join(root, "target"); const link = path.join(root, "link"); await fs.writeFile(target, "probe"); await fs.symlink(target, link, "file"); return (await fs.lstat(link)).isSymbolicLink(); }
+  catch { return false; }
+  finally { await fs.rm(root, { recursive: true, force: true }); }
+})();
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))); });
 function requiredLocks(_summary: unknown, participants: readonly TransactionParticipant[]) {
   const first = participants[0]; if (first === undefined) return { ok: false as const, code: "locks", message: "missing participant" };
+  if (isOwnedDataRetirementParticipant(first)) return { ok: false as const, code: "locks", message: "ordinary fixture expected" };
   const profileKey = path.basename(path.dirname(path.dirname(first.stagedPath)));
   return { ok: true as const, value: [{ kind: "profile" as const, key: profileKey }, { kind: "checkout" as const, key: "checkout-main" }, { kind: "settings" as const, key: "settings-user" }] };
 }
@@ -28,26 +35,30 @@ const codec: TransactionProducerCodec<{ readonly label: string }> = { schema: "t
 function registry(selected: TransactionProducerCodec = codec) { const result = createTransactionCodecRegistry([selected]); if (!result.ok) throw new Error(result.message); return result.value; }
 async function fixture(profile = "profile", existingHome?: string): Promise<OwnedStateStore> { const home = existingHome ?? await fs.mkdtemp(path.join(os.tmpdir(), "picc-tx-")); if (existingHome === undefined) { roots.push(home); if (process.platform !== "win32") await fs.chmod(home, 0o700); } const locations = createLifecycleLocations({ homeDir: home, profilePath: path.join(home, profile), platform: process.platform === "win32" ? "win32" : "posix" }); if (!locations.ok) throw new Error(locations.error.message); const result = await establishOwnedStateStore(locations.value, home); if (!result.ok) throw new Error(result.message); return result.value; }
 async function stage(store: OwnedStateStore, name: string, text: string) { const candidate = path.join(store.stagingRoot, name); const bytes = Buffer.from(text); await fs.writeFile(candidate, bytes, { mode: 0o600, flag: "wx" }); return { path: candidate, digest: sha256(bytes) }; }
-async function participant(store: OwnedStateStore, key: string, text: string, generationId?: string): Promise<TransactionParticipant> {
+async function participant(store: OwnedStateStore, key: string, text: string, generationId?: string): Promise<OrdinaryTransactionParticipant> {
   const staged = await stage(store, `${key}.stage`, text); const partition = ownedRecordPartition(store, "producer", "user"); if (!partition.ok) throw new Error(partition.message); await fs.mkdir(partition.value, { recursive: true, mode: 0o700 });
   return { kind: generationId === undefined ? "test.record" : "test.generation", key, ownerKey: "producer", scopeKey: "user", targetPath: path.join(generationId === undefined ? partition.value : store.generationsRoot, `${key}.json`), targetClass: generationId === undefined ? "owned" : "generation", precondition: { state: "absent" }, stagedPath: staged.path, stagedDigest: staged.digest, rollback: { kind: "delete-new-target" }, producerEvidence: { key }, ...(generationId === undefined ? {} : { generationId }) };
 }
 const deleteCodec: TransactionProducerCodec<{ readonly label: string }> = { ...codec, schema: "test.owned-delete", authorizeOwnedDelete(context) { return (context.participant.producerEvidence as { authority?: string }).authority === "trusted-delete" ? { ok: true, value: undefined } : { ok: false, code: "denied", message: "denied" }; } };
-async function deleteParticipant(store: OwnedStateStore, key: string, prior = "prior-bytes"): Promise<TransactionParticipant> {
+async function deleteParticipant(store: OwnedStateStore, key: string, prior = "prior-bytes"): Promise<OrdinaryTransactionParticipant> {
   const base = await participant(store, key, prior); await fs.writeFile(base.targetPath, prior); const backup = await stage(store, `${key}.backup`, prior);
   return { ...base, effect: "delete", precondition: { state: "present", digest: sha256(Buffer.from(prior)) }, rollback: { kind: "restore-backup", path: backup.path, digest: backup.digest }, producerEvidence: { authority: "trusted-delete" } };
 }
-async function presentReplaceParticipant(store: OwnedStateStore, key: string, prior: string, replacement: string): Promise<TransactionParticipant> {
+async function presentReplaceParticipant(store: OwnedStateStore, key: string, prior: string, replacement: string): Promise<OrdinaryTransactionParticipant> {
   const base = await participant(store, key, replacement); await fs.writeFile(base.targetPath, prior); const backup = await stage(store, `${key}.backup`, prior);
   return { ...base, precondition: { state: "present", digest: sha256(Buffer.from(prior)) }, rollback: { kind: "restore-backup", path: backup.path, digest: backup.digest } };
 }
 function persistedPlanDigest(value: { participants: Record<string, unknown>[]; requiredLocks: unknown[] }): string {
-  const participants = value.participants.map((entry) => ({ kind: entry.kind, ...(entry.effect === undefined ? {} : { effect: entry.effect }), key: entry.key, ownerKey: entry.ownerKey, scopeKey: entry.scopeKey, targetPath: entry.targetPath, targetClass: entry.targetClass, precondition: entry.precondition, stagedPath: entry.stagedPath, stagedDigest: entry.stagedDigest, rollback: entry.rollback, producerEvidence: entry.producerEvidence, targetEvidence: entry.targetEvidence, stagedEvidence: entry.stagedEvidence, ...(entry.backupEvidence === undefined ? {} : { backupEvidence: entry.backupEvidence }), ...(entry.missingParent === undefined ? {} : { missingParent: entry.missingParent }), ...(entry.generationId === undefined ? {} : { generationId: entry.generationId }) }));
+  const participants = value.participants.map((entry) => entry.kind === "owned-data-retirement"
+    ? { kind: entry.kind, key: entry.key, profileKey: entry.profileKey, qualifiedIdentity: entry.qualifiedIdentity, dataPath: entry.dataPath, destinationPath: entry.destinationPath, state: entry.state, sourceEvidence: entry.sourceEvidence, producerEvidence: entry.producerEvidence }
+    : { kind: entry.kind, ...(entry.effect === undefined ? {} : { effect: entry.effect }), key: entry.key, ownerKey: entry.ownerKey, scopeKey: entry.scopeKey, targetPath: entry.targetPath, targetClass: entry.targetClass, precondition: entry.precondition, stagedPath: entry.stagedPath, stagedDigest: entry.stagedDigest, rollback: entry.rollback, producerEvidence: entry.producerEvidence, targetEvidence: entry.targetEvidence, stagedEvidence: entry.stagedEvidence, ...(entry.backupEvidence === undefined ? {} : { backupEvidence: entry.backupEvidence }), ...(entry.missingParent === undefined ? {} : { missingParent: entry.missingParent }), ...(entry.generationId === undefined ? {} : { generationId: entry.generationId }) });
   const encoded = canonicalJsonBytes({ participants, requiredLocks: value.requiredLocks }); if (!encoded.ok) throw new Error(encoded.message); return sha256(encoded.value);
 }
 function lockVector(store: OwnedStateStore) { return [{ kind: "profile" as const, key: store.profileKey }, { kind: "checkout" as const, key: "checkout-main" }, { kind: "settings" as const, key: "settings-user" }]; }
 async function lease(store: OwnedStateStore, operationId: string, recovery = false): Promise<LifecycleLockLease> { const result = await acquireLifecycleLocks({ store, operationId, identities: lockVector(store), ...(recovery ? { expectedRecoveryOperationId: operationId, processProbe: { observe: async () => ({ state: "absent" as const }) } } : {}) }); if (!result.ok) throw new Error(`${result.code}: ${result.message}`); return result.value; }
-async function prepared(store: OwnedStateStore, operationId: string, participants: readonly TransactionParticipant[], selected: TransactionProducerCodec = codec) { const result = await prepareTransaction({ store, codec: selected, operationId, confirmationSummary: { label: operationId }, participants }); if (!result.ok) throw new Error(`${result.code}: ${result.message}`); return result.value; }
+async function prepared(store: OwnedStateStore, operationId: string, participants: readonly OrdinaryTransactionParticipant[], selected?: TransactionProducerCodec): Promise<PreparedTransaction & { readonly participants: readonly OrdinaryTransactionParticipant[] }>;
+async function prepared(store: OwnedStateStore, operationId: string, participants: readonly TransactionParticipant[], selected?: TransactionProducerCodec): Promise<PreparedTransaction>;
+async function prepared(store: OwnedStateStore, operationId: string, participants: readonly TransactionParticipant[], selected: TransactionProducerCodec = codec): Promise<PreparedTransaction> { const result = await prepareTransaction({ store, codec: selected, operationId, confirmationSummary: { label: operationId }, participants }); if (!result.ok) throw new Error(`${result.code}: ${result.message}`); return result.value; }
 async function exists(candidate: string): Promise<boolean> { return fs.lstat(candidate).then(() => true, () => false); }
 async function bytes(candidate: string): Promise<string | undefined> { return fs.readFile(candidate, "utf8").catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error)); }
 async function runBoundedChild(script: string, env: NodeJS.ProcessEnv): Promise<string> {
@@ -60,6 +71,112 @@ async function recovery(store: OwnedStateStore, operationId: string, action: "co
 }
 
 describe("owned lifecycle transactions", () => {
+  it("retires one exact owned data directory, recovers prefixes, and cleans quarantine without following links", async () => {
+    const makeCodec = (store: OwnedStateStore): TransactionProducerCodec => ({ ...codec, schema: "test.owned-data-retirement", requiredLocks: () => ({ ok: true, value: lockVector(store) }),
+      authorizeOwnedDataRetirement(context) { return (context.participant.producerEvidence as { authority?: string }).authority === "last-reference" ? { ok: true, value: undefined } : { ok: false, code: "denied", message: "denied" }; } });
+    for (const selected of ["present", "absent", "complete", "rollback"] as const) {
+      const store = await fixture(); const operationId = `data-retirement-${selected}`; const dataPath = path.join(store.dataRoot, `plugin-${Buffer.from("unused").toString("base64url")}`);
+      const identity = `plugin-${selected}@official`; const expected = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`);
+      if (selected !== "absent") { await fs.mkdir(expected); await fs.writeFile(path.join(expected, "state.txt"), "persistent"); }
+      const itemResult = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 0, key: "data", qualifiedIdentity: identity, producerEvidence: { authority: "last-reference" } });
+      if (!itemResult.ok) throw new Error(itemResult.message); const item = itemResult.value; expect(item.dataPath).not.toBe(dataPath);
+      const selectedCodec = makeCodec(store); const plan = await prepared(store, operationId, [item], selectedCodec); const held = await lease(store, operationId);
+      let fired = false; const phase = selected === "complete" || selected === "rollback" ? "after-data-retirement-rename" as const : undefined;
+      const outcome = await executeTransaction(store, plan, { lease: held, ...(phase === undefined ? {} : { faults: { hit(hit) { if (!fired && hit === phase) { fired = true; throw new Error("retirement-fault"); } } } }) });
+      if (phase !== undefined) {
+        expect(outcome).toMatchObject({ state: "pending-recovery", completed: 1 }); expect(await exists(item.dataPath)).toBe(false); expect(await exists(item.destinationPath)).toBe(true);
+        expect(await recovery(store, operationId, selected === "complete" ? "complete" : "rollback", selectedCodec, held)).toMatchObject({ ok: true, value: { outcome: selected === "complete" ? "committed" : "rolled-back" } });
+        expect(await exists(item.dataPath)).toBe(selected === "rollback"); continue;
+      }
+      expect(outcome).toMatchObject({ state: "committed", receipt: { participants: [{ kind: "owned-data-retirement", state: selected === "absent" ? "absent" : "present" }] } });
+      expect(await exists(item.dataPath)).toBe(false); expect(await exists(item.destinationPath)).toBe(selected === "present");
+      if (selected === "present") {
+        const cleaned = await cleanupCommittedOwnedDataRetirement({ store, operationId, registry: registry(selectedCodec) }); expect(cleaned).toMatchObject({ ok: true, value: { removed: false, retained: true } });
+        expect(await exists(item.destinationPath)).toBe(true);
+      }
+    }
+
+    for (const selectedPhase of ["before-data-cleanup-entry", "after-data-cleanup-entry"] as const) {
+      const cleanupStore = await fixture(); const cleanupId = `data-retirement-cleanup-${selectedPhase}`; const cleanupIdentity = `cleanup-${selectedPhase}@official`; const cleanupSource = path.join(cleanupStore.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(cleanupIdentity).digest("base64url")}`); await fs.mkdir(cleanupSource);
+      const cleanupItem = await createOwnedDataRetirementParticipant({ store: cleanupStore, operationId: cleanupId, participantIndex: 0, key: "data", qualifiedIdentity: cleanupIdentity, producerEvidence: { authority: "last-reference" } }); if (!cleanupItem.ok) throw new Error(cleanupItem.message); const cleanupCodec = makeCodec(cleanupStore); const cleanupPlan = await prepared(cleanupStore, cleanupId, [cleanupItem.value], cleanupCodec); const cleanupLease = await lease(cleanupStore, cleanupId); expect(await executeTransaction(cleanupStore, cleanupPlan, { lease: cleanupLease })).toMatchObject({ state: "committed" }); let cleanupFault = false;
+      const expected = selectedPhase === "before-data-cleanup-entry" ? { removed: false, retained: true } : { removed: true, retained: false };
+      expect(await cleanupCommittedOwnedDataRetirement({ store: cleanupStore, operationId: cleanupId, registry: registry(cleanupCodec), faults: { hit(phase) { if (!cleanupFault && phase === selectedPhase) { cleanupFault = true; throw new Error("cleanup-interrupted"); } } } })).toMatchObject({ ok: true, value: expected });
+      expect(await exists(cleanupItem.value.destinationPath)).toBe(selectedPhase === "before-data-cleanup-entry"); expect(await readTransactionReceipt(cleanupStore, cleanupId)).toMatchObject({ ok: true, value: { outcome: "committed" } });
+      expect(await cleanupCommittedOwnedDataRetirement({ store: cleanupStore, operationId: cleanupId, registry: registry(cleanupCodec) })).toMatchObject({ ok: true, value: { removed: true, retained: false } });
+      expect(await exists(cleanupItem.value.destinationPath)).toBe(false);
+    }
+
+    const store = await fixture(); const operationId = "data-retirement-recreated"; const identity = "recreated@official"; const expected = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); await fs.mkdir(expected);
+    const itemResult = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 0, key: "data", qualifiedIdentity: identity, producerEvidence: { authority: "last-reference" } }); if (!itemResult.ok) throw new Error(itemResult.message); const selectedCodec = makeCodec(store); const plan = await prepared(store, operationId, [itemResult.value], selectedCodec); const held = await lease(store, operationId);
+    expect(await executeTransaction(store, plan, { lease: held, faults: { hit(phase) { if (phase === "after-data-retirement-rename") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery" }); await fs.mkdir(itemResult.value.dataPath);
+    expect(await recovery(store, operationId, "rollback", selectedCodec, held)).toMatchObject({ ok: false, code: "recovery-interrupted" }); expect(await exists(itemResult.value.destinationPath)).toBe(true);
+
+    const uncountedStore = await fixture(); const uncountedId = "data-retirement-uncounted-recreation"; const uncountedIdentity = "uncounted@official"; const uncountedSource = path.join(uncountedStore.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(uncountedIdentity).digest("base64url")}`); await fs.mkdir(uncountedSource);
+    const uncountedItem = await createOwnedDataRetirementParticipant({ store: uncountedStore, operationId: uncountedId, participantIndex: 0, key: "data", qualifiedIdentity: uncountedIdentity, producerEvidence: { authority: "last-reference" } }); if (!uncountedItem.ok) throw new Error(uncountedItem.message); const uncountedCodec = makeCodec(uncountedStore); const uncountedPlan = await prepared(uncountedStore, uncountedId, [uncountedItem.value], uncountedCodec); const uncountedLease = await lease(uncountedStore, uncountedId); let recreated = false;
+    expect(await executeTransaction(uncountedStore, uncountedPlan, { lease: uncountedLease, faults: { async hit(phase) { if (!recreated && phase === "after-data-retirement-rename") { recreated = true; await fs.mkdir(uncountedItem.value.dataPath); throw new Error("recreated-before-count"); } } } })).toMatchObject({ state: "pending-recovery", completed: 0 });
+    expect(await recovery(uncountedStore, uncountedId, "rollback", uncountedCodec, uncountedLease)).toMatchObject({ ok: false, code: "invalid-recovery" }); expect(await exists(uncountedItem.value.destinationPath)).toBe(true); expect(await readTransactionJournal(uncountedStore, uncountedId)).toMatchObject({ ok: true, value: { completed: 0 } }); expect(await readTransactionReceipt(uncountedStore, uncountedId)).toMatchObject({ ok: true, value: undefined });
+
+    const exactStore = await fixture(); const exactId = "data-retirement-exact-uncounted"; const exactIdentity = "exact-uncounted@official"; const exactSource = path.join(exactStore.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(exactIdentity).digest("base64url")}`); const exactSentinel = Buffer.from([0x00, 0x51, 0xff, 0x7e, 0x13, 0xa9]); const exactSentinelPath = path.join(exactSource, "nested", "sentinel.bin"); await fs.mkdir(path.dirname(exactSentinelPath), { recursive: true }); await fs.writeFile(exactSentinelPath, exactSentinel); const exactItem = await createOwnedDataRetirementParticipant({ store: exactStore, operationId: exactId, participantIndex: 0, key: "data", qualifiedIdentity: exactIdentity, producerEvidence: { authority: "last-reference" } }); if (!exactItem.ok) throw new Error(exactItem.message); const exactCodec = makeCodec(exactStore); const exactPlan = await prepared(exactStore, exactId, [exactItem.value], exactCodec); const exactLease = await lease(exactStore, exactId); let exactFault = false; expect(await executeTransaction(exactStore, exactPlan, { lease: exactLease, faults: { hit(phase) { if (!exactFault && phase === "after-data-retirement-rename") { exactFault = true; throw new Error("exact-retired"); } } } })).toMatchObject({ state: "pending-recovery", completed: 1 }); const exactJournal = await readTransactionJournal(exactStore, exactId); if (!exactJournal.ok) throw new Error(exactJournal.message); expect(await rollbackJournal(exactStore, { ...exactJournal.value, completed: 0 }, exactCodec, exactLease)).toMatchObject({ ok: true, value: { outcome: "rolled-back", completed: 0 } }); expect(await fs.readFile(exactSentinelPath)).toEqual(exactSentinel); expect(await exists(exactItem.value.destinationPath)).toBe(false);
+
+    const unsafeStore = await fixture(); const unsafeIdentity = "alias@official"; const unsafePath = path.join(unsafeStore.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(unsafeIdentity).digest("base64url")}`); const outside = path.join(path.dirname(unsafeStore.profileRoot), "outside-data"); await fs.mkdir(outside); await fs.writeFile(path.join(outside, "canary"), "outside");
+    try { await fs.symlink(outside, unsafePath, process.platform === "win32" ? "junction" : "dir"); expect(await createOwnedDataRetirementParticipant({ store: unsafeStore, operationId: "alias-source", participantIndex: 0, key: "data", qualifiedIdentity: unsafeIdentity, producerEvidence: {} })).toMatchObject({ ok: false }); expect(await bytes(path.join(outside, "canary"))).toBe("outside"); } catch (error) { if (process.platform !== "win32") throw error; }
+    await fs.rm(unsafePath, { recursive: true, force: true }); await fs.writeFile(unsafePath, "wrong-kind"); expect(await createOwnedDataRetirementParticipant({ store: unsafeStore, operationId: "wrong-kind", participantIndex: 0, key: "data", qualifiedIdentity: unsafeIdentity, producerEvidence: {} })).toMatchObject({ ok: false });
+  });
+
+  it.skipIf(!LINK_AVAILABLE)("retains retired link trees without touching an outside canary", async () => {
+    const store = await fixture(); const operationId = "data-retirement-link-tree"; const identity = "link-tree@official";
+    const source = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); const outside = path.join(path.dirname(store.profileRoot), "outside-link-canary");
+    await fs.mkdir(source); await fs.writeFile(outside, "outside"); await fs.symlink(outside, path.join(source, "link"), "file");
+    expect((await fs.lstat(path.join(source, "link"))).isSymbolicLink()).toBe(true);
+    const item = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 0, key: "data", qualifiedIdentity: identity, producerEvidence: { authority: "last-reference" } }); if (!item.ok) throw new Error(item.message);
+    const selectedCodec: TransactionProducerCodec = { ...codec, schema: "test.link-retirement", requiredLocks: () => ({ ok: true, value: lockVector(store) }), authorizeOwnedDataRetirement: () => ({ ok: true, value: undefined }) };
+    const plan = await prepared(store, operationId, [item.value], selectedCodec); const held = await lease(store, operationId); expect(await executeTransaction(store, plan, { lease: held })).toMatchObject({ state: "committed" });
+    expect((await fs.lstat(path.join(item.value.destinationPath, "link"))).isSymbolicLink()).toBe(true);
+    expect(await cleanupCommittedOwnedDataRetirement({ store, operationId, registry: registry(selectedCodec) })).toMatchObject({ ok: true, value: { removed: false, retained: true } });
+    expect(await exists(item.value.destinationPath)).toBe(true); expect(await bytes(outside)).toBe("outside");
+  });
+
+  it("keeps every retirement and rollback rename/sync fault prefix truthful", async () => {
+    const forwardPhases = ["before-data-retirement-rename", "after-data-retirement-rename", "after-data-retirement-sync"] as const;
+    for (const selectedPhase of forwardPhases) {
+      const store = await fixture(); const operationId = `retirement-fault-${selectedPhase}`; const identity = `${selectedPhase}@official`; const source = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); await fs.mkdir(source);
+      const item = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 0, key: "data", qualifiedIdentity: identity, producerEvidence: {} }); if (!item.ok) throw new Error(item.message);
+      const selectedCodec: TransactionProducerCodec = { ...codec, schema: `test.${selectedPhase}`, requiredLocks: () => ({ ok: true, value: lockVector(store) }), authorizeOwnedDataRetirement: () => ({ ok: true, value: undefined }) };
+      const plan = await prepared(store, operationId, [item.value], selectedCodec); const held = await lease(store, operationId); let fired = false;
+      const outcome = await executeTransaction(store, plan, { lease: held, faults: { hit(phase) { if (!fired && phase === selectedPhase) { fired = true; throw new Error("fault"); } } } });
+      if (selectedPhase === "before-data-retirement-rename") { expect(outcome).toMatchObject({ state: "failed-before-commit", receipt: { completed: 0 } }); expect(await exists(item.value.dataPath)).toBe(true); }
+      else { expect(outcome).toMatchObject({ state: "pending-recovery", completed: 1 }); expect(await exists(item.value.destinationPath)).toBe(true); }
+    }
+    for (const selectedPhase of ["before-data-rollback-rename", "after-data-rollback-rename", "after-data-rollback-sync"] as const) {
+      const store = await fixture(); const operationId = `rollback-fault-${selectedPhase}`; const identity = `${selectedPhase}@official`; const source = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); await fs.mkdir(source);
+      const item = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 0, key: "data", qualifiedIdentity: identity, producerEvidence: {} }); if (!item.ok) throw new Error(item.message);
+      const selectedCodec: TransactionProducerCodec = { ...codec, schema: `test.${selectedPhase}`, requiredLocks: () => ({ ok: true, value: lockVector(store) }), authorizeOwnedDataRetirement: () => ({ ok: true, value: undefined }) };
+      const plan = await prepared(store, operationId, [item.value], selectedCodec); const held = await lease(store, operationId); expect(await executeTransaction(store, plan, { lease: held, faults: { hit(phase) { if (phase === "after-data-retirement-rename") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery" });
+      let fired = false; expect(await recovery(store, operationId, "rollback", selectedCodec, held, { hit(phase) { if (!fired && phase === selectedPhase) { fired = true; throw new Error("rollback-fault"); } } })).toMatchObject({ ok: false, code: "recovery-interrupted" });
+      const preview = await previewRecovery({ store, operationId, registry: registry(selectedCodec) }); expect(preview).toMatchObject({ ok: true, value: { actions: ["rollback"] } });
+      expect(await recovery(store, operationId, "rollback", selectedCodec, held)).toMatchObject({ ok: true, value: { outcome: "rolled-back" } }); expect(await exists(item.value.dataPath)).toBe(true);
+    }
+  });
+
+  it("binds retirement fields into exact plan authority and enforces mixed record-data-generation ordering", async () => {
+    const store = await fixture(); const identity = "ordered@official"; const operationId = "data-retirement-order"; const expected = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); await fs.mkdir(expected);
+    const removal = await deleteParticipant(store, "installation-removal"); const item = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 1, key: "data", qualifiedIdentity: identity, producerEvidence: { authority: "last-reference" } }); if (!item.ok) throw new Error(item.message); const generation = await participant(store, "generation-after-retirement", "generation", "gen-after-retirement");
+    const selectedCodec: TransactionProducerCodec = { ...deleteCodec, schema: "test.retirement-order", requiredLocks: () => ({ ok: true, value: lockVector(store) }), validatePlan(parts) { const index = parts.findIndex((part) => part.kind === "owned-data-retirement"); const previous = parts[index - 1]; return index > 0 && previous !== undefined && !isOwnedDataRetirementParticipant(previous) && previous.effect === "delete" ? { ok: true, value: undefined } : { ok: false, code: "order", message: "record deletion must precede data retirement" }; }, authorizeOwnedDataRetirement: () => ({ ok: true, value: undefined }) };
+    expect(await prepareTransaction({ store, codec: selectedCodec, operationId, confirmationSummary: { label: operationId }, participants: [item.value] })).toMatchObject({ ok: false, code: "unsafe-target" });
+    const mutations = [
+      { ...item.value, destinationPath: path.join(store.quarantineRoot, "caller-selected") },
+      { ...item.value, dataPath: path.join(store.dataRoot, "plugin-caller-selected") },
+      { ...item.value, profileKey: "profile-foreign" },
+      { ...item.value, qualifiedIdentity: "other@official" },
+      { ...item.value, state: "absent" },
+    ] as unknown as OwnedDataRetirementParticipant[];
+    for (const mutated of mutations) expect((await prepareTransaction({ store, codec: selectedCodec, operationId, confirmationSummary: { label: operationId }, participants: [removal, mutated, generation] })).ok).toBe(false);
+    const foreignStore = await fixture("foreign-profile"); const foreignCodec: TransactionProducerCodec = { ...selectedCodec, requiredLocks: () => ({ ok: true, value: lockVector(foreignStore) }) }; expect((await prepareTransaction({ store: foreignStore, codec: foreignCodec, operationId, confirmationSummary: { label: operationId }, participants: [item.value] })).ok).toBe(false);
+    const plan = await prepared(store, operationId, [removal, item.value, generation], selectedCodec); const held = await lease(store, operationId);
+    expect(await executeTransaction(store, plan, { lease: held })).toMatchObject({ state: "committed", receipt: { completed: 3, generationId: "gen-after-retirement", participants: [{ effect: "delete" }, { kind: "owned-data-retirement" }, { targetClass: "generation" }] } });
+    expect(await exists(item.value.dataPath)).toBe(false); expect(await exists(item.value.destinationPath)).toBe(true);
+  });
+
   it("commits explicit owned deletion, reconciles after unlink, and restores exact bytes through interrupted rollback", async () => {
     for (const phase of [undefined, "before-forward-deletion", "after-forward-deletion"] as const) {
       const store = await fixture(); const operationId = `owned-delete-${phase ?? "commit"}`; const item = await deleteParticipant(store, operationId); const plan = await prepared(store, operationId, [item], deleteCodec); expect(plan.participants[0]).toMatchObject({ effect: "delete" }); const held = await lease(store, operationId); let fired = false;
@@ -165,7 +282,7 @@ describe("owned lifecycle transactions", () => {
 
   it("binds effect independently in journal and receipt while decoding legacy effect-less authority", async () => {
     async function writeCanonical(candidate: string, value: unknown) { const encoded = canonicalJsonBytes(value); if (!encoded.ok) throw new Error(encoded.message); await fs.writeFile(candidate, encoded.value); }
-    const strictDeleteCodec: TransactionProducerCodec = { ...deleteCodec, schema: "test.strict-delete-effect", validatePlan(participants) { return participants.every((item) => item.effect === "delete") ? { ok: true, value: undefined } : { ok: false, code: "effect", message: "delete expected" }; } };
+    const strictDeleteCodec: TransactionProducerCodec = { ...deleteCodec, schema: "test.strict-delete-effect", validatePlan(participants) { return participants.every((item) => !isOwnedDataRetirementParticipant(item) && item.effect === "delete") ? { ok: true, value: undefined } : { ok: false, code: "effect", message: "delete expected" }; } };
     const journalStore = await fixture(); const journalId = "effect-journal"; const journalPart = await deleteParticipant(journalStore, journalId); const journalPlan = await prepared(journalStore, journalId, [journalPart], strictDeleteCodec); const journalLease = await lease(journalStore, journalId); expect(await executeTransaction(journalStore, journalPlan, { lease: journalLease, faults: { hit(phase) { if (phase === "after-forward-deletion") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery", completed: 1 });
     const journalFile = path.join(journalStore.journalsRoot, `${journalId}.json`); const journalOriginal = JSON.parse(await fs.readFile(journalFile, "utf8")) as { participants: Record<string, unknown>[]; requiredLocks: unknown[]; planDigest: string };
     const malformedJournal = structuredClone(journalOriginal); malformedJournal.participants[0]!.effect = "remove"; await writeCanonical(journalFile, malformedJournal); expect(await readTransactionJournal(journalStore, journalId)).toMatchObject({ ok: false, code: "invalid-journal" });
@@ -296,9 +413,9 @@ describe("owned lifecycle transactions", () => {
 
   it("uses exact bounded precommit categories and does not leak secret canaries", async () => {
     const cases = [
-      { id: "cancelled", setup: async (_p: TransactionParticipant) => undefined, signal: true, category: "cancelled" },
-      { id: "stale", setup: async (p: TransactionParticipant) => fs.writeFile(p.targetPath, "changed"), signal: false, category: "stale-precondition" },
-      { id: "staged", setup: async (p: TransactionParticipant) => fs.writeFile(p.stagedPath, "changed"), signal: false, category: "changed-staged" },
+      { id: "cancelled", setup: async (_p: OrdinaryTransactionParticipant) => undefined, signal: true, category: "cancelled" },
+      { id: "stale", setup: async (p: OrdinaryTransactionParticipant) => fs.writeFile(p.targetPath, "changed"), signal: false, category: "stale-precondition" },
+      { id: "staged", setup: async (p: OrdinaryTransactionParticipant) => fs.writeFile(p.stagedPath, "changed"), signal: false, category: "changed-staged" },
     ] as const;
     for (const item of cases) { const store = await fixture(); const p = await participant(store, item.id, "SECRET_CANARY_PAYLOAD"); const plan = await prepared(store, item.id, [p]); await item.setup(p); const held = await lease(store, item.id); const controller = new AbortController(); if (item.signal) controller.abort(); const result = await executeTransaction(store, plan, { lease: held, signal: controller.signal }); expect(result, item.id).toMatchObject({ state: "failed-before-commit", receipt: { failureCategory: item.category, completed: 0 } }); const freshPreview = await previewRecovery({ store, operationId: item.id, registry: registry() }); expect(freshPreview, item.id).toMatchObject({ ok: true, value: { terminalOutcome: "failed-before-commit", failureCategory: item.category } }); if (freshPreview.ok) expect(freshPreview.value, item.id).not.toHaveProperty("generationId"); expect(JSON.stringify(result)).not.toContain("SECRET_CANARY_PAYLOAD"); await releaseLifecycleLocks(held); }
   });
@@ -348,7 +465,7 @@ describe("owned lifecycle transactions", () => {
 
   it("proves complete rollback fault progress and successful rollback-only continuation at every relevant phase", async () => {
     const phases: readonly TransactionFaultPhase[] = ["before-journal", "after-journal", "before-temp-write", "after-temp-write", "after-flush", "before-replacement", "after-replacement", "before-generation-marker", "after-generation-marker", "before-receipt", "after-receipt", "before-retirement", "after-retirement"];
-    for (const [caseIndex, selectedPhase] of phases.entries()) { const store = await fixture(); const operationId = `rollback-phase-${caseIndex}`; const raw = [await participant(store, `${operationId}-record`, "new-record"), await participant(store, `${operationId}-generation`, "new-generation", `rollback-gen-${caseIndex}`)]; const old = ["old-record", "old-generation"]; const parts: TransactionParticipant[] = [];
+    for (const [caseIndex, selectedPhase] of phases.entries()) { const store = await fixture(); const operationId = `rollback-phase-${caseIndex}`; const raw = [await participant(store, `${operationId}-record`, "new-record"), await participant(store, `${operationId}-generation`, "new-generation", `rollback-gen-${caseIndex}`)]; const old = ["old-record", "old-generation"]; const parts: OrdinaryTransactionParticipant[] = [];
       for (const [index, item] of raw.entries()) { await fs.writeFile(item.targetPath, old[index]!); const backup = await stage(store, `${operationId}-backup-${index}`, old[index]!); parts.push({ ...item, precondition: { state: "present", digest: sha256(Buffer.from(old[index]!)) }, rollback: { kind: "restore-backup", path: backup.path, digest: backup.digest } }); }
       const plan = await prepared(store, operationId, parts); const held = await lease(store, operationId); expect(await executeTransaction(store, plan, { lease: held, faults: { hit(phase, index) { if (phase === "after-replacement" && index === 1) throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery", completed: 2 }); let fired = false;
       const interrupted = await recovery(store, operationId, "rollback", codec, held, { hit(phase, index) { const indexMatches = !["before-temp-write", "after-temp-write", "after-flush", "before-replacement", "after-replacement", "before-generation-marker", "after-generation-marker"].includes(selectedPhase) || index === 1; if (!fired && phase === selectedPhase && indexMatches) { fired = true; throw new Error("rollback-fault"); } } }); expect(fired, selectedPhase).toBe(true);

@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { acquireLifecycleLocks, releaseLifecycleLocks, type LifecycleLockLease, type ProcessOwnershipProbe } from "./locks.js";
-import { createTransactionCodecRegistry, executeTransaction, readTransactionJournal, readTransactionReceipt, type PreparedTransaction, type TransactionFaultSeam, type TransactionProducerCodec, type TransactionReceipt } from "./transaction.js";
+import { createTransactionCodecRegistry, executeTransaction, isOwnedDataRetirementParticipant, readTransactionJournal, readTransactionReceipt, type OrdinaryTransactionParticipant, type PreparedTransaction, type TransactionFaultSeam, type TransactionProducerCodec, type TransactionReceipt } from "./transaction.js";
 import { previewRecovery, recoverTransaction } from "./recovery.js";
 import { canonicalJsonBytes, isContainedPath, type OwnedStateStore, type StoreResult } from "./state-store.js";
 import { wrapMarketplaceReceipt, type MarketplaceMutationPreview, type MarketplaceReceipt } from "./planner.js";
@@ -37,7 +37,7 @@ export function receiptMatchesPrepared(receipt: PreparedTransaction, transaction
 }
 async function discardPrepared(store: OwnedStateStore, transaction: PreparedTransaction): Promise<StoreResult<void>> {
   try {
-    const candidates = transaction.participants.flatMap((participant) => [participant.stagedPath, participant.rollback.kind === "restore-backup" ? participant.rollback.path : undefined])
+    const candidates = transaction.participants.filter((participant): participant is OrdinaryTransactionParticipant => !isOwnedDataRetirementParticipant(participant)).flatMap((participant) => [participant.stagedPath, participant.rollback.kind === "restore-backup" ? participant.rollback.path : undefined])
       .filter((candidate): candidate is string => candidate !== undefined && isContainedPath(store.stagingRoot, candidate));
     await Promise.all(candidates.map((candidate) => fs.rm(candidate, { force: true })));
     return { ok: true, value: undefined };

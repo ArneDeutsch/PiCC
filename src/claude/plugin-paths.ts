@@ -3,7 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Diagnostic, PluginRuntimeContext } from "../types.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
-import { isCompleteOwnedProfileReference, type CompleteOwnedProfileReference } from "../plugin-lifecycle/admission.js";
+import { getAdmittedInstallationEvidence, isCompleteOwnedProfileReference, readOwnedAdmissionRecords, reconstructOwnedDataRetirementProducerEvidence, type CompleteOwnedProfileReference, type OwnedDataRetirementProducerEvidence, type OwnedPluginInstallationRecord } from "../plugin-lifecycle/admission.js";
+import { canonicalJsonBytes, readRecordEnvelope, revalidateOwnedStateStore, sha256, type OwnedStateStore, type StoreResult } from "../plugin-lifecycle/state-store.js";
+import { isAuthenticOwnedDataRetirementMutationContext, isOwnedDataRetirementParticipant, type OrdinaryTransactionParticipant, type OwnedDataRetirementMutationContext } from "../plugin-lifecycle/transaction.js";
+
+function samePath(left: string, right: string): boolean { return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right; }
 
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?$/i;
 const authorizedPluginRootBrand: unique symbol = Symbol("AuthorizedPluginRoot");
@@ -553,6 +557,112 @@ export function prepareAuthorizedPluginDataLocation(authorization: AuthorizedPlu
 
 export function ownedPluginDataDeletionEligible(pluginId: string, reference: CompleteOwnedProfileReference): boolean {
   return isQualifiedPluginId(pluginId) && isCompleteOwnedProfileReference(reference) && !reference.installations.some((item) => item.record.pluginId === pluginId);
+}
+
+export function createOwnedDataRetirementAuthorizer(inputs: {
+  readonly store: OwnedStateStore;
+  readonly qualifiedIdentity: string;
+}): (context: OwnedDataRetirementMutationContext) => Promise<StoreResult<void>> {
+  const store = inputs.store; const qualifiedIdentity = inputs.qualifiedIdentity;
+  const deny = (): StoreResult<void> => ({ ok: false, code: "retirement-authority", message: "Exact owned data retirement transition authority is unavailable" });
+  const canonical = (value: unknown): Buffer | undefined => { const encoded = canonicalJsonBytes(value); return encoded.ok ? Buffer.from(encoded.value) : undefined; };
+  const observe = (candidate: string, expected: Buffer): "exact" | "absent" | "uncertain" => {
+    try { return fs.readFileSync(candidate).equals(expected) ? "exact" : "uncertain"; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "uncertain"; }
+  };
+  const sameInstallationAuthority = (left: OwnedPluginInstallationRecord, right: OwnedPluginInstallationRecord): boolean => {
+    const rebound = { ...left, executableGenerationId: right.executableGenerationId }; const leftBytes = canonical(rebound); const rightBytes = canonical(right);
+    return leftBytes !== undefined && rightBytes !== undefined && leftBytes.equals(rightBytes);
+  };
+  return async (context) => {
+    const validStore = await revalidateOwnedStateStore(store); if (!validStore.ok) return validStore;
+    if (!isAuthenticOwnedDataRetirementMutationContext(context) || !isQualifiedPluginId(qualifiedIdentity) || context.participant.profileKey !== store.profileKey
+      || context.participant.qualifiedIdentity !== qualifiedIdentity || context.operationId.length === 0 || context.participants[context.participantIndex] !== context.participant) return deny();
+    const successorIndex = context.participants.length - 1; const successor = context.participants[successorIndex];
+    if (successorIndex <= context.participantIndex || successor === undefined || isOwnedDataRetirementParticipant(successor) || successor.targetClass !== "generation"
+      || !samePath(successor.targetPath, path.join(store.generationsRoot, "current.json")) || successor.precondition.state !== "present" || successor.rollback.kind !== "restore-backup") return deny();
+    const rawEvidence = context.participant.producerEvidence as OwnedDataRetirementProducerEvidence; const selectedPath = typeof rawEvidence === "object" && rawEvidence !== null ? rawEvidence.selectedRecordPath : undefined;
+    const installationDeletes = context.participants.flatMap((participant, index) => !isOwnedDataRetirementParticipant(participant) && participant.kind === "plugin-installation-delete" ? [{ participant, index }] : []);
+    const deleteIndexes = installationDeletes.flatMap(({ participant, index }) => participant.effect === "delete" && participant.targetClass === "owned"
+      && typeof selectedPath === "string" && samePath(participant.targetPath, selectedPath) ? [index] : []);
+    if (installationDeletes.length !== 1 || deleteIndexes.length !== 1 || deleteIndexes[0]! >= context.participantIndex) return deny();
+    const deleteIndex = deleteIndexes[0]!; const deletion = context.participants[deleteIndex];
+    if (deletion === undefined || isOwnedDataRetirementParticipant(deletion) || deletion.precondition.state !== "present" || deletion.rollback.kind !== "restore-backup"
+      || deletion.precondition.digest !== deletion.rollback.digest) return deny();
+    const reconstructed = reconstructOwnedDataRetirementProducerEvidence(store, context.participant.producerEvidence, {
+      targetPath: deletion.targetPath, targetDigest: deletion.precondition.digest, backupPath: deletion.rollback.path, backupDigest: deletion.rollback.digest, scopeKey: deletion.scopeKey,
+    });
+    if (!reconstructed.ok || reconstructed.value.installation.pluginId !== qualifiedIdentity) return deny();
+    const evidence = reconstructed.value.evidence; const predecessor = evidence.predecessorGeneration; const successorPayload = evidence.successorGeneration;
+    const predecessorBytes = canonical(predecessor); const successorBytes = canonical(successorPayload);
+    if (predecessor.generationId === successorPayload.generationId || predecessorBytes === undefined || successorBytes === undefined || successor.precondition.digest !== sha256(predecessorBytes)
+      || successor.rollback.digest !== sha256(predecessorBytes) || successor.stagedDigest !== sha256(successorBytes) || successor.generationId !== successorPayload.generationId) return deny();
+    try {
+      const backup = fs.readFileSync(successor.rollback.path); if (!backup.equals(predecessorBytes)) return deny();
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || context.state !== "terminal") return deny(); }
+    try {
+      const staged = fs.readFileSync(successor.stagedPath); if (!staged.equals(successorBytes)) return deny();
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || context.state !== "terminal") return deny(); }
+    const selectedMember = predecessor.members.filter((member) => member.pluginId === reconstructed.value.installation.pluginId && member.scope === reconstructed.value.installation.scope
+      && member.checkoutFamilyKey === reconstructed.value.installation.checkoutFamilyKey && member.projectKey === reconstructed.value.installation.projectKey && member.recordDigest === reconstructed.value.recordDigest);
+    if (selectedMember.length !== 1 || predecessor.members.filter((member) => member.pluginId === qualifiedIdentity).length !== 1
+      || reconstructed.value.installation.executableGenerationId !== predecessor.generationId) return deny();
+    const survivors = predecessor.members.filter((member) => member !== selectedMember[0]).map((member) => reconstructed.value.installations.find((item) => item.recordDigest === member.recordDigest
+      && item.installation.pluginId === member.pluginId && item.installation.scope === member.scope && item.installation.checkoutFamilyKey === member.checkoutFamilyKey && item.installation.projectKey === member.projectKey)).filter((item): item is (typeof reconstructed.value.installations)[number] => item !== undefined);
+    const replacementParticipants = context.participants.flatMap((participant, index) => !isOwnedDataRetirementParticipant(participant) && participant.kind === "plugin-installation-replace" ? [{ participant, index }] : []);
+    if (replacementParticipants.length !== survivors.length || replacementParticipants.some(({ index }) => index <= deleteIndex || index >= context.participantIndex)) return deny();
+    const replacements: Array<{ readonly index: number; readonly path: string; readonly predecessorBytes: Buffer; readonly successorBytes: Buffer; readonly successor: OwnedPluginInstallationRecord; readonly recordDigest: string }> = [];
+    for (const survivor of survivors) {
+      const matches = replacementParticipants.filter(({ participant }) => samePath(participant.targetPath, survivor.recordPath)); if (matches.length !== 1) return deny();
+      const { participant, index } = matches[0]!;
+      if (participant.effect === "delete" || participant.targetClass !== "owned" || participant.precondition.state !== "present" || participant.rollback.kind !== "restore-backup"
+        || participant.precondition.digest !== survivor.recordBytesDigest || participant.rollback.digest !== survivor.recordBytesDigest) return deny();
+      const persisted = participant.producerEvidence;
+      if (typeof persisted !== "object" || persisted === null || Array.isArray(persisted) || Object.keys(persisted).sort().join() !== "predecessorEnvelopeBase64,role,successorEnvelopeBase64"
+        || (persisted as { role?: unknown }).role !== "survivor-generation-rebind" || typeof (persisted as { predecessorEnvelopeBase64?: unknown }).predecessorEnvelopeBase64 !== "string"
+        || typeof (persisted as { successorEnvelopeBase64?: unknown }).successorEnvelopeBase64 !== "string") return deny();
+      const predecessorEnvelope = Buffer.from((persisted as { predecessorEnvelopeBase64: string }).predecessorEnvelopeBase64, "base64");
+      const successorEnvelope = Buffer.from((persisted as { successorEnvelopeBase64: string }).successorEnvelopeBase64, "base64");
+      if (!predecessorEnvelope.equals(survivor.recordBytes) || sha256(predecessorEnvelope) !== participant.precondition.digest || sha256(successorEnvelope) !== participant.stagedDigest) return deny();
+      const decoded = readRecordEnvelope(successorEnvelope, reconstructed.value.registry);
+      if (!decoded.ok || decoded.value.envelope.schema !== "plugin-installation" || decoded.value.envelope.ownerKey !== "picc-owned" || decoded.value.envelope.scopeKey !== participant.scopeKey) return deny();
+      const replacement = decoded.value.decoded as OwnedPluginInstallationRecord;
+      if (replacement.executableGenerationId !== successorPayload.generationId || !sameInstallationAuthority(survivor.installation, replacement)) return deny();
+      replacements.push({ index, path: survivor.recordPath, predecessorBytes: survivor.recordBytes, successorBytes: successorEnvelope, successor: replacement, recordDigest: decoded.value.envelope.payloadDigest });
+    }
+    if (new Set(replacements.map((item) => item.index)).size !== replacements.length || replacements.some((item, index) => index > 0 && replacements[index - 1]!.index >= item.index)) return deny();
+    const accounted = new Set([deleteIndex, context.participantIndex, successorIndex, ...replacements.map((item) => item.index)]);
+    const profileRoot = path.resolve(store.profileRoot); const affectsOwnedCorpus = (candidate: string): boolean => isContained(profileRoot, path.resolve(candidate));
+    for (const [index, participant] of context.participants.entries()) if (!accounted.has(index)) {
+      if (index >= deleteIndex || isOwnedDataRetirementParticipant(participant) || participant.kind !== "plugin-settings"
+        || participant.ownerKey !== "plugin-settings" || participant.targetClass !== "external" || participant.effect === "delete"
+        || affectsOwnedCorpus(participant.targetPath)) return deny();
+    }
+    const expectedSuccessorMembers = predecessor.members.filter((member) => member !== selectedMember[0]).map((member) => {
+      const replacement = replacements.find((item) => item.successor.pluginId === member.pluginId && item.successor.scope === member.scope
+        && item.successor.checkoutFamilyKey === member.checkoutFamilyKey && item.successor.projectKey === member.projectKey);
+      return replacement === undefined ? undefined : { ...member, recordDigest: replacement.recordDigest };
+    });
+    if (expectedSuccessorMembers.some((item) => item === undefined) || successorPayload.members.length !== expectedSuccessorMembers.length
+      || !successorPayload.members.every((member, index) => canonical(member)?.equals(canonical(expectedSuccessorMembers[index]) ?? Buffer.alloc(0)) === true)) return deny();
+    const terminalRollback = context.state === "terminal" && context.completed === 0 && context.rolledBack === context.participants.length;
+    const effective = terminalRollback ? 0 : context.completed - context.rolledBack;
+    if (effective < 0 || effective > context.participants.length || context.mutation === "rollback" && context.state !== "rolling-back" && !terminalRollback) return deny();
+    if (effective === 0) {
+      const fresh = readOwnedAdmissionRecords(store, reconstructed.value.registry, predecessor).completeReference;
+      if (fresh === undefined || fresh.installations.length !== reconstructed.value.installations.length
+        || !fresh.installations.every((installation) => { const admitted = getAdmittedInstallationEvidence(installation); return admitted !== undefined && reconstructed.value.installations.some((expected) => expected.recordDigest === installation.recordDigest
+          && expected.recordBytesDigest === admitted.recordBytesDigest && samePath(expected.recordPath, admitted.recordPath) && canonical(expected.installation)?.equals(canonical(installation.record) ?? Buffer.alloc(0)) === true); })
+        || fresh.installations.filter((installation) => installation.record.pluginId === qualifiedIdentity).length !== 1) return deny();
+    }
+    const selectedStatus = observe(deletion.targetPath, reconstructed.value.installations.find((item) => samePath(item.recordPath, deletion.targetPath))!.recordBytes);
+    if (effective <= deleteIndex ? selectedStatus !== "exact" : selectedStatus !== "absent") return deny();
+    for (const replacement of replacements) if (observe(replacement.path, effective <= replacement.index ? replacement.predecessorBytes : replacement.successorBytes) !== "exact") return deny();
+    const expectedGeneration = effective > successorIndex ? successorBytes : predecessorBytes;
+    if (observe(successor.targetPath, expectedGeneration) !== "exact") return deny();
+    if (context.state === "terminal" && !terminalRollback && (context.completed !== context.participants.length || context.rolledBack !== 0)) return deny();
+    return { ok: true, value: undefined };
+  };
 }
 
 export function revalidatePluginDataLocation(

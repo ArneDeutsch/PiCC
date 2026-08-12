@@ -22,6 +22,7 @@ const MARKETPLACE = /^[a-z0-9][a-z0-9.-]{0,127}$/;
 const MAX_RECORDS = 4096;
 const MAX_RECORD_DEPTH = 8;
 const MAX_RECORD_BYTES = 1024 * 1024;
+const MAX_RETIREMENT_EVIDENCE_BYTES = 16 * 1024 * 1024;
 
 export interface InstallationCatalogProvenance { readonly marketplaceName: string; readonly marketplaceSnapshotId: `marketplace-${string}`; readonly catalogDigest: Sha256 }
 export type PersistedSelectedRoot = PluginRootSelection | { readonly requested: "package/"; readonly path: ""; readonly usedSingleWrapper: true };
@@ -314,19 +315,140 @@ function verifyPersistedTree(record: OwnedPluginInstallationRecord, artifactsRoo
   } catch { return false; }
 }
 export interface AdmittedOwnedInstallation { readonly record: OwnedPluginInstallationRecord; readonly recordDigest: Sha256 }
+interface AdmittedInstallationEvidence { readonly recordPath: string; readonly recordBytesDigest: Sha256 }
+const admittedInstallationEvidence = new WeakMap<AdmittedOwnedInstallation, AdmittedInstallationEvidence>();
+export function getAdmittedInstallationEvidence(installation: AdmittedOwnedInstallation): AdmittedInstallationEvidence | undefined { return admittedInstallationEvidence.get(installation); }
+export interface OwnedDataRetirementInstallationEvidence {
+  readonly recordPath: string;
+  readonly recordBytesDigest: Sha256;
+  readonly recordEnvelopeBase64: string;
+}
+export interface OwnedDataRetirementProducerEvidence {
+  readonly kind: "owned-data-retirement-authority";
+  readonly version: 1;
+  readonly predecessorGeneration: ExecutableAdmissionGeneration;
+  readonly successorGeneration: ExecutableAdmissionGeneration;
+  readonly selectedRecordPath: string;
+  readonly installations: readonly OwnedDataRetirementInstallationEvidence[];
+}
+export interface ReloadableOwnedDataRetirementRecordEvidence {
+  readonly targetPath: string;
+  readonly targetDigest: Sha256;
+  readonly backupPath: string;
+  readonly backupDigest: Sha256;
+  readonly scopeKey: string;
+}
+export interface ReconstructedOwnedDataRetirementInstallation {
+  readonly installation: OwnedPluginInstallationRecord;
+  readonly recordDigest: Sha256;
+  readonly recordPath: string;
+  readonly recordBytesDigest: Sha256;
+  readonly recordBytes: Buffer;
+}
+function retirementAdmissionRegistry(store: OwnedStateStore): StoreResult<ProducerCodecRegistry> {
+  const profileKey = store.profileKey as LifecycleProfileKey;
+  const snapshotRegistry = createProducerCodecRegistry([createOwnedMarketplaceCodec(profileKey), createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot: store.artifactsRoot })]);
+  if (!snapshotRegistry.ok) return snapshotRegistry;
+  const snapshots = readOwnedAdmissionRecords(store, snapshotRegistry.value, undefined).marketplaceSnapshots; const byId: Record<string, OwnedMarketplaceSnapshotRecord[]> = {};
+  for (const snapshot of snapshots) (byId[snapshot.snapshotId] ??= []).push(snapshot);
+  return createProducerCodecRegistry([createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: byId })]);
+}
+export function issueOwnedDataRetirementProducerEvidence(inputs: {
+  readonly store: OwnedStateStore;
+  readonly predecessor: CompleteOwnedProfileReference;
+  readonly selectedInstallation: AdmittedOwnedInstallation;
+  readonly successorGeneration: ExecutableAdmissionGeneration;
+}): StoreResult<OwnedDataRetirementProducerEvidence> {
+  const profileKey = inputs.store.profileKey as LifecycleProfileKey;
+  const selectedEvidence = getAdmittedInstallationEvidence(inputs.selectedInstallation);
+  const matching = inputs.predecessor.installations.filter((item) => item.record.pluginId === inputs.selectedInstallation.record.pluginId);
+  const expectedMembers = inputs.predecessor.generation.members.filter((member) => !sameMember(inputs.selectedInstallation.record, member));
+  const successor = createExecutableAdmissionGenerationCodec(profileKey).decode(inputs.successorGeneration);
+  if (!isCompleteOwnedProfileReferenceForStore(inputs.store, inputs.predecessor) || !revalidateCompleteOwnedProfileReference(inputs.store, inputs.predecessor)
+    || matching.length !== 1 || matching[0] !== inputs.selectedInstallation || selectedEvidence === undefined || !successor.ok
+    || successor.value.generationId === inputs.predecessor.generation.generationId
+    || inputs.selectedInstallation.record.executableGenerationId !== inputs.predecessor.generation.generationId
+    || successor.value.members.length !== expectedMembers.length
+    || !successor.value.members.every((member) => expectedMembers.some((expected) => memberIdentity(member) === memberIdentity(expected)))) {
+    return fail("retirement-authority", "Authentic reloadable owned data retirement evidence is unavailable");
+  }
+  try {
+    let evidenceBytes = 0; const installations = inputs.predecessor.installations.map((installation): OwnedDataRetirementInstallationEvidence => {
+      const admitted = getAdmittedInstallationEvidence(installation); if (admitted === undefined) throw new Error("missing-evidence");
+      const recordBytes = readOpenedOrdinaryFile(admitted.recordPath, MAX_RECORD_BYTES).bytes;
+      if (sha256(recordBytes) !== admitted.recordBytesDigest || (evidenceBytes += recordBytes.byteLength) > MAX_RETIREMENT_EVIDENCE_BYTES) throw new Error("changed-envelope");
+      return Object.freeze({ recordPath: admitted.recordPath, recordBytesDigest: admitted.recordBytesDigest, recordEnvelopeBase64: recordBytes.toString("base64") });
+    });
+    return { ok: true, value: Object.freeze({ kind: "owned-data-retirement-authority", version: 1, predecessorGeneration: inputs.predecessor.generation,
+      successorGeneration: successor.value, selectedRecordPath: selectedEvidence.recordPath, installations: Object.freeze(installations) }) };
+  } catch { return fail("retirement-authority", "Installation envelope evidence is unavailable"); }
+}
+export function reconstructOwnedDataRetirementProducerEvidence(store: OwnedStateStore, raw: unknown, recordEvidence: ReloadableOwnedDataRetirementRecordEvidence): StoreResult<{ readonly evidence: OwnedDataRetirementProducerEvidence; readonly installation: OwnedPluginInstallationRecord; readonly recordDigest: Sha256; readonly installations: readonly ReconstructedOwnedDataRetirementInstallation[]; readonly registry: ProducerCodecRegistry }> {
+  const profileKey = store.profileKey as LifecycleProfileKey;
+  if (!exact(raw, ["kind", "version", "predecessorGeneration", "successorGeneration", "selectedRecordPath", "installations"]) || raw.kind !== "owned-data-retirement-authority" || raw.version !== 1
+    || typeof raw.selectedRecordPath !== "string" || !path.isAbsolute(raw.selectedRecordPath) || !Array.isArray(raw.installations) || raw.installations.length === 0 || raw.installations.length > 1024) return fail("retirement-authority", "Persisted owned data retirement evidence is malformed");
+  const predecessor = createExecutableAdmissionGenerationCodec(profileKey).decode(raw.predecessorGeneration); const successor = createExecutableAdmissionGenerationCodec(profileKey).decode(raw.successorGeneration);
+  if (!predecessor.ok || !successor.ok || predecessor.value.generationId === successor.value.generationId
+    || !samePath(raw.selectedRecordPath, recordEvidence.targetPath) || recordEvidence.backupDigest !== recordEvidence.targetDigest) return fail("retirement-authority", "Persisted owned data retirement generation or record binding is invalid");
+  const registry = retirementAdmissionRegistry(store); if (!registry.ok) return registry as StoreResult<never>;
+  try {
+    let evidenceBytes = 0; const installations: ReconstructedOwnedDataRetirementInstallation[] = [];
+    for (const item of raw.installations) {
+      if (!exact(item, ["recordPath", "recordBytesDigest", "recordEnvelopeBase64"]) || typeof item.recordPath !== "string" || !path.isAbsolute(item.recordPath)
+        || !digest(item.recordBytesDigest) || typeof item.recordEnvelopeBase64 !== "string" || item.recordEnvelopeBase64.length > 2 * MAX_RECORD_BYTES) return fail("retirement-authority", "Persisted installation evidence is malformed");
+      const bytes = Buffer.from(item.recordEnvelopeBase64, "base64");
+      if (bytes.toString("base64") !== item.recordEnvelopeBase64 || bytes.byteLength > MAX_RECORD_BYTES || (evidenceBytes += bytes.byteLength) > MAX_RETIREMENT_EVIDENCE_BYTES || sha256(bytes) !== item.recordBytesDigest) return fail("retirement-authority", "Persisted installation envelope changed");
+      const decoded = readRecordEnvelope(bytes, registry.value);
+      if (!decoded.ok || decoded.value.envelope.schema !== "plugin-installation" || decoded.value.envelope.ownerKey !== "picc-owned") return fail("retirement-authority", "Persisted envelope is not an authentic installation");
+      const installation = decoded.value.decoded as OwnedPluginInstallationRecord; const scopeKey = ownedInstallationScopeKey(installation); const partition = ownedRecordPartition(store, "picc-owned", scopeKey);
+      if (!partition.ok || !isContainedPath(partition.value, item.recordPath) || decoded.value.envelope.scopeKey !== scopeKey
+        || installation.executableGenerationId !== predecessor.value.generationId
+        || !predecessor.value.members.some((member) => sameMember(installation, member) && member.recordDigest === decoded.value.envelope.payloadDigest)) return fail("retirement-authority", "Persisted installation is outside predecessor authority");
+      installations.push({ installation, recordDigest: decoded.value.envelope.payloadDigest, recordPath: item.recordPath, recordBytesDigest: item.recordBytesDigest, recordBytes: bytes });
+    }
+    if (installations.length !== predecessor.value.members.length || new Set(installations.map((item) => item.recordPath.toLowerCase())).size !== installations.length
+      || !predecessor.value.members.every((member) => installations.some((item) => sameMember(item.installation, member) && item.recordDigest === member.recordDigest))) return fail("retirement-authority", "Embedded predecessor installation set is incomplete");
+    const selected = installations.filter((item) => samePath(item.recordPath, recordEvidence.targetPath) && item.recordBytesDigest === recordEvidence.targetDigest);
+    if (selected.length !== 1 || selected[0]!.installation.pluginId === undefined || ownedInstallationScopeKey(selected[0]!.installation) !== recordEvidence.scopeKey) return fail("retirement-authority", "Selected deletion is not the exact embedded installation");
+    try { const stagedBackup = readOpenedOrdinaryFile(recordEvidence.backupPath, MAX_RECORD_BYTES).bytes; if (sha256(stagedBackup) !== recordEvidence.backupDigest || !stagedBackup.equals(selected[0]!.recordBytes)) return fail("retirement-authority", "Persisted selected backup changed"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    return { ok: true, value: { evidence: raw as unknown as OwnedDataRetirementProducerEvidence, installation: selected[0]!.installation, recordDigest: selected[0]!.recordDigest, installations: Object.freeze(installations), registry: registry.value } };
+  } catch { return fail("retirement-authority", "Persisted installation evidence is unavailable or unsafe"); }
+}
 export interface AdmissionRecordObservation { readonly path: string; readonly status: "admitted" | "inert"; readonly code?: string; readonly producer?: { readonly schema: string; readonly version: number; readonly ownerKey: string; readonly scopeKey: string; readonly payload: unknown } }
-export interface CompleteOwnedProfileReference { readonly installations: readonly AdmittedOwnedInstallation[] }
-const completeReferences = new WeakSet<CompleteOwnedProfileReference>();
+export interface CompleteOwnedProfileReference { readonly installations: readonly AdmittedOwnedInstallation[]; readonly generation: ExecutableAdmissionGeneration }
+interface CompleteReferenceAuthority { readonly profileRoot: string; readonly profileKey: string; readonly revision: Sha256 }
+const completeReferences = new WeakMap<CompleteOwnedProfileReference, CompleteReferenceAuthority>();
 export function isCompleteOwnedProfileReference(value: unknown): value is CompleteOwnedProfileReference { return typeof value === "object" && value !== null && completeReferences.has(value as CompleteOwnedProfileReference); }
 export interface OwnedAdmissionLoad { readonly installations: readonly AdmittedOwnedInstallation[]; readonly marketplaces: readonly OwnedMarketplaceRecord[]; readonly marketplaceSnapshots: readonly OwnedMarketplaceSnapshotRecord[]; readonly records: readonly AdmissionRecordObservation[]; readonly completeReference?: CompleteOwnedProfileReference }
 function discoverRecordFiles(root: string): StoreResult<readonly string[]> { try { try { fs.lstatSync(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, value: Object.freeze([]) }; throw error; } if (!ordinaryCanonicalDirectory(root)) return fail("record-root-invalid", "Existing record root is aliased, unreadable, or unsafe"); const files: string[] = []; const discoveredEntries = { value: 0 }; const walk = (dir: string, depth: number): void => { if (depth > MAX_RECORD_DEPTH) throw new Error("depth"); for (const name of boundedDirectoryNames(dir, MAX_RECORDS, discoveredEntries)) { const child = path.join(dir, name); const stat = fs.lstatSync(child); if (stat.isSymbolicLink() || !samePath(fs.realpathSync.native(child), path.resolve(child))) throw new Error("alias"); if (stat.isDirectory()) walk(child, depth + 1); else if (stat.isFile() && name.endsWith(".json")) files.push(child); else if (!stat.isFile()) throw new Error("special"); } }; walk(root, 0); return { ok: true, value: Object.freeze(files.sort()) }; } catch { return fail("record-discovery-invalid", "Owned record discovery exceeded bounds or encountered unsafe storage"); } }
+function completeReferenceRevision(store: OwnedStateStore): StoreResult<Sha256> {
+  const roots = [store.recordsRoot, store.generationsRoot]; const chunks: Buffer[] = [];
+  for (const root of roots) {
+    const files = discoverRecordFiles(root); if (!files.ok) return files;
+    for (const file of files.value) {
+      try {
+        const bytes = readOpenedOrdinaryFile(file, MAX_RECORD_BYTES).bytes;
+        chunks.push(Buffer.from(path.relative(store.profileRoot, file), "utf8"), Buffer.from([0]), bytes, Buffer.from([0]));
+      } catch { return fail("reference-stale", "Complete owned-profile storage changed or became uncertain"); }
+    }
+  }
+  return { ok: true, value: sha256(Buffer.concat(chunks)) };
+}
+export function isCompleteOwnedProfileReferenceForStore(store: OwnedStateStore, reference: CompleteOwnedProfileReference): boolean {
+  const authority = completeReferences.get(reference); return authority !== undefined && authority.profileKey === store.profileKey && samePath(authority.profileRoot, store.profileRoot);
+}
+export function revalidateCompleteOwnedProfileReference(store: OwnedStateStore, reference: CompleteOwnedProfileReference): boolean {
+  if (!isCompleteOwnedProfileReferenceForStore(store, reference)) return false;
+  const authority = completeReferences.get(reference)!; const revision = completeReferenceRevision(store); return revision.ok && revision.value === authority.revision;
+}
 function sameMember(record: OwnedPluginInstallationRecord, member: ExecutableAdmissionGenerationMember): boolean { return record.pluginId === member.pluginId && record.scope === member.scope && record.checkoutFamilyKey === member.checkoutFamilyKey && record.projectKey === member.projectKey; }
 export function readOwnedAdmissionRecords(store: OwnedStateStore, registry: ProducerCodecRegistry, generation: ExecutableAdmissionGeneration | undefined): OwnedAdmissionLoad {
   const records: AdmissionRecordObservation[] = []; const candidates: Array<{ installation: AdmittedOwnedInstallation; observationIndex: number }> = []; const marketplaceCandidates: Array<{ record: OwnedMarketplaceRecord; observationIndex: number }> = []; const snapshotCandidates: Array<{ record: OwnedMarketplaceSnapshotRecord; observationIndex: number }> = [];
   const discovered = discoverRecordFiles(store.recordsRoot); if (!discovered.ok) return Object.freeze({ installations: Object.freeze([]), marketplaces: Object.freeze([]), marketplaceSnapshots: Object.freeze([]), records: Object.freeze([{ path: store.recordsRoot, status: "inert" as const, code: discovered.code }]) });
   let installationEnvelopeCount = 0; const uncertainRecordFiles: string[] = [];
   for (const file of discovered.value) { try { const bytes = readOpenedOrdinaryFile(file, MAX_RECORD_BYTES).bytes; try { const raw = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; if (raw.schema === "plugin-installation") installationEnvelopeCount++; } catch { /* malformed records remain observable below */ } const decoded = readRecordEnvelope(bytes, registry); if (!decoded.ok) { uncertainRecordFiles.push(file); records.push({ path: file, status: "inert", code: decoded.code }); continue; } const producer = Object.freeze({ schema: decoded.value.envelope.schema, version: decoded.value.envelope.codecVersion, ownerKey: decoded.value.envelope.ownerKey, scopeKey: decoded.value.envelope.scopeKey, payload: decoded.value.decoded }); const reject = (code: string): void => { records.push({ path: file, status: "inert", code, producer }); }; if (decoded.value.envelope.ownerKey !== "picc-owned") { reject("owner-mismatch"); continue; } const partition = ownedRecordPartition(store, decoded.value.envelope.ownerKey, decoded.value.envelope.scopeKey); if (!partition.ok || !isContainedPath(partition.value, file)) { reject("record-containment"); continue; }
-    if (decoded.value.envelope.schema === "plugin-installation") { const record = decoded.value.decoded as OwnedPluginInstallationRecord; if (decoded.value.envelope.scopeKey !== ownedInstallationScopeKey(record)) { reject("scope-mismatch"); continue; } const member = generation?.members.find((item) => sameMember(record, item)); if (generation === undefined || generation.generationId !== record.executableGenerationId || member?.recordDigest !== decoded.value.envelope.payloadDigest || !verifyPersistedTree(record, store.artifactsRoot)) { reject(member === undefined ? "generation-mismatch" : "artifact-mismatch"); continue; } const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); candidates.push({ installation: { record, recordDigest: decoded.value.envelope.payloadDigest }, observationIndex });
+    if (decoded.value.envelope.schema === "plugin-installation") { const record = decoded.value.decoded as OwnedPluginInstallationRecord; if (decoded.value.envelope.scopeKey !== ownedInstallationScopeKey(record)) { reject("scope-mismatch"); continue; } const member = generation?.members.find((item) => sameMember(record, item)); if (generation === undefined || generation.generationId !== record.executableGenerationId || member?.recordDigest !== decoded.value.envelope.payloadDigest || !verifyPersistedTree(record, store.artifactsRoot)) { reject(member === undefined ? "generation-mismatch" : "artifact-mismatch"); continue; } const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); const installation = Object.freeze({ record, recordDigest: decoded.value.envelope.payloadDigest }); admittedInstallationEvidence.set(installation, { recordPath: file, recordBytesDigest: sha256(bytes) }); candidates.push({ installation, observationIndex });
     } else if (decoded.value.envelope.schema === "marketplace-registration") { const record = decoded.value.decoded as OwnedMarketplaceRecord; if (decoded.value.envelope.scopeKey !== ownedMarketplaceScopeKey(record)) reject("scope-mismatch"); else { const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); marketplaceCandidates.push({ record, observationIndex }); }
     } else if (decoded.value.envelope.schema === "marketplace-catalog-snapshot") { const record = decoded.value.decoded as OwnedMarketplaceSnapshotRecord; if (decoded.value.envelope.scopeKey !== ownedMarketplaceSnapshotScopeKey(record)) reject("scope-mismatch"); else if (record.authorityKind === "materialized" && !verifyMaterializedMarketplaceSnapshot(record, store.artifactsRoot)) reject("artifact-mismatch"); else { const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); snapshotCandidates.push({ record, observationIndex }); }
     } else reject("unsupported-record");
@@ -344,7 +466,7 @@ export function readOwnedAdmissionRecords(store: OwnedStateStore, registry: Prod
   const uncertainInstallationRecord = generation?.members.some((member) => { const scopeKey = member.scope === "user" ? `user-${store.profileKey}` : `${member.scope}-${member.projectKey ?? "invalid"}`; return partitionUncertain(scopeKey); }) ?? false;
   const complete = generation !== undefined && !uncertainInstallationRecord && installationEnvelopeCount === generation.members.length && candidates.length === generation.members.length && generation.members.every((member) => candidates.some(({ installation }) => sameMember(installation.record, member) && installation.recordDigest === member.recordDigest));
   if (!complete) for (const candidate of candidates) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "generation-incomplete" };
-  const installations = Object.freeze(complete ? candidates.map((item) => item.installation) : []); const completeReference = complete ? Object.freeze({ installations }) : undefined; if (completeReference) completeReferences.add(completeReference);
+  const installations = Object.freeze(complete ? candidates.map((item) => item.installation) : []); const revision = complete ? completeReferenceRevision(store) : undefined; const completeReference = complete && generation !== undefined && revision?.ok ? Object.freeze({ installations, generation }) : undefined; if (completeReference && revision?.ok) completeReferences.set(completeReference, { profileRoot: store.profileRoot, profileKey: store.profileKey, revision: revision.value });
   return Object.freeze({ installations, marketplaces: Object.freeze(marketplaces), marketplaceSnapshots: Object.freeze(marketplaceSnapshots), records: Object.freeze(records), ...(completeReference === undefined ? {} : { completeReference }) });
 }
 export async function reopenAdmittedMarketplaceSnapshot(

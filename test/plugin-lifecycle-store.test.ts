@@ -33,7 +33,8 @@ function artifactDestination(store: OwnedStateStore, digest: string): string { r
 describe("owned lifecycle state store", () => {
   it("puts every authoritative root beneath one profile and isolates equal operation names across profiles", async () => {
     const base = await home(); const first = await fixture(base, "one"); const second = await fixture(base, "two");
-    for (const store of [first, second]) for (const candidate of [store.artifactsRoot, store.recordsRoot, store.stagingRoot, store.generationsRoot, store.journalsRoot, store.receiptsRoot, store.locksRoot, store.quarantineRoot]) expect(path.relative(store.profileRoot, candidate)).not.toMatch(/^\.\./);
+    for (const store of [first, second]) for (const candidate of [store.artifactsRoot, store.recordsRoot, store.stagingRoot, store.generationsRoot, store.journalsRoot, store.receiptsRoot, store.locksRoot, store.quarantineRoot, store.dataRoot!]) expect(path.relative(store.profileRoot, candidate)).not.toMatch(/^\.\./);
+    expect(first.dataRoot).toBe(path.join(first.profileRoot, "data")); expect(second.dataRoot).toBe(path.join(second.profileRoot, "data"));
     expect(first.profileRoot).not.toBe(second.profileRoot);
     await fs.writeFile(path.join(first.journalsRoot, "same-op.json"), "first"); await fs.writeFile(path.join(second.journalsRoot, "same-op.json"), "second");
     expect(await fs.readFile(path.join(first.journalsRoot, "same-op.json"), "utf8")).toBe("first");

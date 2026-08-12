@@ -41,6 +41,7 @@ export interface OwnedStateStore {
   readonly receiptsRoot: string;
   readonly locksRoot: string;
   readonly quarantineRoot: string;
+  readonly dataRoot: string;
 }
 
 interface StoreAuthority {
@@ -90,7 +91,7 @@ async function createPrivateDirectory(candidate: string): Promise<void> {
 }
 
 const STORE_DIRECTORIES = [
-  "artifacts", "artifacts/sha256", "records", "staging", "generations", "journals", "receipts", "locks", "quarantine",
+  "artifacts", "artifacts/sha256", "records", "staging", "generations", "journals", "receipts", "locks", "quarantine", "data",
 ] as const;
 
 async function syncDirectory(directory: string): Promise<void> {
@@ -119,6 +120,7 @@ export async function establishOwnedStateStore(
     const expectedProfileRoot = path.join(expectedRoot, "profiles", locations.profileKey);
     if (!/^profile-[A-Za-z0-9_-]+$/.test(locations.profileKey) || !equalPath(root, expectedRoot)
       || !equalPath(path.resolve(locations.profileRoot), expectedProfileRoot)
+      || !equalPath(path.resolve(locations.dataRoot), path.join(expectedProfileRoot, "data"))
       || !isContainedPath(home, root) || equalPath(home, root)) throw new Error("store is outside the trusted home");
     const homeReal = await fs.realpath(home);
     if (!equalPath(homeReal, home)) throw new Error("trusted home is aliased");
@@ -159,7 +161,11 @@ export async function establishOwnedStateStore(
       receiptsRoot: path.join(profileRoot, "receipts"),
       locksRoot: path.join(profileRoot, "locks"),
       quarantineRoot: path.join(profileRoot, "quarantine"),
+      dataRoot: path.join(profileRoot, "data"),
     });
+    const dataIdentity = await ordinaryDirectory(store.dataRoot);
+    const quarantineIdentity = await ordinaryDirectory(store.quarantineRoot);
+    if (dataIdentity.dev !== quarantineIdentity.dev) throw new Error("data and quarantine are on different filesystems");
     authorities.set(store, { paths: Object.freeze(bound), store });
     return { ok: true, value: store };
   } catch {

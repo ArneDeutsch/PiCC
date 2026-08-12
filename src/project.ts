@@ -142,7 +142,7 @@ export function loadClaudeProject(opts: {
     const store: OwnedStateStore = Object.freeze({ root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey,
       artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"),
       generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"),
-      locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine") });
+      locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine"), dataRoot: locations.dataRoot });
     const marketplaceCodec = createOwnedMarketplaceCodec(locations.profileKey);
     const marketplaceSnapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot });
     const preliminaryRegistry = createProducerCodecRegistry([marketplaceCodec, marketplaceSnapshotCodec]);
