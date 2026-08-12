@@ -1589,7 +1589,10 @@ describe("lifecycle wiring", () => {
     expect(fs.existsSync(log)).toBe(false);
   });
 
-  it("blocks unconfirmed active resumed child shutdown before background cleanup, MCP release, or SessionEnd", async () => {
+  it.each([
+    { reason: "other", live: true },
+    { reason: "quit", live: false },
+  ] as const)("blocks unconfirmed active resumed child $reason shutdown with surface-accurate recovery guidance", async ({ reason, live }) => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
@@ -1601,6 +1604,8 @@ describe("lifecycle wiring", () => {
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
     const agentId = "agent-332222222222";
+    const noPathAgentId = "agent-332222222223";
+    const transcriptPath = `C:\\safe dir\\child [review] "quoted"\\${"long segment ".repeat(30)}transcript.jsonl`;
     let destructiveCleanup = 0;
     let mcpReleased = false;
     const taskId = internals.backgroundTasks.start(
@@ -1615,8 +1620,10 @@ describe("lifecycle wiring", () => {
     );
     await internals.backgroundTasks.wait(taskId);
     const epochOwner = {};
+    const noPathEpochOwner = {};
     internals.subagentRegistry.register({
       agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      transcriptPath,
       session: {
         checkpointStopEligibility: () => ({
           agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
@@ -1624,11 +1631,40 @@ describe("lifecycle wiring", () => {
         stopCheckpoint: async () => undefined,
       },
     });
+    internals.subagentRegistry.register({
+      agentId: noPathAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: false, oneShot: false,
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId: noPathAgentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: noPathEpochOwner,
+        }),
+        stopCheckpoint: async () => undefined,
+      },
+    });
+    internals.subagentRegistry.register({
+      agentId: "agent-339999999999", agentName: "other", depth: 1, cwd: dir,
+      resumable: true, oneShot: false, transcriptPath: "C:/secret/unaffected.jsonl",
+    });
+    internals.subagentRegistry.markSettled("agent-339999999999", { outcome: "completed" });
     internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
 
-    await expect(shutdownPi.fire("session_shutdown", { reason: "other" })).rejects.toThrow(
-      /Unconfirmed child shutdown disposition blocked cleanup/,
+    const failure = await shutdownPi.fire("session_shutdown", { reason }).then(
+      () => "",
+      (error: unknown) => String(error),
     );
+    const quotedAgentId = JSON.stringify(agentId);
+    const quotedTranscriptPath = JSON.stringify(transcriptPath);
+    expect(JSON.parse(quotedAgentId)).toBe(agentId);
+    expect(JSON.parse(quotedTranscriptPath)).toBe(transcriptPath);
+    expect(failure).toContain(`Bounded subset of affected agents: agent ID ${quotedAgentId}, exact transcript path value ${quotedTranscriptPath}; agent ID ${JSON.stringify(noPathAgentId)}, no transcript path was recorded.`);
+    expect(failure).toMatch(/JSON-quoted agent ID and transcript path value above is exact and reversible.*decode the quoted value as JSON.*copy its decoded contents.*quote delimiters are not part of the ID or path/isu);
+    expect(failure).not.toContain("C:/secret/unaffected.jsonl");
+    expect(failure).not.toContain("…");
+    if (live) {
+      expect(failure).toMatch(/process remains live.*decode or copy each exact quoted agent ID.*attempt TaskOutput with the decoded ID.*only if a canonical report exists.*no canonical report exists or TaskOutput is absent or unavailable.*corresponding exact quoted transcript path value.*decoded path before exit.*no transcript path recorded.*caller-owned parent\/client request history is the remaining source.*Transcript paths survive process replacement, but agent IDs do not.*After restart.*decoded transcript paths directly/isu);
+    } else {
+      expect(failure).toMatch(/process is exiting.*renderer is already stopped.*no further TaskOutput invocation is possible.*Before and after restart.*decode or copy each exact quoted transcript path value.*decoded path as its child recovery locator.*no transcript path recorded.*caller-owned parent\/client request history is the remaining source.*Transcript paths survive process replacement, but agent IDs do not/isu);
+      expect(failure).not.toMatch(/attempt TaskOutput/iu);
+    }
     expect(destructiveCleanup).toBe(0);
     expect(mcpReleased).toBe(false);
     expect(fs.existsSync(log)).toBe(false);
@@ -1886,7 +1922,12 @@ describe("lifecycle wiring", () => {
     expect(persistenceAttempts.get(failedAgentId)).toBe(1);
     expect(stderr.join("\n")).toContain("entry entry-first");
     expect(stderr.join("\n")).toContain(`recovery file ${path.join(dir, "retained-second.json")}`);
-    expect(stderr.join("\n")).toMatch(/persistence failed.*may be lost.*No durable locator/isu);
+    expect(stderr.join("\n")).toMatch(
+      /no durable retained-input locator was established for this bounded subset of generated agent IDs agent-667777777777.*may be lost.*parent\/child transcripts or request history.*inspect the worktree.*possible files, tools, and external effects/isu,
+    );
+    const missingLocatorWarning = stderr.find((line) => line.includes("no durable retained-input locator"));
+    expect(missingLocatorWarning).not.toContain(firstAgentId);
+    expect(missingLocatorWarning).not.toContain(agentId);
 
     await expect(shutdownPi.fire("session_shutdown", { reason: "other" })).resolves.toBeUndefined();
     expect(persistenceAttempts.get(firstAgentId)).toBe(1);

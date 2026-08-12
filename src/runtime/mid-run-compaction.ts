@@ -1234,29 +1234,29 @@ export class MidRunCompactionController {
       });
       return;
     }
+    if (validated.authenticated && validated.sessionDisposition === "terminal") {
+      this.phase = "exhausted";
+      this.terminalFailure = "restoration-paused";
+      this.terminalStage = "resumed-cancellation";
+      this.hostAdmissionRevoked = true;
+      this.emit("checkpoint-cancelled", request.generation, {
+        action: "restart-process",
+        failureCategory: "restoration-paused",
+        stage: "resumed-cancellation",
+      });
+      return;
+    }
     if (validated.authenticated && this.queue.length === 0) {
-      if (validated.sessionDisposition === "reusable") {
-        this.phase = "idle";
-        this.committedGeneration = undefined;
-        this.terminalFailure = undefined;
-        this.terminalStage = undefined;
-        this.hostAdmissionRevoked = false;
-        this.emit("checkpoint-cancelled", request.generation, {
-          action: "session-reusable",
-          failureCategory: "restoration-paused",
-          stage: "resumed-cancellation",
-        });
-      } else {
-        this.phase = "exhausted";
-        this.terminalFailure = "restoration-paused";
-        this.terminalStage = "resumed-cancellation";
-        this.hostAdmissionRevoked = true;
-        this.emit("checkpoint-cancelled", request.generation, {
-          action: "restart-process",
-          failureCategory: "restoration-paused",
-          stage: "resumed-cancellation",
-        });
-      }
+      this.phase = "idle";
+      this.committedGeneration = undefined;
+      this.terminalFailure = undefined;
+      this.terminalStage = undefined;
+      this.hostAdmissionRevoked = false;
+      this.emit("checkpoint-cancelled", request.generation, {
+        action: "session-reusable",
+        failureCategory: "restoration-paused",
+        stage: "resumed-cancellation",
+      });
       return;
     }
     this.phase = "exhausted";

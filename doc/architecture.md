@@ -369,7 +369,11 @@ where to start reading, not the extent of its cluster.
   report. The main-session reuse exception is TUI-only. Pi 0.83 RPC abort does not reclaim native
   queued input, so any authenticated live-RPC cancellation outcome leaves the shared controller
   exhausted with admission closed, requires status 3 and external PiCC process plus session
-  replacement, and never permits same-session resubmission. Pi may drain the queues
+  replacement, and never permits same-session resubmission. The cancellation handoff authenticates
+  a `reusable`, `terminal`, or `restart-required` disposition; publication derives its action from
+  that authority. The accepted session epoch latches a readable mode only for the same session, so
+  a stale terminal context preserves known RPC without inferring it or leaking it to a successor.
+  Pi may drain the queues
   before PiCC can present that outcome; PiCC does not intercept or purge them. Every other
   post-commit restoration, replay, provider/tool, or continuation failure remains terminal.
   `SubagentRegistry` is the sole report and quarantine authority; `TaskOutput`, foreground
@@ -553,9 +557,18 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    servers before firing `SessionEnd`. Confirmed child retained-input reports receive one bounded
    best-effort persistence attempt before retained cleanup. Exact reopen verification of either one Pi
    session custom entry or one restrictive atomic recovery file under the verified Pi session owner
-   produces a locator; complete storage failure emits an explicit possible-loss warning and continues
+   produces a locator; complete storage failure names a bounded subset of affected generated agent IDs,
+   emits an explicit possible-loss warning with transcript and caller-owned request-history recovery where
+   available plus effect inspection, and continues
    ordinary cleanup and `SessionEnd`. Unconfirmed reports remain quarantined and block cleanup rather
-   than being serialized as confirmed data.
+   than being serialized as confirmed data. Their bounded affected-agent projection includes only each
+   outcome's exact current-registry ID and transcript path as reversible JSON-quoted values, or an
+   explicit no-path marker; path characters are not truncated or collapsed. Quote delimiters frame the
+   value and are not path characters. A live non-quit boundary makes `TaskOutput` conditional on a
+   canonical report and otherwise names those decoded paths for copying before exit; after
+   renderer-stopped `quit`, it names them for recovery before or after restart. Transcript paths survive process replacement, while
+   agent IDs do not; caller-owned parent/client request history is the remaining source where available
+   for an affected agent without a recorded path.
 
 ## Mechanical-fidelity decisions (load-bearing)
 

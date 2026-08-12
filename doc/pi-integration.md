@@ -194,8 +194,13 @@ or follow-up queues, and the extension API exposes no queue-reclamation seam. Pi
 retained input and start later turns before PiCC can reach cancellation presentation. PiCC does not
 fake interception; if it does present an authenticated RPC cancellation, the action is
 `restart-process`, status 3, with stage/count/client-history/effect guidance and mandatory external
-PiCC process plus session replacement. This confirmed ending has its own terminal category; controller
-admission and in-process new/resume/fork/reload replacement remain closed. Confirmed shutdown
+PiCC process plus session replacement. For main print/JSON/RPC retained records, `appendEntry` returns no entry ID and neither append
+acceptance nor an existing session path verifies reopened persistence. The
+`picc-checkpoint-retained-input` custom entry is therefore only a non-locator hint. Caller-owned
+client/request history is a recovery source where available, not PiCC-verified persistence. This confirmed ending has its own terminal category; controller
+admission and in-process new/resume/fork/reload replacement remain closed. PiCC binds a readable mode
+only to the accepted session epoch, so a terminal `ctx.mode` failure preserves a known RPC route without
+inferring RPC from an unknown mode or leaking it into a successor session. Confirmed shutdown
 uses the same exact join but cannot claim a stopped editor or reusable session; unresolved retained input gets
 an explicit possible-loss warning and ordinary shutdown continues. The continuation stage is
 advanced immediately before its hidden trigger, so every terminal record names the stage actually
@@ -208,8 +213,21 @@ assistant stream do not. Task-id and stable agent-id callers share that registry
 linked-dispatch join, while stale generations and foreign nested callers cannot reach it. This is PiCC
 hardening, not Claude Code stop-timing parity. At confirmed shutdown, each canonical child report
 gets one bounded best-effort persistence attempt before cleanup: exact reopened session-entry or recovery-file
-verification emits a locator, while complete storage failure warns of possible loss and continues cleanup and
-`SessionEnd`. Unconfirmed child work remains quarantined and blocks cleanup. Split summarization operations qualify
+verification emits a locator, while complete storage failure names only a bounded subset of generated agent IDs
+without locators, warns of possible loss, directs transcript and caller-owned request-history recovery where available
+plus worktree/effect inspection, and continues cleanup and `SessionEnd`. Unconfirmed child work remains quarantined
+and blocks cleanup. The bounded unconfirmed subset pairs each exact current-registry agent ID only with its exact
+transcript path using reversible JSON quoting, or says explicitly that no path was recorded. Path characters are not
+truncated or collapsed; decode the quoted values before `TaskOutput` or filesystem use because their quote delimiters
+are framing, not ID/path characters. For a still-live rejected switch or non-quit shutdown, attempt `TaskOutput` with
+each decoded named agent ID before exit and copy its result only when a canonical report exists. If no canonical report
+exists or the tool is absent or unavailable, use the corresponding decoded transcript path to copy retained input before
+exit. For `quit`, the renderer is already stopped, the process is exiting, and no further `TaskOutput` invocation is
+possible: use each decoded transcript path as a recovery locator before or after restart. Transcript paths survive
+process replacement, but agent IDs do not. Where an affected agent has no recorded path, caller-owned parent/client request
+history is the remaining source when available. In either branch, inspect the worktree and possible effects; do not resume
+or retry that child in-process.
+Split summarization operations qualify
 independently under Pi's policy; PiCC neither pools nor multiplies their retry budgets. A blocked
 `PreCompact` remains policy exhaustion and is not made retryable. The settled-idle sample remains a
 non-resuming fallback.
