@@ -4,6 +4,8 @@ import type {
   PluginMarketplaceSettingsDescriptorObservation,
   Scope,
 } from "../types.js";
+import { routeCatalogPluginSource } from "../plugin-lifecycle/source-matrix.js";
+import type { CatalogPluginSource, MarketplaceRegistrationSource } from "../plugin-lifecycle/types.js";
 
 const MAX_STRING = 4096;
 const MAX_PATTERN = 512;
@@ -255,4 +257,34 @@ export function isSafeMarketplaceGithubRepo(value: string): boolean { return saf
 
 export function isDocumentedMarketplaceName(value: string): boolean {
   return value.length <= MAX_NAME && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) && !WINDOWS_RESERVED.test(value);
+}
+
+export interface MarketplaceCatalogDeclarationSummary {
+  readonly name: string;
+  readonly ownerName: string;
+  readonly plugins: readonly { readonly name: string; readonly supported: boolean; readonly sourceKind?: CatalogPluginSource["kind"]; readonly error?: string }[];
+  readonly unsupportedEntries: number;
+  readonly omittedEntries: number;
+}
+
+export function normalizeMarketplaceCatalogDocument(value: unknown, marketplaceSourceKind: MarketplaceRegistrationSource["kind"] = "local-directory"): MarketplaceCatalogDeclarationSummary | undefined {
+  if (!plain(value) || typeof own(value, "name") !== "string" || !isDocumentedMarketplaceName(own(value, "name") as string)
+    || !plain(own(value, "owner")) || text(own(own(value, "owner") as Record<string, unknown>, "name"), 256) === undefined
+    || !Array.isArray(own(value, "plugins"))) return undefined;
+  const metadata = plain(own(value, "metadata")) ? own(value, "metadata") as Record<string, unknown> : undefined;
+  const pluginRoot = metadata === undefined ? undefined : text(own(metadata, "pluginRoot"), 512);
+  const rawPlugins = own(value, "plugins") as unknown[];
+  const plugins: Array<{ readonly name: string; readonly supported: boolean; readonly sourceKind?: CatalogPluginSource["kind"]; readonly error?: string }> = [];
+  let unsupportedEntries = 0;
+  let omittedEntries = Math.max(0, rawPlugins.length - 1024);
+  for (const entry of rawPlugins.slice(0, 1024)) {
+    if (!plain(entry) || typeof own(entry, "name") !== "string" || !isDocumentedMarketplaceName(own(entry, "name") as string)) { omittedEntries++; continue; }
+    const name = own(entry, "name") as string;
+    const routed = routeCatalogPluginSource(own(entry, "source"), { marketplaceSourceKind, ...(pluginRoot === undefined ? {} : { metadataPluginRoot: pluginRoot }) });
+    if (!routed.ok) {
+      plugins.push(Object.freeze({ name, supported: false, error: "Unsupported, malformed, or unsafe plugin source declaration" }));
+      unsupportedEntries++;
+    } else plugins.push(Object.freeze({ name, supported: true, sourceKind: routed.value.descriptor.kind }));
+  }
+  return Object.freeze({ name: own(value, "name") as string, ownerName: own(own(value, "owner") as Record<string, unknown>, "name") as string, plugins: Object.freeze(plugins), unsupportedEntries, omittedEntries });
 }
