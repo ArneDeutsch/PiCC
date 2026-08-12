@@ -2222,6 +2222,141 @@ describe("subagent mid-run compaction", () => {
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
   });
 
+  it("TaskStop owns the active committed-summary resumed epoch before checkpointPaused publication", async () => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, delayTriggerStart: true,
+    });
+    const registry = new SubagentRegistry();
+    const agentId = "agent-101010101010";
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { onCanonicalStoreForTest: (stored) => {
+        expect(stored).toBe(true);
+        expect(registry.checkpointStopEligible(agentId)).toBe(true);
+      } },
+    );
+    const tasks = new BackgroundTaskRegistry({ registry });
+    let fallbackAborts = 0;
+    const taskId = tasks.start(
+      "agent:reviewer",
+      runtime.dispatch({
+        subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId,
+      }),
+      () => { fallbackAborts += 1; },
+      agentId,
+      "reviewer",
+    );
+    const send = createSendMessageToolDefinition(runtime, { registry, backgroundTasks: tasks });
+    await harness.recoveryCompactStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    await (send.execute as Function)("before-stop", { to: agentId, message: "retain this exact input" });
+    harness.releaseRecoveryCompact();
+    await harness.triggerInvocationStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    harness.releaseTriggerStart();
+    await harness.resumedRunStarted();
+
+    expect(registry.checkpointStopEligible(agentId)).toBe(true);
+    expect(registry.get(agentId)?.checkpointPaused).not.toBe(true);
+    expect(tasks.get(taskId)?.checkpointPaused).not.toBe(true);
+    const stop = createTaskStopTool(tasks, registry);
+    const byTask = (stop.execute as Function)("stop-task", { task_id: taskId });
+    const byAgent = (stop.execute as Function)("stop-agent", { task_id: agentId });
+    expect(registry.get(agentId)?.checkpointStopState).toBe("stopping");
+    expect(tasks.get(taskId)).toMatchObject({ status: "running", checkpointStopState: "stopping" });
+    const sendsBeforeRefusal = harness.customMessages().length;
+    await expect((send.execute as Function)("after-stop", {
+      to: agentId, message: "must not reach the SDK",
+    })).rejects.toThrow(/settling cancellation.*message was not sent/isu);
+    expect(harness.customMessages()).toHaveLength(sendsBeforeRefusal);
+
+    const stops = Promise.all([byTask, byAgent]);
+    await settlement(stops, {
+      description: "active resumed TaskStop task/agent join",
+      describeObserved: () => JSON.stringify({
+        events: harness.events(),
+        agent: registry.get(agentId),
+        task: tasks.get(taskId),
+      }),
+    });
+    const [taskStopped, agentStopped] = await stops;
+    expect(taskStopped.details).toMatchObject({ status: "stopped", disposition: "confirmed", agentId });
+    expect(agentStopped.details).toMatchObject({ status: "stopped", disposition: "confirmed", agentId });
+    expect(fallbackAborts).toBe(0);
+    expect(harness.abortCalls()).toBe(1);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+    expect(harness.disposed()).toBe(true);
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    expect(tasks.get(taskId)).toMatchObject({
+      status: "stopped", checkpointStopDisposition: "confirmed", settlementDelivery: "collected",
+    });
+    const report = registry.get(agentId)?.retainedInputReport;
+    expect(report?.occurrences.map((occurrence) => occurrence.shadow.content)).toEqual(["retain this exact input"]);
+    const output = createTaskOutputTool(tasks);
+    const firstReport = await (output.execute as Function)("report", { task_id: agentId });
+    const repeatedReport = await (output.execute as Function)("report-again", { task_id: agentId });
+    expect(firstReport.details.reportId).toBe(report?.reportId);
+    expect(repeatedReport.content).toEqual(firstReport.content);
+  });
+
+  it("does not retain active stop eligibility after a normally finished resumed stream", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-303030303030";
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      intervalHooks: {
+        afterAgentEnd: () => expect(registry.checkpointStopEligible(agentId)).toBe(false),
+      },
+    });
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+    );
+    const result = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await expect(result).resolves.toMatchObject({ outcome: "completed" });
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+  });
+
+  it("TaskStop quarantines an active resumed generation whose settlement cannot be confirmed", async () => {
+    const clock = childManualClock();
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true,
+      stallCancellationPhase: "final-settlement",
+    });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { deadlinePolicy: { clock, resumedJoinMs: 10 } },
+    );
+    const tasks = new BackgroundTaskRegistry({ registry });
+    const agentId = "agent-202020202020";
+    const taskId = tasks.start(
+      "agent:reviewer",
+      runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId }),
+      undefined,
+      agentId,
+      "reviewer",
+    );
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(true);
+
+    const stopping = tasks.stopAndWait(taskId);
+    expect(tasks.get(taskId)).toMatchObject({ status: "running", checkpointStopState: "stopping" });
+    await waitUntil({ description: "active TaskStop cancellation deadline", predicate: () => clock.pending() });
+    clock.expire();
+    await expect(stopping).resolves.toMatchObject({ disposition: "unconfirmed" });
+    expect(registry.get(agentId)).toMatchObject({ checkpointQuarantined: true, checkpointPaused: true });
+    expect(tasks.get(taskId)).toMatchObject({ status: "failed", checkpointQuarantined: true });
+    expect(harness.disposed()).toBe(false);
+    expect(clock.schedules()).toBe(1);
+  });
+
   it("TaskStop by task id joins retained cleanup and leaves one stopped generation", async () => {
     const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();

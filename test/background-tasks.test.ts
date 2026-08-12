@@ -7,6 +7,7 @@ import {
   buildSettlementNotice,
   createTaskOutputTool,
   createTaskStopTool,
+  scopedBackgroundTools,
   type BackgroundResultLike,
   type BackgroundTaskRecord,
 } from "../src/runtime/background-tasks.js";
@@ -392,6 +393,89 @@ describe("opted-in retained background outcomes", () => {
     oneShot: false,
     checkpointPaused: true,
     session: { stopCheckpoint },
+  });
+
+  it("treats a settled stale task generation as settled without stopping the newer eligible dispatch", async () => {
+    const agents = new SubagentRegistry();
+    agents.register({
+      agentId: AGENT_A, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+    });
+    const cooperativeAbort = vi.fn();
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start(
+      "agent:worker",
+      Promise.resolve({
+        ok: true, outcome: "completed", finalMessage: "old", agentId: AGENT_A,
+      }),
+      cooperativeAbort,
+      AGENT_A,
+      "worker",
+    );
+    await tasks.wait(taskId);
+    agents.markSettled(AGENT_A, { outcome: "completed" });
+    agents.markResuming(AGENT_A);
+
+    const owner = {};
+    const checkpointStop = vi.fn(async () => undefined);
+    agents.register({
+      agentId: AGENT_A,
+      agentName: "worker",
+      depth: 1,
+      cwd: "/repo",
+      resumable: true,
+      oneShot: false,
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId: AGENT_A,
+          dispatchGeneration: 2,
+          checkpointGeneration: 1,
+          owner,
+        }),
+        stopCheckpoint: checkpointStop,
+      },
+    });
+
+    expect(agents.checkpointStopEligible(AGENT_A)).toBe(true);
+    await expect(tasks.stopAndWait(taskId)).resolves.toEqual({
+      found: true, alreadySettled: true, abortRequested: false,
+    });
+    expect(tasks.get(taskId)).toMatchObject({ status: "completed", dispatchGeneration: 1 });
+    expect(cooperativeAbort).not.toHaveBeenCalled();
+    expect(checkpointStop).not.toHaveBeenCalled();
+  });
+
+  it("delegates active agent-id stops only through the owning nested scope", async () => {
+    const agents = new SubagentRegistry();
+    const ownerId = "agent-aaaaaaaaaaab";
+    const foreignOwner = "agent-bbbbbbbbbbbc";
+    const stopCheckpoint = vi.fn(async (attempt?: CheckpointStopAttemptIdentity) => {
+      const report = makeReport(AGENT_A);
+      expect(agents.storeRetainedInputReport(AGENT_A, report)).toBe(true);
+      return { confirmed: true as const, attemptId: attempt!.attemptId, report };
+    });
+    const foreignStopCheckpoint = vi.fn(async () => undefined);
+    for (const [agentId, parentAgentId] of [[AGENT_A, ownerId], [AGENT_B, foreignOwner]] as const) {
+      const epochOwner = {};
+      agents.register({
+        agentId, agentName: "worker", depth: 2, parentAgentId, cwd: "/repo", resumable: true, oneShot: false,
+        session: {
+          checkpointStopEligibility: () => ({
+            agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+          }),
+          stopCheckpoint: agentId === AGENT_A ? stopCheckpoint : foreignStopCheckpoint,
+        },
+      });
+    }
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const tools = scopedBackgroundTools(tasks, ownerId, agents);
+    const stop = tools.taskStop as unknown as ToolLike;
+
+    await expect(stop.execute("owned", { task_id: AGENT_A })).resolves.toMatchObject({
+      details: { agentId: AGENT_A, disposition: "confirmed" },
+    });
+    await expect(stop.execute("foreign", { task_id: AGENT_B })).rejects.toThrow(/Unknown task_id/iu);
+    expect(stopCheckpoint).toHaveBeenCalledTimes(1);
+    expect(foreignStopCheckpoint).not.toHaveBeenCalled();
   });
 
   it("retrieves one canonical report repeatedly by authorized task or agent identity without claiming it", async () => {

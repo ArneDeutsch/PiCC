@@ -1589,7 +1589,7 @@ describe("lifecycle wiring", () => {
     expect(fs.existsSync(log)).toBe(false);
   });
 
-  it("blocks unconfirmed child shutdown before background cleanup, MCP release, or SessionEnd", async () => {
+  it("blocks unconfirmed active resumed child shutdown before background cleanup, MCP release, or SessionEnd", async () => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
@@ -1607,16 +1607,22 @@ describe("lifecycle wiring", () => {
       "agent:reviewer",
       Promise.resolve({
         ok: false, outcome: "failed" as const, finalMessage: "", agentId,
-        agentName: "reviewer", checkpointPaused: true, error: "paused",
+        agentName: "reviewer", error: "ordinary prior generation",
       }),
       async () => { destructiveCleanup++; },
       agentId,
       "reviewer",
     );
     await internals.backgroundTasks.wait(taskId);
+    const epochOwner = {};
     internals.subagentRegistry.register({
       agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
-      checkpointPaused: true, session: { stopCheckpoint: async () => undefined },
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+        }),
+        stopCheckpoint: async () => undefined,
+      },
     });
     internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
 
@@ -1684,11 +1690,12 @@ describe("lifecycle wiring", () => {
     expect(fs.existsSync(log)).toBe(true);
   });
 
-  it("persists a confirmed shutdown report before SessionEnd and names its restart locator", async () => {
+  it("joins and persists an active resumed child before cleanup and SessionEnd", async () => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
     const persisted: unknown[] = [];
+    const order: string[] = [];
     const stderr: string[] = [];
     const originalError = console.error;
     console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
@@ -1698,6 +1705,7 @@ describe("lifecycle wiring", () => {
         onWired: (value) => { internals = value; },
         persistRetainedInputReport: ((report: unknown) => {
           persisted.push(report);
+          order.push("persist");
           return { kind: "session-entry", sessionFile: path.join(dir, "shutdown.jsonl"), entryId: "entry-safe" };
         }) as never,
       });
@@ -1707,28 +1715,58 @@ describe("lifecycle wiring", () => {
       }));
       const agentId = "agent-555555555555";
       let report: ReturnType<typeof createRetainedInputReport>;
+      let stopCalls = 0;
+      let stopStarted = false;
+      let releaseStop!: () => void;
+      const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+      const epochOwner = {};
       internals.subagentRegistry.register({
         agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
-        checkpointPaused: true,
-        session: { stopCheckpoint: async (attempt) => {
-          report = createRetainedInputReport({
-            agentId, sessionId: "session-shutdown", generation: 1, stage: "resumed-cancellation",
-            occurrences: [{ id: 1, sessionId: "session-shutdown", generation: 1, delivery: "steer", content: "retained" }],
-            guidance: "Inspect effects.",
-          });
-          internals.subagentRegistry.storeRetainedInputReport(agentId, report);
-          internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
-          return {
-            confirmed: true, attemptId: attempt!.attemptId, report,
-            releaseCleanup: async (attemptId: object) => {
-              if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
-            },
-          };
-        } },
+        session: {
+          checkpointStopEligibility: () => stopStarted ? undefined : ({
+            agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+          }),
+          stopCheckpoint: async (attempt) => {
+            stopCalls++;
+            stopStarted = true;
+            await stopGate;
+            report = createRetainedInputReport({
+              agentId, sessionId: "session-shutdown", generation: 1, stage: "resumed-cancellation",
+              occurrences: [{ id: 1, sessionId: "session-shutdown", generation: 1, delivery: "steer", content: "retained" }],
+              guidance: "Inspect effects.",
+            });
+            internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+            internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+            return {
+              confirmed: true, attemptId: attempt!.attemptId, report,
+              releaseCleanup: async (attemptId: object) => {
+                if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+                order.push("cleanup");
+              },
+            };
+          },
+        },
       });
 
-      await shutdownPi.fire("session_shutdown", { reason: "other" });
+      const alreadySettling = internals.subagentRegistry.stopCheckpoint(agentId, "session");
+      await waitUntil({
+        description: "active child stop to enter registry-owned settlement",
+        predicate: () => internals.subagentRegistry.get(agentId)?.checkpointStopState === "stopping",
+      });
+      expect(internals.subagentRegistry.get(agentId)?.checkpointPaused).not.toBe(true);
+      expect(internals.subagentRegistry.checkpointStopEligible(agentId)).toBe(false);
+      const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" });
+      await Promise.resolve();
+      expect(stopCalls).toBe(1);
+      expect(persisted).toHaveLength(0);
+      expect(order).toEqual([]);
+      releaseStop();
+      await alreadySettling;
+      await shutdown;
+      order.push("shutdown");
+      expect(stopCalls).toBe(1);
       expect(persisted).toHaveLength(1);
+      expect(order).toEqual(["persist", "cleanup", "shutdown"]);
       expect(stderr.join("\n")).toContain(`session ${path.join(dir, "shutdown.jsonl")}, entry entry-safe`);
       expect(stderr.join("\n")).toContain("Open/search that named JSONL for exact entry id entry-safe and customType picc-retained-input-report");
       expect(stderr.join("\n")).toContain("ordered data.report.occurrences");

@@ -872,7 +872,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible completed or truncated-completed resumable retrieval/],
       parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
     },
-    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
+    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /pre-commit compaction-paused dispatch/, /authenticated post-commit resumed abort\/join epoch/, /linked background settlement join/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/current dispatch generation/, /stale task generations cannot stop a newer generation/, /subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });

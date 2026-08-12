@@ -472,7 +472,7 @@ export class SubagentPanelFocusController {
     record: SubagentRegistryRecord,
     taskId: string,
   ): void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }> {
-    if (this.deps.retainedOutcomes && record.checkpointPaused) {
+    if (this.deps.retainedOutcomes && this.deps.registry.checkpointStopOwned(record.agentId)) {
       return this.deps.stopTask(taskId, { source: "panel" });
     }
     this.deps.registry.markUserStopped(record.agentId);
@@ -590,7 +590,7 @@ export class SubagentPanelFocusController {
 
     const requestPanelStop = (record: SubagentRegistryRecord, taskId: string): void => {
       const label = sanitizeLine(record.agentName, NOTICE_LABEL_CAP) || "agent";
-      if (!this.deps.retainedOutcomes || !record.checkpointPaused) {
+      if (!this.deps.retainedOutcomes || !this.deps.registry.checkpointStopOwned(record.agentId)) {
         this.stopAgent(record, taskId);
         notify(panelNoticeStopRequested(label));
         return;
@@ -677,8 +677,10 @@ export class SubagentPanelFocusController {
       if (stopAllArmedAt !== undefined && now - stopAllArmedAt <= STOP_ALL_CONFIRM_MS) {
         stopAllArmedAt = undefined;
         if (this.deps.retainedOutcomes) {
-          const ordinary = targets.filter((target) => !target.record.checkpointPaused);
-          const checkpoint = targets.filter((target) => target.record.checkpointPaused);
+          const checkpoint = targets.filter((target) =>
+            this.deps.registry.checkpointStopOwned(target.record.agentId));
+          const ordinary = targets.filter((target) =>
+            !this.deps.registry.checkpointStopOwned(target.record.agentId));
           for (const target of ordinary) this.stopAgent(target.record, target.taskId);
           for (const target of checkpoint) requestPanelStop(target.record, target.taskId);
           if (ordinary.length > 0) {

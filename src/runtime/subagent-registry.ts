@@ -52,6 +52,8 @@ export interface CheckpointStopAttemptIdentity {
   readonly attemptId: object;
   readonly agentId: string;
   readonly dispatchGeneration: number;
+  readonly checkpointGeneration?: number;
+  readonly checkpointOwner?: object;
   /** Session shutdown defers destructive cleanup until its one report-persistence attempt completes. */
   readonly deferCleanup?: true;
 }
@@ -78,11 +80,20 @@ export interface CheckpointStopDisposition {
   readonly report?: RetainedInputReport;
 }
 
+export interface ActiveCheckpointStopEligibility {
+  readonly agentId: string;
+  readonly dispatchGeneration: number;
+  readonly checkpointGeneration: number;
+  readonly owner: object;
+}
+
 export interface SteerableSession {
   /** Queue a mid-task course correction (delivered before the next LLM call). */
   steer?(text: string, metadata?: { source: SubagentMessageSource }): Promise<void> | void;
   /** Authenticated continuation of this exact retained checkpoint-paused session. */
   recoverCheckpoint?(text: string): Promise<CheckpointRecoveryResult>;
+  /** Side-effect-free identity for the exact active committed-summary resumed stop owner. */
+  checkpointStopEligibility?(): ActiveCheckpointStopEligibility | undefined;
   /** Stop and join this exact retained checkpoint-paused session. Void remains source-compatible but is not confirmation. */
   stopCheckpoint?(attempt?: CheckpointStopAttemptIdentity): Promise<CheckpointStopTerminalEvidence | void> | void;
   /**
@@ -576,13 +587,51 @@ export class SubagentRegistry {
     this.notifyChange();
   }
 
+  private activeCheckpointStopEligibility(
+    agentId: string,
+  ): ActiveCheckpointStopEligibility | undefined {
+    const record = this.records.get(agentId);
+    if (!record || record.checkpointQuarantined || record.state !== "running") return undefined;
+    let eligibility: ActiveCheckpointStopEligibility | undefined;
+    try {
+      eligibility = record.session?.checkpointStopEligibility?.();
+    } catch {
+      return undefined;
+    }
+    if (eligibility?.agentId !== agentId ||
+        eligibility.dispatchGeneration !== (record.dispatchGeneration ?? 1) ||
+        !Number.isSafeInteger(eligibility.checkpointGeneration) ||
+        eligibility.owner === null || typeof eligibility.owner !== "object") return undefined;
+    return eligibility;
+  }
+
+  /** Pure lookup of the exact active committed-summary resumed stop owner. */
+  checkpointStopEligible(agentId: string, dispatchGeneration?: number): boolean {
+    const eligibility = this.activeCheckpointStopEligibility(agentId);
+    return eligibility !== undefined &&
+      (dispatchGeneration === undefined || eligibility.dispatchGeneration === dispatchGeneration);
+  }
+
+  /** Canonical selector for checkpoint-paused or registry-owned stop work. */
+  checkpointStopOwned(agentId: string, dispatchGeneration?: number): boolean {
+    const record = this.records.get(agentId);
+    if (!record || (dispatchGeneration !== undefined &&
+        (record.dispatchGeneration ?? 1) !== dispatchGeneration)) return false;
+    return record.checkpointPaused === true ||
+      record.checkpointStopState === "stopping" ||
+      record.checkpointStopState === "settling-cancellation" ||
+      this.checkpointStopEligible(agentId, dispatchGeneration);
+  }
+
   /** Publish provisional stop ownership without claiming a terminal outcome. */
-  markCheckpointStopping(
+  private markCheckpointStopping(
     agentId: string,
     source: "task-stop" | "panel" | "session",
+    activeEligibility = false,
   ): boolean {
     const record = this.records.get(agentId);
-    if (!record || record.checkpointQuarantined || record.state !== "running" || !record.checkpointPaused) return false;
+    if (!record || record.checkpointQuarantined || record.state !== "running" ||
+        (!record.checkpointPaused && !activeEligibility)) return false;
     if (record.checkpointStopState === "stopping" || record.checkpointStopState === "settling-cancellation") return true;
     record.checkpointStopState = "stopping";
     record.checkpointStopSource = source;
@@ -604,13 +653,18 @@ export class SubagentRegistry {
     if (existing?.record === record && existing.dispatchGeneration === generation) return existing.settlement;
     const session = record.session;
     const callback = session?.stopCheckpoint;
-    if (record.state !== "running" || !record.checkpointPaused || !session || !callback) {
+    const activeEligibility = this.activeCheckpointStopEligibility(agentId);
+    if (record.state !== "running" || (!record.checkpointPaused && !activeEligibility) || !session || !callback) {
       this.quarantineCheckpoint(agentId);
       return Promise.resolve({ disposition: "unconfirmed", ...(record.retainedInputReport ? { report: record.retainedInputReport } : {}) });
     }
-    this.markCheckpointStopping(agentId, source);
+    this.markCheckpointStopping(agentId, source, activeEligibility !== undefined);
     const attempt = Object.freeze({
       attemptId: Object.freeze({}), agentId, dispatchGeneration: generation,
+      ...(activeEligibility ? {
+        checkpointGeneration: activeEligibility.checkpointGeneration,
+        checkpointOwner: activeEligibility.owner,
+      } : {}),
       ...(source === "session" ? { deferCleanup: true as const } : {}),
     });
     let resolveSettlement!: (value: CheckpointStopDisposition) => void;

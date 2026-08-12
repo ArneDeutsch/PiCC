@@ -32,6 +32,7 @@ import type {
   SubagentRegistryRecord,
   SubagentUsage,
   SubagentMessageSource,
+  ActiveCheckpointStopEligibility,
   CheckpointStopAttemptIdentity,
   CheckpointStopTerminalEvidence,
 } from "./subagent-registry.js";
@@ -731,6 +732,14 @@ function createPreloadDiagnosticCollector(
   };
 }
 
+type RetainedCheckpointOwner = {
+  recover: (text: string) => Promise<DispatchResult>;
+  cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
+  operation?: Promise<DispatchResult>;
+  cleanupPromise?: Promise<void>;
+  stopping: boolean;
+};
+
 /** Adapts one live child AgentSession to the shared checkpoint state machine. */
 class ChildCheckpointCoordinator {
   readonly activation: SkillActivationState;
@@ -749,13 +758,9 @@ class ChildCheckpointCoordinator {
     proactive: boolean;
     trigger: "auto" | "manual";
   } | undefined;
-  private retained: {
-    recover: (text: string) => Promise<DispatchResult>;
-    cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
-    operation?: Promise<DispatchResult>;
-    cleanupPromise?: Promise<void>;
-    stopping: boolean;
-  } | undefined;
+  private retained: RetainedCheckpointOwner | undefined;
+  private readonly retainedReady = childDeferred<RetainedCheckpointOwner>();
+  private readonly dispatchSettled = childDeferred();
   private activeResume: {
     generation: number;
     token: ResumeToken;
@@ -775,6 +780,7 @@ class ChildCheckpointCoordinator {
     triggerInvocation: "scheduled" | "invoked" | "prevented";
     activeStreaming: boolean;
     invalidEvidence: boolean;
+    checkpointStopEligibility?: ActiveCheckpointStopEligibility;
   } | undefined;
   private readonly pendingReplayEnvelopes = new Map<RetainedInputOccurrenceEnvelope, {
     shadow: QueuedInputShadow;
@@ -791,6 +797,7 @@ class ChildCheckpointCoordinator {
     private readonly agentName: string,
     private readonly hookAgentType: string,
     private readonly agentId: string,
+    private readonly dispatchGeneration: number,
     private readonly cwd: CwdState,
     hooks: HookRunnerLike,
     private readonly diagnostics: Diagnostic[],
@@ -1094,6 +1101,10 @@ class ChildCheckpointCoordinator {
     await controller.stableBarrier(snapshot.generation);
   }
 
+  settleDispatch(): void {
+    this.dispatchSettled.resolve();
+  }
+
   consumeStoppedRun(): boolean {
     const stopped = this.stoppedRunSettled;
     this.stoppedRunSettled = false;
@@ -1102,6 +1113,18 @@ class ChildCheckpointCoordinator {
 
   exhausted(): boolean {
     return this.gate.currentController().snapshot().phase === "exhausted";
+  }
+
+  checkpointStopEligibility(): ActiveCheckpointStopEligibility | undefined {
+    const resume = this.activeResume;
+    const snapshot = this.gate.currentController().snapshot();
+    if (!this.cancellationRecovery || !this.summaryCommitted || !resume || resume.invalidEvidence ||
+        !resume.triggerStarted || resume.generation !== snapshot.generation) return undefined;
+    const activelyStreaming = snapshot.phase === "resuming" && resume.activeStreaming;
+    const settlingCancellation = snapshot.phase === "terminalizing" &&
+      snapshot.stage === "resumed-cancellation";
+    if (!activelyStreaming && !settlingCancellation) return undefined;
+    return resume.checkpointStopEligibility;
   }
 
   report(): RetainedInputReport | undefined {
@@ -1139,10 +1162,11 @@ class ChildCheckpointCoordinator {
     // stable so TaskStop and shutdown can still join the whole chain.
     if (this.retained) return;
     this.retained = { recover, cleanup, stopping: false };
+    this.retainedReady.resolve(this.retained);
   }
 
   private claimRetainedCleanup(
-    retained: NonNullable<ChildCheckpointCoordinator["retained"]>,
+    retained: RetainedCheckpointOwner,
     outcome: DispatchOutcome,
     finalText?: string,
   ): Promise<void> {
@@ -1161,13 +1185,28 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const before = controller.snapshot();
     const generation = before.generation;
-    const retained = this.retained;
+    let retained = this.retained;
+    const activeEligibility = this.checkpointStopEligibility();
     const safePreCommitCleanup = before.phase === "exhausted" && before.cancellationCommitted !== true &&
       (before.failureCategory === "operational" || before.failureCategory === "hook-blocked");
     const deferCleanup = attempt?.deferCleanup === true && !safePreCommitCleanup;
+    const activeAttempt = activeEligibility !== undefined &&
+      attempt?.checkpointOwner === activeEligibility.owner &&
+      attempt.checkpointGeneration === activeEligibility.checkpointGeneration;
     await this.cancel(deferCleanup ? "shutdown" : "task-stop", deferCleanup);
-    if (!attempt || attempt.agentId !== this.agentId || attempt.dispatchGeneration !== generation) return;
+    if (!attempt || attempt.agentId !== this.agentId || attempt.dispatchGeneration !== this.dispatchGeneration) return;
+    if (attempt.checkpointOwner !== undefined && !activeAttempt) return;
     if (this.gate.currentController() !== controller || controller.snapshot().generation !== generation) return;
+    if (activeAttempt && !retained) {
+      retained = await Promise.race([
+        this.retainedReady.promise,
+        this.dispatchSettled.promise.then(() => undefined),
+      ]);
+    }
+    if (activeAttempt && retained && !deferCleanup) {
+      retained.stopping = true;
+      await this.claimRetainedCleanup(retained, "aborted");
+    }
     if (safePreCommitCleanup && retained && this.retained === retained && retained.cleanupPromise && !this.isQuarantined()) {
       return Object.freeze({
         confirmed: true as const,
@@ -1466,6 +1505,12 @@ class ChildCheckpointCoordinator {
       triggerInvocation: "scheduled",
       activeStreaming: false,
       invalidEvidence: false,
+      checkpointStopEligibility: Object.freeze({
+        agentId: this.agentId,
+        dispatchGeneration: this.dispatchGeneration,
+        checkpointGeneration: context.generation,
+        owner: Object.freeze({}),
+      }),
     };
     this.activeResume = resume;
     if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) {
@@ -1923,7 +1968,9 @@ export class SubagentRuntime {
     const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
     const record = (recoveryRegistry ?? this.deps.subagentRegistry)?.get(agentId);
     if (record?.checkpointQuarantined) throw new Error(quarantineRefusal(record, "stop"));
-    if (record?.state === "running" && record.checkpointPaused) {
+    if (record?.state === "running" && (recoveryRegistry
+      ? recoveryRegistry.checkpointStopOwned(agentId)
+      : record.checkpointPaused === true)) {
       if (recoveryRegistry) {
         await recoveryRegistry.stopCheckpoint(agentId, "session");
       } else {
@@ -1945,7 +1992,7 @@ export class SubagentRuntime {
       let stopRequested = false;
       if (record?.checkpointQuarantined) {
         // Quarantine is process-terminal authority: never call the adapter again.
-      } else if (record?.state === "running" && record.checkpointPaused) {
+      } else if (record?.state === "running" && registry.checkpointStopOwned(record.agentId)) {
         stopRequested = true;
         const stopped = await registry.stopCheckpoint(record.agentId, "session");
         if (stopped.disposition === "ordinary-cleanup") continue;
@@ -2014,7 +2061,10 @@ export class SubagentRuntime {
     const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
     const records = (recoveryRegistry ?? this.deps.subagentRegistry)?.list() ?? [];
     await Promise.allSettled(records
-      .filter((record) => record.state === "running" && record.checkpointPaused && !record.checkpointQuarantined)
+      .filter((record) => record.state === "running" && !record.checkpointQuarantined &&
+        (recoveryRegistry
+          ? recoveryRegistry.checkpointStopOwned(record.agentId)
+          : record.checkpointPaused === true))
       .map((record) => recoveryRegistry
         ? recoveryRegistry.stopCheckpoint(record.agentId, "session")
         : record.session?.stopCheckpoint?.() ?? Promise.resolve()));
@@ -2660,6 +2710,7 @@ export class SubagentRuntime {
     const settleDispatchAuthority = () => {
       if (dispatchAuthoritySettled) return;
       dispatchAuthoritySettled = true;
+      dispatchCheckpoint?.settleDispatch();
       dispatchCheckpointGate?.logicalRunSettled();
     };
     // The final answer text for the registry record (panel drill-down): the
@@ -2854,6 +2905,7 @@ export class SubagentRuntime {
         agent.name,
         hookAgentType,
         agentId,
+        this.deps.subagentRegistry?.get(agentId)?.dispatchGeneration ?? 1,
         subCwd,
         hookRunner,
         diagnostics,
@@ -3196,6 +3248,7 @@ export class SubagentRuntime {
         session: {
           steer: (text: string, metadata) => checkpoint.steer(text, metadata),
           recoverCheckpoint: (text: string) => checkpoint.recover(text),
+          checkpointStopEligibility: () => checkpoint.checkpointStopEligibility(),
           stopCheckpoint: (attempt) => checkpoint.stopCheckpoint(attempt),
           followUp: (text: string) => checkpoint.followUp(text),
         },

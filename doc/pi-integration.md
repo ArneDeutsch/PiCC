@@ -200,7 +200,13 @@ uses the same exact join but cannot claim a stopped editor or reusable session; 
 an explicit possible-loss warning and ordinary shutdown continues. The continuation stage is
 advanced immediately before its hidden trigger, so every terminal record names the stage actually
 reached. Child cancellation
-physically aborts compaction through the SDK and joins it. At confirmed shutdown, each canonical child report
+physically aborts compaction through the SDK and joins it. Pre-commit compaction-paused TaskStop remains
+the established paused-session exception. Separately, only the current linked dispatch generation's
+authenticated post-commit resumed stream, or its exact `terminalizing`/`resumed-cancellation` join,
+qualifies for an active TaskStop flight; scheduling before authenticated start and a normally closed
+assistant stream do not. Task-id and stable agent-id callers share that registry-owned cancellation and
+linked-dispatch join, while stale generations and foreign nested callers cannot reach it. This is PiCC
+hardening, not Claude Code stop-timing parity. At confirmed shutdown, each canonical child report
 gets one bounded best-effort persistence attempt before cleanup: exact reopened session-entry or recovery-file
 verification emits a locator, while complete storage failure warns of possible loss and continues cleanup and
 `SessionEnd`. Unconfirmed child work remains quarantined and blocks cleanup. Split summarization operations qualify

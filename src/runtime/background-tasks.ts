@@ -159,6 +159,8 @@ export interface BackgroundTaskRecord {
    * (the Agent tool does), confirmed/overwritten from the settled result.
    */
   agentId?: string;
+  /** Exact dispatch-registry generation linked when this task record starts. */
+  readonly dispatchGeneration?: number;
   /** On-disk JSONL transcript of the subagent's session, when persisted. */
   transcriptPath?: string;
   /** True when the settled agent can be continued under `agentId`. */
@@ -429,6 +431,9 @@ export class BackgroundTaskRegistry {
       status: "running",
       admission,
       agentId,
+      dispatchGeneration: agentId
+        ? this.retainedOutcomes?.registry.get(agentId)?.dispatchGeneration
+        : undefined,
       agentType:
         agentType === undefined
           ? undefined
@@ -721,8 +726,14 @@ export class BackgroundTaskRegistry {
       return { found: true, alreadySettled: false, abortRequested: false, disposition: "unconfirmed" };
     }
     const custody = task.agentId ? this.retainedOutcomes?.registry.get(task.agentId) : undefined;
-    const trackedCheckpoint = !!custody &&
-      (task.checkpointPaused === true || custody.checkpointPaused === true || custody.checkpointStopState !== undefined);
+    const currentGeneration = custody?.dispatchGeneration ?? 1;
+    if (custody && task.dispatchGeneration !== undefined && task.dispatchGeneration !== currentGeneration) {
+      return { found: true, alreadySettled: true, abortRequested: false };
+    }
+    const linkedGeneration = !custody || task.dispatchGeneration === undefined ||
+      task.dispatchGeneration === currentGeneration;
+    const trackedCheckpoint = !!custody && linkedGeneration &&
+      this.retainedOutcomes?.registry.checkpointStopOwned(task.agentId!, task.dispatchGeneration) === true;
     // A stop already owns asynchronous cleanup. Until that exact promise
     // settles, every task-id/agent-id caller observes an in-progress stop rather
     // than the superficially terminal status written below.
@@ -1662,6 +1673,8 @@ export function scopedBackgroundTools(
       retainedInputReport?: RetainedInputReport;
       session?: { stopCheckpoint?(): Promise<unknown> | void };
     } | undefined;
+    checkpointStopEligible?(agentId: string, dispatchGeneration?: number): boolean;
+    checkpointStopOwned?(agentId: string, dispatchGeneration?: number): boolean;
   },
 ): { taskOutput: Record<string, unknown>; taskStop: Record<string, unknown> } {
   const view = registry.scopedTo(ownerAgentId);
@@ -1669,6 +1682,16 @@ export function scopedBackgroundTools(
     get: (agentId: string) => {
       const record = pausedAgents.get(agentId);
       return record?.parentAgentId === ownerAgentId ? record : undefined;
+    },
+    checkpointStopEligible: (agentId: string) => {
+      const record = pausedAgents.get(agentId);
+      return record?.parentAgentId === ownerAgentId &&
+        pausedAgents.checkpointStopEligible?.(agentId) === true;
+    },
+    checkpointStopOwned: (agentId: string) => {
+      const record = pausedAgents.get(agentId);
+      return record?.parentAgentId === ownerAgentId &&
+        pausedAgents.checkpointStopOwned?.(agentId) === true;
     },
   } : undefined;
   return {
@@ -1691,16 +1714,18 @@ export function createTaskStopTool(
       retainedInputReport?: RetainedInputReport;
       session?: { stopCheckpoint?(): Promise<unknown> | void };
     } | undefined;
+    checkpointStopEligible?(agentId: string, dispatchGeneration?: number): boolean;
+    checkpointStopOwned?(agentId: string, dispatchGeneration?: number): boolean;
   },
 ): Record<string, unknown> {
   return {
     name: "TaskStop",
     label: "TaskStop",
     description:
-      "Stop a running background task by task-* id (best-effort). A live checkpoint-paused child may instead be stopped by its process-lifetime agent-* id. The task is marked stopped and its result is discarded.",
+      "Stop a running background task by task-* id (best-effort). A checkpoint-paused child may instead be stopped by its process-lifetime agent-* id. As a narrow PiCC hardening exception, TaskStop also joins the exact current dispatch generation's authenticated active post-commit resumed cancellation epoch; this does not apply to ordinary running work or stale generations. The task is marked stopped and its result is discarded.",
     parameters: Type.Object({
       task_id: Type.String({
-        description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a live checkpoint-paused child in this process',
+        description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a checkpoint-paused child or the exact authenticated active post-commit resumed PiCC-hardening exception in this process',
       }),
     }),
     renderCall(
@@ -1749,7 +1774,12 @@ export function createTaskStopTool(
             },
           };
         }
-        if (!paused || paused.state !== "running" || !paused.checkpointPaused ||
+        const checkpointOwned = pausedAgents?.checkpointStopOwned?.(id) === true ||
+          (pausedAgents?.checkpointStopOwned === undefined &&
+            (paused?.checkpointPaused === true || pausedAgents?.checkpointStopEligible?.(id) === true ||
+              paused?.checkpointStopState === "stopping" ||
+              paused?.checkpointStopState === "settling-cancellation"));
+        if (!paused || paused.state !== "running" || !checkpointOwned ||
             !paused.session?.stopCheckpoint) {
           throw unknownIdError(registry, id);
         }
