@@ -5,6 +5,12 @@ import path from "node:path";
 import picc from "../src/index.js";
 import type { ClaudeAgent } from "../src/types.js";
 import type { PiSdk, PiSessionMessage, SubagentRuntimeDeps } from "../src/runtime/subagents.js";
+import type {
+  CheckpointProgress,
+  HostDeadlineClock,
+  HostDeadlinePolicy,
+  MidRunCompactionController,
+} from "../src/runtime/mid-run-compaction.js";
 import { createSendMessageToolDefinition } from "../src/runtime/subagents.js";
 import {
   BackgroundTaskRegistry,
@@ -13,10 +19,11 @@ import {
   scopedBackgroundTools,
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime } from "./helpers/fake-sdk.js";
 import { fakePi } from "./helpers/fake-pi.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
-import { settlement } from "./helpers/async.js";
+import { settlement, waitUntil } from "./helpers/async.js";
 
 interface ChildHarness {
   sdk: PiSdk;
@@ -31,7 +38,8 @@ interface ChildHarness {
   releaseRecoveryCompact(): void;
   resumeCalls(): number;
   events(): string[];
-  customMessages(): Array<{ customType: string; content: unknown }>;
+  customMessages(): Array<{ customType: string; content: unknown; details?: unknown }>;
+  physicalSends(): Array<{ customType: string; options?: Record<string, unknown> }>;
   guardResults(): unknown[];
   providerRegistrations(): Array<{ name: string; config: Record<string, unknown> }>;
   providerAttempts(): number;
@@ -42,6 +50,12 @@ interface ChildHarness {
   executeCheckpointTool(): Promise<Record<string, unknown>>;
   providerBoundaryBlocked(): Promise<void>;
   releaseProviderBlock(): void;
+  resumedRunStarted(): Promise<void>;
+  releaseResumedRun(): void;
+  triggerInvocationStarted(): Promise<void>;
+  releaseTriggerStart(): void;
+  injectSyntheticInvalidReplayCallbacks(): Promise<void>;
+  replaySendStarted(): Promise<void>;
 }
 
 interface CheckpointSdkOptions {
@@ -61,6 +75,22 @@ interface CheckpointSdkOptions {
   highAtProviderBoundary?: boolean;
   holdCheckpointTool?: boolean;
   holdAfterProviderBlock?: boolean;
+  cancelResumedRun?: boolean;
+  gateResumedRun?: boolean;
+  purgeThrows?: boolean;
+  consumeRetainedReplay?: boolean;
+  delayTriggerStart?: boolean;
+  stallCancellationPhase?: "non-trigger" | "trigger" | "abort" | "run" | "final-settlement" | "evidence";
+  triggerEventVariant?: "valid" | "missing" | "stale" | "duplicate" | "wrong-content" | "wrong-role" | "wrong-type" | "unscrubbable";
+  terminalEvidenceVariant?: "valid" | "duplicate-end" | "duplicate-settled" | "wrong-end" | "late-end" | "wrong-run";
+  replayEventVariant?: "valid" | "stale" | "duplicate" | "wrong-content" | "wrong-role" | "wrong-type" | "unscrubbable";
+  intervalHooks?: {
+    afterPurge?: () => void;
+    afterAbort?: () => void;
+    afterAgentEnd?: () => void;
+    afterAgentSettled?: () => void;
+  };
+  onCleanup?: () => void;
 }
 
 function checkpointSdk({
@@ -80,6 +110,17 @@ function checkpointSdk({
   highAtProviderBoundary = false,
   holdCheckpointTool = false,
   holdAfterProviderBlock = false,
+  cancelResumedRun = false,
+  gateResumedRun = false,
+  purgeThrows = false,
+  consumeRetainedReplay = true,
+  delayTriggerStart = false,
+  stallCancellationPhase,
+  triggerEventVariant = "valid",
+  terminalEvidenceVariant = "valid",
+  replayEventVariant = "valid",
+  intervalHooks,
+  onCleanup,
 }: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -93,9 +134,18 @@ function checkpointSdk({
   let admittedProviderRequests = 0;
   let fabricatedResponses = 0;
   const events: string[] = [];
-  const customMessages: Array<{ customType: string; content: unknown }> = [];
+  const customMessages: Array<{ customType: string; content: unknown; details?: unknown }> = [];
+  const physicalSends: Array<{ customType: string; options?: Record<string, unknown> }> = [];
   const guardResults: unknown[] = [];
   const providerRegistrations: Array<{ name: string; config: Record<string, unknown> }> = [];
+  const pendingReplayStarts: Array<{
+    message: Record<string, unknown>;
+    ctx: unknown;
+    delivery: "steer" | "followUp";
+    replayEnvelope?: unknown;
+  }> = [];
+  const clearedReplayStarts: Array<{ message: Record<string, unknown>; ctx: unknown }> = [];
+  let emitPendingReplay: ((message: Record<string, unknown>, ctx: unknown) => Promise<void>) | undefined;
   let releaseRecoveryCompact!: () => void;
   let markRecoveryCompactStarted!: () => void;
   let markCompactionAbortObserved!: () => void;
@@ -103,6 +153,11 @@ function checkpointSdk({
   let releaseCheckpointTool!: () => void;
   let markProviderBoundaryBlocked!: () => void;
   let releaseProviderBlock!: () => void;
+  let markResumedRunStarted!: () => void;
+  let releaseResumedRun!: () => void;
+  let markTriggerInvocationStarted!: () => void;
+  let releaseTriggerStart!: () => void;
+  let markReplaySendStarted!: () => void;
   const recoveryCompactGate = new Promise<void>((resolve) => { releaseRecoveryCompact = resolve; });
   const recoveryCompactStarted = new Promise<void>((resolve) => { markRecoveryCompactStarted = resolve; });
   const compactionAbortObserved = new Promise<void>((resolve) => { markCompactionAbortObserved = resolve; });
@@ -110,6 +165,12 @@ function checkpointSdk({
   const checkpointToolGate = new Promise<void>((resolve) => { releaseCheckpointTool = resolve; });
   const providerBoundaryBlocked = new Promise<void>((resolve) => { markProviderBoundaryBlocked = resolve; });
   const providerBlockGate = new Promise<void>((resolve) => { releaseProviderBlock = resolve; });
+  const resumedRunStarted = new Promise<void>((resolve) => { markResumedRunStarted = resolve; });
+  const resumedRunGate = new Promise<void>((resolve) => { releaseResumedRun = resolve; });
+  const triggerInvocationStarted = new Promise<void>((resolve) => { markTriggerInvocationStarted = resolve; });
+  const triggerStartGate = new Promise<void>((resolve) => { releaseTriggerStart = resolve; });
+  const replaySendStarted = new Promise<void>((resolve) => { markReplaySendStarted = resolve; });
+  const never = new Promise<void>(() => undefined);
 
   class Loader {
     constructor(readonly options: Record<string, unknown>) {}
@@ -146,6 +207,20 @@ function checkpointSdk({
         for (const handler of handlers.get(event) ?? []) results.push(await handler(payload, ctx));
         return results;
       };
+      emitPendingReplay = async (message, eventCtx) => {
+        await emit("message_start", { type: "message_start", message }, eventCtx);
+      };
+      const advanceAgentLoop = async (): Promise<void> => {
+        if (!consumeRetainedReplay) return;
+        const pending = pendingReplayStarts.splice(0);
+        for (const entry of pending) {
+          await emitPendingReplay?.(entry.message, entry.ctx);
+          if (replayEventVariant === "duplicate") {
+            (entry.message.details as Record<string, unknown>).piccCheckpointInput = entry.replayEnvelope;
+            await emitPendingReplay?.(entry.message, entry.ctx);
+          }
+        }
+      };
       let activeResumeAborted = false;
       let contextHigh = false;
       let contextUsageKnown = true;
@@ -175,6 +250,12 @@ function checkpointSdk({
         await emit("turn_start", {}, ctx);
         providerAttempts += 1;
         await emit("before_provider_request", {}, ctx);
+        if (gateResumedRun) {
+          events.push("resumed-run-started");
+          markResumedRunStarted();
+          await resumedRunGate;
+        }
+        await advanceAgentLoop();
         if (!activeResumeAborted) admittedProviderRequests += 1;
         if (activateSkill) {
           await emit("tool_call", {
@@ -182,12 +263,39 @@ function checkpointSdk({
           }, ctx);
         }
         if (resumedToolHook) {
+          events.push("resumed-tool-progress");
           await emit("tool_call", {
             toolName: "CheckpointTool", toolCallId: "resumed-hook", input: {},
           }, ctx);
         }
-        if (activeResumeAborted) {
-          await emit("agent_settled", {}, ctx);
+        if (activeResumeAborted || cancelResumedRun) {
+          const abortedAssistant: PiSessionMessage = {
+            role: "assistant",
+            content: [],
+            stopReason: "aborted",
+          };
+          messages.push(abortedAssistant);
+          await emit("message_end", { message: abortedAssistant }, ctx);
+          const terminalForEvidence = terminalEvidenceVariant === "wrong-end"
+            ? { ...abortedAssistant, stopReason: "stop" }
+            : abortedAssistant;
+          if (terminalEvidenceVariant === "late-end" && stallCancellationPhase !== "final-settlement") {
+            await emit("agent_settled", {}, ctx);
+          }
+          if (stallCancellationPhase !== "evidence") {
+            await emit("agent_end", { messages: [terminalForEvidence] }, ctx);
+            intervalHooks?.afterAgentEnd?.();
+            if (terminalEvidenceVariant === "duplicate-end") {
+              await emit("agent_end", { messages: [terminalForEvidence] }, ctx);
+            }
+          }
+          if (terminalEvidenceVariant !== "late-end" &&
+              stallCancellationPhase !== "final-settlement" && stallCancellationPhase !== "evidence") {
+            await emit("agent_settled", {}, ctx);
+            intervalHooks?.afterAgentSettled?.();
+            if (terminalEvidenceVariant === "duplicate-settled") await emit("agent_settled", {}, ctx);
+          }
+          if (terminalEvidenceVariant === "wrong-run") throw new Error("wrong resumed run settlement");
           return;
         }
         events.push("resumed-provider");
@@ -210,7 +318,7 @@ function checkpointSdk({
         async prompt(text: string) {
           const user: PiSessionMessage = { role: "user", content: text };
           messages.push(user);
-          await emit("message_start", { message: user }, ctx);
+          await emit("message_start", { type: "message_start", message: user }, ctx);
           await emit("turn_start", {}, ctx);
           providerAttempts += 1;
           await emit("before_provider_request", {}, ctx);
@@ -342,12 +450,82 @@ function checkpointSdk({
           return { summary: "summary" };
         },
         async sendCustomMessage(
-          message: { customType: string; content: unknown; display: boolean },
-          sendOptions?: { triggerTurn?: boolean },
+          message: { customType: string; content: unknown; display: boolean; details?: unknown },
+          sendOptions?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
         ) {
+          physicalSends.push({
+            customType: message.customType,
+            ...(sendOptions ? { options: { ...sendOptions } } : {}),
+          });
+          // Installed Pi's message_start event carries the custom message but no delivery mode.
+          const startedMessage: Record<string, any> = { role: "custom", ...message };
+          const originalTriggerEnvelope = (message.details as any)?.piccCheckpointResume;
+          const originalReplayEnvelope = (message.details as any)?.piccCheckpointInput;
+          const retainedReplay = message.customType === "picc-retained-parent-input";
           if (sendOptions?.triggerTurn) {
             resumed = true;
             activeResumeAborted = false;
+            markTriggerInvocationStarted();
+          }
+          if (sendOptions?.triggerTurn && (delayTriggerStart || stallCancellationPhase === "trigger")) {
+            events.push("trigger-invoked");
+            await triggerStartGate;
+          }
+          if (retainedReplay && replayEventVariant !== "valid") {
+            if (replayEventVariant === "stale") {
+              startedMessage.details = { piccCheckpointInput: {} };
+            } else if (replayEventVariant === "wrong-content") {
+              startedMessage.content = "wrong replay";
+            } else if (replayEventVariant === "wrong-role") {
+              startedMessage.role = "user";
+            } else if (replayEventVariant === "wrong-type") {
+              startedMessage.customType = "wrong-replay";
+            } else if (replayEventVariant === "unscrubbable") {
+              Object.defineProperty(startedMessage.details, "piccCheckpointInput", {
+                value: startedMessage.details.piccCheckpointInput,
+                enumerable: true,
+                configurable: false,
+              });
+            }
+          }
+          if (sendOptions?.triggerTurn && triggerEventVariant !== "valid") {
+            if (triggerEventVariant === "stale") {
+              startedMessage.details = { piccCheckpointResume: {} };
+            } else if (triggerEventVariant === "wrong-content") {
+              startedMessage.content = "wrong continuation";
+            } else if (triggerEventVariant === "wrong-role") {
+              startedMessage.role = "user";
+            } else if (triggerEventVariant === "wrong-type") {
+              startedMessage.customType = "wrong-trigger";
+            } else if (triggerEventVariant === "unscrubbable") {
+              Object.defineProperty(startedMessage.details, "piccCheckpointResume", {
+                value: startedMessage.details.piccCheckpointResume,
+                enumerable: true,
+                configurable: false,
+              });
+            }
+          }
+          if (sendOptions?.triggerTurn && triggerEventVariant === "stale") {
+            await emit("message_start", { type: "message_start", message: startedMessage }, ctx);
+          } else if (!retainedReplay && triggerEventVariant !== "missing") {
+            await emit("message_start", { type: "message_start", message: startedMessage }, ctx);
+            if (retainedReplay && replayEventVariant === "duplicate") {
+              startedMessage.details.piccCheckpointInput = originalReplayEnvelope;
+              await emit("message_start", { type: "message_start", message: startedMessage }, ctx);
+            }
+            if (sendOptions?.triggerTurn && triggerEventVariant === "duplicate") {
+              startedMessage.details.piccCheckpointResume = originalTriggerEnvelope;
+              await emit("message_start", { type: "message_start", message: startedMessage }, ctx);
+            }
+          } else if (retainedReplay) {
+            pendingReplayStarts.push({
+              message: startedMessage,
+              ctx,
+              delivery: sendOptions?.deliverAs === "followUp" ? "followUp" : "steer",
+              replayEnvelope: originalReplayEnvelope,
+            });
+          }
+          if (sendOptions?.triggerTurn) {
             resumeCalls += 1;
             await Promise.resolve();
             if (recoveryReject === "before" && !rejectedRecovery) {
@@ -362,19 +540,47 @@ function checkpointSdk({
           } else {
             if (message.customType === "picc-retained-parent-input") {
               events.push("queued-replay");
+              markReplaySendStarted();
+              if (stallCancellationPhase === "non-trigger") await never;
               if (replayReject) throw new Error("retained replay rejected");
             }
-            customMessages.push({ customType: message.customType, content: message.content });
+            customMessages.push({
+              customType: message.customType,
+              content: message.content,
+              ...(message.details === undefined ? {} : { details: message.details }),
+            });
             messages.push({ role: "custom", content: message.content });
           }
         },
-        steer() {},
-        followUp() {},
+        clearQueue() {
+          events.push("clear-queue");
+          if (purgeThrows) throw new Error("queue purge failed");
+          const removed = pendingReplayStarts.splice(0);
+          clearedReplayStarts.push(...removed.map(({ message, ctx: eventCtx }) => ({ message, ctx: eventCtx })));
+          intervalHooks?.afterPurge?.();
+          return {
+            steering: removed.filter(({ delivery }) => delivery === "steer").map(({ message }) => message),
+            followUp: removed.filter(({ delivery }) => delivery === "followUp").map(({ message }) => message),
+          };
+        },
+        steer(text: string) {
+          events.push("direct-steer");
+          messages.push({ role: "user", content: text });
+        },
+        followUp(text: string) {
+          events.push("direct-follow-up");
+          messages.push({ role: "user", content: text });
+        },
         abort() {
+          events.push("abort");
           aborted = true;
           abortCalls += 1;
           releaseProviderBlock();
+          if (stallCancellationPhase !== "run") releaseResumedRun();
+          if (stallCancellationPhase !== "trigger") releaseTriggerStart();
           if (resumed) activeResumeAborted = true;
+          intervalHooks?.afterAbort?.();
+          if (stallCancellationPhase === "abort") return never;
         },
         abortCompaction() {
           compactionAbortCalls += 1;
@@ -382,7 +588,11 @@ function checkpointSdk({
           markCompactionAbortObserved();
           if (!gateProactiveCompact) releaseRecoveryCompact();
         },
-        dispose() { disposed = true; },
+        dispose() {
+          events.push("cleanup");
+          onCleanup?.();
+          disposed = true;
+        },
       };
       void resumed;
       return { session };
@@ -403,6 +613,10 @@ function checkpointSdk({
     resumeCalls: () => resumeCalls,
     events: () => [...events],
     customMessages: () => [...customMessages],
+    physicalSends: () => physicalSends.map((send) => ({
+      ...send,
+      ...(send.options ? { options: { ...send.options } } : {}),
+    })),
     guardResults: () => [...guardResults],
     providerRegistrations: () => [...providerRegistrations],
     providerAttempts: () => providerAttempts,
@@ -417,6 +631,41 @@ function checkpointSdk({
     },
     providerBoundaryBlocked: () => providerBoundaryBlocked,
     releaseProviderBlock: () => releaseProviderBlock(),
+    resumedRunStarted: () => resumedRunStarted,
+    releaseResumedRun: () => releaseResumedRun(),
+    triggerInvocationStarted: () => triggerInvocationStarted,
+    releaseTriggerStart: () => releaseTriggerStart(),
+    injectSyntheticInvalidReplayCallbacks: async () => {
+      const callbacks = clearedReplayStarts.splice(0);
+      for (const entry of callbacks) {
+        events.push("synthetic-invalid-replay-callback");
+        await emitPendingReplay?.(entry.message, entry.ctx);
+      }
+    },
+    replaySendStarted: () => replaySendStarted,
+  };
+}
+
+function childManualClock(): HostDeadlineClock & {
+  schedules(): number;
+  pending(): boolean;
+  expire(): void;
+} {
+  let callback: (() => void) | undefined;
+  let count = 0;
+  return {
+    schedule(_delay, expired) {
+      count += 1;
+      callback = expired;
+      return { clear: () => { callback = undefined; } };
+    },
+    schedules: () => count,
+    pending: () => callback !== undefined,
+    expire() {
+      const current = callback;
+      callback = undefined;
+      current?.();
+    },
   };
 }
 
@@ -428,8 +677,22 @@ function runtimeFor(
   customHookRunner?: { fire(eventName: string): Promise<any> },
   capturedStopFactories?: Array<() => () => boolean>,
   enableResume = false,
-  prepareMcpFor?: SubagentRuntimeDeps["prepareMcpFor"],
+  cancellationRecoveryOrPrepareMcp: boolean | SubagentRuntimeDeps["prepareMcpFor"] = false,
+  cancellationTestOptions?: {
+    deadlinePolicy?: HostDeadlinePolicy;
+    onTriggerScheduledForTest?: () => void;
+    onCanonicalStoreForTest?: (stored: boolean, controller: MidRunCompactionController) => void;
+    onControllerProgressForTest?: (
+      event: CheckpointProgress,
+      controller: MidRunCompactionController,
+    ) => void;
+    worktrees?: any;
+  },
 ) {
+  const enableCancellationRecovery = cancellationRecoveryOrPrepareMcp === true;
+  const prepareMcpFor = typeof cancellationRecoveryOrPrepareMcp === "function"
+    ? cancellationRecoveryOrPrepareMcp
+    : undefined;
   let postCompactAttempts = 0;
   const transcriptPath = path.join(process.cwd(), "package.json");
   const sdk = enableResume
@@ -444,6 +707,24 @@ function runtimeFor(
     proactiveCompactPercent: 90,
     allKnownToolNames: () => ["CheckpointTool"],
     subagentRegistry,
+    ...(cancellationTestOptions?.worktrees ? { worktrees: cancellationTestOptions.worktrees } : {}),
+    ...(enableCancellationRecovery && subagentRegistry
+      ? { compactionCancellationRecovery: {
+          registry: subagentRegistry,
+          ...(cancellationTestOptions?.deadlinePolicy
+            ? { deadlinePolicy: cancellationTestOptions.deadlinePolicy }
+            : {}),
+          ...(cancellationTestOptions?.onTriggerScheduledForTest
+            ? { onTriggerScheduledForTest: cancellationTestOptions.onTriggerScheduledForTest }
+            : {}),
+          ...(cancellationTestOptions?.onCanonicalStoreForTest
+            ? { onCanonicalStoreForTest: cancellationTestOptions.onCanonicalStoreForTest }
+            : {}),
+          ...(cancellationTestOptions?.onControllerProgressForTest
+            ? { onControllerProgressForTest: cancellationTestOptions.onControllerProgressForTest }
+            : {}),
+        } }
+      : {}),
     ...(prepareMcpFor === undefined ? {} : { prepareMcpFor }),
     hookRunner: customHookRunner ?? (failPostCompactAttempt === undefined ? undefined : {
       async fire(eventName: string) {
@@ -852,7 +1133,7 @@ describe("subagent mid-run compaction", () => {
     }
   });
 
-  it("persists a mixed parallel child batch before compact and replays queued parent input before provider release", async () => {
+  it("persists a mixed parallel child batch while omitted recovery keeps direct parent delivery", async () => {
     const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, mixedBatch: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
@@ -881,14 +1162,654 @@ describe("subagent mid-run compaction", () => {
       "tool-result:MalformedTool",
     ]));
     expect(events.indexOf("compact-started")).toBe(4);
-    expect(events.indexOf("queued-replay")).toBeGreaterThan(events.indexOf("compact-started"));
-    expect(events.indexOf("queued-replay")).toBeLessThan(events.indexOf("resumed-provider"));
+    expect(events.indexOf("direct-steer")).toBeGreaterThan(events.indexOf("compact-started"));
+    expect(events).not.toContain("queued-replay");
+    expect(events.indexOf("direct-steer")).toBeLessThan(events.indexOf("resumed-provider"));
+  });
+
+  it("keeps resumed-cancellation custody dormant when the internal option is omitted", async () => {
+    const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, cancelResumedRun: true });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, true, false);
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-888888888888",
+    });
+    await harness.recoveryCompactStarted();
+    await registry.get("agent-888888888888")!.session!.steer!("legacy steer");
+    await registry.get("agent-888888888888")!.session!.followUp!("legacy follow-up");
+    expect(harness.events()).toEqual(expect.arrayContaining(["direct-steer", "direct-follow-up"]));
+    expect(harness.physicalSends().filter(({ customType }) =>
+      customType === "picc-retained-parent-input")).toEqual([]);
+    harness.releaseRecoveryCompact();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    expect("checkpointPaused" in result).toBe(false);
+    expect(result.retainedInputReport).toBeUndefined();
+    expect(registry.get("agent-888888888888")?.retainedInputReport).toBeUndefined();
+    expect(registry.get("agent-888888888888")?.checkpointQuarantined).not.toBe(true);
+    expect(registry.get("agent-888888888888")?.state).toBe("settled");
+    expect(harness.customMessages().filter(({ customType }) =>
+      customType === "picc-checkpoint-resume")).toEqual([]);
+    expect(harness.events()).not.toContain("clear-queue");
+    expect(harness.abortCalls()).toBe(0);
+    expect(harness.disposed()).toBe(true);
+  });
+
+  it("separates accepted replay from consumption and reports equal ordered steer/follow-up custody", async () => {
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: true,
+      consumeRetainedReplay: false,
+    });
+    const registry = new SubagentRegistry();
+    const abort = new AbortController();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, true);
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-777777777777", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    const equalContent = "retain this exact parent message";
+    await (send.execute as Function)("send-retained", {
+      to: "agent-777777777777",
+      message: equalContent,
+    });
+    await registry.get("agent-777777777777")!.session!.followUp!(equalContent);
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    expect(result.retainedInputReport).toBeDefined();
+    expect(result.retainedInputReport!.occurrences.map(({ shadow }) => ({
+      delivery: shadow.delivery,
+      content: shadow.content,
+    }))).toEqual([
+      { delivery: "steer", content: equalContent },
+      { delivery: "followUp", content: equalContent },
+    ]);
+    expect(result.retainedInputReport!.guidance).toMatch(/files, tools, and external effects/iu);
+    expect(harness.events()).toContain("clear-queue");
+    expect(harness.physicalSends().filter(({ customType }) =>
+      customType === "picc-checkpoint-resume" || customType === "picc-retained-parent-input"))
+      .toEqual([
+        { customType: "picc-checkpoint-resume", options: { triggerTurn: true } },
+        { customType: "picc-retained-parent-input", options: { deliverAs: "steer" } },
+        { customType: "picc-retained-parent-input", options: { deliverAs: "followUp" } },
+      ]);
+    expect(harness.physicalSends().some(({ options }) =>
+      options?.deliverAs === "nextTurn" || Object.keys(options ?? {}).length === 0)).toBe(false);
+    const canonical = registry.get("agent-777777777777")!.retainedInputReport;
+    await harness.injectSyntheticInvalidReplayCallbacks();
+    expect(harness.events()).toContain("synthetic-invalid-replay-callback");
+    expect(registry.get("agent-777777777777")!.retainedInputReport).toBe(canonical);
+    expect(canonical!.occurrences).toHaveLength(2);
+    let presentations = 0;
+    expect(await Promise.all([
+      result.retainedInputReport!.claim(async () => { presentations += 1; return true; }),
+      result.retainedInputReport!.claim(async () => { presentations += 1; return true; }),
+    ])).toEqual([true, false]);
+    expect(presentations).toBe(1);
+    expect(harness.disposed()).toBe(true);
+  });
+
+  it.each([
+    { timing: "before SDK invocation", delayed: false },
+    { timing: "after invocation with delayed message_start", delayed: true },
+  ])("cancels $timing without inventing pre-start after invocation", async ({ delayed }) => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: delayed, delayTriggerStart: delayed,
+    });
+    const registry = new SubagentRegistry();
+    const abort = new AbortController();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      delayed ? undefined : { onTriggerScheduledForTest: () => abort.abort() },
+    );
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: delayed ? "agent-111111111111" : "agent-222222222222",
+      abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    if (delayed) {
+      await harness.triggerInvocationStarted();
+      abort.abort();
+    }
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    expect(result.retainedInputReport).toBeDefined();
+    if (delayed) {
+      expect(harness.events()).toContain("trigger-invoked");
+      expect(harness.events()).toContain("abort");
+      expect(harness.resumeCalls()).toBe(1);
+      expect(result.retainedInputReport!.guidance).toMatch(/continuation began/iu);
+    } else {
+      expect(harness.resumeCalls()).toBe(0);
+      expect(harness.events()).toContain("clear-queue");
+      expect(harness.events()).not.toContain("abort");
+      expect(result.retainedInputReport!.guidance).toMatch(/startup was prevented/iu);
+    }
+  });
+
+  it.each([
+    "missing",
+    "stale",
+    "duplicate",
+    "wrong-content",
+    "wrong-role",
+    "wrong-type",
+    "unscrubbable",
+  ] as const)("fails closed for synthetic %s continuation-trigger evidence", async (triggerEventVariant) => {
+    const clock = childManualClock();
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, triggerEventVariant,
+    });
+    const registry = new SubagentRegistry();
+    const abort = new AbortController();
+    const agentId = `agent-${(["missing", "stale", "duplicate", "wrong-content", "wrong-role", "wrong-type", "unscrubbable"].indexOf(triggerEventVariant) + 9).toString(16).repeat(12)}`;
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { deadlinePolicy: { clock, resumedJoinMs: 10 } },
+    );
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, agentId, abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.triggerInvocationStarted();
+    const requiresCancellation = triggerEventVariant === "missing";
+    if (requiresCancellation) {
+      abort.abort();
+      await waitUntil({ description: `${triggerEventVariant} evidence deadline`, predicate: () => clock.pending() });
+      clock.expire();
+    } else {
+      await waitUntil({
+        description: `${triggerEventVariant} evidence quarantine`,
+        predicate: () => registry.get(agentId)?.checkpointQuarantined === true,
+      });
+    }
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true, resumable: false });
+    expect(result.retainedInputReport).toBeUndefined();
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+    expect(harness.disposed()).toBe(false);
+    expect(harness.resumeCalls()).toBe(1);
+    expect(harness.events()).not.toContain("resumed-provider");
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+  });
+
+  it.each([
+    "stale",
+    "duplicate",
+    "wrong-content",
+    "wrong-role",
+    "wrong-type",
+    "unscrubbable",
+  ] as const)("fails closed for synthetic %s active-stream replay occurrence evidence", async (replayEventVariant) => {
+    const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, replayEventVariant });
+    const registry = new SubagentRegistry();
+    const agentId = `agent-${String(["stale", "duplicate", "wrong-content", "wrong-role", "wrong-type", "unscrubbable"].indexOf(replayEventVariant) + 1).repeat(12)}`;
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, true);
+    const dispatch = runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1, agentId });
+    await harness.recoveryCompactStarted();
+    const send = createSendMessageToolDefinition(runtime, {
+      registry, backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    await (send.execute as Function)("malformed-replay", { to: agentId, message: "same replay" });
+    harness.releaseRecoveryCompact();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true, resumable: false });
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+    expect(harness.events()).not.toContain("resumed-provider");
+    expect(harness.disposed()).toBe(false);
+  });
+
+  it.each(([
+    "duplicate-end",
+    "duplicate-settled",
+    "wrong-end",
+    "late-end",
+    "wrong-run",
+  ] as const).flatMap((terminalEvidenceVariant) => ([
+    { terminalEvidenceVariant, cancellation: "requested" as const },
+    { terminalEvidenceVariant, cancellation: "host-observed" as const },
+  ])))("quarantines synthetic $cancellation $terminalEvidenceVariant evidence exactly once", async ({
+    terminalEvidenceVariant,
+    cancellation,
+  }) => {
+    const requested = cancellation === "requested";
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: requested,
+      cancelResumedRun: !requested,
+      terminalEvidenceVariant,
+    });
+    let quarantines = 0;
+    class CountingQuarantineRegistry extends SubagentRegistry {
+      override quarantineCheckpoint(agentId: string): boolean {
+        const stored = super.quarantineCheckpoint(agentId);
+        if (stored) quarantines += 1;
+        return stored;
+      }
+    }
+    const registry = new CountingQuarantineRegistry();
+    const clock = childManualClock();
+    const abort = new AbortController();
+    const variant = ["duplicate-end", "duplicate-settled", "wrong-end", "late-end", "wrong-run"]
+      .indexOf(terminalEvidenceVariant);
+    const digit = (variant * 2 + (requested ? 1 : 2)).toString(16);
+    const agentId = `agent-${digit.repeat(12)}`;
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { deadlinePolicy: { clock, resumedJoinMs: 10 } },
+    );
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, agentId, abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    if (requested) {
+      await harness.resumedRunStarted();
+      abort.abort();
+    }
+    for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
+    if (!registry.get(agentId)?.checkpointQuarantined && clock.pending()) clock.expire();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true, resumable: false });
+    expect(result.retainedInputReport).toBeUndefined();
+    expect(registry.get(agentId)?.retainedInputReport).toBeUndefined();
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+    expect(quarantines).toBe(1);
+    expect(harness.events()).not.toContain("cleanup");
+    expect(harness.disposed()).toBe(false);
+    expect(harness.resumeCalls()).toBe(1);
+    expect(harness.abortCalls()).toBe(requested ? 1 : 0);
+  });
+
+  it.each([
+    "non-trigger",
+    "trigger",
+    "abort",
+    "run",
+    "final-settlement",
+    "evidence",
+  ] as const)("expires one shared deadline for a never-settling %s phase and keeps late callbacks inert", async (phase) => {
+    const clock = childManualClock();
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: phase !== "non-trigger" && phase !== "trigger",
+      stallCancellationPhase: phase,
+    });
+    const registry = new SubagentRegistry();
+    const abort = new AbortController();
+    const agentId = `agent-${String(["non-trigger", "trigger", "abort", "run", "final-settlement", "evidence"].indexOf(phase) + 3).repeat(12)}`;
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { deadlinePolicy: { clock, resumedJoinMs: 10 } },
+    );
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, agentId, abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    if (phase === "non-trigger") {
+      const send = createSendMessageToolDefinition(runtime, {
+        registry, backgroundTasks: new BackgroundTaskRegistry(),
+      });
+      await (send.execute as Function)("stall-replay", { to: agentId, message: "retained" });
+    }
+    harness.releaseRecoveryCompact();
+    if (phase === "non-trigger") await harness.replaySendStarted();
+    else if (phase === "trigger") await harness.triggerInvocationStarted();
+    else await harness.resumedRunStarted();
+    abort.abort();
+    if (phase === "run") {
+      const before = harness.customMessages().length;
+      const send = createSendMessageToolDefinition(runtime, {
+        registry, backgroundTasks: new BackgroundTaskRegistry(),
+      });
+      await expect((send.execute as Function)("during-cancel", {
+        to: agentId, message: "must not fall back",
+      })).rejects.toThrow(/message was not sent/iu);
+      expect(harness.customMessages()).toHaveLength(before);
+    }
+    await waitUntil({ description: `${phase} cancellation deadline`, predicate: () => clock.pending() });
+    expect(clock.schedules()).toBe(1);
+    clock.expire();
+
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true, resumable: false });
+    expect(result.retainedInputReport).toBeUndefined();
+    expect(registry.get(agentId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, state: "running",
+    });
+    expect(harness.disposed()).toBe(false);
+    expect(clock.schedules()).toBe(1);
+
+    harness.releaseTriggerStart();
+    harness.releaseResumedRun();
+    await harness.injectSyntheticInvalidReplayCallbacks();
+    await Promise.resolve();
+    expect(registry.get(agentId)?.checkpointQuarantined).toBe(true);
+    expect(harness.disposed()).toBe(false);
+    expect(clock.schedules()).toBe(1);
+  });
+
+  it.each([
+    { interval: "purge-to-abort", hook: "afterPurge" },
+    { interval: "abort-to-run", hook: "afterAbort" },
+    { interval: "terminal-evidence", hook: "afterAgentEnd" },
+    { interval: "settlement-to-handoff", hook: "afterAgentSettled" },
+  ] as const)("refuses input without fallback during $interval", async ({ hook }) => {
+    const registry = new SubagentRegistry();
+    const refusals: string[] = [];
+    const agentId = `agent-${String(["afterPurge", "afterAbort", "afterAgentEnd", "afterAgentSettled"].indexOf(hook) + 6).repeat(12)}`;
+    const attempt = () => {
+      try {
+        registry.get(agentId)?.session?.steer?.("interval input");
+      } catch (error) {
+        refusals.push(String((error as Error).message));
+      }
+    };
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: true,
+      intervalHooks: { [hook]: attempt },
+    });
+    const abort = new AbortController();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, true);
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, agentId, abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    const before = harness.customMessages().length;
+    abort.abort();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatch(/message was not sent/iu);
+    expect(result.retainedInputReport?.occurrences).toEqual([]);
+    expect(harness.customMessages()).toHaveLength(before);
+    expect(registry.get(agentId)?.checkpointQuarantined).not.toBe(true);
+  });
+
+  it("does not retry, replay, or release when provider/tool progress races cancellation", async () => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, resumedToolHook: true,
+    });
+    const registry = new SubagentRegistry();
+    let reportStores = 0;
+    class CountingRegistry extends SubagentRegistry {
+      override storeRetainedInputReport(agentId: string, report: any): boolean {
+        reportStores += 1;
+        return super.storeRetainedInputReport(agentId, report);
+      }
+    }
+    const counting = new CountingRegistry();
+    const abort = new AbortController();
+    const runtime = runtimeFor(harness, makeAgent(), counting, undefined, undefined, undefined, false, true);
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-121212121212", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    expect(harness.events()).toContain("resumed-tool-progress");
+    expect(harness.events()).not.toContain("resumed-provider");
+    expect(harness.compactCalls()).toBe(1);
+    expect(harness.resumeCalls()).toBe(1);
+    expect(harness.abortCalls()).toBe(1);
+    expect(reportStores).toBe(1);
+    expect(counting.get("agent-121212121212")?.retainedInputReport).toBe(result.retainedInputReport);
+    expect(harness.disposed()).toBe(true);
+    expect(registry.ids()).toEqual([]);
+  });
+
+  it("stores canonically while the controller still owns occurrences, then resolves before settlement and cleanup", async () => {
+    const order: string[] = [];
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: true,
+    });
+    const worktrees = {
+      async enter() {
+        return {
+          ok: true, worktreePath: process.cwd(), branch: "test", baseCommit: "deadbeef",
+          created: true, seededFiles: [], diagnostics: [],
+        };
+      },
+      async exit() {
+        order.push("cleanup");
+        return { ok: true, removed: false, orphaned: false, diagnostics: [] };
+      },
+    };
+    let controllerAtStore: MidRunCompactionController | undefined;
+    class OrderedRegistry extends SubagentRegistry {
+      override storeRetainedInputReport(agentId: string, report: any): boolean {
+        order.push("store");
+        return super.storeRetainedInputReport(agentId, report);
+      }
+      override markSettled(agentId: string, settled?: any): void {
+        expect(controllerAtStore?.queuedInputSnapshot()).toHaveLength(0);
+        order.push("settlement");
+        super.markSettled(agentId, settled);
+      }
+    }
+    const registry = new OrderedRegistry();
+    const runtime = runtimeFor(
+      harness, { ...makeAgent(), isolation: "worktree" }, registry,
+      undefined, undefined, undefined, false, true,
+      {
+        worktrees,
+        onCanonicalStoreForTest: (stored, controller) => {
+          expect(stored).toBe(true);
+          expect(controller.queuedInputSnapshot()).toHaveLength(1);
+          expect(controller.snapshot().phase).toBe("terminalizing");
+          controllerAtStore = controller;
+        },
+        onControllerProgressForTest: (event, controller) => {
+          if (event.category === "checkpoint-cancelled") {
+            expect(controller.queuedInputSnapshot()).toHaveLength(0);
+            order.push("resolution");
+          }
+        },
+      },
+    );
+    const abort = new AbortController();
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-666666666666", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    await registry.get("agent-666666666666")!.session!.steer!("retained for ordered storage");
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "aborted" });
+    const purge = harness.events().indexOf("clear-queue");
+    const physicalAbort = harness.events().indexOf("abort");
+    expect(purge).toBeGreaterThan(-1);
+    expect(physicalAbort).toBeGreaterThan(purge);
+    expect(result.retainedInputReport?.occurrences).toHaveLength(1);
+    expect(registry.get("agent-666666666666")?.retainedInputReport).toBe(result.retainedInputReport);
+    expect(registry.get("agent-666666666666")?.checkpointQuarantined).not.toBe(true);
+    expect(order).toEqual(["store", "resolution", "settlement", "cleanup"]);
+    expect(harness.disposed()).toBe(true);
+  });
+
+  it("keeps controller custody unresolved when canonical storage refuses a different report", async () => {
+    const refusalOrder: string[] = [];
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      gateResumedRun: true,
+      onCleanup: () => refusalOrder.push("cleanup"),
+    });
+    let controllerAtRefusal: MidRunCompactionController | undefined;
+    class RefusingRegistry extends SubagentRegistry {
+      override storeRetainedInputReport(agentId: string, report: any): boolean {
+        const different = createRetainedInputReport({
+          agentId,
+          sessionId: report.sessionId,
+          generation: report.generation,
+          stage: report.stage,
+          occurrences: [],
+          guidance: "Different canonical report retained by the refusal fixture.",
+        });
+        expect(super.storeRetainedInputReport(agentId, different)).toBe(true);
+        refusalOrder.push("store-refused");
+        return false;
+      }
+    }
+    const registry = new RefusingRegistry();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      {
+        onCanonicalStoreForTest: (stored, controller) => {
+          expect(stored).toBe(false);
+          expect(controller.queuedInputSnapshot()).toHaveLength(1);
+          expect(controller.snapshot().phase).toBe("terminalizing");
+          controllerAtRefusal = controller;
+        },
+        onControllerProgressForTest: (event) => {
+          if (event.category === "checkpoint-cancelled") refusalOrder.push("resolution");
+        },
+      },
+    );
+    const abort = new AbortController();
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-141414141414", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    await registry.get("agent-141414141414")!.session!.followUp!("must remain controller-owned");
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+
+    const result = await dispatch;
+    expect(result).toMatchObject({ checkpointPaused: true, retainedInputReport: { occurrences: [] } });
+    expect(controllerAtRefusal?.queuedInputSnapshot()).toHaveLength(1);
+    expect(registry.get("agent-141414141414")).toMatchObject({
+      state: "running", checkpointPaused: true, checkpointQuarantined: true,
+    });
+    expect(refusalOrder).toEqual(["store-refused"]);
+    expect(harness.events()).not.toContain("cleanup");
+    expect(harness.disposed()).toBe(false);
+  });
+
+  it("keeps quarantined worktree and cleanup ownership unreleased", async () => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, purgeThrows: true,
+    });
+    const registry = new SubagentRegistry();
+    let worktreeExits = 0;
+    const worktrees = {
+      async enter() {
+        return {
+          ok: true, worktreePath: process.cwd(), branch: "test", baseCommit: "deadbeef",
+          created: true, seededFiles: [], diagnostics: [],
+        };
+      },
+      async exit() {
+        worktreeExits += 1;
+        return { ok: true, removed: false, orphaned: false, diagnostics: [] };
+      },
+    };
+    const runtime = runtimeFor(
+      harness, { ...makeAgent(), isolation: "worktree" }, registry,
+      undefined, undefined, undefined, false, true, { worktrees },
+    );
+    const abort = new AbortController();
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-131313131313", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true });
+    expect(registry.get("agent-131313131313")?.worktreePath).toBe(process.cwd());
+    expect(registry.get("agent-131313131313")?.checkpointQuarantined).toBe(true);
+    expect(worktreeExits).toBe(0);
+    expect(harness.disposed()).toBe(false);
+    harness.releaseResumedRun();
+  });
+
+  it("quarantines purge ambiguity in the registry and forbids cleanup, recovery, and a second stop", async () => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, purgeThrows: true,
+    });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, true);
+    const abort = new AbortController();
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-555555555555", abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    abort.abort();
+
+    const result = await dispatch;
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true, resumable: false });
+    expect(registry.get("agent-555555555555")).toMatchObject({
+      state: "running", checkpointPaused: true, checkpointQuarantined: true, resumable: false,
+    });
+    expect(harness.events()).toContain("clear-queue");
+    expect(harness.events()).not.toContain("abort");
+    // `dispose` is the cleanup/worktree-release owner's spy: quarantine never acquires it.
+    expect(harness.disposed()).toBe(false);
+    await expect(runtime.stopCheckpoint("agent-555555555555")).rejects.toThrow(
+      /requested stop was not performed.*no canonical retained-input report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+    const send = createSendMessageToolDefinition(runtime, {
+      registry, backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    await expect((send.execute as Function)("quarantined-send", {
+      to: "agent-555555555555", message: "retry",
+    })).rejects.toThrow(
+      /requested message\/recovery was not performed.*no canonical retained-input report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+    const sessionsBeforeReplacement = harness.sessionCreations();
+    await expect(runtime.dispatch({
+      subagentType: "reviewer", prompt: "replacement", depth: 1,
+      agentId: "agent-555555555555",
+    })).rejects.toThrow(
+      /requested dispatch was not performed.*no canonical retained-input report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+    expect(harness.sessionCreations()).toBe(sessionsBeforeReplacement);
+    expect(registry.get("agent-555555555555")?.state).toBe("running");
+    harness.releaseResumedRun();
   });
 
   it("aborts and joins the child before publishing a retained-replay failure", async () => {
     const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, replayReject: true });
     const registry = new SubagentRegistry();
-    const runtime = runtimeFor(harness, makeAgent(), registry);
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, undefined, false, true);
     const dispatch = runtime.dispatch({
       subagentType: "reviewer", prompt: "review", depth: 1,
       agentId: "agent-666666666666",
@@ -1308,6 +2229,36 @@ describe("subagent mid-run compaction", () => {
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
   });
 
+  it("authenticates real pre-commit shutdown cleanup without persistence or quarantine", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+    );
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    let persistenceAttempts = 0;
+
+    const stopped = await runtime.stopAllRetainedSubagents({
+      persist: () => { persistenceAttempts += 1; return true; },
+    });
+
+    expect(stopped).toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(persistenceAttempts).toBe(0);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+    expect(harness.disposed()).toBe(true);
+    expect(registry.get(exhausted.agentId)).toMatchObject({
+      state: "settled",
+      checkpointPaused: false,
+      checkpointStopState: "confirmed",
+    });
+    expect(registry.get(exhausted.agentId)?.checkpointQuarantined).not.toBe(true);
+
+    await expect(runtime.stopAllRetainedSubagents({ persist: () => { persistenceAttempts += 1; return true; } }))
+      .resolves.toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(persistenceAttempts).toBe(0);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+  });
+
   it("revokes the original paused generation after TaskStop abandonment cleanup", async () => {
     const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
@@ -1367,6 +2318,141 @@ describe("subagent mid-run compaction", () => {
     expect(harness.resumeCalls()).toBe(0);
     expect(harness.disposed()).toBe(true);
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
+  });
+
+  it("TaskStop owns the active committed-summary resumed epoch before checkpointPaused publication", async () => {
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true, delayTriggerStart: true,
+    });
+    const registry = new SubagentRegistry();
+    const agentId = "agent-101010101010";
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { onCanonicalStoreForTest: (stored) => {
+        expect(stored).toBe(true);
+        expect(registry.checkpointStopEligible(agentId)).toBe(true);
+      } },
+    );
+    const tasks = new BackgroundTaskRegistry({ registry });
+    let fallbackAborts = 0;
+    const taskId = tasks.start(
+      "agent:reviewer",
+      runtime.dispatch({
+        subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId,
+      }),
+      () => { fallbackAborts += 1; },
+      agentId,
+      "reviewer",
+    );
+    const send = createSendMessageToolDefinition(runtime, { registry, backgroundTasks: tasks });
+    await harness.recoveryCompactStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    await (send.execute as Function)("before-stop", { to: agentId, message: "retain this exact input" });
+    harness.releaseRecoveryCompact();
+    await harness.triggerInvocationStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    harness.releaseTriggerStart();
+    await harness.resumedRunStarted();
+
+    expect(registry.checkpointStopEligible(agentId)).toBe(true);
+    expect(registry.get(agentId)?.checkpointPaused).not.toBe(true);
+    expect(tasks.get(taskId)?.checkpointPaused).not.toBe(true);
+    const stop = createTaskStopTool(tasks, registry);
+    const byTask = (stop.execute as Function)("stop-task", { task_id: taskId });
+    const byAgent = (stop.execute as Function)("stop-agent", { task_id: agentId });
+    expect(registry.get(agentId)?.checkpointStopState).toBe("stopping");
+    expect(tasks.get(taskId)).toMatchObject({ status: "running", checkpointStopState: "stopping" });
+    const sendsBeforeRefusal = harness.customMessages().length;
+    await expect((send.execute as Function)("after-stop", {
+      to: agentId, message: "must not reach the SDK",
+    })).rejects.toThrow(/settling cancellation.*message was not sent/isu);
+    expect(harness.customMessages()).toHaveLength(sendsBeforeRefusal);
+
+    const stops = Promise.all([byTask, byAgent]);
+    await settlement(stops, {
+      description: "active resumed TaskStop task/agent join",
+      describeObserved: () => JSON.stringify({
+        events: harness.events(),
+        agent: registry.get(agentId),
+        task: tasks.get(taskId),
+      }),
+    });
+    const [taskStopped, agentStopped] = await stops;
+    expect(taskStopped.details).toMatchObject({ status: "stopped", disposition: "confirmed", agentId });
+    expect(agentStopped.details).toMatchObject({ status: "stopped", disposition: "confirmed", agentId });
+    expect(fallbackAborts).toBe(0);
+    expect(harness.abortCalls()).toBe(1);
+    expect(harness.events().filter((event) => event === "cleanup")).toHaveLength(1);
+    expect(harness.disposed()).toBe(true);
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+    expect(tasks.get(taskId)).toMatchObject({
+      status: "stopped", checkpointStopDisposition: "confirmed", settlementDelivery: "collected",
+    });
+    const report = registry.get(agentId)?.retainedInputReport;
+    expect(report?.occurrences.map((occurrence) => occurrence.shadow.content)).toEqual(["retain this exact input"]);
+    const output = createTaskOutputTool(tasks);
+    const firstReport = await (output.execute as Function)("report", { task_id: agentId });
+    const repeatedReport = await (output.execute as Function)("report-again", { task_id: agentId });
+    expect(firstReport.details.reportId).toBe(report?.reportId);
+    expect(repeatedReport.content).toEqual(firstReport.content);
+  });
+
+  it("does not retain active stop eligibility after a normally finished resumed stream", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-303030303030";
+    const harness = checkpointSdk({
+      failures: 1,
+      gateRecoveryCompact: true,
+      intervalHooks: {
+        afterAgentEnd: () => expect(registry.checkpointStopEligible(agentId)).toBe(false),
+      },
+    });
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+    );
+    const result = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId,
+    });
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await expect(result).resolves.toMatchObject({ outcome: "completed" });
+    expect(registry.checkpointStopEligible(agentId)).toBe(false);
+  });
+
+  it("TaskStop quarantines an active resumed generation whose settlement cannot be confirmed", async () => {
+    const clock = childManualClock();
+    const harness = checkpointSdk({
+      failures: 1, gateRecoveryCompact: true, gateResumedRun: true,
+      stallCancellationPhase: "final-settlement",
+    });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(
+      harness, makeAgent(), registry, undefined, undefined, undefined, false, true,
+      { deadlinePolicy: { clock, resumedJoinMs: 10 } },
+    );
+    const tasks = new BackgroundTaskRegistry({ registry });
+    const agentId = "agent-202020202020";
+    const taskId = tasks.start(
+      "agent:reviewer",
+      runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1, background: true, agentId }),
+      undefined,
+      agentId,
+      "reviewer",
+    );
+    await harness.recoveryCompactStarted();
+    harness.releaseRecoveryCompact();
+    await harness.resumedRunStarted();
+    expect(registry.checkpointStopEligible(agentId)).toBe(true);
+
+    const stopping = tasks.stopAndWait(taskId);
+    expect(tasks.get(taskId)).toMatchObject({ status: "running", checkpointStopState: "stopping" });
+    await waitUntil({ description: "active TaskStop cancellation deadline", predicate: () => clock.pending() });
+    clock.expire();
+    await expect(stopping).resolves.toMatchObject({ disposition: "unconfirmed" });
+    expect(registry.get(agentId)).toMatchObject({ checkpointQuarantined: true, checkpointPaused: true });
+    expect(tasks.get(taskId)).toMatchObject({ status: "failed", checkpointQuarantined: true });
+    expect(harness.disposed()).toBe(false);
+    expect(clock.schedules()).toBe(1);
   });
 
   it("TaskStop by task id joins retained cleanup and leaves one stopped generation", async () => {

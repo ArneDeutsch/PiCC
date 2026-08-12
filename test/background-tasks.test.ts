@@ -7,11 +7,21 @@ import {
   buildSettlementNotice,
   createTaskOutputTool,
   createTaskStopTool,
+  scopedBackgroundTools,
   type BackgroundResultLike,
   type BackgroundTaskRecord,
 } from "../src/runtime/background-tasks.js";
-import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
-import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
+import {
+  SubagentRegistry,
+  type CheckpointStopAttemptIdentity,
+  type CheckpointStopTerminalEvidence,
+} from "../src/runtime/subagent-registry.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
+import {
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+  type PiSessionStats,
+} from "../src/runtime/subagents.js";
 import {
   RECORD_EXPAND_HINT,
   renderAgentResult,
@@ -348,6 +358,449 @@ describe("BackgroundTaskRegistry", () => {
     await registry.wait(id);
     expect(registry.stop(id)).toEqual({ found: true, alreadySettled: true, abortRequested: false });
     expect(registry.stop("task-99").found).toBe(false);
+  });
+});
+
+describe("opted-in retained background outcomes", () => {
+  const AGENT_A = "agent-111111111111";
+  const AGENT_B = "agent-222222222222";
+  const makeReport = (agentId: string, text = "retained text") => createRetainedInputReport({
+    agentId,
+    sessionId: `session:${agentId}`,
+    generation: 1,
+    stage: "resumed-cancellation",
+    occurrences: [{
+      id: 1,
+      generation: 1,
+      sessionId: `session:${agentId}`,
+      delivery: "steer",
+      content: text,
+    }],
+    guidance: "Inspect files, tools, and external effects before retrying.",
+  });
+  const registerPaused = (
+    registry: SubagentRegistry,
+    agentId: string,
+    parentAgentId?: string,
+    stopCheckpoint?: (attempt?: CheckpointStopAttemptIdentity) => Promise<void | CheckpointStopTerminalEvidence>,
+  ) => registry.register({
+    agentId,
+    agentName: "worker",
+    depth: parentAgentId ? 2 : 1,
+    parentAgentId,
+    cwd: "/repo",
+    resumable: true,
+    oneShot: false,
+    checkpointPaused: true,
+    session: { stopCheckpoint },
+  });
+
+  it("treats a settled stale task generation as settled without stopping the newer eligible dispatch", async () => {
+    const agents = new SubagentRegistry();
+    agents.register({
+      agentId: AGENT_A, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+    });
+    const cooperativeAbort = vi.fn();
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start(
+      "agent:worker",
+      Promise.resolve({
+        ok: true, outcome: "completed", finalMessage: "old", agentId: AGENT_A,
+      }),
+      cooperativeAbort,
+      AGENT_A,
+      "worker",
+    );
+    await tasks.wait(taskId);
+    agents.markSettled(AGENT_A, { outcome: "completed" });
+    agents.markResuming(AGENT_A);
+
+    const owner = {};
+    const checkpointStop = vi.fn(async () => undefined);
+    agents.register({
+      agentId: AGENT_A,
+      agentName: "worker",
+      depth: 1,
+      cwd: "/repo",
+      resumable: true,
+      oneShot: false,
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId: AGENT_A,
+          dispatchGeneration: 2,
+          checkpointGeneration: 1,
+          owner,
+        }),
+        stopCheckpoint: checkpointStop,
+      },
+    });
+
+    expect(agents.checkpointStopEligible(AGENT_A)).toBe(true);
+    await expect(tasks.stopAndWait(taskId)).resolves.toEqual({
+      found: true, alreadySettled: true, abortRequested: false,
+    });
+    expect(tasks.get(taskId)).toMatchObject({ status: "completed", dispatchGeneration: 1 });
+    expect(cooperativeAbort).not.toHaveBeenCalled();
+    expect(checkpointStop).not.toHaveBeenCalled();
+  });
+
+  it("delegates active agent-id stops only through the owning nested scope", async () => {
+    const agents = new SubagentRegistry();
+    const ownerId = "agent-aaaaaaaaaaab";
+    const foreignOwner = "agent-bbbbbbbbbbbc";
+    const stopCheckpoint = vi.fn(async (attempt?: CheckpointStopAttemptIdentity) => {
+      const report = makeReport(AGENT_A);
+      expect(agents.storeRetainedInputReport(AGENT_A, report)).toBe(true);
+      return { confirmed: true as const, attemptId: attempt!.attemptId, report };
+    });
+    const foreignStopCheckpoint = vi.fn(async () => undefined);
+    for (const [agentId, parentAgentId] of [[AGENT_A, ownerId], [AGENT_B, foreignOwner]] as const) {
+      const epochOwner = {};
+      agents.register({
+        agentId, agentName: "worker", depth: 2, parentAgentId, cwd: "/repo", resumable: true, oneShot: false,
+        session: {
+          checkpointStopEligibility: () => ({
+            agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+          }),
+          stopCheckpoint: agentId === AGENT_A ? stopCheckpoint : foreignStopCheckpoint,
+        },
+      });
+    }
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const tools = scopedBackgroundTools(tasks, ownerId, agents);
+    const stop = tools.taskStop as unknown as ToolLike;
+
+    await expect(stop.execute("owned", { task_id: AGENT_A })).resolves.toMatchObject({
+      details: { agentId: AGENT_A, disposition: "confirmed" },
+    });
+    await expect(stop.execute("foreign", { task_id: AGENT_B })).rejects.toThrow(/Unknown task_id/iu);
+    expect(stopCheckpoint).toHaveBeenCalledTimes(1);
+    expect(foreignStopCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("retrieves one canonical report repeatedly by authorized task or agent identity without claiming it", async () => {
+    const agents = new SubagentRegistry();
+    registerPaused(agents, AGENT_A, "agent-aaaaaaaaaaaa");
+    registerPaused(agents, AGENT_B, "agent-bbbbbbbbbbbb");
+    const reportA = makeReport(AGENT_A);
+    const reportB = makeReport(AGENT_B, "foreign retained");
+    expect(agents.storeRetainedInputReport(AGENT_A, reportA)).toBe(true);
+    expect(agents.storeRetainedInputReport(AGENT_B, reportB)).toBe(true);
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", Promise.resolve(result({
+      outcome: "aborted", agentId: AGENT_A, checkpointPaused: true,
+      retainedInputReport: reportA, error: "cancelled",
+    })), undefined, AGENT_A, "worker", "agent-aaaaaaaaaaaa");
+    await tasks.wait(taskId);
+    const notice = buildSettlementNotice(tasks.get(taskId)!);
+    expect(notice).toContain(`1 retained input occurrence(s)`);
+    expect(notice).toContain("stage resumed-cancellation");
+    expect(notice).toContain(`TaskOutput with task_id "${AGENT_A}"`);
+    expect(notice).toContain("does not consume them");
+
+    const own = createTaskOutputTool(tasks.scopedTo("agent-aaaaaaaaaaaa")) as unknown as ToolLike & {
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+    };
+    const byTask = await own.execute("task", { task_id: taskId });
+    const byAgent = await own.execute("agent", { task_id: AGENT_A });
+    const repeated = await own.execute("again", { task_id: AGENT_A });
+    expect(byTask.content[0]!.text).toMatch(/was aborted.*agent-111111111111/isu);
+    expect(byTask.content[0]!.text).toContain(`TaskOutput with task_id "${AGENT_A}"`);
+    expect(byTask.content[0]!.text).toContain("Reported input was not auto-replayed");
+    const collapsed = own.renderResult(byTask, { expanded: false, isPartial: false }, undefined, {
+      state: {}, args: { task_id: taskId }, isError: false,
+    }).render(160).join("\n");
+    expect(collapsed).toMatch(/aborted.*agent-111111111111.*1 retained input occurrence.*TaskOutput with task_id "agent-111111111111"/isu);
+    expect(collapsed).not.toContain("retained text");
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+    try {
+      const durable = own.renderResult(byTask, { expanded: false, isPartial: false }, undefined, {
+        state: {}, args: { task_id: taskId }, isError: false,
+      }).render(60).join("\n");
+      expect(durable).toMatch(/aborted.*agent-111111111111.*1 retained input occurrence.*TaskOutput\s+with task_id "agent-111111111111".*not auto-replayed.*existing files, tools, and external effects/isu);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+    expect(byTask.details.reportId).toBe(reportA.reportId);
+    expect(byTask.details.stage).toBe("resumed-cancellation");
+    expect(byAgent.details).not.toHaveProperty("status");
+    expect(byAgent.details).not.toHaveProperty("outcome");
+    expect(byAgent.details.reportId).toBe(reportA.reportId);
+    expect(byAgent.details.stage).toBe("resumed-cancellation");
+    expect(repeated.details.occurrences).toBe(reportA.occurrences);
+    expect(repeated.content).toEqual(byAgent.content);
+    await expect(own.execute("foreign", { task_id: AGENT_B })).rejects.toThrow(/Unknown task_id/iu);
+    expect(await reportA.claim(async () => true)).toBe(true);
+  });
+
+  it("keeps foreground report-only identities discoverable and omission source-compatible", async () => {
+    const agents = new SubagentRegistry();
+    registerPaused(agents, AGENT_A);
+    const report = makeReport(AGENT_A);
+    agents.storeRetainedInputReport(AGENT_A, report);
+    const opted = createTaskOutputTool(new BackgroundTaskRegistry({ registry: agents })) as unknown as ToolLike;
+    expect((await opted.execute("foreground", { task_id: AGENT_A })).details.reportId).toBe(report.reportId);
+    const legacy = createTaskOutputTool(new BackgroundTaskRegistry()) as unknown as ToolLike;
+    await expect(legacy.execute("legacy", { task_id: AGENT_A })).rejects.toThrow(/Unknown task_id/iu);
+  });
+
+  it("suppresses terminal stop until confirmed and makes simultaneous wait observe the provisional state", async () => {
+    const agents = new SubagentRegistry();
+    let release!: () => void;
+    let resolveTask!: (value: BackgroundResultLike) => void;
+    let stopCalls = 0;
+    const report = makeReport(AGENT_A);
+    registerPaused(agents, AGENT_A, undefined, async (attempt) => {
+      stopCalls++;
+      await new Promise<void>((resolve) => { release = resolve; });
+      agents.storeRetainedInputReport(AGENT_A, report);
+      agents.markSettled(AGENT_A, { outcome: "aborted" });
+      resolveTask(result({ outcome: "aborted", agentId: AGENT_A, retainedInputReport: report, error: "cancelled" }));
+      return { confirmed: true as const, attemptId: attempt!.attemptId, report };
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", new Promise((resolve) => { resolveTask = resolve; }), async () => {
+      throw new Error("task abort must not compete with registry checkpoint-stop ownership");
+    }, AGENT_A, "worker");
+    const output = createTaskOutputTool(tasks) as unknown as ToolLike;
+    const waiting = output.execute("wait", { task_id: taskId });
+    const stopping = tasks.stopAndWait(taskId);
+    const stopAllJoin = agents.stopCheckpoint(AGENT_A, "session");
+    const repeatedTaskStop = tasks.stopAndWait(taskId);
+    await vi.waitFor(() => expect(tasks.get(taskId)?.checkpointStopState).toBe("stopping"));
+    expect(tasks.get(taskId)?.status).toBe("running");
+    const provisional = await waiting;
+    expect(provisional.content[0]!.text).toMatch(/settling cancellation|stopping/iu);
+    expect(provisional.content[0]!.text).not.toMatch(/was aborted|marked stopped/iu);
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    release();
+    const [taskDisposition, sessionDisposition, repeatedDisposition] = await Promise.all([
+      stopping, stopAllJoin, repeatedTaskStop,
+    ]);
+    expect(taskDisposition).toMatchObject({ disposition: "confirmed" });
+    expect(sessionDisposition).toEqual({ disposition: "confirmed", report });
+    expect(repeatedDisposition).toEqual(taskDisposition);
+    expect(tasks.get(taskId)).toMatchObject({
+      status: "stopped", retainedInputReport: report, settlementDelivery: "collected",
+    });
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    expect(stopCalls).toBe(1);
+    await tasks.stopAndWait(taskId);
+    expect(stopCalls).toBe(1);
+  });
+
+  it("preserves ordinary-cleanup through stop/finalize/wait without a report or quarantine", async () => {
+    const agents = new SubagentRegistry();
+    registerPaused(agents, AGENT_A, undefined, async (attempt) => {
+      agents.markSettled(AGENT_A, { outcome: "aborted" });
+      return { confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup" };
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", Promise.resolve(result({
+      ok: false, outcome: "failed", agentId: AGENT_A, checkpointPaused: true, error: "pre-commit exhausted",
+    })), undefined, AGENT_A, "worker");
+    await tasks.wait(taskId);
+
+    await expect(tasks.stopAndWait(taskId, "panel")).resolves.toMatchObject({ disposition: "ordinary-cleanup" });
+    expect(tasks.get(taskId)).toMatchObject({
+      status: "stopped", checkpointPaused: false, checkpointStopDisposition: "ordinary-cleanup",
+    });
+    expect(tasks.get(taskId)).not.toHaveProperty("retainedInputReport");
+    expect(tasks.get(taskId)).not.toHaveProperty("checkpointQuarantined");
+    expect(tasks.stop(taskId, "session")).toMatchObject({ disposition: "ordinary-cleanup" });
+  });
+
+  it("keeps TaskOutput and actual TaskStop nonterminal when central evidence precedes linked settlement", async () => {
+    const agents = new SubagentRegistry();
+    let resolveTask!: (value: BackgroundResultLike) => void;
+    let releaseOwner!: () => void;
+    let ownerEntered = false;
+    const ownerGate = new Promise<void>((resolve) => { releaseOwner = resolve; });
+    const report = makeReport(AGENT_A);
+    registerPaused(agents, AGENT_A, undefined, async (attempt) => {
+      ownerEntered = true;
+      await ownerGate;
+      agents.storeRetainedInputReport(AGENT_A, report);
+      return { confirmed: true, attemptId: attempt!.attemptId, report };
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", new Promise((resolve) => { resolveTask = resolve; }), undefined, AGENT_A, "worker");
+    const output = createTaskOutputTool(tasks) as unknown as ToolLike;
+    const stop = createTaskStopTool(tasks, agents) as unknown as ToolLike;
+    let outputDone = false;
+    let stopDone = false;
+    const waiting = output.execute("wait-opposite", { task_id: taskId }).then((value) => { outputDone = true; return value; });
+    const stopping = stop.execute("stop-opposite", { task_id: taskId }).then((value) => { stopDone = true; return value; });
+    await vi.waitFor(() => expect(ownerEntered).toBe(true));
+    expect(tasks.get(taskId)).toMatchObject({ status: "running", checkpointStopState: "stopping" });
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    releaseOwner();
+    await vi.waitFor(() => expect(agents.get(AGENT_A)?.checkpointStopState).toBe("confirmed"));
+    const provisional = await waiting;
+    expect(outputDone).toBe(true);
+    expect(provisional.content[0]!.text).toMatch(/settling cancellation|stopping/iu);
+    expect(provisional.content[0]!.text).not.toMatch(/was aborted|stop confirmed/iu);
+    expect(stopDone).toBe(false);
+    expect(tasks.get(taskId)?.status).toBe("running");
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    resolveTask(result({ outcome: "aborted", agentId: AGENT_A, checkpointPaused: true, retainedInputReport: report, error: "cancelled" }));
+    const stopped = await stopping;
+    const shown = await output.execute("final-opposite", { task_id: taskId });
+    expect(shown.content[0]!.text).toMatch(/was aborted.*Retained input report.*TaskOutput with task_id "agent-111111111111"/isu);
+    expect(stopped.content[0]!.text).toMatch(/stop confirmed.*1 retained input occurrence.*TaskOutput with task_id "agent-111111111111"/isu);
+    expect(tasks.get(taskId)).toMatchObject({ status: "stopped", checkpointStopDisposition: "confirmed" });
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+  });
+
+  it("drives foreground agent-id TaskStop evidence and rejects void, missing, repeated, and stale evidence", async () => {
+    for (const mode of ["confirmed", "void", "missing", "stale"] as const) {
+      const agents = new SubagentRegistry();
+      const report = makeReport(AGENT_A, mode);
+      let calls = 0;
+      const stopCheckpoint = async (attempt?: CheckpointStopAttemptIdentity): Promise<void | CheckpointStopTerminalEvidence> => {
+        calls++;
+        if (mode === "void") return;
+        if (mode === "missing") return { confirmed: true } as never;
+        if (mode === "stale") return { confirmed: true, attemptId: attempt!.attemptId, report };
+        agents.storeRetainedInputReport(AGENT_A, report);
+        agents.markSettled(AGENT_A, { outcome: "aborted" });
+        return { confirmed: true, attemptId: attempt!.attemptId, report };
+      };
+      registerPaused(agents, AGENT_A, undefined, stopCheckpoint);
+      if (mode === "stale") {
+        agents.storeRetainedInputReport(AGENT_A, report);
+        agents.markSettled(AGENT_A, { outcome: "aborted" });
+        agents.markResuming(AGENT_A);
+        agents.register({
+          agentId: AGENT_A, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+          oneShot: false, checkpointPaused: true, session: { stopCheckpoint },
+        });
+      }
+      const tasks = new BackgroundTaskRegistry({ registry: agents });
+      const stop = createTaskStopTool(tasks, agents) as unknown as ToolLike;
+      if (mode === "confirmed") {
+        const first = await stop.execute("direct", { task_id: AGENT_A });
+        expect(first.content[0]!.text).toMatch(/stop confirmed.*1 retained input occurrence.*TaskOutput with task_id "agent-111111111111".*not auto-replayed.*existing effects/isu);
+        expect(first.content[0]!.text).not.toContain("0 retained");
+        const repeated = await stop.execute("direct-repeat", { task_id: AGENT_A });
+        expect(repeated.content).toEqual(first.content);
+      } else {
+        await expect(stop.execute(`direct-${mode}`, { task_id: AGENT_A })).rejects.toThrow(
+          /unconfirmed host work.*not reported stopped or aborted.*Do not retry in this process.*fresh process and session.*transcript.*worktree.*effects/isu,
+        );
+        await expect(stop.execute(`direct-${mode}-repeat`, { task_id: AGENT_A })).rejects.toThrow(/no second stop.*Do not retry in this process/isu);
+      }
+      expect(calls).toBe(1);
+    }
+  });
+
+  it("confirmed retained model TaskStop remains terminal to SendMessage while panel permanence refuses", async () => {
+    const agents = new SubagentRegistry();
+    const report = makeReport(AGENT_A);
+    agents.register({
+      agentId: AGENT_A, agentName: "worker", depth: 1, cwd: process.cwd(),
+      transcriptPath: "/sessions/agent.jsonl", resumable: true, oneShot: false, checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        agents.storeRetainedInputReport(AGENT_A, report);
+        agents.markSettled(AGENT_A, { outcome: "aborted" });
+        return { confirmed: true, attemptId: attempt!.attemptId, report };
+      } },
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const stop = createTaskStopTool(tasks, agents) as unknown as ToolLike;
+    const stopped = await stop.execute("model-stop", { task_id: AGENT_A });
+    expect(stopped.content[0]!.text).toContain(`TaskOutput with task_id "${AGENT_A}"`);
+    const runtime = {
+      dispatch: async () => result({ agentId: AGENT_A, finalMessage: "resumed" }),
+    };
+    const send = createSendMessageToolDefinition(runtime as never, {
+      registry: agents, backgroundTasks: tasks,
+    }) as unknown as ToolLike;
+    await expect(send.execute("resume", { to: AGENT_A, message: "retry deliberately" }))
+      .rejects.toThrow(/not resumable|cannot be resumed/iu);
+    expect(agents.get(AGENT_A)).toMatchObject({ retainedInputReport: report, resumable: false });
+
+    const panelAgent = "agent-333333333333";
+    agents.register({
+      agentId: panelAgent, agentName: "worker", depth: 1, cwd: process.cwd(),
+      transcriptPath: "/sessions/panel.jsonl", resumable: true, oneShot: false,
+    });
+    const panelReport = makeReport(panelAgent);
+    agents.storeRetainedInputReport(panelAgent, panelReport);
+    agents.markSettled(panelAgent, { outcome: "aborted" });
+    agents.markUserStopped(panelAgent);
+    await expect(send.execute("panel", { to: panelAgent, message: "resume" })).rejects.toThrow(
+      /stopped by the user.*not auto-replayed.*TaskOutput with task_id "agent-333333333333"/isu,
+    );
+  });
+
+  it("rejects void and stale prior-report stop evidence without a second physical stop", async () => {
+    for (const mode of ["void", "stale"] as const) {
+      const agents = new SubagentRegistry();
+      const stale = makeReport(AGENT_A, "prior generation");
+      let calls = 0;
+      const stopCheckpoint = async (attempt?: CheckpointStopAttemptIdentity): Promise<void | CheckpointStopTerminalEvidence> => {
+        calls++;
+        if (mode === "stale") {
+          return { confirmed: true, attemptId: attempt!.attemptId, report: stale };
+        }
+      };
+      registerPaused(agents, AGENT_A, undefined, stopCheckpoint);
+      if (mode === "stale") {
+        agents.storeRetainedInputReport(AGENT_A, stale);
+        agents.markSettled(AGENT_A, { outcome: "aborted" });
+        agents.markResuming(AGENT_A);
+        agents.register({
+          agentId: AGENT_A, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+          oneShot: false, checkpointPaused: true, session: { stopCheckpoint },
+        });
+      }
+      const first = await agents.stopCheckpoint(AGENT_A, "task-stop");
+      const repeated = await agents.stopCheckpoint(AGENT_A, "session");
+      expect(first.disposition).toBe("unconfirmed");
+      expect(repeated).toEqual(first);
+      expect(agents.get(AGENT_A)).toMatchObject({ checkpointQuarantined: true, checkpointPaused: true });
+      expect(calls).toBe(1);
+    }
+  });
+
+  it("lets quarantine preserve live authority, suppress cleanup/publication, and never stop twice", async () => {
+    const agents = new SubagentRegistry();
+    let stopCalls = 0;
+    const cleanup = vi.fn(async () => {});
+    const session = { stopCheckpoint: async () => {
+      stopCalls++;
+      agents.quarantineCheckpoint(AGENT_A);
+    } };
+    agents.register({
+      agentId: AGENT_A, agentName: "worker", depth: 1, cwd: "/repo/worktree",
+      worktreePath: "/repo/worktree", transcriptPath: "/sessions/agent-111111111111.jsonl",
+      resumable: true, oneShot: false, checkpointPaused: true, session,
+    });
+    const tasks = new BackgroundTaskRegistry({ registry: agents });
+    const taskId = tasks.start("agent:worker", Promise.resolve(result({
+      outcome: "failed", agentId: AGENT_A, checkpointPaused: true, error: "paused",
+    })), cleanup, AGENT_A, "worker");
+    await tasks.wait(taskId);
+    await expect(tasks.stopAndWait(taskId)).resolves.toMatchObject({ disposition: "unconfirmed" });
+    expect(tasks.get(taskId)).toMatchObject({ status: "failed", checkpointQuarantined: true });
+    expect(agents.get(AGENT_A)).toMatchObject({
+      checkpointPaused: true, checkpointQuarantined: true, session,
+      cwd: "/repo/worktree", worktreePath: "/repo/worktree",
+      transcriptPath: "/sessions/agent-111111111111.jsonl",
+    });
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(tasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    const output = createTaskOutputTool(tasks) as unknown as ToolLike;
+    const shown = await output.execute("unconfirmed", { task_id: taskId });
+    expect(shown.content[0]!.text).toMatch(/unconfirmed host work.*No canonical.*fresh process and session.*transcript.*worktree.*external/isu);
+    await tasks.stopAndWait(taskId);
+    expect(stopCalls).toBe(1);
+    expect(cleanup).not.toHaveBeenCalled();
   });
 });
 
@@ -3117,9 +3570,9 @@ describe("BackgroundTaskRegistry.scopedTo — per-dispatcher isolation", () => {
     }
   };
 
-  /** The "Known background tasks:" list segment of an unknown-id error. */
+  /** The "Known task/report ids:" list segment of an unknown-id error. */
   const knownSegment = (msg: string): string => {
-    const i = msg.indexOf("Known background tasks:");
+    const i = msg.indexOf("Known task/report ids:");
     return i >= 0 ? msg.slice(i) : msg;
   };
 

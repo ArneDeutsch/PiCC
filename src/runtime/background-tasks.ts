@@ -24,7 +24,15 @@ import {
   formatBackgroundTaskIdentity,
   normalizeBackgroundTaskId,
 } from "./background-identity.js";
-import type { SubagentAdmission } from "./subagent-registry.js";
+import {
+  formatRetainedInputReport,
+  retainedInputCount,
+  taskOutputAgentLocator,
+  type CheckpointStopDisposition,
+  type SubagentAdmission,
+  type SubagentRegistry,
+} from "./subagent-registry.js";
+import type { RetainedInputReport } from "./retained-input-report.js";
 import {
   formatSubagentRecoveryGuidance,
   type SubagentRecoveryDisposition,
@@ -111,6 +119,8 @@ export interface BackgroundResultLike {
   usage?: UsageLike;
   /** A compaction-exhausted child retains its live session until recovery or stop. */
   checkpointPaused?: boolean;
+  /** Canonical report already stored by the dispatch registry before publication. */
+  retainedInputReport?: RetainedInputReport;
   /** State-aware recovery advice for an ordinary transient-category terminal failure. */
   recoveryDisposition?: SubagentRecoveryDisposition;
   /** The single error channel: present iff `outcome !== "completed"`. */
@@ -149,6 +159,8 @@ export interface BackgroundTaskRecord {
    * (the Agent tool does), confirmed/overwritten from the settled result.
    */
   agentId?: string;
+  /** Exact dispatch-registry generation linked when this task record starts. */
+  readonly dispatchGeneration?: number;
   /** On-disk JSONL transcript of the subagent's session, when persisted. */
   transcriptPath?: string;
   /** True when the settled agent can be continued under `agentId`. */
@@ -204,11 +216,19 @@ export interface BackgroundTaskRecord {
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
   /** Cooperative abort hook (wired to the dispatch's AbortController), if any. */
-  abort?: () => void | Promise<void>;
+  abort?: () => unknown | Promise<unknown>;
   /** Settlement of the single claimed cooperative abort invocation. */
   abortSettlement?: Promise<void>;
   /** Failed result retained a live compaction-paused child. */
   checkpointPaused?: boolean;
+  /** Opted-in nonterminal stop state; `status` remains nonterminal until disposition. */
+  checkpointStopState?: "stopping" | "settling-cancellation";
+  /** Canonical report identity mirrored before any terminal publication. */
+  retainedInputReport?: RetainedInputReport;
+  /** Unconfirmed host quiescence overrides any provisional/terminal task state. */
+  checkpointQuarantined?: boolean;
+  /** Exact registry-owned checkpoint-stop settlement for repeatable TaskStop reads. */
+  checkpointStopDisposition?: "ordinary-cleanup" | "confirmed" | "unconfirmed";
   /** Settled dispatch-result disposition, frozen generation-locally. */
   recoveryDisposition?: SubagentRecoveryDisposition;
   /**
@@ -220,30 +240,46 @@ export interface BackgroundTaskRecord {
   settlementDelivery?: "pending" | "collected" | "notified";
 }
 
+export interface BackgroundStopResult {
+  found: boolean;
+  alreadySettled: boolean;
+  abortRequested: boolean;
+  disposition?: StopDisposition;
+}
+
 /**
- * The minimal registry surface the TaskOutput/TaskStop tools consume: exactly
- * the six members both factories and {@link unknownIdError} call. The
- * concrete {@link BackgroundTaskRegistry} satisfies it structurally, so the
- * coordinator keeps passing the full registry unchanged; a subagent instead
- * receives `registry.scopedTo(ownerId)` — a live-delegating, owner-filtered view
- * with the identical shape. Widening the tools to this interface makes the scope
- * the *only* seam: nothing in a tool body can reach a task the view hides.
+ * Owner-filterable registry surface consumed by TaskOutput and TaskStop. The
+ * coordinator passes the concrete registry; subagents receive the structurally
+ * identical live view from `registry.scopedTo(ownerId)`, keeping task and report
+ * authorization at this single seam.
  */
 export interface BackgroundTaskView {
   get(id: string): BackgroundTaskRecord | undefined;
   ids(): string[];
   wait(id: string): Promise<BackgroundTaskRecord | undefined>;
-  stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean };
+  stop(id: string, source?: "task-stop" | "panel" | "session"): BackgroundStopResult;
   /** Stop and join both dispatch settlement and any retained checkpoint cleanup. */
-  stopAndWait?(id: string): Promise<{ found: boolean; alreadySettled: boolean; abortRequested: boolean }>;
+  stopAndWait?(id: string, source?: "task-stop" | "panel" | "session"): Promise<BackgroundStopResult>;
   /** Atomically stop the newest owned task linked to an agent identity. */
-  stopAgentAndWait?(agentId: string): Promise<{ record?: BackgroundTaskRecord; found: boolean; alreadySettled: boolean; abortRequested: boolean }>;
+  stopAgentAndWait?(agentId: string, source?: "task-stop" | "panel" | "session"): Promise<BackgroundStopResult & { record?: BackgroundTaskRecord }>;
   /** Mark a terminal task result as collected through TaskOutput. */
   markCollected(id: string): boolean;
   subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void;
   /** Subscribe only to this owned task's presentation-relevant mutations. */
   subscribe?(id: string, listener: () => void): () => void;
+  /** Acquire or join the canonical registry-owned checkpoint stop. */
+  stopCheckpoint?(agentId: string, source: "task-stop" | "panel" | "session"): Promise<CheckpointStopDisposition> | undefined;
+  /** Opted-in report-only lookup by stable agent identity. */
+  retainedReport?(agentId: string): RetainedInputReport | undefined;
+  /** Authorized report locators for helpful unknown-id guidance. */
+  retainedReportIds?(): string[];
 }
+
+export interface RetainedOutcomeRegistryOptions {
+  registry: SubagentRegistry;
+}
+
+export type StopDisposition = "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed";
 
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
@@ -275,6 +311,8 @@ export class BackgroundTaskRegistry {
   >();
   private readonly changeListeners = new Set<() => void>();
   private readonly taskChangeListeners = new Map<string, Set<() => void>>();
+
+  constructor(private readonly retainedOutcomes?: RetainedOutcomeRegistryOptions) {}
 
   /** Global mutation listener for assembled presentation surfaces. */
   onChange(listener: () => void): () => void {
@@ -374,7 +412,7 @@ export class BackgroundTaskRegistry {
   start(
     label: string,
     promise: Promise<BackgroundResultLike>,
-    abort?: () => void | Promise<void>,
+    abort?: () => unknown | Promise<unknown>,
     agentId?: string,
     agentType?: string,
     owner?: string,
@@ -393,6 +431,9 @@ export class BackgroundTaskRegistry {
       status: "running",
       admission,
       agentId,
+      dispatchGeneration: agentId
+        ? this.retainedOutcomes?.registry.get(agentId)?.dispatchGeneration
+        : undefined,
       agentType:
         agentType === undefined
           ? undefined
@@ -428,6 +469,23 @@ export class BackgroundTaskRegistry {
         record.truncated = result.truncated === true;
         record.checkpointPaused = result.checkpointPaused === true;
         record.recoveryDisposition = result.recoveryDisposition;
+        const custody = record.agentId
+          ? this.retainedOutcomes?.registry.get(record.agentId)
+          : undefined;
+        if (result.retainedInputReport && custody?.retainedInputReport === result.retainedInputReport) {
+          record.retainedInputReport = result.retainedInputReport;
+        } else if (custody?.retainedInputReport) {
+          record.retainedInputReport = custody.retainedInputReport;
+        }
+        if (custody?.checkpointQuarantined) {
+          record.checkpointQuarantined = true;
+          record.checkpointStopState = undefined;
+          record.status = "failed";
+          record.checkpointPaused = true;
+          record.error = quarantineTaskGuidance(record);
+          this.notifyChange(id);
+          return;
+        }
         // Usage mirror: recorded before the stopped-branch early return
         // below, so an aborted task still reports what its partial run cost.
         record.usage = result.usage;
@@ -435,6 +493,14 @@ export class BackgroundTaskRegistry {
           if (!record.diagnostics.some((current) => current.severity === diagnostic.severity && current.message === diagnostic.message)) {
             record.diagnostics.push(diagnostic);
           }
+        }
+        if (record.checkpointStopState) {
+          // The stop owner publishes confirmed/unconfirmed after its exact adapter join.
+          if (record.retainedInputReport) {
+            record.checkpointStopState = "settling-cancellation";
+          }
+          this.notifyChange(id);
+          return;
         }
         if (record.status === "stopped") {
           // TaskStop contract: a stopped task's result is discarded.
@@ -463,7 +529,9 @@ export class BackgroundTaskRegistry {
       },
       (err) => {
         record.settledAt ??= Date.now();
-        if (record.status !== "stopped") {
+        if (record.checkpointStopState) {
+          // A rejecting dispatch is still not cancellation disposition evidence.
+        } else if (record.status !== "stopped") {
           record.status = "failed";
           record.error = capErrorText(err instanceof Error ? err.message : String(err));
         }
@@ -597,6 +665,7 @@ export class BackgroundTaskRegistry {
       selected.add(agentId);
       if (
         task.status === "running" ||
+        task.checkpointStopState !== undefined ||
         (task.settlementDelivery ?? "pending") !== "pending"
       ) continue;
 
@@ -607,6 +676,7 @@ export class BackgroundTaskRegistry {
       const isValid = (): boolean =>
         (task.settlementDelivery ?? "pending") === "pending" &&
         task.status !== "running" &&
+        task.checkpointStopState === undefined &&
         this.newestTaskByAgent.get(agentId) === task &&
         (fallback || isArmed(agentId));
       notices.push({
@@ -654,31 +724,70 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Best-effort stop: a running task is marked stopped (result discarded on
-   * completion) and its abort hook — when the dispatch wired one — is invoked.
+   * Best-effort stop: an ordinary running task is marked stopped, its result is
+   * discarded, and its abort hook is invoked when available. A tracked
+   * checkpoint remains nonterminal and joins registry-owned settlement.
    */
-  stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
+  stop(
+    id: string,
+    source: "task-stop" | "panel" | "session" = "task-stop",
+  ): BackgroundStopResult {
     const task = this.tasks.get(id);
     if (!task) return { found: false, alreadySettled: false, abortRequested: false };
+    if (task.checkpointStopDisposition) {
+      return { found: true, alreadySettled: false, abortRequested: true, disposition: task.checkpointStopDisposition };
+    }
+    if (task.checkpointQuarantined) {
+      return { found: true, alreadySettled: false, abortRequested: false, disposition: "unconfirmed" };
+    }
+    const custody = task.agentId ? this.retainedOutcomes?.registry.get(task.agentId) : undefined;
+    const currentGeneration = custody?.dispatchGeneration ?? 1;
+    if (custody && task.dispatchGeneration !== undefined && task.dispatchGeneration !== currentGeneration) {
+      return { found: true, alreadySettled: true, abortRequested: false };
+    }
+    const linkedGeneration = !custody || task.dispatchGeneration === undefined ||
+      task.dispatchGeneration === currentGeneration;
+    const trackedCheckpoint = !!custody && linkedGeneration &&
+      this.retainedOutcomes?.registry.checkpointStopOwned(task.agentId!, task.dispatchGeneration) === true;
     // A stop already owns asynchronous cleanup. Until that exact promise
     // settles, every task-id/agent-id caller observes an in-progress stop rather
     // than the superficially terminal status written below.
     if (task.abortSettlement) {
-      return { found: true, alreadySettled: false, abortRequested: true };
+      return {
+        found: true,
+        alreadySettled: false,
+        abortRequested: true,
+        ...(trackedCheckpoint ? { disposition: "provisional" as const } : {}),
+      };
     }
     if (task.status !== "running" && !task.checkpointPaused) {
       return { found: true, alreadySettled: true, abortRequested: false };
     }
-    task.status = "stopped";
-    task.checkpointPaused = false;
+    if (trackedCheckpoint) {
+      task.settlementDelivery = "collected";
+      task.checkpointStopState = custody?.retainedInputReport ? "settling-cancellation" : "stopping";
+      const ownerSettlement = this.retainedOutcomes!.registry.stopCheckpoint(task.agentId!, source);
+      // The central owner and linked background generation are independent joins.
+      // Neither ordering may publish a terminal task status before both settle.
+      const settlement = Promise.all([ownerSettlement, task.settled]).then(([outcome]) => {
+        this.finalizeCheckpointStop(task, outcome);
+      });
+      task.abortSettlement = settlement;
+      void settlement.finally(() => {
+        if (task.abortSettlement === settlement) task.abortSettlement = undefined;
+      }).catch(() => undefined);
+    } else {
+      task.status = "stopped";
+      task.checkpointPaused = false;
+    }
     // Duration display ends at the stop, not at the (possibly much later)
     // cooperative promise settlement.
     task.settledAt ??= Date.now();
-    let abortRequested = false;
+    let abortRequested = trackedCheckpoint;
     this.notifyChange(id);
-    if (task.abort) {
+    if (!trackedCheckpoint && task.abort) {
       try {
-        const claimed = Promise.resolve(task.abort()).catch(() => undefined);
+        const claimed = Promise.resolve(task.abort()).then(() => undefined, () => undefined);
         // Claim once before exposing settlement to an awaiting TaskStop. Keep
         // the marker authoritative until settlement, then remove only this
         // generation's claim so a later stop sees the genuinely settled state.
@@ -691,39 +800,89 @@ export class BackgroundTaskRegistry {
         // best-effort — a failing abort hook must not fail the stop
       }
     }
-    return { found: true, alreadySettled: false, abortRequested };
+    return {
+      found: true,
+      alreadySettled: false,
+      abortRequested,
+      ...(trackedCheckpoint ? { disposition: "provisional" as const } : {}),
+    };
   }
 
-  async stopAndWait(id: string): Promise<{ found: boolean; alreadySettled: boolean; abortRequested: boolean }> {
+  private finalizeCheckpointStop(
+    task: BackgroundTaskRecord,
+    outcome: CheckpointStopDisposition,
+  ): StopDisposition {
+    const custody = task.agentId ? this.retainedOutcomes?.registry.get(task.agentId) : undefined;
+    if (outcome.disposition === "unconfirmed" || custody?.checkpointQuarantined) {
+      if (outcome.report) task.retainedInputReport = outcome.report;
+      task.checkpointStopDisposition = "unconfirmed";
+      task.checkpointQuarantined = true;
+      task.checkpointStopState = undefined;
+      task.status = "failed";
+      task.checkpointPaused = true;
+      task.error = quarantineTaskGuidance(task);
+      this.notifyChange(task.id);
+      return "unconfirmed";
+    }
+    const report = outcome.report;
+    if (outcome.disposition === "ordinary-cleanup" ||
+        (outcome.disposition === "confirmed" && report && custody?.retainedInputReport === report)) {
+      if (report) task.retainedInputReport = report;
+      task.checkpointStopDisposition = outcome.disposition;
+      task.checkpointStopState = undefined;
+      task.status = "stopped";
+      task.checkpointPaused = false;
+      task.error = undefined;
+      this.notifyChange(task.id);
+      return outcome.disposition;
+    }
+    if (task.agentId && custody) this.retainedOutcomes?.registry.quarantineCheckpoint(task.agentId);
+    task.checkpointQuarantined = true;
+    task.checkpointStopState = undefined;
+    task.status = "failed";
+    task.checkpointPaused = true;
+    task.error = quarantineTaskGuidance(task);
+    this.notifyChange(task.id);
+    return "unconfirmed";
+  }
+
+  async stopAndWait(
+    id: string,
+    source: "task-stop" | "panel" | "session" = "task-stop",
+  ): Promise<BackgroundStopResult> {
     const task = this.tasks.get(id);
     const pendingStop = task?.abortSettlement;
     const joinRetainedCheckpoint = task?.checkpointPaused === true;
-    const result = this.stop(id);
+    const result = this.stop(id, source);
     const abortSettlement = pendingStop ?? task?.abortSettlement;
     // Ordinary TaskStop remains a cooperative request (the underlying task may
     // ignore abort indefinitely). A checkpoint-paused record is different: its
     // dispatch already settled and the abort callback owns finite retained
     // cleanup, which TaskStop must join before reporting success.
-    if (joinRetainedCheckpoint || pendingStop) await abortSettlement;
+    if (joinRetainedCheckpoint || pendingStop || result.disposition === "provisional") {
+      await abortSettlement;
+    }
     // Ordinary running tasks may ignore cooperative abort indefinitely. Only a
-    // checkpoint-paused task has already settled its dispatch and transfers a
-    // finite retained-cleanup join to TaskStop.
-    if (joinRetainedCheckpoint) await task?.settled;
+    // checkpoint-owned stop has a finite linked dispatch settlement to join.
+    if (joinRetainedCheckpoint || result.disposition === "provisional") {
+      await task?.settled;
+    }
+    if (task && result.disposition === "provisional") {
+      return { ...result, disposition: task.checkpointStopDisposition ?? "unconfirmed" };
+    }
     return result;
   }
 
-  async stopAgentAndWait(agentId: string): Promise<{
-    record?: BackgroundTaskRecord;
-    found: boolean;
-    alreadySettled: boolean;
-    abortRequested: boolean;
-  }> {
+  async stopAgentAndWait(
+    agentId: string,
+    source: "task-stop" | "panel" | "session" = "task-stop",
+  ): Promise<BackgroundStopResult & { record?: BackgroundTaskRecord }> {
     const record = this.newestTaskByAgent.get(agentId);
     if (!record) return { found: false, alreadySettled: false, abortRequested: false };
     // Suppress collection/notice before any await: agent-id stop owns both the
     // paused child and its linked background generation atomically.
     record.settlementDelivery = "collected";
-    const result = await this.stopAndWait(record.id);
+    const result = await this.stopAndWait(record.id, source);
     return { record, ...result };
   }
 
@@ -737,7 +896,10 @@ export class BackgroundTaskRegistry {
    * checkpoint-paused child remains user-stoppable; ordinary completed/failed
    * tasks cannot be retroactively claimed as user-stopped.
    */
-  markUserStopped(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
+  markUserStopped(
+    id: string,
+    source: "task-stop" | "panel" | "session" = "panel",
+  ): BackgroundStopResult {
     const task = this.tasks.get(id);
     if (!task) return { found: false, alreadySettled: false, abortRequested: false };
     if (
@@ -748,7 +910,27 @@ export class BackgroundTaskRegistry {
       task.userStopped = true;
       this.notifyChange(id);
     }
-    return this.stop(id);
+    return this.stop(id, source);
+  }
+
+  async markUserStoppedAndWait(id: string): Promise<BackgroundStopResult> {
+    const initial = this.markUserStopped(id, "panel");
+    if (initial.disposition !== "provisional") return initial;
+    return this.stopAndWait(id, "panel");
+  }
+
+  stopCheckpoint(agentId: string, source: "task-stop" | "panel" | "session") {
+    return this.retainedOutcomes?.registry.stopCheckpoint(agentId, source);
+  }
+
+  retainedReport(agentId: string): RetainedInputReport | undefined {
+    return this.retainedOutcomes?.registry.get(agentId)?.retainedInputReport;
+  }
+
+  retainedReportIds(): string[] {
+    return this.retainedOutcomes?.registry.list()
+      .filter((record) => record.retainedInputReport !== undefined)
+      .map((record) => record.agentId) ?? [];
   }
 
   /**
@@ -775,21 +957,34 @@ export class BackgroundTaskRegistry {
       ids: () =>
         [...this.tasks.values()].filter((task) => task.owner === ownerId).map((task) => task.id),
       wait: async (id) => (owns(id) ? this.wait(id) : undefined),
-      stop: (id) =>
-        owns(id) ? this.stop(id) : { found: false, alreadySettled: false, abortRequested: false },
-      stopAndWait: (id) => owns(id)
-        ? this.stopAndWait(id)
+      stop: (id, source) =>
+        owns(id) ? this.stop(id, source) : { found: false, alreadySettled: false, abortRequested: false },
+      stopAndWait: (id, source) => owns(id)
+        ? this.stopAndWait(id, source)
         : Promise.resolve({ found: false, alreadySettled: false, abortRequested: false }),
-      stopAgentAndWait: (agentId) => {
+      stopAgentAndWait: (agentId, source) => {
         const record = this.newestTaskByAgent.get(agentId);
         return record && record.owner === ownerId
-          ? this.stopAgentAndWait(agentId)
+          ? this.stopAgentAndWait(agentId, source)
           : Promise.resolve({ found: false, alreadySettled: false, abortRequested: false });
       },
       markCollected: (id) => (owns(id) ? this.markCollected(id) : false),
       subscribeProgress: (id, listener) =>
         owns(id) ? this.subscribeProgress(id, listener) : () => {},
       subscribe: (id, listener) => owns(id) ? this.subscribe(id, listener) : () => {},
+      stopCheckpoint: (agentId, source) => {
+        const record = this.retainedOutcomes?.registry.get(agentId);
+        return record?.parentAgentId === ownerId
+          ? this.retainedOutcomes!.registry.stopCheckpoint(agentId, source)
+          : undefined;
+      },
+      retainedReport: (agentId) => {
+        const record = this.retainedOutcomes?.registry.get(agentId);
+        return record?.parentAgentId === ownerId ? record.retainedInputReport : undefined;
+      },
+      retainedReportIds: () => this.retainedOutcomes?.registry.list()
+        .filter((record) => record.parentAgentId === ownerId && record.retainedInputReport !== undefined)
+        .map((record) => record.agentId) ?? [],
     };
   }
 }
@@ -801,6 +996,14 @@ export class BackgroundTaskRegistry {
  * control characters and whitespace runs collapse to spaces — and capped.
  */
 const ERROR_TEXT_CAP = 500;
+
+function quarantineTaskGuidance(task: Pick<BackgroundTaskRecord, "id" | "agentId" | "retainedInputReport">): string {
+  const report = task.retainedInputReport;
+  const reportGuidance = report && task.agentId
+    ? `The canonical report remains available through ${taskOutputAgentLocator(task.agentId)}.`
+    : "No canonical retained-input report exists; inspect the transcript for retained input.";
+  return `Background task ${task.id} has unconfirmed host work; it is not being reported stopped or aborted. ${reportGuidance} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible files, tools, and external effects.`;
+}
 
 function capErrorText(message: string): string {
   const flat = message.replace(/[\s\p{Cc}]+/gu, " ").trim();
@@ -969,6 +1172,13 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   }
   const guidance = outcome === "failed" ? recoveryGuidance(task) : undefined;
   if (guidance) lines.push(guidance);
+  if (task.retainedInputReport) {
+    const report = task.retainedInputReport;
+    lines.push(
+      `${retainedInputCount(report)} retained input occurrence(s) are available in the canonical report at stage ${report.stage}. ` +
+      `Retrieve the unchanged details with ${taskOutputAgentLocator(report.agentId)}; this notice does not consume them.`,
+    );
+  }
   const mcpQualification = task.diagnostics
     .map((diagnostic) => diagnostic.message)
     .filter((message) => message.startsWith("Agent MCP availability warning:") || message.startsWith("Agent MCP cleanup warning:"))
@@ -1054,9 +1264,9 @@ function settlementRecordDetails(task: BackgroundTaskRecord): SubagentRenderDeta
 }
 
 function unknownIdError(view: BackgroundTaskView, id: string): Error {
-  const known = view.ids();
+  const known = [...view.ids(), ...(view.retainedReportIds?.() ?? [])];
   return new Error(
-    `Unknown task_id "${id}". Known background tasks: ${known.length ? known.join(", ") : "(none — dispatch one with the Agent tool; dispatches run in the background by default)"}`,
+    `Unknown task_id "${id}". Known task/report ids: ${known.length ? known.join(", ") : "(none — dispatch one with the Agent tool; dispatches run in the background by default)"}`,
   );
 }
 
@@ -1134,6 +1344,23 @@ function exactAwaitedTaskOutputPartialId(
   return requested;
 }
 
+function retainedReportOutput(report: RetainedInputReport, task?: BackgroundTaskRecord) {
+  return {
+    content: [{ type: "text", text: formatRetainedInputReport(report) }],
+    details: {
+      retainedOutcome: true,
+      reportId: report.reportId,
+      occurrences: report.occurrences,
+      representedCount: report.occurrences.length,
+      unrepresentableCount: report.unrepresentableCount,
+      retainedCount: retainedInputCount(report),
+      stage: report.stage,
+      agentId: report.agentId,
+      ...(task ? { taskId: task.id, status: task.status } : {}),
+    },
+  };
+}
+
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
 export function createTaskOutputTool(
   registry: BackgroundTaskView,
@@ -1173,7 +1400,13 @@ export function createTaskOutputTool(
         ? Object.freeze({ taskId: correlatedId, description })
         : undefined;
       const resolveAgentColor = presentation.resolveAgentColor;
-      return renderAgentResult(result, options, theme, context, {
+      // `stage` is structured TaskOutput custody detail; the existing shared human
+      // renderer has a closed details schema, so keep that machine field out of its
+      // validation snapshot without changing the canonical tool result.
+      const renderInput = result.details && "stage" in result.details
+        ? { ...result, details: Object.fromEntries(Object.entries(result.details).filter(([key]) => key !== "stage")) as SubagentRenderDetails }
+        : result;
+      return renderAgentResult(renderInput, options, theme, context, {
         surface: "task-output",
         ...(resolveAgentColor ? { resolveAgentColor } : {}),
         ...(awaitedTaskOutputFallback ? { awaitedTaskOutputFallback } : {}),
@@ -1190,7 +1423,37 @@ export function createTaskOutputTool(
       // lookup or interpolation. Minted ids ("task-N") pass through unchanged.
       const id = sanitizeLine(String(params.task_id ?? ""), CAPTURED_LINE_CAP);
       const task = registry.get(id);
-      if (!task) throw unknownIdError(registry, id);
+      if (!task) {
+        const report = isAgentId(id) ? registry.retainedReport?.(id) : undefined;
+        if (report) return retainedReportOutput(report);
+        throw unknownIdError(registry, id);
+      }
+      if (task.checkpointStopState) {
+        const report = task.retainedInputReport ?? (task.agentId ? registry.retainedReport?.(task.agentId) : undefined);
+        const locator = task.agentId ? taskOutputAgentLocator(task.agentId) : `TaskOutput with task_id "${id}"`;
+        return {
+          content: [{
+            type: "text",
+            text: `Background task ${id} is ${task.checkpointStopState}; cancellation has no confirmed disposition yet. No stopped/aborted outcome is being claimed. If confirmed, retrieve retained input with ${locator} and inspect possible existing effects before retrying.`,
+          }],
+          details: {
+            taskId: id,
+            status: "running",
+            checkpointStopState: task.checkpointStopState,
+            ...(report ? { reportId: report.reportId } : {}),
+          },
+        };
+      }
+      if (task.checkpointQuarantined) {
+        const report = task.retainedInputReport ?? (task.agentId ? registry.retainedReport?.(task.agentId) : undefined);
+        const guidance = report
+          ? ` Retrieve the canonical report with ${taskOutputAgentLocator(report.agentId)}.`
+          : " No canonical retained-input report exists; inspect the transcript for retained input.";
+        return {
+          content: [{ type: "text", text: `${quarantineTaskGuidance(task)}${guidance}` }],
+          details: { taskId: id, status: "failed", checkpointQuarantined: true },
+        };
+      }
       // The clean dispatched agent type is the identity shown at every surface
       // (agentType is set eagerly at start; no `agent:`-prefix stripping).
       const agent = task.agentType ?? task.agentName ?? "subagent";
@@ -1228,7 +1491,7 @@ export function createTaskOutputTool(
           // must wake it immediately even though queued dispatch cleanup remains
           // deliberately delayed. Admission-only changes repaint when possible.
           unsubTask = registry.subscribe?.(id, () => {
-            if (task.status === "running") onUpdate?.(partial(task.progress));
+            if (task.status === "running" && !task.checkpointStopState) onUpdate?.(partial(task.progress));
             else wakeForStatusChange();
           }) ?? (() => {});
           if (onUpdate) {
@@ -1262,6 +1525,22 @@ export function createTaskOutputTool(
         }
         // On abort mid-wait the task may still be "running": fall through to build
         // the current-status (poll) result below rather than throwing.
+      }
+      if (task.checkpointStopState) {
+        const report = task.retainedInputReport ?? (task.agentId ? registry.retainedReport?.(task.agentId) : undefined);
+        const locator = task.agentId ? taskOutputAgentLocator(task.agentId) : `TaskOutput with task_id "${id}"`;
+        return {
+          content: [{
+            type: "text",
+            text: `Background task ${id} is ${task.checkpointStopState}; cancellation has no confirmed disposition yet. No stopped/aborted outcome is being claimed. If confirmed, retrieve retained input with ${locator} and inspect possible existing effects before retrying.`,
+          }],
+          details: {
+            taskId: id,
+            status: "running",
+            checkpointStopState: task.checkpointStopState,
+            ...(report ? { reportId: report.reportId } : {}),
+          },
+        };
       }
       // SECURITY (defense-in-depth): `task.label` derives from the raw
       // model-supplied `subagent_type` and is interpolated into this terminal-
@@ -1352,6 +1631,11 @@ export function createTaskOutputTool(
       // additions — the sanctioned UI channel; renderers are pure over
       // (result, details, theme) and cannot read the registry, and `text`
       // above stays byte-identical for print/RPC.
+      const canonicalReport = task.retainedInputReport ??
+        (task.agentId ? registry.retainedReport?.(task.agentId) : undefined);
+      if (canonicalReport && task.status !== "running") {
+        text += `\n\n${formatRetainedInputReport(canonicalReport)}`;
+      }
       const output = {
         content: [{ type: "text", text }],
         details: {
@@ -1373,6 +1657,15 @@ export function createTaskOutputTool(
           ...(task.error ? { error: task.error } : {}),
           ...(task.userStopped ? { userStopped: true } : {}),
           ...(alreadyReported ? { alreadyReported: true } : {}),
+          ...(canonicalReport ? {
+            retainedOutcome: true,
+            reportId: canonicalReport.reportId,
+            occurrences: canonicalReport.occurrences,
+            representedCount: canonicalReport.occurrences.length,
+            unrepresentableCount: canonicalReport.unrepresentableCount,
+            retainedCount: retainedInputCount(canonicalReport),
+            stage: canonicalReport.stage,
+          } : {}),
         } satisfies SubagentRenderDetails,
       };
       if (task.status !== "running" && !registry.markCollected(id)) {
@@ -1407,8 +1700,13 @@ export function scopedBackgroundTools(
       parentAgentId?: string;
       state: "running" | "settled";
       checkpointPaused?: boolean;
-      session?: { stopCheckpoint?(): Promise<void> };
+      checkpointQuarantined?: boolean;
+      checkpointStopState?: "stopping" | "settling-cancellation" | "confirmed" | "unconfirmed";
+      retainedInputReport?: RetainedInputReport;
+      session?: { stopCheckpoint?(): Promise<unknown> | void };
     } | undefined;
+    checkpointStopEligible?(agentId: string, dispatchGeneration?: number): boolean;
+    checkpointStopOwned?(agentId: string, dispatchGeneration?: number): boolean;
   },
 ): { taskOutput: Record<string, unknown>; taskStop: Record<string, unknown> } {
   const view = registry.scopedTo(ownerAgentId);
@@ -1416,6 +1714,16 @@ export function scopedBackgroundTools(
     get: (agentId: string) => {
       const record = pausedAgents.get(agentId);
       return record?.parentAgentId === ownerAgentId ? record : undefined;
+    },
+    checkpointStopEligible: (agentId: string) => {
+      const record = pausedAgents.get(agentId);
+      return record?.parentAgentId === ownerAgentId &&
+        pausedAgents.checkpointStopEligible?.(agentId) === true;
+    },
+    checkpointStopOwned: (agentId: string) => {
+      const record = pausedAgents.get(agentId);
+      return record?.parentAgentId === ownerAgentId &&
+        pausedAgents.checkpointStopOwned?.(agentId) === true;
     },
   } : undefined;
   return {
@@ -1433,18 +1741,23 @@ export function createTaskStopTool(
       agentName: string;
       state: "running" | "settled";
       checkpointPaused?: boolean;
-      session?: { stopCheckpoint?(): Promise<void> };
+      checkpointQuarantined?: boolean;
+      checkpointStopState?: "stopping" | "settling-cancellation" | "confirmed" | "unconfirmed";
+      retainedInputReport?: RetainedInputReport;
+      session?: { stopCheckpoint?(): Promise<unknown> | void };
     } | undefined;
+    checkpointStopEligible?(agentId: string, dispatchGeneration?: number): boolean;
+    checkpointStopOwned?(agentId: string, dispatchGeneration?: number): boolean;
   },
 ): Record<string, unknown> {
   return {
     name: "TaskStop",
     label: "TaskStop",
     description:
-      "Stop a running background task by task-* id (best-effort). A live checkpoint-paused child may instead be stopped by its process-lifetime agent-* id. The task is marked stopped and its result is discarded.",
+      "Stop a running background task by task-* id (best-effort). A checkpoint-paused child may instead be stopped by its process-lifetime agent-* id. As a narrow PiCC hardening exception, TaskStop also joins the exact current dispatch generation's authenticated active post-commit resumed cancellation epoch; this does not apply to ordinary running work or stale generations. The task is marked stopped and its result is discarded.",
     parameters: Type.Object({
       task_id: Type.String({
-        description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a live checkpoint-paused child in this process',
+        description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a checkpoint-paused child or the exact authenticated active post-commit resumed PiCC-hardening exception in this process',
       }),
     }),
     renderCall(
@@ -1469,7 +1782,36 @@ export function createTaskStopTool(
       const task = registry.get(id);
       if (!task) {
         const paused = isAgentId(id) ? pausedAgents?.get(id) : undefined;
-        if (!paused || paused.state !== "running" || !paused.checkpointPaused ||
+        if (paused?.checkpointQuarantined) {
+          const locator = paused.retainedInputReport
+            ? ` The canonical report remains available through ${taskOutputAgentLocator(paused.agentId)}.`
+            : " No canonical retained-input report exists; inspect the transcript for retained input.";
+          throw new Error(`Agent ${paused.agentId} has unconfirmed host work; no second stop was attempted.${locator} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.`);
+        }
+        if (paused?.checkpointStopState === "confirmed" && paused.retainedInputReport) {
+          const count = retainedInputCount(paused.retainedInputReport);
+          return {
+            content: [{
+              type: "text",
+              text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement at stage ${paused.retainedInputReport.stage}. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
+            }],
+            details: {
+              agentId: paused.agentId,
+              status: "stopped",
+              checkpointPaused: true,
+              disposition: "confirmed",
+              reportId: paused.retainedInputReport.reportId,
+              retainedCount: count,
+              stage: paused.retainedInputReport.stage,
+            },
+          };
+        }
+        const checkpointOwned = pausedAgents?.checkpointStopOwned?.(id) === true ||
+          (pausedAgents?.checkpointStopOwned === undefined &&
+            (paused?.checkpointPaused === true || pausedAgents?.checkpointStopEligible?.(id) === true ||
+              paused?.checkpointStopState === "stopping" ||
+              paused?.checkpointStopState === "settling-cancellation"));
+        if (!paused || paused.state !== "running" || !checkpointOwned ||
             !paused.session?.stopCheckpoint) {
           throw unknownIdError(registry, id);
         }
@@ -1478,34 +1820,77 @@ export function createTaskStopTool(
         // stale TaskOutput or settlement notice survives an agent-id stop. The
         // registry record is mutable and cleanup clears `session`, so bind the
         // authenticated stop capability before the await.
-        const linked = await registry.stopAgentAndWait?.(id);
-        if (!linked?.abortRequested) await stopCheckpoint();
+        const linked = await registry.stopAgentAndWait?.(id, "task-stop");
+        const ownedStop = linked?.disposition
+          ? undefined
+          : registry.stopCheckpoint?.(id, "task-stop");
+        const direct = ownedStop ? await ownedStop : linked?.disposition ? linked : undefined;
+        if (!direct) {
+          await stopCheckpoint();
+          return {
+            content: [{
+              type: "text",
+              text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — checkpoint-paused session stopped after joining active recovery work.`,
+            }],
+            details: { agentId: paused.agentId, status: "stopped", checkpointPaused: true },
+          };
+        }
+        const disposition = direct.disposition;
+        const report = ("report" in direct ? direct.report : undefined) ?? registry.retainedReport?.(id) ?? paused.retainedInputReport;
+        if (disposition === "unconfirmed" || paused.checkpointQuarantined) {
+          const locator = report
+            ? ` The canonical report remains available through ${taskOutputAgentLocator(id)}.`
+            : " No canonical retained-input report exists; inspect the transcript for retained input.";
+          throw new Error(`Agent ${paused.agentId} has unconfirmed host work and is not reported stopped or aborted.${locator} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.`);
+        }
+        const count = report ? retainedInputCount(report) : 0;
         return {
           content: [{
             type: "text",
-            text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — checkpoint-paused session stopped after joining active recovery work.`,
+            text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — stop confirmed after settlement${report ? ` at stage ${report.stage}` : ""}. ${count} retained input occurrence(s); ${taskOutputAgentLocator(paused.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`,
           }],
-          details: { agentId: paused.agentId, status: "stopped", checkpointPaused: true },
+          details: {
+            agentId: paused.agentId,
+            status: "stopped",
+            checkpointPaused: true,
+            disposition: "confirmed",
+            reportId: report?.reportId,
+            retainedCount: report ? retainedInputCount(report) : undefined,
+            ...(report ? { stage: report.stage } : {}),
+          },
         };
       }
       const stopped = registry.stopAndWait
-        ? await registry.stopAndWait(id)
-        : registry.stop(id);
+        ? await registry.stopAndWait(id, "task-stop")
+        : registry.stop(id, "task-stop");
       const identity = formatBackgroundTaskIdentity(
         id,
         task.agentType ?? task.agentName ?? "subagent",
         task.agentId,
       );
-      const text = stopped.alreadySettled
-        ? `${identity} — already finished with status "${task.status}"; nothing to stop.`
-        : stopped.abortRequested
-          ? `${identity} — stop requested (cooperative abort). The task is marked stopped and its result will be discarded.`
-          : `${identity} — marked stopped. Cooperative stop is not supported for this dispatch; it may run to completion, but its result will be discarded.`;
+      const report = task.retainedInputReport ?? (task.agentId ? registry.retainedReport?.(task.agentId) : undefined);
+      const text = stopped.disposition === "unconfirmed"
+        ? `${identity} — host quiescence is unconfirmed; no stopped/aborted outcome is claimed. ${report && task.agentId ? `Canonical report: ${taskOutputAgentLocator(task.agentId)}.` : "No canonical report exists; inspect the transcript for retained input."} Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.`
+        : stopped.disposition === "confirmed"
+          ? `${identity} — stop confirmed after settlement${report ? ` at stage ${report.stage}` : ""}. ${report ? retainedInputCount(report) : 0} retained input occurrence(s)${task.agentId ? `; ${taskOutputAgentLocator(task.agentId)}` : ""}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`
+          : stopped.alreadySettled
+            ? `${identity} — already finished with status "${task.status}"; nothing to stop.`
+            : stopped.abortRequested
+              ? `${identity} — stop requested (cooperative abort). The task is marked stopped and its result will be discarded.`
+              : `${identity} — marked stopped. Cooperative stop is not supported for this dispatch; it may run to completion, but its result will be discarded.`;
       return {
         content: [{ type: "text", text }],
         details: {
           taskId: id,
           status: task.status,
+          ...(stopped.disposition ? { disposition: stopped.disposition, agentId: task.agentId } : {}),
+          ...(report ? {
+            reportId: report.reportId,
+            retainedCount: retainedInputCount(report),
+            representedCount: report.occurrences.length,
+            unrepresentableCount: report.unrepresentableCount,
+            stage: report.stage,
+          } : {}),
         } satisfies SubagentRenderDetails,
       };
     },

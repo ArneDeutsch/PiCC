@@ -370,6 +370,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(proactive).toMatch(boundary);
     }
     expect(proactive).toContain("feature.compaction-summary-recovery");
+    expect(proactive).toMatch(/exact aborted terminal object identity followed by same-run selected-branch settlement/);
+    expect(proactive).toMatch(/TUI steering\/follow-up\/draft order and no automatic replay/);
+    expect(proactive).toMatch(/Live RPC post-compaction retained-replay cancellation is unsupported/);
+    expect(proactive).toMatch(/distinct confirmed restart-required terminal category/);
+    expect(proactive).toMatch(/restart-process with status 3, leaves controller admission closed, refuses in-process new\/resume\/fork\/reload replacement/);
+    expect(proactive).toMatch(/requires an external fresh PiCC process plus fresh session/);
+    expect(proactive).toMatch(/Pi may drain those queues before PiCC can present the outcome/);
+    expect(proactive).not.toMatch(/TUI and live RPC may remain reusable|reusable live RPC cancellation/);
+    expect(proactive).toMatch(/canonical report shared by all consumers/);
+    expect(proactive).toMatch(/ambiguous records remain quarantined/);
     expect(proactive).not.toMatch(
       /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
     );
@@ -931,7 +941,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible completed or truncated-completed resumable retrieval/],
       parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
     },
-    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
+    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /pre-commit compaction-paused dispatch/, /authenticated post-commit resumed abort\/join epoch/, /linked background settlement join/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/current dispatch generation/, /stale task generations cannot stop a newer generation/, /subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });
@@ -963,6 +973,19 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ["multiline/detail history", "The detail view retains multiline activity history."],
   ])("detects duplicated panel mechanic: %s", (_category, canary) => {
     expect(duplicatesPanelMechanics(canary)).toBe(true);
+  });
+
+  it("pins canonical retained-input custody and shutdown truth across affected capability owners", () => {
+    const expected = ["tool.Agent", "tool.Task", "tool.TaskOutput", "tool.TaskStop", "tool.SendMessage", "feature.background-agents"];
+    for (const id of expected) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).toMatch(/canonical|canonical owner/);
+      expect(note, id).toMatch(/quarantined|quarantine/);
+    }
+    const background = lookupCapability("feature.background-agents")?.note ?? "";
+    expect(background).toMatch(/exactly reopens.*session entry.*recovery file/);
+    expect(background).toMatch(/best-effort.*warns of possible loss.*cleanup continues/);
+    expect(background).toMatch(/unconfirmed work still blocks cleanup/);
   });
 
   it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {

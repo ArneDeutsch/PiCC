@@ -1,4 +1,10 @@
-import { guardSteer, type SubagentRegistry, type SubagentRegistryRecord } from "./subagent-registry.js";
+import {
+  guardSteer,
+  retainedInputCount,
+  taskOutputAgentLocator,
+  type SubagentRegistry,
+  type SubagentRegistryRecord,
+} from "./subagent-registry.js";
 import {
   SubagentPanelModel,
   newestTaskByAgent,
@@ -85,6 +91,9 @@ export const PANEL_NOTICE_RESIZE_ACTION = "Resize wider to show an agent row bef
 export function panelNoticeStopRequested(label: string): string {
   return `Stop requested for ${label} — it will settle as aborted.`;
 }
+export function panelNoticeStopSettling(label: string): string {
+  return `Stop requested for ${label}; settling.`;
+}
 export function panelNoticeStopAllArmed(n: number): string {
   return `Press X again to stop ${n} active background agent${n === 1 ? "" : "s"}.`;
 }
@@ -131,12 +140,16 @@ export interface SubagentPanelFocusDeps {
   /** Task-registry notification for status/admission-only presentation changes. */
   onTasksChange?: (listener: () => void) => () => void;
   /**
-   * Task-side user stop (`BackgroundTaskRegistry.markUserStopped` in
-   * production) — every panel stop pairs it with
-   * `SubagentRegistry.markUserStopped` so user-stop permanence holds on both
-   * registries.
+   * Task-side stop (`BackgroundTaskRegistry.markUserStopped` in production).
+   * Ordinary panel stops pair it immediately with `SubagentRegistry.markUserStopped`;
+   * retained checkpoint stops defer registry permanence until confirmed settlement.
    */
-  stopTask: (taskId: string) => void;
+  stopTask: (
+    taskId: string,
+    metadata?: { source: "panel" },
+  ) => void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }>;
+  /** Dormant retained-checkpoint stop settlement and presentation; omission preserves shipped panel behavior. */
+  retainedOutcomes?: boolean;
   /** The passive widget's suppression seam: hidden while this panel is open. */
   widget: { setSuppressed(on: boolean): void };
   /** Injected clock (tests); defaults to Date.now. */
@@ -398,21 +411,25 @@ export class SubagentPanelFocusController {
         if (byAgent.has(key.agentId)) return { ok: false, refusal: PANEL_NOTICE_STALE };
         const record = this.deps.registry.get(key.agentId);
         if (!record) return { ok: false, refusal: PANEL_NOTICE_STALE };
-        return guardSteer(record);
+        return guardSteer(record, "panel");
       }
       const task = tasks.find((candidate) => candidate.id === key.taskId);
       if (!task?.agentId || byAgent.get(task.agentId)?.id !== task.id) {
         return { ok: false, refusal: PANEL_NOTICE_STALE };
       }
+      const record = this.deps.registry.get(task.agentId);
+      if (!record) return { ok: false, refusal: PANEL_NOTICE_STALE };
+      if (record.userStopped || record.checkpointQuarantined || record.checkpointStopState === "stopping" ||
+          record.checkpointStopState === "settling-cancellation") {
+        return guardSteer(record, "panel");
+      }
       if (task.status !== "running") {
         return { ok: false, refusal: detailSteerUnavailable("agent is no longer running") };
       }
-      const record = this.deps.registry.get(task.agentId);
-      if (!record) return { ok: false, refusal: PANEL_NOTICE_STALE };
       if ((task.admission ?? record.admission ?? "admitted") !== "admitted") {
         return { ok: false, refusal: detailSteerUnavailable("waiting for capacity") };
       }
-      return guardSteer(record);
+      return guardSteer(record, "panel");
     } catch {
       return { ok: false, refusal: PANEL_NOTICE_STALE };
     }
@@ -451,9 +468,15 @@ export class SubagentPanelFocusController {
    * sees `userStopped`), then the task-side marker+abort, which drives the
    * normal aborted settlement notice to the model.
    */
-  private stopAgent(record: SubagentRegistryRecord, taskId: string): void {
+  private stopAgent(
+    record: SubagentRegistryRecord,
+    taskId: string,
+  ): void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }> {
+    if (this.deps.retainedOutcomes && this.deps.registry.checkpointStopOwned(record.agentId)) {
+      return this.deps.stopTask(taskId, { source: "panel" });
+    }
     this.deps.registry.markUserStopped(record.agentId);
-    this.deps.stopTask(taskId);
+    return this.deps.stopTask(taskId);
   }
 
   /** Active background agents (newest generation each) — stop-all's targets. */
@@ -565,6 +588,51 @@ export class SubagentPanelFocusController {
       // The periodic tick remains a display-only fallback.
     }
 
+    const requestPanelStop = (record: SubagentRegistryRecord, taskId: string): void => {
+      const label = sanitizeLine(record.agentName, NOTICE_LABEL_CAP) || "agent";
+      if (!this.deps.retainedOutcomes || !this.deps.registry.checkpointStopOwned(record.agentId)) {
+        this.stopAgent(record, taskId);
+        notify(panelNoticeStopRequested(label));
+        return;
+      }
+      const bestEffortNotify = (message: string): void => {
+        try { notify(message); } catch { /* notification is never lifecycle authority */ }
+      };
+      let stopping: void | Promise<void | { disposition?: "provisional" | "ordinary-cleanup" | "confirmed" | "unconfirmed" }>;
+      try {
+        stopping = this.stopAgent(record, taskId);
+      } catch (error) {
+        this.deps.registry.quarantineCheckpoint(record.agentId);
+        const report = this.deps.registry.get(record.agentId)?.retainedInputReport;
+        bestEffortNotify(`Stop request for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+        return;
+      }
+      const settlement = Promise.resolve(stopping).then((result) => {
+        const current = this.deps.registry.get(record.agentId);
+        const report = current?.retainedInputReport;
+        if (result?.disposition === "ordinary-cleanup" && current?.checkpointStopState === "confirmed" &&
+            !current.checkpointQuarantined && !report) {
+          this.deps.registry.markUserStopped(record.agentId);
+          bestEffortNotify(`Stop confirmed for ${label}; pre-commit cleanup completed and no retained-input report was required.`);
+          return;
+        }
+        if (result?.disposition !== "confirmed" || current?.checkpointStopState !== "confirmed" ||
+            current.checkpointQuarantined || !report) {
+          this.deps.registry.quarantineCheckpoint(record.agentId);
+          bestEffortNotify(`Stop disposition for ${label} is unconfirmed. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+          return;
+        }
+        this.deps.registry.markUserStopped(record.agentId);
+        bestEffortNotify(`Stop confirmed for ${label} at stage ${report.stage}. ${retainedInputCount(report)} retained input occurrence(s); ${taskOutputAgentLocator(record.agentId)}. Reported input was not auto-replayed; inspect possible existing effects before deliberate retry.`);
+      }, (error) => {
+        this.deps.registry.quarantineCheckpoint(record.agentId);
+        const report = this.deps.registry.get(record.agentId)?.retainedInputReport;
+        bestEffortNotify(`Stop settlement for ${label} has unconfirmed cleanup: ${sanitizeLine((error as Error).message, NOTICE_LABEL_CAP)}. Do not retry in this process. Exit PiCC completely, start a fresh process and session, and inspect the transcript, worktree, and possible effects.${report ? ` ${retainedInputCount(report)} retained input occurrence(s) at stage ${report.stage}; canonical report: ${taskOutputAgentLocator(record.agentId)}.` : " No canonical retained-input report exists."}`);
+      });
+      void settlement.catch(() => undefined);
+      bestEffortNotify(panelNoticeStopSettling(label));
+    };
+
     /**
      * Action shared by `x`/`d` in the list and `ctrl+x` in the drill-down —
      * identical re-resolve/stale semantics on every surface.
@@ -577,12 +645,7 @@ export class SubagentPanelFocusController {
             notify(PANEL_NOTICE_RUNNING_DISMISS);
             return;
           }
-          this.stopAgent(target.record, target.taskId);
-          notify(
-            panelNoticeStopRequested(
-              sanitizeLine(target.record.agentName, NOTICE_LABEL_CAP) || "agent",
-            ),
-          );
+          requestPanelStop(target.record, target.taskId);
           return;
         case "running-foreground":
           notify(mode === "dismiss" ? PANEL_NOTICE_RUNNING_DISMISS : PANEL_NOTICE_FOREGROUND);
@@ -613,8 +676,20 @@ export class SubagentPanelFocusController {
       const now = this.nowFn();
       if (stopAllArmedAt !== undefined && now - stopAllArmedAt <= STOP_ALL_CONFIRM_MS) {
         stopAllArmedAt = undefined;
-        for (const target of targets) this.stopAgent(target.record, target.taskId);
-        notify(panelNoticeStopAllDone(targets.length));
+        if (this.deps.retainedOutcomes) {
+          const checkpoint = targets.filter((target) =>
+            this.deps.registry.checkpointStopOwned(target.record.agentId));
+          const ordinary = targets.filter((target) =>
+            !this.deps.registry.checkpointStopOwned(target.record.agentId));
+          for (const target of ordinary) this.stopAgent(target.record, target.taskId);
+          for (const target of checkpoint) requestPanelStop(target.record, target.taskId);
+          if (ordinary.length > 0) {
+            try { notify(panelNoticeStopAllDone(ordinary.length)); } catch { /* lifecycle settlement is authoritative */ }
+          }
+        } else {
+          for (const target of targets) this.stopAgent(target.record, target.taskId);
+          notify(panelNoticeStopAllDone(targets.length));
+        }
         return;
       }
       stopAllArmedAt = now;

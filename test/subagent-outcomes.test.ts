@@ -8,8 +8,9 @@ import {
   createTaskOutputTool,
   createTaskStopTool,
 } from "../src/runtime/background-tasks.js";
-import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { SubagentRegistry, type SteerableSession } from "../src/runtime/subagent-registry.js";
 import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
@@ -40,6 +41,172 @@ const CALL_SHAPED_RESULT = `{
 }`;
 
 describe("dispatch outcome classification", () => {
+  it("keeps retained reports deeply immutable, finite, and claimable after failed delivery", async () => {
+    const nestedContent = [{ type: "text", text: "same retained text", nested: { value: 1 } }];
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab",
+      sessionId: "session:agent-0123456789ab",
+      generation: 4,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 7,
+        generation: 4,
+        sessionId: "session:agent-0123456789ab",
+        content: nestedContent,
+        delivery: "followUp",
+      }],
+      guidance: "Files, tools, and external effects may already exist; inspect them before explicit resend.",
+    });
+    nestedContent[0]!.text = "mutated after capture";
+    (nestedContent[0]!.nested as { value: number }).value = 2;
+    let deliveries = 0;
+    expect(await report.claim(async () => { deliveries += 1; return false; })).toBe(false);
+    const foreground = report.claim(async () => { deliveries += 1; await Promise.resolve(); return true; });
+    const settlementNotice = report.claim(async () => { deliveries += 1; return true; });
+
+    expect(await Promise.all([foreground, settlementNotice])).toEqual([true, false]);
+    expect(deliveries).toBe(2);
+    expect(report.occurrences).toEqual([expect.objectContaining({
+      disposition: "reported",
+      shadow: expect.objectContaining({
+        id: 7,
+        content: [{ type: "text", text: "same retained text", nested: { value: 1 } }],
+      }),
+    })]);
+    expect(report.guidance).toMatch(/files, tools, and external effects/iu);
+    expect(Object.isFrozen(report)).toBe(true);
+    expect(Object.isFrozen(report.occurrences)).toBe(true);
+    expect(Object.isFrozen(report.occurrences[0]!.shadow.content)).toBe(true);
+    expect(Object.isFrozen((report.occurrences[0]!.shadow.content as any[])[0]!.nested)).toBe(true);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: Number.NaN,
+      stage: "resumed-cancellation", occurrences: [], guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], unrepresentableCount: Number.POSITIVE_INFINITY,
+      guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+  });
+
+  it("counts unsupported retained content while preserving bounded immutable JSON-like values", () => {
+    const mutable = { type: "text", text: "safe", nested: [1, true, null] };
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const exotic = [
+      new Map([["text", "lost"]]), new Set([1]), new Date(), new Uint8Array([1]),
+      () => undefined, Symbol("lost"), cycle, Number.NaN, Number.POSITIVE_INFINITY,
+    ];
+    const occurrences = [mutable, ...exotic].map((content, index) => ({
+      id: index + 1, generation: 2, sessionId: "session", delivery: "steer" as const,
+      content: [content] as never,
+    }));
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences, unrepresentableCount: 3, guidance: "recover\u0000 safely",
+    });
+    mutable.text = "changed";
+    mutable.nested[0] = 9;
+    expect(report.occurrences).toHaveLength(1);
+    expect(report.occurrences[0]!.shadow.content).toEqual([{
+      type: "text", text: "safe", nested: [1, true, null],
+    }]);
+    expect(report.unrepresentableCount).toBe(3 + exotic.length);
+    expect(report.guidance).toBe("recover  safely");
+
+    const tooDeep: unknown[] = [];
+    let cursor = tooDeep;
+    for (let index = 0; index < 25; index += 1) {
+      const next: unknown[] = [];
+      cursor.push(next);
+      cursor = next;
+    }
+    const capped = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences: [{
+        id: 99, generation: 2, sessionId: "session", delivery: "followUp", content: tooDeep,
+      }], guidance: "recover",
+    });
+    expect(capped.occurrences).toEqual([]);
+    expect(capped.unrepresentableCount).toBe(1);
+
+    const overflowSafe = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 100, generation: 2, sessionId: "wrong-session", delivery: "steer", content: "lost",
+      }],
+      unrepresentableCount: Number.MAX_SAFE_INTEGER,
+      guidance: `\u0000${"g".repeat(2_100)}\u007f`,
+    });
+    expect(overflowSafe.unrepresentableCount).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(overflowSafe.unrepresentableCount)).toBe(true);
+    expect(overflowSafe.guidance).not.toMatch(/[\u0000\u007f]/u);
+    expect(overflowSafe.guidance.length).toBeLessThanOrEqual(2_000);
+    expect(overflowSafe.guidance).toMatch(/\[truncated\]$/u);
+  });
+
+  it("stores one canonical report before cleanup and makes quarantine authoritative", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-0123456789ab", agentName: "reviewer", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "Inspect side effects before resend.",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    const differentReport = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "different object",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", differentReport)).toBe(false);
+    registry.markSettled("agent-0123456789ab", { outcome: "aborted" });
+    expect(registry.get("agent-0123456789ab")?.retainedInputReport).toBe(report);
+    expect(registry.quarantineCheckpoint("agent-0123456789ab")).toBe(true);
+    expect(() => registry.assertDispatchAdmission("agent-0123456789ab")).toThrow(
+      /requested dispatch was not performed.*canonical report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+
+    registry.register({
+      agentId: "agent-fedcba987654", agentName: "worker", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(true);
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(false);
+    const quarantined = registry.get("agent-fedcba987654")!;
+    registry.noteProgress("agent-fedcba987654", { tail: ["late"], activity: "late" });
+    registry.noteAdmission("agent-fedcba987654", "waiting");
+    registry.markCheckpointPaused("agent-fedcba987654");
+    registry.markUserStopped("agent-fedcba987654");
+    registry.markSettled("agent-fedcba987654", { outcome: "aborted" });
+    registry.markResuming("agent-fedcba987654");
+    const forbiddenReport = createRetainedInputReport({
+      agentId: "agent-fedcba987654", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "late",
+    });
+    expect(registry.storeRetainedInputReport("agent-fedcba987654", forbiddenReport)).toBe(false);
+    expect(() => registry.register({
+      agentId: "agent-fedcba987654", agentName: "replacement", depth: 2, cwd: "/other",
+      resumable: true, oneShot: false,
+    })).toThrow(/quarantined/iu);
+    expect(registry.get("agent-fedcba987654")).toBe(quarantined);
+    expect(registry.get("agent-fedcba987654")).toMatchObject({
+      agentName: "worker", state: "running", checkpointPaused: true,
+      checkpointQuarantined: true, resumable: false,
+    });
+    expect(registry.get("agent-fedcba987654")?.userStopped).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.progress).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.admission).toBe("admitted");
+    expect(registry.isSettledNoticeArmed("agent-fedcba987654")).toBe(false);
+    expect(registry.consumeSettledNotice("agent-fedcba987654")).toBe(false);
+    expect(() => registry.assertDispatchAdmission("agent-fedcba987654")).toThrow(
+      /requested dispatch was not performed.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+  });
+
   it("stopReason 'error' with no prior output → failed with the error named, never an empty success", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 rate limit exceeded (mock provider)" }],
@@ -51,6 +218,339 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toMatch(API_DEATH);
     expect(result.error).toContain("429 rate limit exceeded");
     expect(result.finalMessage).toBe("");
+  });
+
+  it("opted foreground presentation reads the canonical report without consuming custody and omission leaks no detail", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+    });
+    const report = createRetainedInputReport({
+      agentId, sessionId: "session:foreground", generation: 3, stage: "resumed-cancellation",
+      occurrences: [{
+        id: 7, generation: 3, sessionId: "session:foreground", delivery: "followUp",
+        content: "please preserve this",
+      }],
+      guidance: "Inspect files, tools, and external effects before retrying.",
+    });
+    registry.storeRetainedInputReport(agentId, report);
+    const dispatchResult = {
+      ok: false as const, outcome: "aborted" as const, finalMessage: "", agentId,
+      resumable: true, agentName: "reviewer", retainedInputReport: report,
+      error: "Subagent was cancelled after compaction.", diagnostics: [],
+    };
+    const runtime = {
+      dispatch: async () => dispatchResult,
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const opted = createAgentToolDefinition(runtime as never, {
+      depth: 0,
+      retainedOutcomes: { registry },
+    }) as unknown as ToolLike;
+    const error = await opted.execute("foreground", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    }).catch((cause: Error) => cause);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/1 represented.*TaskOutput with task_id "agent-0123456789ab".*not auto-replayed.*existing files, tools, and external effects/isu);
+    expect(await report.claim(async () => true)).toBe(true);
+
+    const legacy = createAgentToolDefinition(runtime as never, { depth: 0 }) as unknown as ToolLike;
+    const legacyError = await legacy.execute("legacy", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    }).catch((cause: Error) => cause);
+    expect((legacyError as Error).message).toBe("Subagent was cancelled after compaction.");
+    expect((legacyError as Error).message).not.toContain("please preserve this");
+  });
+
+  it("foreground retained detail remains durable when renderer convenience is collapsed or narrow", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({ agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false });
+    const report = createRetainedInputReport({
+      agentId, sessionId: "session:narrow", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:narrow", delivery: "steer", content: "durable" }],
+      guidance: "Inspect possible existing effects.",
+    });
+    registry.storeRetainedInputReport(agentId, report);
+    const runtime = {
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "partial", agentId, resumable: false,
+        agentName: "reviewer", retainedInputReport: report, error: "failed", diagnostics: [],
+      }),
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const tool = createAgentToolDefinition(runtime as never, {
+      depth: 0, retainedOutcomes: { registry },
+    }) as unknown as ToolLike & {
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+    };
+    const returned = await tool.execute("narrow", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    });
+    expect(returned.content[0]!.text).toMatch(/failed.*agent-0123456789ab.*1 represented.*1 total.*TaskOutput with task_id "agent-0123456789ab".*not auto-replayed.*existing effects/isu);
+    const render = (width: number) => tool.renderResult(returned, { expanded: false, isPartial: false }, undefined, {
+      state: {}, args: { subagent_type: "reviewer" }, isError: false,
+    }).render(width).join("\n");
+    const collapsed = render(120);
+    expect(collapsed).toMatch(/failed.*agent-0123456789ab.*1 retained input occurrence.*TaskOutput with task_id "agent-0123456789ab"/isu);
+    expect(collapsed).not.toContain("durable");
+    const narrow = render(7);
+    expect(narrow.split("\n")[0]).toMatch(/^✗\s+r/iu);
+    expect(narrow).toContain("resize");
+    expect(returned.details).toMatchObject({
+      outcome: "failed", agentId, reportId: report.reportId, retainedCount: 1,
+    });
+    expect(returned.details.occurrences).toBe(report.occurrences);
+    expect(await report.claim(async () => true)).toBe(true);
+  });
+
+  it("does not project retained detail for a noncanonical report or a generic failure", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({ agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false });
+    const canonical = createRetainedInputReport({
+      agentId, sessionId: "session:canonical", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:canonical", delivery: "steer", content: "canonical secret" }],
+      guidance: "canonical guidance",
+    });
+    const mismatched = createRetainedInputReport({
+      agentId, sessionId: "session:mismatch", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 2, generation: 1, sessionId: "session:mismatch", delivery: "followUp", content: "mismatch secret" }],
+      guidance: "mismatch guidance",
+    });
+    registry.storeRetainedInputReport(agentId, canonical);
+    const outcomes = [
+      { retainedInputReport: mismatched, error: "mismatched failure" },
+      { error: "generic failure" },
+    ];
+    const runtime = {
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "partial", agentId, resumable: false,
+        agentName: "reviewer", diagnostics: [], ...outcomes.shift()!,
+      }),
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const tool = createAgentToolDefinition(runtime as never, {
+      depth: 0, retainedOutcomes: { registry },
+    }) as unknown as ToolLike;
+    for (const call of ["mismatch", "generic"]) {
+      const shown = await tool.execute(call, {
+        subagent_type: "reviewer", prompt: "work", run_in_background: false,
+      });
+      expect(shown.details).not.toHaveProperty("reportId");
+      expect(shown.details).not.toHaveProperty("retainedCount");
+      expect(shown.content[0]!.text).not.toMatch(/canonical secret|mismatch secret|canonical guidance|mismatch guidance|TaskOutput with task_id/iu);
+    }
+
+    const causeOnly = createAgentToolDefinition({
+      ...runtime,
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "", agentId, resumable: false,
+        agentName: "reviewer", error: "generic cause only", diagnostics: [],
+      }),
+    } as never, { depth: 0, retainedOutcomes: { registry } }) as unknown as ToolLike;
+    let failure: Error | undefined;
+    try {
+      await causeOnly.execute("cause-only", {
+        subagent_type: "reviewer", prompt: "work", run_in_background: false,
+      });
+    } catch (error) {
+      failure = error as Error;
+    }
+    expect(failure?.message).toBe("generic cause only");
+    expect(failure?.message).not.toMatch(/canonical secret|session:canonical|canonical guidance|report-|agent-0123456789ab|retained|occurrence|TaskOutput|auto-replayed|effects/iu);
+  });
+
+  it("omitted stop-all is a no-touch empty capability", async () => {
+    const touched = { registry: 0, session: 0, callback: 0 };
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: new Proxy(new SubagentRegistry(), {
+        get() { touched.registry++; throw new Error("registry must not be read"); },
+      }),
+    });
+    const result = await runtime.stopAllRetainedSubagents({ persist: async () => {
+      touched.callback++;
+      return true;
+    } });
+    expect(result).toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(touched).toEqual({ registry: 0, session: 0, callback: 0 });
+  });
+
+  it("accepts a synchronous-void checkpoint stop and quarantines it once as unconfirmed", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    let stops = 0;
+    const session: SteerableSession = { stopCheckpoint: () => { stops++; } };
+    registry.register({
+      agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session,
+    });
+    await expect(registry.stopCheckpoint(agentId, "session")).resolves.toMatchObject({ disposition: "unconfirmed" });
+    await expect(registry.stopCheckpoint(agentId, "session")).resolves.toMatchObject({ disposition: "unconfirmed" });
+    expect(stops).toBe(1);
+    expect(registry.get(agentId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+  });
+
+  it("runtime stop and shutdown helpers use the shared opt-in owner instead of accepting void adapters", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    const shutdownId = "agent-fedcba987654";
+    let calls = 0;
+    registry.register({
+      agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session: { stopCheckpoint: async () => { calls++; } },
+    });
+    registry.register({
+      agentId: shutdownId, agentName: "shutdown worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session: { stopCheckpoint: async () => { calls++; } },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    await runtime.stopCheckpoint(agentId);
+    expect(calls).toBe(1);
+    expect(registry.get(agentId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+    await runtime.shutdownCheckpointPaused();
+    expect(calls).toBe(2);
+    expect(registry.get(shutdownId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+  });
+
+  it("stop-all attempts confirmed persistence once and releases cleanup after failure", async () => {
+    const registry = new SubagentRegistry();
+    const confirmedId = "agent-0123456789ab";
+    let stops = 0;
+    let cleanups = 0;
+    let report: ReturnType<typeof createRetainedInputReport>;
+    registry.register({
+      agentId: confirmedId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+      oneShot: false, checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        stops++;
+        report = createRetainedInputReport({
+          agentId: confirmedId, sessionId: "session:stop-all", generation: 1,
+          stage: "resumed-cancellation", occurrences: [], guidance: "Inspect effects.",
+        });
+        registry.storeRetainedInputReport(confirmedId, report);
+        registry.markSettled(confirmedId, { outcome: "aborted" });
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            cleanups++;
+          },
+        };
+      } },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    const persisted: object[] = [];
+    const first = await runtime.stopAllRetainedSubagents({ persist: async (candidate) => {
+      persisted.push(candidate.reportId);
+      return false;
+    } });
+    expect(first).toMatchObject({ confirmed: 1, unconfirmed: 0 });
+    expect(first.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: true, persisted: false, cleanupReleased: true,
+    });
+    expect(cleanups).toBe(1);
+
+    const repeated = await runtime.stopAllRetainedSubagents({ persist: async () => {
+      throw new Error("must not repeat");
+    } });
+    expect(repeated.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: false, persisted: false, cleanupReleased: true,
+    });
+    expect(persisted).toEqual([report!.reportId]);
+    expect(stops).toBe(1);
+    expect(cleanups).toBe(1);
+  });
+
+  it.each(["task-stop", "panel"] as const)(
+    "reuses exact-generation cleanup evidence from ordinary %s before shutdown persistence",
+    async (source) => {
+      const registry = new SubagentRegistry();
+      const agentId = source === "task-stop" ? "agent-111111111111" : "agent-222222222222";
+      let cleanups = 0;
+      let persistenceAttempts = 0;
+      registry.register({
+        agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+        oneShot: false, checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          const report = createRetainedInputReport({
+            agentId, sessionId: `session:${source}`, generation: 1, stage: "resumed-cancellation",
+            occurrences: [], guidance: "Inspect effects.",
+          });
+          registry.storeRetainedInputReport(agentId, report);
+          cleanups++;
+          registry.markSettled(agentId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, report };
+        } },
+      });
+      const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+        subagentRegistry: registry,
+        compactionCancellationRecovery: { registry },
+      });
+
+      await expect(registry.stopCheckpoint(agentId, source)).resolves.toMatchObject({ disposition: "confirmed" });
+      expect(registry.get(agentId)?.retainedInputCleanupReleasedDispatchGeneration).toBe(1);
+      const shutdown = await runtime.stopAllRetainedSubagents({ persist: async () => {
+        persistenceAttempts++;
+        return true;
+      } });
+      expect(shutdown.outcomes[0]).toMatchObject({
+        disposition: "confirmed", persisted: true, cleanupReleased: true,
+      });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+
+      await runtime.stopAllRetainedSubagents({ persist: async () => {
+        throw new Error("must not repeat");
+      } });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+    },
+  );
+
+  it("stop-all quarantines missing, void, throw, false, and truthy nonboolean evidence once", async () => {
+    const registry = new SubagentRegistry();
+    const modes = ["missing", "void", "throw", "false", "truthy"] as const;
+    const calls = new Map<string, number>();
+    for (const [index, mode] of modes.entries()) {
+      const agentId = `agent-${String(index + 1).repeat(12)}`;
+      registry.register({
+        agentId, agentName: mode, depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+        checkpointPaused: true,
+        ...(mode === "missing" ? {} : { session: { stopCheckpoint: async () => {
+          calls.set(mode, (calls.get(mode) ?? 0) + 1);
+          if (mode === "throw") throw new Error("stop failed");
+          if (mode === "false") return false as never;
+          if (mode === "truthy") return { confirmed: "yes" } as never;
+        } } }),
+      });
+    }
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    const first = await runtime.stopAllRetainedSubagents();
+    const repeated = await runtime.stopAllRetainedSubagents();
+    expect(first).toMatchObject({ confirmed: 0, unconfirmed: modes.length });
+    expect(repeated.outcomes).toEqual(first.outcomes.map((outcome) => ({ ...outcome, stopRequested: false })));
+    expect([...calls.values()]).toEqual([1, 1, 1, 1]);
+    for (const record of registry.list()) {
+      expect(record).toMatchObject({ checkpointQuarantined: true, checkpointPaused: true });
+    }
   });
 
   it("fails closed on a terminal pending assistant response without retrying or reporting completion", async () => {

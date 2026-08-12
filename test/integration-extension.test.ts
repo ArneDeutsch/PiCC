@@ -2655,13 +2655,13 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     await expect(sub1Stop.execute("r3", { task_id: coordTaskId })).rejects.toThrow(/Unknown task_id/);
 
     // Non-leak: an "unknown id" message echoes the QUERIED id back (the caller's
-    // own input — no leak) but its "Known background tasks" list must reveal only
+    // own input — no leak) but its "Known task/report ids" list must reveal only
     // subagent1's OWN task, never the coordinator's or the sibling's id.
     const errMsg = (r: Promise<unknown>) => r.then(() => "", (e: Error) => e.message);
     const foreignRefusal = await errMsg(
       sub1Output.execute("r4", { task_id: coordTaskId, wait: false }),
     );
-    const knownList = foreignRefusal.split("Known background tasks:")[1] ?? "";
+    const knownList = foreignRefusal.split("Known task/report ids:")[1] ?? "";
     expect(knownList).toContain(ownTaskId1!);
     expect(knownList).not.toContain(coordTaskId);
     expect(knownList).not.toContain(siblingTaskId!);
@@ -2671,7 +2671,7 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     const unknownRefusal = await errMsg(
       sub1Output.execute("r4b", { task_id: "task-99999", wait: false }),
     );
-    expect(unknownRefusal.split("Known background tasks:")[1] ?? "").toBe(knownList);
+    expect(unknownRefusal.split("Known task/report ids:")[1] ?? "").toBe(knownList);
 
     // No side effect: the refused TaskStop did not stop the coordinator's task.
     expect(internals.backgroundTasks.get(coordTaskId)?.status).not.toBe("stopped");
