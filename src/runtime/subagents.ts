@@ -985,6 +985,7 @@ class ChildCheckpointCoordinator {
       sessionId: handoff.sessionId,
       generation: handoff.generation,
       token: handoff.token,
+      sessionDisposition: "reusable",
       resolutions: handoff.retained.map((shadow) => ({ id: shadow.id, disposition: "reported" as const })),
     };
   }

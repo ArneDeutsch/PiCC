@@ -612,11 +612,13 @@ excludes; project configuration overrides user configuration):
   retained-input record. Cancelling a subagent checkpoint aborts its compaction. Quota, authentication, cancellation,
   deterministic provider errors, and PreCompact policy blocks are not made broadly retryable. If
   compaction or mandatory restoration cannot complete, work remains paused rather than continuing
-  near the limit. In live RPC, use the reported counts and stage together with client/request history,
-  inspect possible effects, then deliberately resubmit; the RPC session remains reusable only after
-  every occurrence has surviving custody. Print and JSON are partial, use status 3, and require the
-  caller to recover input from its own request history. A non-reusable RPC ending also uses status 3;
-  a reusable live RPC cancellation does not. A sink failure leaves custody unresolved and
+  near the limit. Live RPC cancellation during post-compaction retained replay is unsupported: Pi
+  0.83 may drain native queued input before PiCC can present the cancellation. If PiCC does present
+  it, use the reported counts and stage with client/request history, inspect possible effects, then
+  terminate PiCC and start a fresh process and fresh session; never deliberately resubmit in the
+  affected RPC session. The action is `restart-process` and status is 3. Print and JSON are likewise
+  partial/nonzero, but use `retrieve-and-relaunch` and require the caller to recover input from its
+  own request history. A sink failure leaves custody unresolved and
   refuses retry rather than guessing; failure to show a decorative TUI notice does not undo successful
   editor or report custody.
 
@@ -627,7 +629,7 @@ excludes; project configuration overrides user configuration):
   input a checkpoint could not deliver — and Pi-owned stdout does not prove the logical work
   completed. The process status does report one thing: outside the TUI, a **main-session**
   checkpoint PiCC reports as paused or cancelled sets exit status **3** in print and JSON modes and
-  for a non-reusable RPC ending. A reusable live RPC cancellation does not set it. This is distinct
+  for every presented live-RPC post-compaction cancellation. This is distinct
   from `0` and from the status Pi's own print-mode failures use, so a scripted caller can tell
   "finished" from "gave up" without reading prose. It is latched for the rest of the process and never cleared: later recovery
   does not turn the earlier partial paused/cancelled outcome into a one-shot success. A subagent
@@ -647,9 +649,10 @@ excludes; project configuration overrides user configuration):
 
   JSON and RPC expose uncorrelated `picc-checkpoint-lifecycle` custom entries: category
   `checkpoint-exhausted` marks a paused boundary, `checkpoint-cancelled` marks a cancelled checkpoint
-  and its action says whether a live RPC session is reusable, `checkpoint-resumed` marks resumed work, and
-  `checkpoint-manual-compaction-refused` gives restart-process guidance only when manual compaction
-  is refused because an unconfirmed-host ending made the process terminal.
+  (`restart-process` for live RPC post-compaction cancellation), `checkpoint-resumed` marks resumed work, and
+  `checkpoint-manual-compaction-refused` gives restart-process guidance when either authenticated
+  RPC cancellation or unconfirmed host work made the process terminal. In-process `/new`, `/resume`,
+  `/fork`, and `/reload` are refused; terminate PiCC and start a fresh process and fresh session.
   Read `checkpoint-resumed`
   as superseded by any later terminal record for the same run — resumed work can still fail after
   it, and the terminal record is then the last word. An RPC prompt acknowledgement is not a
@@ -906,7 +909,7 @@ behaviors worth knowing:
 | MCP pending-approval notice at every startup | Review the pending servers and choose approval or decline under [MCP server settings](#6-security--permission-posture). Use `/mcp` for bounded status and settings guidance, or `/doctor` for broader compatibility findings. |
 | Managed MCP policy is fail closed or a repaired policy is not taking effect | Use `/mcp` or `/doctor` to inspect the reported authority, compiler observations, and any redacted source label. Ask the administrator to repair either the platform-fixed standalone `managed-mcp.json` or the reported managed-settings system file or ordered drop-in. Then use `/reload` or restart PiCC; `/new` does not reload policy. |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
-| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the session was persisted and its process exited, reopen that exact session before `/compact`; a one-shot ephemeral print/JSON session cannot be reopened, so start a replacement session and resend retained input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from client/request history, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; print, JSON, and non-reusable RPC endings use status **3**, while a reusable live RPC cancellation does not. |
+| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the session was persisted and its process exited, reopen that exact session before `/compact`; a one-shot ephemeral print/JSON session cannot be reopened, so start a replacement session and resend retained input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from client/request history, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. Any presented post-compaction RPC cancellation is terminal: recover input from client/request history, inspect possible effects, terminate PiCC, and start a fresh process and fresh session without reopening or resubmitting in the affected session. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; print, JSON, and presented post-compaction RPC cancellation use status **3**. |
 | `picc -p` exited with status **3** | A main-session checkpoint ended partially or was abandoned; resumed work may already have started, and files, tools, or external effects may exist. Treat stdout as partial, inspect the lifecycle stage in the `PiCC: ` stderr line or `picc-checkpoint-lifecycle` JSON/RPC entry, and follow its recovery guidance before resubmitting. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |

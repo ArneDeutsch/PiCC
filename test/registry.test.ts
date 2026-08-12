@@ -371,6 +371,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(proactive).toContain("feature.compaction-summary-recovery");
     expect(proactive).toMatch(/exact aborted terminal object identity followed by same-run selected-branch settlement/);
     expect(proactive).toMatch(/TUI steering\/follow-up\/draft order and no automatic replay/);
+    expect(proactive).toMatch(/Live RPC post-compaction retained-replay cancellation is unsupported/);
+    expect(proactive).toMatch(/distinct confirmed restart-required terminal category/);
+    expect(proactive).toMatch(/restart-process with status 3, leaves controller admission closed, refuses in-process new\/resume\/fork\/reload replacement/);
+    expect(proactive).toMatch(/requires an external fresh PiCC process plus fresh session/);
+    expect(proactive).toMatch(/Pi may drain those queues before PiCC can present the outcome/);
+    expect(proactive).not.toMatch(/TUI and live RPC may remain reusable|reusable live RPC cancellation/);
     expect(proactive).toMatch(/canonical report shared by all consumers/);
     expect(proactive).toMatch(/ambiguous records remain quarantined/);
     expect(proactive).not.toMatch(

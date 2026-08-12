@@ -366,8 +366,13 @@ where to start reading, not the extent of its cluster.
   exhaustion remains recoverable in-session. After a committed summary, the only safe cancellation
   exception is an exact aborted assistant terminal followed by settlement of that same selected-branch
   message: the main TUI restores text to the editor, while child input becomes one canonical retained
-  report. Every other post-commit restoration, replay, provider/tool, or continuation failure remains
-  terminal. `SubagentRegistry` is the sole report and quarantine authority; `TaskOutput`, foreground
+  report. The main-session reuse exception is TUI-only. Pi 0.83 RPC abort does not reclaim native
+  queued input, so any authenticated live-RPC cancellation outcome leaves the shared controller
+  exhausted with admission closed, requires status 3 and external PiCC process plus session
+  replacement, and never permits same-session resubmission. Pi may drain the queues
+  before PiCC can present that outcome; PiCC does not intercept or purge them. Every other
+  post-commit restoration, replay, provider/tool, or continuation failure remains terminal.
+  `SubagentRegistry` is the sole report and quarantine authority; `TaskOutput`, foreground
   Agent/Task results, settlement notices, and the panel all consume that same immutable report identity.
   Unconfirmed child records stay quarantined and cannot be stopped, disposed, or released twice.
   If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
@@ -536,9 +541,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    is diagnostic-only, while universal hook stop closes the committed-summary session. Confirmed
    pre-commit operational or hook exhaustion leaves admission paused and recoverable. An exact
    aborted-terminal/same-branch settlement after resume may instead reconcile retained main input
-   without replaying work; all ambiguous or other post-commit failures close the session and require
-   replacement. An unconfirmed-host ending is process-terminal:
-   neither manual recovery nor in-process replacement is safe. Pi's internally
+   without replaying work in the TUI. A presented live-RPC outcome requires terminating PiCC and
+   starting a fresh process and fresh session; print and JSON remain partial/nonzero
+   retrieve-and-relaunch outcomes. The authenticated RPC ending is process-terminal despite confirmed
+   quiescence: neither manual recovery nor in-process new/resume/fork/reload replacement is safe. All
+   ambiguous or other post-commit failures close the session and require replacement. An
+   unconfirmed-host ending is likewise process-terminal. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
    only at a successfully completed logical settlement boundary; logically unsuccessful outcomes
    bypass ordinary Stop handling. `session_shutdown` joins checkpoint work and shuts down the MCP

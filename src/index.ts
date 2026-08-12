@@ -97,6 +97,7 @@ import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-t
 import {
   MainSessionCheckpointGate,
   UnconfirmedHostDeadlineError,
+  RESTART_REQUIRED_RECOVERY_GUIDANCE,
   UNCONFIRMED_HOST_RECOVERY_GUIDANCE,
   callbackCompactionAttempt,
   type CheckpointProgress,
@@ -1943,6 +1944,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const unconfirmedHostText =
     `PiCC could not confirm that checkpoint host work stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+  const restartRequiredText =
+    `This authenticated RPC checkpoint cancellation is terminal in the current process. ${RESTART_REQUIRED_RECOVERY_GUIDANCE}`;
 
   const postCommitFailureText = (stage: CheckpointProgress["stage"]): string => {
     if (stage === "restoration") {
@@ -2126,6 +2129,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const controller = mainCheckpointGate.currentController();
     const cancelledText = (): string => {
       const snapshot = controller.snapshot();
+      if (snapshot.failureCategory === "restart-required") return restartRequiredText;
       if (snapshot.failureCategory === "unconfirmed-host") return unconfirmedHostText;
       switch (cancelledCheckpointOutlook(snapshot)) {
         case "unconfirmed": return unconfirmedHostText;
@@ -2211,14 +2215,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : persisted
           ? `If this process exits, reopen the exact persisted session (${session}) before /compact. Run /compact, then explicitly continue.`
           : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
-    const cancellationOutcome = event.category === "checkpoint-cancelled" && event.action === "session-reusable" &&
+    const cancellationOutcome = event.category === "checkpoint-cancelled" &&
       resumedCancellationOutcome?.generation === event.generation ? resumedCancellationOutcome : undefined;
-    const reusableSurface = mode === "tui" || mode === "rpc";
-    const presentedAction = cancellationOutcome && !reusableSurface ? "retrieve-and-relaunch" : event.action;
+    const presentedAction = cancellationOutcome
+      ? mode === "tui" ? "session-reusable"
+        : mode === "rpc" ? "restart-process"
+          : "retrieve-and-relaunch"
+      : event.action;
     const retainedSource = cancellationOutcome?.retainedRecordAccessible
       ? "client/request history and the retained-input record" : "client/request history";
     const text = cancellationOutcome
-      ? `Authenticated resumed cancellation settled: action=${presentedAction}, stage=${cancellationOutcome.stage}, ${cancellationOutcome.restoredCount} restored, ${cancellationOutcome.reportedCount} reported, ${cancellationOutcome.unresolvedCount} unresolved, ${cancellationOutcome.nonTextCount} non-text. No additional continuation or retained-input replay was started after cancellation. The first resumed continuation had already started, so prior files, tools, or external effects may exist; inspect them before deliberate resubmission.${mode === "rpc" ? ` Recover retained input from ${retainedSource} before deliberate resubmission.` : reusableSurface ? "" : ` Recover retained input from ${retainedSource}, then start a fresh request/session deliberately.`}`
+      ? mode === "rpc"
+        ? `Authenticated resumed cancellation was observed, but live RPC recovery is unsupported: action=${presentedAction}, stage=${cancellationOutcome.stage}, ${cancellationOutcome.restoredCount} restored, ${cancellationOutcome.reportedCount} reported, ${cancellationOutcome.unresolvedCount} unresolved, ${cancellationOutcome.nonTextCount} non-text. The first resumed continuation and native queued input may already have produced later turns, files, tool calls, or external effects. Recover retained input from ${retainedSource}, inspect client/request history and effects, then terminate PiCC and start a fresh process and fresh session; do not deliberately resubmit in this RPC session.`
+        : `Authenticated resumed cancellation settled: action=${presentedAction}, stage=${cancellationOutcome.stage}, ${cancellationOutcome.restoredCount} restored, ${cancellationOutcome.reportedCount} reported, ${cancellationOutcome.unresolvedCount} unresolved, ${cancellationOutcome.nonTextCount} non-text. No additional continuation or retained-input replay was started after cancellation. The first resumed continuation had already started, so prior files, tools, or external effects may exist; inspect them before deliberate resubmission.${mode === "tui" ? "" : ` Recover retained input from ${retainedSource}, then start a fresh request/session deliberately.`}`
       : headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
     if (surface === "tui") {
       try {
@@ -2281,8 +2290,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // status left — and Pi's interactive quit calls `process.exit(0)` explicitly, so a
     // status set from a stale TUI context cannot leak out of an interactive run.
     if ((mode === "print" || mode === "json" || mode === "rpc" || mode === undefined) &&
-        (event.category === "checkpoint-exhausted" || event.category === "checkpoint-cancelled") &&
-        !(event.action === "session-reusable" && mode === "rpc")) {
+        (event.category === "checkpoint-exhausted" || event.category === "checkpoint-cancelled")) {
       process.exitCode = CHECKPOINT_GAVE_UP_EXIT_CODE;
     }
     if (cancellationOutcome) resumedCancellationOutcome = undefined;
@@ -2344,9 +2352,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         })),
         restoredTextCount: editorCustody ? textById.size : 0,
         nonTextCount: handoff.retained.length - textById.size,
-        notice: mode !== "tui"
-          ? "Retained input was not auto-replayed. Retrieve accepted input from client/request history and this session record, inspect possible existing files, tools, and external effects, then deliberately resubmit if appropriate."
-          : "Retained input was not auto-replayed. Inspect possible existing files, tools, and external effects before deliberate resubmission.",
+        notice: mode === "rpc"
+          ? "Retained input may still exist in Pi's native RPC queues. Retrieve accepted input from client/request history and this session record, inspect possible existing files, tools, and external effects, then terminate PiCC and start a fresh process and fresh session; do not resubmit in this RPC session."
+          : mode !== "tui"
+            ? "Retained input was not auto-replayed. Retrieve accepted input from client/request history and this session record, inspect possible existing files, tools, and external effects, then deliberately resubmit if appropriate."
+            : "Retained input was not auto-replayed. Inspect possible existing files, tools, and external effects before deliberate resubmission.",
       });
       reportCustody = true;
     } catch {
@@ -2374,6 +2384,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       sessionId: handoff.sessionId,
       generation: handoff.generation,
       token: handoff.token,
+      sessionDisposition: mode === "tui" ? "reusable" : mode === "rpc" ? "restart-required" : "terminal",
       resolutions: handoff.retained.map((shadow) => ({ id: shadow.id, disposition: resolutions.get(shadow.id)! })),
     };
   };
@@ -3336,15 +3347,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const result = await mainCheckpointGate.beforeSessionSwitch();
     if (result?.cancel) {
       if (mainCheckpointGate.currentController().isProcessTerminal()) {
+        const terminalSnapshot = mainCheckpointGate.currentController().snapshot();
+        const notice = terminalSnapshot.failureCategory === "restart-required"
+          ? restartRequiredText : unconfirmedHostText;
         const surface = checkpointSurface(ctx);
         try {
-          if (surface === "tui") ctx.ui?.notify?.(unconfirmedHostText, "error");
-          else if (surface === "print" || surface === "stderr") console.error(`PiCC: ${unconfirmedHostText}`);
+          if (surface === "tui") ctx.ui?.notify?.(notice, "error");
+          else if (surface === "print" || surface === "stderr") console.error(`PiCC: ${notice}`);
         } catch { /* presentation only */ }
         appendCheckpointEntry({
           category: "checkpoint-session-switch-refused",
           action: "restart-process",
-          notice: unconfirmedHostText,
+          notice,
         });
       }
     } else {
@@ -3360,6 +3374,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_start", async (event: any, ctx: any) => {
+    const startController = mainCheckpointGate.currentController();
+    if (startController.isProcessTerminal()) {
+      const notice = startController.snapshot().failureCategory === "restart-required"
+        ? restartRequiredText : unconfirmedHostText;
+      const surface = checkpointSurface(ctx);
+      try {
+        if (surface === "tui") ctx.ui?.notify?.(notice, "error");
+        else if (surface === "print" || surface === "stderr") console.error(`PiCC: ${notice}`);
+      } catch { /* presentation only */ }
+      appendCheckpointEntry({
+        category: "checkpoint-session-start-refused",
+        action: "restart-process",
+        notice,
+      });
+      throw new Error(notice);
+    }
     let branch: unknown;
     try {
       branch = ctx.sessionManager?.getBranch?.();
@@ -3573,7 +3603,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         throw new Error(`Main checkpoint shutdown custody could not be confirmed. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`, { cause: error });
       }
       const mainShutdown = mainCheckpointGate.currentController().snapshot();
-      if (mainCheckpointGate.currentController().isProcessTerminal()) {
+      if (mainShutdown.failureCategory === "unconfirmed-host" ||
+          mainShutdown.cancellationQuiescence === "unconfirmed") {
         throw new UnconfirmedHostDeadlineError();
       }
       if ((mainShutdown.cancellationKind === "shutdown" && mainShutdown.cancellationCommitted &&
@@ -4522,6 +4553,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   ): void => {
     const snapshot = controller.snapshot();
     const cancelledReason = (): string => {
+      if (snapshot.failureCategory === "restart-required") {
+        return `authenticated RPC cancellation cannot be recovered or replaced in this process. ${RESTART_REQUIRED_RECOVERY_GUIDANCE}`;
+      }
       if (snapshot.failureCategory === "unconfirmed-host") {
         return `checkpoint host work could not be confirmed stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
       }

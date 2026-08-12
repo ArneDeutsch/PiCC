@@ -2212,6 +2212,20 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   let sdk: ReturnType<typeof fakeSdk>;
   let duringForkDispatch: ((prompt: string) => Promise<void>) | undefined;
   const integrationDeadlines = manualDeadlineClock();
+  const installFreshExtension = async (): Promise<void> => {
+    pi = fakePi();
+    picc(pi.api as never, {
+      sdk: sdk.sdk,
+      onInitializationSettled: pi.captureInitialization,
+      checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
+      onWired: (internals) => {
+        mainCheckpointGate = internals.mainCheckpointGate;
+        inputHooks = internals.inputHooks;
+      },
+    });
+    await pi.waitForInitialization();
+    await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+  };
   const originalCwd = process.cwd();
   const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
@@ -2310,18 +2324,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         return "scoped fork completed";
       },
     });
-    pi = fakePi();
-    picc(pi.api as never, {
-      sdk: sdk.sdk,
-      onInitializationSettled: pi.captureInitialization,
-      checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
-      onWired: (internals) => {
-        mainCheckpointGate = internals.mainCheckpointGate;
-        inputHooks = internals.inputHooks;
-      },
-    });
-    await pi.waitForInitialization();
-    await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    await installFreshExtension();
   });
 
   afterAll(() => {
@@ -3669,19 +3672,37 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("session_start", { reason: "startup" }, ctx);
   });
 
-  it.each(["print", "json", "rpc"] as const)(
-    "keeps only live RPC reusable after authenticated resumed cancellation in %s mode",
-    async (mode) => {
+  it.each([
+    { mode: "print", retainedReportFailure: false },
+    { mode: "json", retainedReportFailure: false },
+    { mode: "rpc", retainedReportFailure: false },
+    { mode: "rpc", retainedReportFailure: true },
+  ] as const)(
+    "keeps only TUI reusable after authenticated resumed cancellation in $mode mode (report failure: $retainedReportFailure)",
+    async ({ mode, retainedReportFailure }) => {
       const savedExitCode = process.exitCode;
       process.exitCode = undefined;
       let branch: any[] = [];
+      let providerAborts = 0;
+      let retainedReportAttempts = 0;
+      const extension = pi;
+      const originalAppendEntry = extension.api.appendEntry as (customType: string, data: unknown) => void;
+      if (retainedReportFailure) {
+        extension.api.appendEntry = (customType: string, data: unknown) => {
+          if (customType === "picc-checkpoint-retained-input") {
+            retainedReportAttempts += 1;
+            throw new Error("retained report unavailable");
+          }
+          originalAppendEntry(customType, data);
+        };
+      }
       const base = {
         model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
         getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
         hasPendingMessages: () => false,
         sessionManager: { getBranch: () => branch },
         compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
-        abort: () => undefined,
+        abort: () => { providerAborts += 1; },
       };
       const ctx = mode === "rpc" ? pi.rpcCtx(base)
         : mode === "json" ? pi.printCtx({ ...base, mode: "json" }) : pi.printCtx(base);
@@ -3717,26 +3738,86 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         await pi.fire("agent_settled", {}, ctx);
         await outer;
 
-        expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+        expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+          phase: "exhausted", admission: "closed",
+          queuedInputs: retainedReportFailure ? 1 : 0,
+          failureCategory: mode === "rpc" ? "restart-required" : "restoration-paused",
+          stage: "resumed-cancellation",
+        });
         const lifecycleRecords = pi.entries.filter((entry) =>
           entry.customType === "picc-checkpoint-lifecycle" && entry.data.category === "checkpoint-cancelled");
         const retainedRecords = pi.entries.filter((entry) =>
           entry.customType === "picc-checkpoint-retained-input");
         expect(lifecycleRecords).toHaveLength(1);
-        expect(retainedRecords).toHaveLength(1);
-        expect(retainedRecords[0]?.data).toMatchObject({ nonTextCount: 1 });
+        expect(retainedRecords).toHaveLength(retainedReportFailure ? 0 : 1);
+        if (!retainedReportFailure) {
+          expect(retainedRecords[0]?.data).toMatchObject({ nonTextCount: 1 });
+        }
+        expect(retainedReportAttempts).toBe(retainedReportFailure ? 1 : 0);
         const lifecycle = lifecycleRecords[0]?.data;
         expect(lifecycle).toMatchObject({
-          action: mode === "rpc" ? "session-reusable" : "retrieve-and-relaunch",
-          stage: "resumed-cancellation", restoredCount: 0, reportedCount: 1,
-          unresolvedCount: 0, nonTextCount: 1,
-          retainedInputSource: mode === "rpc"
+          action: mode === "rpc" ? "restart-process" : "retrieve-and-relaunch",
+          stage: "resumed-cancellation", restoredCount: 0,
+          reportedCount: retainedReportFailure ? 0 : 1,
+          unresolvedCount: retainedReportFailure ? 1 : 0, nonTextCount: 1,
+          retainedInputSource: mode === "rpc" && !retainedReportFailure
             ? "client/request history and the retained-input session record"
             : "client/request history",
         });
         expect(String(lifecycle?.notice)).toContain("client/request history");
-        expect(process.exitCode).toBe(mode === "rpc" ? undefined : 3);
+        expect(process.exitCode).toBe(3);
+        if (mode === "rpc") {
+          expect(String(lifecycle?.notice)).toContain("terminate PiCC and start a fresh process and fresh session");
+          expect(String(lifecycle?.notice)).toContain("native queued input may already have produced later turns");
+          expect(String(lifecycle?.notice)).not.toContain("No additional continuation or retained-input replay");
+          if (retainedReportFailure) {
+            expect(String(lifecycle?.notice)).toContain("1 unresolved");
+            expect(String(lifecycle?.notice)).toContain("Recover retained input from client/request history");
+            expect(String(lifecycle?.notice)).not.toContain("client/request history and the retained-input record");
+          } else {
+            expect(String(retainedRecords[0]?.data.notice)).toContain("do not resubmit in this RPC session");
+          }
+          expect(pi.entries.some((entry) => entry.data.action === "session-reusable")).toBe(false);
+          const hostMessagesBeforePrompt = pi.messages.length;
+          const userMessagesBeforePrompt = pi.userMessages.length;
+          await expect(pi.fire("input", {
+            text: "later RPC prompt", source: "rpc", streamingBehavior: undefined,
+          }, ctx)).resolves.toEqual({ action: "handled" });
+          const abortsBeforeProvider = providerAborts;
+          await pi.fire("before_provider_request", {}, ctx);
+          expect(providerAborts).toBe(abortsBeforeProvider + 1);
+          expect(pi.messages).toHaveLength(hostMessagesBeforePrompt);
+          expect(pi.userMessages).toHaveLength(userMessagesBeforePrompt);
+          expect(process.exitCode).toBe(3);
+          expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+            phase: "exhausted", admission: "closed", failureCategory: "restart-required",
+          });
+          expect(mainCheckpointGate.currentController().isProcessTerminal()).toBe(true);
+          expect(pi.entries.some((entry) => entry.data.action === "session-reusable")).toBe(false);
+
+          await expect(pi.fire("session_before_switch", {}, ctx)).resolves.toEqual({ cancel: true });
+          const switchRefusal = pi.entries.find((entry) =>
+            entry.data.category === "checkpoint-session-switch-refused");
+          expect(switchRefusal?.data).toMatchObject({ action: "restart-process" });
+          expect(String(switchRefusal?.data.notice)).toContain("fresh process and fresh session");
+          expect(String(switchRefusal?.data.notice)).not.toContain("could not confirm");
+
+          for (const reason of ["new", "resume", "fork", "reload"] as const) {
+            await expect(pi.fire("session_start", { reason }, ctx))
+              .rejects.toThrow(/fresh process and fresh session/u);
+          }
+          expect(pi.entries.filter((entry) =>
+            entry.data.category === "checkpoint-session-start-refused")).toHaveLength(4);
+          expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+            phase: "exhausted", failureCategory: "restart-required",
+          });
+          await expect(pi.fire("session_shutdown", { reason: "quit" }, ctx)).resolves.toBeUndefined();
+          extension.api.appendEntry = originalAppendEntry;
+          // The remaining cases model later processes in this long-lived fake extension owner.
+          await installFreshExtension();
+        }
       } finally {
+        extension.api.appendEntry = originalAppendEntry;
         process.exitCode = savedExitCode;
       }
     },

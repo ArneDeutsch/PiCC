@@ -31,6 +31,7 @@ export type CompactionFailureCategory =
   | "cancelled"
   | "hook-blocked"
   | "restoration-paused"
+  | "restart-required"
   | "unconfirmed-host"
   | "stale-generation"
   | "shutdown";
@@ -54,10 +55,10 @@ export interface QueuedInputShadow {
 }
 
 /**
- * What the reader can still do after this ending. `session-ended` and `restart-process`
- * exist because "start a new session" is false for a session that is shutting down and
- * for a cancellation whose join never confirmed the host went quiet — the latter leaves
- * a controller that refuses replacement as well as recovery.
+ * What the reader can still do after this ending. `session-ended` exists when the host
+ * session is shutting down. `restart-process` also covers confirmed cancellation on a
+ * surface whose adapter forbids session reuse; its controller remains closed without
+ * classifying the confirmed join as unconfirmed-host.
  */
 export type CheckpointAction =
   | "resume"
@@ -176,6 +177,8 @@ export interface CancelledInputResolution {
   readonly sessionId: string;
   readonly generation: number;
   readonly token: object;
+  /** Whether confirmed custody permits reuse, ordinary one-shot termination, or requires a fresh process. */
+  readonly sessionDisposition: "reusable" | "terminal" | "restart-required";
   readonly resolutions: readonly CancelledInputResolutionEntry[];
 }
 
@@ -203,6 +206,8 @@ export const MAIN_CALLBACK_COMPACTION_DEADLINE_MS = 5 * 60 * 1000;
 export const RESUMED_RUN_JOIN_DEADLINE_MS = 30 * 1000;
 export const UNCONFIRMED_HOST_RECOVERY_GUIDANCE =
   "In the TUI, copy any restored draft before exiting; in headless modes, recover input from client/request history. Then exit PiCC completely, start a fresh PiCC process and a fresh session, do not reopen the affected session, and resend it.";
+export const RESTART_REQUIRED_RECOVERY_GUIDANCE =
+  "Recover retained input from RPC client/request history, inspect possible files, tools, later turns, and external effects, then terminate PiCC and start a fresh process and fresh session; do not reopen or replace the session in this process.";
 
 export interface HostDeadlineTimer {
   clear(): void;
@@ -443,7 +448,8 @@ export class MidRunCompactionController {
       checkpointAbortRequested: this.checkpointAbortRequested,
       queuedInputs: this.queue.length,
       admission: this.phase === "exhausted"
-        ? this.terminalFailure === "restoration-paused" || this.terminalFailure === "unconfirmed-host"
+        ? this.terminalFailure === "restoration-paused" || this.terminalFailure === "restart-required" ||
+          this.terminalFailure === "unconfirmed-host"
           ? "closed" : "recoverable-rejection"
         : this.phase === "cancelled"
           ? "closed"
@@ -648,7 +654,7 @@ export class MidRunCompactionController {
     if (this.phase === "idle") return "accept";
     if (this.phase === "exhausted") {
       if (this.terminalFailure === "restoration-paused") return "reject-restoration";
-      if (this.terminalFailure === "unconfirmed-host" || !this.recovery) return "reject-closed";
+      if (this.terminalFailure === "restart-required" || this.terminalFailure === "unconfirmed-host" || !this.recovery) return "reject-closed";
       return "reject-recoverable";
     }
     if (this.phase === "cancelled") return "reject-closed";
@@ -661,7 +667,8 @@ export class MidRunCompactionController {
   }
 
   isProcessTerminal(): boolean {
-    return (this.phase === "exhausted" && this.terminalFailure === "unconfirmed-host") ||
+    return (this.phase === "exhausted" &&
+      (this.terminalFailure === "restart-required" || this.terminalFailure === "unconfirmed-host")) ||
       (this.phase === "cancelled" && this.cancellation?.quiescence === "unconfirmed");
   }
 
@@ -1215,20 +1222,45 @@ export class MidRunCompactionController {
     }
     this.clearResumeAuthority();
 
-    if (validated.authenticated && this.queue.length === 0) {
-      this.phase = "idle";
-      this.committedGeneration = undefined;
-      this.terminalFailure = undefined;
-      this.terminalStage = undefined;
-      this.hostAdmissionRevoked = false;
+    if (validated.authenticated && validated.sessionDisposition === "restart-required") {
+      this.phase = "exhausted";
+      this.terminalFailure = "restart-required";
+      this.terminalStage = "resumed-cancellation";
+      this.hostAdmissionRevoked = true;
       this.emit("checkpoint-cancelled", request.generation, {
-        action: "session-reusable",
-        failureCategory: "restoration-paused",
+        action: "restart-process",
+        failureCategory: "restart-required",
         stage: "resumed-cancellation",
       });
       return;
     }
+    if (validated.authenticated && this.queue.length === 0) {
+      if (validated.sessionDisposition === "reusable") {
+        this.phase = "idle";
+        this.committedGeneration = undefined;
+        this.terminalFailure = undefined;
+        this.terminalStage = undefined;
+        this.hostAdmissionRevoked = false;
+        this.emit("checkpoint-cancelled", request.generation, {
+          action: "session-reusable",
+          failureCategory: "restoration-paused",
+          stage: "resumed-cancellation",
+        });
+      } else {
+        this.phase = "exhausted";
+        this.terminalFailure = "restoration-paused";
+        this.terminalStage = "resumed-cancellation";
+        this.hostAdmissionRevoked = true;
+        this.emit("checkpoint-cancelled", request.generation, {
+          action: "restart-process",
+          failureCategory: "restoration-paused",
+          stage: "resumed-cancellation",
+        });
+      }
+      return;
+    }
     this.phase = "exhausted";
+    this.terminalFailure = "restoration-paused";
     this.terminalStage = "cancellation-join";
     this.emit("checkpoint-exhausted", request.generation, {
       action: "new-session",
@@ -1264,26 +1296,35 @@ export class MidRunCompactionController {
   private validateCancelledInputResolution(
     handoff: CancelledInputHandoff,
     resolution: CancelledInputResolution | undefined,
-  ): { authenticated: boolean; dispositions: ReadonlyMap<number, CancelledInputDisposition> } {
+  ): {
+    authenticated: boolean;
+    sessionDisposition: "reusable" | "terminal" | "restart-required";
+    dispositions: ReadonlyMap<number, CancelledInputDisposition>;
+  } {
     const unresolved = new Map(handoff.retained.map((entry) => [entry.id, "unresolved" as const]));
     try {
       if (!resolution || resolution.sessionId !== handoff.sessionId || resolution.generation !== handoff.generation ||
-          resolution.token !== handoff.token || !Array.isArray(resolution.resolutions)) {
-        return { authenticated: false, dispositions: unresolved };
+          resolution.token !== handoff.token ||
+          (resolution.sessionDisposition !== "reusable" && resolution.sessionDisposition !== "terminal" &&
+            resolution.sessionDisposition !== "restart-required") ||
+          !Array.isArray(resolution.resolutions)) {
+        return { authenticated: false, sessionDisposition: "terminal", dispositions: unresolved };
       }
       const expected = new Set(handoff.retained.map((entry) => entry.id));
       const validated = new Map<number, CancelledInputDisposition>();
       for (const entry of resolution.resolutions) {
         if (!entry || typeof entry !== "object" || !expected.has(entry.id) || validated.has(entry.id) ||
             (entry.disposition !== "restored" && entry.disposition !== "reported" && entry.disposition !== "unresolved")) {
-          return { authenticated: false, dispositions: unresolved };
+          return { authenticated: false, sessionDisposition: "terminal", dispositions: unresolved };
         }
         validated.set(entry.id, entry.disposition);
       }
-      if (validated.size !== expected.size) return { authenticated: false, dispositions: unresolved };
-      return { authenticated: true, dispositions: validated };
+      if (validated.size !== expected.size) {
+        return { authenticated: false, sessionDisposition: "terminal", dispositions: unresolved };
+      }
+      return { authenticated: true, sessionDisposition: resolution.sessionDisposition, dispositions: validated };
     } catch {
-      return { authenticated: false, dispositions: unresolved };
+      return { authenticated: false, sessionDisposition: "terminal", dispositions: unresolved };
     }
   }
 
@@ -2453,6 +2494,10 @@ export class MainSessionCheckpointGate {
   private async cancelCurrent(kind: CancellationKind): Promise<void> {
     const snapshot = this.controller.snapshot();
     if (this.controller.isProcessTerminal()) {
+      if (snapshot.failureCategory === "restart-required" && kind === "shutdown") return;
+      if (snapshot.failureCategory === "restart-required") {
+        throw new Error(`Authenticated RPC checkpoint cancellation requires process replacement. ${RESTART_REQUIRED_RECOVERY_GUIDANCE}`);
+      }
       throw new Error(`Checkpoint host quiescence is unconfirmed. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`);
     }
     if (snapshot.phase !== "idle") await this.controller.cancel(snapshot.generation, kind);

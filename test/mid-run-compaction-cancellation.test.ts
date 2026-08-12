@@ -42,12 +42,16 @@ function arm(controller: MidRunCompactionController): number {
   return generation;
 }
 
-function resolution(handoff: CancelledInputHandoff, disposition: "restored" | "reported" | "unresolved" = "restored"):
-CancelledInputResolution {
+function resolution(
+  handoff: CancelledInputHandoff,
+  disposition: "restored" | "reported" | "unresolved" = "restored",
+  sessionDisposition: "reusable" | "terminal" | "restart-required" = "reusable",
+): CancelledInputResolution {
   return {
     sessionId: handoff.sessionId,
     generation: handoff.generation,
     token: handoff.token,
+    sessionDisposition,
     resolutions: handoff.retained.map((entry) => ({ id: entry.id, disposition })),
   };
 }
@@ -113,6 +117,64 @@ describe("settled resumed cancellation protocol", () => {
     expect(clock.pending()).toBe(false);
     expect(controller.snapshot()).toMatchObject({ phase: "idle", admission: "open" });
   });
+
+  it.each(["reported", "unresolved"] as const)(
+    "keeps an authenticated restart-required handoff process-terminal with %s retained custody",
+    async (disposition) => {
+      const progress: CheckpointProgress[] = [];
+      let context!: ResumeContext;
+      let controller!: MidRunCompactionController;
+      controller = new MidRunCompactionController({
+        sessionId: "rpc-session",
+        threshold: 90,
+        compact: async () => {
+          controller.observeCompactionCommit(controller.snapshot().generation);
+          return { ok: true };
+        },
+        resume: (candidate) => {
+          context = candidate;
+          return {
+            replay: async () => ({ delivered: true, pendingHostStart: true }),
+            cancelAndJoin: async () => {
+              expect(controller.resumedAborted(candidate.token)).toBe(true);
+              expect(controller.resumedSettled(candidate.token, "cancelled")).toBe(true);
+              return { ending: "aborted" as const };
+            },
+          };
+        },
+        cancelledInput: (handoff) => resolution(handoff, disposition, "restart-required"),
+        progress: (event) => progress.push(event),
+      });
+      const generation = arm(controller);
+      controller.shadowInput(generation, "retained", "followUp");
+      const checkpoint = controller.checkpoint(generation);
+      await waitUntil({ description: "terminal resume ownership", predicate: () => context !== undefined });
+
+      await expect(context.requestCancellation("user")).resolves.toEqual({ cancelled: true, rejected: [] });
+      await checkpoint;
+
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted",
+        admission: "closed",
+        queuedInputs: disposition === "unresolved" ? 1 : 0,
+        failureCategory: "restart-required",
+        stage: "resumed-cancellation",
+      });
+      expect(controller.isProcessTerminal()).toBe(true);
+      expect(controller.ordinaryInputDisposition()).toBe("reject-closed");
+      expect(controller.providerAdmissionAllowed(generation)).toBe(false);
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      expect(terminalActions(progress)).toEqual([
+        expect.objectContaining({
+          category: "checkpoint-cancelled",
+          action: "restart-process",
+          failureCategory: "restart-required",
+          stage: "resumed-cancellation",
+        }),
+      ]);
+      expect(progress.some((event) => event.action === "session-reusable")).toBe(false);
+    },
+  );
 
   it.each(["requested-first", "observed-first"] as const)(
     "converges %s duplicate and stale resumed requests on one owner",
