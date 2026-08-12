@@ -31,6 +31,8 @@ export interface MissingParentRequest {
 export interface CreatedParentEvidence { readonly temporaryPath: string; readonly finalPath: string; readonly dev: string; readonly ino: string }
 export interface TransactionParticipant {
   readonly kind: string;
+  /** Omission is the persisted backward-compatible replace effect. */
+  readonly effect?: "replace" | "delete";
   readonly key: string;
   readonly ownerKey: string;
   readonly scopeKey: string;
@@ -65,6 +67,8 @@ export interface TransactionProducerCodec<T = unknown> {
   readonly requiredLocks: (summary: unknown, participants: readonly TransactionParticipant[]) => StoreResult<readonly LifecycleLockIdentity[]>;
   /** Required for external participants and reconstructed from this trusted registry during recovery. */
   readonly authorizeExternal?: (context: ExternalMutationContext) => StoreResult<void | ExternalAuthorization> | Promise<StoreResult<void | ExternalAuthorization>>;
+  /** Required only for explicit PiCC-owned record deletion. */
+  readonly authorizeOwnedDelete?: (context: ExternalMutationContext) => StoreResult<void> | Promise<StoreResult<void>>;
 }
 export interface TransactionCodecRegistry { readonly lookup: (schema: string, version: number) => TransactionProducerCodec | undefined }
 function fail(code: string, message: string): StoreResult<never> { return { ok: false, code, message }; }
@@ -88,8 +92,8 @@ export function createTransactionCodecRegistry(codecs: readonly TransactionProdu
     if (!validCodecIdentity(codec.schema, codec.version) || typeof codec.decodeSummary !== "function" || typeof codec.validatePlan !== "function" || typeof codec.requiredLocks !== "function") return fail("invalid-codec", "Trusted transaction codec identity or callbacks are invalid");
     const key = `${codec.schema}\0${codec.version}`; if (map.has(key)) return fail("invalid-codec", "Trusted transaction codec identity is duplicated");
     const decodeSummary = codec.decodeSummary.bind(codec); const validatePlan = codec.validatePlan.bind(codec);
-    const requiredLocks = codec.requiredLocks.bind(codec); const authorizeExternal = codec.authorizeExternal?.bind(codec);
-    map.set(key, Object.freeze({ schema: codec.schema, version: codec.version, decodeSummary, validatePlan, requiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }) }));
+    const requiredLocks = codec.requiredLocks.bind(codec); const authorizeExternal = codec.authorizeExternal?.bind(codec); const authorizeOwnedDelete = codec.authorizeOwnedDelete?.bind(codec);
+    map.set(key, Object.freeze({ schema: codec.schema, version: codec.version, decodeSummary, validatePlan, requiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }) }));
   }
   return { ok: true, value: Object.freeze({ lookup: (schema: string, version: number) => map.get(`${schema}\0${version}`) }) };
 }
@@ -165,8 +169,9 @@ async function fileDigest(candidate: string): Promise<Sha256 | undefined> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
 
+function participantEffect(participant: TransactionParticipant): "replace" | "delete" { return participant.effect ?? "replace"; }
 function participantForDigest(participant: TransactionParticipant): unknown {
-  return { kind: participant.kind, key: participant.key, ownerKey: participant.ownerKey, scopeKey: participant.scopeKey,
+  return { kind: participant.kind, ...(participant.effect === undefined ? {} : { effect: participant.effect }), key: participant.key, ownerKey: participant.ownerKey, scopeKey: participant.scopeKey,
     targetPath: participant.targetPath, targetClass: participant.targetClass, precondition: participant.precondition,
     stagedPath: participant.stagedPath, stagedDigest: participant.stagedDigest, rollback: participant.rollback,
     producerEvidence: participant.producerEvidence, targetEvidence: participant.targetEvidence, stagedEvidence: participant.stagedEvidence,
@@ -193,8 +198,10 @@ async function normalizeParticipant(store: OwnedStateStore, raw: TransactionPart
       if (!samePath(await fs.realpath(request.canonicalAncestor), request.canonicalAncestor) || ancestor.dev.toString() !== request.ancestorDev || ancestor.ino.toString() !== request.ancestorIno) return fail("unsafe-target", "Missing-parent ancestor authority changed");
       try { await fs.lstat(request.path); return fail("unsafe-target", "A planned missing parent already exists"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
+    if (raw.effect !== undefined && raw.effect !== "replace" && raw.effect !== "delete") throw new Error("effect");
     if (raw.precondition.state !== "absent" && (raw.precondition.state !== "present" || !/^sha256:[a-f0-9]{64}$/.test(raw.precondition.digest))) throw new Error("precondition");
     if (raw.precondition.state === "absent" ? raw.rollback.kind !== "delete-new-target" : raw.rollback.kind !== "restore-backup" || raw.rollback.digest !== raw.precondition.digest) return fail("invalid-rollback", "CAS state and exact rollback evidence disagree");
+    if (raw.effect === "delete" && (raw.targetClass !== "owned" || raw.precondition.state !== "present" || raw.rollback.kind !== "restore-backup" || raw.stagedDigest !== raw.precondition.digest || raw.missingParent !== undefined || raw.generationId !== undefined)) return fail("invalid-participant", "Forward deletion requires one exact present PiCC-owned record and authentic prior-byte evidence");
     if (raw.targetClass === "generation" && (typeof raw.generationId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(raw.generationId))) return fail("invalid-participant", "Generation participant requires a bounded id");
     if (raw.targetClass !== "generation" && raw.generationId !== undefined) return fail("invalid-participant", "Generation ids are confined to the generation participant");
     const targetEvidence = raw.missingParent === undefined
@@ -245,8 +252,8 @@ export async function prepareTransaction<T>(inputs: { readonly store: OwnedState
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(inputs.operationId)) return fail("invalid-operation", "Operation id is invalid");
   if (inputs.targetAuthority !== undefined) return fail("unsafe-target", "Generic external authority cannot prepare a transaction");
   const decodeSummary = inputs.codec.decodeSummary.bind(inputs.codec); const validatePlan = inputs.codec.validatePlan.bind(inputs.codec);
-  const deriveRequiredLocks = inputs.codec.requiredLocks.bind(inputs.codec); const authorizeExternal = inputs.codec.authorizeExternal?.bind(inputs.codec);
-  const codecSnapshot: TransactionProducerCodec = Object.freeze({ schema: inputs.codec.schema, version: inputs.codec.version, decodeSummary, validatePlan, requiredLocks: deriveRequiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }) });
+  const deriveRequiredLocks = inputs.codec.requiredLocks.bind(inputs.codec); const authorizeExternal = inputs.codec.authorizeExternal?.bind(inputs.codec); const authorizeOwnedDelete = inputs.codec.authorizeOwnedDelete?.bind(inputs.codec);
+  const codecSnapshot: TransactionProducerCodec = Object.freeze({ schema: inputs.codec.schema, version: inputs.codec.version, decodeSummary, validatePlan, requiredLocks: deriveRequiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }) });
   const summaryClone = canonicalClone(inputs.confirmationSummary); if (!summaryClone.ok) return summaryClone;
   if (!decodeSummary(summaryClone.value).ok) return fail("invalid-summary", "Producer confirmation summary is invalid");
   const summaryBytes = canonicalJsonBytes(summaryClone.value); if (!summaryBytes.ok) return summaryBytes;
@@ -256,24 +263,31 @@ export async function prepareTransaction<T>(inputs: { readonly store: OwnedState
   if (new Set(normalized.map((item) => item.key)).size !== normalized.length || new Set(normalized.map((item) => process.platform === "win32" ? item.targetPath.toLowerCase() : item.targetPath)).size !== normalized.length) return fail("invalid-plan", "Participant keys and canonical targets must be unique");
   const generation = validateGenerationRelationship(normalized); if (!generation.ok) return generation;
   if (normalized.some((item) => item.targetClass === "external") && authorizeExternal === undefined) return fail("unsafe-target", "External participants require a reconstructible trusted producer callback");
+  if (normalized.some((item) => item.effect === "delete") && authorizeOwnedDelete === undefined) return fail("unsafe-target", "Owned deletion requires reconstructible trusted producer authority");
   if (!validatePlan(normalized).ok) return fail("invalid-plan", "Producer rejected the exact normalized plan");
   const locksResult = deriveRequiredLocks(summaryClone.value, normalized); if (!locksResult.ok) return fail("invalid-locks", "Producer could not derive required transaction locks");
   const locksClone = canonicalClone(locksResult.value); if (!locksClone.ok || !validRequiredLocks(inputs.store, locksClone.value)) return fail("invalid-locks", "Producer required locks are not an exact canonical profile-first vector");
   const planBytes = canonicalJsonBytes({ participants: normalized.map(participantForDigest), requiredLocks: locksClone.value }); if (!planBytes.ok) return planBytes;
   const prepared = deepFreeze({ operationId: inputs.operationId, producerSchema: codecSnapshot.schema, producerVersion: codecSnapshot.version,
     confirmationSummary: summaryClone.value, confirmationDigest: sha256(summaryBytes.value), participants: normalized, requiredLocks: locksClone.value, planDigest: sha256(planBytes.value) });
+  for (const [index, participant] of normalized.entries()) if (participantEffect(participant) === "delete") {
+    try { await fs.lstat(deletionMarkerPath(inputs.store, prepared, index)); return fail("unsafe-target", "Operation-bound deletion evidence path already exists"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail("unsafe-target", "Operation-bound deletion evidence path is unavailable"); }
+  }
   preparedCapabilities.set(prepared, { store: inputs.store, codec: codecSnapshot }); return { ok: true, value: prepared };
 }
 
 function validParticipantShape(raw: unknown): raw is TransactionParticipant {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
   const value = raw as Record<string, unknown>; const keys = ["key", "kind", "ownerKey", "precondition", "producerEvidence", "rollback", "scopeKey", "stagedDigest", "stagedEvidence", "stagedPath", "targetClass", "targetEvidence", "targetPath"];
+  if ("effect" in value) keys.push("effect");
   if ("backupEvidence" in value) keys.push("backupEvidence"); if ("missingParent" in value) keys.push("missingParent"); if ("generationId" in value) keys.push("generationId");
   if (!exactKeys(value, keys) || typeof value.kind !== "string" || !/^[a-z][a-z0-9.-]{0,63}$/.test(value.kind)
     || typeof value.key !== "string" || !/^[A-Za-z0-9._-]{1,256}$/.test(value.key)
     || typeof value.ownerKey !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(value.ownerKey)
     || typeof value.scopeKey !== "string" || !/^[A-Za-z0-9._-]{1,256}$/.test(value.scopeKey)
     || typeof value.targetPath !== "string" || !path.isAbsolute(value.targetPath) || typeof value.stagedPath !== "string" || !path.isAbsolute(value.stagedPath)
+    || (value.effect !== undefined && value.effect !== "replace" && value.effect !== "delete")
     || (value.targetClass !== "owned" && value.targetClass !== "external" && value.targetClass !== "generation")
     || typeof value.stagedDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.stagedDigest)
     || !validEvidenceShape(value.targetEvidence) || !validEvidenceShape(value.stagedEvidence)
@@ -286,6 +300,7 @@ function validParticipantShape(raw: unknown): raw is TransactionParticipant {
   else if (rollback.kind === "restore-backup") { if (!exactKeys(rollback, ["digest", "kind", "path"]) || pre.state !== "present" || rollback.digest !== pre.digest || typeof rollback.path !== "string" || !path.isAbsolute(rollback.path) || typeof rollback.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(rollback.digest) || !validEvidenceShape(value.backupEvidence) || !samePath(value.backupEvidence.path, rollback.path)) return false; }
   else return false;
   if (value.missingParent !== undefined && (pre.state !== "absent" || value.targetClass !== "external")) return false;
+  if (value.effect === "delete" && (value.targetClass !== "owned" || pre.state !== "present" || rollback.kind !== "restore-backup" || value.stagedDigest !== pre.digest || value.missingParent !== undefined || "generationId" in value)) return false;
   return value.targetClass === "generation" ? typeof value.generationId === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.generationId) : !("generationId" in value);
 }
 
@@ -294,10 +309,17 @@ export async function revalidatePersistedTransaction(store: OwnedStateStore, tra
     || !codec.decodeSummary(transaction.confirmationSummary).ok || !transaction.participants.every(validParticipantShape) || !validRequiredLocks(store, transaction.requiredLocks)) return fail("invalid-producer-data", "Persisted transaction or producer identity is invalid");
   const generation = validateGenerationRelationship(transaction.participants); if (!generation.ok) return generation;
   if (transaction.participants.some((item) => item.targetClass === "external") && codec.authorizeExternal === undefined) return fail("unknown-producer", "External target callback is unavailable; operation remains inert");
+  if (transaction.participants.some((item) => item.effect === "delete") && codec.authorizeOwnedDelete === undefined) return fail("unknown-producer", "Owned-delete callback is unavailable; operation remains inert");
   if (!codec.validatePlan(transaction.participants).ok) return fail("invalid-producer-data", "Producer rejected persisted plan");
-  for (const participant of transaction.participants) if (participant.targetClass === "external") {
-    const authorized = await codec.authorizeExternal?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
-    if (authorized === undefined || !authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted external authority");
+  for (const participant of transaction.participants) {
+    if (participant.targetClass === "external") {
+      const authorized = await codec.authorizeExternal?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
+      if (authorized === undefined || !authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted external authority");
+    }
+    if (participant.effect === "delete") {
+      const authorized = await codec.authorizeOwnedDelete?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
+      if (authorized === undefined || !authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted owned-delete authority");
+    }
   }
   const derivedLocks = codec.requiredLocks(transaction.confirmationSummary, transaction.participants);
   if (!derivedLocks.ok || !lockIdentitiesEqual(derivedLocks.value, transaction.requiredLocks)) return fail("invalid-producer-data", "Producer required-lock derivation changed");
@@ -315,7 +337,7 @@ export async function revalidatePersistedTransaction(store: OwnedStateStore, tra
   return { ok: true, value: undefined };
 }
 
-export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-parent-creation" | "after-parent-creation" | "before-parent-identity-journal" | "after-parent-identity-journal" | "before-parent-publication" | "after-parent-publication" | "before-parent-removal" | "after-parent-removal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement";
+export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-parent-creation" | "after-parent-creation" | "before-parent-identity-journal" | "after-parent-identity-journal" | "before-parent-publication" | "after-parent-publication" | "before-parent-removal" | "after-parent-removal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-forward-deletion" | "after-forward-deletion-marker" | "after-forward-deletion-mutation" | "after-forward-deletion" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement";
 export interface TransactionFaultSeam { readonly hit: (phase: TransactionFaultPhase, participantIndex?: number) => void | Promise<void> }
 const NO_FAULTS: TransactionFaultSeam = Object.freeze({ hit: () => undefined });
 export interface TransactionJournal extends PreparedTransaction {
@@ -383,10 +405,16 @@ async function persistReceipt(store: OwnedStateStore, receipt: TransactionReceip
   await leaseBoundary(store, lease, receipt.operationId, receipt.lockBindings, receipt.requiredLocks);
 }
 async function authorize(codec: TransactionProducerCodec, operationId: string, participant: TransactionParticipant, mutation: ExternalMutation, temporary?: AdjacentTemporaryEvidence): Promise<ExternalAuthorization | undefined> {
-  if (participant.targetClass !== "external") return undefined;
-  const result = await codec.authorizeExternal?.({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
-  if (result === undefined || !result.ok) throw new Error("external-authority");
-  return result.value === undefined ? undefined : result.value;
+  if (participant.targetClass === "external") {
+    const result = await codec.authorizeExternal?.({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
+    if (result === undefined || !result.ok) throw new Error("external-authority");
+    return result.value === undefined ? undefined : result.value;
+  }
+  if (participant.effect === "delete") {
+    const result = await codec.authorizeOwnedDelete?.({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
+    if (result === undefined || !result.ok) throw new Error("owned-delete-authority");
+  }
+  return undefined;
 }
 async function captureTemporary(handle: FileHandle, temporary: string, digest: Sha256): Promise<AdjacentTemporaryEvidence> {
   const opened = await handle.stat({ bigint: true }); const pathname = await fs.lstat(temporary, { bigint: true });
@@ -427,10 +455,11 @@ async function validateParticipantTarget(participant: TransactionParticipant, re
   return true;
 }
 async function validateFinalMutationTarget(participant: TransactionParticipant, mutation: ExternalMutation, created?: CreatedParentEvidence | null): Promise<void> {
+  const restoringDelete = mutation === "rollback" && participant.effect === "delete";
   const requireOriginalTarget = mutation === "replace" && participant.precondition.state === "present";
   if (!await validateParticipantTarget(participant, requireOriginalTarget, created)) throw new Error("target-authority");
   if (mutation === "replace") { if (!await casMatches(participant)) throw new Error("stale-precondition"); }
-  else if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
+  else if (await fileDigest(participant.targetPath) !== (restoringDelete ? undefined : participant.stagedDigest)) throw new Error("rollback-target-changed");
 }
 async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, operationId: string, bindings: readonly JournalLockBinding[], requiredLocks: readonly LifecycleLockIdentity[], codec: TransactionProducerCodec, participant: TransactionParticipant, bytes: Uint8Array, faults: TransactionFaultSeam, index: number, mutation: ExternalMutation, created?: CreatedParentEvidence | null): Promise<void> {
   const generation = participant.targetClass === "generation"; if (generation) { await faults.hit("before-generation-marker", index); await leaseBoundary(store, lease, operationId, bindings, requiredLocks); }
@@ -449,7 +478,7 @@ async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, 
     await renameReplace(temporaryPath, participant.targetPath, async () => {
       if (!await validateTemporary(temporary!) || !await validateParticipantTarget(participant, mutation === "replace" && participant.precondition.state === "present", created)) throw new Error("temporary-identity");
       if (mutation === "replace" && !await casMatches(participant)) throw new Error("stale-precondition");
-      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
+      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== (participant.effect === "delete" ? undefined : participant.stagedDigest)) throw new Error("rollback-target-changed");
       const authorization = await authorize(codec, operationId, participant, mutation, temporary);
       if (authorization?.temporaryMode === undefined) {
         await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
@@ -459,7 +488,7 @@ async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, 
       await fs.chmod(temporaryPath, authorization.temporaryMode);
       if (!await validateTemporary(temporary!) || !await validateParticipantTarget(participant, mutation === "replace" && participant.precondition.state === "present", created)) throw new Error("temporary-identity");
       if (mutation === "replace" && !await casMatches(participant)) throw new Error("stale-precondition");
-      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed");
+      if (mutation === "rollback" && await fileDigest(participant.targetPath) !== (participant.effect === "delete" ? undefined : participant.stagedDigest)) throw new Error("rollback-target-changed");
       await authorize(codec, operationId, participant, mutation, temporary);
       await leaseBoundary(store, lease, operationId, bindings, requiredLocks);
     });
@@ -475,6 +504,112 @@ async function atomicReplace(store: OwnedStateStore, lease: LifecycleLockLease, 
     } catch { /* Uncertain adjacent residue is inactive and retained. */ }
     throw error;
   }
+}
+async function validateDeleteEvidence(participant: TransactionParticipant): Promise<boolean> {
+  return participant.rollback.kind === "restore-backup" && participant.precondition.state === "present"
+    && participant.stagedDigest === participant.precondition.digest && participant.rollback.digest === participant.precondition.digest
+    && participant.backupEvidence !== undefined && await validateEvidence(participant.backupEvidence, false) && await validateEvidence(participant.stagedEvidence!, false)
+    && await fileDigest(participant.rollback.path) === participant.precondition.digest && await fileDigest(participant.stagedPath) === participant.precondition.digest;
+}
+function deletionMarkerPath(store: OwnedStateStore, journal: PreparedTransaction, index: number): string {
+  const binding = sha256(Buffer.from(`${journal.operationId}\0${journal.planDigest}\0${index}`, "utf8")).slice("sha256:".length);
+  return path.join(store.stagingRoot, `delete-${binding}.evidence`);
+}
+async function deletionMarkerIdentity(store: OwnedStateStore, journal: PreparedTransaction, participant: TransactionParticipant, index: number): Promise<"absent" | "linked-target" | "committed" | "invalid"> {
+  const marker = deletionMarkerPath(store, journal, index);
+  try {
+    if (!isContainedPath(store.stagingRoot, marker) || !samePath(await fs.realpath(path.dirname(marker)), store.stagingRoot)) return "invalid";
+    const markerStat = await fs.lstat(marker, { bigint: true });
+    const expectedDigest = participant.precondition.state === "present" ? participant.precondition.digest : undefined;
+    const markerDigest = sha256(await fs.readFile(marker));
+    if (!markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.nlink < 1n || participant.targetEvidence?.targetDev !== markerStat.dev.toString()
+      || participant.targetEvidence.targetIno !== markerStat.ino.toString() || markerDigest !== expectedDigest) return "invalid";
+    try {
+      const targetStat = await fs.lstat(participant.targetPath, { bigint: true });
+      return targetStat.isFile() && !targetStat.isSymbolicLink() && targetStat.dev === markerStat.dev && targetStat.ino === markerStat.ino ? "linked-target" : "committed";
+    } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "committed" : "invalid"; }
+  } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "invalid"; }
+}
+async function retireDeletionMarker(store: OwnedStateStore, journal: PreparedTransaction, participant: TransactionParticipant, index: number, allowCommitted: boolean): Promise<void> {
+  const status = await deletionMarkerIdentity(store, journal, participant, index);
+  if (status !== "linked-target" && !(allowCommitted && status === "committed")) throw new Error("deletion-evidence-uncertain");
+  await fs.unlink(deletionMarkerPath(store, journal, index));
+  await syncDirectory(store.stagingRoot);
+}
+export async function inspectDeletionEvidence(store: OwnedStateStore, transaction: PreparedTransaction): Promise<StoreResult<boolean>> {
+  let present = false;
+  for (const [index, participant] of transaction.participants.entries()) if (participantEffect(participant) === "delete") {
+    const status = await deletionMarkerIdentity(store, transaction, participant, index);
+    if (status === "invalid") return fail("invalid-deletion-evidence", "Operation-bound deletion evidence is invalid; recovery remains inert");
+    if (status !== "absent") present = true;
+  }
+  return { ok: true, value: present };
+}
+async function mutationCommitted(store: OwnedStateStore, journal: PreparedTransaction, participant: TransactionParticipant, index: number): Promise<boolean> {
+  return participantEffect(participant) === "delete" ? await deletionMarkerIdentity(store, journal, participant, index) === "committed" : await committedPostcondition(participant);
+}
+async function preflightForwardParticipant(store: OwnedStateStore, journal: PreparedTransaction, participant: TransactionParticipant, index: number, created?: CreatedParentEvidence | null): Promise<void> {
+  if (participantEffect(participant) === "delete") {
+    const marker = await deletionMarkerIdentity(store, journal, participant, index);
+    if (marker === "invalid") throw new Error("deletion-evidence-invalid");
+    if (marker !== "absent") return;
+  }
+  if (!await validateParticipantTarget(participant, participant.precondition.state === "present", created)) throw new Error("target-authority");
+  if (!await casMatches(participant)) throw new Error("stale-precondition");
+}
+type DeleteFailureReconciliation = "absent" | "committed" | "uncertain";
+async function reconcileDeleteMutationFailure(store: OwnedStateStore, journal: TransactionJournal, participant: TransactionParticipant, index: number): Promise<DeleteFailureReconciliation> {
+  const status = await deletionMarkerIdentity(store, journal, participant, index);
+  if (status === "absent") return "absent";
+  if (status === "committed") return "committed";
+  return "uncertain";
+}
+async function forwardDelete(store: OwnedStateStore, lease: LifecycleLockLease, journal: TransactionJournal, codec: TransactionProducerCodec, participant: TransactionParticipant, faults: TransactionFaultSeam, index: number): Promise<void> {
+  await faults.hit("before-forward-deletion", index);
+  const marker = deletionMarkerPath(store, journal, index);
+  let markerStatus = await deletionMarkerIdentity(store, journal, participant, index);
+  if (markerStatus === "invalid") throw new Error("deletion-evidence-invalid");
+  if (markerStatus === "committed") {
+    if (await fileDigest(participant.targetPath) !== undefined) throw new Error("delete-postcondition-changed");
+    await faults.hit("after-forward-deletion", index);
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    return;
+  }
+  if (markerStatus === "absent") {
+    if (!await validateParticipantTarget(participant, true) || !await casMatches(participant)) throw new Error("stale-precondition");
+    if (!await validateDeleteEvidence(participant)) throw new Error("changed-staged");
+    await authorize(codec, journal.operationId, participant, "delete");
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    if (!await validateParticipantTarget(participant, true) || !await casMatches(participant)) throw new Error("stale-precondition");
+    if (!await validateDeleteEvidence(participant)) throw new Error("changed-staged");
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    await fs.link(participant.targetPath, marker);
+    await syncDirectory(store.stagingRoot);
+    markerStatus = await deletionMarkerIdentity(store, journal, participant, index);
+    if (markerStatus !== "linked-target") throw new Error("deletion-evidence-invalid");
+    await faults.hit("after-forward-deletion-marker", index);
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+  }
+  let last: unknown;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      if (await deletionMarkerIdentity(store, journal, participant, index) !== "linked-target") throw new Error("deletion-evidence-invalid");
+      await authorize(codec, journal.operationId, participant, "delete");
+      await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+      if (await deletionMarkerIdentity(store, journal, participant, index) !== "linked-target") throw new Error("deletion-evidence-invalid");
+      await fs.unlink(participant.targetPath); break;
+    } catch (error) {
+      last = error;
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt + 1));
+    }
+  }
+  if (await deletionMarkerIdentity(store, journal, participant, index) !== "committed") throw last ?? new Error("delete-failed");
+  await faults.hit("after-forward-deletion-mutation", index);
+  await syncDirectory(path.dirname(participant.targetPath));
+  if (await fileDigest(participant.targetPath) !== undefined) throw new Error("delete-postcondition-changed");
+  await faults.hit("after-forward-deletion", index);
+  await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
 }
 async function ensureMissingParent(store: OwnedStateStore, lease: LifecycleLockLease, journal: TransactionJournal, codec: TransactionProducerCodec, index: number, faults: TransactionFaultSeam, onJournal?: (updated: TransactionJournal) => void): Promise<{ readonly journal: TransactionJournal; readonly created?: CreatedParentEvidence }> {
   const participant = journal.participants[index]!; if (participant.missingParent === undefined) return { journal };
@@ -523,6 +658,7 @@ async function removeCreatedParent(store: OwnedStateStore, lease: LifecycleLockL
   await faults.hit("after-parent-removal", index); await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
 }
 async function casMatches(participant: TransactionParticipant): Promise<boolean> { const digest = await fileDigest(participant.targetPath); return participant.precondition.state === "absent" ? digest === undefined : digest === participant.precondition.digest; }
+async function committedPostcondition(participant: TransactionParticipant): Promise<boolean> { return participantEffect(participant) === "delete" ? await fileDigest(participant.targetPath) === undefined : await fileDigest(participant.targetPath) === participant.stagedDigest; }
 export function completedGenerationId(transaction: PreparedTransaction, completed: number): string | undefined {
   if (completed !== transaction.participants.length) return undefined; const last = transaction.participants.at(-1); return last?.targetClass === "generation" ? last.generationId : undefined;
 }
@@ -640,8 +776,8 @@ export async function readTransactionJournal(store: OwnedStateStore, operationId
   const raw = await readCanonicalObject(journalPath(store, operationId)); if (!raw.ok || raw.value === undefined) return fail("invalid-journal", "Stored transaction journal is missing or invalid");
   const structural = decodeJournalStructure(store, operationId, raw.value); if (!structural.ok) return structural; const parsed = structural.value;
   let completed = parsed.completed; let rolledBack = parsed.rolledBack;
-  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const index = completed - rolledBack - 1; const p = parsed.participants[index]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; const created = parsed.createdParents[index]; if (created !== null && await createdParentLocation(p, created) !== undefined) break; rolledBack += 1; } }
-  else { while (completed < parsed.participants.length && await fileDigest(parsed.participants[completed]!.targetPath) === parsed.participants[completed]!.stagedDigest) completed += 1; }
+  if (parsed.state === "rolling-back") { while (rolledBack < completed) { const index = completed - rolledBack - 1; const p = parsed.participants[index]!; const expectedDigest = p.rollback.kind === "delete-new-target" ? undefined : p.rollback.digest; if (await fileDigest(p.targetPath) !== expectedDigest) break; if (participantEffect(p) === "delete" && await deletionMarkerIdentity(store, parsed, p, index) !== "absent") break; const created = parsed.createdParents[index]; if (created !== null && await createdParentLocation(p, created) !== undefined) break; rolledBack += 1; } }
+  else { while (completed < parsed.participants.length) { const p = parsed.participants[completed]!; if (participantEffect(p) === "delete" ? !(await mutationCommitted(store, parsed, p, completed) && await committedPostcondition(p)) : !await committedPostcondition(p)) break; completed += 1; } }
   return { ok: true, value: Object.freeze({ ...parsed, completed, rolledBack, state: parsed.state === "rolling-back" ? "rolling-back" : completed > 0 ? "pending" : parsed.state }) };
 }
 
@@ -650,6 +786,15 @@ export async function listPendingJournals(store: OwnedStateStore): Promise<Store
     for (const name of names) { const id = name.slice(0, -5); const receipt = await readTransactionReceipt(store, id); if (!receipt.ok || receipt.value === undefined) pending.push(id); }
     return { ok: true, value: Object.freeze(pending.sort()) };
   } catch { return fail("journal-read", "Pending transaction journals could not be inspected"); }
+}
+async function retireTerminalDeletionMarkers(store: OwnedStateStore, journal: TransactionJournal, lease: LifecycleLockLease): Promise<void> {
+  for (const [index, participant] of journal.participants.entries()) {
+    if (participantEffect(participant) !== "delete") continue;
+    await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks);
+    const status = await deletionMarkerIdentity(store, journal, participant, index);
+    if (status === "committed") await retireDeletionMarker(store, journal, participant, index, true);
+    else if (status !== "absent") throw new Error("deletion-evidence-uncertain");
+  }
 }
 async function retireJournal(store: OwnedStateStore, journal: TransactionJournal, lease: LifecycleLockLease, faults: TransactionFaultSeam): Promise<void> {
   await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks); await faults.hit("before-retirement");
@@ -685,23 +830,33 @@ export async function executeTransaction(store: OwnedStateStore, prepared: Prepa
   // Preparation captured immutable data and callback references, but publication still reruns the
   // producer and digest bindings. Filesystem CAS/staging checks follow the journal so failures are durable.
   let journal: TransactionJournal = Object.freeze({ ...prepared, format: "picc-transaction-journal", formatVersion: 1, lockBindings: lease.bindings, completed: 0, rolledBack: 0, createdParents: Object.freeze(prepared.participants.map(() => null)), state: "prepared" }); const faults = options.faults ?? NO_FAULTS;
+  let deleteFailurePending = false;
   try {
     await persistJournal(store, journal, lease, faults, true, undefined, () => revalidatePreparedAuthority(store, prepared, capability.codec));
     for (let index = 0; index < journal.participants.length; index += 1) {
       if (options.signal?.aborted === true) throw new Error("cancelled"); const participant = journal.participants[index]!;
       const parent = await ensureMissingParent(store, lease, journal, capability.codec, index, faults, (updated) => { journal = updated; }); journal = parent.journal;
-      await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks); if (!await validateParticipantTarget(participant, participant.precondition.state === "present", parent.created)) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("stale-precondition");
+      await leaseBoundary(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks); await preflightForwardParticipant(store, journal, participant, index, parent.created);
       const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest || !await validateEvidence(participant.stagedEvidence!, false)) throw new Error("changed-staged");
-      try { await atomicReplace(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks, capability.codec, participant, payload, faults, index, "replace", parent.created); }
-      catch (error) { if (await fileDigest(participant.targetPath) === participant.stagedDigest) { journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
+      try { if (participantEffect(participant) === "delete") await forwardDelete(store, lease, journal, capability.codec, participant, faults, index); else await atomicReplace(store, lease, journal.operationId, journal.lockBindings, journal.requiredLocks, capability.codec, participant, payload, faults, index, "replace", parent.created); }
+      catch (error) {
+        if (participantEffect(participant) === "delete") {
+          const reconciliation = await reconcileDeleteMutationFailure(store, journal, participant, index);
+          deleteFailurePending = reconciliation === "committed" || reconciliation === "uncertain";
+          if (reconciliation === "committed") { journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, NO_FAULTS, false, index).catch(() => undefined); }
+        } else if (await mutationCommitted(store, journal, participant, index)) { journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, NO_FAULTS, false, index).catch(() => undefined); }
+        throw error;
+      }
       journal = Object.freeze({ ...journal, completed: index + 1, state: "pending" }); await persistJournal(store, journal, lease, faults, false, index);
     }
     const receipt = receiptFrom(journal, "committed");
     try { await persistReceipt(store, receipt, lease, faults); } catch (error) { const reread = await readTransactionReceipt(store, journal.operationId); if (reread.ok && reread.value !== undefined) { await retireJournal(store, journal, lease, NO_FAULTS).catch(() => undefined); return await deliver(outcomeFromReceipt(reread.value), options); } throw error; }
+    await retireTerminalDeletionMarkers(store, journal, lease).catch(() => undefined);
     await retireJournal(store, journal, lease, faults).catch(() => undefined); return await deliver({ state: "committed", receipt }, options);
   } catch (error) {
     const stored = await readTransactionReceipt(store, journal.operationId); if (stored.ok && stored.value !== undefined) return deliver(outcomeFromReceipt(stored.value), options);
     if (journal.completed > 0) return deliver({ state: "pending-recovery", operationId: journal.operationId, completed: journal.completed, cause: "Transaction interrupted after a committed safe prefix" }, options);
+    if (deleteFailurePending) return deliver({ state: "pending-recovery", operationId: journal.operationId, completed: 0, cause: "Deletion mutation evidence requires explicit recovery" }, options);
     for (let index = 0; index < journal.participants.length; index += 1) if (journal.createdParents[index] !== null) await removeCreatedParent(store, lease, journal, capability.codec, index, NO_FAULTS).catch(() => undefined);
     const receipt = receiptFrom(journal, "failed-before-commit", classify(error, options.signal));
     try { await persistReceipt(store, receipt, lease, NO_FAULTS); await retireJournal(store, journal, lease, NO_FAULTS).catch(() => undefined); const reread = await readTransactionReceipt(store, journal.operationId); if (reread.ok && reread.value !== undefined) return deliver(outcomeFromReceipt(reread.value), options); }
@@ -727,11 +882,11 @@ export async function persistReconciledJournal(store: OwnedStateStore, journal: 
 export async function completeJournal(store: OwnedStateStore, journal: TransactionJournal, codec: TransactionProducerCodec, lease: LifecycleLockLease, faults: TransactionFaultSeam = NO_FAULTS): Promise<StoreResult<TransactionReceipt>> {
   let current = journal;
   try {
-    for (let index = 0; index < current.completed; index += 1) if (await fileDigest(current.participants[index]!.targetPath) !== current.participants[index]!.stagedDigest) throw new Error("prefix changed");
-    for (let index = current.completed; index < current.participants.length; index += 1) { const participant = current.participants[index]!; const parent = await ensureMissingParent(store, lease, current, codec, index, faults, (updated) => { current = updated; }); current = parent.journal; await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateParticipantTarget(participant, participant.precondition.state === "present", parent.created)) throw new Error("target-authority"); if (!await casMatches(participant)) throw new Error("CAS"); const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest) throw new Error("staged");
-      try { await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, payload, faults, index, "replace", parent.created); } catch (error) { if (await fileDigest(participant.targetPath) === participant.stagedDigest) { current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
+    for (let index = 0; index < current.completed; index += 1) { const participant = current.participants[index]!; if (!await committedPostcondition(participant) || (participantEffect(participant) === "delete" && !await mutationCommitted(store, current, participant, index))) throw new Error("prefix changed"); }
+    for (let index = current.completed; index < current.participants.length; index += 1) { const participant = current.participants[index]!; const parent = await ensureMissingParent(store, lease, current, codec, index, faults, (updated) => { current = updated; }); current = parent.journal; await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await preflightForwardParticipant(store, current, participant, index, parent.created); const payload = await fs.readFile(participant.stagedPath); if (sha256(payload) !== participant.stagedDigest) throw new Error("staged");
+      try { if (participantEffect(participant) === "delete") await forwardDelete(store, lease, current, codec, participant, faults, index); else await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, payload, faults, index, "replace", parent.created); } catch (error) { if (await mutationCommitted(store, current, participant, index)) { current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, NO_FAULTS, false, index).catch(() => undefined); } throw error; }
       current = Object.freeze({ ...current, completed: index + 1, state: "pending" }); await persistJournal(store, current, lease, faults, false, index); }
-    const receipt = receiptFrom(current, "committed"); await persistReceipt(store, receipt, lease, faults); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
+    const receipt = receiptFrom(current, "committed"); await persistReceipt(store, receipt, lease, faults); await retireTerminalDeletionMarkers(store, current, lease).catch(() => undefined); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
   } catch { const receipt = await readTransactionReceipt(store, current.operationId); return receipt.ok && receipt.value !== undefined ? { ok: true, value: receipt.value } : fail("recovery-interrupted", "Explicit completion remains pending"); }
 }
 export async function rollbackJournal(store: OwnedStateStore, journal: TransactionJournal, codec: TransactionProducerCodec, lease: LifecycleLockLease, faults: TransactionFaultSeam = NO_FAULTS): Promise<StoreResult<TransactionReceipt>> {
@@ -740,14 +895,32 @@ export async function rollbackJournal(store: OwnedStateStore, journal: Transacti
     // Publish rollback intent before exposing operation faults so every interrupted rollback is
     // durably rollback-only, including a fault before the first progress-journal update.
     await persistJournal(store, current, lease, NO_FAULTS);
-    for (let index = current.completed - current.rolledBack - 1; index >= 0; index -= 1) { const participant = current.participants[index]!; const rollbackDigest = participant.rollback.kind === "delete-new-target" ? undefined : participant.rollback.digest; const observed = await fileDigest(participant.targetPath); if (observed !== participant.stagedDigest && observed !== rollbackDigest) throw new Error("target changed");
-      if (observed === participant.stagedDigest) { await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateParticipantTarget(participant, false, current.createdParents[index])) throw new Error("target-authority");
-        if (participant.rollback.kind === "delete-new-target") { if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed"); await faults.hit("before-replacement", index); await validateFinalMutationTarget(participant, "delete", current.createdParents[index]); await authorize(codec, current.operationId, participant, "delete"); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await fs.rm(participant.targetPath); await syncDirectory(path.dirname(participant.targetPath)); await faults.hit("after-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); }
-        else { const backup = await fs.readFile(participant.rollback.path); if (participant.precondition.state !== "present" || sha256(backup) !== participant.precondition.digest || participant.rollback.digest !== participant.precondition.digest) throw new Error("backup"); await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, backup, faults, index, "rollback", current.createdParents[index]); } }
+    for (let index = current.completed - current.rolledBack - 1; index >= 0; index -= 1) { const participant = current.participants[index]!; const rollbackDigest = participant.rollback.kind === "delete-new-target" ? undefined : participant.rollback.digest; const committedDigest = participantEffect(participant) === "delete" ? undefined : participant.stagedDigest; const observed = await fileDigest(participant.targetPath);
+      if (participantEffect(participant) === "delete") {
+        const marker = await deletionMarkerIdentity(store, current, participant, index);
+        if (marker === "committed") {
+          if (observed !== undefined) throw new Error("rollback-target-changed");
+          await faults.hit("before-replacement", index); await authorize(codec, current.operationId, participant, "rollback"); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks);
+          if (await deletionMarkerIdentity(store, current, participant, index) !== "committed" || !await validateParticipantTarget(participant, false, current.createdParents[index])) throw new Error("deletion-evidence-uncertain");
+          await renameReplace(deletionMarkerPath(store, current, index), participant.targetPath, () => leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks));
+          await syncDirectory(path.dirname(participant.targetPath)); await syncDirectory(store.stagingRoot); await faults.hit("after-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks);
+        } else if (marker === "linked-target") await retireDeletionMarker(store, current, participant, index, false);
+        else if (marker !== "absent" || observed !== rollbackDigest) throw new Error("deletion-evidence-uncertain");
+      } else {
+        if (observed !== committedDigest && observed !== rollbackDigest) throw new Error("target changed");
+        if (observed === committedDigest && observed !== rollbackDigest) { await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); if (!await validateParticipantTarget(participant, false, current.createdParents[index])) throw new Error("target-authority");
+          if (participant.rollback.kind === "delete-new-target") { if (await fileDigest(participant.targetPath) !== participant.stagedDigest) throw new Error("rollback-target-changed"); await faults.hit("before-replacement", index); await validateFinalMutationTarget(participant, "delete", current.createdParents[index]); await authorize(codec, current.operationId, participant, "delete"); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); await fs.rm(participant.targetPath); await syncDirectory(path.dirname(participant.targetPath)); await faults.hit("after-replacement", index); await leaseBoundary(store, lease, current.operationId, current.lockBindings, current.requiredLocks); }
+          else { const backup = await fs.readFile(participant.rollback.path); if (participant.precondition.state !== "present" || sha256(backup) !== participant.precondition.digest || participant.rollback.digest !== participant.precondition.digest) throw new Error("backup"); await atomicReplace(store, lease, current.operationId, current.lockBindings, current.requiredLocks, codec, participant, backup, faults, index, "rollback", current.createdParents[index]); } }
+      }
       await removeCreatedParent(store, lease, current, codec, index, faults);
       current = Object.freeze({ ...current, rolledBack: current.rolledBack + 1 }); await persistJournal(store, current, lease, faults, false, index); }
-    // A process may die after journaling a created parent but before committing its participant.
+    // A process may die after journaling operation-owned evidence but before committing its participant.
     // Reconcile every remaining identity before publishing terminal rollback truth.
+    for (const [index, participant] of current.participants.entries()) if (participantEffect(participant) === "delete") {
+      const marker = await deletionMarkerIdentity(store, current, participant, index);
+      if (marker === "linked-target") await retireDeletionMarker(store, current, participant, index, false);
+      else if (marker !== "absent") throw new Error("deletion-evidence-uncertain");
+    }
     for (let index = 0; index < current.createdParents.length; index += 1) if (current.createdParents[index] !== null) await removeCreatedParent(store, lease, current, codec, index, faults);
     const receipt = receiptFrom(current, "rolled-back"); await persistReceipt(store, receipt, lease, faults); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
   } catch { const receipt = await readTransactionReceipt(store, current.operationId); return receipt.ok && receipt.value !== undefined ? { ok: true, value: receipt.value } : fail("recovery-interrupted", "Explicit rollback remains pending"); }
