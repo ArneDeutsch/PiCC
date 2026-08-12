@@ -144,17 +144,17 @@ export function loadClaudeProject(opts: {
       generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"),
       locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine") });
     const marketplaceCodec = createOwnedMarketplaceCodec(locations.profileKey);
-    const marketplaceSnapshotCodec = createOwnedMarketplaceSnapshotCodec(locations.profileKey);
+    const marketplaceSnapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot });
     const preliminaryRegistry = createProducerCodecRegistry([marketplaceCodec, marketplaceSnapshotCodec]);
     const preliminary = preliminaryRegistry.ok ? readOwnedAdmissionRecords(store, preliminaryRegistry.value, undefined) : { marketplaces: [], marketplaceSnapshots: [], records: [], installations: [] };
-    const snapshotAuthorities = new Map<string, MarketplaceSnapshotAuthority>(); const conflictingSnapshots = new Set<string>();
+    const snapshotAuthorities = new Map<string, MarketplaceSnapshotAuthority[]>(); const overflowingSnapshotIds = new Set<string>();
     for (const record of preliminary.marketplaceSnapshots) {
-      const authority: MarketplaceSnapshotAuthority = { marketplaceName: record.marketplaceName, catalogDigest: record.catalogDigest, source: record.source, provenance: record.provenance };
-      const existing = snapshotAuthorities.get(record.snapshotId);
-      if (existing === undefined) snapshotAuthorities.set(record.snapshotId, authority);
-      else if (JSON.stringify(existing) !== JSON.stringify(authority)) conflictingSnapshots.add(record.snapshotId);
+      const authorities = snapshotAuthorities.get(record.snapshotId) ?? [];
+      if (authorities.length < 128) authorities.push(record); else overflowingSnapshotIds.add(record.snapshotId);
+      snapshotAuthorities.set(record.snapshotId, authorities);
     }
-    const snapshots = Object.fromEntries([...snapshotAuthorities].filter(([snapshotId]) => !conflictingSnapshots.has(snapshotId)));
+    for (const snapshotId of overflowingSnapshotIds) snapshotAuthorities.set(snapshotId, []);
+    const snapshots = Object.fromEntries([...snapshotAuthorities].map(([snapshotId, authorities]) => [snapshotId, Object.freeze(authorities)]));
     const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: snapshots });
     const generationCodec = createExecutableAdmissionGenerationCodec(locations.profileKey);
     executableGenerationObservation = observeExecutableGenerationFile(path.join(store.generationsRoot, "current.json"), generationCodec);
@@ -162,7 +162,7 @@ export function loadClaudeProject(opts: {
     const admission = registry.ok ? readOwnedAdmissionRecords(store, registry.value, executableGenerationObservation.status === "valid" ? executableGenerationObservation.generation : undefined) : { marketplaces: [], marketplaceSnapshots: [], records: [], installations: [] as AdmittedOwnedInstallation[] };
     if (executableGenerationObservation.status === "valid" && admission.completeReference === undefined) executableGenerationObservation = { status: "membership-invalid", code: "generation-incomplete", generation: executableGenerationObservation.generation };
     ownedProfileReference = admission.completeReference;
-    ownedMarketplaces = ownedMarketplaceProjection(admission.marketplaces, admission.marketplaceSnapshots);
+    ownedMarketplaces = ownedMarketplaceProjection(admission.marketplaces, admission.marketplaceSnapshots, { checkoutFamilyKey: locations.checkoutFamilyKey!, projectKey: locations.checkoutFamilyKey! });
     const projected = projectOwnedAndImportedInstallations({ imported: installedState.installations, owned: admission.installations, locations, projectPath: root });
     pluginAdmissions = projected.projections;
     for (const conflict of projected.conflicts) diagnostics.push({ severity: "warning", message: `Owned/imported plugin authority conflict for ${conflict}; all conflicting records remained inert` });

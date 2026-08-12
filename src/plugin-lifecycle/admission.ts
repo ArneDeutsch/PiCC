@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import semver from "semver";
@@ -67,21 +68,42 @@ export interface ExecutableAdmissionGenerationMember {
   readonly recordDigest: Sha256;
 }
 export interface ExecutableAdmissionGeneration { readonly ownership: "picc-owned"; readonly profileKey: LifecycleProfileKey; readonly generationId: string; readonly members: readonly ExecutableAdmissionGenerationMember[] }
-export interface OwnedMarketplaceRecord {
+interface OwnedMarketplaceRecordBase {
   readonly ownership: "picc-owned"; readonly name: string; readonly profileKey: LifecycleProfileKey;
   readonly source: MarketplaceRegistrationSource; readonly selectedSnapshotId: `marketplace-${string}`;
 }
-export interface OwnedMarketplaceSnapshotRecord {
-  readonly ownership: "picc-owned"; readonly marketplaceName: string; readonly profileKey: LifecycleProfileKey;
-  readonly snapshotId: `marketplace-${string}`; readonly catalogDigest: Sha256; readonly source: MarketplaceRegistrationSource;
-  readonly provenance: Readonly<{ readonly adapter: "local-directory-snapshot" | "local-catalog-snapshot" | "anonymous-https-git" | "public-https-catalog"; readonly immutableIdentity: string }>;
+export type OwnedMarketplaceRecord = OwnedMarketplaceRecordBase & (
+  | { readonly scope: "user"; readonly checkoutFamilyKey?: never; readonly projectKey?: never }
+  | { readonly scope: "project" | "local"; readonly checkoutFamilyKey: CheckoutFamilyKey; readonly projectKey: CheckoutFamilyKey }
+);
+export interface CatalogOnlyMarketplaceSnapshotTrustTarget {
+  readonly authorityKind: "catalog-only"; readonly marketplaceName: string; readonly snapshotId: `marketplace-${string}`;
+  readonly source: Extract<MarketplaceRegistrationSource, { readonly kind: "https-catalog" }>; readonly catalogDigest: Sha256;
+  readonly provenance: Readonly<{ readonly adapter: "public-https-catalog"; readonly canonicalUrl: string }>;
 }
-export interface MarketplaceSnapshotAuthority { readonly marketplaceName: string; readonly catalogDigest: Sha256; readonly source: MarketplaceRegistrationSource; readonly provenance: OwnedMarketplaceSnapshotRecord["provenance"] }
+export interface MaterializedMarketplaceSnapshotTrustTarget {
+  readonly authorityKind: "materialized"; readonly marketplaceName: string; readonly snapshotId: `marketplace-${string}`;
+  readonly source: Exclude<MarketplaceRegistrationSource, { readonly kind: "https-catalog" }>; readonly catalogDigest: Sha256;
+  readonly artifactDigest: Sha256; readonly treeDigest: Sha256; readonly rootDigest: Sha256;
+  readonly selectedRoot: PluginRootSelection; readonly artifactRoot: string; readonly installRoot: string; readonly catalogRelativePath: string;
+  readonly provenance: Readonly<
+    | { readonly adapter: "local-directory-snapshot" | "local-catalog-snapshot"; readonly artifactDigest: Sha256 }
+    | { readonly adapter: "anonymous-https-git"; readonly commit: string; readonly artifactDigest: Sha256 }
+  >;
+}
+export type MarketplaceSnapshotTrustTarget = CatalogOnlyMarketplaceSnapshotTrustTarget | MaterializedMarketplaceSnapshotTrustTarget;
+export interface MarketplaceSnapshotTrustGrant { readonly kind: "marketplace-snapshot-trust"; readonly target: MarketplaceSnapshotTrustTarget; readonly targetDigest: Sha256 }
+interface OwnedMarketplaceSnapshotRecordBase { readonly ownership: "picc-owned"; readonly profileKey: LifecycleProfileKey; readonly trust: MarketplaceSnapshotTrustGrant }
+export type OwnedMarketplaceSnapshotRecord = OwnedMarketplaceSnapshotRecordBase & MarketplaceSnapshotTrustTarget;
+export type MarketplaceSnapshotAuthority = OwnedMarketplaceSnapshotRecord;
 
 export function ownedInstallationScopeKey(record: Pick<OwnedPluginInstallationRecord, "scope" | "profileKey" | "projectKey">): string { return record.scope === "user" ? `user-${record.profileKey}` : `${record.scope}-${record.projectKey ?? "invalid"}`; }
-export function ownedMarketplaceScopeKey(record: Pick<OwnedMarketplaceRecord, "name">): string { return `marketplace-${record.name}`; }
-export function ownedMarketplaceSnapshotScopeKey(record: Pick<OwnedMarketplaceSnapshotRecord, "marketplaceName">): string { return `marketplace-snapshot-${record.marketplaceName}`; }
-export interface AdmissionContext { readonly profileKey: LifecycleProfileKey; readonly artifactsRoot: string; readonly marketplaceSnapshots?: Readonly<Record<string, MarketplaceSnapshotAuthority>> }
+function partitionSegment(value: string): string { return `${Buffer.byteLength(value, "utf8")}-${value}`; }
+function partitionIdentity(parts: readonly string[]): string { return sha256(Buffer.from(parts.map(partitionSegment).join(""), "utf8")).slice("sha256:".length); }
+export function ownedMarketplaceScopeKey(record: Pick<OwnedMarketplaceRecord, "profileKey" | "scope" | "checkoutFamilyKey" | "projectKey" | "name">): string { return `marketplace-${partitionIdentity([record.profileKey, record.scope, record.checkoutFamilyKey ?? "", record.projectKey ?? "", record.name])}`; }
+export function ownedMarketplaceSnapshotScopeKey(record: Pick<OwnedMarketplaceSnapshotRecord, "profileKey" | "marketplaceName" | "snapshotId" | "source">): string { return `marketplace-snapshot-${partitionIdentity([record.profileKey, record.marketplaceName, record.snapshotId, JSON.stringify(record.source)])}`; }
+export interface AdmissionContext { readonly profileKey: LifecycleProfileKey; readonly artifactsRoot: string; readonly marketplaceSnapshots?: Readonly<Record<string, readonly MarketplaceSnapshotAuthority[]>> }
+export interface MarketplaceSnapshotCodecContext { readonly profileKey: LifecycleProfileKey; readonly artifactsRoot: string }
 
 function fail(code: string, message: string): StoreResult<never> { return { ok: false, code, message }; }
 function plain(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype && Object.getOwnPropertySymbols(value).length === 0; }
@@ -126,7 +148,7 @@ function decodeSource(value: unknown): PersistedPluginSource | undefined {
   return undefined;
 }
 function decodeTrust(value: unknown): ExecutableTrustGrant | undefined { return exact(value, ["target", "artifactDigest", "treeDigest", "rootDigest", "executableDigest", "selectedRoot", "allowedCrossMarketplaceDependencies"]) && safeIdentity(value.target) && digest(value.artifactDigest) && digest(value.treeDigest) && digest(value.rootDigest) && digest(value.executableDigest) && decodeRootSelection(value.selectedRoot) !== undefined && Array.isArray(value.allowedCrossMarketplaceDependencies) ? value as unknown as ExecutableTrustGrant : undefined; }
-function validScope(payload: Record<string, unknown>): boolean { return payload.scope === "user" ? payload.checkoutFamilyKey === undefined && payload.projectKey === undefined : (payload.scope === "project" || payload.scope === "local") && typeof payload.checkoutFamilyKey === "string" && CHECKOUT.test(payload.checkoutFamilyKey) && payload.projectKey === payload.checkoutFamilyKey; }
+function validScope(payload: Record<string, unknown>): boolean { return payload.scope === "user" ? payload.checkoutFamilyKey === undefined && payload.projectKey === undefined : (payload.scope === "project" || payload.scope === "local") && safeProjectKey(payload.checkoutFamilyKey) && CHECKOUT.test(payload.checkoutFamilyKey) && payload.projectKey === payload.checkoutFamilyKey; }
 
 export function createOwnedPluginInstallationCodec(context: AdmissionContext): ProducerCodec<OwnedPluginInstallationRecord> {
   return Object.freeze({ schema: "plugin-installation", version: 1, decode: (payload: unknown) => {
@@ -136,16 +158,19 @@ export function createOwnedPluginInstallationCodec(context: AdmissionContext): P
     const selectedRoot = decodeRootSelection(payload.selectedRoot);
     const artifactRoot = digest(payload.treeDigest) ? path.join(path.resolve(context.artifactsRoot), payload.treeDigest.slice(7)) : "";
     const expectedRoot = selectedRoot === undefined ? "" : path.join(artifactRoot, ...selectedRoot.path.split("/"));
-    const snapshot = source === undefined ? undefined : context.marketplaceSnapshots?.[source.marketplaceSnapshotId];
-    const catalogRelationship = source !== undefined && source.marketplaceName === pluginMarketplace(String(payload.pluginId)) && snapshot?.marketplaceName === source.marketplaceName && snapshot.catalogDigest === source.catalogDigest;
+    const snapshots = source === undefined ? [] : context.marketplaceSnapshots?.[source.marketplaceSnapshotId] ?? [];
+    const catalogAuthorities = source === undefined || source.marketplaceName !== pluginMarketplace(String(payload.pluginId)) ? [] : snapshots.filter((snapshot) => snapshot.snapshotId === source.marketplaceSnapshotId && snapshot.marketplaceName === source.marketplaceName && snapshot.catalogDigest === source.catalogDigest);
+    const catalogRelationship = catalogAuthorities.length > 0;
     const relativePath = source?.kind === "marketplace-relative" ? [source.pluginRoot, source.path].filter((item): item is string => item !== undefined && item !== "").join("/") : "";
+    const snapshotDeclarationRelationship = source !== undefined && catalogAuthorities.every((snapshot) => snapshot.authorityKind === "catalog-only" || verifyMaterializedMarketplaceCatalog(snapshot, context.artifactsRoot, { pluginId: String(payload.pluginId), source }));
+    const relativeSnapshotRelationship = source?.kind !== "marketplace-relative" || catalogAuthorities.length > 0 && catalogAuthorities.every((snapshot) => snapshot.authorityKind === "materialized" && snapshot.artifactDigest === payload.artifactDigest && snapshot.treeDigest === payload.treeDigest);
     const selectionRelationship = source?.kind === "marketplace-relative" ? selectedRoot?.requested === "relative-subtree" && selectedRoot.path === relativePath && !selectedRoot.usedSingleWrapper
       : source?.kind === "git" ? selectedRoot?.requested === "tree-root" && selectedRoot.path === "" && !selectedRoot.usedSingleWrapper
       : source?.kind === "npm" ? selectedRoot?.requested === "package/" && selectedRoot.path === "" && selectedRoot.usedSingleWrapper
       : source?.kind === "zip" ? selectedRoot?.requested === "root-or-single-wrapper" && ((selectedRoot.path === "" && !selectedRoot.usedSingleWrapper) || (selectedRoot.usedSingleWrapper && selectedRoot.path.length > 0 && !selectedRoot.path.includes("/"))) : false;
     const sourceRelationship = source?.kind === "npm" ? source.version === payload.version : source?.kind === "zip" ? source.zipDigest === payload.artifactDigest : source?.kind === "git" || source?.kind === "marketplace-relative" ? payload.artifactDigest === payload.treeDigest : false;
     const versionRelationship = typeof payload.version === "string" && (source?.kind === "npm" ? semver.valid(payload.version) === payload.version : VERSION.test(payload.version));
-    if (payload.ownership !== "picc-owned" || !safeIdentity(payload.pluginId) || payload.profileKey !== context.profileKey || !PROFILE.test(String(payload.profileKey)) || !validScope(payload) || !versionRelationship || source === undefined || !catalogRelationship || !selectionRelationship || !sourceRelationship || !digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || !digest(payload.executableDigest) || selectedRoot === undefined || typeof payload.installRoot !== "string" || !path.isAbsolute(payload.installRoot) || path.resolve(payload.installRoot) !== path.resolve(expectedRoot) || trust === undefined || trust.target !== payload.pluginId || trust.artifactDigest !== payload.artifactDigest || trust.treeDigest !== payload.treeDigest || trust.rootDigest !== payload.rootDigest || trust.executableDigest !== payload.executableDigest || JSON.stringify(trust.selectedRoot) !== JSON.stringify(selectedRoot) || JSON.stringify(trust.allowedCrossMarketplaceDependencies) !== JSON.stringify(allow) || !data || data.profileKey !== payload.profileKey || data.identity !== payload.pluginId || typeof payload.executableGenerationId !== "string" || !GENERATION.test(payload.executableGenerationId) || !validAllow || (payload.marketplaceDefaultEnabled !== undefined && typeof payload.marketplaceDefaultEnabled !== "boolean")) return fail("invalid-admission", "Owned installation authority or relationship is invalid");
+    if (payload.ownership !== "picc-owned" || !safeIdentity(payload.pluginId) || payload.profileKey !== context.profileKey || !PROFILE.test(String(payload.profileKey)) || !validScope(payload) || !versionRelationship || source === undefined || !catalogRelationship || !snapshotDeclarationRelationship || !relativeSnapshotRelationship || !selectionRelationship || !sourceRelationship || !digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || !digest(payload.executableDigest) || selectedRoot === undefined || typeof payload.installRoot !== "string" || !path.isAbsolute(payload.installRoot) || path.resolve(payload.installRoot) !== path.resolve(expectedRoot) || trust === undefined || trust.target !== payload.pluginId || trust.artifactDigest !== payload.artifactDigest || trust.treeDigest !== payload.treeDigest || trust.rootDigest !== payload.rootDigest || trust.executableDigest !== payload.executableDigest || JSON.stringify(trust.selectedRoot) !== JSON.stringify(selectedRoot) || JSON.stringify(trust.allowedCrossMarketplaceDependencies) !== JSON.stringify(allow) || !data || data.profileKey !== payload.profileKey || data.identity !== payload.pluginId || typeof payload.executableGenerationId !== "string" || !GENERATION.test(payload.executableGenerationId) || !validAllow || (payload.marketplaceDefaultEnabled !== undefined && typeof payload.marketplaceDefaultEnabled !== "boolean")) return fail("invalid-admission", "Owned installation authority or relationship is invalid");
     return { ok: true as const, value: Object.freeze(payload as unknown as OwnedPluginInstallationRecord) };
   } });
 }
@@ -159,21 +184,49 @@ export function createExecutableAdmissionGenerationCodec(profileKey: LifecyclePr
 }
 export function createOwnedMarketplaceCodec(profileKey: LifecycleProfileKey): ProducerCodec<OwnedMarketplaceRecord> {
   return Object.freeze({ schema: "marketplace-registration", version: 1, decode: (payload: unknown): StoreResult<OwnedMarketplaceRecord> => {
-    if (!exact(payload, ["ownership", "name", "profileKey", "source", "selectedSnapshotId"])) return fail("invalid-marketplace", "Owned marketplace registration is invalid");
+    if (!exact(payload, ["ownership", "name", "profileKey", "scope", "source", "selectedSnapshotId"], ["checkoutFamilyKey", "projectKey"])) return fail("invalid-marketplace", "Owned marketplace registration is invalid");
     const source = marketplaceSource(payload.source);
-    return payload.ownership === "picc-owned" && payload.profileKey === profileKey && typeof payload.name === "string" && MARKETPLACE.test(payload.name) && source !== undefined && typeof payload.selectedSnapshotId === "string" && SNAPSHOT.test(payload.selectedSnapshotId)
+    return payload.ownership === "picc-owned" && payload.profileKey === profileKey && PROFILE.test(String(payload.profileKey)) && typeof payload.name === "string" && MARKETPLACE.test(payload.name) && validScope(payload) && source !== undefined && typeof payload.selectedSnapshotId === "string" && SNAPSHOT.test(payload.selectedSnapshotId)
       ? { ok: true, value: Object.freeze(payload as unknown as OwnedMarketplaceRecord) } : fail("invalid-marketplace", "Owned marketplace registration is invalid");
   } });
 }
-export function createOwnedMarketplaceSnapshotCodec(profileKey: LifecycleProfileKey): ProducerCodec<OwnedMarketplaceSnapshotRecord> {
+function sameCanonical(left: unknown, right: unknown): boolean { const leftBytes = canonicalJsonBytes(left); const rightBytes = canonicalJsonBytes(right); return leftBytes.ok && rightBytes.ok && Buffer.from(leftBytes.value).equals(Buffer.from(rightBytes.value)); }
+function snapshotTargetDigest(target: MarketplaceSnapshotTrustTarget): Sha256 | undefined { const bytes = canonicalJsonBytes(target); return bytes.ok ? sha256(bytes.value) : undefined; }
+export function createMarketplaceSnapshotTrustGrant(target: MarketplaceSnapshotTrustTarget): StoreResult<MarketplaceSnapshotTrustGrant> { const targetDigest = snapshotTargetDigest(target); return targetDigest === undefined ? fail("invalid-marketplace-trust", "Marketplace snapshot trust target is not canonical") : { ok: true, value: Object.freeze({ kind: "marketplace-snapshot-trust", target, targetDigest }) }; }
+function validSnapshotTrust(value: unknown, target: MarketplaceSnapshotTrustTarget): value is MarketplaceSnapshotTrustGrant {
+  if (!exact(value, ["kind", "target", "targetDigest"]) || value.kind !== "marketplace-snapshot-trust" || !digest(value.targetDigest) || !sameCanonical(value.target, target)) return false;
+  return snapshotTargetDigest(target) === value.targetDigest;
+}
+function catalogOnlyTarget(payload: Record<string, unknown>, source: MarketplaceRegistrationSource): CatalogOnlyMarketplaceSnapshotTrustTarget | undefined {
+  if (source.kind !== "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "provenance", "trust"]) || !exact(payload.provenance, ["adapter", "canonicalUrl"]) || payload.provenance.adapter !== "public-https-catalog" || typeof payload.provenance.canonicalUrl !== "string") return undefined;
+  let canonicalUrl: URL; try { canonicalUrl = new URL(payload.provenance.canonicalUrl); } catch { return undefined; }
+  const routedFinal = routeMarketplaceSource({ source: "url", url: payload.provenance.canonicalUrl });
+  let declaredUrl: URL; try { declaredUrl = new URL(source.url); } catch { return undefined; }
+  const declaredPort = declaredUrl.port === "" ? 443 : Number(declaredUrl.port); const finalPort = canonicalUrl.port === "" ? 443 : Number(canonicalUrl.port);
+  if (!routedFinal.ok || routedFinal.value.descriptor.kind !== "https-catalog" || routedFinal.value.descriptor.url !== payload.provenance.canonicalUrl
+    || canonicalUrl.toString() !== payload.provenance.canonicalUrl || declaredPort !== 443 && declaredPort !== 8443 || finalPort !== 443 && finalPort !== 8443
+    || payload.snapshotId !== `marketplace-${createHash("sha256").update(`${payload.catalogDigest}\0${payload.provenance.canonicalUrl}`).digest("base64url")}`) return undefined;
+  return Object.freeze({ authorityKind: "catalog-only", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, provenance: payload.provenance }) as CatalogOnlyMarketplaceSnapshotTrustTarget;
+}
+function materializedTarget(payload: Record<string, unknown>, source: MarketplaceRegistrationSource, artifactsRoot: string): MaterializedMarketplaceSnapshotTrustTarget | undefined {
+  if (source.kind === "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "artifactDigest", "treeDigest", "rootDigest", "selectedRoot", "artifactRoot", "installRoot", "catalogRelativePath", "provenance", "trust"])) return undefined;
+  const selectedRoot = decodeRootSelection(payload.selectedRoot); const expectedArtifactRoot = digest(payload.treeDigest) ? path.join(path.resolve(artifactsRoot), payload.treeDigest.slice(7)) : "";
+  const expectedCatalogPath = source.kind === "local-catalog-file" ? path.basename(source.path) : ".claude-plugin/marketplace.json";
+  const localAdapter = source.kind === "local-directory" ? "local-directory-snapshot" : source.kind === "local-catalog-file" ? "local-catalog-snapshot" : undefined; const provenance = plain(payload.provenance) ? payload.provenance : {};
+  const localProvenance = localAdapter !== undefined && exact(provenance, ["adapter", "artifactDigest"]) && provenance.adapter === localAdapter && provenance.artifactDigest === payload.artifactDigest;
+  const gitProvenance = (source.kind === "github" || source.kind === "https-git") && exact(provenance, ["adapter", "commit", "artifactDigest"]) && provenance.adapter === "anonymous-https-git" && typeof provenance.commit === "string" && /^[a-f0-9]{40}$/.test(provenance.commit) && provenance.artifactDigest === payload.artifactDigest;
+  const identitySeed = gitProvenance ? `${String(provenance.commit)}\0${payload.catalogDigest}\0${payload.treeDigest}` : `${payload.catalogDigest}\0${payload.treeDigest}`; const expectedSnapshotId = `marketplace-${createHash("sha256").update(identitySeed).digest("base64url")}`;
+  if (!digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || payload.snapshotId !== expectedSnapshotId || payload.artifactDigest !== payload.treeDigest || payload.rootDigest !== payload.treeDigest || selectedRoot?.requested !== "tree-root" || selectedRoot.path !== "" || selectedRoot.usedSingleWrapper || typeof payload.artifactRoot !== "string" || !path.isAbsolute(payload.artifactRoot) || !samePath(path.resolve(payload.artifactRoot), expectedArtifactRoot) || typeof payload.installRoot !== "string" || !samePath(path.resolve(payload.installRoot), expectedArtifactRoot) || typeof payload.catalogRelativePath !== "string" || payload.catalogRelativePath === "" || normalizePortableRelativePath(payload.catalogRelativePath) !== payload.catalogRelativePath || payload.catalogRelativePath !== expectedCatalogPath || (!localProvenance && !gitProvenance)) return undefined;
+  const catalogPath = path.resolve(expectedArtifactRoot, ...payload.catalogRelativePath.split("/")); if (!isContainedPath(expectedArtifactRoot, catalogPath) || samePath(expectedArtifactRoot, catalogPath)) return undefined;
+  return Object.freeze({ authorityKind: "materialized", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, artifactDigest: payload.artifactDigest, treeDigest: payload.treeDigest, rootDigest: payload.rootDigest, selectedRoot: payload.selectedRoot, artifactRoot: payload.artifactRoot, installRoot: payload.installRoot, catalogRelativePath: payload.catalogRelativePath, provenance: payload.provenance }) as MaterializedMarketplaceSnapshotTrustTarget;
+}
+export function createOwnedMarketplaceSnapshotCodec(context: MarketplaceSnapshotCodecContext): ProducerCodec<OwnedMarketplaceSnapshotRecord> {
   return Object.freeze({ schema: "marketplace-catalog-snapshot", version: 1, decode: (payload: unknown): StoreResult<OwnedMarketplaceSnapshotRecord> => {
-    if (!exact(payload, ["ownership", "marketplaceName", "profileKey", "snapshotId", "catalogDigest", "source", "provenance"])) return fail("invalid-marketplace-snapshot", "Owned marketplace snapshot is invalid");
+    if (!plain(payload)) return fail("invalid-marketplace-snapshot", "Owned marketplace snapshot is invalid");
     const source = marketplaceSource(payload.source);
-    if (payload.ownership !== "picc-owned" || payload.profileKey !== profileKey || typeof payload.marketplaceName !== "string" || !MARKETPLACE.test(payload.marketplaceName) || typeof payload.snapshotId !== "string" || !SNAPSHOT.test(payload.snapshotId) || !digest(payload.catalogDigest) || source === undefined || !exact(payload.provenance, ["adapter", "immutableIdentity"]) || typeof payload.provenance.immutableIdentity !== "string" || payload.provenance.immutableIdentity.length === 0 || payload.provenance.immutableIdentity.length > 512) return fail("invalid-marketplace-snapshot", "Owned marketplace snapshot is invalid");
-    const adapter = source.kind === "local-directory" ? "local-directory-snapshot" : source.kind === "local-catalog-file" ? "local-catalog-snapshot" : source.kind === "https-catalog" ? "public-https-catalog" : "anonymous-https-git";
-    const identity = source.kind === "local-directory" || source.kind === "local-catalog-file" ? source.path : source.kind === "https-catalog" ? source.url : payload.provenance.immutableIdentity;
-    const immutableIdentityValid = source.kind !== "github" && source.kind !== "https-git" || /^[a-f0-9]{40}$/.test(payload.provenance.immutableIdentity);
-    return payload.provenance.adapter === adapter && immutableIdentityValid && identity === payload.provenance.immutableIdentity ? { ok: true, value: Object.freeze(payload as unknown as OwnedMarketplaceSnapshotRecord) } : fail("invalid-marketplace-snapshot", "Marketplace snapshot provenance is unbound");
+    if (payload.ownership !== "picc-owned" || payload.profileKey !== context.profileKey || !PROFILE.test(String(payload.profileKey)) || payload.authorityKind !== "catalog-only" && payload.authorityKind !== "materialized" || typeof payload.marketplaceName !== "string" || !MARKETPLACE.test(payload.marketplaceName) || typeof payload.snapshotId !== "string" || !SNAPSHOT.test(payload.snapshotId) || !digest(payload.catalogDigest) || source === undefined) return fail("invalid-marketplace-snapshot", "Owned marketplace snapshot is invalid");
+    const target = payload.authorityKind === "catalog-only" ? catalogOnlyTarget(payload, source) : materializedTarget(payload, source, context.artifactsRoot);
+    return target !== undefined && validSnapshotTrust(payload.trust, target) ? { ok: true, value: Object.freeze(payload as unknown as OwnedMarketplaceSnapshotRecord) } : fail("invalid-marketplace-snapshot", "Marketplace snapshot authority or trust is unbound");
   } });
 }
 
@@ -199,13 +252,61 @@ function boundedDirectoryNames(directory: string, maximum: number, count: { valu
   finally { opened.closeSync(); }
   return names.sort();
 }
+interface ExecutableCatalogDeclaration { readonly index: number; readonly name: string; readonly source: CatalogPluginSource; readonly defaultEnabled?: boolean }
+interface ExecutableCatalogProjection { readonly name: string; readonly pluginRoot?: string; readonly declarations: readonly ExecutableCatalogDeclaration[] }
+function decodeExecutableMarketplaceCatalog(bytes: Uint8Array, sourceKind: MarketplaceRegistrationSource["kind"]): ExecutableCatalogProjection | undefined {
+  let parsed: unknown; try { parsed = JSON.parse(Buffer.from(bytes).toString("utf8")); } catch { return undefined; }
+  if (!plain(parsed) || typeof parsed.name !== "string" || !MARKETPLACE.test(parsed.name) || !Array.isArray(parsed.plugins) || parsed.plugins.length > 1024) return undefined;
+  const metadata = plain(parsed.metadata) ? parsed.metadata : undefined; const pluginRoot = metadata?.pluginRoot;
+  if (pluginRoot !== undefined && (typeof pluginRoot !== "string" || normalizePortableRelativePath(pluginRoot) !== pluginRoot)) return undefined;
+  const declarations: ExecutableCatalogDeclaration[] = [];
+  for (const [index, value] of parsed.plugins.entries()) {
+    if (!plain(value) || typeof value.name !== "string" || !MARKETPLACE.test(value.name)) continue;
+    const routed = routeCatalogPluginSource(value.source, { marketplaceSourceKind: sourceKind, ...(pluginRoot === undefined ? {} : { metadataPluginRoot: pluginRoot }) });
+    if (!routed.ok) continue;
+    if (value.defaultEnabled !== undefined && typeof value.defaultEnabled !== "boolean") continue;
+    declarations.push(Object.freeze({ index, name: value.name, source: routed.value.descriptor, ...(value.defaultEnabled === undefined ? {} : { defaultEnabled: value.defaultEnabled }) }));
+  }
+  return Object.freeze({ name: parsed.name, ...(pluginRoot === undefined ? {} : { pluginRoot }), declarations: Object.freeze(declarations) });
+}
+function readPersistedTree(artifactRoot: string): readonly ArtifactDigestEntry[] {
+  if (!ordinaryCanonicalDirectory(artifactRoot)) throw new Error("artifact-root");
+  const entries: ArtifactDigestEntry[] = []; const count = { value: 0 }; let total = 0;
+  const walk = (directory: string, relative: string, depth: number): void => { if (depth > PORTABLE_TREE_LIMITS.maximumDepth) throw new Error("depth"); const names = boundedDirectoryNames(directory, PORTABLE_TREE_LIMITS.maximumEntries, count); for (const name of names) { const child = path.join(directory, name); const childRelative = relative === "" ? name : `${relative}/${name}`; if (Buffer.byteLength(childRelative, "utf8") > PORTABLE_TREE_LIMITS.maximumPathBytes) throw new Error("path"); const stat = fs.lstatSync(child); if (stat.isSymbolicLink() || !samePath(fs.realpathSync.native(child), path.resolve(child))) throw new Error("alias"); if (stat.isDirectory()) { entries.push({ path: childRelative, kind: "directory" }); walk(child, childRelative, depth + 1); } else if (stat.isFile()) { const opened = readOpenedOrdinaryFile(child, PORTABLE_TREE_LIMITS.maximumFileBytes); if ((total += opened.bytes.length) > PORTABLE_TREE_LIMITS.maximumTotalBytes) throw new Error("bytes"); entries.push({ path: childRelative, kind: "file", executable: process.platform !== "win32" && (opened.stat.mode & 0o111n) !== 0n, data: opened.bytes }); } else throw new Error("special"); } };
+  walk(artifactRoot, "", 0); return Object.freeze(entries);
+}
+function verifyMaterializedMarketplaceCatalog(snapshot: MaterializedMarketplaceSnapshotTrustTarget, artifactsRoot: string, installation?: { readonly pluginId: string; readonly source: PersistedPluginSource }): boolean {
+  try {
+    const root = path.resolve(artifactsRoot); const artifactRoot = path.join(root, snapshot.treeDigest.slice(7));
+    if (!ordinaryCanonicalDirectory(root) || !ordinaryCanonicalDirectory(artifactRoot) || !samePath(path.resolve(snapshot.artifactRoot), artifactRoot) || !samePath(path.resolve(snapshot.installRoot), artifactRoot)) return false;
+    const catalogPath = path.join(artifactRoot, ...snapshot.catalogRelativePath.split("/")); const catalog = readOpenedOrdinaryFile(catalogPath, MAX_RECORD_BYTES).bytes;
+    let basic: unknown; try { basic = JSON.parse(catalog.toString("utf8")); } catch { return false; }
+    if (!plain(basic) || basic.name !== snapshot.marketplaceName || !Array.isArray(basic.plugins) || basic.plugins.length > 1024 || sha256(catalog) !== snapshot.catalogDigest) return false;
+    if (installation === undefined) return true;
+    const projection = decodeExecutableMarketplaceCatalog(catalog, snapshot.source.kind); if (projection === undefined) return false;
+    const pluginName = installation.pluginId.slice(0, installation.pluginId.lastIndexOf("@"));
+    return projection.declarations.filter((item) => {
+      if (item.name !== pluginName) return false;
+      const source = installation.source;
+      if (source.kind === "marketplace-relative") return item.source.kind === "relative" && item.source.path === source.path && item.source.pluginRoot === source.pluginRoot;
+      if (source.kind === "git") return JSON.stringify(item.source) === JSON.stringify(source.declaration);
+      if (source.kind === "npm") return item.source.kind === "npm" && item.source.package === source.package && item.source.registry === source.registry;
+      return item.source.kind === "https-zip" && item.source.url === source.url && (item.source.sha256 === undefined || `sha256:${item.source.sha256}` === source.zipDigest);
+    }).length === 1;
+  } catch { return false; }
+}
+function verifyMaterializedMarketplaceSnapshot(snapshot: MaterializedMarketplaceSnapshotTrustTarget, artifactsRoot: string): boolean {
+  try {
+    const artifactRoot = path.join(path.resolve(artifactsRoot), snapshot.treeDigest.slice(7)); const entries = readPersistedTree(artifactRoot);
+    return digestArtifactEntries(entries) === snapshot.treeDigest && snapshot.artifactDigest === snapshot.treeDigest && snapshot.rootDigest === snapshot.treeDigest
+      && verifyMaterializedMarketplaceCatalog(snapshot, artifactsRoot);
+  } catch { return false; }
+}
 function verifyPersistedTree(record: OwnedPluginInstallationRecord, artifactsRoot: string): boolean {
   try {
     const root = path.resolve(artifactsRoot); const artifactRoot = path.join(root, record.treeDigest.slice(7)); const installRoot = path.resolve(record.installRoot);
-    if (!ordinaryCanonicalDirectory(root) || !ordinaryCanonicalDirectory(artifactRoot) || !ordinaryCanonicalDirectory(installRoot) || !samePath(installRoot, path.join(artifactRoot, ...record.selectedRoot.path.split("/"))) || !isContainedPath(artifactRoot, installRoot)) return false;
-    const entries: ArtifactDigestEntry[] = []; const count = { value: 0 }; let total = 0;
-    const walk = (directory: string, relative: string, depth: number): void => { if (depth > PORTABLE_TREE_LIMITS.maximumDepth) throw new Error("depth"); const names = boundedDirectoryNames(directory, PORTABLE_TREE_LIMITS.maximumEntries, count); for (const name of names) { const child = path.join(directory, name); const childRelative = relative === "" ? name : `${relative}/${name}`; if (Buffer.byteLength(childRelative, "utf8") > PORTABLE_TREE_LIMITS.maximumPathBytes) throw new Error("path"); const stat = fs.lstatSync(child); if (stat.isSymbolicLink() || !samePath(fs.realpathSync.native(child), path.resolve(child))) throw new Error("alias"); if (stat.isDirectory()) { entries.push({ path: childRelative, kind: "directory" }); walk(child, childRelative, depth + 1); } else if (stat.isFile()) { const opened = readOpenedOrdinaryFile(child, PORTABLE_TREE_LIMITS.maximumFileBytes); if ((total += opened.bytes.length) > PORTABLE_TREE_LIMITS.maximumTotalBytes) throw new Error("bytes"); entries.push({ path: childRelative, kind: "file", executable: process.platform !== "win32" && (opened.stat.mode & 0o111n) !== 0n, data: opened.bytes }); } else throw new Error("special"); } };
-    walk(artifactRoot, "", 0); return digestArtifactEntries(entries) === record.treeDigest && digestArtifactEntries(entries, record.selectedRoot.path) === record.rootDigest;
+    if (!ordinaryCanonicalDirectory(root) || !ordinaryCanonicalDirectory(installRoot) || !samePath(installRoot, path.join(artifactRoot, ...record.selectedRoot.path.split("/"))) || !isContainedPath(artifactRoot, installRoot)) return false;
+    const entries = readPersistedTree(artifactRoot); return digestArtifactEntries(entries) === record.treeDigest && digestArtifactEntries(entries, record.selectedRoot.path) === record.rootDigest;
   } catch { return false; }
 }
 export interface AdmittedOwnedInstallation { readonly record: OwnedPluginInstallationRecord; readonly recordDigest: Sha256 }
@@ -223,18 +324,18 @@ export function readOwnedAdmissionRecords(store: OwnedStateStore, registry: Prod
   for (const file of discovered.value) { try { const bytes = readOpenedOrdinaryFile(file, MAX_RECORD_BYTES).bytes; try { const raw = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; if (raw.schema === "plugin-installation") installationEnvelopeCount++; } catch { /* malformed records remain observable below */ } const decoded = readRecordEnvelope(bytes, registry); if (!decoded.ok) { uncertainRecordFiles.push(file); records.push({ path: file, status: "inert", code: decoded.code }); continue; } const producer = Object.freeze({ schema: decoded.value.envelope.schema, version: decoded.value.envelope.codecVersion, ownerKey: decoded.value.envelope.ownerKey, scopeKey: decoded.value.envelope.scopeKey, payload: decoded.value.decoded }); const reject = (code: string): void => { records.push({ path: file, status: "inert", code, producer }); }; if (decoded.value.envelope.ownerKey !== "picc-owned") { reject("owner-mismatch"); continue; } const partition = ownedRecordPartition(store, decoded.value.envelope.ownerKey, decoded.value.envelope.scopeKey); if (!partition.ok || !isContainedPath(partition.value, file)) { reject("record-containment"); continue; }
     if (decoded.value.envelope.schema === "plugin-installation") { const record = decoded.value.decoded as OwnedPluginInstallationRecord; if (decoded.value.envelope.scopeKey !== ownedInstallationScopeKey(record)) { reject("scope-mismatch"); continue; } const member = generation?.members.find((item) => sameMember(record, item)); if (generation === undefined || generation.generationId !== record.executableGenerationId || member?.recordDigest !== decoded.value.envelope.payloadDigest || !verifyPersistedTree(record, store.artifactsRoot)) { reject(member === undefined ? "generation-mismatch" : "artifact-mismatch"); continue; } const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); candidates.push({ installation: { record, recordDigest: decoded.value.envelope.payloadDigest }, observationIndex });
     } else if (decoded.value.envelope.schema === "marketplace-registration") { const record = decoded.value.decoded as OwnedMarketplaceRecord; if (decoded.value.envelope.scopeKey !== ownedMarketplaceScopeKey(record)) reject("scope-mismatch"); else { const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); marketplaceCandidates.push({ record, observationIndex }); }
-    } else if (decoded.value.envelope.schema === "marketplace-catalog-snapshot") { const record = decoded.value.decoded as OwnedMarketplaceSnapshotRecord; if (decoded.value.envelope.scopeKey !== ownedMarketplaceSnapshotScopeKey(record)) reject("scope-mismatch"); else { const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); snapshotCandidates.push({ record, observationIndex }); }
+    } else if (decoded.value.envelope.schema === "marketplace-catalog-snapshot") { const record = decoded.value.decoded as OwnedMarketplaceSnapshotRecord; if (decoded.value.envelope.scopeKey !== ownedMarketplaceSnapshotScopeKey(record)) reject("scope-mismatch"); else if (record.authorityKind === "materialized" && !verifyMaterializedMarketplaceSnapshot(record, store.artifactsRoot)) reject("artifact-mismatch"); else { const observationIndex = records.length; records.push({ path: file, status: "admitted", producer }); snapshotCandidates.push({ record, observationIndex }); }
     } else reject("unsupported-record");
   } catch { uncertainRecordFiles.push(file); records.push({ path: file, status: "inert", code: "unreadable-record" }); } }
   const partitionUncertain = (scopeKey: string): boolean => { const partition = ownedRecordPartition(store, "picc-owned", scopeKey); return partition.ok && uncertainRecordFiles.some((file) => isContainedPath(partition.value, file)); };
   const uncertainMarketplaceCandidates = new Set(marketplaceCandidates.filter((candidate) => partitionUncertain(ownedMarketplaceScopeKey(candidate.record))));
   for (const candidate of uncertainMarketplaceCandidates) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "authority-uncertain" };
   const marketplaces = marketplaceCandidates.filter((candidate) => !uncertainMarketplaceCandidates.has(candidate)).map((candidate) => candidate.record);
-  const conflictingSnapshotIds = new Set<string>(); const snapshotAuthority = new Map<string, string>();
-  for (const candidate of snapshotCandidates) { const authority = JSON.stringify(candidate.record); const existing = snapshotAuthority.get(candidate.record.snapshotId); if (existing === undefined) snapshotAuthority.set(candidate.record.snapshotId, authority); else if (existing !== authority) conflictingSnapshotIds.add(candidate.record.snapshotId); }
+  const conflictingSnapshotAuthorities = new Set<string>(); const snapshotAuthority = new Map<string, string>();
+  for (const candidate of snapshotCandidates) { const key = ownedMarketplaceSnapshotScopeKey(candidate.record); const authority = JSON.stringify(candidate.record); const existing = snapshotAuthority.get(key); if (existing === undefined) snapshotAuthority.set(key, authority); else if (existing !== authority) conflictingSnapshotAuthorities.add(key); }
   const uncertainSnapshotCandidates = new Set(snapshotCandidates.filter((candidate) => partitionUncertain(ownedMarketplaceSnapshotScopeKey(candidate.record))));
-  for (const candidate of snapshotCandidates) if (conflictingSnapshotIds.has(candidate.record.snapshotId)) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "snapshot-authority-conflict" }; else if (uncertainSnapshotCandidates.has(candidate)) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "authority-uncertain" };
-  const marketplaceSnapshots = snapshotCandidates.filter((candidate) => !conflictingSnapshotIds.has(candidate.record.snapshotId) && !uncertainSnapshotCandidates.has(candidate)).map((candidate) => candidate.record);
+  for (const candidate of snapshotCandidates) if (conflictingSnapshotAuthorities.has(ownedMarketplaceSnapshotScopeKey(candidate.record))) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "snapshot-authority-conflict" }; else if (uncertainSnapshotCandidates.has(candidate)) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "authority-uncertain" };
+  const marketplaceSnapshots = snapshotCandidates.filter((candidate) => !conflictingSnapshotAuthorities.has(ownedMarketplaceSnapshotScopeKey(candidate.record)) && !uncertainSnapshotCandidates.has(candidate)).map((candidate) => candidate.record);
   const uncertainInstallationRecord = generation?.members.some((member) => { const scopeKey = member.scope === "user" ? `user-${store.profileKey}` : `${member.scope}-${member.projectKey ?? "invalid"}`; return partitionUncertain(scopeKey); }) ?? false;
   const complete = generation !== undefined && !uncertainInstallationRecord && installationEnvelopeCount === generation.members.length && candidates.length === generation.members.length && generation.members.every((member) => candidates.some(({ installation }) => sameMember(installation.record, member) && installation.recordDigest === member.recordDigest));
   if (!complete) for (const candidate of candidates) records[candidate.observationIndex] = { ...records[candidate.observationIndex]!, status: "inert", code: "generation-incomplete" };

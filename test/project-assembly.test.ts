@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,8 +22,8 @@ import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
 import { loadSettings } from "../src/discovery/settings.js";
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
-import { createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection } from "../src/plugin-lifecycle/admission.js";
-import { canonicalJsonBytes, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, type MarketplaceSnapshotTrustTarget } from "../src/plugin-lifecycle/admission.js";
+import { canonicalJsonBytes, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
 import { acquireLifecycleLocks, releaseLifecycleLocks } from "../src/plugin-lifecycle/locks.js";
 import { executeTransaction } from "../src/plugin-lifecycle/transaction.js";
 import { planPluginSettingsWrite } from "../src/plugin-lifecycle/settings-plan.js";
@@ -80,6 +81,18 @@ function writeSkill(dir: string, name: string, description: string): void {
   write(path.join(dir, name, "SKILL.md"), `---\ndescription: ${description}\n---\nbody of ${name}`);
 }
 
+function artifactEntriesFromDirectory(root: string): ArtifactDigestEntry[] {
+  const entries: ArtifactDigestEntry[] = [];
+  const walk = (directory: string, relative: string): void => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name); const childRelative = relative === "" ? name : `${relative}/${name}`; const stat = fs.statSync(file);
+      if (stat.isDirectory()) { entries.push({ path: childRelative, kind: "directory" }); walk(file, childRelative); }
+      else entries.push({ path: childRelative, kind: "file", executable: process.platform !== "win32" && (stat.mode & 0o111) !== 0, data: fs.readFileSync(file) });
+    }
+  };
+  walk(root, ""); return entries;
+}
+
 /** Base fixture: a git repo root and a hermetic user dir. */
 function makeBase(): { base: string; repo: string; userDir: string } {
   const base = makeTmp();
@@ -90,40 +103,40 @@ function makeBase(): { base: string; repo: string; userDir: string } {
   return { base, repo, userDir };
 }
 
-function installOwnedPlugin(base: string, repo: string, userDir: string, checkoutFamilyPath = repo, homeDir = path.dirname(userDir), defaults: { manifest?: boolean; marketplace?: boolean; dependencies?: unknown; name?: string; hooks?: boolean; skillBytes?: Uint8Array } = { manifest: true }): { root: string; dataRoot: string; installationRecordPath: string; marketplaceRecordPath: string; snapshotRecordPath: string; generationPath: string; member: Record<string, unknown>; treeDigest: string; rootDigest: string; executableDigest: string } {
+function installOwnedPlugin(base: string, repo: string, userDir: string, checkoutFamilyPath = repo, homeDir = path.dirname(userDir), defaults: { manifest?: boolean; marketplace?: boolean; dependencies?: unknown; name?: string; hooks?: boolean; skillBytes?: Uint8Array; catalogPadding?: string; catalogMetadataPluginRoot?: unknown; snapshotOnly?: boolean } = { manifest: true }): { root: string; dataRoot: string; installationRecordPath: string; marketplaceRecordPath: string; snapshotRecordPath: string; generationPath: string; member: Record<string, unknown>; treeDigest: string; rootDigest: string; executableDigest: string } {
   const locationsResult = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: repo, checkoutFamilyPath } });
   if (!locationsResult.ok) throw new Error("locations"); const locations = locationsResult.value;
   const pluginName = defaults.name ?? "owned"; const pluginId = `${pluginName}@official` as `${string}@${string}`;
   const manifest = JSON.stringify({ name: pluginName, version: "1.0.0", ...(defaults.manifest === undefined ? {} : { defaultEnabled: defaults.manifest }), ...(defaults.dependencies === undefined ? {} : { dependencies: defaults.dependencies }), ...(defaults.hooks ? { hooks: "./hooks/hooks.json" } : {}) });
   const skill = defaults.skillBytes ?? Buffer.from(`---\ndescription: ${pluginName} skill\n---\n${pluginName} body`); const hook = JSON.stringify({ PreToolUse: [{ hooks: [] }] });
+  const catalog = JSON.stringify({ name: "official", owner: { name: "PiCC test" }, plugins: [{ name: pluginName, source: `./${pluginName}` }], ...(defaults.catalogPadding === undefined ? {} : { padding: defaults.catalogPadding }), ...(defaults.catalogMetadataPluginRoot === undefined ? {} : { metadata: { pluginRoot: defaults.catalogMetadataPluginRoot } }) });
   const entries: ArtifactDigestEntry[] = [
+    { path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: Buffer.from(catalog) },
     { path: pluginName, kind: "directory" }, { path: `${pluginName}/.claude-plugin`, kind: "directory" }, { path: `${pluginName}/.claude-plugin/plugin.json`, kind: "file", data: Buffer.from(manifest) },
     { path: `${pluginName}/skills`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill/SKILL.md`, kind: "file", data: skill },
     ...(defaults.hooks ? [{ path: `${pluginName}/hooks`, kind: "directory" as const }, { path: `${pluginName}/hooks/hooks.json`, kind: "file" as const, data: Buffer.from(hook) }] : []),
   ];
   const treeDigest = digestArtifactEntries(entries); const artifactRoot = path.join(locations.profileRoot, "artifacts", "sha256", treeDigest.slice(7)); const root = path.join(artifactRoot, pluginName); const rootDigest = digestArtifactEntries(entries, pluginName);
-  write(path.join(root, ".claude-plugin", "plugin.json"), manifest); write(path.join(root, "skills", `${pluginName}-skill`, "SKILL.md"), skill); if (defaults.hooks) write(path.join(root, "hooks", "hooks.json"), hook);
+  write(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog); write(path.join(root, ".claude-plugin", "plugin.json"), manifest); write(path.join(root, "skills", `${pluginName}-skill`, "SKILL.md"), skill); if (defaults.hooks) write(path.join(root, "hooks", "hooks.json"), hook);
   const executable = executableDigestForProjection(projectPluginManifest(JSON.parse(manifest) as Record<string, unknown>, path.join(root, ".claude-plugin", "plugin.json")).projection);
   if (!executable.ok) throw new Error("executable");
   const store: OwnedStateStore = { root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey, artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"), generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"), locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine") };
-  const snapshotId = "marketplace-owned" as const; const catalogDigest = `sha256:${"a".repeat(64)}` as const;
+  const catalogDigest = sha256(Buffer.from(catalog)); const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${treeDigest}`).digest("base64url")}` as const;
   const source = { kind: "local-directory", path: path.resolve(base, "catalog") } as const;
   const marketplaceCodec = createOwnedMarketplaceCodec(locations.profileKey);
-  const marketplace = { ownership: "picc-owned", name: "official", profileKey: locations.profileKey, source, selectedSnapshotId: snapshotId } as const;
-  const marketplaceEnvelope = createRecordEnvelope(marketplaceCodec, "picc-owned", "marketplace-official", marketplace); if (!marketplaceEnvelope.ok) throw new Error("marketplace envelope");
-  const marketplacePartition = ownedRecordPartition(store, "picc-owned", "marketplace-official"); if (!marketplacePartition.ok) throw new Error("partition"); const marketplaceRecordPath = path.join(marketplacePartition.value, "record.json"); write(marketplaceRecordPath, Buffer.from(marketplaceEnvelope.value.bytes).toString("utf8"));
-  const snapshotCodec = createOwnedMarketplaceSnapshotCodec(locations.profileKey);
-  const snapshot = { ownership: "picc-owned", marketplaceName: "official", profileKey: locations.profileKey, source, snapshotId, catalogDigest, provenance: { adapter: "local-directory-snapshot", immutableIdentity: source.path } } as const;
-  const snapshotEnvelope = createRecordEnvelope(snapshotCodec, "picc-owned", "marketplace-snapshot-official", snapshot); if (!snapshotEnvelope.ok) throw new Error("snapshot envelope");
-  const snapshotPartition = ownedRecordPartition(store, "picc-owned", "marketplace-snapshot-official"); if (!snapshotPartition.ok) throw new Error("partition"); const snapshotRecordPath = path.join(snapshotPartition.value, "record.json"); write(snapshotRecordPath, Buffer.from(snapshotEnvelope.value.bytes).toString("utf8"));
-  const snapshotAuthority = { marketplaceName: "official", catalogDigest, source, provenance: snapshot.provenance };
-  const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: { [snapshotId]: snapshotAuthority } });
+  const marketplace = { ownership: "picc-owned", name: "official", profileKey: locations.profileKey, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey!, projectKey: locations.checkoutFamilyKey!, source, selectedSnapshotId: snapshotId } as const;
+  const marketplaceScopeKey = ownedMarketplaceScopeKey(marketplace); const marketplaceEnvelope = createRecordEnvelope(marketplaceCodec, "picc-owned", marketplaceScopeKey, marketplace); if (!marketplaceEnvelope.ok) throw new Error("marketplace envelope");
+  const marketplacePartition = ownedRecordPartition(store, "picc-owned", marketplaceScopeKey); if (!marketplacePartition.ok) throw new Error("partition"); const marketplaceRecordPath = path.join(marketplacePartition.value, "record.json"); write(marketplaceRecordPath, Buffer.from(marketplaceEnvelope.value.bytes).toString("utf8"));
+  const snapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot });
+  const snapshotTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source, catalogDigest, artifactDigest: treeDigest, treeDigest, rootDigest: treeDigest, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: treeDigest } };
+  const snapshotTrust = createMarketplaceSnapshotTrustGrant(snapshotTarget); if (!snapshotTrust.ok) throw new Error(snapshotTrust.message); const snapshot = { ownership: "picc-owned", profileKey: locations.profileKey, ...snapshotTarget, trust: snapshotTrust.value } as const;
+  const snapshotScopeKey = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(snapshotCodec, "picc-owned", snapshotScopeKey, snapshot); if (!snapshotEnvelope.ok) throw new Error("snapshot envelope");
+  const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScopeKey); if (!snapshotPartition.ok) throw new Error("partition"); const snapshotRecordPath = path.join(snapshotPartition.value, "record.json"); write(snapshotRecordPath, Buffer.from(snapshotEnvelope.value.bytes).toString("utf8"));
+  const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: { [snapshotId]: [snapshot] } });
   const installation = { ownership: "picc-owned", pluginId, scope: "project", profileKey: locations.profileKey, checkoutFamilyKey: locations.checkoutFamilyKey!, projectKey: locations.checkoutFamilyKey!, version: "1.0.0", source: { kind: "marketplace-relative", marketplaceName: "official", path: pluginName, marketplaceSnapshotId: snapshotId, catalogDigest }, artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: pluginName, usedSingleWrapper: false }, installRoot: root, dataIdentity: { profileKey: locations.profileKey, identity: pluginId }, executableGenerationId: "admission-current", trust: { target: pluginId, artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: pluginName, usedSingleWrapper: false }, allowedCrossMarketplaceDependencies: [] }, allowedCrossMarketplaceDependencies: [], ...(defaults.marketplace === undefined ? {} : { marketplaceDefaultEnabled: defaults.marketplace }) } as const;
-  const installationScopeKey = `project-${locations.checkoutFamilyKey}`;
-  const installEnvelope = createRecordEnvelope(installationCodec, "picc-owned", installationScopeKey, installation); if (!installEnvelope.ok) throw new Error("install envelope");
-  const installPartition = ownedRecordPartition(store, "picc-owned", installationScopeKey); if (!installPartition.ok) throw new Error("partition"); const installationRecordPath = path.join(installPartition.value, `${pluginName}.json`); write(installationRecordPath, Buffer.from(installEnvelope.value.bytes).toString("utf8"));
-  const member = { pluginId, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey, projectKey: locations.checkoutFamilyKey, recordDigest: installEnvelope.value.envelope.payloadDigest };
-  const generation = canonicalJsonBytes({ ownership: "picc-owned", profileKey: locations.profileKey, generationId: "admission-current", members: [member] }); if (!generation.ok) throw new Error("generation"); const generationPath = path.join(store.generationsRoot, "current.json"); write(generationPath, Buffer.from(generation.value).toString("utf8"));
+  const installationScopeKey = `project-${locations.checkoutFamilyKey}`; let installationRecordPath = path.join(store.recordsRoot, "absent-installation.json"); let member: Record<string, unknown> = {};
+  if (!defaults.snapshotOnly) { const installEnvelope = createRecordEnvelope(installationCodec, "picc-owned", installationScopeKey, installation); if (!installEnvelope.ok) throw new Error("install envelope"); const installPartition = ownedRecordPartition(store, "picc-owned", installationScopeKey); if (!installPartition.ok) throw new Error("partition"); installationRecordPath = path.join(installPartition.value, `${pluginName}.json`); write(installationRecordPath, Buffer.from(installEnvelope.value.bytes).toString("utf8")); member = { pluginId, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey, projectKey: locations.checkoutFamilyKey, recordDigest: installEnvelope.value.envelope.payloadDigest }; }
+  const generation = canonicalJsonBytes({ ownership: "picc-owned", profileKey: locations.profileKey, generationId: "admission-current", members: defaults.snapshotOnly ? [] : [member] }); if (!generation.ok) throw new Error("generation"); const generationPath = path.join(store.generationsRoot, "current.json"); write(generationPath, Buffer.from(generation.value).toString("utf8"));
   return { root, dataRoot: locations.dataRoot, installationRecordPath, marketplaceRecordPath, snapshotRecordPath, generationPath, member, treeDigest, rootDigest, executableDigest: executable.value };
 }
 
@@ -1053,13 +1066,60 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     };
     const before = snapshot();
     const project = load(repo, userDir);
-    expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", selectedSnapshotId: "marketplace-owned" })]);
+    expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", selectedSnapshotId: expect.stringMatching(/^marketplace-/u) })]);
     expect(project.pluginAdmissions).toEqual(expect.arrayContaining([expect.objectContaining({ ownership: "picc-owned", pluginId: "owned@official", installPath: owned.root })]));
     expect(project.plugins).toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: "owned@official", ownership: "picc-owned" })]));
     expect(findByName(project.skills, "owned:owned-skill")).toBeDefined();
     expect(project.pluginContexts.get("owned@official")?.dataDir).toContain(owned.dataRoot);
     expect(project.lifecycleObservation.records.filter((item) => item.status === "admitted")).toHaveLength(3);
     expect(snapshot()).toBe(before);
+  });
+
+  it.each([
+    ["missing", (catalog: string) => fs.rmSync(catalog)],
+    ["mutated", (catalog: string) => fs.appendFileSync(catalog, " ")],
+    ["aliased", (catalog: string) => { const target = path.join(path.dirname(path.dirname(path.dirname(catalog))), "external-catalog.json"); fs.renameSync(catalog, target); fs.linkSync(target, catalog); }],
+  ] as const)("rejects %s retained marketplace catalog evidence", (_label, mutateCatalog) => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const catalog = path.join(path.dirname(owned.root), ".claude-plugin", "marketplace.json"); mutateCatalog(catalog);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" })]));
+  });
+
+  it("rejects an initially authored catalog above the catalog-read bound while within tree bounds", () => {
+    const { base, repo, userDir } = makeBase(); const padding = "x".repeat(1024 * 1024 + 1); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogPadding: padding, snapshotOnly: true });
+    const catalogPath = path.join(path.dirname(owned.root), ".claude-plugin", "marketplace.json"); const catalogBytes = fs.statSync(catalogPath).size;
+    expect(catalogBytes).toBeGreaterThan(1024 * 1024); expect(catalogBytes).toBeLessThan(PORTABLE_TREE_LIMITS.maximumFileBytes); expect(catalogBytes).toBeLessThan(PORTABLE_TREE_LIMITS.maximumTotalBytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" })]));
+  });
+
+  it("keeps basic materialized snapshot observation when no valid relative declaration is authorized", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogMetadataPluginRoot: "../invalid", snapshotOnly: true }); const project = load(repo, userDir);
+    expect(project.ownedMarketplaces).toHaveLength(1); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
+  });
+
+  it("projects only the active same-name checkout family while retaining the foreign record passively", () => {
+    const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); if (registration?.producer === undefined) throw new Error("registration");
+    const payload = registration.producer.payload as Record<string, unknown>; const foreignKey = `checkout-${"f".repeat(43)}`; const foreign = { ...payload, checkoutFamilyKey: foreignKey, projectKey: foreignKey };
+    const profileKey = payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const scopeKey = ownedMarketplaceScopeKey(foreign as never); const envelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", scopeKey, foreign as never); if (!envelope.ok) throw new Error(envelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); const foreignPath = path.join(partition.value, "record.json"); write(foreignPath, envelope.value.bytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", checkoutFamilyKey: payload.checkoutFamilyKey })]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: foreignPath, status: "admitted", producer: expect.objectContaining({ payload: expect.objectContaining({ checkoutFamilyKey: foreignKey }) }) })]));
+  });
+
+  it("fresh-loads a stable registration refresh while retaining both snapshots and executable generation", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); const oldSnapshot = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (registration?.producer === undefined || oldSnapshot?.producer === undefined) throw new Error("owned records");
+    const oldArtifactRoot = path.dirname(owned.root); const candidate = path.join(base, "refreshed-artifact"); fs.cpSync(oldArtifactRoot, candidate, { recursive: true }); const refreshedCatalog = Buffer.from(JSON.stringify({ name: "official", owner: { name: "PiCC refreshed" }, plugins: [{ name: "owned", source: "./owned" }] })); fs.writeFileSync(path.join(candidate, ".claude-plugin", "marketplace.json"), refreshedCatalog);
+    const refreshedTree = digestArtifactEntries(artifactEntriesFromDirectory(candidate)); const profileRoot = path.dirname(path.dirname(path.dirname(path.dirname(oldSnapshot.path)))); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const refreshedRoot = path.join(artifactsRoot, refreshedTree.slice(7)); fs.renameSync(candidate, refreshedRoot);
+    const catalogDigest = sha256(refreshedCatalog); const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${refreshedTree}`).digest("base64url")}` as const;
+    const oldPayload = oldSnapshot.producer.payload as Record<string, unknown>; const target: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source: oldPayload.source as Extract<MarketplaceSnapshotTrustTarget, { authorityKind: "materialized" }>["source"], catalogDigest, artifactDigest: refreshedTree, treeDigest: refreshedTree, rootDigest: refreshedTree, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot: refreshedRoot, installRoot: refreshedRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: refreshedTree } }; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+    const profileKey = oldPayload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const; const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore; const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); write(path.join(snapshotPartition.value, "record.json"), snapshotEnvelope.value.bytes);
+    const refreshedRegistration = { ...(registration.producer.payload as Record<string, unknown>), selectedSnapshotId: snapshotId }; const stableScope = ownedMarketplaceScopeKey(refreshedRegistration as never); expect(stableScope).toBe(registration.producer.scopeKey); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", stableScope, refreshedRegistration as never); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); fs.writeFileSync(registration.path, registrationEnvelope.value.bytes);
+    const second = load(repo, userDir); expect(second.ownedMarketplaces).toEqual([expect.objectContaining({ selectedSnapshotId: snapshotId })]); expect(second.lifecycleObservation.records.filter((item) => item.producer?.schema === "marketplace-catalog-snapshot" && item.status === "admitted")).toHaveLength(2); expect(second.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(second.executableGenerationObservation).toMatchObject({ status: "valid", generation: { generationId: "admission-current" } });
   });
 
   it("authorizes data deletion only from the opaque final complete-profile reference", () => {
@@ -1111,7 +1171,7 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const installationObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "plugin-installation"); const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot");
     if (installationObservation?.producer === undefined || snapshotObservation?.producer === undefined) throw new Error("owned observations");
     const installation = installationObservation.producer.payload as Record<string, unknown>; const snapshot = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = installation.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey;
-    const installationCodec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: path.dirname(path.dirname(owned.root)), marketplaceSnapshots: { [String(snapshot.snapshotId)]: { marketplaceName: String(snapshot.marketplaceName), catalogDigest: snapshot.catalogDigest as import("../src/plugin-lifecycle/types.js").Sha256, source: snapshot.source as never, provenance: snapshot.provenance as never } } });
+    const installationCodec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: path.dirname(path.dirname(owned.root)), marketplaceSnapshots: { [String(snapshot.snapshotId)]: [snapshot as never] } });
     const higher = { ...installation, scope: "local", marketplaceDefaultEnabled: true }; const higherEnvelope = createRecordEnvelope(installationCodec, "picc-owned", `local-${String(installation.checkoutFamilyKey)}`, higher as never); if (!higherEnvelope.ok) throw new Error(higherEnvelope.message);
     const recordsRoot = path.dirname(path.dirname(path.dirname(installationObservation.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", `local-${String(installation.checkoutFamilyKey)}`); if (!partition.ok) throw new Error(partition.message); write(path.join(partition.value, "higher.json"), Buffer.from(higherEnvelope.value.bytes).toString("utf8"));
     const marker = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [owned.member, { ...owned.member, scope: "local", recordDigest: higherEnvelope.value.envelope.payloadDigest }] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(owned.generationPath, bytes.value);
@@ -1183,18 +1243,24 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     expect(project.lifecycleObservation.records.every((record) => { const relative = path.relative(lifecycleRoot, record.path); return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`); })).toBe(true);
   });
 
-  it("keeps executable membership unchanged when a newer catalog snapshot is observed alongside its authority", () => {
+  it("keeps executable membership unchanged when registration selection lacks retained snapshot authority", () => {
     const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir);
     const first = load(repo, userDir);
     const marketplaceRecord = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration");
     if (marketplaceRecord?.producer === undefined) throw new Error("marketplace record");
     const payload = marketplaceRecord.producer.payload as Record<string, unknown>;
-    const refreshed = { ...payload, selectedSnapshotId: "marketplace-refreshed" };
-    const encoded = createRecordEnvelope(createOwnedMarketplaceCodec(payload["profileKey"] as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey), "picc-owned", marketplaceRecord.producer.scopeKey, refreshed as never); if (!encoded.ok) throw new Error("refresh");
-    fs.writeFileSync(path.join(path.dirname(marketplaceRecord.path), "refreshed.json"), encoded.value.bytes);
+    const refreshed = { ...payload, selectedSnapshotId: "marketplace-refreshed" }; const scopeKey = ownedMarketplaceScopeKey(refreshed as never);
+    const encoded = createRecordEnvelope(createOwnedMarketplaceCodec(payload["profileKey"] as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey), "picc-owned", scopeKey, refreshed as never); if (!encoded.ok) throw new Error("refresh");
+    const recordsRoot = path.dirname(path.dirname(path.dirname(marketplaceRecord.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey: payload["profileKey"] as string, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); fs.rmSync(marketplaceRecord.path); write(path.join(partition.value, "refreshed.json"), Buffer.from(encoded.value.bytes).toString("utf8"));
     const second = load(repo, userDir);
     expect(second.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual(first.plugins.map((plugin) => [plugin.pluginId, plugin.version]));
     expect(second.pluginAdmissions.filter((item) => item.ownership === "picc-owned").map((item) => item.executableGenerationId)).toEqual(["admission-current"]);
+  });
+
+  it("retains immutable snapshot and executable authority after mutable marketplace removal", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); fs.rmSync(owned.marketplaceRecordPath);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins.map((plugin) => plugin.pluginId)).toContain("owned@official");
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
   });
 
   it("treats a fresh profile with no lifecycle roots as clean absence", () => {
@@ -1223,12 +1289,50 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const originalBytes = fs.readFileSync(snapshotRecord.path); fs.rmSync(snapshotRecord.path); const missing = load(repo, userDir);
     expect(missing.ownedMarketplaces).toEqual([]); expect(missing.plugins).toEqual([]);
     fs.writeFileSync(snapshotRecord.path, originalBytes); const payload = snapshotRecord.producer.payload as Record<string, unknown>;
-    const conflicting = { ...payload, marketplaceName: "community", catalogDigest: `sha256:${"b".repeat(64)}` };
-    const profileKey = payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const codec = createOwnedMarketplaceSnapshotCodec(profileKey); const envelope = createRecordEnvelope(codec, "picc-owned", "marketplace-snapshot-community", conflicting as never); if (!envelope.ok) throw new Error(envelope.message);
-    const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotRecord.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", "marketplace-snapshot-community"); if (!partition.ok) throw new Error(partition.message);
+    const profileKey = payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotRecord.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...originalTarget } = payload; const originalArtifactRoot = String(originalTarget.artifactRoot); const alternateRoot = `${originalArtifactRoot}${path.sep}child${path.sep}..`; const conflictingTarget = { ...originalTarget, artifactRoot: alternateRoot, installRoot: alternateRoot } as MarketplaceSnapshotTrustTarget; const conflictingTrust = createMarketplaceSnapshotTrustGrant(conflictingTarget); if (!conflictingTrust.ok) throw new Error(conflictingTrust.message); const conflicting = { ownership: "picc-owned", profileKey, ...conflictingTarget, trust: conflictingTrust.value }; const scopeKey = ownedMarketplaceSnapshotScopeKey(conflicting); const codec = createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot: store.artifactsRoot }); const envelope = createRecordEnvelope(codec, "picc-owned", scopeKey, conflicting as never); if (!envelope.ok) throw new Error(envelope.message);
+    const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message);
     write(path.join(partition.value, "conflict.json"), Buffer.from(envelope.value.bytes).toString("utf8"));
     const conflict = load(repo, userDir); expect(conflict.ownedMarketplaces).toEqual([]); expect(conflict.plugins).toEqual([]);
     expect(conflict.lifecycleObservation.records.filter((item) => item.code === "snapshot-authority-conflict")).toHaveLength(2);
+  });
+
+  it("keeps content-identical same-name snapshot authorities from different sources independent", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (snapshotObservation?.producer === undefined) throw new Error("snapshot");
+    const original = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = original.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotObservation.path))); const profileRoot = path.dirname(recordsRoot); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const source = { kind: "local-directory", path: path.resolve(base, "independent-catalog") } as const; const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...targetFields } = original; const target = { ...targetFields, source } as MarketplaceSnapshotTrustTarget; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+    const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message); const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); write(path.join(snapshotPartition.value, "record.json"), snapshotEnvelope.value.bytes);
+    const registration = { ownership: "picc-owned", name: "official", profileKey, scope: "user", source, selectedSnapshotId: target.snapshotId } as const; const registrationScope = ownedMarketplaceScopeKey(registration); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", registrationScope, registration); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); const registrationPartition = ownedRecordPartition(store, "picc-owned", registrationScope); if (!registrationPartition.ok) throw new Error(registrationPartition.message); write(path.join(registrationPartition.value, "record.json"), registrationEnvelope.value.bytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ scope: "project", source: original.source }), expect.objectContaining({ scope: "user", source })]); expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]);
+    expect(project.lifecycleObservation.records.filter((item) => item.producer?.schema === "marketplace-catalog-snapshot" && item.status === "admitted")).toHaveLength(2);
+  });
+
+  it("admits 128 agreeing same-content authorities and fails their installation bucket closed at 129", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (snapshotObservation?.producer === undefined) throw new Error("snapshot");
+    const original = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = original.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotObservation.path))); const profileRoot = path.dirname(recordsRoot); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...targetFields } = original;
+    const addAuthority = (index: number): void => {
+      const source = { kind: "local-directory", path: path.resolve(base, `same-content-authority-${index}`) } as const;
+      const target = { ...targetFields, source } as MarketplaceSnapshotTrustTarget; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+      const scopeKey = ownedMarketplaceSnapshotScopeKey(snapshot); const envelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", scopeKey, snapshot); if (!envelope.ok) throw new Error(envelope.message); const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); write(path.join(partition.value, "record.json"), envelope.value.bytes);
+    };
+    for (let index = 1; index < 128; index++) addAuthority(index);
+    const atLimit = load(repo, userDir); expect(atLimit.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(atLimit.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toHaveLength(1);
+    addAuthority(128);
+    const overflow = load(repo, userDir); expect(overflow.plugins).toEqual([]); expect(overflow.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]); expect(overflow.executableGenerationObservation).toMatchObject({ status: "membership-invalid", code: "generation-incomplete" });
+    expect(overflow.lifecycleObservation.records).toContainEqual(expect.objectContaining({ status: "inert", code: "invalid-payload" }));
+  });
+
+  it("diagnoses valid envelopes placed under other valid authority partitions without suppressing controls", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); const snapshot = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (registration?.producer === undefined || snapshot?.producer === undefined) throw new Error("records");
+    const profileKey = (registration.producer.payload as Record<string, unknown>).profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const registrationPayload = registration.producer.payload as Record<string, unknown>; const userAuthority = { ...registrationPayload, scope: "user" } as Record<string, unknown>; delete userAuthority.checkoutFamilyKey; delete userAuthority.projectKey; const wrongRegistrationPartition = ownedRecordPartition(store, "picc-owned", ownedMarketplaceScopeKey(userAuthority as never)); if (!wrongRegistrationPartition.ok) throw new Error(wrongRegistrationPartition.message); const wrongRegistrationPath = path.join(wrongRegistrationPartition.value, "misplaced.json"); write(wrongRegistrationPath, fs.readFileSync(registration.path));
+    const snapshotPayload = snapshot.producer.payload as Record<string, unknown>; const otherSource = { kind: "local-directory", path: path.resolve(base, "other-authority") } as const; const wrongSnapshotKey = ownedMarketplaceSnapshotScopeKey({ ...snapshotPayload, source: otherSource } as never); const wrongSnapshotPartition = ownedRecordPartition(store, "picc-owned", wrongSnapshotKey); if (!wrongSnapshotPartition.ok) throw new Error(wrongSnapshotPartition.message); const wrongSnapshotPath = path.join(wrongSnapshotPartition.value, "misplaced.json"); write(wrongSnapshotPath, fs.readFileSync(snapshot.path));
+    const project = load(repo, userDir); expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(project.ownedMarketplaces).toHaveLength(1);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: wrongRegistrationPath, status: "inert", code: "record-containment" }), expect.objectContaining({ path: wrongSnapshotPath, status: "inert", code: "record-containment" }), expect.objectContaining({ path: owned.marketplaceRecordPath, status: "admitted" }), expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
   });
 
   it("rejects aliased records/artifacts and bounds an oversized passive generation read", () => {
@@ -1257,9 +1361,13 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
 
   it("suppresses only a snapshot partition whose sibling record is unreadable", () => {
     const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir);
+    const original = JSON.parse(fs.readFileSync(owned.snapshotRecordPath, "utf8")) as { payload: Record<string, unknown> }; const profileKey = original.payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(owned.snapshotRecordPath))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const source = { kind: "https-catalog", url: "https://catalog.example.org/community.json" } as const; const catalogDigest = `sha256:${"7".repeat(64)}` as const; const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${source.url}`).digest("base64url")}` as const; const target: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "community", snapshotId, source, catalogDigest, provenance: { adapter: "public-https-catalog", canonicalUrl: source.url } }; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+    const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot: store.artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message); const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); const survivingSnapshotPath = path.join(snapshotPartition.value, "record.json"); write(survivingSnapshotPath, snapshotEnvelope.value.bytes);
+    const registration = { ownership: "picc-owned", name: "community", profileKey, scope: "user", source, selectedSnapshotId: snapshotId } as const; const registrationScope = ownedMarketplaceScopeKey(registration); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", registrationScope, registration); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); const registrationPartition = ownedRecordPartition(store, "picc-owned", registrationScope); if (!registrationPartition.ok) throw new Error(registrationPartition.message); write(path.join(registrationPartition.value, "record.json"), registrationEnvelope.value.bytes);
     const oversizedPath = path.join(path.dirname(owned.snapshotRecordPath), "oversized.json"); fs.writeFileSync(oversizedPath, ""); fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
     const project = load(repo, userDir);
-    expect(project.ownedMarketplaces).toEqual([]);
+    expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "community", scope: "user" })]);
     expect(project.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]);
     expect(project.plugins).toEqual([]);
     expect(project.pluginContexts.has("owned@official")).toBe(false);
@@ -1267,6 +1375,22 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
       expect.objectContaining({ path: expect.stringContaining("oversized.json"), status: "inert", code: "unreadable-record" }),
       expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "authority-uncertain" }),
       expect.objectContaining({ path: owned.marketplaceRecordPath, status: "admitted" }),
+      expect.objectContaining({ path: survivingSnapshotPath, status: "admitted" }),
+    ]));
+  });
+
+  it("contains registration uncertainty to one exact scoped marketplace partition", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir);
+    const projectEnvelope = JSON.parse(fs.readFileSync(owned.marketplaceRecordPath, "utf8")) as { payload: Record<string, unknown> }; const profileKey = projectEnvelope.payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey;
+    const userRegistration: Record<string, unknown> = { ...projectEnvelope.payload, scope: "user" }; delete userRegistration.checkoutFamilyKey; delete userRegistration.projectKey;
+    const userScopeKey = ownedMarketplaceScopeKey(userRegistration as never); const codec = createOwnedMarketplaceCodec(profileKey); const userEnvelope = createRecordEnvelope(codec, "picc-owned", userScopeKey, userRegistration as never); if (!userEnvelope.ok) throw new Error(userEnvelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(owned.marketplaceRecordPath))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "" } satisfies OwnedStateStore;
+    const userPartition = ownedRecordPartition(store, "picc-owned", userScopeKey); if (!userPartition.ok) throw new Error(userPartition.message); write(path.join(userPartition.value, "record.json"), Buffer.from(userEnvelope.value.bytes).toString("utf8"));
+    const oversizedPath = path.join(path.dirname(owned.marketplaceRecordPath), "oversized.json"); fs.writeFileSync(oversizedPath, ""); fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", scope: "user" })]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: owned.marketplaceRecordPath, status: "inert", code: "authority-uncertain" }),
+      expect.objectContaining({ path: path.join(userPartition.value, "record.json"), status: "admitted" }),
     ]));
   });
 
@@ -1293,7 +1417,8 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     expect(project.plugins).toEqual([]);
     expect(project.pluginContexts.has("owned@official")).toBe(false);
     expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: owned.installationRecordPath, status: "inert", code: "artifact-mismatch" }),
+      expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" }),
+      expect.objectContaining({ path: owned.installationRecordPath, status: "inert" }),
     ]));
   });
 

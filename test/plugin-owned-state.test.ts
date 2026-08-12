@@ -1,19 +1,24 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
+import { createExecutableAdmissionGenerationCodec, createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, type MarketplaceSnapshotTrustTarget, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
 import { assembledEnablement, ownedMarketplaceProjection, projectOwnedAndImportedInstallations } from "../src/plugin-lifecycle/projection.js";
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { admitDependencyGraph, type DependencyAdmissionCandidate } from "../src/plugin-lifecycle/dependency-admission.js";
+import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
 import type { LifecycleProfileKey, Sha256 } from "../src/plugin-lifecycle/types.js";
 
 const digest = (character: string): Sha256 => `sha256:${character.repeat(64)}` as Sha256;
+const marketplaceSnapshotId = (...parts: readonly string[]): `marketplace-${string}` => `marketplace-${createHash("sha256").update(parts.join("\0")).digest("base64url")}`;
 const profileKey = `profile-${"p".repeat(43)}` as LifecycleProfileKey;
 const checkoutFamilyKey = `checkout-${"c".repeat(43)}` as const;
 const artifactsRoot = path.resolve("owned-artifacts");
 const installRoot = path.join(artifactsRoot, digest("b").slice(7), "selected");
 
 function installation(source: OwnedPluginInstallationRecord["source"] = {
-  kind: "marketplace-relative", marketplaceName: "official", path: "plugins/tool", pluginRoot: "selected", marketplaceSnapshotId: "marketplace-snapshotA", catalogDigest: digest("f"),
+  kind: "git", marketplaceName: "official", declaration: { kind: "https-git", url: "https://git.example.org/tool.git", sha: "a".repeat(40) }, commit: "a".repeat(40), marketplaceSnapshotId: "marketplace-snapshotA", catalogDigest: digest("f"),
 }): OwnedPluginInstallationRecord {
   const selectedRoot = source.kind === "marketplace-relative" ? { requested: "relative-subtree" as const, path: [source.pluginRoot, source.path].filter(Boolean).join("/"), usedSingleWrapper: false } : source.kind === "zip" ? { requested: "root-or-single-wrapper" as const, path: "selected", usedSingleWrapper: true } : source.kind === "npm" ? { requested: "package/" as const, path: "" as const, usedSingleWrapper: true as const } : { requested: "tree-root" as const, path: "", usedSingleWrapper: false };
   const selectedInstallRoot = path.join(artifactsRoot, digest("b").slice(7), ...selectedRoot.path.split("/"));
@@ -34,8 +39,11 @@ function mutate(source: OwnedPluginInstallationRecord, pathName: string, value: 
   target[parts.at(-1)!] = value; return result;
 }
 
-const snapshotAuthority = { marketplaceName: "official", catalogDigest: digest("f"), source: { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const, provenance: { adapter: "public-https-catalog" as const, immutableIdentity: "https://catalog.example.org/catalog.json" } };
-const codec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": snapshotAuthority } });
+const snapshotSource = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const;
+const snapshotTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "official", snapshotId: "marketplace-snapshotA", source: snapshotSource, catalogDigest: digest("f"), provenance: { adapter: "public-https-catalog", canonicalUrl: snapshotSource.url } };
+const snapshotGrant = createMarketplaceSnapshotTrustGrant(snapshotTarget); if (!snapshotGrant.ok) throw new Error(snapshotGrant.message);
+const snapshotAuthority = { ownership: "picc-owned", profileKey, ...snapshotTarget, trust: snapshotGrant.value } as const;
+const codec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": [snapshotAuthority] } });
 
 describe("owned durable admission", () => {
   it("rejects every mutated installation authority field and relationship", () => {
@@ -53,8 +61,8 @@ describe("owned durable admission", () => {
     ];
     for (const [field, value] of mutations) expect(codec.decode(mutate(base, field, value)), field).toMatchObject({ ok: false });
     expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: {} }).decode(base)).toMatchObject({ ok: false });
-    expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": { ...snapshotAuthority, catalogDigest: digest("e") } } }).decode(base)).toMatchObject({ ok: false });
-    expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": { ...snapshotAuthority, marketplaceName: "community" } } }).decode(base)).toMatchObject({ ok: false });
+    expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": [{ ...snapshotAuthority, catalogDigest: digest("e") }] } }).decode(base)).toMatchObject({ ok: false });
+    expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot, marketplaceSnapshots: { "marketplace-snapshotA": [{ ...snapshotAuthority, marketplaceName: "community" }] } }).decode(base)).toMatchObject({ ok: false });
     const crossAuthorized = { ...base, allowedCrossMarketplaceDependencies: ["community"], trust: { ...base.trust, allowedCrossMarketplaceDependencies: ["community"] } };
     expect(codec.decode(crossAuthorized)).toMatchObject({ ok: true });
   });
@@ -89,26 +97,159 @@ describe("owned durable admission", () => {
     expect(codec.decode({ ...zipAtRoot, selectedRoot: rootSelection, installRoot: path.join(artifactsRoot, digest("b").slice(7)), trust: { ...zipAtRoot.trust, selectedRoot: rootSelection } })).toMatchObject({ ok: true });
   });
 
-  it("keeps catalog snapshots distinct from executable generations and validates membership", () => {
+  it("binds marketplace registration scope and partition authority without cross-scope conflicts", () => {
     const marketplaceCodec = createOwnedMarketplaceCodec(profileKey);
-    const snapshotCodec = createOwnedMarketplaceSnapshotCodec(profileKey);
-    const source = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const;
-    const registrationA = { ownership: "picc-owned", name: "official", profileKey, source, selectedSnapshotId: "marketplace-a" } as const;
-    const registrationB = { ...registrationA, selectedSnapshotId: "marketplace-b" as const };
-    const snapshotA = { ownership: "picc-owned", marketplaceName: "official", profileKey, source, snapshotId: "marketplace-a", catalogDigest: digest("a"), provenance: { adapter: "public-https-catalog", immutableIdentity: source.url } } as const;
-    expect(marketplaceCodec.decode(registrationA)).toMatchObject({ ok: true });
-    expect(snapshotCodec.decode(snapshotA)).toMatchObject({ ok: true });
-    const gitSnapshot = { ...snapshotA, source: { kind: "https-git", url: "https://git.example.org/catalog.git" }, provenance: { adapter: "anonymous-https-git", immutableIdentity: "a".repeat(40) } } as const;
-    expect(snapshotCodec.decode(gitSnapshot)).toMatchObject({ ok: true });
-    expect(snapshotCodec.decode({ ...gitSnapshot, provenance: { ...gitSnapshot.provenance, immutableIdentity: "branch-main" } })).toMatchObject({ ok: false });
-    expect(ownedMarketplaceProjection([registrationA, registrationB], [snapshotA])).toEqual([]);
-    expect(ownedMarketplaceProjection([registrationA], [])).toEqual([]);
-    const conflictingSnapshot = { ...snapshotA, marketplaceName: "community", catalogDigest: digest("b") } as const;
-    expect(ownedMarketplaceProjection([registrationA], [snapshotA, conflictingSnapshot])).toEqual([]);
+    const source = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const; const selectedSnapshotId = marketplaceSnapshotId(digest("a"), source.url);
+    const user = { ownership: "picc-owned", name: "official", profileKey, scope: "user", source, selectedSnapshotId } as const;
+    const project = { ...user, scope: "project", checkoutFamilyKey, projectKey: checkoutFamilyKey } as const; const local = { ...project, scope: "local" } as const;
+    expect(marketplaceCodec.decode(user)).toMatchObject({ ok: true });
+    expect(marketplaceCodec.decode(project)).toMatchObject({ ok: true });
+    expect(marketplaceCodec.decode(local)).toMatchObject({ ok: true });
+    for (const candidate of [
+      { ...user, checkoutFamilyKey }, { ...user, projectKey: checkoutFamilyKey }, { ...user, scope: "project" },
+      { ...project, checkoutFamilyKey: `checkout-${"d".repeat(43)}` }, { ...project, projectKey: `checkout-${"d".repeat(43)}` },
+      { ...project, profileKey: `profile-${"x".repeat(43)}` }, { ...project, selectedSnapshotId: "selection" },
+    ]) expect(marketplaceCodec.decode(candidate)).toMatchObject({ ok: false });
+    expect(new Set([ownedMarketplaceScopeKey(user), ownedMarketplaceScopeKey(project), ownedMarketplaceScopeKey(local)])).toHaveProperty("size", 3);
+    const refreshedUser = { ...user, selectedSnapshotId: "marketplace-b" as const };
+    expect(ownedMarketplaceScopeKey(user)).toBe(ownedMarketplaceScopeKey(refreshedUser));
+
+    const target: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "official", snapshotId: selectedSnapshotId, source, catalogDigest: digest("a"), provenance: { adapter: "public-https-catalog", canonicalUrl: source.url } };
+    const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+    const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+    expect(ownedMarketplaceProjection([user, project, local], [snapshot], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([local, project, user]);
+    const foreignFamily = `checkout-${"d".repeat(43)}` as const; const foreign = { ...project, checkoutFamilyKey: foreignFamily, projectKey: foreignFamily } as const;
+    expect(ownedMarketplaceProjection([user, project, foreign], [snapshot], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([project, user]);
+    expect(ownedMarketplaceProjection([{ ...user, selectedSnapshotId: "marketplace-b" }, user], [snapshot], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([]);
+    expect(ownedMarketplaceProjection([user], [], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([]);
+    const independentSnapshot = { ...snapshot, marketplaceName: "community" } as const;
+    expect(ownedMarketplaceProjection([user], [snapshot, independentSnapshot], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([user]);
+    const otherSource = { kind: "https-catalog", url: "https://mirror.example.org/catalog.json" } as const;
+    const otherTarget = { ...target, source: otherSource } satisfies MarketplaceSnapshotTrustTarget; const otherTrust = createMarketplaceSnapshotTrustGrant(otherTarget); if (!otherTrust.ok) throw new Error(otherTrust.message);
+    expect(ownedMarketplaceProjection([user], [snapshot, { ownership: "picc-owned", profileKey, ...otherTarget, trust: otherTrust.value }], { checkoutFamilyKey, projectKey: checkoutFamilyKey })).toEqual([user]);
+  });
+
+  it("admits only exact catalog-only or materialized marketplace snapshot authority and trust", () => {
+    const snapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot });
+    const httpsSource = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const; const reviewedFinalUrl = "https://cdn.example.org/catalog.json";
+    const catalogTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "official", snapshotId: marketplaceSnapshotId(digest("a"), reviewedFinalUrl), source: httpsSource, catalogDigest: digest("a"), provenance: { adapter: "public-https-catalog", canonicalUrl: reviewedFinalUrl } };
+    const catalogTrust = createMarketplaceSnapshotTrustGrant(catalogTarget); if (!catalogTrust.ok) throw new Error(catalogTrust.message);
+    const catalogSnapshot = { ownership: "picc-owned", profileKey, ...catalogTarget, trust: catalogTrust.value } as const;
+    expect(snapshotCodec.decode(catalogSnapshot)).toMatchObject({ ok: true, value: { source: httpsSource, provenance: { canonicalUrl: reviewedFinalUrl } } });
+    for (const canonicalUrl of [
+      "http://cdn.example.org/catalog.json",
+      "https://user:secret@cdn.example.org/catalog.json",
+      "https://cdn.example.org/catalog.json?token=secret",
+      "https://cdn.example.org/catalog.json#section",
+      "https://127.0.0.1/catalog.json",
+      "https://catalog.internal/catalog.json",
+      "https://catalog/catalog.json",
+      "https://catalog.example/catalog.json",
+      "https://cdn.example.org:9443/catalog.json",
+    ]) {
+      const target = { ...catalogTarget, snapshotId: marketplaceSnapshotId(digest("a"), canonicalUrl), provenance: { adapter: "public-https-catalog" as const, canonicalUrl } } satisfies MarketplaceSnapshotTrustTarget;
+      const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+      expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...target, trust: trust.value }), canonicalUrl).toMatchObject({ ok: false });
+    }
+    const acceptedPortUrl = "https://cdn.example.org:8443/catalog.json"; const acceptedPortTarget = { ...catalogTarget, snapshotId: marketplaceSnapshotId(digest("a"), acceptedPortUrl), provenance: { adapter: "public-https-catalog" as const, canonicalUrl: acceptedPortUrl } } satisfies MarketplaceSnapshotTrustTarget; const acceptedPortTrust = createMarketplaceSnapshotTrustGrant(acceptedPortTarget); if (!acceptedPortTrust.ok) throw new Error(acceptedPortTrust.message);
+    expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...acceptedPortTarget, trust: acceptedPortTrust.value })).toMatchObject({ ok: true });
+    for (const declaredUrl of ["https://catalog.example.org:8443/catalog.json", "https://catalog.example.org:9443/catalog.json"] as const) {
+      const target = { ...catalogTarget, source: { kind: "https-catalog" as const, url: declaredUrl } } satisfies MarketplaceSnapshotTrustTarget; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+      expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...target, trust: trust.value }), declaredUrl).toMatchObject({ ok: declaredUrl.includes(":8443/") });
+    }
+    for (const manufactured of [
+      { ...catalogSnapshot, artifactDigest: digest("b") }, { ...catalogSnapshot, treeDigest: digest("b") }, { ...catalogSnapshot, rootDigest: digest("b") },
+      { ...catalogSnapshot, artifactRoot: artifactsRoot }, { ...catalogSnapshot, catalogRelativePath: ".claude-plugin/marketplace.json" },
+      { ...catalogSnapshot, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false } }, { ...catalogSnapshot, installRoot: artifactsRoot },
+      { ...catalogSnapshot, provenance: { ...catalogTarget.provenance, canonicalUrl: "https://redirect.example.org/catalog.json" } },
+      { ...catalogSnapshot, trust: { ...catalogTrust.value, kind: "confirmed-marketplace-snapshot-trust" } },
+      { ...catalogSnapshot, trust: { ...catalogTrust.value, target: { ...catalogTarget, catalogDigest: digest("c") } } },
+    ]) expect(snapshotCodec.decode(manufactured)).toMatchObject({ ok: false });
+
+    const gitSource = { kind: "https-git", url: "https://git.example.org/catalog.git" } as const;
+    const artifactRoot = path.join(artifactsRoot, digest("b").slice(7));
+    const commit = "a".repeat(40); const materializedTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId: marketplaceSnapshotId(commit, digest("a"), digest("b")), source: gitSource, catalogDigest: digest("a"), artifactDigest: digest("b"), treeDigest: digest("b"), rootDigest: digest("b"), selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "anonymous-https-git", commit, artifactDigest: digest("b") } };
+    const materializedTrust = createMarketplaceSnapshotTrustGrant(materializedTarget); if (!materializedTrust.ok) throw new Error(materializedTrust.message);
+    const materializedSnapshot = { ownership: "picc-owned", profileKey, ...materializedTarget, trust: materializedTrust.value } as const;
+    expect(snapshotCodec.decode(materializedSnapshot)).toMatchObject({ ok: true });
+    expect(ownedMarketplaceSnapshotScopeKey(materializedSnapshot)).not.toBe(ownedMarketplaceSnapshotScopeKey({ ...materializedSnapshot, snapshotId: "marketplace-other" }));
+    expect(ownedMarketplaceSnapshotScopeKey(materializedSnapshot)).not.toBe(ownedMarketplaceSnapshotScopeKey({ ...materializedSnapshot, source: { ...gitSource, url: "https://git.example.org/other.git" } }));
+    const mutations: Array<[string, unknown]> = [
+      ["authorityKind", "catalog-only"], ["marketplaceName", "community"], ["snapshotId", "marketplace-other"], ["source.url", "https://git.example.org/other.git"],
+      ["catalogDigest", digest("c")], ["artifactDigest", digest("c")], ["treeDigest", digest("c")], ["rootDigest", digest("c")],
+      ["selectedRoot.path", "nested"], ["selectedRoot.usedSingleWrapper", true], ["artifactRoot", path.resolve("other")], ["installRoot", path.resolve("other")],
+      ["catalogRelativePath", "../marketplace.json"], ["catalogRelativePath", "marketplace.json"], ["provenance.adapter", "local-directory-snapshot"], ["provenance.commit", "branch-main"], ["provenance.artifactDigest", digest("c")],
+      ["trust.kind", "confirmed-marketplace-snapshot-trust"], ["trust.targetDigest", digest("c")], ["trust.target.marketplaceName", "community"], ["trust.target.snapshotId", "marketplace-other"], ["trust.target.source.url", "https://git.example.org/other.git"],
+      ["trust.target.catalogDigest", digest("c")], ["trust.target.artifactDigest", digest("c")], ["trust.target.treeDigest", digest("c")], ["trust.target.rootDigest", digest("c")], ["trust.target.selectedRoot.path", "nested"], ["trust.target.artifactRoot", path.resolve("other")], ["trust.target.installRoot", path.resolve("other")], ["trust.target.catalogRelativePath", "marketplace.json"], ["trust.target.provenance.commit", "b".repeat(40)],
+    ];
+    for (const [field, value] of mutations) expect(snapshotCodec.decode(mutate(materializedSnapshot as unknown as OwnedPluginInstallationRecord, field, value)), `stale grant: ${field}`).toMatchObject({ ok: false });
+    const resignedInvalidTargets: MarketplaceSnapshotTrustTarget[] = [
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), rootDigest: digest("c") },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), artifactDigest: digest("c"), provenance: { ...materializedTarget.provenance, artifactDigest: digest("c") } },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), selectedRoot: { requested: "tree-root", path: "nested", usedSingleWrapper: false } },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), artifactRoot: path.resolve("outside-artifact") },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), installRoot: path.resolve("outside-install") },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), provenance: { ...materializedTarget.provenance, artifactDigest: digest("c") } },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), source: { kind: "local-directory", path: path.resolve("catalog") }, provenance: materializedTarget.provenance },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), provenance: { adapter: "anonymous-https-git", commit: "b".repeat(40), artifactDigest: digest("b") } },
+      { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), catalogRelativePath: "marketplace.json" },
+    ];
+    for (const target of resignedInvalidTargets) { const grant = createMarketplaceSnapshotTrustGrant(target); if (!grant.ok) throw new Error(grant.message); expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...target, trust: grant.value })).toMatchObject({ ok: false }); }
+    expect(snapshotCodec.decode({ ...materializedSnapshot, provenance: { ...materializedTarget.provenance, canonicalPath: path.resolve("mutable-source") } })).toMatchObject({ ok: false });
+    expect(snapshotCodec.decode({ ...materializedSnapshot, trust: { ...materializedTrust.value, kind: "pending-marketplace-snapshot-trust" } })).toMatchObject({ ok: false });
+    const localSource = { kind: "local-catalog-file", path: path.resolve("catalogs", "official.json") } as const; const localTarget: MarketplaceSnapshotTrustTarget = { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), snapshotId: marketplaceSnapshotId(digest("a"), digest("b")), source: localSource, catalogRelativePath: "official.json", provenance: { adapter: "local-catalog-snapshot", artifactDigest: digest("b") } }; const localTrust = createMarketplaceSnapshotTrustGrant(localTarget); if (!localTrust.ok) throw new Error(localTrust.message); const localSnapshot = { ownership: "picc-owned", profileKey, ...localTarget, trust: localTrust.value } as const;
+    expect(snapshotCodec.decode(localSnapshot)).toMatchObject({ ok: true });
+    expect(snapshotCodec.decode({ ...localSnapshot, catalogRelativePath: ".claude-plugin/marketplace.json" })).toMatchObject({ ok: false });
+    const sourceFamilies = [
+      { source: { kind: "local-directory", path: path.resolve("catalogs", "official") } as const, provenance: { adapter: "local-directory-snapshot" as const, artifactDigest: digest("b") }, id: marketplaceSnapshotId(digest("a"), digest("b")) },
+      { source: { kind: "github", repository: "owner/catalog" } as const, provenance: { adapter: "anonymous-https-git" as const, commit, artifactDigest: digest("b") }, id: marketplaceSnapshotId(commit, digest("a"), digest("b")) },
+    ];
+    for (const family of sourceFamilies) {
+      const target: MarketplaceSnapshotTrustTarget = { ...(materializedTarget as Extract<MarketplaceSnapshotTrustTarget, { readonly authorityKind: "materialized" }>), source: family.source, provenance: family.provenance, snapshotId: family.id };
+      const grant = createMarketplaceSnapshotTrustGrant(target); if (!grant.ok) throw new Error(grant.message);
+      expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...target, trust: grant.value })).toMatchObject({ ok: true });
+    }
+    const staleReviewedTarget = { ...catalogTarget, provenance: { ...catalogTarget.provenance, canonicalUrl: "https://redirect.example.org/catalog.json" } } satisfies MarketplaceSnapshotTrustTarget;
+    const staleReviewedTrust = createMarketplaceSnapshotTrustGrant(staleReviewedTarget); if (!staleReviewedTrust.ok) throw new Error(staleReviewedTrust.message);
+    expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...staleReviewedTarget, trust: staleReviewedTrust.value })).toMatchObject({ ok: false });
+    const reboundSource = { kind: "https-catalog", url: "https://rebound.example.org/catalog.json" } as const;
+    expect(snapshotCodec.decode({ ...catalogSnapshot, source: reboundSource })).toMatchObject({ ok: false });
+    const unsafeReboundTarget = { ...catalogTarget, source: { kind: "https-catalog", url: "http://rebound.example.org/catalog.json" } } as MarketplaceSnapshotTrustTarget; const unsafeReboundTrust = createMarketplaceSnapshotTrustGrant(unsafeReboundTarget); if (!unsafeReboundTrust.ok) throw new Error(unsafeReboundTrust.message);
+    expect(snapshotCodec.decode({ ownership: "picc-owned", profileKey, ...unsafeReboundTarget, trust: unsafeReboundTrust.value })).toMatchObject({ ok: false });
+
     const generation = createExecutableAdmissionGenerationCodec(profileKey).decode({ ownership: "picc-owned", profileKey, generationId: "admission-current", members: [{ pluginId: "tool@official", scope: "project", checkoutFamilyKey, projectKey: checkoutFamilyKey, recordDigest: digest("e") }] });
     expect(generation).toMatchObject({ ok: true, value: { generationId: "admission-current" } });
-    expect(createExecutableAdmissionGenerationCodec(profileKey).decode({ ownership: "picc-owned", profileKey, generationId: "admission-current", members: [{ pluginId: "tool@official", scope: "project", checkoutFamilyKey, projectKey: `checkout-${"d".repeat(43)}`, recordDigest: digest("e") }] })).toMatchObject({ ok: false });
     expect(JSON.stringify(generation)).not.toContain("marketplace-a");
+  });
+
+  it("binds relative installation authority to one retained materialized catalog declaration", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-relative-admission-"));
+    try {
+      const ownedArtifacts = path.join(parent, "artifacts"); const catalog = Buffer.from(JSON.stringify({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: "./tool" }] }));
+      const entries: ArtifactDigestEntry[] = [{ path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: catalog }, { path: "plugins", kind: "directory" }, { path: "plugins/tool", kind: "directory" }];
+      const treeDigest = digestArtifactEntries(entries); const artifactRoot = path.join(ownedArtifacts, treeDigest.slice(7)); fs.mkdirSync(path.join(artifactRoot, ".claude-plugin"), { recursive: true }); fs.mkdirSync(path.join(artifactRoot, "plugins", "tool"), { recursive: true }); fs.writeFileSync(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog);
+      const rawCatalogDigest = `sha256:${createHash("sha256").update(catalog).digest("hex")}` as Sha256;
+      const source = { kind: "local-directory", path: path.join(parent, "source") } as const; const snapshotId = marketplaceSnapshotId(rawCatalogDigest, treeDigest);
+      const target: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source, catalogDigest: rawCatalogDigest, artifactDigest: treeDigest, treeDigest, rootDigest: treeDigest, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: treeDigest } };
+      const grant = createMarketplaceSnapshotTrustGrant(target); if (!grant.ok) throw new Error(grant.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: grant.value } as const;
+      const relative = installation({ kind: "marketplace-relative", marketplaceName: "official", path: "tool", pluginRoot: "plugins", marketplaceSnapshotId: snapshotId, catalogDigest: rawCatalogDigest });
+      const record = { ...relative, artifactDigest: treeDigest, treeDigest, installRoot: path.join(artifactRoot, "plugins", "tool"), selectedRoot: { requested: "relative-subtree" as const, path: "plugins/tool", usedSingleWrapper: false }, trust: { ...relative.trust, artifactDigest: treeDigest, treeDigest, selectedRoot: { requested: "relative-subtree" as const, path: "plugins/tool", usedSingleWrapper: false } } };
+      const relativeCodec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: ownedArtifacts, marketplaceSnapshots: { [snapshotId]: [snapshot] } });
+      expect(relativeCodec.decode(record)).toMatchObject({ ok: true });
+      expect(relativeCodec.decode({ ...record, pluginId: "other@official", dataIdentity: { profileKey, identity: "other@official" }, trust: { ...record.trust, target: "other@official" } })).toMatchObject({ ok: false });
+      const catalogOnly = snapshotAuthority; expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: ownedArtifacts, marketplaceSnapshots: { [snapshotId]: [catalogOnly] } }).decode(record)).toMatchObject({ ok: false });
+      const expectRejectedDeclaration = (catalogValue: unknown): void => {
+        const bytes = Buffer.from(JSON.stringify(catalogValue)); const candidateEntries: ArtifactDigestEntry[] = [{ path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: bytes }, { path: "plugins", kind: "directory" }, { path: "plugins/tool", kind: "directory" }];
+        const candidateTree = digestArtifactEntries(candidateEntries); const candidateRoot = path.join(ownedArtifacts, candidateTree.slice(7)); fs.mkdirSync(path.join(candidateRoot, ".claude-plugin"), { recursive: true }); fs.mkdirSync(path.join(candidateRoot, "plugins", "tool"), { recursive: true }); fs.writeFileSync(path.join(candidateRoot, ".claude-plugin", "marketplace.json"), bytes);
+        const candidateCatalogDigest = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as Sha256; const candidateSnapshotId = marketplaceSnapshotId(candidateCatalogDigest, candidateTree); const candidateTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId: candidateSnapshotId, source, catalogDigest: candidateCatalogDigest, artifactDigest: candidateTree, treeDigest: candidateTree, rootDigest: candidateTree, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot: candidateRoot, installRoot: candidateRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: candidateTree } }; const candidateGrant = createMarketplaceSnapshotTrustGrant(candidateTarget); if (!candidateGrant.ok) throw new Error(candidateGrant.message); const candidateSnapshot = { ownership: "picc-owned", profileKey, ...candidateTarget, trust: candidateGrant.value } as const;
+        const candidateRelative = installation({ kind: "marketplace-relative", marketplaceName: "official", path: "tool", pluginRoot: "plugins", marketplaceSnapshotId: candidateSnapshotId, catalogDigest: candidateCatalogDigest }); const candidateRecord = { ...candidateRelative, artifactDigest: candidateTree, treeDigest: candidateTree, installRoot: path.join(candidateRoot, "plugins", "tool"), selectedRoot: { requested: "relative-subtree" as const, path: "plugins/tool", usedSingleWrapper: false }, trust: { ...candidateRelative.trust, artifactDigest: candidateTree, treeDigest: candidateTree, selectedRoot: { requested: "relative-subtree" as const, path: "plugins/tool", usedSingleWrapper: false } } };
+        expect(createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: ownedArtifacts, marketplaceSnapshots: { [candidateSnapshotId]: [candidateSnapshot] } }).decode(candidateRecord)).toMatchObject({ ok: false });
+      };
+      expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: "./wrong" }] });
+      expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "other" }, plugins: [{ name: "tool", source: "./tool" }] });
+      expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: { source: "github", repo: "owner/tool" } }] });
+      expectRejectedDeclaration({ name: "official", metadata: { pluginRoot: "plugins" }, plugins: [{ name: "tool", source: "./tool" }, { name: "tool", source: "./tool" }] });
+    } finally { fs.rmSync(parent, { recursive: true, force: true }); }
   });
 
   it("projects imported evidence without inventing optional timestamps and rejects owner/scope conflicts", () => {

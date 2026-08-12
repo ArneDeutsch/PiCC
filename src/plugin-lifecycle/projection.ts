@@ -119,16 +119,16 @@ export function observeLifecycleEnvelope(store: Parameters<typeof observePersist
   return Object.freeze({ records: Object.freeze([...records]), receipts: observed.receipts, pending: observed.journals });
 }
 
-export function ownedMarketplaceProjection(records: readonly OwnedMarketplaceRecord[], snapshots: readonly OwnedMarketplaceSnapshotRecord[] = []): readonly OwnedMarketplaceRecord[] {
-  const byName = new Map<string, OwnedMarketplaceRecord>(); const conflicts = new Set<string>();
-  const conflictingSnapshotIds = new Set<string>(); const snapshotAuthorities = new Map<string, string>();
-  for (const snapshot of snapshots) { const authority = JSON.stringify(snapshot); const existing = snapshotAuthorities.get(snapshot.snapshotId); if (existing === undefined) snapshotAuthorities.set(snapshot.snapshotId, authority); else if (existing !== authority) conflictingSnapshotIds.add(snapshot.snapshotId); }
+export function ownedMarketplaceProjection(records: readonly OwnedMarketplaceRecord[], snapshots: readonly OwnedMarketplaceSnapshotRecord[], active: { readonly checkoutFamilyKey: string; readonly projectKey: string }): readonly OwnedMarketplaceRecord[] {
+  const byAuthority = new Map<string, OwnedMarketplaceRecord>(); const conflicts = new Set<string>();
   for (const record of records) {
-    const snapshot = conflictingSnapshotIds.has(record.selectedSnapshotId) ? undefined : snapshots.find((item) => item.snapshotId === record.selectedSnapshotId && item.marketplaceName === record.name && JSON.stringify(item.source) === JSON.stringify(record.source));
-    if (snapshot === undefined) { conflicts.add(record.name); continue; }
-    const existing = byName.get(record.name);
-    if (existing === undefined) byName.set(record.name, record);
-    else if (JSON.stringify(existing) !== JSON.stringify(record)) conflicts.add(record.name);
+    if (record.scope !== "user" && (record.checkoutFamilyKey !== active.checkoutFamilyKey || record.projectKey !== active.projectKey)) continue;
+    const snapshot = snapshots.find((item) => item.snapshotId === record.selectedSnapshotId && item.marketplaceName === record.name && JSON.stringify(item.source) === JSON.stringify(record.source));
+    const authority = record.scope === "user" ? `${record.profileKey}\0user\0${record.name}` : `${record.profileKey}\0${record.scope}\0${record.checkoutFamilyKey}\0${record.projectKey}\0${record.name}`;
+    if (snapshot === undefined) { conflicts.add(authority); continue; }
+    const existing = byAuthority.get(authority);
+    if (existing === undefined) byAuthority.set(authority, record);
+    else if (JSON.stringify(existing) !== JSON.stringify(record)) conflicts.add(authority);
   }
-  return Object.freeze([...byName.entries()].filter(([name]) => !conflicts.has(name)).map(([, record]) => record).sort((a, b) => a.name.localeCompare(b.name)));
+  return Object.freeze([...byAuthority.entries()].filter(([authority]) => !conflicts.has(authority)).map(([, record]) => record).sort((a, b) => a.name.localeCompare(b.name) || a.scope.localeCompare(b.scope)));
 }
