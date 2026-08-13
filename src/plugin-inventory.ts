@@ -13,7 +13,7 @@ import type {
 } from "./types.js";
 
 const LIMIT = Object.freeze({ items: 2048, installations: 64, declarations: 64, components: 128, dependencies: 128, renames: 64, marketplaces: 256, policies: 256, diagnostics: 128, evidence: 256, fields: 64 });
-export const PLUGIN_INVENTORY_SESSION_BOUNDARY = "Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.";
+export const PLUGIN_INVENTORY_SESSION_BOUNDARY = "Captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh.";
 export const PLUGIN_INVENTORY_COMMAND_BOUNDARY = "Captured for this command; run the command again to refresh.";
 
 type RuntimeComponentKind = "skills" | "commands" | "agents" | "hooks" | "mcpServers" | "lspServers";
@@ -78,7 +78,7 @@ export interface PluginInventoryLifecycleOperation {
 export interface PluginInventoryLifecycleState {
   readonly ownership: PluginInventoryOwnership; readonly marketplaceOwnership?: PluginInventoryOwnership; readonly mutableRecordKey?: string; readonly selectedScope?: string;
   readonly candidates?: readonly PluginInventoryLifecycleCandidate[]; readonly selectionRequired?: boolean; readonly selectionGuidance?: string;
-  readonly availableActions: readonly ("install" | "update" | "reinstall" | "enable" | "disable" | "uninstall")[];
+  readonly availableActions: readonly ("install" | "update" | "enable" | "disable" | "uninstall")[];
   readonly installed: boolean; readonly declared?: boolean; readonly effectiveEnabled?: boolean; readonly loaded: boolean;
   readonly trusted?: boolean; readonly immutableRevision?: string; readonly integrity?: string; readonly root?: PluginInventoryLocation;
   readonly defaultEnablementSource?: string; readonly dependency: PluginInventoryDependencyPosture;
@@ -384,7 +384,7 @@ export function buildPluginInventorySnapshot(options: BuildPluginInventorySnapsh
     const marketplaceCandidates = lifecycle.marketplaces.get(names.marketplaceName) ?? []; const marketplaceOwnership: PluginInventoryOwnership | undefined = marketplaceCandidates.length > 0 ? "picc-owned" : undefined;
     const catalogInstallEligible = !installed && catalogEntries.length > 0 && marketplaceCandidates.length === 1 && marketplaceCandidates[0]?.selected === true && lifecycle.mutationBlockedReason === undefined;
     const targetReady = selectedCandidate !== undefined && !selectionRequired && lifecycle.mutationBlockedReason === undefined;
-    const availableActions: PluginInventoryLifecycleState["availableActions"] = catalogInstallEligible ? ["install"] : targetReady ? ["update", "reinstall", "enable", "disable", "uninstall"] : [];
+    const availableActions: PluginInventoryLifecycleState["availableActions"] = catalogInstallEligible ? ["install"] : targetReady ? ["update", "enable", "disable", "uninstall"] : [];
     const readOnlyReason = lifecycle.mutationBlockedReason ?? (selectionRequired ? "More than one writable scope is available; select an exact scope before mutation" : rawCandidates.length > 0 && selectedCandidate === undefined ? "No exact runtime-selected writable target was observed" : lifecycleOwnership === "managed" ? "Administrator-owned installation" : lifecycleOwnership === "seed" ? "Seed installation is managed at its source" : lifecycleOwnership === "claude-imported-readonly" ? "Claude-owned installation; use Claude Code to mutate it" : undefined);
     const defaultEnablementSource = explicitDeclared ? "explicit-setting" : selectedCandidate !== undefined && enablement !== undefined ? "derived-owned-default" : selectedPlugin?.manifestProjection.defaultEnabled?.presence === "explicit" ? "manifest-default" : "enabled-by-default";
     const itemLifecycle: PluginInventoryLifecycleState = Object.freeze({ ownership: lifecycleOwnership, ...(marketplaceOwnership === undefined ? {} : { marketplaceOwnership }), candidates, ...(selectionRequired ? { selectionRequired: true, selectionGuidance: "Select one exact writable scope before previewing a lifecycle mutation" } : {}), availableActions: Object.freeze(availableActions), ...(selectedCandidate === undefined ? {} : { mutableRecordKey: selectedCandidate.mutableRecordKey, selectedScope: selectedCandidate.scope, trusted: selectedCandidate.trusted, immutableRevision: selectedCandidate.immutableRevision, integrity: selectedCandidate.integrity, root: selectedCandidate.root }), installed, declared: explicitDeclared, effectiveEnabled: enablement?.enabled, loaded, defaultEnablementSource, dependency, ...(readOnlyReason === undefined ? {} : { readOnlyReason }), ...(evidence?.pendingStep === undefined ? {} : { pendingStep: evidence.pendingStep }), ...(evidence?.recoveryCategory === undefined ? {} : { recoveryCategory: evidence.recoveryCategory }), ...(evidence?.recoveryCommand === undefined ? {} : { recoveryCommand: evidence.recoveryCommand }), lifecycleOperations: evidence?.lifecycleOperations ?? Object.freeze([]), pendingReload, retainedErrors });

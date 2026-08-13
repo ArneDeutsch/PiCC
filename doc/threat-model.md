@@ -62,6 +62,14 @@ bundles, development roots, marketplace catalogs, and cache presence without com
 authority likewise remain inert. This evidence is neither a publisher-authenticity claim nor an OS
 sandbox; the baseline local-user trust and isolation limits above still apply.
 
+Plugin acquisition is an explicit user-authorized executable-content boundary. Source descriptors,
+remote responses, repositories, packages, archives, catalogs, paths, links, names, and dependency
+metadata are untrusted until PiCC validates a bounded portable tree and binds trust to immutable
+content. Opening or merely observing a project grants no new acquisition, trust approval, lifecycle
+recovery, installation, or settings-write authority; execution still follows the imported-or-committed
+boundary above. PiCC does not accept ambient credentials, SSH/private sources, private-network
+destinations, package lifecycle scripts, or mutable source identity as substitutes for that boundary.
+
 ## Out of scope
 
 PiCC does not attempt to defend against:

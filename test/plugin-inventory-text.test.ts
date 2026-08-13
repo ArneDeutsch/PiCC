@@ -111,6 +111,9 @@ describe("plugin inventory operation grammar", () => {
     expect(parsePluginInventoryArgv(["uninstall", "same@one", "--remove-declaration", "no", "--remove-data", "yes", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "uninstall", flags: { removeDeclaration: false, removeData: true } } });
     expect(parsePluginInventoryArgv(["recover"])).toEqual({ kind: "operation", operation: { kind: "recover-list" } });
     expect(parsePluginInventoryArgv(["recover", "plugin_exact", "--rollback", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "recover", operationId: "plugin_exact", flags: { recoveryAction: "rollback", yes: true } } });
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("interactive TUI");
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("focused workflows");
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("standalone commands");
     expect(PLUGIN_INVENTORY_SLASH_USAGE).not.toContain("evil");
   });
 
@@ -212,7 +215,7 @@ describe("plugin inventory deterministic text", () => {
     expect(rendered).toContain("Plugin: loaded@market\n  installed: 1 valid, 1 invalid\n  enabled: not declared\n  runtime: loaded\n  lifecycle: not projected\n  catalog: not known");
     expect(rendered.indexOf("same@two")).toBeLessThan(rendered.indexOf("same@one"));
     expect(rendered.indexOf("loaded@market")).toBeLessThan(rendered.indexOf("same@one"));
-    expect(rendered).toContain("captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh");
+    expect(rendered).toContain("captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh");
     expect(renderPluginInventoryList(snapshot([], { lifetime: "command" }))).toContain("captured for this command; rerun this command to refresh");
   });
 
@@ -463,12 +466,12 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.qualifiedIdentities).toContain("same@m1");
     expect(projection.omissions).toEqual({ identities: 2, managedPolicyEvidence: 0, captureEvidence: [] });
     expect(projection.managedPolicyEvidence).toEqual([
-      { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
-      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
+      { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" },
+      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" },
     ]);
     expect(projection.text).toContain("Run /doctor for details");
-    expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
-    expect(projection.text).toContain("system policy drop-in was unreadable; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
+    expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run /reload-plugins in the interactive TUI, or start a new PiCC session.");
+    expect(projection.text).toContain("system policy drop-in was unreadable; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run /reload-plugins in the interactive TUI, or start a new PiCC session.");
     expect(projection.text).not.toContain("captured for this session");
     expect(projection.text).not.toContain("raw administrator path");
   });
@@ -496,7 +499,7 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.counts).toEqual({ known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1 });
     expect(projection.diagnostics).toContainEqual(expect.objectContaining({ qualifiedIdentity: "same@two", status: "blocked" }));
     expect(projection.capabilityEvidence).toEqual([{ capabilityId: "feature.plugins-agents", qualifiedIdentity: "same@one", component: "agents", observation: "Plugin agent field hooks was stripped before runtime construction" }]);
-    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" }]);
+    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" }]);
     expect(projection.snapshotBoundary).toContain("captured for this session");
   });
 
@@ -513,7 +516,7 @@ describe("plugin inventory startup and doctor projections", () => {
     const doctor = projectPluginInventoryDoctor(snapshot([], { diagnostics }));
     expect(doctor.managedPolicyEvidence).toHaveLength(3);
     for (const [sourceClass, sourceLabel, actor] of sources) {
-      expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact: "source-ignored", guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("canonical /reload") }));
+      expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact: "source-ignored", guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("/reload-plugins") }));
     }
     expect(JSON.stringify(doctor)).not.toMatch(/C:\/RAW/u);
 
@@ -552,7 +555,7 @@ describe("plugin inventory startup and doctor projections", () => {
       message: "repair this declaration",
       nextCommand: "/plugin details p@market",
       repairBoundary: expect.stringContaining("read-only"),
-      refreshGuidance: expect.stringContaining("canonical /reload"),
+      refreshGuidance: expect.stringContaining("/reload-plugins"),
     })]);
     expect(projection.omitted.diagnostics.projection).toBe(0);
   });

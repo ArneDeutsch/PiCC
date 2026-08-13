@@ -129,7 +129,7 @@ describe("plugin inventory focused UI", () => {
     expect(zero).toContain("No matches for the active literal filter");
     expect(zero).toContain("read-only · captured for this session");
     expect(zero).toContain("run /reload-plugins in the interactive TUI");
-    expect(zero).toContain("exit and relaunch");
+    expect(zero).toMatch(/exit and relaunch\s+PiCC/);
     expect(zero).toContain("Local known catalogs/registrations only");
   });
 

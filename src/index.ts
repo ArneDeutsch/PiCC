@@ -567,8 +567,8 @@ export async function writeFdFully(
 }
 
 const PLUGIN_CONTROL_NAMES = new Set(["plugin", "plugins", "reload-plugins"]);
-const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
-const PLUGIN_RECONCILE_RECOVERY = `Reconcile or reinstall the plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}`;
+const PLUGIN_REFRESH_ACTION = "run /reload-plugins in the interactive TUI or start a new PiCC session";
+const PLUGIN_RECONCILE_RECOVERY = `Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, ${PLUGIN_REFRESH_ACTION}`;
 
 function pluginDataFailureRecovery(code: string): string {
   return code === "unreadable-path" || code === "wrong-kind"

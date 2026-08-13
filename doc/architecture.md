@@ -220,10 +220,32 @@ resolve dependencies, rewrite settings, or start unsupported components. Session
 startup diagnostics, and `/doctor` consume the same fixed snapshot for the extension lifetime;
 launcher inventory commands build one command-scoped snapshot without normal runtime startup.
 Consumers produce bounded, redacted projections without rereading plugin state. Post-capture
-point-of-use refusals remain separate live evidence. Refreshing a session snapshot requires canonical
-`/reload` in the interactive TUI or a full PiCC relaunch. Construction and viewing perform no
+point-of-use refusals remain separate live evidence. Refreshing a session snapshot requires `/reload-plugins` in the interactive TUI or a new PiCC
+session. Construction and viewing perform no
 marketplace refresh or acquisition, settings or registry writes, plugin process startup, hook
 execution, usage mutation, or prompt-cache invalidation.
+
+### `plugin-lifecycle/` — owned acquisition and durable desired state
+
+This subsystem owns safe source routing and acquisition, immutable artifact and marketplace snapshot
+storage, exact PiCC-owned installation/registration records, settings planning/writing, executable
+admission generations, transaction receipts, and offline recovery. It is the only lifecycle mutation
+authority. Imported Claude installations and Claude-owned, seed, or managed marketplace registrations
+are assembly inputs and remain read-only.
+
+`src/project.ts` remains the project-assembly authority: it captures applicable imported executable
+trees, validates the one committed PiCC-owned generation, combines both ownership families, resolves
+effective enablement and dependencies, and produces the session snapshot and reload candidate. Plugin
+skill and legacy-command Markdown is privately captured during assembly and later activated from those
+bytes; ordinary skills retain progressive disclosure by reading their file on activation. Terminal
+commands and the focused TUI share the typed `PluginLifecyclePort` composition in
+`plugin-inventory-cli.ts`; passive inventory browsing never crosses its mutation methods. Lifecycle
+receipts refresh durable desired-state projections, while the loaded runtime stays session-captured
+until a successful `/reload-plugins` replacement or a new session.
+
+**Placement:** lifecycle source, storage, transaction, settings, trust, dependency, and recovery code.
+Project contribution selection and final runtime assembly remain in `src/project.ts` and the Claude
+component loaders.
 
 ### `engine/` — the deterministic enforcement primitives
 
@@ -491,8 +513,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    launcher selection nor compiled-generation verification. The process env is then made UTF-8-safe,
    and `loadClaudeProject()` assembles the project model. MCP loading resolves standalone authority
    and immutable managed-settings policy, admits raw winners, and materializes only enabled results.
-   `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a multiplexer so
-   skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime` (admitted enabled
+   Project opening and observation perform no plugin acquisition, trust approval, lifecycle recovery,
+   or settings mutation. `CwdState`, `PermissionEngine`, `WorktreeManager`, and `HookRunner` (behind a
+   multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime` (admitted enabled
    MCP servers begin connecting in the background, non-blocking) are constructed. All
    Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard
    extension is installed on tool events, and extension load creates the MCP exposure transaction.

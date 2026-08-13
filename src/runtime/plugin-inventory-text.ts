@@ -19,7 +19,7 @@ const MAX_STARTUP_POLICY_EVIDENCE = 3;
 const MAX_DOCTOR_POLICY_EVIDENCE = 10;
 const MAX_LINE = 320;
 
-export const PLUGIN_INVENTORY_SLASH_USAGE = "Usage: /plugin list | /plugin details <plugin@marketplace>. Lifecycle changes are standalone: run `picc plugin --help` in a terminal. No changes were made.";
+export const PLUGIN_INVENTORY_SLASH_USAGE = "Usage: /plugin list | /plugin details <plugin@marketplace>. In the interactive TUI, lifecycle actions open focused workflows; run `picc plugin --help` in a terminal for standalone commands. No changes were made.";
 export const PLUGIN_INVENTORY_ARGV_USAGE = `Usage: picc plugin <command>
   marketplace list
   marketplace details <name> [--selector <record>]
@@ -494,7 +494,7 @@ function policyGuidance(sourceClass: string, category: PluginInventoryManagedPol
   if (ADMIN_POLICY_SOURCES.has(sourceClass)) return category === "managed-policy-malformed" ? "Ask an administrator to correct the policy format" : "Ask an administrator to correct access to the policy source";
   return category === "managed-policy-malformed" ? "Correct the managed-policy override format" : "Correct access to the managed-policy override input";
 }
-function policyRefreshAction(): string { return "run canonical /reload in the interactive TUI, or exit and relaunch PiCC"; }
+function policyRefreshAction(): string { return "run /reload-plugins in the interactive TUI, or start a new PiCC session"; }
 function policyEvidence(diagnostics: readonly PluginInventoryDiagnostic[]): PluginInventoryManagedPolicyEvidence[] {
   const seen = new Set<string>(); const values: PluginInventoryManagedPolicyEvidence[] = [];
   for (const diagnostic of diagnostics) {
