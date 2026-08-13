@@ -27,7 +27,7 @@ import {
   createTrustedLifecycleRegistry, LifecycleRecoveryService,
 } from "../src/plugin-lifecycle/lifecycle-service.js";
 import {
-  createPluginAcquisitionAdapter, deriveOwnedPluginCatalogSelections, inspectAcquiredPlugin, PluginLifecycleService, pluginLifecycleProducerRegistry, pluginLifecycleTransactionRegistry, projectPluginPreviewForModel,
+  createPluginAcquisitionAdapter, decodePluginStableSelector, deriveOwnedPluginCatalogSelections, encodePluginStableSelector, inspectAcquiredPlugin, PluginLifecycleService, pluginLifecycleProducerRegistry, pluginLifecycleTransactionRegistry, projectPluginPreviewForModel,
   type PluginInspection, type PluginLocalSnapshot, type PluginObservation,
 } from "../src/plugin-lifecycle/plugin-service.js";
 import type { Sha256 } from "../src/plugin-lifecycle/types.js";
@@ -100,6 +100,15 @@ function admitCrossScopeIdentity(value: Awaited<ReturnType<typeof fixture>>, bas
 }
 
 describe("PluginLifecycleService", () => {
+  it("round trips only the canonical stable plugin selector wire format", () => {
+    const selector = { pluginId: "tool@official", owner: "picc-owned", scope: "project", profileKey: `profile-${"a".repeat(64)}`, projectKey: `checkout-${"b".repeat(64)}` } as const;
+    const encoded = encodePluginStableSelector(selector);
+    expect(decodePluginStableSelector(encoded)).toEqual(selector);
+    const reordered = Buffer.from(JSON.stringify({ owner: selector.owner, pluginId: selector.pluginId, scope: selector.scope, profileKey: selector.profileKey, projectKey: selector.projectKey }), "utf8").toString("base64url");
+    expect(decodePluginStableSelector(reordered)).toBeUndefined();
+    expect(decodePluginStableSelector(`${encoded}=`)).toBeUndefined();
+  });
+
   it("derives selections only from exact registration and retained snapshot projection authority", async () => {
     const value = await fixture(); const selected = deriveOwnedPluginCatalogSelections([value.registration], [value.snapshot]); expect(selected).toMatchObject({ ok: true, value: [{ pluginId: "other@official" }, { pluginId: "tool@official", source: value.source, allowedCrossMarketplaceDependencies: [], dependencies: [], dependencyDeclaration: "absent" }] });
     expect(deriveOwnedPluginCatalogSelections([{ ...value.registration, selectedSnapshotId: "marketplace-stale" }], [value.snapshot])).toMatchObject({ ok: false, code: "catalog-authority-ambiguous" });

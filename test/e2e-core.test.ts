@@ -157,11 +157,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     async () => {
       const result = await runPi({ script: [], prompt: "/plugin install ignored" });
       expect(result.requests).toHaveLength(0);
-      expect(result.stdout).toContain("Read-only usage: /plugin list | /plugin details <plugin@marketplace>");
-      expect(result.stdout).toContain("Run /plugin list to copy an exact qualified identity");
+      expect(result.stdout).toContain("Usage: /plugin list | /plugin details <plugin@marketplace>");
+      expect(result.stdout).toContain("Lifecycle changes are standalone: run `picc plugin --help` in a terminal");
       expect(result.stdout).toContain("No changes were made");
-      expect(result.stdout).toContain("Manage plugin installation and enablement in Claude Code.");
-      expect(result.stdout).toContain("canonical /reload in the interactive TUI or exit and relaunch PiCC");
       expect(result.stdout).not.toContain("install ignored");
     },
     TEST_TIMEOUT_MS,

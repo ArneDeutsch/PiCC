@@ -19,12 +19,44 @@ const MAX_STARTUP_POLICY_EVIDENCE = 3;
 const MAX_DOCTOR_POLICY_EVIDENCE = 10;
 const MAX_LINE = 320;
 
-export const PLUGIN_INVENTORY_SLASH_USAGE = "Read-only usage: /plugin list | /plugin details <plugin@marketplace> (example: /plugin details formatter@official). Run /plugin list to copy an exact qualified identity.";
-export const PLUGIN_INVENTORY_ARGV_USAGE = "Read-only usage: picc plugin list | picc plugin details <plugin@marketplace> (example: picc plugin details formatter@official). Run picc plugin list to copy an exact qualified identity.";
+export const PLUGIN_INVENTORY_SLASH_USAGE = "Usage: /plugin list | /plugin details <plugin@marketplace>. Lifecycle changes are standalone: run `picc plugin --help` in a terminal. No changes were made.";
+export const PLUGIN_INVENTORY_ARGV_USAGE = `Usage: picc plugin <command>
+  marketplace list
+  marketplace details <name> [--selector <record>]
+  marketplace add <name> --source <local-directory|local-catalog-file|github|https-git|https-catalog> <value> [--ref <ref>] [--scope <user|project|local>] [--declaration-only] [--yes]
+  marketplace refresh <name> [--selector <record>] [--declaration-only] [--yes]
+  marketplace update <name> [--selector <record>] [--declaration-only] [--yes]
+  marketplace remove <name> [--selector <record>] --preserve-installed yes [--declaration-only] [--yes]
+  list
+  details <plugin@marketplace|selector>
+  install <plugin@marketplace> [--marketplace-selector <marketplace-record>] [--scope <user|project|local>] [--declaration-only] [--yes]
+  enable|disable <plugin@marketplace> [--selector <plugin-record>] [--declaration-only] [--yes]
+  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--declaration-only] [--yes]
+  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration <yes|no> --remove-data <yes|no> [--declaration-only] [--yes]
+  recover [operation-id] [--complete|--rollback] [--yes]
+Output is bounded human-readable text; no stable JSON schema is provided.`;
 
+export interface PluginLifecycleFlags {
+  readonly yes: boolean;
+  readonly declarationOnly: boolean;
+  readonly scope?: "user" | "project" | "local";
+  readonly selector?: string;
+  readonly marketplaceSelector?: string;
+  readonly preserveInstalled?: true;
+  readonly removeDeclaration?: boolean;
+  readonly removeData?: boolean;
+  readonly recoveryAction?: "complete" | "rollback";
+}
 export type PluginInventoryOperation =
   | { readonly kind: "list" }
-  | { readonly kind: "details"; readonly qualifiedIdentity: string };
+  | { readonly kind: "details"; readonly identity?: string; readonly qualifiedIdentity?: string }
+  | { readonly kind: "marketplace-list" }
+  | { readonly kind: "marketplace-details"; readonly name: string; readonly selector?: string }
+  | { readonly kind: "marketplace-add"; readonly name: string; readonly sourceKind: "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog"; readonly sourceValue: string; readonly ref?: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "marketplace-refresh" | "marketplace-remove"; readonly name: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "install" | "enable" | "disable" | "update" | "uninstall"; readonly qualifiedIdentity: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "recover-list" }
+  | { readonly kind: "recover"; readonly operationId: string; readonly flags: PluginLifecycleFlags };
 
 export type PluginInventoryOperationParseResult =
   | { readonly kind: "operation"; readonly operation: PluginInventoryOperation }
@@ -87,24 +119,82 @@ function validQualifiedIdentity(value: string): boolean {
   return parseQualifiedPluginId(value) !== undefined;
 }
 
-function parseTokens(tokens: readonly string[], usage: string): PluginInventoryOperationParseResult {
+function parseReadOnlyTokens(tokens: readonly string[], usage: string): PluginInventoryOperationParseResult {
   if (tokens.length === 1 && tokens[0] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "list" }) });
-  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) {
-    return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
-  }
+  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
   return Object.freeze({ kind: "usage", usage });
+}
+
+function validPlain(value: string, maximum = 256): boolean {
+  return value.length > 0 && value.length <= maximum && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+function validOperationId(value: string): boolean { return /^[A-Za-z0-9_-]{1,128}$/.test(value); }
+function validMarketplaceName(value: string): boolean { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) && value.length <= 128; }
+
+function parseFlags(tokens: readonly string[], allowed: ReadonlySet<string>): PluginLifecycleFlags | undefined {
+  let yes = false; let declarationOnly = false; let scope: PluginLifecycleFlags["scope"]; let selector: string | undefined; let marketplaceSelector: string | undefined;
+  let preserveInstalled: true | undefined; let removeDeclaration: boolean | undefined; let removeData: boolean | undefined; let recoveryAction: "complete" | "rollback" | undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (!allowed.has(token)) return undefined;
+    if (token === "--yes") { if (yes) return undefined; yes = true; continue; }
+    if (token === "--declaration-only") { if (declarationOnly) return undefined; declarationOnly = true; continue; }
+    if (token === "--complete" || token === "--rollback") { if (recoveryAction !== undefined) return undefined; recoveryAction = token.slice(2) as "complete" | "rollback"; continue; }
+    const value = tokens[++index]; if (value === undefined || value.startsWith("--") || !validPlain(value, 1024)) return undefined;
+    if (token === "--scope") { if (scope !== undefined || !["user", "project", "local"].includes(value)) return undefined; scope = value as PluginLifecycleFlags["scope"]; }
+    else if (token === "--selector") { if (selector !== undefined || !/^[A-Za-z0-9_-]{1,1024}$/.test(value)) return undefined; selector = value; }
+    else if (token === "--marketplace-selector") { if (marketplaceSelector !== undefined || !/^[A-Za-z0-9_-]{1,1024}$/.test(value)) return undefined; marketplaceSelector = value; }
+    else if (token === "--preserve-installed") { if (preserveInstalled !== undefined || value !== "yes") return undefined; preserveInstalled = true; }
+    else if (token === "--remove-declaration") { if (removeDeclaration !== undefined || !["yes", "no"].includes(value)) return undefined; removeDeclaration = value === "yes"; }
+    else if (token === "--remove-data") { if (removeData !== undefined || !["yes", "no"].includes(value)) return undefined; removeData = value === "yes"; }
+    else return undefined;
+  }
+  return Object.freeze({ yes, declarationOnly, ...(scope === undefined ? {} : { scope }), ...(selector === undefined ? {} : { selector }), ...(marketplaceSelector === undefined ? {} : { marketplaceSelector }), ...(preserveInstalled === undefined ? {} : { preserveInstalled }), ...(removeDeclaration === undefined ? {} : { removeDeclaration }), ...(removeData === undefined ? {} : { removeData }), ...(recoveryAction === undefined ? {} : { recoveryAction }) });
+}
+
+function parseArgvTokens(tokens: readonly string[]): PluginInventoryOperationParseResult {
+  if (tokens.length === 1 && tokens[0] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "list" }) });
+  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
+  if (tokens.length === 2 && tokens[0] === "details" && /^[A-Za-z0-9_-]{16,1024}$/.test(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", identity: tokens[1]! }) });
+  if (tokens[0] === "marketplace") {
+    if (tokens.length === 2 && tokens[1] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-list" }) });
+    if (tokens[1] === "details" && validMarketplaceName(tokens[2] ?? "")) { const flags = parseFlags(tokens.slice(3), new Set(["--selector"])); if (flags !== undefined) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-details", name: tokens[2]!, ...(flags.selector === undefined ? {} : { selector: flags.selector }) }) }); }
+    if (tokens[1] === "add" && validMarketplaceName(tokens[2] ?? "") && tokens[3] === "--source" && ["local-directory", "local-catalog-file", "github", "https-git", "https-catalog"].includes(tokens[4] ?? "") && validPlain(tokens[5] ?? "", 4096)) {
+      const tail = [...tokens.slice(6)]; let ref: string | undefined; const refIndex = tail.indexOf("--ref");
+      if (refIndex >= 0) { const value = tail[refIndex + 1]; if (value === undefined || !validPlain(value, 256) || refIndex + 2 > tail.length) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE }); ref = value; tail.splice(refIndex, 2); }
+      const flags = parseFlags(tail, new Set(["--scope", "--declaration-only", "--yes"]));
+      if (flags !== undefined && (ref === undefined || tokens[4] === "github" || tokens[4] === "https-git")) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-add", name: tokens[2]!, sourceKind: tokens[4] as "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog", sourceValue: tokens[5]!, ...(ref === undefined ? {} : { ref }), flags }) });
+    }
+    if (["refresh", "update", "remove"].includes(tokens[1] ?? "") && validMarketplaceName(tokens[2] ?? "")) {
+      const remove = tokens[1] === "remove"; const flags = parseFlags(tokens.slice(3), new Set(["--selector", "--declaration-only", "--yes", ...(remove ? ["--preserve-installed"] : [])]));
+      if (flags !== undefined && (!remove || flags.preserveInstalled === true)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: remove ? "marketplace-remove" : "marketplace-refresh", name: tokens[2]!, flags }) as PluginInventoryOperation });
+    }
+    return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  }
+  if (["install", "enable", "disable", "update", "uninstall"].includes(tokens[0] ?? "") && validQualifiedIdentity(tokens[1] ?? "")) {
+    const action = tokens[0] as "install" | "enable" | "disable" | "update" | "uninstall";
+    const allowed = new Set(["--declaration-only", "--yes", ...(action === "install" || action === "update" ? ["--marketplace-selector"] : []), ...(action === "enable" || action === "disable" || action === "update" || action === "uninstall" ? ["--selector"] : []), ...(action === "install" ? ["--scope"] : []), ...(action === "uninstall" ? ["--remove-declaration", "--remove-data"] : [])]);
+    const flags = parseFlags(tokens.slice(2), allowed);
+    if (flags !== undefined && (action !== "uninstall" || flags.removeDeclaration !== undefined && flags.removeData !== undefined)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: action, qualifiedIdentity: tokens[1]!, flags }) });
+  }
+  if (tokens[0] === "recover") {
+    if (tokens.length === 1) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "recover-list" }) });
+    if (validOperationId(tokens[1] ?? "")) { const flags = parseFlags(tokens.slice(2), new Set(["--complete", "--rollback", "--yes"])); if (flags !== undefined) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "recover", operationId: tokens[1]!, flags }) }); }
+  }
+  return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
 }
 
 export function parsePluginInventorySlash(input: string): PluginInventoryOperationParseResult {
   if (input.length > MAX_INPUT || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.replace(/\t/gu, ""))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
   const match = /^[ \t]*\/plugin(?:[ \t]+([^\r\n]*?))?[ \t]*$/.exec(input);
   if (match === null || match[1] === undefined) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
-  return parseTokens(match[1].split(/[ \t]+/), PLUGIN_INVENTORY_SLASH_USAGE);
+  return parseReadOnlyTokens(match[1].split(/[ \t]+/), PLUGIN_INVENTORY_SLASH_USAGE);
 }
 
 export function parsePluginInventoryArgv(argv: readonly string[]): PluginInventoryOperationParseResult {
-  if (argv.some((token) => token.length > MAX_INPUT || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(token))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
-  return parseTokens(argv, PLUGIN_INVENTORY_ARGV_USAGE);
+  if (argv.some((token) => token.length > 4096 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(token))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  return parseArgvTokens(argv);
 }
 
 const REDACTED_FIELD = "<redacted-field>";
@@ -392,7 +482,11 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   return lines.join("\n");
 }
 
-export function renderPluginInventoryOperation(snapshot: PluginInventorySnapshot, operation: PluginInventoryOperation): string { return operation.kind === "list" ? renderPluginInventoryList(snapshot) : renderPluginInventoryDetails(snapshot, operation.qualifiedIdentity); }
+export function renderPluginInventoryOperation(snapshot: PluginInventorySnapshot, operation: PluginInventoryOperation): string {
+  if (operation.kind === "list") return renderPluginInventoryList(snapshot);
+  if (operation.kind === "details" && operation.qualifiedIdentity !== undefined) return renderPluginInventoryDetails(snapshot, operation.qualifiedIdentity);
+  return PLUGIN_INVENTORY_ARGV_USAGE;
+}
 
 const SOURCE_LABELS: Readonly<Record<string, string>> = Object.freeze({ "system-file": "system policy file", "system-drop-in": "system policy drop-in", override: "managed-policy override" });
 const ADMIN_POLICY_SOURCES = new Set(["system-file", "system-drop-in"]);

@@ -98,13 +98,20 @@ describe("plugin inventory operation grammar", () => {
     }
   });
 
-  it("rejects missing, extra, unqualified, ambiguous, control, option, and mutation-looking forms without reflection", () => {
+  it("keeps slash mutation-looking input inert while argv accepts only complete lifecycle forms", () => {
     const slashValues = ["/plugin", "/plugin details", "/plugin details same", "/plugin details same@one extra", "/plugin install same@one", "/plugin --help", "/plugin list\ninstall evil", `/plugin details ${"a".repeat(520)}@m`];
-    const argvValues = [[], ["details"], ["details", "same"], ["details", "same@one", "extra"], ["install", "same@one"], ["--help"], ["details", "same@one\nremove"]];
+    const argvValues = [[], ["details"], ["details", "same"], ["details", "same@one", "extra"], ["install"], ["install", "same@one", "--unknown"], ["install", "same@one", "--yes", "--yes"], ["marketplace", "remove", "official", "--yes"], ["details", "same@one\nremove"], ["uninstall", "same@one", "--remove-data", "yes"]];
     for (const value of slashValues) expect(parsePluginInventorySlash(value)).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
     for (const value of argvValues) expect(parsePluginInventoryArgv(value)).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    expect(parsePluginInventoryArgv(["install", "same@one", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q", "--scope", "project", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "install", qualifiedIdentity: "same@one", flags: { marketplaceSelector: "bWFya2V0cGxhY2UtZXhhY3Q", scope: "project", yes: true } } });
+    expect(parsePluginInventoryArgv(["update", "same@one", "--selector", "cGx1Z2lu", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "update", flags: { selector: "cGx1Z2lu", marketplaceSelector: "bWFya2V0cGxhY2UtZXhhY3Q" } } });
+    expect(parsePluginInventoryArgv(["install", "same@one", "--selector", "bWFya2V0cGxhY2UtZXhhY3Q"])).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    expect(parsePluginInventoryArgv(["enable", "same@one", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q"])).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    expect(parsePluginInventoryArgv(["marketplace", "update", "official", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "marketplace-refresh", name: "official" } });
+    expect(parsePluginInventoryArgv(["uninstall", "same@one", "--remove-declaration", "no", "--remove-data", "yes", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "uninstall", flags: { removeDeclaration: false, removeData: true } } });
+    expect(parsePluginInventoryArgv(["recover"])).toEqual({ kind: "operation", operation: { kind: "recover-list" } });
+    expect(parsePluginInventoryArgv(["recover", "plugin_exact", "--rollback", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "recover", operationId: "plugin_exact", flags: { recoveryAction: "rollback", yes: true } } });
     expect(PLUGIN_INVENTORY_SLASH_USAGE).not.toContain("evil");
-    expect(PLUGIN_INVENTORY_ARGV_USAGE).not.toContain("remove");
   });
 
   it("treats argv as exact tokens and slash whitespace as spaces or tabs only", () => {

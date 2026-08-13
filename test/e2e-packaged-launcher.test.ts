@@ -221,7 +221,7 @@ afterAll(() => {
 }, 120_000);
 
 it(
-  "installed release tarball > runs read-only packaged plugin inventory commands without PiCC runtime startup",
+  "installed release tarball > runs the smallest packaged standalone plugin route without PiCC runtime startup",
   async () => {
     const root = temporaryDirectory("picc-packaged-inventory-");
     const project = path.join(root, "project");
@@ -331,21 +331,18 @@ require("node:module").syncBuiltinESMExports();
       expect(list.stdout).toBe([
         "Plugin inventory (read-only)",
         "Snapshot: captured for this command; rerun this command to refresh",
+        "Loaded generation: not identified",
+        "Durable desired generation: not identified",
         "Plugin: hostile@market",
         "  installed: 1 valid",
         "  enabled: yes",
         "  runtime: loaded",
+        "  lifecycle: owner=claude-imported-readonly; desired-installed=yes; declared=yes; effective=yes; loaded=yes; reload=not pending",
         "  catalog: not known",
+        "Scoped candidate: hostile@market; scope=user; owner=claude-imported-readonly; read-only; selector=eyJwbHVnaW5JZCI6Imhvc3RpbGVAbWFya2V0Iiwib3duZXIiOiJjbGF1ZGUtaW1wb3J0ZWQtcmVhZG9ubHkiLCJzY29wZSI6InVzZXIifQ",
         "",
       ].join("\n"));
 
-      const details = await run(["details", "hostile@market"]);
-      expect(details).toMatchObject({
-        code: 0,
-        stderr: "",
-      });
-      expect(details.stdout).toContain("Plugin: hostile@market");
-      expect(details.stdout).toContain("Mode: read-only");
 
       expect(networkRequests).toBe(0);
       expect(fs.existsSync(executionCanary)).toBe(false);

@@ -213,15 +213,29 @@ function strictBase64(value: unknown, maximum = 1024 * 1024): StoreResult<Buffer
 function snapshotsById(snapshots: readonly OwnedMarketplaceSnapshotRecord[]): Record<string, OwnedMarketplaceSnapshotRecord[]> { const result: Record<string, OwnedMarketplaceSnapshotRecord[]> = {}; for (const snapshot of snapshots) (result[snapshot.snapshotId] ??= []).push(snapshot); return result; }
 export function pluginMutableRecordKey(record: Pick<OwnedPluginInstallationRecord, "pluginId" | "scope" | "profileKey" | "projectKey">): string { return `${record.pluginId}\0picc-owned\0${record.scope}\0${record.profileKey}\0${record.projectKey ?? ""}`; }
 const identityKey = pluginMutableRecordKey;
+export function encodePluginStableSelector(value: PluginStableSelector): string {
+  const canonical: PluginStableSelector = { pluginId: value.pluginId, owner: value.owner, scope: value.scope, ...(value.profileKey === undefined ? {} : { profileKey: value.profileKey }), ...(value.projectKey === undefined ? {} : { projectKey: value.projectKey }) };
+  return Buffer.from(JSON.stringify(canonical), "utf8").toString("base64url");
+}
+export function decodePluginStableSelector(raw: string): PluginStableSelector | undefined {
+  if (!/^[A-Za-z0-9_-]{1,1024}$/.test(raw)) return undefined;
+  try {
+    const bytes = Buffer.from(raw, "base64url");
+    if (bytes.toString("base64url") !== raw) return undefined;
+    const value = JSON.parse(bytes.toString("utf8")) as PluginStableSelector; const keys = Object.keys(value).sort().join(",");
+    if (!isQualifiedPluginId(value.pluginId) || !["picc-owned", "claude-imported-readonly", "managed", "seed"].includes(value.owner) || !["user", "project", "local", "managed"].includes(value.scope)
+      || (value.profileKey !== undefined && (typeof value.profileKey !== "string" || value.profileKey.length === 0 || value.profileKey.length > 256))
+      || (value.projectKey !== undefined && (typeof value.projectKey !== "string" || value.projectKey.length === 0 || value.projectKey.length > 256))
+      || !["owner,pluginId,scope", "owner,pluginId,profileKey,scope", "owner,pluginId,profileKey,projectKey,scope"].includes(keys)
+      || encodePluginStableSelector(value) !== raw) return undefined;
+    return Object.freeze(value);
+  } catch { return undefined; }
+}
 function selectorFor(row: PluginObservation): string {
   const authority = row.authority?.record; const profileKey = authority?.profileKey ?? row.profileKey; const projectKey = authority?.projectKey ?? row.projectKey;
-  const value: PluginStableSelector = { pluginId: row.pluginId, owner: row.owner, scope: row.scope, ...(profileKey === undefined ? {} : { profileKey }), ...(projectKey === undefined ? {} : { projectKey }) };
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  return encodePluginStableSelector({ pluginId: row.pluginId, owner: row.owner, scope: row.scope, ...(profileKey === undefined ? {} : { profileKey }), ...(projectKey === undefined ? {} : { projectKey }) });
 }
-function parseSelector(raw: string): PluginStableSelector | undefined {
-  if (!/^[A-Za-z0-9_-]{1,1024}$/.test(raw)) return undefined;
-  try { const value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as PluginStableSelector; const keys = Object.keys(value).sort().join(","); if (!isQualifiedPluginId(value.pluginId) || !["picc-owned", "claude-imported-readonly", "managed", "seed"].includes(value.owner) || !["user", "project", "local", "managed"].includes(value.scope) || !["owner,pluginId,scope", "owner,pluginId,profileKey,scope", "owner,pluginId,profileKey,projectKey,scope"].includes(keys)) return undefined; return value; } catch { return undefined; }
-}
+const parseSelector = decodePluginStableSelector;
 function guidanceFor(owner: PluginOwner): string | undefined { return owner === "managed" ? "This plugin is administrator-owned; ask the administrator to change it." : owner === "seed" ? "This seed installation is read-only; manage it with Claude Code." : owner === "claude-imported-readonly" ? "This plugin is Claude-owned; use Claude Code to change it." : undefined; }
 function operationId(): string { return `plugin_${randomBytes(18).toString("base64url")}`; }
 function recordName(pluginId: string): string { return `plugin-${createHash("sha256").update(pluginId, "utf8").digest("base64url")}.json`; }

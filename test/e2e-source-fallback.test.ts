@@ -112,7 +112,7 @@ function pluginCommand(launcher: string, cwd: string, args: string[], pluginCana
 }
 
 describe.skipIf(cliMissing)("source-checkout fallback", () => {
-  it("runs one disclosed TypeScript generation through real Pi and both plugin commands until relaunch", async () => {
+  it("keeps standalone plugin routing on one disclosed TypeScript generation until rebuild and relaunch", async () => {
     const isolated = isolatedCheckout();
     const list = pluginCommand(isolated.launcher, isolated.root, ["list"], isolated.pluginCanary);
     expect(list.status, list.stderr).toBe(0);
