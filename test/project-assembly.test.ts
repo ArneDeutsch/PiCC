@@ -32,6 +32,7 @@ import { preparePluginSettingsWrite } from "../src/plugin-lifecycle/settings-wri
 import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
 import { createOwnedDataRetirementAuthorizer, ownedPluginDataDeletionEligible } from "../src/claude/plugin-paths.js";
 import { PORTABLE_TREE_LIMITS } from "../src/plugin-lifecycle/tree-validator.js";
+import { pluginMutableRecordKey } from "../src/plugin-lifecycle/plugin-service.js";
 
 /**
  * Assembly-level coverage for loadClaudeProject: settings,
@@ -104,21 +105,22 @@ function makeBase(): { base: string; repo: string; userDir: string } {
   return { base, repo, userDir };
 }
 
-function installOwnedPlugin(base: string, repo: string, userDir: string, checkoutFamilyPath = repo, homeDir = path.dirname(userDir), defaults: { manifest?: boolean; marketplace?: boolean; dependencies?: unknown; name?: string; hooks?: boolean; skillBytes?: Uint8Array; catalogPadding?: string; catalogMetadataPluginRoot?: unknown; snapshotOnly?: boolean } = { manifest: true }): { root: string; dataRoot: string; installationRecordPath: string; marketplaceRecordPath: string; snapshotRecordPath: string; generationPath: string; member: Record<string, unknown>; treeDigest: string; rootDigest: string; executableDigest: string } {
+function installOwnedPlugin(base: string, repo: string, userDir: string, checkoutFamilyPath = repo, homeDir = path.dirname(userDir), defaults: { manifest?: boolean; marketplace?: boolean; dependencies?: unknown; name?: string; hooks?: boolean; skillBytes?: Uint8Array; catalogPadding?: string; catalogMetadataPluginRoot?: unknown; snapshotOnly?: boolean; catalogOnlyName?: string } = { manifest: true }): { root: string; dataRoot: string; installationRecordPath: string; marketplaceRecordPath: string; snapshotRecordPath: string; generationPath: string; member: Record<string, unknown>; treeDigest: string; rootDigest: string; executableDigest: string } {
   const locationsResult = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: repo, checkoutFamilyPath } });
   if (!locationsResult.ok) throw new Error("locations"); const locations = locationsResult.value;
   const pluginName = defaults.name ?? "owned"; const pluginId = `${pluginName}@official` as `${string}@${string}`;
   const manifest = JSON.stringify({ name: pluginName, version: "1.0.0", ...(defaults.manifest === undefined ? {} : { defaultEnabled: defaults.manifest }), ...(defaults.dependencies === undefined ? {} : { dependencies: defaults.dependencies }), ...(defaults.hooks ? { hooks: "./hooks/hooks.json" } : {}) });
   const skill = defaults.skillBytes ?? Buffer.from(`---\ndescription: ${pluginName} skill\n---\n${pluginName} body`); const hook = JSON.stringify({ PreToolUse: [{ hooks: [] }] });
-  const catalog = JSON.stringify({ name: "official", owner: { name: "PiCC test" }, plugins: [{ name: pluginName, source: `./${pluginName}` }], ...(defaults.catalogPadding === undefined ? {} : { padding: defaults.catalogPadding }), ...(defaults.catalogMetadataPluginRoot === undefined ? {} : { metadata: { pluginRoot: defaults.catalogMetadataPluginRoot } }) });
+  const catalog = JSON.stringify({ name: "official", owner: { name: "PiCC test" }, plugins: [{ name: pluginName, source: `./${pluginName}` }, ...(defaults.catalogOnlyName === undefined ? [] : [{ name: defaults.catalogOnlyName, source: `./${defaults.catalogOnlyName}` }])], ...(defaults.catalogPadding === undefined ? {} : { padding: defaults.catalogPadding }), ...(defaults.catalogMetadataPluginRoot === undefined ? {} : { metadata: { pluginRoot: defaults.catalogMetadataPluginRoot } }) });
   const entries: ArtifactDigestEntry[] = [
     { path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: Buffer.from(catalog) },
     { path: pluginName, kind: "directory" }, { path: `${pluginName}/.claude-plugin`, kind: "directory" }, { path: `${pluginName}/.claude-plugin/plugin.json`, kind: "file", data: Buffer.from(manifest) },
     { path: `${pluginName}/skills`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill/SKILL.md`, kind: "file", data: skill },
     ...(defaults.hooks ? [{ path: `${pluginName}/hooks`, kind: "directory" as const }, { path: `${pluginName}/hooks/hooks.json`, kind: "file" as const, data: Buffer.from(hook) }] : []),
+    ...(defaults.catalogOnlyName === undefined ? [] : [{ path: defaults.catalogOnlyName, kind: "directory" as const }, { path: `${defaults.catalogOnlyName}/.claude-plugin`, kind: "directory" as const }, { path: `${defaults.catalogOnlyName}/.claude-plugin/plugin.json`, kind: "file" as const, data: Buffer.from(JSON.stringify({ name: defaults.catalogOnlyName, version: "1.0.0" })) }]),
   ];
   const treeDigest = digestArtifactEntries(entries); const artifactRoot = path.join(locations.profileRoot, "artifacts", "sha256", treeDigest.slice(7)); const root = path.join(artifactRoot, pluginName); const rootDigest = digestArtifactEntries(entries, pluginName);
-  write(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog); write(path.join(root, ".claude-plugin", "plugin.json"), manifest); write(path.join(root, "skills", `${pluginName}-skill`, "SKILL.md"), skill); if (defaults.hooks) write(path.join(root, "hooks", "hooks.json"), hook);
+  write(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog); write(path.join(root, ".claude-plugin", "plugin.json"), manifest); write(path.join(root, "skills", `${pluginName}-skill`, "SKILL.md"), skill); if (defaults.hooks) write(path.join(root, "hooks", "hooks.json"), hook); if (defaults.catalogOnlyName !== undefined) write(path.join(artifactRoot, defaults.catalogOnlyName, ".claude-plugin", "plugin.json"), JSON.stringify({ name: defaults.catalogOnlyName, version: "1.0.0" }));
   const executable = executableDigestForProjection(projectPluginManifest(JSON.parse(manifest) as Record<string, unknown>, path.join(root, ".claude-plugin", "plugin.json")).projection);
   if (!executable.ok) throw new Error("executable");
   const store: OwnedStateStore = { root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey, artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"), generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"), locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine"), dataRoot: locations.dataRoot };
@@ -322,6 +324,26 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     } finally {
       open.mockRestore();
     }
+  });
+
+  it("renders lifecycle recovery evidence distinctly from ordinary doctor diagnostics", () => {
+    const { repo, userDir } = makeBase();
+    const project = load(repo, userDir);
+    const report = buildCompatReport(project);
+    const inventory = report.pluginInventory!;
+    const doctor = renderDoctorReport(project, {
+      ...report,
+      pluginInventory: {
+        ...inventory,
+        diagnostics: Object.freeze([
+          Object.freeze({ global: true, severity: "warning" as const, category: "lifecycle" as const, message: "Lifecycle pending: refresh", operationId: "orphan-operation", semanticStep: "refresh; 2 committed steps", recoveryCategory: "complete-or-rollback" as const, nextCommand: "picc plugin recover orphan-operation" }),
+          Object.freeze({ global: true, severity: "warning" as const, category: "diagnostic" as const, message: "ordinary diagnostic", nextCommand: "/plugin details alpha@official" }),
+        ]),
+      },
+    });
+    expect(doctor).toContain("Lifecycle evidence — owner: global; operation id: orphan-operation; semantic step: refresh; 2 committed steps; recovery category: complete-or-rollback; target: not attributed; observational recovery command: picc plugin recover orphan-operation");
+    expect(doctor).toContain("Diagnostic — global: ordinary diagnostic. Next: /plugin details alpha@official.");
+    expect(doctor).not.toContain("Lifecycle evidence — owner: global; operation id: not available; semantic step: not available; recovery category: not available; target: not attributed; observational recovery command: /plugin details alpha@official");
   });
 
   it("builds capability evidence only after plugin agent and hook validation", () => {
@@ -1073,7 +1095,20 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     expect(findByName(project.skills, "owned:owned-skill")).toBeDefined();
     expect(project.pluginContexts.get("owned@official")?.dataDir).toContain(owned.dataRoot);
     expect(project.lifecycleObservation.records.filter((item) => item.status === "admitted")).toHaveLength(3);
+    const authority = project.pluginAdmissions.find((value) => value.ownership === "picc-owned" && value.pluginId === "owned@official"); if (authority?.ownership !== "picc-owned") throw new Error("owned authority");
+    expect(project.pluginInventory.loadedGenerationId).toBe("admission-current");
+    expect(project.pluginInventory.find("owned@official")?.lifecycle).toMatchObject({ ownership: "picc-owned", mutableRecordKey: pluginMutableRecordKey(authority.authority.record), selectedScope: "project", loaded: true, dependency: { state: "satisfied" } });
+    expect(project.pluginInventory.find("owned@official")?.lifecycle?.candidates).toEqual([expect.objectContaining({ mutableRecordKey: pluginMutableRecordKey(authority.authority.record), selected: true })]);
+    expect(project.pluginInventory.marketplaces.find((value) => value.name === "official")).toMatchObject({ ownership: "picc-owned", candidates: [expect.objectContaining({ mutableRecordKey: ownedMarketplaceScopeKey(project.ownedMarketplaces[0]!), trusted: true })], availableActions: ["inspect"], readOnlyReason: expect.stringContaining("No exact selected") });
     expect(snapshot()).toBe(before);
+  });
+
+  it("exposes catalog-only install eligibility only through the exact selected owned marketplace", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogOnlyName: "catalog-only" });
+    const source = path.join(repo, "catalog"); fs.cpSync(path.dirname(owned.root), source, { recursive: true }); write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ extraKnownMarketplaces: { official: { source: { source: "directory", path: "./catalog" } } } }));
+    const project = load(repo, userDir); const catalogOnly = project.pluginInventory.find("catalog-only@official");
+    expect(catalogOnly).toMatchObject({ catalogPresence: true, lifecycle: { ownership: "unknown", marketplaceOwnership: "picc-owned", installed: false, availableActions: ["install"] } });
+    expect(project.pluginInventory.marketplaces.find((value) => value.name === "official")).toMatchObject({ ownership: "picc-owned", availableActions: ["inspect", "refresh", "remove"] });
   });
 
   it.each([
@@ -1243,6 +1278,16 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const recordsRoot = path.dirname(path.dirname(path.dirname(installationObservation.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", `local-${String(installation.checkoutFamilyKey)}`); if (!partition.ok) throw new Error(partition.message); write(path.join(partition.value, "higher.json"), Buffer.from(higherEnvelope.value.bytes).toString("utf8"));
     const marker = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [owned.member, { ...owned.member, scope: "local", recordDigest: higherEnvelope.value.envelope.payloadDigest }] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(owned.generationPath, bytes.value);
     expect(load(repo, userDir).plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]);
+  });
+
+  it("projects a disabled dependency as the enabled dependent's activation blocker", () => {
+    const { base, repo, userDir } = makeBase(); const required = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "required" }); const dependent = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "dependent", dependencies: ["required"] });
+    const marker = JSON.parse(fs.readFileSync(dependent.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [required.member, dependent.member] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(dependent.generationPath, bytes.value);
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "required@official": false, "dependent@official": true } }));
+    const project = load(repo, userDir);
+    expect(project.pluginResolutionOutcomes.find((value) => value.pluginId === "required@official")).toMatchObject({ status: "disabled" });
+    expect(project.pluginInventory.find("required@official")?.lifecycle?.dependency).toMatchObject({ state: "not-evaluated" });
+    expect(project.pluginInventory.find("dependent@official")?.lifecycle?.dependency).toMatchObject({ state: "blocked", reason: "Dependency assembly decision: disabled" });
   });
 
   it.each([
@@ -1493,7 +1538,7 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const { base, repo, userDir } = makeBase(); const required = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "required", hooks: true }); const dependent = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "dependent", dependencies: ["required"] });
     const marker = JSON.parse(fs.readFileSync(dependent.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [required.member, dependent.member] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(dependent.generationPath, bytes.value);
     const hookPath = path.join(required.root, "hooks", "hooks.json"); const original = fs.readFileSync; const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: unknown, ...args: unknown[]) => path.normalize(String(candidate)) === path.normalize(hookPath) ? (() => { throw Object.assign(new Error("deterministic hook rejection"), { code: "EACCES" }); })() : (original as (...values: unknown[]) => unknown)(candidate, ...args)) as typeof fs.readFileSync);
-    try { const project = load(repo, userDir); expect(project.plugins).toEqual([]); for (const pluginId of ["required@official", "dependent@official"]) expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === pluginId)).toMatchObject({ status: "rejected", context: undefined, sources: undefined }); expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "dependent@official")?.diagnostics.map((item) => item.message).join("\n")).toContain("final dependency admission"); }
+    try { const project = load(repo, userDir); expect(project.plugins).toEqual([]); for (const pluginId of ["required@official", "dependent@official"]) expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === pluginId)).toMatchObject({ status: "rejected", context: undefined, sources: undefined }); expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "dependent@official")?.diagnostics.map((item) => item.message).join("\n")).toContain("final dependency admission"); expect(project.pluginInventory.find("required@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); expect(project.pluginInventory.find("dependent@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); }
     finally { spy.mockRestore(); }
   });
 

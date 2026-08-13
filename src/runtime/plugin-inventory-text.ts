@@ -59,6 +59,11 @@ export interface PluginInventoryDoctorDiagnostic {
   readonly severity: PluginInventoryDiagnostic["severity"];
   readonly message: string;
   readonly status?: string;
+  readonly category?: "lifecycle" | "diagnostic";
+  readonly operationId?: string;
+  readonly semanticStep?: string;
+  readonly target?: string;
+  readonly recoveryCategory?: "complete-or-rollback" | "inspect";
   readonly nextCommand?: string;
   readonly repairBoundary?: string;
   readonly refreshGuidance?: string;
@@ -238,6 +243,10 @@ function installationSummary(item: PluginInventoryItem): string {
   return valid === 0 && invalid === 0 ? "none" : `${valid} valid${invalid > 0 ? `, ${invalid} invalid` : ""}`;
 }
 function runtimeStatus(item: PluginInventoryItem): string { return item.outcome?.status ?? "not resolved"; }
+function lifecycleSummary(item: PluginInventoryItem): string {
+  const value = item.lifecycle; if (value === undefined) return "not projected";
+  return `owner=${value.ownership}; desired-installed=${yesNo(value.installed)}; declared=${yesNo(value.declared)}; effective=${yesNo(value.effectiveEnabled)}; loaded=${yesNo(value.loaded)}; reload=${value.pendingReload ? "pending" : "not pending"}`;
+}
 function lowerBoundary(value: string): string { const plain = value.endsWith(".") ? value.slice(0, -1) : value; return `${plain[0]?.toLowerCase() ?? ""}${plain.slice(1)}`; }
 function boundary(snapshot: PluginInventorySnapshot): string {
   return snapshot.lifetime === "session"
@@ -247,7 +256,7 @@ function boundary(snapshot: PluginInventorySnapshot): string {
 
 function needsAttention(item: PluginInventoryItem): boolean {
   return item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
-    (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
+    (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0;
 }
 
 function relevance(item: PluginInventoryItem): number {
@@ -297,12 +306,13 @@ function addBoundedRecords<T>(lines: string[], heading: string, values: readonly
 }
 
 export function renderPluginInventoryList(snapshot: PluginInventorySnapshot): string {
-  const lines = ["Plugin inventory (read-only)", `Snapshot: ${boundary(snapshot)}`];
+  const lines = ["Plugin inventory (read-only)", `Snapshot: ${boundary(snapshot)}`, `Loaded generation: ${text(snapshot.loadedGenerationId ?? "not identified", 100)}`, `Durable desired generation: ${text(snapshot.durableDesired?.generationId ?? "not identified", 100)}`];
   for (const item of relevantItems(snapshot.items).slice(0, MAX_LIST_ITEMS)) {
     lines.push(`Plugin: ${qualified(item.qualifiedIdentity)}`);
     lines.push(`  installed: ${installationSummary(item)}`);
     lines.push(`  enabled: ${yesNo(item.enablement?.enabled)}`);
     lines.push(`  runtime: ${runtimeStatus(item)}`);
+    lines.push(`  lifecycle: ${lifecycleSummary(item)}`);
     lines.push(`  catalog: ${item.catalogPresence ? "known" : "not known"}`);
   }
   const localRows = Math.max(0, snapshot.items.length - MAX_LIST_ITEMS);
@@ -318,10 +328,19 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   const item = snapshot.find(qualifiedIdentity);
   if (item === undefined || item.qualifiedIdentity !== qualifiedIdentity) return [`Plugin not found: ${qualified(qualifiedIdentity)}`, `Snapshot: ${boundary(snapshot)}`, "Bounded output can omit catalog-only identities. Use the list command to copy an exact qualified identity; in the interactive TUI use the literal /plugin filter."].join("\n");
   const lines = [
-    `Plugin: ${qualified(item.qualifiedIdentity)}`, "Mode: read-only", `Snapshot: ${boundary(snapshot)}`,
+    `Plugin: ${qualified(item.qualifiedIdentity)}`, "Mode: read-only", `Snapshot: ${boundary(snapshot)}`, `Loaded generation: ${text(snapshot.loadedGenerationId ?? "not identified", 100)}; durable desired generation: ${text(snapshot.durableDesired?.generationId ?? "not identified", 100)}`,
     `Installed: ${installationSummary(item)}`,
     `Enablement: enabled=${yesNo(item.enablement?.enabled)}; scope=${item.enablement === undefined ? "not declared" : text(item.enablement.scope, 80)}; source=${location(item.enablement?.source)}`,
     `Runtime outcome: status=${text(runtimeStatus(item), 80)}; shared-state causes=${item.outcome?.sharedStateCauses.length ? item.outcome.sharedStateCauses.map((value) => text(value, 80)).join(", ") : "none"}`,
+    `Lifecycle axes: ${lifecycleSummary(item)}`,
+    `Lifecycle target: mutable-record=${text(item.lifecycle?.mutableRecordKey ?? "not available", 160)}; selected-scope=${text(item.lifecycle?.selectedScope ?? "not available", 80)}; marketplace-owner=${text(item.lifecycle?.marketplaceOwnership ?? "unknown", 80)}; trusted=${yesNo(item.lifecycle?.trusted)}`,
+    `Lifecycle eligibility: ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(", ") : "none (read-only or unavailable)"}`,
+    `Scoped candidates: ${(item.lifecycle?.candidates ?? []).map((value) => `${text(value.scope, 60)}:${value.selected ? "selected" : "candidate"}:${text(value.mutableRecordKey, 160)}`).join(", ") || "none"}${item.lifecycle?.selectionRequired ? `; selection required (${text(item.lifecycle.selectionGuidance ?? "select an exact scope", 160)})` : ""}`,
+    `Immutable desired content: revision=${text(item.lifecycle?.immutableRevision ?? "not available", 100)}; integrity=${text(item.lifecycle?.integrity ?? "not available", 100)}; root=${location(item.lifecycle?.root)}`,
+    `Default enablement source: ${text(item.lifecycle?.defaultEnablementSource ?? "not available", 100)}`,
+    `Dependency posture: ${text(item.lifecycle?.dependency.state ?? "not available", 80)}${item.lifecycle?.dependency.reason === undefined ? "" : `; reason=${text(item.lifecycle.dependency.reason, 160)}`}`,
+    `Lifecycle availability: ${item.lifecycle?.readOnlyReason === undefined ? "mutable when an explicit lifecycle action is available" : `read-only; ${text(item.lifecycle.readOnlyReason, 160)}`}`,
+    `Pending lifecycle: step=${text(item.lifecycle?.pendingStep ?? "none", 160)}; reload=${item.lifecycle?.pendingReload === true ? "pending" : "not pending"}; recovery-category=${text(item.lifecycle?.recoveryCategory ?? "none", 80)}; recovery-command=${text(item.lifecycle?.recoveryCommand ?? "none", 160)}`,
     `Catalog presence: ${item.catalogPresence ? "known locally" : "not known locally"}`,
     `Selected installation: scope=${item.selectedInstallation === undefined ? "not available" : text(item.selectedInstallation.scope, 80)}; version=${item.selectedInstallation === undefined ? "not available" : text(item.selectedInstallation.version, 80)}`,
     `Selected root: ${location(item.selectedInstallation?.root)}`, `Selected project location: ${location(item.selectedInstallation?.project)}`, `Data location: ${location(item.selectedInstallation?.data)}`,
@@ -361,6 +380,11 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   addBoundedRecords(lines, "Renames (declared only; migration is not performed)", item.renames, (value) => [
     `from=${text(value.from, 100)}; target=${value.target === null ? "removed" : text(value.target, 100)}`, `status=${text(value.status, 80)}`, `posture=${value.posture}`, `provenance=${provenance(value.provenance)}`,
   ]);
+  addBoundedRecords(lines, "Lifecycle operation guidance", item.lifecycle?.lifecycleOperations ?? [], (value) => [
+    `operation=${text(value.operationId, 100)}; status=${value.status}; step=${text(value.semanticStep, 160)}`,
+    `category=${value.category}; target=${text(value.target ?? "not attributed", 120)}; recovery=${text(value.recoveryCommand, 160)}`,
+  ]);
+  addBounded(lines, "Retained lifecycle failures", item.lifecycle?.retainedErrors ?? [], (value) => text(value));
   addBounded(lines, "Item diagnostics", item.diagnostics, (value) => `${value.severity}: ${text(value.message)}`);
   addBounded(lines, "GLOBAL policy observations (not owned by this plugin; not enforced by PiCC)", snapshot.policyObservations, (value) => `kind=${text(value.kind, 80)}; descriptor=${value.descriptor === undefined ? "none" : text(JSON.stringify(value.descriptor), 160)}; descriptor-provenance=${provenance(value.descriptorProvenance)}; match=${text(String(value.match), 80)}; valid-scope=${yesNo(value.validScope)}; empty-lockdown=${yesNo(value.emptyLockdown)}; posture=${value.posture}; provenance=${provenance(value.provenance)}`);
   const capture = captureOmissions(snapshot);
@@ -393,11 +417,16 @@ function capPolicyEvidence(values: readonly PluginInventoryManagedPolicyEvidence
 }
 
 export function projectPluginInventoryStartup(snapshot: PluginInventorySnapshot): PluginInventoryStartupProjection {
-  const failed = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
+  const failed = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled" || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0);
+  const lifecycleOperations = [
+    ...(snapshot.durableDesired?.pendingOperations ?? []),
+    ...(snapshot.durableDesired?.terminalOperations.filter((value) => value.outcome === "failed-before-commit" && value.recoveryCommand !== undefined).map((value) => ({ operationId: value.operationId, status: value.outcome, semanticStep: value.semanticStep, ...(value.target === undefined ? {} : { target: value.target }), recoveryCommand: value.recoveryCommand!, category: value.category ?? "inspect" as const })) ?? []),
+  ];
   const allIdentities = [...new Set(failed.map((item) => qualified(item.qualifiedIdentity)))];
   const identities = allIdentities.slice(0, 10);
   const allPolicies = policyEvidence(snapshot.diagnostics).filter((value) => ADMIN_POLICY_SOURCES.has(value.sourceClass)); const policies = capPolicyEvidence(allPolicies, MAX_STARTUP_POLICY_EVIDENCE);
-  const lines = failed.slice(0, 10).map((item) => `Plugin ${qualified(item.qualifiedIdentity)} needs attention: ${item.outcome!.status}. Run /doctor for details.`);
+  const lines = lifecycleOperations.slice(0, 10).map((value) => `Lifecycle operation ${text(value.operationId, 100)} needs attention: step=${text(value.semanticStep, 120)}; category=${value.category}; target=${text(value.target ?? "not attributed", 100)}; recovery=${text(value.recoveryCommand, 160)}. Run /doctor for details.`);
+  lines.push(...failed.slice(0, Math.max(0, 10 - lines.length)).map((item) => `Plugin ${qualified(item.qualifiedIdentity)} needs attention: ${item.lifecycle?.pendingStep ?? item.outcome?.status ?? "retained lifecycle failure"}. Run /doctor for details.`));
   for (const value of policies) {
     lines.push(`${value.sourceLabel} was ${value.condition}; the administrator source was ignored and plugin enablement may differ. ${value.guidance}, then ${value.refreshGuidance}.`);
   }
@@ -418,15 +447,27 @@ export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot):
       const identity = qualified(item.qualifiedIdentity);
       allDiagnostics.push(Object.freeze({ qualifiedIdentity: identity, global: false, severity: "warning", message: `Plugin runtime outcome is ${item.outcome.status}`, status: item.outcome.status, nextCommand: next(identity), ...recovery }));
     }
-    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
+    for (const operation of item.lifecycle?.lifecycleOperations ?? []) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: "warning", category: "lifecycle", operationId: operation.operationId, semanticStep: operation.semanticStep, ...(operation.target === undefined ? {} : { target: operation.target }), recoveryCategory: operation.category, message: `Lifecycle ${operation.status}: ${text(operation.semanticStep)}`, nextCommand: operation.recoveryCommand, ...recovery }));
+    for (const message of item.lifecycle?.retainedErrors ?? []) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: "warning", category: "lifecycle", message: text(message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
+    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, category: "diagnostic", message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
   }
+  const attributedOperations = new Set(snapshot.items.flatMap((item) => item.lifecycle?.lifecycleOperations?.map((value) => value.operationId) ?? []));
+  const globalLifecycleOperations = [
+    ...(snapshot.durableDesired?.pendingOperations ?? []),
+    ...(snapshot.durableDesired?.terminalOperations.filter((value) => value.outcome === "failed-before-commit" && value.recoveryCommand !== undefined).map((value) => ({ operationId: value.operationId, status: value.outcome, semanticStep: value.semanticStep, ...(value.target === undefined ? {} : { target: value.target }), recoveryCommand: value.recoveryCommand!, category: value.category ?? "inspect" as const })) ?? []),
+  ];
+  for (const operation of globalLifecycleOperations) if (!attributedOperations.has(operation.operationId)) allDiagnostics.push(Object.freeze({ global: true, severity: "warning", category: "lifecycle", operationId: operation.operationId, semanticStep: operation.semanticStep, ...(operation.target === undefined ? {} : { target: operation.target }), recoveryCategory: operation.category, message: `Lifecycle ${operation.status}: ${text(operation.semanticStep)}`, nextCommand: operation.recoveryCommand, ...recovery }));
   for (const diagnostic of snapshot.diagnostics) {
     if (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") continue;
-    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, message: text(diagnostic.message), ...recovery }));
+    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, category: diagnostic.category === "lifecycle-observation" ? "lifecycle" : "diagnostic", message: text(diagnostic.message), ...recovery }));
   }
   const uniqueDiagnostics = allDiagnostics.filter((value, index, values) => values.findIndex((candidate) =>
     candidate.qualifiedIdentity === value.qualifiedIdentity && candidate.global === value.global &&
-    candidate.severity === value.severity && candidate.message === value.message) === index);
+    candidate.severity === value.severity && candidate.message === value.message &&
+    (candidate.category !== "lifecycle" && value.category !== "lifecycle" ||
+      candidate.category === value.category && candidate.operationId === value.operationId &&
+      candidate.semanticStep === value.semanticStep && candidate.target === value.target &&
+      candidate.recoveryCategory === value.recoveryCategory && candidate.nextCommand === value.nextCommand)) === index);
   const diagnostics = uniqueDiagnostics.slice(0, MAX_DIAGNOSTICS);
   const uniqueEvidence = snapshot.capabilityEvidence.filter((value, index, values) => values.findIndex((candidate) =>
     candidate.capabilityId === value.capabilityId && candidate.qualifiedIdentity === value.qualifiedIdentity &&
@@ -439,13 +480,13 @@ export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot):
   const attentionIdentities = new Set<string>();
   for (const item of snapshot.items) {
     if ((item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") ||
-      item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
+      item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0 ||
       item.components.some((value) => value.supportTier !== "full")) attentionIdentities.add(item.qualifiedIdentity);
   }
   for (const value of uniqueEvidence) if (value.supportTier !== undefined && value.supportTier !== "full") attentionIdentities.add(value.qualifiedIdentity);
   const attention = attentionIdentities.size;
   return Object.freeze({
-    counts: Object.freeze({ known: snapshot.items.length, installed: snapshot.items.filter((item) => item.installations.some((entry) => entry.validity === "valid")).length, enabled: snapshot.items.filter((item) => item.enablement?.enabled === true).length, loaded: snapshot.items.filter((item) => item.outcome?.status === "loaded").length, cataloged: snapshot.items.filter((item) => item.catalogPresence).length, attention }),
+    counts: Object.freeze({ known: snapshot.items.length, installed: snapshot.items.filter((item) => item.lifecycle?.installed ?? item.installations.some((entry) => entry.validity === "valid")).length, enabled: snapshot.items.filter((item) => item.lifecycle?.effectiveEnabled ?? item.enablement?.enabled === true).length, loaded: snapshot.items.filter((item) => item.lifecycle?.loaded ?? item.outcome?.status === "loaded").length, cataloged: snapshot.items.filter((item) => item.catalogPresence).length, attention }),
     diagnostics: Object.freeze(diagnostics), capabilityEvidence: Object.freeze(evidence), managedPolicyEvidence: Object.freeze(policies), captureOmissions: capture,
     omitted: Object.freeze({ diagnostics: Object.freeze({ capture: captureDiagnostics, projection: Math.max(0, uniqueDiagnostics.length - diagnostics.length) }), capabilityEvidence: Object.freeze({ capture: captureCapabilities, projection: Math.max(0, uniqueEvidence.length - evidence.length) }), managedPolicyEvidence: Object.freeze({ projection: Math.max(0, allPolicies.length - policies.length) }) }),
     snapshotBoundary: boundary(snapshot),

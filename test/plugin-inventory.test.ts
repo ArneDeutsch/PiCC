@@ -8,6 +8,8 @@ import type { InstalledPluginObservation } from "../src/claude/plugin-installed-
 import { buildPluginInventorySnapshot, type PluginInventoryComponent } from "../src/plugin-inventory.js";
 import type { InstalledPlugin } from "../src/claude/plugins.js";
 import type { PluginMarketplaceState, PluginResolutionOutcome } from "../src/types.js";
+import type { OwnedMarketplaceRecord } from "../src/plugin-lifecycle/admission.js";
+import type { LifecycleObservationEnvelope } from "../src/plugin-lifecycle/projection.js";
 
 const directoryLinksAvailable = (() => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "picc-inventory-link-probe-"));
@@ -264,6 +266,95 @@ describe("buildPluginInventorySnapshot", () => {
     expect(snapshot.refreshGuidance).toBe("Captured for this command; run the command again to refresh.");
     expect(snapshot.refreshGuidance).not.toContain("/reload");
     expect(fs.existsSync(selected.dataDir)).toBe(false);
+  });
+
+  it("decodes the bounded lifecycle envelope without I/O and keeps durable desired state distinct from loaded truth", () => {
+    const { projectRoot, userDir } = fixture(); const installRoot = path.join(userDir, "plugins", "cache", "owned", "2");
+    const read = vi.spyOn(fs, "readFileSync");
+    const snapshot = buildPluginInventorySnapshot({
+      projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [], loadedGeneration: { ownership: "picc-owned", profileKey: "profile-test", generationId: "admission-loaded", members: [] },
+      lifecycleObservation: {
+        records: [
+          { path: "record", status: "admitted", producer: { schema: "plugin-installation", version: 1, ownerKey: "picc-owned", scopeKey: "project-checkout", payload: { ownership: "picc-owned", pluginId: "owned@local", scope: "project", profileKey: "profile-test", projectKey: "checkout-test", version: "2.0.0", installRoot, executableDigest: `sha256:${"a".repeat(64)}`, executableGenerationId: "admission-loaded", source: { kind: "git" }, trust: { target: "plugin" } } } },
+          { path: "market", status: "admitted", producer: { schema: "marketplace-registration", version: 1, ownerKey: "picc-owned", scopeKey: "user-profile", payload: { ownership: "picc-owned", name: "local", profileKey: "profile-test", scope: "user", selectedSnapshotId: "snapshot", source: { kind: "github", repository: "owner/repo" } } } },
+          { path: "bad", status: "inert", code: "generation-incomplete" },
+        ],
+        receipts: [{ path: "receipt", status: "invalid" }],
+        pending: [{ operationId: "plugin_pending", status: "pending", journal: { operationId: "plugin_pending", producerSchema: "plugin-lifecycle", completed: 1, confirmationSummary: { operationId: "plugin_pending", action: "update", pluginId: "owned@local" } } }],
+      },
+    });
+    const owned = snapshot.find("owned@local")!;
+    expect(owned.lifecycle).toMatchObject({ ownership: "picc-owned", installed: true, loaded: false, pendingStep: "update; 1 committed step", recoveryCategory: "complete-or-rollback", pendingReload: false });
+    expect(owned.lifecycle?.candidates).toEqual([expect.objectContaining({ mutableRecordKey: "owned@local\0picc-owned\0project\0profile-test\0checkout-test", scope: "project", trusted: true, immutableRevision: "2.0.0", integrity: `sha256:${"a".repeat(64)}` })]);
+    expect(snapshot.loadedGenerationId).toBe("admission-loaded"); expect(snapshot.durableDesired).toMatchObject({ generationId: "admission-loaded", pluginIdentities: ["owned@local"], marketplaceNames: ["local"] });
+    expect(snapshot.marketplaces[0]).toMatchObject({ name: "local", ownership: "picc-owned", candidates: [expect.objectContaining({ scope: "user", trusted: true })] });
+    expect(snapshot.durableDesired!.retainedErrors).toEqual(["Owned lifecycle record is inert (generation-incomplete)", "A retained lifecycle receipt is invalid"]);
+    expect(snapshot.diagnostics.map((value) => value.message)).toEqual(expect.arrayContaining([...snapshot.durableDesired!.retainedErrors]));
+    expect(read).not.toHaveBeenCalled(); expectRecursivelyFrozen(snapshot);
+  });
+
+  it("keeps a combined over-limit lifecycle envelope bounded, immutable, and fail-closed", () => {
+    const { projectRoot, userDir } = fixture(); const installRoot = path.join(userDir, "plugins", "cache", "bounded");
+    const records: LifecycleObservationEnvelope["records"][number][] = [{ path: "plugin", status: "admitted", producer: { schema: "plugin-installation", version: 1, ownerKey: "picc-owned", scopeKey: "user", payload: { ownership: "picc-owned", pluginId: "bounded@market", scope: "user", profileKey: "profile-bounded", version: "1", installRoot, executableDigest: `sha256:${"a".repeat(64)}`, executableGenerationId: "generation-bounded", trust: {}, source: { kind: "git" } } } }];
+    for (let index = 0; index < 256; index += 1) records.push({ path: `market-${index}`, status: "admitted", producer: { schema: "marketplace-registration", version: 1, ownerKey: "picc-owned", scopeKey: "user", payload: { ownership: "picc-owned", name: `market-${index}`, profileKey: "profile-bounded", scope: "user", selectedSnapshotId: `snapshot-${index}`, source: { kind: "github", repository: "owner/repo" } } } });
+    const pending = Array.from({ length: 129 }, (_, index) => ({ operationId: `pending-${index}`, status: "pending" as const, journal: { operationId: `pending-${index}`, producerSchema: "unattributed-lifecycle", completed: index, confirmationSummary: { operationId: `pending-${index}`, action: "inspect" } } }));
+    const receipts = Array.from({ length: 129 }, (_, index) => ({ path: `receipt-${index}`, status: "present" as const, receipt: { operationId: `failed-${index}`, producerSchema: "unattributed-lifecycle", outcome: "failed-before-commit", confirmationSummary: { operationId: `failed-${index}`, action: "inspect" } } }));
+    const snapshot = buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: { "bounded@market": { enabled: false, scope: "user", source: path.join(userDir, "settings.json") } }, outcomes: [{ pluginId: "bounded@market", status: "disabled", diagnostics: [] }], selectedPlugins: [], loadedGeneration: { ownership: "picc-owned", profileKey: "profile-bounded", generationId: "generation-bounded", members: [] }, runtimeSelections: [{ pluginId: "bounded@market", installation: { pluginId: "bounded@market", scope: "user", installPath: installRoot, version: "1", provenance: { statePath: "state", stateVersion: 2 } } }], lifecycleObservation: { records, pending, receipts } });
+    expect(snapshot.durableDesired?.omissions).toMatchObject({ "lifecycle.records": 1, "lifecycle.pending": 1, "lifecycle.receipts": 1 });
+    expect(snapshot.durableDesired?.pendingOperations).toHaveLength(128); expect(snapshot.durableDesired?.terminalOperations).toHaveLength(128);
+    expect(snapshot.find("bounded@market")?.lifecycle).toMatchObject({ availableActions: [], readOnlyReason: expect.stringContaining("inspect recovery") });
+    expect(snapshot.durableDesired?.pendingOperations[0]).toMatchObject({ operationId: "pending-0", semanticStep: "inspect; 0 committed steps", category: "complete-or-rollback", recoveryCommand: "picc plugin recover pending-0" });
+    expect(snapshot.durableDesired?.terminalOperations[0]).toMatchObject({ operationId: "failed-0", semanticStep: "inspect; failed-before-commit", category: "inspect", recoveryCommand: "picc plugin recover failed-0" });
+    (records[0]!.producer as { payload: unknown }).payload = {}; pending[0]!.journal.confirmationSummary.action = "mutated"; receipts[0]!.receipt.confirmationSummary.action = "mutated";
+    expect(snapshot.find("bounded@market")?.lifecycle?.immutableRevision).toBe("1"); expect(snapshot.durableDesired?.pendingOperations[0]?.semanticStep).toBe("inspect; 0 committed steps"); expect(snapshot.durableDesired?.terminalOperations[0]?.semanticStep).toBe("inspect; failed-before-commit");
+    expectRecursivelyFrozen(snapshot);
+  });
+
+  it("uses a validated admission generation as durable desired authority, including an empty generation", () => {
+    const { projectRoot, userDir } = fixture(); const base = { projectRoot, userDir, installedStateStatus: "valid" as const, installedObservations: [], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [] };
+    const empty = buildPluginInventorySnapshot({ ...base, loadedGeneration: { ownership: "picc-owned", profileKey: "profile-empty", generationId: "generation-empty", members: [] }, lifecycleObservation: { records: [], pending: [], receipts: [] } });
+    expect(empty).toMatchObject({ loadedGenerationId: "generation-empty", durableDesired: { generationId: "generation-empty", pluginIdentities: [] } });
+    const mismatch = buildPluginInventorySnapshot({ ...base, loadedGeneration: { ownership: "picc-owned", profileKey: "profile-empty", generationId: "generation-valid", members: [] }, lifecycleObservation: { records: [{ path: "record", status: "admitted", producer: { schema: "plugin-installation", version: 1, ownerKey: "picc-owned", scopeKey: "user", payload: { ownership: "picc-owned", pluginId: "mismatch@market", scope: "user", profileKey: "profile-empty", version: "1", installRoot: path.join(userDir, "plugins", "cache", "mismatch"), executableDigest: `sha256:${"a".repeat(64)}`, executableGenerationId: "generation-disagrees", trust: {}, source: { kind: "git" } } } }], pending: [], receipts: [] } });
+    expect(mismatch.durableDesired).toMatchObject({ generationId: "generation-valid", retainedErrors: ["Owned installation generation disagrees with the validated admission generation"] });
+    expect(mismatch.find("mismatch@market")?.lifecycle).toMatchObject({ availableActions: [], readOnlyReason: expect.stringContaining("invalid") });
+  });
+
+  it("keeps reload and dependency posture tied to final assembly facts", () => {
+    const { projectRoot, userDir } = fixture(); const root = path.join(userDir, "plugins", "cache", "market", "plug", "1");
+    const observed: InstalledPluginObservation = { qualifiedIdentity: "plug@market", lifecycleName: "plug", marketplaceName: "market", validity: "valid", loadEligibility: "observation-only", declared: { scope: "user", version: "1", installPath: root }, problems: [] };
+    const build = (installedObservations: readonly InstalledPluginObservation[], enablement: boolean, outcome: PluginResolutionOutcome, dependencyDecisions: Parameters<typeof buildPluginInventorySnapshot>[0]["dependencyDecisions"]) => buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations, marketplaceState: marketplace(), enablement: { "plug@market": { enabled: enablement, scope: "user", source: path.join(userDir, "settings.json") } }, outcomes: [outcome], selectedPlugins: [], dependencyDecisions });
+    expect(build([observed], false, { pluginId: "plug@market", status: "disabled", diagnostics: [] }, [{ pluginId: "plug@market", admitted: false, reasons: ["disabled"] }]).find("plug@market")?.lifecycle).toMatchObject({ pendingReload: false, dependency: { state: "not-evaluated" } });
+    expect(build([], true, { pluginId: "plug@market", status: "loaded", diagnostics: [] }, [{ pluginId: "plug@market", admitted: true, reasons: [] }]).find("plug@market")?.lifecycle?.pendingReload).toBe(true);
+    expect(build([observed], true, { pluginId: "plug@market", status: "rejected", diagnostics: [] }, [{ pluginId: "plug@market", admitted: false, reasons: ["missing"] }]).find("plug@market")?.lifecycle).toMatchObject({ pendingReload: false, dependency: { state: "blocked", reason: "Dependency assembly decision: missing" } });
+    expect(build([observed], true, { pluginId: "plug@market", status: "blocked", diagnostics: [] }, [{ pluginId: "plug@market", admitted: false, reasons: ["disabled"] }]).find("plug@market")?.lifecycle).toMatchObject({ dependency: { state: "blocked", reason: "Dependency assembly decision: disabled" } });
+    expect(build([observed], true, { pluginId: "plug@market", status: "blocked", diagnostics: [] }, undefined).find("plug@market")?.lifecycle).toMatchObject({ dependency: { state: "not-evaluated" } });
+  });
+
+  it("retains every owned scope order-independently and fails selection and malformed evidence closed", () => {
+    const { projectRoot, userDir } = fixture(); const digest = `sha256:${"d".repeat(64)}`; const profileKey = "profile-test";
+    const record = (scope: "user" | "project", projectKey?: string) => ({ path: scope, status: "admitted" as const, producer: { schema: "plugin-installation", version: 1, ownerKey: "picc-owned", scopeKey: scope, payload: { ownership: "picc-owned", pluginId: "multi@market", scope, profileKey, ...(projectKey === undefined ? {} : { projectKey }), version: "1", installRoot: path.join(userDir, "plugins", "cache", scope), executableDigest: digest, executableGenerationId: "generation", trust: {}, source: { kind: "git" } } } });
+    const build = (records: readonly ReturnType<typeof record>[], extraPending: boolean) => buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [{ qualifiedIdentity: "multi@market", lifecycleName: "multi", marketplaceName: "market", validity: "valid", loadEligibility: "observation-only", declared: { scope: "managed", version: "imported" }, problems: [] }], marketplaceState: marketplace(), enablement: {}, outcomes: [], selectedPlugins: [], runtimeSelections: [{ pluginId: "multi@market", installation: { pluginId: "multi@market", scope: "project", projectPath: projectRoot, installPath: path.join(userDir, "plugins", "cache", "project"), version: "1", provenance: { statePath: "state", stateVersion: 2 } } }], lifecycleObservation: { records, receipts: [], pending: extraPending ? [{ operationId: "bad", status: "pending", journal: { producerSchema: "plugin-lifecycle", confirmationSummary: { operationId: "other", action: "update", pluginId: "multi@market" } } }] : [] } });
+    const forward = build([record("user"), record("project", "checkout-test")], false); const reverse = build([record("project", "checkout-test"), record("user")], false);
+    expect(forward.find("multi@market")?.lifecycle?.candidates).toEqual(reverse.find("multi@market")?.lifecycle?.candidates);
+    expect(forward.find("multi@market")?.lifecycle).toMatchObject({ ownership: "picc-owned", selectionRequired: true, availableActions: [], readOnlyReason: expect.stringContaining("select") });
+    expect(forward.find("multi@market")?.lifecycle?.candidates).toEqual([expect.objectContaining({ scope: "project", selected: true }), expect.objectContaining({ scope: "user", selected: false })]);
+    expect(forward.find("multi@market")?.lifecycle?.candidates?.map((value) => value.mutableRecordKey)).toEqual([`multi@market\0picc-owned\0project\0${profileKey}\0checkout-test`, `multi@market\0picc-owned\0user\0${profileKey}\0`]);
+    const marketRecord = (scope: "user" | "project"): OwnedMarketplaceRecord => scope === "user" ? { ownership: "picc-owned", name: "market", profileKey: profileKey as `profile-${string}`, scope, source: { kind: "github", repository: "owner/repo" }, selectedSnapshotId: "marketplace-snapshot" } : { ownership: "picc-owned", name: "market", profileKey: profileKey as `profile-${string}`, scope, checkoutFamilyKey: "checkout-test" as `checkout-${string}`, projectKey: "checkout-test" as `checkout-${string}`, source: { kind: "github", repository: "owner/repo" }, selectedSnapshotId: "marketplace-snapshot" };
+    const marketProvenance = { scope: "project" as const, sourcePath: path.join(projectRoot, ".claude", "settings.json"), origin: "primary" as const, order: 0 };
+    const marketState = marketplace({ registrations: [{ name: "market", source: { kind: "github", repo: "owner/repo" }, sourceProvenance: { field: "source", sourcePath: marketProvenance.sourcePath }, provenance: marketProvenance, selected: true, validity: "valid" }], selectedRegistrations: [{ name: "market", source: { kind: "github", repo: "owner/repo" }, sourceProvenance: { field: "source", sourcePath: marketProvenance.sourcePath }, provenance: marketProvenance, selected: true, validity: "valid" }] });
+    const ownedMarkets = [marketRecord("user"), marketRecord("project")]; const marketplaceSnapshot = buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketState, enablement: {}, outcomes: [], selectedPlugins: [], selectedOwnedMarketplaces: ownedMarkets, lifecycleObservation: { records: ownedMarkets.map((payload) => ({ path: payload.scope, status: "admitted" as const, producer: { schema: "marketplace-registration", version: 1, ownerKey: "picc-owned", scopeKey: payload.scope, payload } })), receipts: [], pending: [] } });
+    expect(marketplaceSnapshot.marketplaces[0]).toMatchObject({ ownership: "picc-owned", selectionRequired: true, mutableRecordKey: expect.any(String), availableActions: ["inspect"], readOnlyReason: expect.stringContaining("select") });
+    const invalid = build([record("user")], true); expect(invalid.find("multi@market")?.lifecycle).toMatchObject({ availableActions: [], readOnlyReason: expect.stringContaining("invalid") });
+    expect(invalid.durableDesired?.retainedErrors).toContain("Lifecycle recovery evidence is invalid or ambiguously attributed");
+  });
+
+  it("observes terminal lifecycle outcomes without granting authority or blocking on valid history alone", () => {
+    const { projectRoot, userDir } = fixture(); const installRoot = path.join(userDir, "plugins", "cache", "history"); const profileKey = "profile-history";
+    const record = { path: "record", status: "admitted" as const, producer: { schema: "plugin-installation", version: 1, ownerKey: "picc-owned", scopeKey: "user", payload: { ownership: "picc-owned", pluginId: "history@market", scope: "user", profileKey, version: "1", installRoot, executableDigest: `sha256:${"a".repeat(64)}`, executableGenerationId: "generation", trust: {}, source: { kind: "git" } } } };
+    const receipt = (operationId: string, outcome: "committed" | "failed-before-commit") => ({ path: operationId, status: "present" as const, receipt: { operationId, producerSchema: "plugin-lifecycle", outcome, confirmationSummary: { operationId, action: "update", pluginId: "history@market" } } });
+    const snapshot = buildPluginInventorySnapshot({ projectRoot, userDir, installedStateStatus: "valid", installedObservations: [], marketplaceState: marketplace(), enablement: { "history@market": { enabled: false, scope: "user", source: path.join(userDir, "settings.json") } }, outcomes: [{ pluginId: "history@market", status: "disabled", diagnostics: [] }], selectedPlugins: [], runtimeSelections: [{ pluginId: "history@market", installation: { pluginId: "history@market", scope: "user", installPath: installRoot, version: "1", provenance: { statePath: "state", stateVersion: 2 } } }], lifecycleObservation: { records: [record], pending: [], receipts: [receipt("committed", "committed"), receipt("failed", "failed-before-commit")] } });
+    expect(snapshot.find("history@market")?.lifecycle).toMatchObject({ mutableRecordKey: `history@market\0picc-owned\0user\0${profileKey}\0`, availableActions: ["update", "reinstall", "enable", "disable", "uninstall"], retainedErrors: ["Lifecycle update ended failed-before-commit"] });
+    expect(snapshot.durableDesired?.terminalOperations).toEqual([expect.objectContaining({ operationId: "committed", outcome: "committed", target: "history@market" }), expect.objectContaining({ operationId: "failed", outcome: "failed-before-commit", target: "history@market" })]);
   });
 
   it("performs no write, network, process, hook, runtime, or data-directory side effects", () => {

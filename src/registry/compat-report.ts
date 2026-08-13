@@ -1789,10 +1789,19 @@ function pluginInventoryLines(inventory: PluginInventoryDoctorProjection | undef
   for (const diagnostic of inventory.diagnostics) {
     const owner = diagnostic.qualifiedIdentity ?? "global";
     const status = diagnostic.status === undefined ? "" : ` [${diagnostic.status}]`;
-    const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
     const repair = diagnostic.repairBoundary === undefined ? "" : ` Repair boundary: ${diagnostic.repairBoundary}.`;
     const refresh = diagnostic.refreshGuidance === undefined ? "" : ` Refresh: ${diagnostic.refreshGuidance}.`;
-    lines.push(`  - ${owner}${status}: ${diagnostic.message}.${action}${repair}${refresh}`);
+    if (diagnostic.category === "lifecycle") {
+      const operationId = diagnostic.operationId ?? "not available";
+      const semanticStep = diagnostic.semanticStep ?? "not available";
+      const recoveryCategory = diagnostic.recoveryCategory ?? "not available";
+      const target = diagnostic.target ?? "not attributed";
+      const recoveryCommand = diagnostic.nextCommand ?? "not available";
+      lines.push(`  - Lifecycle evidence — owner: ${owner}${status}; operation id: ${operationId}; semantic step: ${semanticStep}; recovery category: ${recoveryCategory}; target: ${target}; observational recovery command: ${recoveryCommand}; message: ${diagnostic.message}.${repair}${refresh}`);
+    } else {
+      const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
+      lines.push(`  - Diagnostic — ${owner}${status}: ${diagnostic.message}.${action}${repair}${refresh}`);
+    }
   }
   const diagnosticOmissions = inventory.omitted.diagnostics.capture + inventory.omitted.diagnostics.projection;
   if (diagnosticOmissions > 0) lines.push(`  - ${diagnosticOmissions} additional captured diagnostic(s) omitted.`);

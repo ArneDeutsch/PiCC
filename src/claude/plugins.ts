@@ -17,7 +17,7 @@ import type { PluginAgentLoaderSource } from "./agents.js";
 import { projectPluginManifest, type SafePluginManifestProjection } from "./plugin-metadata.js";
 import { executableDigestForProjection } from "../plugin-lifecycle/admission.js";
 import { isOwnedInstallationProjection, type OwnedInstallationProjection } from "../plugin-lifecycle/projection.js";
-import { admitDependencyGraph } from "../plugin-lifecycle/dependency-admission.js";
+import { admitDependencyGraph, type DependencyAdmissionDecision } from "../plugin-lifecycle/dependency-admission.js";
 import {
   authorizePluginRoot,
   authorizeOwnedPluginDataLocation,
@@ -65,6 +65,8 @@ export interface ResolveInstalledPluginsResult {
   plugins: InstalledPlugin[];
   outcomes: PluginResolutionOutcome[];
   diagnostics: Diagnostic[];
+  selectedInstallations: readonly { readonly pluginId: string; readonly installation: NormalizedPluginInstallation }[];
+  dependencyDecisions: readonly DependencyAdmissionDecision[];
 }
 
 type CandidateInstallation = NormalizedPluginInstallation | OwnedInstallationProjection;
@@ -512,6 +514,7 @@ export function resolveInstalledPlugins(options: {
   const diagnostics: Diagnostic[] = [];
   const provisional: ProvisionalPlugin[] = [];
   const disabledDependencyEvidence: Array<{ pluginId: string; version: string; ownership: "picc-owned" | "claude-imported-readonly" }> = [];
+  const selectedInstallations: Array<{ pluginId: string; installation: NormalizedPluginInstallation }> = [];
   const projects = new Set(projectIdentities(options.projectRoot));
   const cacheRoots = authorizedCacheRoots(options.userDir, options.env ?? process.env);
   const blocklist = readBlocklist(options.userDir, options.readBlocklistForTest);
@@ -521,7 +524,7 @@ export function resolveInstalledPlugins(options: {
     const enabled = options.enablement[pluginId]!;
     if (!enabled.enabled) {
       const selected = chooseInstallation(pluginId, options.installations, projects);
-      if (!selected.ambiguous && selected.installation !== undefined) disabledDependencyEvidence.push({ pluginId, version: selected.installation.version, ownership: isOwnedInstallation(selected.installation) ? "picc-owned" : "claude-imported-readonly" });
+      if (!selected.ambiguous && selected.installation !== undefined) { disabledDependencyEvidence.push({ pluginId, version: selected.installation.version, ownership: isOwnedInstallation(selected.installation) ? "picc-owned" : "claude-imported-readonly" }); selectedInstallations.push({ pluginId, installation: normalizedInstallation(selected.installation) }); }
       outcomes.push({ pluginId, status: "disabled", diagnostics: [] });
       continue;
     }
@@ -651,6 +654,8 @@ export function resolveInstalledPlugins(options: {
     plugins: provisional.filter((item) => !rejectedIds.has(item.plugin.pluginId) && !dependencyRejected.has(item.plugin.pluginId)).map((item) => item.plugin),
     outcomes,
     diagnostics,
+    selectedInstallations: Object.freeze(selectedInstallations),
+    dependencyDecisions,
   };
 }
 

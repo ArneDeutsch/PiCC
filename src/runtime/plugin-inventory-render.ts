@@ -54,8 +54,10 @@ function pluginStatusColor(row: Extract<PluginInventoryRow, { kind: "plugin" }>)
 
 function framing(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): void {
   addWrapped(lines, theme, "accent", "PiCC plugin inventory", width);
-  addWrapped(lines, theme, "muted", "read-only · captured for this session", width);
-  addWrapped(lines, theme, "muted", "Refresh: run /reload in the interactive TUI, or exit and relaunch PiCC.", width);
+  addWrapped(lines, theme, "muted", "read-only · captured for this session · lifecycle eligibility only", width);
+  addWrapped(lines, theme, "muted", `Generation: loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
+  if (view.actionOverlay) addWrapped(lines, theme, view.actionOverlay.phase === "failed" || view.actionOverlay.phase === "reload-unconfirmed" ? "warning" : "accent", `Overlay: ${safe(view.actionOverlay.phase, 40)} · ${safe(view.actionOverlay.target ?? view.actionOverlay.operationId, 100)}${view.actionOverlay.message ? ` · ${safe(view.actionOverlay.message)}` : ""}`, width);
+  addWrapped(lines, theme, "muted", "Refresh loaded runtime: run /reload in the interactive TUI, or exit and relaunch PiCC.", width);
   if (view.activeView === "Discover" || view.activeView === "Marketplaces") {
     addWrapped(lines, theme, "muted", "Local known catalogs/registrations only · no network refresh, download, or management.", width);
   }
@@ -75,8 +77,13 @@ function diagnosticSummary(value: PluginInventoryDiagnostic): string {
 function rowSummary(row: PluginInventoryRow): { identity: string; summary: string; color: string } {
   if (row.kind === "marketplace") return {
     identity: safe(row.identity),
-    summary: `${safe(row.marketplace.validity, 30)} · ${safe(row.marketplace.scope, 50)} · ${safe(row.marketplace.origin, 50)}`,
+    summary: `${safe(row.marketplace.validity, 30)} · ${safe(row.marketplace.ownership ?? "unknown owner", 50)} · ${safe(row.marketplace.scope, 50)} · eligibility ${(row.marketplace.availableActions ?? []).join(",") || "inspect only"}${row.marketplace.selectionRequired ? " · scope selection required" : ""}`,
     color: row.marketplace.validity === "rejected" ? "error" : row.marketplace.selected ? "success" : "muted",
+  };
+  if (row.kind === "global-lifecycle") return {
+    identity: safe(row.identity),
+    summary: `lifecycle evidence · ${safe(row.operation.status, 40)} · step ${safe(row.operation.semanticStep, 100)} · category ${row.operation.category} · target ${safe(row.operation.target ?? "not attributed", 100)}`,
+    color: "warning",
   };
   if (row.kind === "global-diagnostic") return {
     identity: safe(row.identity), summary: diagnosticSummary(row.diagnostic),
@@ -88,7 +95,7 @@ function rowSummary(row: PluginInventoryRow): { identity: string; summary: strin
   const invalid = item.installations.length - valid;
   return {
     identity: qualifiedIdentity(row.identity),
-    summary: `installation records ${valid} valid / ${invalid} invalid · ${item.enablement ? item.enablement.enabled ? "enabled" : "disabled" : "enablement unknown"} · session outcome ${safe(item.outcome?.status ?? "not resolved", 80)} · ${support.text}`,
+    summary: `installation records ${valid} valid / ${invalid} invalid · session outcome ${safe(item.outcome?.status ?? "not resolved", 80)} · owner ${safe(item.lifecycle?.ownership ?? "unknown", 40)} · desired ${item.lifecycle === undefined ? "unknown" : item.lifecycle.installed ? "installed" : "not installed"}/${item.lifecycle?.effectiveEnabled === undefined ? "enablement unknown" : item.lifecycle.effectiveEnabled ? "enabled" : "disabled"} · loaded ${item.lifecycle?.loaded ? "yes" : "no"} · eligibility ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(",") : "none"}${item.lifecycle?.selectionRequired ? " · scope selection required" : ""} · ${support.text}`,
     color: pluginStatusColor(row),
   };
 }
@@ -120,7 +127,7 @@ function renderList(view: PluginInventoryModelView, theme: unknown, width: numbe
     const summary = rowSummary(row);
     const prefix = selectedRow ? "> " : "  ";
     const identity = selectedRow ? themedFg(theme, "accent", summary.identity) : summary.identity;
-    const cue = row.kind === "global-diagnostic" ? "Enter action" : "Enter details";
+    const cue = "Enter details";
     if (row.kind === "plugin") {
       // A canonical qualified identity has its own wrapped display lines at every width.
       pushWrapped(`${prefix}${identity}`, width, lines);
@@ -159,8 +166,14 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
   pushDetail(lines, `Source: selected state ${location(item.selectedInstallation?.provenance.state)} · enablement ${location(item.enablement?.source)}`);
   pushDetail(lines, `Version: installed ${safe(item.selectedInstallation?.version ?? "not available", 100)} · manifest ${safe(metadata?.version ?? "not available", 100)} · catalog ${safe(item.catalogDeclarations[0]?.version ?? "not available", 100)}`);
   pushDetail(lines, `Revision: catalog ${safe(item.catalogDeclarations[0]?.revision ?? "not available", 100)} · evidence ${safe(item.catalogDeclarations[0]?.revisionEvidence ?? "not available", 100)}`);
-  pushDetail(lines, `Scope: ${safe(item.selectedInstallation?.scope ?? item.enablement?.scope ?? "not available", 80)}`);
-  pushDetail(lines, `Anchored location: root ${location(item.selectedInstallation?.root)} · project ${location(item.selectedInstallation?.project)} · data ${location(item.selectedInstallation?.data)}`);
+  pushDetail(lines, `Lifecycle: owner ${safe(item.lifecycle?.ownership ?? "unknown", 60)} · desired installed ${item.lifecycle?.installed ? "yes" : "no"} · declared ${item.lifecycle?.declared ? "explicit" : "derived/default"} · effective enabled ${item.lifecycle?.effectiveEnabled ? "yes" : "no"} · loaded ${item.lifecycle?.loaded ? "yes" : "no"}`);
+  pushDetail(lines, `Eligibility: ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(", ") : "none"}${item.lifecycle?.readOnlyReason ? ` · ${safe(item.lifecycle.readOnlyReason)}` : ""}`);
+  pushDetail(lines, `Trust/content: trusted ${item.lifecycle?.trusted === undefined ? "unknown" : item.lifecycle.trusted ? "yes" : "no"} · revision ${safe(item.lifecycle?.immutableRevision ?? "not available", 100)} · integrity ${safe(item.lifecycle?.integrity ?? "not available", 100)}`);
+  pushDetail(lines, `Pending/recovery: reload ${item.lifecycle?.pendingReload ? "pending" : "not pending"} · step ${safe(item.lifecycle?.pendingStep ?? "none", 120)} · recovery ${safe(item.lifecycle?.recoveryCommand ?? "none", 160)}`, item.lifecycle?.pendingReload || item.lifecycle?.pendingStep ? "warning" : "text");
+  pushDetail(lines, `Dependency: ${safe(item.lifecycle?.dependency.state ?? "not evaluated", 60)}${item.lifecycle?.dependency.reason ? ` · ${safe(item.lifecycle.dependency.reason, 180)}` : ""}`);
+  pushDetail(lines, `Scope: ${safe(item.lifecycle?.selectedScope ?? item.selectedInstallation?.scope ?? item.enablement?.scope ?? "not available", 80)} · mutable target ${safe(item.lifecycle?.mutableRecordKey ?? "not selected", 180)}`);
+  addDetailValues(lines, "Scoped lifecycle candidates", (item.lifecycle?.candidates ?? []).map((value) => `${safe(value.scope, 60)} · ${value.selected ? "selected" : "candidate"} · key ${safe(value.mutableRecordKey, 200)} · trusted ${value.trusted === undefined ? "unknown" : value.trusted ? "yes" : "no"}`), identity, item.lifecycle?.selectionRequired ? "warning" : "text");
+  pushDetail(lines, `Anchored location: root ${location(item.selectedInstallation?.root)} · desired root ${location(item.lifecycle?.root)} · project ${location(item.selectedInstallation?.project)} · data ${location(item.selectedInstallation?.data)}`);
   addDetailValues(lines, "Installation records", item.installations.map((value) => {
     const problems = value.problems.length ? value.problems.map((problem) => safe(problem, 100)).join(", ") : "none";
     const diagnostics = value.diagnostics.length ? value.diagnostics.map((diagnostic) => `${safe(diagnostic.severity, 30)}:${safe(diagnostic.message, 160)}`).join(", ") : "none";
@@ -177,6 +190,8 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
     "Global marketplace policy observations are not attributed to this plugin and are not mutation controls.",
     ...view.policyObservations.map((value) => `GLOBAL ${safe(value.kind, 80)} · match ${safe(String(value.match), 40)} · valid scope ${value.validScope ? "yes" : "no"} · ${provenance(value.provenance)} · not attributed/not enforced`),
   ], identity, "warning");
+  addDetailValues(lines, "Lifecycle operation guidance", (item.lifecycle?.lifecycleOperations ?? []).map((value) => `operation ${safe(value.operationId, 100)} · status ${value.status} · step ${safe(value.semanticStep, 160)} · category ${value.category} · target ${safe(value.target ?? "not attributed", 120)} · recovery ${safe(value.recoveryCommand, 160)}`), identity, "warning");
+  addDetailValues(lines, "Retained lifecycle failures", item.lifecycle?.retainedErrors ?? [], identity, "warning");
   addDetailValues(lines, "Diagnostics with provenance", item.diagnostics.map((value) => `${safe(value.severity, 30)} · category ${safe(value.category ?? "uncategorized", 80)} · source ${safe(value.sourceClass ?? "unknown", 80)} · impact ${safe(value.impact ?? "not stated", 100)} · ${safe(value.message)}`), identity,
     item.diagnostics.some((value) => value.severity === "error") ? "error" : item.diagnostics.length ? "warning" : "text");
   addDetailValues(lines, "Catalog declarations with provenance", item.catalogDeclarations.map((value) => `source ${formatPluginInventoryStructuredSource(value.source)} · description ${safe(value.description ?? "not declared")} · version ${safe(value.version ?? "not declared", 80)} · revision ${safe(value.revision ?? "not declared", 80)} · ${provenance(value.provenance)} · ${safe(value.runtimeEffect, 80)}`), identity);
@@ -189,13 +204,33 @@ function marketplaceDetail(view: PluginInventoryModelView): DetailLine[] {
   return [
     { text: `Marketplace registration: ${safe(value.name)}`, color: "accent" },
     { text: `Validity/selection: ${safe(value.validity, 40)} · ${value.selected ? "selected" : "not selected"}`, color: value.validity === "rejected" ? "error" : "text" },
-    { text: `Scope/origin: ${safe(value.scope, 100)} · ${safe(value.origin, 100)}`, color: "text" },
+    { text: `Ownership/scope: ${safe(value.ownership ?? "unknown", 80)} · ${safe(value.scope, 100)} · ${safe(value.origin, 100)}`, color: "text" },
+    { text: `Eligibility: ${(value.availableActions ?? []).join(", ") || "inspect only"}${value.readOnlyReason ? ` · ${safe(value.readOnlyReason)}` : ""}`, color: value.readOnlyReason ? "warning" : "text" },
+    { text: `Trust/target: ${value.trusted === undefined ? "unknown" : value.trusted ? "trusted" : "untrusted"} · ${safe(value.mutableRecordKey ?? "not selected", 180)}`, color: "text" },
+    { text: `Scoped candidates: ${(value.candidates ?? []).map((candidate) => `${safe(candidate.scope, 50)}:${candidate.selected ? "selected" : "candidate"}:${safe(candidate.mutableRecordKey, 120)}`).join(" · ") || "none"}`, color: value.selectionRequired ? "warning" : "text" },
+    { text: `Pending: ${safe(value.pendingStep ?? "none", 160)}`, color: value.pendingStep ? "warning" : "text" },
+    ...(value.lifecycleOperations ?? []).map((operation) => ({ text: `Lifecycle operation: ${safe(operation.operationId, 100)} · ${operation.status} · step ${safe(operation.semanticStep, 160)} · category ${operation.category} · target ${safe(operation.target ?? "not attributed", 120)} · recovery ${safe(operation.recoveryCommand, 160)}`, color: "warning" })),
     { text: `Fixture contract: ${safe(value.fixtureContract ?? "not declared", 80)}`, color: "text" },
     { text: `Anchored catalog location: ${location(value.catalog)}`, color: "text" },
     { text: `Source fields: ${formatPluginInventoryStructuredSource(value.source)}`, color: "text" },
     { text: `Source provenance: ${provenance(value.sourceProvenance)}`, color: "text" },
     { text: `Registration provenance: ${provenance(value.provenance)}`, color: "text" },
-    { text: "Local registration/catalog evidence only; no network refresh, download, install, update, enable, disable, or removal is available here.", color: "muted" },
+    { text: "Passive eligibility only; this view never invokes, confirms, or collects input for lifecycle services.", color: "muted" },
+  ];
+}
+function globalLifecycleDetail(view: PluginInventoryModelView): DetailLine[] {
+  const detail = view.detail;
+  if (!detail || detail.kind !== "global-lifecycle") return [];
+  const value = detail.operation;
+  return [
+    { text: "Unattributed lifecycle evidence", color: "accent" },
+    { text: `Operation id: ${safe(value.operationId, 100)}`, color: "warning" },
+    { text: `Status: ${safe(value.status, 60)}`, color: "warning" },
+    { text: `Semantic step: ${safe(value.semanticStep, 160)}`, color: "warning" },
+    { text: `Recovery category: ${value.category}`, color: "warning" },
+    { text: `Target: ${safe(value.target ?? "not attributed", 120)}`, color: "warning" },
+    { text: `Observational recovery command: ${safe(value.recoveryCommand, 160)}`, color: "warning" },
+    { text: "Passive observation only; this view performs no I/O and never invokes lifecycle recovery.", color: "muted" },
   ];
 }
 function globalDiagnosticDetail(view: PluginInventoryModelView): DetailLine[] {
@@ -215,7 +250,7 @@ function globalDiagnosticDetail(view: PluginInventoryModelView): DetailLine[] {
   ];
 }
 function renderDetail(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): number {
-  const raw = view.detail?.kind === "plugin" ? pluginDetail(view) : view.detail?.kind === "marketplace" ? marketplaceDetail(view) : globalDiagnosticDetail(view);
+  const raw = view.detail?.kind === "plugin" ? pluginDetail(view) : view.detail?.kind === "marketplace" ? marketplaceDetail(view) : view.detail?.kind === "global-lifecycle" ? globalLifecycleDetail(view) : globalDiagnosticDetail(view);
   const body: string[] = [];
   for (const value of raw) addWrapped(body, theme, value.color, value.text, width);
   const max = Math.max(0, body.length - DETAIL_WINDOW);
@@ -247,7 +282,7 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   } else selectedVisible = renderList(view, options.theme, width, lines);
   addWrapped(lines, options.theme, "muted", view.detail
     ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · /plugin list · /plugin details <qualified-name>"
-    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details/action · Esc clear/close · /plugin list", width);
+    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · /plugin list", width);
   const safeLines = clampLines(lines, width).map((line) => {
     try { return visibleWidth(line) <= width ? line : ""; } catch { return ""; }
   });

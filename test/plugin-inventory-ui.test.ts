@@ -41,7 +41,7 @@ function marketplace(name = "official"): PluginInventoryMarketplace {
 
 function snapshot(options: {
   items?: readonly PluginInventoryItem[]; marketplaces?: readonly PluginInventoryMarketplace[]; diagnostics?: readonly PluginInventoryDiagnostic[];
-  omissions?: Readonly<Record<string, number>>; find?: (identity: string) => PluginInventoryItem | undefined;
+  durableDesired?: PluginInventorySnapshot["durableDesired"]; omissions?: Readonly<Record<string, number>>; find?: (identity: string) => PluginInventoryItem | undefined;
 } = {}): PluginInventorySnapshot {
   const items = options.items ?? [item("alpha@official"), item("alpha@community", { status: "rejected", diagnostics: [{ severity: "error", message: "load rejected" }] })];
   return {
@@ -49,6 +49,7 @@ function snapshot(options: {
     items, marketplaces: options.marketplaces ?? [marketplace()], marketplaceCatalogs: [], allowlistObservations: [], conflictObservations: [],
     policyObservations: [{ kind: "strict", match: true, validScope: true, emptyLockdown: false, posture: "claude-lifecycle-observation-not-enforced", provenance: { source: { kind: "marketplace-cache", display: "<marketplace-cache>/official/policy.json" }, scope: "managed" } }],
     diagnostics: options.diagnostics ?? [], capabilityEvidence: [], omissions: options.omissions ?? {},
+    ...(options.durableDesired === undefined ? {} : { durableDesired: options.durableDesired }),
     find: options.find ?? ((identity) => items.find((value) => value.qualifiedIdentity === identity)),
   };
 }
@@ -306,6 +307,32 @@ describe("plugin inventory focused UI", () => {
     expect(detail).toContain("Impact: source-ignored");
   });
 
+  it("shows filterable unattributed lifecycle recovery rows without duplicating attributed operations", () => {
+    const attributed = Object.freeze({ operationId: "attributed-operation", status: "pending" as const, semanticStep: "install; 1 committed step", target: "alpha@official", recoveryCommand: "picc plugin recover attributed-operation", category: "complete-or-rollback" as const });
+    const pending = Object.freeze({ operationId: "unattributed-pending", status: "pending" as const, semanticStep: "refresh; 2 committed steps", recoveryCommand: "picc plugin recover unattributed-pending", category: "complete-or-rollback" as const });
+    const failed = Object.freeze({ operationId: "unattributed-failed", outcome: "failed-before-commit" as const, semanticStep: "remove; failed-before-commit", target: "orphan target", recoveryCommand: "picc plugin recover unattributed-failed", category: "inspect" as const });
+    const attributedMarketplace = { ...marketplace(), lifecycleOperations: [attributed] };
+    const model = new PluginInventoryModel(snapshot({
+      items: [], marketplaces: [attributedMarketplace],
+      durableDesired: { pluginIdentities: [], marketplaceNames: [], pendingOperations: [attributed, pending], terminalOperations: [failed], retainedErrors: [], omissions: {} },
+    }));
+    model.setView(3);
+    expect(model.view().rows.map((row) => row.identity)).toEqual(["Lifecycle · unattributed-pending", "Lifecycle · unattributed-failed"]);
+    expect(model.view().rows.every(Object.isFrozen)).toBe(true);
+
+    model.appendFilter("complete-or-rollback");
+    expect(model.view().rows.map((row) => row.identity)).toEqual(["Lifecycle · unattributed-pending"]);
+    expect(model.enterDetail()).toBe("entered");
+    expect(Object.isFrozen(model.view().detail)).toBe(true);
+    const detail = normalizedOutput(allDetail(model, 48).split("\n"));
+    for (const evidence of ["Unattributed lifecycle evidence", "Operation id: unattributed-pending", "Semantic step: refresh; 2 committed steps", "Recovery category: complete-or-rollback", "Target: not attributed", "Observational recovery command: picc plugin recover unattributed-pending", "never invokes lifecycle recovery"]) expect(detail).toContain(evidence);
+
+    model.leaveDetail();
+    model.clearFilter();
+    model.appendFilter("orphan target");
+    expect(model.view().rows.map((row) => row.identity)).toEqual(["Lifecycle · unattributed-failed"]);
+  });
+
   it("honors configured and raw keys, revision-only repaint, visible filter, and the Esc ladder", () => {
     const done = vi.fn();
     const requestRender = vi.fn();
@@ -497,6 +524,25 @@ describe("plugin inventory focused UI", () => {
     } } });
     expect(failed).toEqual({ opened: false, reason: "open-failed" });
     expect(disposed).toBe(1);
+  });
+
+  it("passively renders lifecycle truth and scoped eligibility at normal and narrow widths", () => {
+    const base = item("owned@official", { components: 0 });
+    const lifecycleItem: PluginInventoryItem = { ...base, lifecycle: { ownership: "picc-owned", marketplaceOwnership: "picc-owned", candidates: [
+      { mutableRecordKey: "owned@official\0picc-owned\0project\0profile-a\0checkout-a", scope: "project", ownership: "picc-owned", selected: false, installed: true, trusted: true },
+      { mutableRecordKey: "owned@official\0picc-owned\0local\0profile-a\0checkout-a", scope: "local", ownership: "picc-owned", selected: false, installed: true, trusted: true },
+    ], selectionRequired: true, selectionGuidance: "Select one exact writable scope", availableActions: [], installed: true, declared: false, effectiveEnabled: false, loaded: true, trusted: true, immutableRevision: "revision-with-a-very-long-value", integrity: `sha256:${"a".repeat(64)}`, defaultEnablementSource: "derived-owned-default", dependency: { state: "blocked", reason: "Dependency assembly decision: missing" }, readOnlyReason: "More than one writable scope is available", pendingStep: "update; 1 committed step", recoveryCategory: "complete-or-rollback", recoveryCommand: "picc plugin recover plugin_pending", lifecycleOperations: [{ operationId: "plugin_pending", status: "pending", semanticStep: "update; 1 committed step", target: "owned@official", recoveryCommand: "picc plugin recover plugin_pending", category: "complete-or-rollback" }], pendingReload: true, retainedErrors: ["Lifecycle update ended failed-before-commit"] } };
+    const lifecycleMarketplace: PluginInventoryMarketplace = { ...marketplace("official"), pendingStep: "refresh; 0 committed steps", lifecycleOperations: [{ operationId: "market_failed", status: "failed-before-commit", semanticStep: "refresh; failed-before-commit", target: "official", recoveryCommand: "picc plugin recover market_failed", category: "inspect" }] };
+    const snap = { ...snapshot({ items: [lifecycleItem], marketplaces: [lifecycleMarketplace] }), loadedGenerationId: "loaded-generation", durableDesired: { generationId: "desired-generation", pluginIdentities: ["owned@official"], marketplaceNames: ["official"], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } };
+    const model = new PluginInventoryModel(snap); model.setView(1);
+    const normal = output(renderPluginInventory(model.view(), { width: 120, theme: plainTheme }).lines);
+    for (const truth of ["loaded loaded-generation", "desired desired-generation", "scope selection required", "eligibility none"]) expect(normal).toContain(truth);
+    expect(model.enterDetail()).toBe("entered"); const detail = allDetail(model, 120);
+    for (const truth of ["declared derived/default", "Dependency: blocked", "plugin_pending", "complete-or-rollback", "picc plugin recover plugin_pending", "Scoped lifecycle candidates", "Retained lifecycle failures", "Lifecycle update ended failed-before-commit"]) expect(detail).toContain(truth);
+    model.leaveDetail(); model.setView(2); expect(model.enterDetail()).toBe("entered"); const marketDetail = allDetail(model, 120);
+    for (const truth of ["market_failed", "refresh; failed-before-commit", "category inspect", "target official", "picc plugin recover market_failed"]) expect(marketDetail).toContain(truth);
+    for (const width of [32, 18]) for (const line of renderPluginInventory(model.view(), { width, theme: plainTheme }).lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    expect(normal).not.toContain("confirm");
   });
 
   it("performs no filesystem I/O, network, process launch, or snapshot mutation on populated paths", () => {

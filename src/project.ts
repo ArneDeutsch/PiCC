@@ -22,6 +22,7 @@ import { loadPluginInstalledState } from "./claude/plugin-installed-state.js";
 import { loadPluginMarketplaceState } from "./claude/plugin-marketplaces.js";
 import { createPluginMetadataReadCapability } from "./claude/plugin-metadata.js";
 import { buildPluginInventorySnapshot, type PluginInventoryCapabilityEvidence, type PluginInventorySnapshot } from "./plugin-inventory.js";
+import { pluginMutableRecordKey } from "./plugin-lifecycle/plugin-service.js";
 import { lookupCapability } from "./registry/capability-registry.js";
 import {
   authorizedCacheRoots,
@@ -250,6 +251,7 @@ export function loadClaudeProject(opts: {
     loadedPluginHooks.set(plugin.pluginId, pluginHooks);
     finalLoadedComponents[plugin.pluginId] = { skills: 0, commands: 0, agents: 0, hooks: 0 };
   }
+  let finalActualDependencyDecisions = pluginResult.dependencyDecisions;
   if (rejectedAtLoad.size > 0) {
     const finalDependencyDecisions = admitDependencyGraph(selectedPlugins.map((plugin) => ({
       pluginId: plugin.pluginId, version: plugin.version, enabled: true, available: !rejectedAtLoad.has(plugin.pluginId),
@@ -257,6 +259,9 @@ export function loadClaudeProject(opts: {
       dependencyDeclaration: plugin.manifestProjection.dependencyDeclaration,
       ...(plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: plugin.allowedCrossMarketplaceDependencies }),
     })));
+    const mergedDependencyDecisions = new Map(finalActualDependencyDecisions.map((decision) => [decision.pluginId, decision]));
+    for (const decision of finalDependencyDecisions) mergedDependencyDecisions.set(decision.pluginId, decision);
+    finalActualDependencyDecisions = Object.freeze([...mergedDependencyDecisions.values()].sort((left, right) => left.pluginId.localeCompare(right.pluginId)));
     for (const decision of finalDependencyDecisions) {
       if (decision.admitted || rejectedAtLoad.has(decision.pluginId) || selectedPlugins.find((plugin) => plugin.pluginId === decision.pluginId)?.ownership !== "picc-owned") continue;
       rejectedAtLoad.add(decision.pluginId);
@@ -409,6 +414,13 @@ export function loadClaudeProject(opts: {
     finalLoadedComponents,
     diagnostics: [...installedState.diagnostics, ...diagnostics.filter((entry) => entry.category !== undefined)],
     capabilityEvidence: inventoryCapabilityEvidence,
+    lifecycleObservation,
+    ...(executableGenerationObservation.status === "valid" ? { loadedGeneration: executableGenerationObservation.generation } : {}),
+    applicableOwnedRecordKeys: pluginAdmissions.flatMap((projection) => projection.ownership === "picc-owned" ? [pluginMutableRecordKey(projection.authority.record)] : []),
+    selectedOwnedMarketplaces: ownedMarketplaces,
+    dependencyDecisions: finalActualDependencyDecisions,
+    runtimeSelections: pluginResult.selectedInstallations,
+    explicitEnablementIdentities: Object.keys(settings.effectivePluginEnablement ?? {}),
   });
 
   return {
