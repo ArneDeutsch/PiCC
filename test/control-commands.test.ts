@@ -846,7 +846,8 @@ describe("reserved plugin-management commands", () => {
         expect(usage).toContain("Usage: /plugin list | /plugin details <plugin@marketplace>");
         expect(usage).toContain("No changes were made");
         expect(usage).toContain("run picc plugin --help");
-        expect(usage).toContain("use /reload-plugins in this live interactive session or start a new PiCC session");
+        expect(usage).toContain("Headless mode cannot reload plugins");
+        expect(usage).toContain("If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session.");
         if (invalid !== "--help") expect(usage).not.toContain(invalid);
       }
 
@@ -1004,6 +1005,40 @@ describe("reserved plugin-management commands", () => {
     } finally {
       cleanupFixture(root);
     }
+  });
+
+  it("keeps headless lifecycle requests inert and collects TUI workflow values without transcript egress", async () => {
+    let compositions = 0; const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] }); let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk, pluginLifecycle: async () => { compositions += 1; return { ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }; } }, (projectRoot) => {
+      hookFixture = createHookProcessFixture(projectRoot); const settingsPath = path.join(projectRoot, ".claude", "settings.json"); fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown> : {}; settings.env = hookFixture.env; settings.hooks = { UserPromptSubmit: [{ hooks: [{ type: "command", command: hookFixture.command, args: ["complete", "plugin-lifecycle-headless"] }] }] }; fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
+    });
+    try {
+      for (const [mode, ctx] of [["print", fresh.printCtx()], ["json", fresh.ctx({ mode: "json", hasUI: false })], ["rpc", fresh.rpcCtx()]] as const) {
+        fresh.entries.length = 0; const customs = fresh.customs.length; const messages = fresh.messages.length; const userMessages = fresh.userMessages.length;
+        expect(await fresh.fire("input", { text: "/plugin install SECRET_SOURCE_VALUE", source: mode }, ctx)).toEqual({ action: "handled" });
+        expect(compositions).toBe(0); expect(fresh.customs).toHaveLength(customs); expect(fresh.messages).toHaveLength(messages); expect(fresh.userMessages).toHaveLength(userMessages);
+        const guidance = String(controlEntry("plugin", fresh)?.data?.output ?? ""); expect(guidance.length).toBeLessThan(5000); expect(guidance).toContain("Headless modes are guidance-only"); expect(guidance).toContain("If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session."); expect(guidance).not.toContain("SECRET_SOURCE_VALUE");
+      }
+
+      fresh.entries.length = 0;
+      const opening = fresh.commands.get("plugin").handler("install SECRET_SOURCE_VALUE", fresh.tuiCtx());
+      await Promise.resolve(); const custom = fresh.customs.at(-1)!; await custom.ready;
+      expect(compositions).toBe(0);
+      expect(custom.render(72).join("\n")).not.toContain("SECRET_SOURCE_VALUE");
+      custom.input("\r");
+      custom.input("alpha@official"); custom.input("\r");
+      custom.input("user"); custom.input("\r");
+      await vi.waitFor(() => expect(custom.render(72).join("\n")).toContain("fixture unavailable"));
+      expect(compositions).toBe(1);
+      expect(custom.render(72).join("\n")).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)/u);
+      custom.input("\u001b"); custom.input("\u001b"); await opening;
+
+      for (const [args, expected] of [["enable TRAILING_RAW_SECRET", "enable"], ["disable TRAILING_RAW_SECRET", "disable"], ["update TRAILING_RAW_SECRET", "update"], ["uninstall TRAILING_RAW_SECRET", "uninstall"], ["marketplace add TRAILING_RAW_SECRET", "marketplace-add"], ["marketplace refresh TRAILING_RAW_SECRET", "marketplace-refresh"], ["marketplace remove TRAILING_RAW_SECRET", "marketplace-remove"], ["recover TRAILING_RAW_SECRET", "recover"]] as const) {
+        const routed = fresh.commands.get("plugin").handler(args, fresh.tuiCtx()); await Promise.resolve(); const pane = fresh.customs.at(-1)!; await pane.ready; const text = pane.render(72).join("\n"); expect(text).toContain(expected); expect(text).not.toContain("TRAILING_RAW_SECRET"); pane.input("\u001b"); pane.input("\u001b"); await routed;
+      }
+      expect(JSON.stringify(fresh.entries)).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)|TRAILING_RAW_SECRET/u);
+      expect(fresh.messages).toEqual([]); expect(fresh.userMessages).toEqual([]); expect(sdk.promptCalls()).toBe(0); expect(hookFixture?.spawnedChildren()).toHaveLength(0);
+    } finally { await hookFixture?.cleanup("plugin-lifecycle-headless"); cleanupFixture(root); }
   });
 
   it("uses a bounded list fallback when interactive opening is unavailable or rejected", async () => {

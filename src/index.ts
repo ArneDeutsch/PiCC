@@ -151,6 +151,8 @@ import {
   sanitizePluginInventoryDisplayText,
 } from "./runtime/plugin-inventory-text.js";
 import { openPluginInventory } from "./runtime/plugin-inventory-focus.js";
+import { createProductionPluginLifecyclePort, type PluginLifecyclePort } from "./plugin-inventory-cli.js";
+import type { PluginInventoryActionName } from "./runtime/plugin-inventory-model.js";
 import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
@@ -396,6 +398,8 @@ export interface PiccTestSeam {
     | "serverStates"
     | "shutdown"
   >;
+  /** TEST-ONLY lifecycle composition override for focused plugin UI wiring. */
+  pluginLifecycle?: (project: LoadedProject) => Promise<{ readonly ok: true; readonly value: PluginLifecyclePort } | { readonly ok: false; readonly code: string; readonly message: string }>;
   /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
   mcpControl?: {
     whenSettled?: () => Promise<void>;
@@ -5349,7 +5353,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       render: async () => renderUsageReport(),
     }],
     ["plugin", {
-      description: "PiCC: inspect the read-only plugin inventory",
+      description: "PiCC: inspect and explicitly manage the local plugin lifecycle",
       render: async (args, ctx) => renderPluginControl(args, ctx),
     }],
     ["plugins", {
@@ -5450,24 +5454,34 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return overlay === undefined ? output : `${output}\n\n${overlay}`;
   }
 
-  function pluginReadOnlyUsage(_ctx: any): string {
-    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. For lifecycle commands, run picc plugin --help. Then use /reload-plugins in this live interactive session or start a new PiCC session.`;
+  function pluginReadOnlyUsage(ctx: any): string {
+    const adoption = ctx?.mode === "tui" ? "After a committed plugin change, use /reload-plugins in this live interactive session or start a new PiCC session." : "Headless mode cannot reload plugins. If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session.";
+    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. In the interactive TUI, /plugin install|enable|disable|update|uninstall, /plugin marketplace add|refresh|remove, and /plugin recover enter the focused workflow; values and destructive choices are collected there. Headless modes are guidance-only; run picc plugin --help for standalone commands. ${adoption}`;
+  }
+
+  function requestedPluginAction(args: string): PluginInventoryActionName | undefined {
+    const tokens = args.trim().toLowerCase().split(/[ \t]+/u);
+    if (tokens[0] === "marketplace" && ["add", "refresh", "remove"].includes(tokens[1] ?? "")) return `marketplace-${tokens[1]}` as PluginInventoryActionName;
+    if (["install", "enable", "disable", "update", "uninstall", "recover"].includes(tokens[0] ?? "")) return tokens[0] as PluginInventoryActionName;
+    return undefined;
   }
 
   async function renderPluginControl(args: string, ctx: any): Promise<string | undefined> {
-    if (/^[ \t]*$/.test(args)) {
-      if (ctx?.mode !== "tui") return withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory));
+    const requestedAction = requestedPluginAction(args);
+    if (/^[ \t]*$/.test(args) || requestedAction !== undefined) {
+      if (ctx?.mode !== "tui") return requestedAction === undefined ? withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory)) : pluginReadOnlyUsage(ctx);
       const overlay = pluginRuntimeOverlay();
       if (overlay !== undefined) {
         try { ctx.ui?.notify?.(overlay, "warning"); } catch { /* overlay is additive */ }
       }
-      const opened = await openPluginInventory(project.pluginInventory, ctx);
+      const lifecycleFactory = () => testSeam?.pluginLifecycle?.(project) ?? createProductionPluginLifecyclePort(project, { cwd: project.cwd, env: process.env, platform: process.platform });
+      const opened = await openPluginInventory(project.pluginInventory, ctx, { lifecycleFactory, ...(requestedAction === undefined ? {} : { initialAction: requestedAction }) });
       if (opened.opened) return undefined;
       const warning = opened.reason === "unavailable"
         ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only list instead."
         : "Interactive plugin inventory could not open; showing the bounded read-only list instead.";
       try { ctx.ui?.notify?.(warning, "warning"); } catch { /* text fallback remains authoritative */ }
-      return `${warning}\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))}`;
+      return `${warning} Run picc plugin --help for standalone lifecycle commands.\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))}`;
     }
     const parsed = parsePluginInventorySlash(`/plugin ${args}`);
     return parsed.kind === "usage"

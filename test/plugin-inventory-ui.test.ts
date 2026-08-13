@@ -1,11 +1,13 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginInventoryDiagnostic, PluginInventoryItem, PluginInventoryMarketplace, PluginInventorySnapshot } from "../src/plugin-inventory.js";
 import { PluginInventoryFocusController, openPluginInventory } from "../src/runtime/plugin-inventory-focus.js";
-import { PluginInventoryModel } from "../src/runtime/plugin-inventory-model.js";
+import { PluginInventoryModel, type PluginInventoryActionName } from "../src/runtime/plugin-inventory-model.js";
 import { renderPluginInventory } from "../src/runtime/plugin-inventory-render.js";
+import type { PluginLifecyclePort } from "../src/plugin-inventory-cli.js";
 
 function item(identity: string, options: {
   catalog?: boolean; status?: PluginInventoryItem["outcome"] extends infer _T ? NonNullable<PluginInventoryItem["outcome"]>["status"] : never;
@@ -57,8 +59,8 @@ function snapshot(options: {
 const plainTheme = { fg: (_color: string, value: string) => value };
 const output = (lines: readonly string[]): string => lines.join("\n");
 const normalizedOutput = (lines: readonly string[]): string => output(lines).replace(/\s+/gu, " ");
-function component(snap = snapshot(), options: { render?: typeof renderPluginInventory; requestRender?: () => void; done?: () => void; keybindings?: { matches(data: string, id: string): boolean }; onError?: (error: unknown) => void } = {}) {
-  return new PluginInventoryFocusController({ snapshot: snap, tui: { requestRender: options.requestRender ?? (() => {}) }, theme: plainTheme, keybindings: options.keybindings, done: options.done ?? (() => {}), render: options.render, onError: options.onError });
+function component(snap = snapshot(), options: { render?: typeof renderPluginInventory; requestRender?: () => void; done?: () => void; keybindings?: { matches(data: string, id: string): boolean }; onError?: (error: unknown) => void; lifecycle?: PluginLifecyclePort; lifecycleFactory?: () => Promise<{ ok: true; value: PluginLifecyclePort } | { ok: false; code: string; message: string }>; initialAction?: PluginInventoryActionName } = {}) {
+  return new PluginInventoryFocusController({ snapshot: snap, tui: { requestRender: options.requestRender ?? (() => {}) }, theme: plainTheme, done: options.done ?? (() => {}), ...(options.keybindings === undefined ? {} : { keybindings: options.keybindings }), ...(options.render === undefined ? {} : { render: options.render }), ...(options.onError === undefined ? {} : { onError: options.onError }), ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }), ...(options.lifecycleFactory === undefined ? {} : { lifecycleFactory: options.lifecycleFactory }), ...(options.initialAction === undefined ? {} : { initialAction: options.initialAction }) });
 }
 function allDetail(model: PluginInventoryModel, width = 100): string {
   let result = renderPluginInventory(model.view(), { width, theme: plainTheme });
@@ -126,7 +128,8 @@ describe("plugin inventory focused UI", () => {
     const zero = output(renderPluginInventory(model.view(), { width: 90 }).lines);
     expect(zero).toContain("No matches for the active literal filter");
     expect(zero).toContain("read-only · captured for this session");
-    expect(zero).toContain("run /reload in the interactive TUI, or exit and relaunch PiCC");
+    expect(zero).toContain("run /reload-plugins in the interactive TUI");
+    expect(zero).toContain("exit and relaunch");
     expect(zero).toContain("Local known catalogs/registrations only");
   });
 
@@ -543,6 +546,308 @@ describe("plugin inventory focused UI", () => {
     for (const truth of ["market_failed", "refresh; failed-before-commit", "category inspect", "target official", "picc plugin recover market_failed"]) expect(marketDetail).toContain(truth);
     for (const width of [32, 18]) for (const line of renderPluginInventory(model.view(), { width, theme: plainTheme }).lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     expect(normal).not.toContain("confirm");
+  });
+
+  it("drives typed preview, double-submit protection, cancellation propagation, receipt lookup, and fresh durable projection", async () => {
+    const preview = { operationId: "plugin_ui_enable", action: "enable", pluginId: "alpha@official", scope: "user", mutableRecordKey: "record", profileKey: "profile-test", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["Enable the selected declaration"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    const receipt = { operationId: "plugin_ui_enable", action: "enable", pluginId: "alpha@official", outcome: "committed", completed: 1, summary: preview } as never;
+    const desiredItem = { ...item("alpha@official"), lifecycle: { ownership: "picc-owned" as const, marketplaceOwnership: "picc-owned" as const, candidates: [], selectionRequired: false, availableActions: ["disable" as const], installed: true, declared: true, effectiveEnabled: true, loaded: false, trusted: true, dependency: { state: "satisfied" as const }, pendingReload: true, retainedErrors: [] } };
+    const projection = snapshot({ items: [desiredItem], durableDesired: { generationId: "desired-new", pluginIdentities: ["alpha@official"], marketplaceNames: [], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } });
+    let capturedSignal: AbortSignal | undefined; let executeCalls = 0; let lookupCalls = 0; let resolvePlan!: (value: any) => void; let blockPlan = false;
+    const port = {
+      marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false, code: "unused", message: "unused" }), plan: async () => ({ ok: false, code: "unused", message: "unused" }), prepare: () => ({ ok: false, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true, value: undefined }) },
+      plugins: { list: () => [], details: () => ({ ok: false, code: "unused", message: "unused" }), plan: async (_operation: unknown, signal?: AbortSignal) => { capturedSignal = signal; return blockPlan ? new Promise((resolve) => { resolvePlan = resolve; }) : { ok: true, value: preview }; }, execute: async () => { executeCalls += 1; return { ok: true, value: receipt }; }, discardPreview: async () => ({ ok: true, value: undefined }) },
+      recovery: { list: () => [], preview: async () => ({ ok: false, code: "unused", message: "unused" }), recover: async () => ({ ok: false, code: "unused", message: "unused" }) },
+      targets: { plugin: () => ({ ok: false, code: "unused", message: "unused" }), marketplace: () => ({ ok: false, code: "unused", message: "unused" }) },
+      lookup: async () => { lookupCalls += 1; return { ok: true, value: { state: "terminal", receipt } }; }, projection: () => ({ ok: true, value: projection }),
+    } as PluginLifecyclePort;
+    let failReceiptRender = false;
+    const renderer: typeof renderPluginInventory = (view, options) => { if (failReceiptRender && view.workflow?.phase === "receipt") throw new Error("receipt renderer"); return renderPluginInventory(view, options); };
+    const c = component(snapshot({ items: [item("alpha@official")] }), { lifecycle: port, initialAction: "enable", render: renderer });
+    c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r");
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
+    expect(c.render(54).join("\n")).toContain("Operation id: plugin_ui_enable");
+    c.handleInput("\r");
+    expect(c.render(54).join("\n")).toContain("Final confirmation");
+    c.handleInput("\r");
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("receipt"));
+    expect(executeCalls).toBe(1);
+    expect(c.view().durableDesired.durableDesired?.generationId).toBe("desired-new");
+    expect(c.view().durableDesired.find("alpha@official")?.outcome?.status).toBe("loaded");
+    failReceiptRender = true; c.invalidate(); c.render(80);
+    await vi.waitFor(() => expect(lookupCalls).toBeGreaterThan(0));
+
+    blockPlan = true;
+    const cancelled = component(snapshot(), { lifecycle: port, initialAction: "enable" });
+    cancelled.handleInput("\r"); cancelled.handleInput("alpha@official"); cancelled.handleInput("\r");
+    await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+    cancelled.handleInput("\u001b");
+    expect(capturedSignal?.aborted).toBe(true);
+    resolvePlan({ ok: false, code: "cancelled", message: "cancelled" });
+    await vi.waitFor(() => expect(cancelled.view().workflow).toBeUndefined());
+  });
+
+  it("retains execution authority through progress renderer failure and Esc", async () => {
+    const operationId = "plugin_render_flight"; const preview = { operationId, action: "enable", pluginId: "alpha@official", scope: "user", mutableRecordKey: "record", profileKey: "profile-test", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["enable"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    const receipt = { operationId, action: "enable", pluginId: "alpha@official", outcome: "committed", completed: 1, summary: preview } as never;
+    let resolveExecute!: (value: unknown) => void; let lookups = 0;
+    const execution = new Promise((resolve) => { resolveExecute = resolve; });
+    const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => execution, discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: {}, lookup: async () => { lookups += 1; return { ok: true, value: { state: "terminal", receipt } }; }, projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const renderer: typeof renderPluginInventory = (view, options) => { if (view.workflow?.phase === "progress") throw new Error("progress renderer failed"); return renderPluginInventory(view, options); };
+    const c = component(snapshot(), { lifecycle: port, initialAction: "enable", render: renderer }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); c.render(72); c.handleInput("\r"); c.render(72); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("progress")); c.render(72);
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("terminal-fallback")); c.handleInput("\u001b"); expect(c.view().workflow).toMatchObject({ phase: "terminal-fallback", message: expect.stringContaining("Esc intent was recorded locally") });
+    resolveExecute({ ok: true, value: receipt }); await vi.waitFor(() => expect(lookups).toBeGreaterThan(0)); const terminal = c.view().workflow; expect(terminal && "operationId" in terminal ? terminal.operationId : undefined).toBe(operationId); const truth = terminal?.phase === "receipt" ? terminal.receipt.outcome : terminal?.phase === "terminal-fallback" ? terminal.message : ""; expect(truth).toContain("committed"); expect(lookups).toBeGreaterThan(0);
+  });
+
+  it("keeps global marketplace add targetless on managed/imported rows before planning", () => {
+    for (const ownership of ["managed", "claude-imported-readonly"] as const) {
+      let compositions = 0; const selected = { ...marketplace("official"), ownership, availableActions: [] as const };
+      const c = component(snapshot({ marketplaces: [selected] }), { lifecycleFactory: async () => { compositions += 1; return { ok: false, code: "unused", message: "unused" }; } }); c.handleInput("\u001b[C"); c.handleInput("\u001b[C"); c.handleInput("A");
+      expect(c.view().workflow).toMatchObject({ phase: "select-action", actions: ["marketplace-add"] }); expect((c.view().workflow as { target?: unknown }).target).toBeUndefined(); c.handleInput("\r"); expect(c.view().workflow).toMatchObject({ phase: "input", action: "marketplace-add", field: "marketplace name" }); expect(compositions).toBe(0);
+    }
+  });
+
+  it("keeps direct targets private, supports editable acknowledgement input, and invalidates delayed composition on Esc/dispose", async () => {
+    const direct = component(snapshot(), { initialAction: "enable" });
+    expect(direct.view().workflow).toMatchObject({ phase: "select-action" });
+    expect((direct.view().workflow as { target?: unknown }).target).toBeUndefined();
+
+    let factoryCalls = 0; let planCalls = 0; let resolveFactory!: (value: { ok: true; value: PluginLifecyclePort }) => void;
+    const port = { marketplaces: {}, plugins: { plan: async () => { planCalls += 1; return { ok: false, code: "unused", message: "unused" }; } }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const delayed = component(snapshot(), { initialAction: "enable", lifecycleFactory: () => { factoryCalls += 1; return new Promise((resolve) => { resolveFactory = resolve; }); } });
+    delayed.handleInput("\r"); delayed.handleInput("alpha@official"); delayed.handleInput("\r");
+    await vi.waitFor(() => expect(factoryCalls).toBe(1));
+    delayed.handleInput("\u001b"); resolveFactory({ ok: true, value: port });
+    await vi.waitFor(() => expect(delayed.view().workflow).toBeUndefined()); expect(planCalls).toBe(0);
+
+    let removeCompositions = 0;
+    const remove = component(snapshot(), { initialAction: "marketplace-remove", lifecycleFactory: async () => { removeCompositions += 1; return { ok: false, code: "fixture", message: "secret detail" }; } });
+    remove.handleInput("\r"); remove.handleInput("official"); remove.handleInput("\r"); remove.handleInput("no"); remove.handleInput("\r");
+    expect(remove.view().workflow).toMatchObject({ phase: "input", field: "preserve installed acknowledgement" }); expect(output(remove.render(70))).toContain("Invalid preserve installed acknowledgement"); expect(removeCompositions).toBe(0);
+    remove.handleInput("\u007f"); remove.handleInput("\u007f"); remove.handleInput("yes"); remove.handleInput("\r");
+    await vi.waitFor(() => expect(removeCompositions).toBe(1)); await vi.waitFor(() => expect(remove.view().workflow?.phase).toBe("failed")); expect(JSON.stringify(remove.view())).not.toContain("secret detail");
+
+    let disposedFactory!: (value: { ok: true; value: PluginLifecyclePort }) => void;
+    const disposed = component(snapshot(), { initialAction: "enable", lifecycleFactory: () => new Promise((resolve) => { disposedFactory = resolve; }) });
+    disposed.handleInput("\r"); disposed.handleInput("alpha@official"); disposed.handleInput("\r"); disposed.dispose(); disposedFactory({ ok: true, value: port }); await Promise.resolve(); expect(planCalls).toBe(0);
+  });
+
+  it("binds duplicate candidates through the shared exact-selector authority and refuses stale records", async () => {
+    const base = item("alpha@official"); const owned = { ...base, lifecycle: { ownership: "picc-owned" as const, candidates: [{ mutableRecordKey: "record-user", scope: "user", ownership: "picc-owned" as const, selected: false, installed: true }, { mutableRecordKey: "record-local", scope: "local", ownership: "picc-owned" as const, selected: false, installed: true }], selectionRequired: true, availableActions: [] as const, installed: true, loaded: true, dependency: { state: "satisfied" as const }, pendingReload: false, retainedErrors: [] } };
+    const preview = { operationId: "plugin_exact", action: "enable", pluginId: "alpha@official", scope: "local", mutableRecordKey: "record-local", profileKey: "profile-test", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["enable"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    let operation: any; let resolvedKey: string | undefined;
+    const exact = { kind: "plugin" as const, identity: "alpha@official", scope: "local", mutableRecordKey: "record-local", selector: "selector-local" };
+    const port = { marketplaces: {}, plugins: { plan: async (value: unknown) => { operation = value; return { ok: true, value: preview }; }, discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: { plugin: (_identity: string, key: string) => { resolvedKey = key; return key === "record-local" ? { ok: true, value: exact } : { ok: false, code: "stale-selector", message: "stale" }; }, marketplace: () => ({ ok: false, code: "unused", message: "unused" }) }, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot({ items: [owned] }), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("select-candidate")); c.handleInput("\u001b[B"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); expect(resolvedKey).toBe("record-local"); expect(operation.flags.selector).toBe("selector-local"); expect(normalizedOutput(c.render(90))).toContain("selector fingerprint");
+
+    let stalePlans = 0; const stalePort = { ...port, plugins: { ...port.plugins, plan: async () => { stalePlans += 1; return { ok: true, value: preview }; } }, targets: { ...port.targets, plugin: () => ({ ok: false, code: "stale-selector", message: "stale" }) } } as unknown as PluginLifecyclePort;
+    const stale = component(snapshot({ items: [owned] }), { lifecycle: stalePort, initialAction: "enable" }); stale.handleInput("\r"); stale.handleInput("alpha@official"); stale.handleInput("\r"); await vi.waitFor(() => expect(stale.view().workflow?.phase).toBe("select-candidate")); stale.handleInput("\r"); await vi.waitFor(() => expect(stale.view().workflow?.phase).toBe("failed")); expect(stalePlans).toBe(0); expect(output(stale.render(72))).toContain("target changed");
+  });
+
+  it("projects scope/profile/checkout and complete local source authority without raw keys or paths", async () => {
+    const rendered: string[] = [];
+    for (const [scope, sourceValue] of [["user", "/first/same"], ["project", "/second/same"], ["local", "/third/same"]] as const) {
+      const port = { marketplaces: { plan: async (operation: any) => ({ ok: true, value: { operationId: `market_${scope}`, action: "add", registration: { name: operation.name, scope, profileKey: "profile-secret-key", ...(scope === "user" ? {} : { checkoutFamilyKey: "checkout-secret-key", projectKey: "checkout-secret-key" }), source: { kind: "local-directory", path: operation.sourceValue } }, snapshot: { snapshotId: `marketplace-${scope}`, catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: `sha256:${"d".repeat(64)}`, settingsFingerprint: `sha256:${"e".repeat(64)}`, settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"] } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+      const c = component(snapshot(), { lifecycle: port, initialAction: "marketplace-add" }); c.handleInput("\r"); for (const value of ["new-market", "local-directory", sourceValue, scope]) { c.handleInput(value); c.handleInput("\r"); } await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); const text = normalizedOutput(c.render(120)); rendered.push(text); const sourceFingerprint = createHash("sha256").update(JSON.stringify({ kind: "local-directory", path: sourceValue }), "utf8").digest("hex").slice(0, 16); expect(text).toContain(`local-directory basename same · full authority ${sourceFingerprint}`); expect(text).toContain(`requested scope ${scope}`); expect(text).toMatch(/profile [a-f0-9]{16}/u); expect(text).toContain(scope === "user" ? "checkout user-global" : "checkout "); expect(text).not.toContain("profile-secret-key"); expect(text).not.toContain("checkout-secret-key"); expect(text).not.toContain(sourceValue); expect(c.view().workflow).toMatchObject({ confirmationEnabled: true });
+    }
+    expect(new Set(rendered).size).toBe(3);
+    const incompletePort = { marketplaces: { plan: async () => ({ ok: true, value: { operationId: "market_incomplete", action: "add", registration: { name: "new-market", scope: "project", profileKey: "profile-secret-key", source: { kind: "local-directory", path: "/fourth/same" } }, snapshot: { snapshotId: "marketplace-incomplete", catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: `sha256:${"d".repeat(64)}`, settingsFingerprint: `sha256:${"e".repeat(64)}`, settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"] } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const incomplete = component(snapshot(), { lifecycle: incompletePort, initialAction: "marketplace-add" }); incomplete.handleInput("\r"); for (const value of ["new-market", "local-directory", "/fourth/same", "project"]) { incomplete.handleInput(value); incomplete.handleInput("\r"); } await vi.waitFor(() => expect(incomplete.view().workflow?.phase).toBe("preview")); expect(incomplete.view().workflow).toMatchObject({ confirmationEnabled: false, projection: { omissions: 1 } });
+  });
+
+  it("keeps raw producer previews out of view and requires exact rendered confirmation attestation", async () => {
+    const preview = { operationId: "plugin_attested", action: "enable", pluginId: "alpha@official", scope: "user", mutableRecordKey: "record", profileKey: "profile-test", requestedSource: { kind: "https-git", url: "https://user:password@example.com/private.git" }, dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: ["skill"], removeDeclaration: false, removeData: false, participants: [], consequences: ["Enable exact record"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    let executes = 0; let discards = 0;
+    const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => { executes += 1; return { ok: false, code: "unused", message: "unused" }; }, discardPreview: async () => { discards += 1; return { ok: true, value: undefined }; } }, recovery: {}, targets: { plugin: () => ({ ok: false, code: "unused", message: "unused" }), marketplace: () => ({ ok: false, code: "unused", message: "unused" }) }, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
+    expect(JSON.stringify(c.view())).not.toMatch(/password|requestedSource|confirmationDigest/u); const projected = normalizedOutput(c.render(72)); expect(projected).toContain("https-git host example.com · full authority"); expect(projected).toContain("requested scope user"); expect(projected).toMatch(/profile [a-f0-9]{16}/u);
+    c.handleInput("\r"); expect(c.view().workflow?.phase).toBe("confirmation"); c.invalidate(); c.handleInput("\r"); await vi.waitFor(() => expect(discards).toBe(1)); expect(executes).toBe(0); expect(c.view().workflow?.phase).toBe("failed");
+
+    const narrow = component(snapshot(), { lifecycle: port, initialAction: "enable" }); narrow.handleInput("\r"); narrow.handleInput("alpha@official"); narrow.handleInput("\r"); await vi.waitFor(() => expect(narrow.view().workflow?.phase).toBe("preview")); expect(narrow.render(7).join("\n")).toContain("Resize"); expect(discards).toBe(1); expect(executes).toBe(0); expect(narrow.view().workflow?.phase).toBe("preview");
+  });
+
+  it("keeps one loaded snapshot fixed across the stateful add-install-disable-enable-update-uninstall-recovery chain", async () => {
+    const catalogOnly = item("alpha@official", { installationRecords: false, enablement: false, runtime: false });
+    const loaded = snapshot({ items: [catalogOnly], marketplaces: [] });
+    const market = { ...marketplace(), ownership: "picc-owned" as const, mutableRecordKey: "market-user", candidates: [{ mutableRecordKey: "market-user", scope: "user" as const, selected: true, trusted: true }], availableActions: ["refresh", "remove"] as const };
+    const desiredItem = (action: "install" | "disable" | "enable" | "update" | "uninstall", installed: boolean): PluginInventoryItem => ({
+      ...catalogOnly,
+      installations: installed ? item("alpha@official").installations : [],
+      lifecycle: {
+        ownership: "picc-owned", marketplaceOwnership: "picc-owned",
+        candidates: installed ? [{ mutableRecordKey: "record-user", scope: "user", ownership: "picc-owned", selected: true, installed: true }] : [],
+        availableActions: [action], installed, declared: installed, effectiveEnabled: action !== "enable" && installed,
+        loaded: false, trusted: true, dependency: { state: "satisfied" }, pendingReload: installed, retainedErrors: [],
+      },
+    });
+    const projection = (generation: string, action: "install" | "disable" | "enable" | "update" | "uninstall", installed: boolean, pending = false) => snapshot({
+      items: [desiredItem(action, installed)], marketplaces: [market],
+      durableDesired: {
+        generationId: generation, pluginIdentities: installed ? ["alpha@official"] : [], marketplaceNames: ["official"],
+        pendingOperations: pending ? [{ operationId: "plugin_pending", status: "pending", semanticStep: "uninstall", target: "alpha@official", recoveryCommand: "picc plugin recover plugin_pending", category: "complete-or-rollback" }] : [],
+        terminalOperations: [], retainedErrors: [], omissions: {},
+      },
+    });
+    const projections = [
+      projection("desired-added", "install", false), projection("desired-installed", "disable", true),
+      projection("desired-disabled", "enable", true), projection("desired-enabled", "update", true),
+      projection("desired-updated", "uninstall", true), projection("desired-uninstalled", "install", false, true),
+      projection("desired-recovered", "install", false),
+    ];
+    let stage = 0;
+    const plans: string[] = [];
+    const executions: string[] = [];
+    const pluginPreview = (action: "install" | "disable" | "enable" | "update" | "uninstall") => ({
+      operationId: `plugin_${action}`, action, pluginId: "alpha@official", scope: "user", mutableRecordKey: action === "install" ? undefined : "record-user", profileKey: "profile-test",
+      dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: ["skills"], removeDeclaration: action === "uninstall", removeData: false,
+      participants: [], consequences: [`${action} alpha@official`], confirmationDigest: `sha256:${"a".repeat(64)}`,
+    }) as never;
+    const marketplacePreview = { operationId: "marketplace_add", action: "add", registration: { name: "official", scope: "user", profileKey: "profile-test", source: { kind: "https-git", url: "https://example.test/catalog.git" } }, snapshot: { snapshotId: "catalog-snapshot", catalogDigest: "sha256:catalog", trust: { targetDigest: "sha256:catalog" } }, catalog: { plugins: [{ name: "alpha", supported: true, sourceKind: "https-git" }], omittedEntries: 0 }, stateFingerprint: "state-before", settingsFingerprint: "settings-before", settingsEffect: { requested: "registered", effective: "registered" }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add official"], confirmationDigest: `sha256:${"b".repeat(64)}` } as never;
+    const recoverySummary = { pluginId: "alpha@official", scope: "user", profileKey: "profile-test", dependencies: { selected: { admitted: true, reasons: [] }, graph: [], decisions: [] }, executableComponents: [], participants: [], consequences: ["complete uninstall"], removeDeclaration: true, removeData: false };
+    const recoveryPreview = { operationId: "plugin_pending", producerSchema: "plugin-lifecycle", producerVersion: 1, confirmationDigest: `sha256:${"c".repeat(64)}`, planDigest: `sha256:${"d".repeat(64)}`, completed: 1, remaining: 1, rolledBack: 0, actions: ["complete"] as const, confirmationSummary: recoverySummary } as never;
+    const port: PluginLifecyclePort = {
+      marketplaces: {
+        listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false, code: "unused", message: "unused" }),
+        plan: async (operation) => { expect(stage).toBe(0); expect(operation).toMatchObject({ kind: "marketplace-add", name: "official", sourceValue: "https://user:secret@example.test/catalog.git" }); plans.push(operation.kind); return { ok: true, value: marketplacePreview }; },
+        prepare: (preview) => ({ ok: true, value: { preview, execute: async () => { expect(stage).toBe(0); executions.push("marketplace-add"); stage += 1; return { ok: true, value: { operationId: "marketplace_add", outcome: "committed", completed: 1, summary: marketplacePreview } as never }; } } }),
+        discardPreview: async () => ({ ok: true, value: undefined }),
+      },
+      plugins: {
+        list: () => [], details: () => ({ ok: false, code: "unused", message: "unused" }),
+        plan: async (operation) => {
+          const expected = ["install", "disable", "enable", "update", "uninstall"][stage - 1]; expect(operation.kind).toBe(expected);
+          expect(operation.qualifiedIdentity).toBe("alpha@official");
+          if (operation.kind === "install") expect(operation.flags.marketplaceSelector).toBe("market-selector");
+          else { expect(operation.flags.selector).toBe("plugin-selector"); if (operation.kind === "update") expect(operation.flags.marketplaceSelector).toBe("market-selector"); }
+          plans.push(operation.kind); return { ok: true, value: pluginPreview(operation.kind) };
+        },
+        execute: async (preview) => { const expected = ["install", "disable", "enable", "update", "uninstall"][stage - 1]; expect(preview.action).toBe(expected); executions.push(preview.action); stage += 1; return { ok: true, value: { operationId: `plugin_${preview.action}`, action: preview.action, pluginId: "alpha@official", outcome: "committed", completed: 1, summary: preview } as never }; },
+        discardPreview: async () => ({ ok: true, value: undefined }),
+      },
+      recovery: {
+        list: () => [{ operationId: "plugin_pending", status: "pending" }],
+        preview: async (operationId: string) => { expect(stage).toBe(6); expect(operationId).toBe("plugin_pending"); plans.push("recover"); return { ok: true, value: recoveryPreview }; },
+        recover: async (operationId, action) => { expect(operationId).toBe("plugin_pending"); expect(action).toBe("complete"); executions.push("recover"); stage += 1; return { ok: true, value: { operationId, producerSchema: "plugin-lifecycle", outcome: "committed", completed: 2, summary: recoverySummary } as never }; },
+      },
+      targets: {
+        plugin: (identity: string, key: string) => { expect(identity).toBe("alpha@official"); expect(key).toBe("record-user"); return { ok: true, value: { kind: "plugin", identity, scope: "user", mutableRecordKey: key, selector: "plugin-selector" } }; },
+        marketplace: (identity: string, key: string) => { expect(identity).toBe("official"); expect(key).toBe("market-user"); return { ok: true, value: { kind: "marketplace", identity, scope: "user", mutableRecordKey: key, selector: "market-selector" } }; },
+      },
+      lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: projections[stage - 1]! }),
+    };
+    const c = component(loaded, { lifecycle: port, initialAction: "marketplace-add" });
+    const enter = (value?: string) => { if (value !== undefined) c.handleInput(value); c.handleInput("\r"); };
+    const confirm = async (operationId: string) => {
+      await vi.waitFor(() => expect(c.view().workflow).toMatchObject({ phase: "preview", operationId }));
+      expect(output(c.render(78))).toContain(`Operation id: ${operationId}`); c.handleInput("\r");
+      expect(c.view().workflow?.phase).toBe("confirmation"); expect(output(c.render(78))).toContain("Final confirmation"); c.handleInput("\r");
+      await vi.waitFor(() => expect(c.view().workflow).toMatchObject({ phase: "receipt", operationId })); expect(output(c.render(78))).toContain("lifecycle receipt");
+      expect(c.view().loadedSnapshot).toBe(loaded); expect(c.view().loadedSnapshot.find("alpha@official")?.outcome).toBeUndefined();
+    };
+    const selectNext = (action: string) => { c.handleInput("\r"); c.handleInput("A"); expect(c.view().workflow).toMatchObject({ phase: "select-action", actions: [action] }); c.handleInput("\r"); };
+
+    c.handleInput("\r"); enter("official"); enter("https-git"); enter("https://user:secret@example.test/catalog.git"); enter("user");
+    await confirm("marketplace_add"); expect(JSON.stringify(c.view())).not.toMatch(/user:secret/u);
+    selectNext("install"); enter("alpha@official"); enter("user"); await confirm("plugin_install");
+    selectNext("disable"); await confirm("plugin_disable");
+    selectNext("enable"); await confirm("plugin_enable");
+    selectNext("update"); await confirm("plugin_update");
+    selectNext("uninstall"); enter("yes"); enter("no"); await confirm("plugin_uninstall");
+
+    c.handleInput("\r"); c.handleInput("\u001b[D");
+    expect(c.view().rows[c.view().selectedIndex]).toMatchObject({ kind: "global-lifecycle", operation: { operationId: "plugin_pending" } });
+    c.handleInput("A"); expect(c.view().workflow).toMatchObject({ phase: "select-action", actions: ["recover"], target: { kind: "recovery", identity: "plugin_pending" } }); c.handleInput("\r"); enter("complete");
+    await confirm("plugin_pending");
+    expect(plans).toEqual(["marketplace-add", "install", "disable", "enable", "update", "uninstall", "recover"]);
+    expect(executions).toEqual(plans); expect(stage).toBe(7); expect(c.view().durableDesired.durableDesired?.generationId).toBe("desired-recovered");
+  });
+
+  it("disables confirmation for every oversized required plugin evidence family and long scalar", async () => {
+    const base = { operationId: "plugin_omission", action: "enable", pluginId: "alpha@official", scope: "user", mutableRecordKey: "record", profileKey: "profile-test", immutableRevision: "rev", dependencies: { selected: { admitted: true, reasons: [] as string[] }, blocking: false, graph: [] as unknown[], decisions: [] as unknown[] }, executableComponents: [] as string[], removeDeclaration: false, removeData: false, participants: [] as unknown[], consequences: ["change"] as string[], confirmationDigest: `sha256:${"a".repeat(64)}` };
+    const many = Array.from({ length: 129 }, (_, index) => `value-${index}`); const variants = [
+      { ...base, executableComponents: many }, { ...base, dependencies: { ...base.dependencies, selected: { admitted: true, reasons: many } } }, { ...base, dependencies: { ...base.dependencies, graph: many } }, { ...base, dependencies: { ...base.dependencies, decisions: many } }, { ...base, participants: many }, { ...base, consequences: many }, { ...base, immutableRevision: "x".repeat(321) },
+    ];
+    for (const preview of variants) {
+      const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+      const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); expect(c.view().workflow).toMatchObject({ confirmationEnabled: false, projection: { omissions: expect.any(Number) } }); expect((c.view().workflow as any).projection.omissions).toBeGreaterThan(0); c.handleInput("\u001b");
+    }
+  });
+
+  it.each(["marketplace-refresh", "marketplace-remove"] as const)("drives %s through exact plan, rendered confirmations, execution, and receipt", async (action) => {
+    const selected = { ...marketplace("official"), ownership: "picc-owned" as const, candidates: [{ mutableRecordKey: "market-user", scope: "user" as const, selected: true, trusted: true }], availableActions: ["refresh", "remove"] as const };
+    const preview = { operationId: `market_${action}`, action: action === "marketplace-refresh" ? "refresh" : "remove", registration: { name: "official", scope: "user", profileKey: "profile", source: { kind: "github", repository: "owner/repo" } }, snapshot: { snapshotId: "snapshot", catalogDigest: "digest", trust: { targetDigest: "trust" } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: "state", settingsFingerprint: "settings", settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: [action], confirmationDigest: `sha256:${"b".repeat(64)}` } as never;
+    const receipt = { operationId: `market_${action}`, outcome: "committed", completed: 1, summary: preview } as never; let operation: any; let executes = 0;
+    const port = { marketplaces: { plan: async (value: unknown) => { operation = value; return { ok: true, value: preview }; }, prepare: () => ({ ok: true, value: { preview, execute: async () => { executes += 1; return { ok: true, value: receipt }; } } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: { marketplace: (_identity: string, key: string) => ({ ok: true, value: { kind: "marketplace", identity: "official", scope: "user", mutableRecordKey: key, selector: "market-selector" } }) }, lookup: async () => ({ ok: true, value: { state: "terminal", receipt } }), projection: () => ({ ok: true, value: snapshot({ marketplaces: [selected] }) }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot({ marketplaces: [selected] }), { lifecycle: port, initialAction: action }); c.handleInput("\r"); c.handleInput("official"); c.handleInput("\r"); if (action === "marketplace-remove") { c.handleInput("yes"); c.handleInput("\r"); }
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); expect(operation.flags.selector).toBe("market-selector"); if (action === "marketplace-remove") expect(operation.flags.preserveInstalled).toBe(true); expect(output(c.render(88))).toContain("Lifecycle preview"); c.handleInput("\r"); expect(output(c.render(88))).toContain("Final confirmation"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("receipt")); expect(executes).toBe(1); expect(output(c.render(88))).toContain("Marketplace lifecycle receipt · official");
+  });
+
+  it("executes one deferred operation despite a real double confirmation submit and retains projection warning truth", async () => {
+    const preview = { operationId: "plugin_double", action: "enable", pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["enable"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    const receipt = { operationId: "plugin_double", action: "enable", pluginId: "alpha@official", outcome: "committed", completed: 1, summary: preview } as never; let release!: (value: unknown) => void; let executes = 0;
+    const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => { executes += 1; return new Promise((resolve) => { release = resolve; }); }, discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: { state: "terminal", receipt } }), projection: () => ({ ok: false, code: "projection-failed", message: "private" }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); c.render(80); c.handleInput("\r"); c.render(80); c.handleInput("\r"); c.handleInput("\r"); await vi.waitFor(() => expect(executes).toBe(1)); release({ ok: true, value: receipt }); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("receipt")); expect(executes).toBe(1); expect(c.view().workflow).toMatchObject({ receipt: { outcome: "committed" }, projectionFailure: expect.stringContaining("receipt remains authoritative") }); expect(output(c.render(100))).toContain("Desired-state projection refresh failed");
+  });
+
+  it("discards a successful late preview after cancellation without resurrecting the workflow", async () => {
+    const preview = { operationId: "plugin_late", action: "enable", pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["enable"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    let resolvePlan!: (value: unknown) => void; let discards = 0; let executes = 0;
+    const port = { marketplaces: {}, plugins: { plan: async () => new Promise((resolve) => { resolvePlan = resolve; }), execute: async () => { executes += 1; return { ok: false, code: "unused", message: "unused" }; }, discardPreview: async () => { discards += 1; return { ok: true, value: undefined }; } }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("planning")); c.handleInput("\u001b"); resolvePlan({ ok: true, value: preview }); await vi.waitFor(() => expect(discards).toBe(1)); expect(c.view().workflow).toBeUndefined(); expect(executes).toBe(0);
+  });
+
+  it("binds a two-registration install marketplace exactly once and immediately plans the explicit choice", async () => {
+    const catalog = { ...item("alpha@official", { installationRecords: false, enablement: false, runtime: false }), lifecycle: { ownership: "picc-owned" as const, marketplaceOwnership: "picc-owned" as const, candidates: [], selectionRequired: false, availableActions: ["install" as const], installed: false, loaded: false, dependency: { state: "satisfied" as const }, pendingReload: false, retainedErrors: [] } };
+    const registrations = { ...marketplace("official"), ownership: "picc-owned" as const, candidates: [{ mutableRecordKey: "market-user", scope: "user" as const, selected: false, trusted: true }, { mutableRecordKey: "market-project", scope: "project" as const, selected: false, trusted: true }], selectionRequired: true };
+    const preview = { operationId: "plugin_two_marketplaces", action: "install", pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["install"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    let plans = 0; let selectedKey = ""; let operation: any;
+    const port = { marketplaces: {}, plugins: { plan: async (value: unknown) => { plans += 1; operation = value; return { ok: true, value: preview }; }, discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: { marketplace: (_identity: string, key: string) => { selectedKey = key; return { ok: true, value: { kind: "marketplace", identity: "official", scope: key === "market-project" ? "project" : "user", mutableRecordKey: key, selector: `selector-${key}` } }; } }, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot({ items: [catalog], marketplaces: [registrations] }), { lifecycle: port, initialAction: "install" });
+    c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); c.handleInput("user"); c.handleInput("\r");
+    await vi.waitFor(() => expect(c.view().workflow).toMatchObject({ phase: "select-candidate", candidates: [{ authority: { mutableRecordKey: "market-user" } }, { authority: { mutableRecordKey: "market-project" } }] }));
+    c.handleInput("\u001b[B"); c.handleInput("\r");
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
+    expect(plans).toBe(1); expect(selectedKey).toBe("market-project"); expect(operation.flags.marketplaceSelector).toBe("selector-market-project");
+  });
+
+  it("keeps stale discard cleanup from resurrecting a cancelled or disposed workflow", async () => {
+    const preview = { operationId: "plugin_discard_race", action: "enable", pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["enable"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    let release!: (value: { ok: true; value: undefined }) => void; let discards = 0; let executes = 0;
+    const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => { executes += 1; return { ok: false, code: "unused", message: "unused" }; }, discardPreview: async () => { discards += 1; return new Promise((resolve) => { release = resolve; }); } }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const renderer: typeof renderPluginInventory = (view, options) => { if (view.workflow?.phase === "preview") throw new Error("preview renderer fault"); return renderPluginInventory(view, options); };
+    const cancelled = component(snapshot(), { lifecycle: port, initialAction: "enable", render: renderer }); cancelled.handleInput("\r"); cancelled.handleInput("alpha@official"); cancelled.handleInput("\r"); await vi.waitFor(() => expect(cancelled.view().workflow?.phase).toBe("preview")); cancelled.render(72); await vi.waitFor(() => expect(discards).toBe(1)); cancelled.handleInput("\u001b"); expect(cancelled.view().workflow).toBeUndefined(); release({ ok: true, value: undefined }); await Promise.resolve(); await Promise.resolve(); expect(cancelled.view().workflow).toBeUndefined(); expect(executes).toBe(0);
+
+    let disposeRelease!: (value: { ok: true; value: undefined }) => void;
+    const disposePort = { ...port, plugins: { ...port.plugins, discardPreview: async () => { discards += 1; return new Promise((resolve) => { disposeRelease = resolve; }); } } } as unknown as PluginLifecyclePort;
+    const disposed = component(snapshot(), { lifecycle: disposePort, initialAction: "enable" }); disposed.handleInput("\r"); disposed.handleInput("alpha@official"); disposed.handleInput("\r"); await vi.waitFor(() => expect(disposed.view().workflow?.phase).toBe("preview")); disposed.dispose(); expect(discards).toBe(2); disposeRelease({ ok: true, value: undefined }); await Promise.resolve(); expect(executes).toBe(0);
+  });
+
+  it("renders the ordinary marketplace receipt name with outcome-specific truth", async () => {
+    for (const outcome of ["committed", "rolled-back", "failed-before-commit"] as const) {
+      const preview = { operationId: `market_${outcome}`, action: "add", registration: { name: "named-market", scope: "user", profileKey: "profile", source: { kind: "github", repository: "owner/repo" } }, snapshot: { snapshotId: "snapshot", catalogDigest: "digest", trust: { targetDigest: "trust" } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: "state", settingsFingerprint: "settings", settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"], confirmationDigest: `sha256:${"b".repeat(64)}` } as never;
+      const receipt = { operationId: `market_${outcome}`, outcome, completed: outcome === "committed" ? 1 : 0, summary: preview } as never;
+      const port = { marketplaces: { plan: async () => ({ ok: true, value: preview }), prepare: () => ({ ok: true, value: { preview, execute: async () => ({ ok: true, value: receipt }) } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: { state: "terminal", receipt } }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+      const c = component(snapshot(), { lifecycle: port, initialAction: "marketplace-add" }); c.handleInput("\r"); for (const value of ["named-market", "github", "owner/repo", "user"]) { c.handleInput(value); c.handleInput("\r"); } await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); c.render(80); c.handleInput("\r"); c.render(80); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("receipt")); const rendered = output(c.render(100)); expect(rendered).toContain(`Marketplace lifecycle receipt · named-market`); expect(rendered).toContain(outcome); expect(rendered).toContain(outcome === "committed" ? "Durable marketplace state changed" : outcome === "rolled-back" ? "operation rolled back" : "failed before commit");
+    }
+  });
+
+  it("fails closed on omitted marketplace/recovery evidence and refuses managed plugin mutation before composition", async () => {
+    let executions = 0;
+    const incompleteMarket = { operationId: "market_missing", action: "add", registration: { name: "missing", scope: "user", profileKey: "profile", source: { kind: "github", repository: "owner/repo" } }, snapshot: { snapshotId: "snapshot", catalogDigest: "digest", trust: { targetDigest: "trust" } }, catalog: { omittedEntries: 0 }, stateFingerprint: "state", settingsFingerprint: "settings", settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"], confirmationDigest: `sha256:${"b".repeat(64)}` } as never;
+    const marketPort = { marketplaces: { plan: async () => ({ ok: true, value: incompleteMarket }), prepare: () => ({ ok: true, value: { preview: incompleteMarket, execute: async () => { executions += 1; return { ok: false, code: "unused", message: "unused" }; } } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const market = component(snapshot(), { lifecycle: marketPort, initialAction: "marketplace-add" }); market.handleInput("\r"); for (const value of ["missing", "github", "owner/repo", "user"]) { market.handleInput(value); market.handleInput("\r"); } await vi.waitFor(() => expect(market.view().workflow).toMatchObject({ phase: "preview", confirmationEnabled: false })); market.handleInput("\r"); expect(executions).toBe(0);
+
+    const recoveryPreview = { operationId: "pending_missing", producerSchema: "plugin-lifecycle", producerVersion: 1, confirmationDigest: "digest", planDigest: "plan", completed: 1, remaining: 1, rolledBack: 0, actions: ["complete"], confirmationSummary: { pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: [] }, graph: [] }, executableComponents: [], consequences: [] } } as never;
+    const recoveryPort = { marketplaces: {}, plugins: {}, recovery: { preview: async () => ({ ok: true, value: recoveryPreview }), recover: async () => { executions += 1; return { ok: false, code: "unused", message: "unused" }; } }, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const recovery = component(snapshot(), { lifecycle: recoveryPort, initialAction: "recover" }); recovery.handleInput("\r"); recovery.handleInput("pending_missing"); recovery.handleInput("\r"); recovery.handleInput("complete"); recovery.handleInput("\r"); await vi.waitFor(() => expect(recovery.view().workflow).toMatchObject({ phase: "preview", confirmationEnabled: false })); recovery.handleInput("\r"); expect(executions).toBe(0);
+
+    let compositions = 0; const managedItem = { ...item("managed@official"), lifecycle: { ownership: "managed" as const, candidates: [], selectionRequired: false, availableActions: [] as const, installed: true, loaded: true, dependency: { state: "satisfied" as const }, pendingReload: false, retainedErrors: [] } }; const managed = component(snapshot({ items: [managedItem] }), { lifecycleFactory: async () => { compositions += 1; return { ok: false, code: "unused", message: "unused" }; } }); managed.handleInput("A"); expect(managed.view().workflow?.phase).toBe("refused"); expect(compositions).toBe(0);
+  });
+
+  it("keeps wide and combining Unicode workflow confirmation width-bounded", async () => {
+    const preview = { operationId: "plugin_unicode", action: "enable", pluginId: "alpha@official", scope: "user", profileKey: "profile", dependencies: { selected: { admitted: true, reasons: ["界e\u0301界e\u0301"] }, blocking: false, graph: [] }, executableComponents: ["技能e\u0301"], removeDeclaration: false, removeData: false, participants: [], consequences: ["変更界e\u0301"], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), discardPreview: async () => ({ ok: true, value: undefined }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+    const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); for (const width of [8, 13, 24]) for (const line of c.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width); c.render(24); c.handleInput("\r"); for (const line of c.render(13)) expect(visibleWidth(line)).toBeLessThanOrEqual(13);
   });
 
   it("performs no filesystem I/O, network, process launch, or snapshot mutation on populated paths", () => {

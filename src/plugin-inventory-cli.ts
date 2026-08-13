@@ -10,7 +10,8 @@ import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, 
 import { createLifecycleLocations } from "./plugin-lifecycle/locations.js";
 import type { MarketplaceMutationPreview, MarketplaceReceipt } from "./plugin-lifecycle/planner.js";
 import { createMarketplaceAcquisitionAdapter, marketplaceSourceAnchor, PluginMarketplaceService, type MarketplaceObservation, type MarketplaceObservationList, type MarketplaceObservationView } from "./plugin-lifecycle/marketplace-service.js";
-import { createPluginAcquisitionAdapter, decodePluginStableSelector, deriveOwnedPluginCatalogSelections, encodePluginStableSelector, inspectAcquiredPlugin, PluginLifecycleService, type PluginCatalogSelection, type PluginDetailsView, type PluginLocalSnapshot, type PluginMutationPreview, type PluginReceipt, type PluginStableSelector } from "./plugin-lifecycle/plugin-service.js";
+import { createPluginAcquisitionAdapter, decodePluginStableSelector, deriveOwnedPluginCatalogSelections, encodePluginStableSelector, inspectAcquiredPlugin, pluginMutableRecordKey, PluginLifecycleService, type PluginCatalogSelection, type PluginDetailsView, type PluginLocalSnapshot, type PluginMutationPreview, type PluginOperationLookup, type PluginReceipt, type PluginStableSelector } from "./plugin-lifecycle/plugin-service.js";
+import type { PluginInventorySnapshot } from "./plugin-inventory.js";
 import { LifecycleRecoveryService } from "./plugin-lifecycle/lifecycle-service.js";
 import type { RecoveryPreview } from "./plugin-lifecycle/recovery.js";
 import { planPluginSettingsWrite } from "./plugin-lifecycle/settings-plan.js";
@@ -40,28 +41,42 @@ export interface PluginInventoryCliOutput {
   error(message: string): void;
 }
 
-interface PreparedMarketplace { readonly preview: MarketplaceMutationPreview; readonly execute: (digest: string) => Promise<unknown> }
-export interface PluginLifecycleCliServices {
+interface PreparedMarketplace { readonly preview: MarketplaceMutationPreview; readonly execute: (digest: string) => Promise<StoreResult<MarketplaceReceipt> | { readonly ok: false; readonly code: string; readonly message: string; readonly receipt?: MarketplaceReceipt }> }
+export type PluginLifecycleReceipt = MarketplaceReceipt | PluginReceipt | TransactionReceipt;
+export type PluginLifecycleOperationLookup =
+  | { readonly state: "pending"; readonly operationId: string; readonly completed: number; readonly total: number; readonly recoveryActions: readonly ("complete" | "rollback")[] }
+  | { readonly state: "terminal"; readonly receipt: PluginLifecycleReceipt };
+export interface PluginLifecycleExactTarget { readonly kind: "plugin" | "marketplace"; readonly identity: string; readonly scope: string; readonly mutableRecordKey: string; readonly selector: string }
+
+/** One production lifecycle composition shared by the terminal command and focused TUI. */
+export interface PluginLifecyclePort {
   readonly marketplaces: {
     listStatus(): MarketplaceObservationList;
     details(name: string, selector?: string): StoreResult<MarketplaceObservationView>;
-    plan(operation: Extract<PluginInventoryOperation, { kind: "marketplace-add" | "marketplace-refresh" | "marketplace-remove" }>): Promise<StoreResult<MarketplaceMutationPreview>>;
+    plan(operation: Extract<PluginInventoryOperation, { kind: "marketplace-add" | "marketplace-refresh" | "marketplace-remove" }>, signal?: AbortSignal): Promise<StoreResult<MarketplaceMutationPreview>>;
     prepare(preview: MarketplaceMutationPreview): StoreResult<PreparedMarketplace>;
     discardPreview(operationId: string): Promise<StoreResult<void>>;
   };
   readonly plugins: {
     list(): readonly PluginDetailsView[];
     details(identity: string): StoreResult<PluginDetailsView>;
-    plan(operation: Extract<PluginInventoryOperation, { kind: "install" | "enable" | "disable" | "update" | "uninstall" }>): Promise<StoreResult<PluginMutationPreview>>;
+    plan(operation: Extract<PluginInventoryOperation, { kind: "install" | "enable" | "disable" | "update" | "uninstall" }>, signal?: AbortSignal): Promise<StoreResult<PluginMutationPreview>>;
     execute(preview: PluginMutationPreview, digest: string): Promise<StoreResult<PluginReceipt> | { readonly ok: false; readonly code: string; readonly message: string; readonly receipt?: PluginReceipt }>;
     discardPreview(operationId: string): Promise<StoreResult<void>>;
   };
   readonly recovery: {
     list(): readonly { readonly operationId: string; readonly status: string }[];
     preview(operationId: string): Promise<StoreResult<RecoveryPreview>>;
-    recover(operationId: string, action: "complete" | "rollback"): Promise<StoreResult<TransactionReceipt | PluginReceipt>>;
+    recover(operationId: string, action: "complete" | "rollback"): Promise<StoreResult<PluginLifecycleReceipt>>;
   };
+  readonly targets: {
+    plugin(identity: string, mutableRecordKey: string): StoreResult<PluginLifecycleExactTarget>;
+    marketplace(name: string, mutableRecordKey: string): StoreResult<PluginLifecycleExactTarget>;
+  };
+  lookup(operationId: string): Promise<StoreResult<PluginLifecycleOperationLookup | undefined>>;
+  projection(): StoreResult<PluginInventorySnapshot>;
 }
+export type PluginLifecycleCliServices = PluginLifecyclePort;
 
 export interface PluginInventoryCliOptions {
   cwd?: string;
@@ -228,7 +243,7 @@ async function runLifecycle(operation: Exclude<PluginInventoryOperation, { kind:
     try { output.log(text); } catch { const discarded = await services.marketplaces.discardPreview(planned.value.operationId); try { output.error(discarded.ok ? `Preview output failed before execution. Operation ID: ${safe(planned.value.operationId, 128)}. Staging was discarded; no durable desired state change was committed.` : `Preview output failed and staging cleanup is uncertain. Operation ID: ${safe(planned.value.operationId, 128)}. Preserve any lifecycle staging; no execution was attempted.`); } catch {} return 1; }
     const confirmation = await confirmed(operation, text, options); if (confirmation !== "confirmed") { const discarded = await services.marketplaces.discardPreview(planned.value.operationId); output.error(discardStatus("Marketplace", confirmation, planned.value.operationId, discarded)); return 2; }
     const prepared = services.marketplaces.prepare(planned.value); if (!prepared.ok) { const discarded = await services.marketplaces.discardPreview(planned.value.operationId); output.error(discarded.ok ? resultError(prepared) : `Marketplace preparation failed and staging cleanup is uncertain. Operation ID: ${safe(planned.value.operationId, 128)}. Preserve any lifecycle staging; no execution was attempted.`); return 1; }
-    const result = await prepared.value.execute(planned.value.confirmationDigest) as StoreResult<MarketplaceReceipt> | { readonly ok: false; readonly code: string; readonly message: string; readonly receipt?: MarketplaceReceipt };
+    const result = await prepared.value.execute(planned.value.confirmationDigest);
     if (!result.ok) { if ("receipt" in result && result.receipt !== undefined) return emitReceipt(output, result.receipt); return emitLifecycleFailure(output, result, planned.value.operationId); } return emitReceipt(output, result.value);
   }
   const pluginOperation = operation as Extract<PluginInventoryOperation, { kind: "install" | "enable" | "disable" | "update" | "uninstall" }>;
@@ -249,7 +264,7 @@ function lifecycleSource(value: LoadedProject["pluginInventory"]["marketplaces"]
   if (kind === "url" && typeof value["url"] === "string") return { kind: "https-catalog", url: value["url"] };
   return undefined;
 }
-async function productionServices(project: LoadedProject, options: PluginInventoryCliOptions): Promise<StoreResult<PluginLifecycleCliServices>> {
+async function createPluginLifecyclePort(project: LoadedProject, options: PluginInventoryCliOptions, freshCommandAuthority?: LoadedProject): Promise<StoreResult<PluginLifecyclePort>> {
   const home = path.resolve(options.homeDir ?? os.homedir()); const identities = projectIdentities(project.root); const active = identities.at(-1); const family = identities[0];
   if (active === undefined || family === undefined) return { ok: false, code: "wrong-checkout", message: "Lifecycle commands require one canonical active checkout" };
   const locationResult = createLifecycleLocations({ homeDir: home, profilePath: project.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family } });
@@ -268,6 +283,7 @@ async function productionServices(project: LoadedProject, options: PluginInvento
   };
   loadAuthority();
   const captureProject = (): LoadedProject => loadClaudeProject({ cwd: project.cwd, ...(options.env === undefined ? {} : { env: options.env }), ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }), managedPolicyPlatform: options.platform ?? process.platform, pluginInventoryLifetime: "command" });
+  const mutationAuthority = (): LoadedProject => freshCommandAuthority ?? captureProject();
   const catalogFor = (snapshot: ReturnType<typeof loadAuthority>["snapshots"][number] | undefined) => {
     const retained = snapshot?.executableCatalog; if (retained === undefined) return undefined;
     const plugins = retained.declarations.map((entry) => Object.freeze({ name: entry.pluginId.slice(0, entry.pluginId.lastIndexOf("@")), supported: true as const, sourceKind: entry.source.kind }));
@@ -310,37 +326,99 @@ async function productionServices(project: LoadedProject, options: PluginInvento
         if (selector === undefined) return marketplaceService.details(name);
         const selected = selectedMarketplace(name, selector); return selected.ok ? marketplaceService.details(name, selected.value) : selected;
       },
-      plan: async (operation) => {
-        if (operation.kind === "marketplace-add") { const foreign = marketplaceObservations().find((row) => row.name === operation.name && (row.owner === "managed" || row.owner === "claude-imported")); if (foreign !== undefined) return { ok: false, code: foreign.owner === "managed" ? "managed-readonly" : "imported-readonly", message: foreign.owner === "managed" ? "A same-name marketplace is administrator-owned; ask the administrator to change it. No acquisition, trust approval, staging, adoption, or settings write was attempted" : "A same-name marketplace is Claude-owned; use Claude Code to change or remove it. No acquisition, trust approval, staging, adoption, or settings write was attempted" }; return marketplaceService.add(operation.name, source(operation), { scope: operation.flags.scope, declarationOnly: operation.flags.declarationOnly }); }
+      plan: async (operation, signal) => {
+        if (signal?.aborted) return { ok: false, code: "cancelled", message: "Marketplace planning was cancelled" };
+        const current = mutationAuthority(); const foreign = operation.kind === "marketplace-add" || operation.flags.selector === undefined ? foreignMarketplaceTarget(current, operation.name) : undefined;
+        if (foreign !== undefined) return { ok: false, code: foreign === "managed" ? "managed-readonly" : foreign === "seed" ? "seed-readonly" : "imported-readonly", message: ownershipRefusal("marketplace", foreign) };
+        const uncertainty = marketplaceAuthorityUncertain(current, options); if (uncertainty.uncertain) return { ok: false, code: "marketplace-ownership-uncertain", message: uncertainMarketplaceAuthorityRefusal(uncertainty.settingsAuthorityFailure) };
+        if (operation.kind === "marketplace-add") return marketplaceService.add(operation.name, source(operation), { scope: operation.flags.scope, declarationOnly: operation.flags.declarationOnly, ...(signal === undefined ? {} : { signal }) });
         const selected = operation.flags.selector === undefined ? undefined : selectedMarketplace(operation.name, operation.flags.selector);
         if (selected !== undefined && !selected.ok) return selected;
         return operation.kind === "marketplace-refresh"
-          ? marketplaceService.refresh(operation.name, { ...(selected === undefined ? {} : { registration: selected.value }), declarationOnly: operation.flags.declarationOnly })
-          : marketplaceService.remove(operation.name, { ...(selected === undefined ? {} : { registration: selected.value }), declarationOnly: operation.flags.declarationOnly, acknowledgePreservedDependents: operation.flags.preserveInstalled });
+          ? marketplaceService.refresh(operation.name, { ...(selected === undefined ? {} : { registration: selected.value }), declarationOnly: operation.flags.declarationOnly, ...(signal === undefined ? {} : { signal }) })
+          : marketplaceService.remove(operation.name, { ...(selected === undefined ? {} : { registration: selected.value }), declarationOnly: operation.flags.declarationOnly, acknowledgePreservedDependents: operation.flags.preserveInstalled, ...(signal === undefined ? {} : { signal }) });
       },
       prepare: (preview) => marketplaceService.prepare(preview), discardPreview: (id) => marketplaceService.discardPreview(id),
     },
     plugins: {
       list: () => pluginService().list(), details: (identity) => pluginService().details(identity),
-      plan: async (operation) => {
-        const selector = operation.flags.selector;
+      plan: async (operation, signal) => {
+        if (signal?.aborted) return { ok: false, code: "cancelled", message: "Plugin planning was cancelled" };
+        const current = mutationAuthority(); const selector = operation.flags.selector;
+        const exact = selector === undefined ? undefined : exactPluginSelector(current, operation.qualifiedIdentity, selector); const foreign = exact?.ownership === "claude-imported-readonly" ? { managed: exact.installation.scope === "managed" } : selector === undefined ? foreignPluginTarget(current, operation.qualifiedIdentity) : undefined;
+        if (foreign !== undefined) return { ok: false, code: foreign.managed ? "managed-readonly" : "imported-readonly", message: ownershipRefusal("plugin", foreign.managed ? "managed" : "claude-imported") };
+        if (pluginOwnershipUncertain(current)) return { ok: false, code: "imported-ownership-uncertain", message: uncertainPluginOwnershipRefusal(current) };
+        if (operation.kind === "install" || operation.kind === "update") { const uncertainty = marketplaceAuthorityUncertain(current, options); if (uncertainty.uncertain) return { ok: false, code: "marketplace-ownership-uncertain", message: uncertainMarketplaceAuthorityRefusal(uncertainty.settingsAuthorityFailure) }; }
         if (operation.kind === "enable" || operation.kind === "disable" || operation.kind === "uninstall") { const service = pluginService(); const planned = operation.kind === "enable" ? await service.enable(operation.qualifiedIdentity as QualifiedPluginIdentity, { selector, declarationOnly: operation.flags.declarationOnly }) : operation.kind === "disable" ? await service.disable(operation.qualifiedIdentity as QualifiedPluginIdentity, { selector, declarationOnly: operation.flags.declarationOnly }) : await service.uninstall(operation.qualifiedIdentity as QualifiedPluginIdentity, { selector, declarationOnly: operation.flags.declarationOnly, removeDeclaration: operation.flags.removeDeclaration, removeData: operation.flags.removeData }); if (planned.ok) preparedPluginServices.set(planned.value.operationId, service); return planned; }
-        const local = pluginSnapshot(); if (operation.kind === "install") { const foreign = local.rows.find((row) => row.pluginId === operation.qualifiedIdentity && row.owner !== "picc-owned"); if (foreign !== undefined) return { ok: false, code: foreign.owner === "managed" ? "managed-readonly" : "imported-readonly", message: foreign.owner === "managed" ? "This plugin is administrator-owned; ask the administrator to change it. No acquisition, trust approval, write, staging, or adoption was attempted" : "This plugin is Claude-owned; use Claude Code to change or remove it. No acquisition, trust approval, write, staging, or adoption was attempted" }; }
+        const local = pluginSnapshot(); if (operation.kind === "install") { const foreign = local.rows.find((row) => row.pluginId === operation.qualifiedIdentity && row.owner !== "picc-owned"); if (foreign !== undefined) return { ok: false, code: foreign.owner === "managed" ? "managed-readonly" : "imported-readonly", message: foreign.owner === "managed" ? "This plugin is administrator-owned; ask the administrator to change it. No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted" : "This plugin is Claude-owned; use Claude Code to change or remove it. No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted" }; }
         const authoritative = deriveOwnedPluginCatalogSelections(local.marketplaceRegistrations ?? [], local.marketplaceSnapshots); if (!authoritative.ok) return authoritative; let candidates = authoritative.value.filter((item) => item.pluginId === operation.qualifiedIdentity);
         const marketplaceSelection = operation.flags.marketplaceSelector; if (marketplaceSelection !== undefined) { const key = decodeMarketplaceSelector(marketplaceSelection); if (key === undefined) return { ok: false, code: "invalid-selector", message: "Marketplace selector is malformed or noncanonical" }; candidates = candidates.filter((item) => item.registration !== undefined && ownedMarketplaceScopeKey(item.registration) === key); }
         if (operation.kind === "update" && selector !== undefined && decodePluginSelector(selector, operation.qualifiedIdentity) === undefined) return { ok: false, code: "invalid-selector", message: "Plugin selector is malformed, noncanonical, or identifies another plugin" };
         if (candidates.length !== 1 || candidates[0]!.registration === undefined) return { ok: false, code: "catalog-selection-required", message: `Select one exact current marketplace registration with --marketplace-selector; run picc plugin marketplace details ${safe(operation.qualifiedIdentity.slice(operation.qualifiedIdentity.lastIndexOf("@") + 1), 128)} and copy its selector. --selector identifies the predecessor installed plugin record, while --marketplace-selector identifies the current registration. Matching selections ${candidates.length}; retained declarations ${authoritative.value.slice(0, 8).map((item) => item.pluginId).join(", ") || "none"}; registrations ${local.marketplaceRegistrations?.length ?? 0}; snapshots ${local.marketplaceSnapshots.length}` };
         const selection = candidates[0]!; const snapshotMatches = local.marketplaceSnapshots.filter((item) => item.profileKey === selection.registration!.profileKey && item.marketplaceName === selection.registration!.name && item.snapshotId === selection.snapshotId && item.catalogDigest === selection.catalogDigest && same(item.source, selection.registration!.source));
         if (snapshotMatches.length !== 1) return { ok: false, code: "catalog-authority-ambiguous", message: "The selected registration no longer resolves to one exact retained snapshot; refresh or inspect the marketplace" };
-        const snapshot = snapshotMatches[0]!; const request = { source: selection.source, catalog: { marketplaceName: snapshot.marketplaceName, snapshotId: snapshot.snapshotId, catalogDigest: snapshot.catalogDigest, registration: selection.registration, snapshot, defaultEnabled: selection.defaultEnabled, allowedCrossMarketplaceDependencies: selection.allowedCrossMarketplaceDependencies } };
+        const snapshot = snapshotMatches[0]!; const request = { source: selection.source, catalog: { marketplaceName: snapshot.marketplaceName, snapshotId: snapshot.snapshotId, catalogDigest: snapshot.catalogDigest, registration: selection.registration, snapshot, defaultEnabled: selection.defaultEnabled, allowedCrossMarketplaceDependencies: selection.allowedCrossMarketplaceDependencies }, ...(signal === undefined ? {} : { signal }) };
         const service = pluginService(local); const planned = operation.kind === "install" ? await service.install({ pluginId: operation.qualifiedIdentity as QualifiedPluginIdentity, ...request }, { scope: operation.flags.scope, declarationOnly: operation.flags.declarationOnly }) : await service.update(operation.qualifiedIdentity as QualifiedPluginIdentity, request, { selector, declarationOnly: operation.flags.declarationOnly }); if (planned.ok) preparedPluginServices.set(planned.value.operationId, service); return planned;
       },
-      execute: (preview, digest) => { const service = preparedPluginServices.get(preview.operationId); return service === undefined ? Promise.resolve({ ok: false as const, code: "preview-not-found", message: "Plugin preview is unavailable in this command composition" }) : service.execute(preview, digest); }, discardPreview: async (id) => { const service = preparedPluginServices.get(id); return service === undefined ? { ok: false as const, code: "preview-not-found", message: "Plugin preview is unavailable in this command composition" } : service.discardPreview(id); },
+      execute: async (preview, digest) => { const service = preparedPluginServices.get(preview.operationId); if (service === undefined) return { ok: false as const, code: "preview-not-found", message: "Plugin preview is unavailable in this command composition" }; const result = await service.execute(preview, digest); if (result.ok || !result.ok && "receipt" in result && result.receipt !== undefined) preparedPluginServices.delete(preview.operationId); return result; },
+      discardPreview: async (id) => { const service = preparedPluginServices.get(id); if (service === undefined) return { ok: false as const, code: "preview-not-found", message: "Plugin preview is unavailable in this command composition" }; const result = await service.discardPreview(id); if (result.ok) preparedPluginServices.delete(id); return result; },
     },
-    recovery: { list: () => observePersistedTransactionsSync(store).journals.filter((item) => item.status === "pending").map((item) => ({ operationId: item.operationId, status: item.status })), preview: (id) => recovery().preview(id), recover: (id, action) => recovery().recover(id, action) },
+    recovery: {
+      list: () => observePersistedTransactionsSync(store).journals.filter((item) => item.status === "pending").map((item) => ({ operationId: item.operationId, status: item.status })),
+      preview: (id) => recovery().preview(id),
+      recover: async (id, action) => {
+        const observed = observePersistedTransactionsSync(store); const journal = observed.journals.find((item) => item.operationId === id); const receipt = observed.receipts.find((item) => item.receipt?.operationId === id); const producer = receipt?.receipt?.producerSchema ?? journal?.journal?.producerSchema;
+        let result: StoreResult<PluginLifecycleReceipt>;
+        if (producer === "plugin-lifecycle") result = await (preparedPluginServices.get(id) ?? pluginService()).recover(id, action);
+        else if (producer === "marketplace-lifecycle") result = await marketplaceService.recover(id, action);
+        else result = await recovery().recover(id, action);
+        if (result.ok) preparedPluginServices.delete(id); return result;
+      },
+    },
+    targets: {
+      plugin: (identity, mutableRecordKey) => {
+        const matches = pluginService().list().filter((row) => row.pluginId === identity).flatMap((row) => {
+          const decoded = decodePluginStableSelector(row.selector); if (decoded === undefined || decoded.scope === "managed") return [];
+          return pluginMutableRecordKey({ pluginId: decoded.pluginId, scope: decoded.scope, profileKey: (decoded.profileKey ?? store.profileKey) as `profile-${string}`, ...(decoded.projectKey === undefined ? {} : { projectKey: decoded.projectKey }) }) === mutableRecordKey ? [row] : [];
+        });
+        return matches.length === 1 ? { ok: true, value: Object.freeze({ kind: "plugin", identity, scope: matches[0]!.scope, mutableRecordKey, selector: matches[0]!.selector }) } : { ok: false, code: "stale-selector", message: "The exact plugin record is stale or ambiguous; refresh the inventory and select it again" };
+      },
+      marketplace: (name, mutableRecordKey) => {
+        const selected = loadAuthority().applicableRegistrations.filter((record) => record.name === name && ownedMarketplaceScopeKey(record) === mutableRecordKey);
+        return selected.length === 1 ? { ok: true, value: Object.freeze({ kind: "marketplace", identity: name, scope: selected[0]!.scope, mutableRecordKey, selector: marketplaceSelector(mutableRecordKey) }) } : { ok: false, code: "stale-selector", message: "The exact marketplace registration is stale or ambiguous; refresh the inventory and select it again" };
+      },
+    },
+    lookup: async (operationId) => {
+      const observed = observePersistedTransactionsSync(store);
+      const journal = observed.journals.find((item) => item.operationId === operationId);
+      const receipt = observed.receipts.find((item) => item.receipt?.operationId === operationId || item.status === "invalid" && path.basename(item.path) === `${operationId}.json`);
+      if (journal?.status === "invalid" || receipt?.status === "invalid") return { ok: false, code: "invalid-operation-evidence", message: "Persisted operation evidence is malformed; no producer was inferred" };
+      const producerSchema = receipt?.receipt?.producerSchema ?? journal?.journal?.producerSchema;
+      if (producerSchema === undefined) return { ok: true, value: undefined };
+      if (producerSchema === "plugin-lifecycle") { const result = await (preparedPluginServices.get(operationId) ?? pluginService()).lookupOperation(operationId) as StoreResult<PluginOperationLookup | undefined>; if (result.ok && result.value?.state === "terminal") preparedPluginServices.delete(operationId); return result; }
+      if (producerSchema === "marketplace-lifecycle") {
+        const terminal = await marketplaceService.receipt(operationId);
+        if (!terminal.ok) return terminal;
+        if (terminal.value !== undefined) return { ok: true, value: { state: "terminal", receipt: terminal.value } };
+        const pending = await marketplaceService.recoveryStatus(operationId);
+        if (!pending.ok) return pending.code === "not-found" ? { ok: true, value: undefined } : pending;
+        return { ok: true, value: { state: "pending", operationId, completed: pending.value.completed, total: pending.value.completed + pending.value.remaining, recoveryActions: pending.value.actions } };
+      }
+      const preview = await recovery().preview(operationId); if (!preview.ok) return preview;
+      if (preview.value.terminalOutcome !== undefined) {
+        const found = receipt?.receipt; return found === undefined ? { ok: false, code: "invalid-receipt", message: "Terminal operation evidence has no validated receipt" } : { ok: true, value: { state: "terminal", receipt: found } };
+      }
+      return { ok: true, value: { state: "pending", operationId, completed: preview.value.completed, total: preview.value.completed + preview.value.remaining, recoveryActions: preview.value.actions } };
+    },
+    projection: () => {
+      try { return { ok: true, value: captureProject().pluginInventory }; }
+      catch { return { ok: false, code: "projection-failed", message: "Fresh durable plugin projection could not be captured" }; }
+    },
   };
   return { ok: true, value: services };
 }
+
+export function createProductionPluginLifecyclePort(project: LoadedProject, options: PluginInventoryCliOptions = {}): Promise<StoreResult<PluginLifecyclePort>> { return createPluginLifecyclePort(project, options); }
 
 function exactPluginSelector(project: LoadedProject, pluginId: string, selector: string): ProjectPluginAdmission | undefined {
   const matches = projectSelectorCandidates(project, pluginId).filter((candidate) => candidate.selector === selector);
@@ -360,7 +438,7 @@ function foreignMarketplaceTarget(project: LoadedProject, name: string): Foreign
   return foreign.length > 0 ? "unknown" : undefined;
 }
 function ownershipRefusal(kind: "plugin" | "marketplace", ownership: "managed" | "claude-imported" | "seed" | "unknown"): string {
-  const subject = kind === "plugin" ? "This plugin" : "A same-name marketplace"; const unchanged = "No acquisition, trust approval, write, staging, or adoption was attempted. No service composition occurred.";
+  const subject = kind === "plugin" ? "This plugin" : "A same-name marketplace"; const unchanged = "No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted.";
   if (ownership === "managed") return `PiCC plugin lifecycle refused (managed-readonly): ${subject} is administrator-owned; ask the administrator to change it. ${unchanged}`;
   if (ownership === "seed") return `PiCC plugin lifecycle refused (seed-readonly): ${subject} is configured from a read-only seed; manage it at its configured source. ${unchanged}`;
   if (ownership === "unknown") return `PiCC plugin lifecycle refused (ownership-unknown): ${subject} ownership could not be attributed; repair or inspect marketplace state before changing it. ${unchanged}`;
@@ -389,7 +467,7 @@ function marketplaceAuthorityUncertain(project: LoadedProject, options: PluginIn
   return { uncertain, settingsAuthorityFailure };
 }
 function uncertainPluginOwnershipRefusal(project: LoadedProject): string {
-  const unchanged = "No acquisition, trust approval, write, staging, adoption, or service composition was attempted.";
+  const unchanged = "No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted.";
   if (project.pluginInventory.installedStateStatus === "unsupported") return `PiCC plugin lifecycle refused (imported-ownership-uncertain): The installed-plugin-state format is unsupported; update PiCC or report the unsupported installed-plugin-state format. Use passive picc plugin list or interactive /doctor to inspect it. ${unchanged}`;
   if (project.pluginInventory.installedStateStatus === "unreadable") return `PiCC plugin lifecycle refused (imported-ownership-uncertain): Installed plugin ownership is unreadable; check permissions and access, then use passive picc plugin list or interactive /doctor. ${unchanged}`;
   if (project.pluginInventory.installedStateStatus === "malformed") return `PiCC plugin lifecycle refused (imported-ownership-uncertain): Installed plugin ownership is malformed; repair the malformed state outside PiCC, then use passive picc plugin list or interactive /doctor. ${unchanged}`;
@@ -397,7 +475,7 @@ function uncertainPluginOwnershipRefusal(project: LoadedProject): string {
 }
 function uncertainMarketplaceAuthorityRefusal(settingsAuthorityFailure: boolean): string {
   const settings = settingsAuthorityFailure ? " Unreadable or malformed settings authority may hide marketplace declarations." : "";
-  return `PiCC plugin lifecycle refused (marketplace-ownership-uncertain): Marketplace registration or catalog-selection evidence is incomplete.${settings} Inspect it passively with picc plugin marketplace list/details or interactive /doctor before changing it. No acquisition, trust approval, write, staging, adoption, or service composition was attempted.`;
+  return `PiCC plugin lifecycle refused (marketplace-ownership-uncertain): Marketplace registration or catalog-selection evidence is incomplete.${settings} Inspect it passively with picc plugin marketplace list/details or interactive /doctor before changing it. No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted.`;
 }
 
 export async function runPluginInventoryCli(argv: readonly string[], output: PluginInventoryCliOutput = console, options: PluginInventoryCliOptions = {}): Promise<number> {
@@ -447,7 +525,7 @@ export async function runPluginInventoryCli(argv: readonly string[], output: Plu
   }
   if (options.services === undefined && parsed.operation.kind === "recover-list") { const observation = project.lifecycleObservation.pending; const all = observation.filter((item) => item.status === "pending"); const uncertain = observation.some((item) => item.status === "invalid"); const rows = all.slice(0, MAX_ROWS); for (const row of rows) output.log(`Operation ID: ${safe(row.operationId, 128)}; status=${row.status}`); const omitted = Math.max(0, all.length - MAX_ROWS); if (uncertain) output.log(`Pending lifecycle operations: exact total unknown; ${all.length} pending operations were observed and additional evidence may have been omitted. Run picc plugin recover <exact-operation-id> to inspect one observed operation.`); else if (all.length > 0) output.log(`Pending lifecycle operations: total=${all.length}; omitted=${omitted}. Run picc plugin recover <exact-operation-id> to inspect one exact operation.`); if (rows.length === 0 && !uncertain) output.log("No pending lifecycle operations were found. This read-only listing made no changes."); return uncertain ? 1 : 0; }
   if (options.services === undefined && (parsed.operation.kind === "marketplace-list" || parsed.operation.kind === "marketplace-details")) { const readOperation = parsed.operation; const all = project.pluginInventory.marketplaces.filter((row) => readOperation.kind === "marketplace-list" || row.name === readOperation.name && (readOperation.selector === undefined || row.mutableRecordKey === decodeMarketplaceSelector(readOperation.selector))); const rows = all.slice(0, MAX_ROWS); for (const row of rows) output.log([`Marketplace: ${safe(row.name, 128)}`, `  owner: ${row.ownership ?? "unknown"}; selected=${row.selected}; trusted=${row.trusted ?? false}`, `  source authority: ${sourceAnchorText(row.source)}`, `  scope: ${safe(row.scope, 80)}; origin=${safe(row.origin, 80)}${row.mutableRecordKey === undefined ? "; read-only" : `; selector=${marketplaceSelector(row.mutableRecordKey)}`}`].join("\n")); const capturedOmitted = readOperation.kind === "marketplace-list" ? project.pluginInventory.omissions["snapshot.marketplaces"] ?? 0 : 0; const omitted = capturedOmitted + all.length - rows.length; if (omitted > 0) output.log(`Marketplace rows: total=${all.length + capturedOmitted}; omitted=${omitted}. Run picc plugin marketplace details <exact-name> with a listed selector.`); const authority = marketplaceAuthorityUncertain(project, options); if (authority.uncertain) { const absent = rows.length === 0 && readOperation.kind === "marketplace-details" ? " The requested marketplace was not observed, but that result is inconclusive while evidence is incomplete." : ""; output.error(`${uncertainMarketplaceAuthorityRefusal(authority.settingsAuthorityFailure)}${absent}`); return 1; } if (rows.length === 0) { if (parsed.operation.kind === "marketplace-details") { output.error("PiCC marketplace not found. No changes were made."); return 1; } output.log("No marketplaces are registered."); } return 0; }
-  const services = await (options.services?.(project) ?? productionServices(project, options)); if (!services.ok) { output.error(resultError(services)); return 1; }
+  const services = await (options.services?.(project) ?? createPluginLifecyclePort(project, options, project)); if (!services.ok) { output.error(resultError(services)); return 1; }
   if (parsed.operation.kind === "details") { const result = services.value.plugins.details(parsed.operation.identity ?? parsed.operation.qualifiedIdentity ?? ""); if (!result.ok) { output.error(resultError(result)); return 1; } output.log(renderPluginRow(result.value)); return 0; }
   return runLifecycle(parsed.operation, services.value, output, options);
 }

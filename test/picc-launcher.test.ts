@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
+import { createProductionPluginLifecyclePort, runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
+import { loadClaudeProject } from "../src/project.js";
 import { PLUGIN_INVENTORY_ARGV_USAGE } from "../src/runtime/plugin-inventory-text.js";
 import {
   PI_SUITE_PACKAGES,
@@ -744,6 +745,17 @@ process.exit(23);
     expect(fs.existsSync(rejectedCanary)).toBe(false);
   });
 
+  it("exports one cancellable typed production lifecycle composition with lookup and fresh projection", async () => {
+    const { project, userDir } = inventoryFixture(); const env = { PICC_CLAUDE_USER_DIR: userDir };
+    const loaded = loadClaudeProject({ cwd: project, env, homeDir: path.dirname(project), pluginInventoryLifetime: "command" });
+    const composed = await createProductionPluginLifecyclePort(loaded, { cwd: project, env, homeDir: path.dirname(project), platform: "linux" });
+    expect(composed.ok).toBe(true); if (!composed.ok) return;
+    expect(composed.value.projection()).toMatchObject({ ok: true, value: { lifetime: "command" } });
+    await expect(composed.value.lookup("plugin_missing_operation")).resolves.toEqual({ ok: true, value: undefined });
+    const abort = new AbortController(); abort.abort();
+    await expect(composed.value.marketplaces.plan({ kind: "marketplace-add", name: "cancelled", sourceKind: "github", sourceValue: "owner/repo", flags: { yes: false, declarationOnly: false, scope: "user" } }, abort.signal)).resolves.toMatchObject({ ok: false, code: "cancelled" });
+  });
+
   it("runs command semantics and fresh snapshots in process through the shared grammar", async () => {
     const { project, userDir } = inventoryFixture();
     const env = { PICC_CLAUDE_USER_DIR: userDir };
@@ -881,9 +893,21 @@ process.exit(23);
       else write(installedFile, JSON.stringify({ version: 2, plugins: { [`${"a".repeat(300)}@official`]: [{ scope: "user", installPath: path.join(userDir, "cache"), version: "1.0.0" }] } }));
       let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("uncertain plugin ownership reached composition"); }) as never };
       const malformedSelector = await runPluginInProcess(project, ["enable", "target@official", "--selector", "eA", "--yes"], options); expect(malformedSelector.code).toBe(2); expect(malformedSelector.stderr.join("\n")).toContain("invalid-selector");
-      for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"], ["enable", "target@official", "--yes"], ["disable", "target@official", "--yes"], ["uninstall", "target@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("imported-ownership-uncertain"); expect(result.stderr.join("\n")).toContain(fixture === "omission" ? "omitted by safe bounds" : "repair the malformed state outside PiCC"); expect(result.stderr.join("\n")).toContain("passive picc plugin list or interactive /doctor"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, write, staging, adoption, or service composition was attempted."); }
+      for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"], ["enable", "target@official", "--yes"], ["disable", "target@official", "--yes"], ["uninstall", "target@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("imported-ownership-uncertain"); expect(result.stderr.join("\n")).toContain(fixture === "omission" ? "omitted by safe bounds" : "repair the malformed state outside PiCC"); expect(result.stderr.join("\n")).toContain("passive picc plugin list or interactive /doctor"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted."); }
       expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
     }
+  });
+
+  it("enforces fresh ownership and marketplace authority at the direct typed plan boundary", async () => {
+    const pluginFixture = inventoryFixture(); const pluginHome = path.dirname(pluginFixture.project);
+    const pluginProject = loadClaudeProject({ cwd: pluginFixture.project, env: { PICC_CLAUDE_USER_DIR: pluginFixture.userDir }, homeDir: pluginHome, pluginInventoryLifetime: "session" });
+    const pluginPort = await createProductionPluginLifecyclePort(pluginProject, { env: { PICC_CLAUDE_USER_DIR: pluginFixture.userDir }, homeDir: pluginHome }); expect(pluginPort.ok).toBe(true); write(path.join(pluginFixture.userDir, "plugins", "installed_plugins.json"), "{ malformed");
+    if (pluginPort.ok) { const result = await pluginPort.value.plugins.plan({ kind: "install", qualifiedIdentity: "target@official", flags: { yes: false, declarationOnly: false, scope: "user" } }); expect(result).toMatchObject({ ok: false, code: "imported-ownership-uncertain" }); }
+
+    const marketFixture = inventoryFixture(); const marketHome = path.dirname(marketFixture.project);
+    const marketProject = loadClaudeProject({ cwd: marketFixture.project, env: { PICC_CLAUDE_USER_DIR: marketFixture.userDir }, homeDir: marketHome, pluginInventoryLifetime: "session" });
+    const marketPort = await createProductionPluginLifecyclePort(marketProject, { env: { PICC_CLAUDE_USER_DIR: marketFixture.userDir }, homeDir: marketHome }); expect(marketPort.ok).toBe(true); write(path.join(marketFixture.userDir, "plugins", "known_marketplaces.json"), "{ malformed");
+    if (marketPort.ok) { const result = await marketPort.value.marketplaces.plan({ kind: "marketplace-add", name: "new-market", sourceKind: "local-directory", sourceValue: marketFixture.project, flags: { yes: false, declarationOnly: false, scope: "user" } }); expect(result).toMatchObject({ ok: false, code: "marketplace-ownership-uncertain" }); }
   });
 
   it("refuses marketplace mutations when registration ownership evidence is malformed, unreadable, or omitted", async () => {
@@ -960,7 +984,7 @@ process.exit(23);
       let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("foreign target reached composition"); }) as never };
       const listed = await runPluginInProcess(project, ["details", "foreign@official"], options); const selector = /selector=([A-Za-z0-9_-]+)/u.exec(listed.stdout.join("\n"))?.[1]; expect(selector).toBeDefined();
       const copied = await runPluginInProcess(project, ["details", selector!], options); expect(copied.code).toBe(0); expect(copied.stdout.join("\n")).toContain(`owner=${scope === "managed" ? "managed" : "claude-imported-readonly"}`);
-      for (const args of pluginActions("foreign@official")) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(scope === "managed" ? "managed-readonly" : "imported-readonly"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, write, staging, or adoption was attempted"); }
+      for (const args of pluginActions("foreign@official")) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(scope === "managed" ? "managed-readonly" : "imported-readonly"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted"); }
       const selectedActions = [["enable", "foreign@official", "--selector", selector!, "--yes"], ["disable", "foreign@official", "--selector", selector!, "--yes"], ["update", "foreign@official", "--selector", selector!, "--yes"], ["uninstall", "foreign@official", "--selector", selector!, "--remove-declaration", "no", "--remove-data", "no", "--yes"]];
       for (const args of selectedActions) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(scope === "managed" ? "managed-readonly" : "imported-readonly"); expect(result.stderr.join("\n")).not.toContain("invalid-selector"); }
       expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
@@ -1010,8 +1034,8 @@ process.exit(23);
     fs.rmSync(path.join(value.project, ".claude", "settings.json"));
     write(path.join(value.marketplace, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [{ name: "bare", source: "./plugins/bare", version: "2.0.0", defaultEnabled: false }, { name: "tool", source: "./plugins/tool", defaultEnabled: false }] }));
     write(path.join(value.marketplace, "plugins", "tool", ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "2.0.0", skills: "./skills", commands: "./commands", hooks: "./hooks/hooks.json", mcpServers: "./.mcp.json" }));
-    const refreshed = await runPluginInProcess(value.project, ["marketplace", "refresh", "official", "--selector", marketplaceSelector!, "--yes"], options); expect(refreshed.code, refreshed.stderr.join("\n")).toBe(0);
-    const updated = await runPluginInProcess(value.project, ["update", "tool@official", "--selector", pluginSelector!, "--marketplace-selector", marketplaceSelector!, "--yes"], options); expect(updated.code, updated.stderr.join("\n")).toBe(0); expect(updated.stdout.join("\n")).toContain("Immutable revision: marketplace-"); expect(fs.existsSync(value.runtimeCanary)).toBe(false);
+    const refreshed = await runPluginInProcess(value.project, ["marketplace", "refresh", "official", "--selector", marketplaceSelector!, "--yes"], options); expect(refreshed.code, refreshed.stderr.join("\n")).toBe(0); expect(refreshed.stdout.join("\n")).toContain(`Selected marketplace scope/selector: user; ${marketplaceSelector}`);
+    const updated = await runPluginInProcess(value.project, ["update", "tool@official", "--selector", pluginSelector!, "--marketplace-selector", marketplaceSelector!, "--yes"], options); expect(updated.code, updated.stderr.join("\n")).toBe(0); expect(updated.stdout.join("\n")).toContain(`Target scope/record selector: user; ${pluginSelector}`); expect(updated.stdout.join("\n")).toContain(`Selected marketplace selector: ${marketplaceSelector}`); expect(updated.stdout.join("\n")).toContain("Immutable revision: marketplace-"); expect(fs.existsSync(value.runtimeCanary)).toBe(false);
     const updatedDetails = await runPluginInProcess(value.project, ["details", "tool@official"], options); expect(updatedDetails.stdout.join("\n")).toContain("version=2.0.0"); expect(JSON.parse(fs.readFileSync(path.join(value.userDir, "settings.json"), "utf8"))).toMatchObject({ enabledPlugins: { "tool@official": true } });
     const identities = projectIdentities(value.project); const locations = createLifecycleLocations({ homeDir: value.homeDir, profilePath: value.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } }); if (!locations.ok) throw new Error(locations.error.message); const established = await establishOwnedStateStore(locations.value, value.homeDir); if (!established.ok) throw new Error(established.message);
     const registrationFiles: string[] = []; const visit = (directory: string): void => { for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const target = path.join(directory, entry.name); if (entry.isDirectory()) visit(target); else if (entry.name.endsWith(".json") && fs.readFileSync(target, "utf8").includes('"schema":"marketplace-registration"')) registrationFiles.push(target); } }; visit(established.value.recordsRoot); expect(registrationFiles).toHaveLength(1);
@@ -1025,7 +1049,7 @@ process.exit(23);
     const removedTool = await runPluginInProcess(value.project, ["uninstall", "tool@official", "--selector", pluginSelector!, "--remove-declaration", "yes", "--remove-data", "no", "--yes"], options); expect(removedTool.code, removedTool.stderr.join("\n")).toBe(0);
     const removedBare = await runPluginInProcess(value.project, ["uninstall", "bare@official", "--selector", bareSelector!, "--remove-declaration", "no", "--remove-data", "no", "--yes"], options); expect(removedBare.code, removedBare.stderr.join("\n")).toBe(0);
     fs.rmSync(path.join(partition.value, path.basename(registrationFiles[0]!))); fs.rmSync(path.join(value.project, ".claude", "settings.json"));
-    const removedUserMarketplace = await runPluginInProcess(value.project, ["marketplace", "remove", "official", "--selector", marketplaceSelector!, "--preserve-installed", "yes", "--yes"], options); expect(removedUserMarketplace.code, removedUserMarketplace.stderr.join("\n")).toBe(0);
+    const removedUserMarketplace = await runPluginInProcess(value.project, ["marketplace", "remove", "official", "--selector", marketplaceSelector!, "--preserve-installed", "yes", "--yes"], options); expect(removedUserMarketplace.code, removedUserMarketplace.stderr.join("\n")).toBe(0); expect(removedUserMarketplace.stdout.join("\n")).toContain(`Selected marketplace scope/selector: user; ${marketplaceSelector}`); expect(removedUserMarketplace.stdout.join("\n")).toContain("Destructive choice: preserve-installations=true");
   });
 
   it("preserves ambient managed-policy precedence in production settings planning", async () => {
@@ -1045,7 +1069,7 @@ process.exit(23);
     const preview = installed.stdout.join("\n"); expect(installed.code, installed.stderr.join("\n")).toBe(2); expect(installed.stderr.join("\n")).toContain("cancelled"); expect(preview).toContain("Default/enablement: enabled=false; source=existing-effective"); expect(preview).toContain("requested=false; effective=false; declaration-only=true");
   });
 
-  it("reports and rolls back an interrupted production lifecycle operation through fresh offline recovery", async () => {
+  it("reports and rolls back an interrupted production lifecycle operation through its retained production port", async () => {
     const value = localLifecycleFixture(); const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: false };
     expect((await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace, "--yes"], options)).code).toBe(0);
 
@@ -1057,16 +1081,13 @@ process.exit(23);
       if (source.includes(".tmp-") && !destination.includes(`${path.sep}staging${path.sep}`) && destination.includes(`${path.sep}.picc${path.sep}`)) interrupted = true;
       return result;
     }) as typeof fs.promises.rename;
-    let failedCode = -1; const pendingOutput: string[] = [];
-    try { failedCode = await runPluginInventoryCli(["install", "tool@official", "--yes"], { log: (message) => pendingOutput.push(message), error: () => { throw new Error("pending progress renderer failed"); } }, { cwd: value.project, platform: "linux", ...options }); } finally { promises.rename = originalRename; }
+    let failedCode = -1; const pendingOutput: string[] = []; let retainedPort: Awaited<ReturnType<typeof createProductionPluginLifecyclePort>> | undefined;
+    try { failedCode = await runPluginInventoryCli(["install", "tool@official", "--yes"], { log: (message) => pendingOutput.push(message), error: () => { throw new Error("pending progress renderer failed"); } }, { cwd: value.project, platform: "linux", ...options, services: async (project) => { retainedPort = await createProductionPluginLifecyclePort(project, options); return retainedPort; } }); } finally { promises.rename = originalRename; }
     expect(interrupted).toBe(true); expect(failedCode).toBe(1); expect(pendingOutput.at(-1)).toContain("Lifecycle result output failed");
     const operationId = /Operation ID: (plugin_[A-Za-z0-9_-]+)/u.exec(pendingOutput.join("\n"))?.[1]; expect(operationId).toBeDefined();
 
     const listed = await runPluginInProcess(value.project, ["recover"], options); expect(listed.stdout.join("\n")).toContain(`Operation ID: ${operationId}; status=pending`);
-    const profilesRoot = path.join(value.homeDir, ".picc", "plugins", "v1", "profiles"); const canonical = (input: unknown): unknown => Array.isArray(input) ? input.map(canonical) : typeof input === "object" && input !== null ? Object.fromEntries(Object.entries(input).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonical(item)])) : input;
-    for (const profile of fs.readdirSync(profilesRoot)) { const locks = path.join(profilesRoot, profile, "locks"); for (const lock of fs.readdirSync(locks)) { const ownerPath = path.join(locks, lock, "owner.json"); const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as Record<string, unknown>; owner.pid = 2_147_483_647; fs.writeFileSync(ownerPath, JSON.stringify(canonical(owner))); } }
-    const recovered = runSourcePluginWithEnv(value.project, ["recover", operationId!, "--rollback", "--yes"], { PICC_CLAUDE_USER_DIR: value.userDir, HOME: value.homeDir, USERPROFILE: value.homeDir });
-    expect(recovered.status, recovered.stderr).toBe(0); expect(recovered.stdout).toContain("Chosen recovery action/result: rollback"); expect(recovered.stdout, recovered.stderr).toContain("Outcome: rolled-back"); expect(recovered.stdout).toContain("No durable desired state change was committed");
+    expect(retainedPort?.ok).toBe(true); if (retainedPort?.ok) { const recovered = await retainedPort.value.recovery.recover(operationId!, "rollback"); expect(recovered).toMatchObject({ ok: true, value: { outcome: "rolled-back" } }); const terminalLookup = await retainedPort.value.lookup(operationId!); expect(terminalLookup).toMatchObject({ ok: true, value: { state: "terminal", receipt: { outcome: "rolled-back" } } }); }
     const terminal = await runPluginInProcess(value.project, ["recover", operationId!], options); expect(terminal.stdout.join("\n")).toContain("Outcome: rolled-back");
   });
 

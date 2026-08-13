@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { PluginInventoryComponent, PluginInventoryDiagnostic, PluginInventoryProvenance } from "../plugin-inventory.js";
 import { clampLines, pushWrapped, themedFg } from "./render-util.js";
-import { PLUGIN_INVENTORY_VIEWS, type PluginInventoryModelView, type PluginInventoryRow } from "./plugin-inventory-model.js";
+import { PLUGIN_INVENTORY_VIEWS, type PluginInventoryModelView, type PluginInventoryRow, type PluginInventoryWorkflow } from "./plugin-inventory-model.js";
 import { parseQualifiedPluginId } from "../util/plugin-id.js";
 import { formatPluginInventoryDisplayLocation, sanitizePluginInventoryDisplayText } from "./plugin-inventory-text.js";
 import { formatPluginInventoryStructuredSource } from "./plugin-inventory-display.js";
@@ -18,6 +18,7 @@ interface DetailLine { readonly text: string; readonly color: string }
 function safe(value: unknown, cap = TEXT_CAP): string {
   return sanitizePluginInventoryDisplayText(typeof value === "string" ? value : String(value ?? ""), cap);
 }
+function workflowMessage(value: string): string { return [...value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")].slice(0, 512).join(""); }
 function qualifiedIdentity(value: unknown): string {
   return parseQualifiedPluginId(value)?.qualifiedIdentity ?? "unknown@unknown";
 }
@@ -53,13 +54,14 @@ function pluginStatusColor(row: Extract<PluginInventoryRow, { kind: "plugin" }>)
 }
 
 function framing(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): void {
-  addWrapped(lines, theme, "accent", "PiCC plugin inventory", width);
-  addWrapped(lines, theme, "muted", "read-only · captured for this session · lifecycle eligibility only", width);
+  addWrapped(lines, theme, "accent", "PiCC plugin inventory · lifecycle", width);
+  addWrapped(lines, theme, "muted", "read-only · captured for this session · browsing is inert", width);
+  addWrapped(lines, theme, "muted", "Durable desired state refreshes after receipts; loaded runtime remains captured.", width);
   addWrapped(lines, theme, "muted", `Generation: loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
   if (view.actionOverlay) addWrapped(lines, theme, view.actionOverlay.phase === "failed" || view.actionOverlay.phase === "reload-unconfirmed" ? "warning" : "accent", `Overlay: ${safe(view.actionOverlay.phase, 40)} · ${safe(view.actionOverlay.target ?? view.actionOverlay.operationId, 100)}${view.actionOverlay.message ? ` · ${safe(view.actionOverlay.message)}` : ""}`, width);
-  addWrapped(lines, theme, "muted", "Refresh loaded runtime: run /reload in the interactive TUI, or exit and relaunch PiCC.", width);
+  addWrapped(lines, theme, "muted", "Refresh loaded runtime: run /reload-plugins in the interactive TUI, or exit and relaunch PiCC.", width);
   if (view.activeView === "Discover" || view.activeView === "Marketplaces") {
-    addWrapped(lines, theme, "muted", "Local known catalogs/registrations only · no network refresh, download, or management.", width);
+    addWrapped(lines, theme, "muted", "Local known catalogs/registrations only · acquisition begins only after an explicit action and planning progress is cancellable.", width);
   }
 }
 function tabs(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): void {
@@ -249,6 +251,31 @@ function globalDiagnosticDetail(view: PluginInventoryModelView): DetailLine[] {
     ...(administrator ? [{ text: "Administrator action may be required because this diagnostic is owned by managed/system policy.", color: "warning" }] : []),
   ];
 }
+function workflowPreviewLines(state: Extract<PluginInventoryWorkflow, { phase: "preview" | "confirmation" }>): DetailLine[] {
+  const p = state.projection; const values: DetailLine[] = [];
+  pushDetail(values, `${state.phase === "confirmation" ? "Final confirmation" : "Lifecycle preview"}: ${p.action}`, "accent");
+  pushDetail(values, `Operation id: ${safe(p.operationId, 128)}`, "warning"); pushDetail(values, `Target: ${safe(p.target, 320)}`); pushDetail(values, `Exact scope/selector authority: ${safe(p.authority, 1200)}`, "warning"); pushDetail(values, `Redacted source authority: ${safe(p.sourceAuthority, 400)}`);
+  const groups: readonly [string, readonly string[], DetailLine["color"]][] = [
+    ["Immutable resolution", p.resolution, "text"], ["Critical trust", p.trust, "warning"], ["Dependency posture", p.dependencies, "text"], ["Settings/effective/default", p.settings, "text"], ["Executable components", p.executable, "warning"], ["Destructive choices", p.destructive, "warning"], ["Participants", p.participants, "text"], ["Consequences", p.consequences, "text"], ["Current-session behavior", p.sessionBehavior, "warning"], ["Recovery", p.recovery, "warning"],
+  ];
+  for (const [label, entries, color] of groups) { pushDetail(values, `${label}: ${entries.length === 0 ? "none" : `${entries.length} item(s)`}`, color); for (const entry of entries) pushDetail(values, `${label}: ${safe(entry, 1400)}`, color); }
+  if (p.omissions > 0) pushDetail(values, `${p.omissions} required values are missing, unsupported, oversized, truncated, or unrenderable. Confirmation is disabled.`, "error");
+  return values;
+}
+
+function renderWorkflow(state: PluginInventoryWorkflow, theme: unknown, width: number, lines: string[]): number {
+  if (state.phase === "select-action") { addWrapped(lines, theme, "accent", "Choose lifecycle action", width); state.actions.forEach((action, index) => addWrapped(lines, theme, index === state.selected ? "accent" : "text", `${index === state.selected ? ">" : " "} ${action}`, width)); addWrapped(lines, theme, "muted", "↑/↓ select · Enter continue · Esc cancel", width); return 0; }
+  if (state.phase === "select-candidate") { addWrapped(lines, theme, "accent", `Choose exact candidate · ${safe(state.targetIdentity, 256)}`, width); state.candidates.forEach((candidate, index) => addWrapped(lines, theme, index === state.selected ? "accent" : "text", `${index === state.selected ? ">" : " "} ${safe(candidate.label, 256)}`, width)); addWrapped(lines, theme, "muted", "↑/↓ select · Enter bind exact record · Esc cancel", width); return 0; }
+  if (state.phase === "input") { addWrapped(lines, theme, "accent", `${state.action} · ${state.field}`, width); addWrapped(lines, theme, state.invalid ? "error" : "muted", state.invalid ?? state.hint, width); addWrapped(lines, theme, "text", state.entered ? "Value entered (private; hidden from rendering and transcript)" : "Type value, then Enter", width); addWrapped(lines, theme, "muted", "Backspace edits · Left/Shift-Tab goes Back · Esc cancels", width); return 0; }
+  if (state.phase === "planning") { addWrapped(lines, theme, "accent", `Planning ${state.action}…`, width); addWrapped(lines, theme, "muted", "Resolving immutable acquisition and preview evidence · Esc cancels", width); return 0; }
+  if (state.phase === "preview" || state.phase === "confirmation") { const raw = workflowPreviewLines(state); const body: string[] = []; raw.forEach((value) => addWrapped(body, theme, value.color, value.text, width)); const max = Math.max(0, body.length - DETAIL_WINDOW); const scroll = Math.min(max, state.detailScroll); if (scroll > 0) addWrapped(lines, theme, "muted", `↑ ${scroll} confirmation lines above`, width); lines.push(...body.slice(scroll, scroll + DETAIL_WINDOW)); if (body.length > scroll + DETAIL_WINDOW) addWrapped(lines, theme, "muted", `↓ ${body.length - scroll - DETAIL_WINDOW} confirmation lines below`, width); addWrapped(lines, theme, state.confirmationEnabled ? "warning" : "error", state.confirmationEnabled ? (state.phase === "preview" ? "Enter opens final confirmation · Esc discards" : "Enter commits this visible projection · Esc discards") : "Confirmation disabled: required evidence omitted", width); return max; }
+  if (state.phase === "cancelling") { addWrapped(lines, theme, "warning", state.message, width); addWrapped(lines, theme, "muted", "Confirmation is unavailable while staging is discarded.", width); return 0; }
+  if (state.phase === "progress") { addWrapped(lines, theme, "accent", `Executing ${state.action} · ${safe(state.operationId, 128)}`, width); addWrapped(lines, theme, "warning", state.cancellationRequested ? "Esc intent was recorded locally after execution began; it was not sent as an execution cancellation. Waiting for authoritative receipt or recovery evidence; no rollback is claimed." : "Commit progress is authoritative; Esc records local intent and waits, but does not cancel execution or erase committed steps.", width); return 0; }
+  if (state.phase === "receipt") { const target = state.receipt.target === undefined ? "" : ` · ${safe(state.receipt.target, 256)}`; addWrapped(lines, theme, state.receipt.outcome === "committed" ? "success" : "warning", `${state.receipt.kind === "plugin" ? "Plugin" : "Marketplace"} lifecycle receipt${target} · ${safe(state.operationId, 128)} · ${state.receipt.outcome} · completed ${state.receipt.completed}`, width); const truth = state.receipt.outcome === "committed" ? state.receipt.kind === "plugin" ? "Durable desired plugin state changed. Loaded runtime badges remain fixed until /reload-plugins succeeds or PiCC restarts." : "Durable marketplace state changed. Installed plugin code and loaded runtime are unchanged." : state.receipt.outcome === "rolled-back" ? "The operation rolled back; no committed desired change is claimed." : "The operation failed before commit; no committed desired change is claimed."; addWrapped(lines, theme, state.pendingReload ? "warning" : "text", truth, width); if (state.projectionFailure) addWrapped(lines, theme, "error", state.projectionFailure, width); addWrapped(lines, theme, "muted", "Enter returns to inventory.", width); return 0; }
+  if (state.phase === "terminal-fallback") { addWrapped(lines, theme, "warning", `Lifecycle outcome · ${safe(state.operationId, 128)}`, width); addWrapped(lines, theme, "warning", state.message, width); if (state.recoveryCommand) addWrapped(lines, theme, "accent", state.recoveryCommand, width); return 0; }
+  addWrapped(lines, theme, state.phase === "pending-recovery" ? "warning" : "error", `${state.phase === "pending-recovery" ? "Pending recovery" : state.phase === "refused" ? "Lifecycle refused" : "Lifecycle failed"}${"operationId" in state && state.operationId ? ` · ${safe(state.operationId, 128)}` : ""}`, width); addWrapped(lines, theme, "warning", workflowMessage("message" in state ? state.message : "Lifecycle state is unavailable"), width); addWrapped(lines, theme, "muted", state.phase === "pending-recovery" ? `Exact fallback: picc plugin recover ${state.operationId}` : "Enter returns; no unconfirmed action will execute.", width); return 0;
+}
+
 function renderDetail(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): number {
   const raw = view.detail?.kind === "plugin" ? pluginDetail(view) : view.detail?.kind === "marketplace" ? marketplaceDetail(view) : view.detail?.kind === "global-lifecycle" ? globalLifecycleDetail(view) : globalDiagnosticDetail(view);
   const body: string[] = [];
@@ -275,14 +302,16 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   tabs(view, options.theme, width, lines);
   let maxDetailScroll = 0;
   let selectedVisible = false;
-  if (view.detail) {
+  if (view.workflow) maxDetailScroll = renderWorkflow(view.workflow, options.theme, width, lines);
+  else if (view.detail) {
     if (view.filter) addWrapped(lines, options.theme, "accent", `Active filter: ${safe(view.filter)}`, width);
     maxDetailScroll = renderDetail(view, options.theme, width, lines);
     renderOmissions(view, options.theme, width, lines);
   } else selectedVisible = renderList(view, options.theme, width, lines);
-  addWrapped(lines, options.theme, "muted", view.detail
+  if (!view.workflow) addWrapped(lines, options.theme, "muted", view.detail
     ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · /plugin list · /plugin details <qualified-name>"
     : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · /plugin list", width);
+  if (!view.workflow) addWrapped(lines, options.theme, "muted", "A opens eligible lifecycle actions.", width);
   const safeLines = clampLines(lines, width).map((line) => {
     try { return visibleWidth(line) <= width ? line : ""; } catch { return ""; }
   });

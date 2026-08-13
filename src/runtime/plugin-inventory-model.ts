@@ -30,6 +30,28 @@ export interface PluginInventoryActionOverlay {
   readonly target?: string; readonly message?: string; readonly receiptOutcome?: "committed" | "rolled-back" | "failed-before-commit";
   readonly recoveryCommand?: string; readonly updatedAt: string;
 }
+export type PluginInventoryActionName = "marketplace-add" | "marketplace-refresh" | "marketplace-remove" | "install" | "enable" | "disable" | "update" | "uninstall" | "recover";
+export interface PluginInventoryTargetAuthority { readonly kind: "plugin" | "marketplace" | "recovery"; readonly identity: string; readonly mutableRecordKey?: string; readonly scope?: string }
+export interface PluginInventoryCandidate { readonly label: string; readonly authority: PluginInventoryTargetAuthority }
+export interface PluginInventoryConfirmationProjection {
+  readonly operationId: string; readonly action: PluginInventoryActionName; readonly target: string; readonly authority: string;
+  readonly sourceAuthority: string; readonly resolution: readonly string[]; readonly trust: readonly string[]; readonly dependencies: readonly string[];
+  readonly settings: readonly string[]; readonly executable: readonly string[]; readonly destructive: readonly string[]; readonly participants: readonly string[];
+  readonly consequences: readonly string[]; readonly sessionBehavior: readonly string[]; readonly recovery: readonly string[]; readonly omissions: number;
+}
+export interface PluginInventoryReceiptProjection { readonly kind: "plugin" | "marketplace"; readonly target?: string; readonly outcome: "committed" | "rolled-back" | "failed-before-commit"; readonly completed: number; readonly generationId?: string }
+export type PluginInventoryWorkflow =
+  | { readonly phase: "select-action"; readonly actions: readonly PluginInventoryActionName[]; readonly selected: number; readonly target?: PluginInventoryTargetAuthority }
+  | { readonly phase: "select-candidate"; readonly action: PluginInventoryActionName; readonly candidates: readonly PluginInventoryCandidate[]; readonly selected: number; readonly targetIdentity: string }
+  | { readonly phase: "input"; readonly action: PluginInventoryActionName; readonly target?: PluginInventoryTargetAuthority; readonly field: string; readonly entered: boolean; readonly hint: string; readonly invalid?: string }
+  | { readonly phase: "planning"; readonly action: PluginInventoryActionName; readonly target?: PluginInventoryTargetAuthority }
+  | { readonly phase: "preview" | "confirmation"; readonly action: PluginInventoryActionName; readonly operationId: string; readonly target?: PluginInventoryTargetAuthority; readonly projection: PluginInventoryConfirmationProjection; readonly detailScroll: number; readonly confirmationEnabled: boolean }
+  | { readonly phase: "cancelling"; readonly action: PluginInventoryActionName; readonly operationId?: string; readonly target?: PluginInventoryTargetAuthority; readonly message: string }
+  | { readonly phase: "progress"; readonly action: PluginInventoryActionName; readonly operationId: string; readonly target?: PluginInventoryTargetAuthority; readonly cancellationRequested: boolean }
+  | { readonly phase: "receipt"; readonly action: PluginInventoryActionName; readonly operationId: string; readonly target?: PluginInventoryTargetAuthority; readonly receipt: PluginInventoryReceiptProjection; readonly pendingReload: boolean; readonly projectionFailure?: string }
+  | { readonly phase: "pending-recovery"; readonly action: PluginInventoryActionName; readonly operationId: string; readonly target?: PluginInventoryTargetAuthority; readonly message: string; readonly recoveryActions: readonly ("complete" | "rollback")[] }
+  | { readonly phase: "terminal-fallback"; readonly operationId: string; readonly message: string; readonly recoveryCommand?: string }
+  | { readonly phase: "refused" | "failed"; readonly action?: PluginInventoryActionName; readonly operationId?: string; readonly target?: PluginInventoryTargetAuthority; readonly message: string };
 export interface PluginInventoryModelView {
   readonly activeView: PluginInventoryViewName;
   readonly activeViewIndex: number;
@@ -48,6 +70,7 @@ export interface PluginInventoryModelView {
   readonly loadedSnapshot: PluginInventorySnapshot;
   readonly durableDesired: PluginInventorySnapshot;
   readonly actionOverlay?: PluginInventoryActionOverlay;
+  readonly workflow?: PluginInventoryWorkflow;
 }
 
 const FAILURE_STATUSES = new Set(["enabled-but-uninstalled", "unsupported", "ambiguous", "blocked", "malformed", "rejected"]);
@@ -148,6 +171,7 @@ export class PluginInventoryModel {
   private detailTarget?: PluginInventoryDetailTarget;
   private scroll = 0;
   private warningText?: string;
+  private workflowState?: PluginInventoryWorkflow;
   private revisionNumber = 0;
 
   constructor(snapshot: PluginInventorySnapshot, durableDesired: PluginInventorySnapshot = snapshot) { this.snapshot = snapshot; this.desiredSnapshot = durableDesired === snapshot ? snapshot : desiredWithCapturedRuntime(snapshot, durableDesired); this.reconcile(); }
@@ -162,6 +186,78 @@ export class PluginInventoryModel {
   revision(): number { return this.revisionNumber; }
   filter(): string { return this.filterText; }
   inDetail(): boolean { return this.detailTarget !== undefined; }
+  workflow(): PluginInventoryWorkflow | undefined { return this.workflowState; }
+  inWorkflow(): boolean { return this.workflowState !== undefined; }
+
+  availableActions(): readonly PluginInventoryActionName[] {
+    const row = this.rows().rows.find((value) => value.key === this.selected);
+    if (row?.kind === "plugin") {
+      const lifecycle = row.item.lifecycle;
+      if (lifecycle?.ownership === "managed" || lifecycle?.ownership === "claude-imported-readonly" || lifecycle?.ownership === "seed") return Object.freeze([]);
+      const projected = (lifecycle?.availableActions ?? []).flatMap((value): PluginInventoryActionName[] => ["install", "enable", "disable", "update", "uninstall"].includes(value) ? [value as PluginInventoryActionName] : []);
+      if (projected.length > 0) return Object.freeze(projected);
+      if ((lifecycle?.candidates?.length ?? 0) > 1) return Object.freeze(["update", "enable", "disable", "uninstall"]);
+      if (row.item.catalogPresence && lifecycle?.installed === false) return Object.freeze(["install"]);
+      return Object.freeze([]);
+    }
+    if (row?.kind === "marketplace") {
+      if (row.marketplace.ownership === "managed" || row.marketplace.ownership === "claude-imported-readonly" || row.marketplace.ownership === "seed") return Object.freeze(["marketplace-add"]);
+      const projected = (row.marketplace.availableActions ?? []).flatMap((value): PluginInventoryActionName[] => value === "refresh" ? ["marketplace-refresh"] : value === "remove" ? ["marketplace-remove"] : []);
+      return Object.freeze(["marketplace-add", ...projected.length > 0 ? projected : (row.marketplace.candidates?.length ?? 0) > 0 ? ["marketplace-refresh", "marketplace-remove"] as PluginInventoryActionName[] : []]);
+    }
+    if (row?.kind === "global-lifecycle") return Object.freeze(["recover"]);
+    if (this.viewIndex === 2) return Object.freeze(["marketplace-add"]);
+    return Object.freeze([]);
+  }
+  selectedActionTarget(): { readonly target?: PluginInventoryTargetAuthority; readonly candidates: readonly PluginInventoryCandidate[]; readonly refusal?: string } {
+    const row = this.rows().rows.find((value) => value.key === this.selected);
+    if (row?.kind === "plugin") {
+      const lifecycle = row.item.lifecycle;
+      if (lifecycle?.ownership === "managed") return { candidates: [], refusal: "This plugin is administrator-owned; ask the administrator to change it. No lifecycle service or acquisition was started." };
+      if (lifecycle?.ownership === "claude-imported-readonly" || lifecycle?.ownership === "seed") return { candidates: [], refusal: "This plugin is Claude-owned; use Claude Code to change it. No lifecycle service or acquisition was started." };
+      const candidates = (lifecycle?.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · ${value.selected ? "selected" : "candidate"}`, authority: Object.freeze({ kind: "plugin" as const, identity: row.identity, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) }));
+      const selected = candidates.filter((_value, index) => lifecycle?.candidates?.[index]?.selected === true);
+      return { ...(selected.length === 1 ? { target: selected[0]!.authority } : candidates.length === 1 ? { target: candidates[0]!.authority } : {}), candidates: Object.freeze(candidates) };
+    }
+    if (row?.kind === "marketplace") {
+      if (row.marketplace.ownership === "managed") return { candidates: [], refusal: "This marketplace is administrator-owned; ask the administrator to change it. No lifecycle service or acquisition was started." };
+      if (row.marketplace.ownership === "claude-imported-readonly") return { candidates: [], refusal: "This marketplace is Claude-owned; use Claude Code to change it. No lifecycle service or acquisition was started." };
+      if (row.marketplace.ownership === "seed") return { candidates: [] };
+      const candidates = (row.marketplace.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · ${value.selected ? "selected" : "candidate"}`, authority: Object.freeze({ kind: "marketplace" as const, identity: row.identity, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) }));
+      const selected = candidates.filter((_value, index) => row.marketplace.candidates?.[index]?.selected === true);
+      return { ...(selected.length === 1 ? { target: selected[0]!.authority } : candidates.length === 1 ? { target: candidates[0]!.authority } : {}), candidates: Object.freeze(candidates) };
+    }
+    if (row?.kind === "global-lifecycle") return { target: { kind: "recovery", identity: row.operation.operationId }, candidates: [] };
+    return { candidates: [] };
+  }
+  actionCandidates(action: PluginInventoryActionName, identity: string): readonly PluginInventoryCandidate[] {
+    if (action === "recover" || action === "marketplace-add") return Object.freeze([]);
+    if (action.startsWith("marketplace-")) {
+      const marketplace = this.desiredSnapshot.marketplaces.find((value) => value.name === identity);
+      return Object.freeze((marketplace?.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · marketplace registration`, authority: Object.freeze({ kind: "marketplace" as const, identity, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) })));
+    }
+    const item = this.desiredSnapshot.find(identity);
+    if (action === "install") {
+      const marketplace = item === undefined ? undefined : this.desiredSnapshot.marketplaces.find((value) => value.name === item.marketplaceName);
+      return Object.freeze((marketplace?.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · marketplace registration`, authority: Object.freeze({ kind: "marketplace" as const, identity: marketplace!.name, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) })));
+    }
+    return Object.freeze((item?.lifecycle?.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · plugin record`, authority: Object.freeze({ kind: "plugin" as const, identity, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) })));
+  }
+  marketplaceCandidatesForPlugin(identity: string): readonly PluginInventoryCandidate[] {
+    const item = this.desiredSnapshot.find(identity); const marketplace = item === undefined ? undefined : this.desiredSnapshot.marketplaces.find((value) => value.name === item.marketplaceName);
+    return Object.freeze((marketplace?.candidates ?? []).map((value) => Object.freeze({ label: `${value.scope} · marketplace registration`, authority: Object.freeze({ kind: "marketplace" as const, identity: marketplace!.name, mutableRecordKey: value.mutableRecordKey, scope: value.scope }) })));
+  }
+  beginActionSelection(actions: readonly PluginInventoryActionName[] = this.availableActions(), inheritSelectedTarget = true): boolean {
+    const globalMarketplaceAdd = actions.length === 1 && actions[0] === "marketplace-add";
+    const selection = inheritSelectedTarget && !globalMarketplaceAdd ? this.selectedActionTarget() : { candidates: [] as readonly PluginInventoryCandidate[] };
+    if (selection.refusal !== undefined) { this.workflowState = { phase: "refused", message: selection.refusal }; this.bump(); return false; }
+    if (actions.length === 0) { this.workflowState = { phase: "refused", message: "This record is read-only or has no eligible lifecycle action. Managed and Claude-owned records must be changed by their owner." }; this.bump(); return false; }
+    this.workflowState = Object.freeze({ phase: "select-action", actions: Object.freeze([...actions]), selected: 0, ...(selection.target === undefined ? {} : { target: selection.target }) }); this.bump(); return true;
+  }
+  moveAction(delta: number): void { const state = this.workflowState; if (state?.phase !== "select-action" || state.actions.length === 0) return; const selected = Math.max(0, Math.min(state.actions.length - 1, state.selected + Math.trunc(delta))); if (selected !== state.selected) { this.workflowState = { ...state, selected }; this.bump(); } }
+  setWorkflow(value: PluginInventoryWorkflow | undefined): void { this.workflowState = value === undefined ? undefined : Object.freeze(value); this.bump(); }
+  failWorkflow(message: string, action?: PluginInventoryActionName, operationId?: string, target?: PluginInventoryTargetAuthority): void { this.workflowState = Object.freeze({ phase: "failed", ...(action === undefined ? {} : { action }), ...(operationId === undefined ? {} : { operationId }), ...(target === undefined ? {} : { target }), message: [...message.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")].slice(0, 512).join("") }); this.bump(); }
+  leaveWorkflow(): boolean { if (this.workflowState === undefined) return false; this.workflowState = undefined; this.bump(); return true; }
 
   setView(index: number): void {
     const next = ((Math.trunc(index) % PLUGIN_INVENTORY_VIEWS.length) + PLUGIN_INVENTORY_VIEWS.length) % PLUGIN_INVENTORY_VIEWS.length;
@@ -293,6 +389,7 @@ export class PluginInventoryModel {
       policyObservations: this.desiredSnapshot.policyObservations,
       loadedSnapshot: this.snapshot, durableDesired: this.desiredSnapshot,
       ...(this.overlay === undefined ? {} : { actionOverlay: this.overlay }),
+      ...(this.workflowState === undefined ? {} : { workflow: this.workflowState }),
     };
   }
 
