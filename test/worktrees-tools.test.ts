@@ -42,6 +42,7 @@ interface ExitStub {
 function makeHarness(opts: {
   exitResult?: ExitStub;
   seededFiles?: string[];
+  ownedStdioServerNames?: string[];
   hookOutcomes?: Partial<Record<"WorktreeCreate" | "WorktreeRemove", Partial<HookOutcome>>>;
 } = {}) {
   const calls: Call[] = [];
@@ -88,6 +89,7 @@ function makeHarness(opts: {
   const tools = createWorktreeTools({
     worktrees, cwdState, hookRunner,
     captureUniversalStop: () => () => { universalStops += 1; return true; },
+    ownedStdioServerNames: () => opts.ownedStdioServerNames ?? [],
   }) as unknown as Tool[];
   const enter = tools.find((t) => t.name === "EnterWorktree")!;
   const exit = tools.find((t) => t.name === "ExitWorktree")!;
@@ -132,6 +134,24 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
       "Seeded from .worktreeinclude: .env.example, config/dev.json",
       "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
     ].join("\n"));
+  });
+
+  it("queries live owned-stdio routes only after successful entry", async () => {
+    const names: string[] = [];
+    const h = makeHarness({ ownedStdioServerNames: names });
+    names.push("inline-safe");
+    const res = await h.enter.execute("pin", { name: "wt-pinned" });
+    expect(text(res)).toContain('Scoped MCP stdio remains pinned to its launch directory ("inline-safe").');
+    expect(text(res)).toContain("Restart the agent in the desired worktree");
+    expect(res.details).toMatchObject({ scopedMcpPinned: true });
+
+    names.length = 0;
+    const quiet = await h.enter.execute("quiet", { name: "wt-quiet" });
+    expect(text(quiet)).not.toContain("Scoped MCP stdio");
+
+    const ordinary = makeHarness();
+    const ordinaryResult = await ordinary.enter.execute("ordinary", { name: "wt-ordinary" });
+    expect(text(ordinaryResult)).not.toContain("Scoped MCP stdio");
   });
 
   it("releases the previous worktree (exit keep) when entering a different one", async () => {

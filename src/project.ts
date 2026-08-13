@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, HookHandler, PluginRuntimeContext, ResolvedMcpConfig } from "./types.js";
+import type { AgentMcpAdmissionContext, ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, HookHandler, PluginRuntimeContext, ResolvedMcpConfig } from "./types.js";
 import { SUPPORTED_HOOK_EVENTS } from "./types.js";
 import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discovery/locations.js";
 import { loadSettings } from "./discovery/settings.js";
@@ -313,6 +313,7 @@ export function loadClaudeProject(opts: {
     loadNativeState: loadClaudeMcpState,
     loadProjectMcpJson: loadMcpJson,
   };
+  let agentMcpAdmission: AgentMcpAdmissionContext | undefined;
   const mcp = resolveMcpConfig({
     projectRoot: root,
     loadOrdinaryMcp: () => ({
@@ -329,6 +330,7 @@ export function loadClaudeProject(opts: {
     mcpPolicyRestrictiveMaterialOmitted: settings.mcpPolicyRestrictiveMaterialOmitted,
     managedMcp,
     ...(opts.env === undefined ? {} : { env: opts.env }),
+    captureAgentMcpAdmission: (context) => { agentMcpAdmission = context; },
   });
 
   const hookConfigs: HookConfig[] = [settings.hooks];
@@ -433,6 +435,7 @@ export function loadClaudeProject(opts: {
     rules: rulesResult.rules,
     claudeMd: claudeMdResult.files,
     mcp,
+    ...(agentMcpAdmission === undefined ? {} : { agentMcpAdmission }),
     diagnostics,
     mergedHooks,
     plugins,

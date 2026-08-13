@@ -612,6 +612,142 @@ describe("SendMessage tool — steer + refusals", () => {
     expect(h.created.length).toBe(createdBefore);
   });
 
+  it("fails a completed resume when its original named definition disappeared before any worktree/provider activity", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const transcriptPath = fakeMainSessionFile();
+    const id = mintAgentId();
+    registry.register({
+      agentId: id, agentName: "removed-reviewer", depth: 1, cwd: path.dirname(transcriptPath),
+      transcriptPath, resumable: true, oneShot: false,
+    });
+    registry.markSettled(id, { outcome: "completed" });
+    let worktreeEntries = 0;
+    const h = fakeSdk({ replies: ["must not run"] });
+    const runtime = makeSubagentRuntime([], h.sdk, {
+      subagentRegistry: registry,
+      worktrees: {
+        enter: async () => { worktreeEntries += 1; return { ok: false, diagnostics: [] }; },
+        exit: async () => ({}),
+      },
+    });
+    const sm = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as unknown as ToolLike;
+    const accepted = await sm.execute("missing", { to: id, message: "continue" });
+    const taskId = String(accepted.details.taskId);
+    await backgroundTasks.wait(taskId);
+    expect(backgroundTasks.get(taskId)).toMatchObject({ status: "failed" });
+    expect(backgroundTasks.get(taskId)?.error).toContain("original agent definition");
+    expect(h.created).toHaveLength(0);
+    expect(worktreeEntries).toBe(0);
+    expect(registry.get(id)).toMatchObject({ state: "settled", outcome: "failed" });
+    const retry = await sm.execute("missing-again", { to: id, message: "status after failure" });
+    await backgroundTasks.wait(String(retry.details.taskId));
+    expect(backgroundTasks.get(String(retry.details.taskId))).toMatchObject({ status: "failed" });
+    expect(registry.get(id)).toMatchObject({ state: "settled", outcome: "failed" });
+  });
+
+  it("settles resumed admission-policy validation failure immediately and keeps later SendMessage effect-free", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const transcriptPath = fakeMainSessionFile();
+    const id = mintAgentId();
+    registry.register({
+      agentId: id, agentName: "reviewer", depth: 1, cwd: path.dirname(transcriptPath),
+      transcriptPath, resumable: true, oneShot: false,
+    });
+    registry.markSettled(id, { outcome: "completed" });
+    const h = fakeSdk({ replies: ["must not run"] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      subagentRegistry: registry,
+      validateMcpAgent: () => { throw new Error("agent MCP admission context is unavailable"); },
+    });
+    const sm = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as unknown as ToolLike;
+
+    for (const call of ["policy-1", "policy-2"]) {
+      const accepted = await sm.execute(call, { to: id, message: "continue" });
+      const taskId = String(accepted.details.taskId);
+      await backgroundTasks.wait(taskId);
+      expect(backgroundTasks.get(taskId)).toMatchObject({ status: "failed" });
+      expect(backgroundTasks.get(taskId)?.error).toContain("admission context is unavailable");
+      expect(registry.get(id)).toMatchObject({ state: "settled", outcome: "failed" });
+    }
+    expect(h.created).toHaveLength(0);
+  });
+
+  it("completed resume uses the current matching definition/policy and a fresh scope with the original cwd", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const main = fakeMainSessionFile();
+    const source = { path: "/project/.claude/agents/reviewer.md", scope: "project" as const };
+    const agents = [makeAgent({ name: "reviewer", tools: ["Read"], source })];
+    const h = fakeSdk({ replies: ["first", "resumed"] });
+    const prepared: Array<{ tools: string[] | undefined; cwd: string; scope: number }> = [];
+    const closed: number[] = [];
+    let policyVersion = 1;
+    const runtime = makeSubagentRuntime(agents, h.sdk, {
+      subagentRegistry: registry,
+      getMainSessionFile: () => main,
+      validateMcpAgent: (agent) => {
+        expect(agent.metadata?.policy).toBe(`v${policyVersion}`);
+      },
+      prepareMcpFor: async (agent, cwd) => {
+        const scope = prepared.length + 1;
+        prepared.push({ tools: agent.tools, cwd, scope });
+        return {
+          scope: {
+            whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+            diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [`mcp__session-v${policyVersion}__tool`],
+            borrowedServerNames: () => [`session-v${policyVersion}`], callTool: async () => ({}), readResource: async () => ({}),
+            shutdown: async () => { closed.push(scope); return { confirmed: [`scope-${scope}`], unconfirmed: [], diagnostics: [] }; },
+            retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+          },
+          activeOwnedStdioServerNames: () => [],
+        };
+      },
+    });
+    agents[0] = { ...agents[0]!, metadata: { policy: "v1" } };
+    const first = await runtime.dispatch({ subagentType: "reviewer", prompt: "first", depth: 1 });
+    const originalCwd = registry.get(first.agentId)!.cwd;
+
+    policyVersion = 2;
+    agents[0] = makeAgent({ name: "reviewer", tools: ["Grep"], source, metadata: { policy: "v2" } });
+    const sm = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as unknown as ToolLike;
+    const accepted = await sm.execute("resume-current", { to: first.agentId, message: "continue" });
+    await backgroundTasks.wait(String(accepted.details.taskId));
+
+    expect(prepared).toEqual([
+      { tools: ["Read"], cwd: originalCwd, scope: 1 },
+      { tools: ["Grep"], cwd: originalCwd, scope: 2 },
+    ]);
+    expect(closed).toEqual([1, 2]);
+    expect(h.created).toHaveLength(2);
+    expect(registry.get(first.agentId)).toMatchObject({ state: "settled", outcome: "completed", cwd: originalCwd });
+  });
+
+  it("does not fall back to built-in general-purpose when the original authored definition disappears", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const main = fakeMainSessionFile();
+    const agents = [makeAgent({ name: "general-purpose", source: { path: "/project/.claude/agents/general-purpose.md", scope: "project" } })];
+    const h = fakeSdk({ replies: ["authored done", "must not run"] });
+    const runtime = makeSubagentRuntime(agents, h.sdk, {
+      subagentRegistry: registry,
+      getMainSessionFile: () => main,
+    });
+    const first = await runtime.dispatch({ subagentType: "general-purpose", prompt: "work", depth: 1 });
+    expect(first.resumable).toBe(true);
+    agents.splice(0);
+
+    const sm = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as unknown as ToolLike;
+    const accepted = await sm.execute("resume", { to: first.agentId, message: "continue" });
+    const taskId = String(accepted.details.taskId);
+    await backgroundTasks.wait(taskId);
+    expect(backgroundTasks.get(taskId)?.error).toContain("original agent definition");
+    expect(registry.get(first.agentId)?.state).toBe("settled");
+    expect(registry.get(first.agentId)?.outcome).toBe("failed");
+    expect(h.created).toHaveLength(1);
+  });
+
   it("refuses one-shot builtins (Explore) — never resumed nor steered", async () => {
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();

@@ -29,9 +29,22 @@ import type {
   SteerableSession,
   SubagentAdmission,
   SubagentRegistry,
+  SubagentRegistryRecord,
   SubagentUsage,
+  SubagentMessageSource,
+  SubagentAgentProvenance,
+  ActiveCheckpointStopEligibility,
+  CheckpointStopAttemptIdentity,
+  CheckpointStopTerminalEvidence,
 } from "./subagent-registry.js";
-import { guardSteer, oneShotRefusal, userStoppedRefusal } from "./subagent-registry.js";
+import {
+  formatRetainedInputReport,
+  guardSteer,
+  oneShotRefusal,
+  retainedInputCount,
+  taskOutputAgentLocator,
+  userStoppedRefusal,
+} from "./subagent-registry.js";
 import {
   agentTrailerFrame,
   agentTrailerLine,
@@ -68,12 +81,23 @@ import {
 import {
   MainSessionCheckpointGate,
   promiseCompactionAttempt,
+  type CancelledInputHandoff,
+  type CancelledInputResolution,
   type CancellationKind,
   type CheckpointProgress,
+  type HostDeadlinePolicy,
+  type HostInputClass,
+  type HostInputLease,
+  type MidRunCompactionController,
   type QueuedInputShadow,
   type ResumeContext,
   type ResumeToken,
+  type RetainedInputOccurrenceEnvelope,
 } from "./mid-run-compaction.js";
+import {
+  createRetainedInputReport,
+  type RetainedInputReport,
+} from "./retained-input-report.js";
 import {
   budgetSkillReinjection,
   newSkillActivationState,
@@ -84,6 +108,18 @@ import {
   SubagentRecoveryProgress,
   type SubagentRecoveryDisposition,
 } from "./subagent-recovery.js";
+import type { AgentMcpScope } from "./agent-mcp.js";
+
+const AGENT_MCP_WARNING_PREFIX = "Agent MCP availability warning:";
+const AGENT_MCP_CLEANUP_WARNING_PREFIX = "Agent MCP cleanup warning:";
+
+export interface DispatchMcpContext {
+  readonly scope: AgentMcpScope;
+  readonly setupWarning?: string;
+  /** Queried at successful EnterWorktree time; startup snapshots can outlive the server. */
+  readonly activeOwnedStdioServerNames?: () => readonly string[];
+  readonly reportPinWarning?: (warning: string) => void;
+}
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -117,6 +153,7 @@ export type SubagentCustomToolsFactory = (
   notebookSession: NotebookSessionState,
   activation: SkillActivationState,
   captureUniversalStop?: () => () => boolean,
+  mcp?: DispatchMcpContext,
 ) => unknown[];
 
 export interface SubagentRuntimeDeps {
@@ -150,8 +187,12 @@ export interface SubagentRuntimeDeps {
    * NotebookEdit tools; it is never reconstructed by the factory.
    */
   customToolsFor: SubagentCustomToolsFactory;
-  /** All Claude tool names the harness knows (for gateTools' allKnown). */
-  allKnownToolNames: () => string[];
+  /** Builds the effectful dispatch-local MCP scope after initial worktree admission. */
+  prepareMcpFor?: (agent: ClaudeAgent, spawnCwd: string, signal: AbortSignal) => Promise<DispatchMcpContext>;
+  /** Fail-closed admission dependency check performed before hooks/worktrees/effects. */
+  validateMcpAgent?: (agent: ClaudeAgent) => void;
+  /** All known Claude tool names, using the exact dispatch MCP scope when supplied. */
+  allKnownToolNames: (scope?: AgentMcpScope) => string[];
   permissionEngine: PermissionEngine;
   hookRunner: HookRunner;
   getCwd: () => string;
@@ -182,6 +223,18 @@ export interface SubagentRuntimeDeps {
   clipMaxTokens?: number;
   /** Child sessions use the same resolved proactive threshold as the main session. */
   proactiveCompactPercent?: number;
+  /** Dormant until production composes canonical post-compaction cancellation custody. */
+  compactionCancellationRecovery?: {
+    registry: SubagentRegistry;
+    /** Deterministic deadline seam used by focused child lifecycle tests. */
+    deadlinePolicy?: HostDeadlinePolicy;
+    /** Test observation seam after trigger ownership is scheduled but before SDK invocation. */
+    onTriggerScheduledForTest?: () => void;
+    /** Observe canonical-store ordering without exposing child controller ownership in production. */
+    onCanonicalStoreForTest?: (stored: boolean, controller: MidRunCompactionController) => void;
+    /** Observe controller progress ordering even when ordinary stopped-run presentation is suppressed. */
+    onControllerProgressForTest?: (event: CheckpointProgress, controller: MidRunCompactionController) => void;
+  };
   /**
    * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
    * state. Sharing the parent's injector would let a subagent's file touches consume
@@ -384,6 +437,7 @@ interface PiSession {
     message: { customType: string; content: unknown; display: boolean; details?: unknown },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
   ): Promise<void>;
+  clearQueue?(): { steering: unknown[]; followUp: unknown[] };
   setThinkingLevel?(level: string): void;
   /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
   abort?(): Promise<void> | void;
@@ -466,6 +520,8 @@ export interface DispatchResult {
   usage?: DispatchUsage;
   /** True when exhaustion retained this exact live guarded session for recovery/stop. */
   checkpointPaused?: boolean;
+  /** Structured custody for input left undelivered by a settled resumed cancellation. */
+  retainedInputReport?: RetainedInputReport;
   /** True only for an ordinary terminal assistant error after the session ran. */
   terminalAssistantError?: true;
   /** State-aware recovery advice for an ordinary transient-category terminal failure. */
@@ -589,6 +645,23 @@ const CAPTURED_LINE_CAP = 120;
  * `resolved`/`agent`; `opts.agentOverride` stays undefined (so `overrideDispatch`
  * is false and the fork isn't mistaken for a skill override).
  */
+function agentProvenance(agent: ClaudeAgent): SubagentAgentProvenance {
+  return Object.freeze({
+    kind: agent.builtin === true ? "builtin" : "authored",
+    sourcePath: agent.source.path,
+    sourceScope: agent.source.scope,
+    ...(agent.source.pluginId === undefined ? {} : { pluginId: agent.source.pluginId }),
+  });
+}
+
+function sameAgentProvenance(
+  current: SubagentAgentProvenance,
+  original: SubagentAgentProvenance,
+): boolean {
+  return current.kind === original.kind && current.sourcePath === original.sourcePath &&
+    current.sourceScope === original.sourceScope && current.pluginId === original.pluginId;
+}
+
 function buildForkAgent(): ClaudeAgent {
   return {
     name: FORK_SUBAGENT_TYPE,
@@ -694,6 +767,14 @@ function createPreloadDiagnosticCollector(
   };
 }
 
+type RetainedCheckpointOwner = {
+  recover: (text: string) => Promise<DispatchResult>;
+  cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
+  operation?: Promise<DispatchResult>;
+  cleanupPromise?: Promise<void>;
+  stopping: boolean;
+};
+
 /** Adapts one live child AgentSession to the shared checkpoint state machine. */
 class ChildCheckpointCoordinator {
   readonly activation: SkillActivationState;
@@ -712,23 +793,36 @@ class ChildCheckpointCoordinator {
     proactive: boolean;
     trigger: "auto" | "manual";
   } | undefined;
-  private retained: {
-    recover: (text: string) => Promise<DispatchResult>;
-    cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
-    operation?: Promise<DispatchResult>;
-    cleanupPromise?: Promise<void>;
-    stopping: boolean;
-  } | undefined;
+  private retained: RetainedCheckpointOwner | undefined;
+  private readonly retainedReady = childDeferred<RetainedCheckpointOwner>();
+  private readonly dispatchSettled = childDeferred();
   private activeResume: {
     generation: number;
     token: ResumeToken;
+    context: ResumeContext;
     started: ChildDeferred;
     providerOpen: ChildDeferred;
     settled: ChildDeferred;
     run: Promise<void>;
     agentSettled: boolean;
     runCompleted: boolean;
+    runRejected: boolean;
+    abortedEvidence: boolean;
+    triggerLease?: HostInputLease;
+    triggerEnvelope: object;
+    triggerAccepted: ChildDeferred;
+    triggerStarted: boolean;
+    triggerInvocation: "scheduled" | "invoked" | "prevented";
+    activeStreaming: boolean;
+    invalidEvidence: boolean;
+    checkpointStopEligibility?: ActiveCheckpointStopEligibility;
   } | undefined;
+  private readonly pendingReplayEnvelopes = new Map<RetainedInputOccurrenceEnvelope, {
+    shadow: QueuedInputShadow;
+    lease?: HostInputLease;
+    delivery: "steer" | "followUp";
+    content: QueuedInputShadow["content"];
+  }>();
   private readonly scopedHookDiagnosticFingerprints = new Set<string>();
   private scopedHookDiagnosticsSaturated = false;
 
@@ -738,11 +832,13 @@ class ChildCheckpointCoordinator {
     private readonly agentName: string,
     private readonly hookAgentType: string,
     private readonly agentId: string,
+    private readonly dispatchGeneration: number,
     private readonly cwd: CwdState,
     hooks: HookRunnerLike,
     private readonly diagnostics: Diagnostic[],
     private readonly surfaceDiagnostic?: (diagnostic: Diagnostic) => void,
     private readonly emitProgress?: (snapshot: ProgressSnapshot) => void,
+    private readonly cancellationRecovery?: SubagentRuntimeDeps["compactionCancellationRecovery"],
   ) {
     const identityWrap = (runner: HookRunnerLike): HookRunnerLike => ({
       fire: (eventName, payload, toolCall) => runner.fire(
@@ -753,11 +849,19 @@ class ChildCheckpointCoordinator {
     });
     this.activation = newSkillActivationState(new Map(), identityWrap);
     this.hooks = this.hookFacade(hooks);
-    this.gate = new MainSessionCheckpointGate(sessionId, threshold);
+    this.gate = new MainSessionCheckpointGate(
+      sessionId,
+      threshold,
+      cancellationRecovery?.deadlinePolicy,
+    );
     this.gate.attachExecution({
       progress: (event) => this.progress(event),
       compact: (signal) => this.compact(signal),
       resume: (context) => this.resume(context),
+      ...(cancellationRecovery
+        ? { cancelledInput: (handoff: CancelledInputHandoff, context: ResumeContext) =>
+            this.reclaimCancelledInput(handoff, context) }
+        : {}),
     });
   }
 
@@ -769,6 +873,163 @@ class ChildCheckpointCoordinator {
 
   attachContextReset(reset: (() => void) | undefined): void {
     this.resetContextInjection = reset;
+  }
+
+  private hostOperation<T>(inputClass: HostInputClass, operation: () => T | Promise<T>): Promise<T> {
+    const admission = this.gate.hostInputAdmission(inputClass);
+    if (admission.kind === "refuse-settling") {
+      throw new Error(`Subagent "${this.agentName}" is settling a checkpoint cancellation. Retry only after the parent call returns; this message was not sent.`);
+    }
+    if (admission.kind === "inactive") return Promise.resolve().then(operation);
+    const running = Promise.resolve().then(operation);
+    void running.then(
+      () => { this.gate.settleHostInput(admission.lease); },
+      () => { this.gate.settleHostInput(admission.lease); },
+    );
+    return running;
+  }
+
+  private invalidateResumeEvidence(resume: NonNullable<ChildCheckpointCoordinator["activeResume"]>): void {
+    resume.invalidEvidence = true;
+    const controller = this.gate.currentController();
+    if (controller.invalidateResumedCancellation(resume.token)) {
+      this.cancellationRecovery?.registry.quarantineCheckpoint(this.agentId);
+    }
+  }
+
+  private customMessageStarted(event: any): void {
+    const message = event?.message;
+    if (!message) return;
+    const resume = this.activeResume;
+    const piCCMessage = message.customType === "picc-checkpoint-resume" ||
+      message.customType === "picc-retained-parent-input";
+    if (message.role !== "custom") {
+      if (this.cancellationRecovery && resume && piCCMessage) this.invalidateResumeEvidence(resume);
+      return;
+    }
+    if (resume && message.details?.piccCheckpointResume === resume.triggerEnvelope) {
+      const lease = resume.triggerLease;
+      const valid = !!lease && !resume.triggerStarted && resume.triggerInvocation === "invoked" &&
+        message.customType === "picc-checkpoint-resume" &&
+        message.content === "Context was compacted. Continue the same pending task from the preserved state.";
+      if (!valid || !scrubEnvelope(message.details, "piccCheckpointResume")) {
+        if (lease) this.gate.settleHostInput(lease);
+        resume.triggerLease = undefined;
+        resume.triggerAccepted.resolve();
+        this.invalidateResumeEvidence(resume);
+        return;
+      }
+      resume.triggerStarted = true;
+      resume.activeStreaming = true;
+      resume.triggerLease = undefined;
+      this.gate.settleHostInput(lease);
+      resume.triggerAccepted.resolve();
+      return;
+    }
+    if (this.cancellationRecovery && resume && message.customType === "picc-checkpoint-resume") {
+      this.invalidateResumeEvidence(resume);
+      return;
+    }
+
+    const details = message.details;
+    const envelope = details?.piccCheckpointInput as RetainedInputOccurrenceEnvelope | undefined;
+    const pending = envelope && this.pendingReplayEnvelopes.get(envelope);
+    if (!envelope || !pending) {
+      if (this.cancellationRecovery && resume && message.customType === "picc-retained-parent-input") {
+        this.invalidateResumeEvidence(resume);
+      }
+      return;
+    }
+    const { shadow, lease, delivery, content } = pending;
+    // Installed Pi message_start carries no delivery metadata. The authenticated resumed
+    // stream plus this exact PiCC-owned envelope and pending physical send class are the authority.
+    const valid = !!resume && resume.activeStreaming && !resume.invalidEvidence &&
+      (delivery === "steer" || delivery === "followUp") && message.content === content &&
+      message.customType === "picc-retained-parent-input" &&
+      envelope.sessionId === shadow.sessionId && envelope.generation === shadow.generation &&
+      envelope.id === shadow.id && envelope.delivery === delivery &&
+      scrubEnvelope(details, "piccCheckpointInput");
+    this.pendingReplayEnvelopes.delete(envelope);
+    if (lease) this.gate.settleHostInput(lease);
+    if (!valid || this.gate.currentController().consumeShadow(
+      shadow.generation,
+      shadow.id,
+      shadow.sessionId,
+    ) !== shadow) {
+      if (resume) this.invalidateResumeEvidence(resume);
+      else this.gate.currentController().failUnconfirmedHost(shadow.generation);
+    }
+  }
+
+  private agentEnded(event: any): void {
+    const resume = this.activeResume;
+    const controller = this.gate.currentController();
+    if (!resume || resume.generation !== controller.snapshot().generation || !resume.triggerStarted) return;
+    if (resume.agentSettled || !resume.activeStreaming) {
+      this.invalidateResumeEvidence(resume);
+      return;
+    }
+    const messages = Array.isArray(event?.messages) ? event.messages : [];
+    const terminal = [...messages].reverse().find((message) => message?.role === "assistant");
+    const sessionTerminal = [...(this.session?.messages ?? [])].reverse()
+      .find((message) => message?.role === "assistant");
+    const cancellationExpected = controller.snapshot().phase === "terminalizing" ||
+      sessionTerminal?.stopReason === "aborted";
+    resume.activeStreaming = false;
+    if (cancellationExpected) {
+      if (terminal?.stopReason !== "aborted" || sessionTerminal?.stopReason !== "aborted" ||
+          resume.abortedEvidence || !controller.resumedAborted(resume.token)) {
+        this.invalidateResumeEvidence(resume);
+        return;
+      }
+      resume.abortedEvidence = true;
+    } else if (terminal?.stopReason === "aborted") {
+      this.invalidateResumeEvidence(resume);
+    }
+  }
+
+  private reclaimCancelledInput(
+    handoff: CancelledInputHandoff,
+    context: ResumeContext,
+  ): CancelledInputResolution {
+    const registry = this.cancellationRecovery?.registry;
+    if (!registry || context.token !== this.activeResume?.token || handoff.generation !== context.generation ||
+        handoff.sessionId !== this.gate.currentController().sessionId) {
+      throw new Error("Child cancellation custody is stale or unavailable");
+    }
+    // An accepted SDK send is not consumption. Cancellation reclaims every exact
+    // still-pending envelope before publishing the report, making later host callbacks inert.
+    for (const [envelope, pending] of this.pendingReplayEnvelopes) {
+      if (pending.shadow.sessionId === handoff.sessionId &&
+          pending.shadow.generation === handoff.generation) {
+        if (pending.lease) this.gate.settleHostInput(pending.lease);
+        this.pendingReplayEnvelopes.delete(envelope);
+      }
+    }
+    const stageGuidance = handoff.continuationStarted
+      ? `Subagent "${this.agentName}" stopped after its compacted continuation began.`
+      : `Subagent "${this.agentName}" stopped at the compacted-continuation boundary; continuation startup was prevented or rejected before an authenticated stream was observed.`;
+    const report = createRetainedInputReport({
+      agentId: this.agentId,
+      sessionId: handoff.sessionId,
+      generation: handoff.generation,
+      stage: "resumed-cancellation",
+      occurrences: handoff.retained,
+      guidance: `${stageGuidance} Files, tools, and external effects from earlier or ambiguous work may already exist; inspect the transcript and working tree before explicitly resending represented input. The report's unrepresentable count names retained input that could not be stored safely. No retained input was replayed automatically.`,
+    });
+    const stored = registry.storeRetainedInputReport(this.agentId, report);
+    this.cancellationRecovery?.onCanonicalStoreForTest?.(stored, this.gate.currentController());
+    if (!stored) {
+      registry.quarantineCheckpoint(this.agentId);
+      throw new Error("Canonical retained-input report storage failed");
+    }
+    return {
+      sessionId: handoff.sessionId,
+      generation: handoff.generation,
+      token: handoff.token,
+      sessionDisposition: "reusable",
+      resolutions: handoff.retained.map((shadow) => ({ id: shadow.id, disposition: "reported" as const })),
+    };
   }
 
   wrapTools(tools: unknown[]): unknown[] {
@@ -843,10 +1104,13 @@ class ChildCheckpointCoordinator {
     const child = this;
     return (pi: { on(event: string, handler: (event: any, ctx: any) => unknown): void }) => {
       pi.on("message_end", (event, ctx) => child.gate.assistantMessageEnded(event?.message, ctx));
-      pi.on("message_start", (event) => child.gate.userMessageStarted(
-        event?.message,
-        event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
-      ));
+      pi.on("message_start", (event) => {
+        child.customMessageStarted(event);
+        child.gate.userMessageStarted(
+          event?.message,
+          event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
+        );
+      });
       pi.on("tool_execution_end", (event) => child.gate.toolExecutionEnded(event));
       pi.on("turn_end", (_event, ctx) => child.gate.turnEnded(ctx));
       pi.on("turn_start", async (_event, ctx) => {
@@ -856,10 +1120,13 @@ class ChildCheckpointCoordinator {
       pi.on("before_provider_request", async (_event, ctx) => {
         await child.gate.beforeProviderRequest(ctx);
       });
+      pi.on("agent_end", (event) => child.agentEnded(event));
       pi.on("agent_settled", async (_event, ctx) => child.settled(ctx));
       pi.on("session_before_compact", async (event) => child.beforeCompact(event));
       pi.on("session_compact", async (event) => child.afterCompact(event));
-      pi.on("session_shutdown", async () => child.cancel("shutdown"));
+      // A child session boundary may confirm cancellation, but parent-session
+      // persistence must authorize retained cleanup separately.
+      pi.on("session_shutdown", async () => child.cancel("shutdown", true));
     };
   }
 
@@ -867,6 +1134,10 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const snapshot = controller.snapshot();
     await controller.stableBarrier(snapshot.generation);
+  }
+
+  settleDispatch(): void {
+    this.dispatchSettled.resolve();
   }
 
   consumeStoppedRun(): boolean {
@@ -879,10 +1150,37 @@ class ChildCheckpointCoordinator {
     return this.gate.currentController().snapshot().phase === "exhausted";
   }
 
+  checkpointStopEligibility(): ActiveCheckpointStopEligibility | undefined {
+    const resume = this.activeResume;
+    const snapshot = this.gate.currentController().snapshot();
+    if (!this.cancellationRecovery || !this.summaryCommitted || !resume || resume.invalidEvidence ||
+        !resume.triggerStarted || resume.generation !== snapshot.generation) return undefined;
+    const activelyStreaming = snapshot.phase === "resuming" && resume.activeStreaming;
+    const settlingCancellation = snapshot.phase === "terminalizing" &&
+      snapshot.stage === "resumed-cancellation";
+    if (!activelyStreaming && !settlingCancellation) return undefined;
+    return resume.checkpointStopEligibility;
+  }
+
+  report(): RetainedInputReport | undefined {
+    return this.cancellationRecovery?.registry.get(this.agentId)?.retainedInputReport;
+  }
+
+  isQuarantined(): boolean {
+    return this.cancellationRecovery?.registry.get(this.agentId)?.checkpointQuarantined === true;
+  }
+
   failureMessage(): string {
     const snapshot = this.gate.currentController().snapshot();
+    if (this.isQuarantined() || snapshot.failureCategory === "unconfirmed-host") {
+      const report = this.report();
+      const retainedGuidance = report
+        ? "Recover only the represented retained input from the canonical parent report; its unrepresentable count requires separate transcript inspection."
+        : "Retained input was not safely reportable; no parent-result recovery source exists.";
+      return `Subagent "${this.agentName}" has unconfirmed host work after checkpoint cancellation. Its live session, transcript, retained input, and worktree remain quarantined; do not resume, replace, or release it in this process. Do not retry in this process. ${retainedGuidance} Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files/tools/external effects.`;
+    }
     if (snapshot.failureCategory === "restoration-paused") {
-      return `Automatic context compaction for subagent "${this.agentName}" committed, but restoration or continuation failed. The agent is paused and no continuation ran. Do not compact it again or retry SendMessage; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`;
+      return `Automatic context compaction for subagent "${this.agentName}" committed, but restoration or continuation did not reach a confirmed reusable completion. The agent is paused; continuation may have been prevented or may have begun before the failure. Files, tools, and external effects may already exist, so inspect them before abandoning it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input. Do not compact it again or retry SendMessage.`;
     }
     if (snapshot.failureCategory === "hook-blocked") {
       return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; before this process exits, repair or disable the hook and use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
@@ -899,31 +1197,99 @@ class ChildCheckpointCoordinator {
     // stable so TaskStop and shutdown can still join the whole chain.
     if (this.retained) return;
     this.retained = { recover, cleanup, stopping: false };
+    this.retainedReady.resolve(this.retained);
   }
 
   private claimRetainedCleanup(
-    retained: NonNullable<ChildCheckpointCoordinator["retained"]>,
+    retained: RetainedCheckpointOwner,
     outcome: DispatchOutcome,
     finalText?: string,
   ): Promise<void> {
-    // This synchronous claim is the sole entrance to disposal, registry
-    // settlement, worktree release, and the final SubagentStop hook. `stopping`
-    // is reserved for an external cancellation so recovery can distinguish a
-    // normal terminal cleanup from a concurrent stop that must suppress output.
+    // This synchronous claim is the sole entrance to disposal, registry settlement,
+    // worktree release, and the final SubagentStop hook. `stopping` is reserved for an
+    // external cancellation so recovery can distinguish normal terminal cleanup from a
+    // concurrent stop that must suppress output. Quarantine precedes and forbids that owner.
+    if (this.isQuarantined()) return Promise.reject(new Error(this.failureMessage()));
     if (!retained.cleanupPromise) retained.cleanupPromise = retained.cleanup(outcome, finalText);
     return retained.cleanupPromise;
   }
 
-  async cancel(kind: CancellationKind): Promise<void> {
+  async stopCheckpoint(
+    attempt?: CheckpointStopAttemptIdentity,
+  ): Promise<CheckpointStopTerminalEvidence | void> {
+    const controller = this.gate.currentController();
+    const before = controller.snapshot();
+    const generation = before.generation;
+    let retained = this.retained;
+    const activeEligibility = this.checkpointStopEligibility();
+    const safePreCommitCleanup = before.phase === "exhausted" && before.cancellationCommitted !== true &&
+      (before.failureCategory === "operational" || before.failureCategory === "hook-blocked");
+    const deferCleanup = attempt?.deferCleanup === true && !safePreCommitCleanup;
+    const activeAttempt = activeEligibility !== undefined &&
+      attempt?.checkpointOwner === activeEligibility.owner &&
+      attempt.checkpointGeneration === activeEligibility.checkpointGeneration;
+    await this.cancel(deferCleanup ? "shutdown" : "task-stop", deferCleanup);
+    if (!attempt || attempt.agentId !== this.agentId || attempt.dispatchGeneration !== this.dispatchGeneration) return;
+    if (attempt.checkpointOwner !== undefined && !activeAttempt) return;
+    if (this.gate.currentController() !== controller || controller.snapshot().generation !== generation) return;
+    if (activeAttempt && !retained) {
+      retained = await Promise.race([
+        this.retainedReady.promise,
+        this.dispatchSettled.promise.then(() => undefined),
+      ]);
+    }
+    if (activeAttempt && retained && !deferCleanup) {
+      retained.stopping = true;
+      await this.claimRetainedCleanup(retained, "aborted");
+    }
+    if (safePreCommitCleanup && retained && this.retained === retained && retained.cleanupPromise && !this.isQuarantined()) {
+      return Object.freeze({
+        confirmed: true as const,
+        attemptId: attempt.attemptId,
+        kind: "ordinary-cleanup" as const,
+      });
+    }
+    const report = this.cancellationRecovery?.registry.get(this.agentId)?.retainedInputReport;
+    if (!report || report.generation !== generation) return;
+    const releaseCleanup = deferCleanup && retained
+      ? async (attemptId: object): Promise<void> => {
+          if (attemptId !== attempt.attemptId || this.retained !== retained || this.isQuarantined()) {
+            throw new Error("checkpoint cleanup authority is stale");
+          }
+          await this.claimRetainedCleanup(retained, "aborted");
+        }
+      : undefined;
+    return Object.freeze({
+      confirmed: true as const, attemptId: attempt.attemptId, report,
+      ...(releaseCleanup ? { releaseCleanup } : {}),
+    });
+  }
+
+  async cancel(kind: CancellationKind, deferRetainedCleanup = false): Promise<void> {
     const retained = this.retained;
     if (retained) retained.stopping = true;
     const session = this.session;
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
-    const cancellation = this.gate.cancel(kind);
     this.compactOperation = undefined;
     try { session?.abortCompaction?.(); } catch { /* cancellation still joins the run */ }
     const resume = this.activeResume;
+    const snapshot = controller.snapshot();
+    const sharedResumeCancellation = snapshot.phase === "resuming" ||
+      (snapshot.phase === "terminalizing" && snapshot.stage === "resumed-cancellation");
+    if (this.cancellationRecovery && resume && resume.generation === generation && sharedResumeCancellation) {
+      try {
+        const outcome = await resume.context.requestCancellation(kind);
+        if (!outcome.cancelled) throw new Error("Checkpoint cancellation request is stale");
+        await controller.stableBarrier(generation);
+      } catch (error) {
+        if (!this.isQuarantined()) this.cancellationRecovery.registry.quarantineCheckpoint(this.agentId);
+        throw error;
+      }
+      if (retained && !deferRetainedCleanup) await this.claimRetainedCleanup(retained, "aborted");
+      return;
+    }
+    const cancellation = this.gate.cancel(kind);
     this.activeResume = undefined;
     resume?.started.resolve();
     resume?.providerOpen.resolve();
@@ -933,18 +1299,39 @@ class ChildCheckpointCoordinator {
     await retained?.operation?.catch(() => undefined);
     await cancellation;
     await controller.stableBarrier(generation);
-    if (retained) await this.claimRetainedCleanup(retained, "aborted");
+    if (retained && !deferRetainedCleanup) await this.claimRetainedCleanup(retained, "aborted");
   }
 
-  steer(text: string): Promise<void> | void {
+  private deliverParentInput(
+    text: string,
+    delivery: "steer" | "followUp",
+    source: SubagentMessageSource = "send-message",
+  ): Promise<void> | void {
+    if (!this.cancellationRecovery) {
+      return delivery === "steer" ? this.session?.steer?.(text) : this.session?.followUp?.(text);
+    }
     const controller = this.gate.currentController();
     const snapshot = controller.snapshot();
     if (snapshot.phase === "exhausted") throw new Error(this.failureMessage());
     if (snapshot.phase !== "idle" && snapshot.phase !== "cancelled") {
-      const retained = controller.shadowInput(snapshot.generation, text, "steer");
+      const retained = controller.shadowInput(snapshot.generation, text, delivery);
       if (retained) return;
+      const report = this.cancellationRecovery.registry.get(this.agentId)?.retainedInputReport;
+      const locator = report
+        ? ` Retrieve it with ${taskOutputAgentLocator(this.agentId)}.`
+        : ` If settlement is confirmed, use ${taskOutputAgentLocator(this.agentId)}.`;
+      const origin = source === "panel" ? "Panel steering" : "SendMessage";
+      throw new Error(`${origin} was refused because subagent "${this.agentName}" is settling checkpoint cancellation; the message was not sent.${locator} Inspect possible existing effects before retrying.`);
     }
-    return this.session?.steer?.(text);
+    return delivery === "steer" ? this.session?.steer?.(text) : this.session?.followUp?.(text);
+  }
+
+  steer(text: string, metadata?: { source: SubagentMessageSource }): Promise<void> | void {
+    return this.deliverParentInput(text, "steer", metadata?.source ?? "send-message");
+  }
+
+  followUp(text: string): Promise<void> | void {
+    return this.deliverParentInput(text, "followUp");
   }
 
   recover(text: string): Promise<DispatchResult> {
@@ -986,7 +1373,7 @@ class ChildCheckpointCoordinator {
       void error;
       if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
       if (this.summaryCommitted) {
-        await controller.failAfterCommittedSummary(generation);
+        await controller.failAfterCommittedSummary(generation, "restoration");
         throw new Error(`Compaction committed before recovery failed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
       }
       const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
@@ -996,7 +1383,7 @@ class ChildCheckpointCoordinator {
     }
     if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
     if (this.restorationFailed) {
-      await controller.failAfterCommittedSummary(generation);
+      await controller.failAfterCommittedSummary(generation, "restoration");
       throw new Error(`Context or skill restoration failed after compaction committed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
     }
     const recovered = controller.recoverAfterManualCompaction(token);
@@ -1019,7 +1406,11 @@ class ChildCheckpointCoordinator {
         throw new Error(this.failureMessage());
       }
       const currentController = this.gate.currentController();
-      await currentController.failAfterCommittedSummary(currentController.snapshot().generation);
+      const currentSnapshot = currentController.snapshot();
+      await currentController.failAfterCommittedSummary(
+        currentSnapshot.generation,
+        currentSnapshot.stage ?? "continuation-start",
+      );
       throw new Error(this.failureMessage());
     }
   }
@@ -1041,14 +1432,20 @@ class ChildCheckpointCoordinator {
       return;
     }
     if (resume && resume.generation === controller.snapshot().generation &&
-        controller.snapshot().phase === "resuming") {
+        (controller.snapshot().phase === "resuming" ||
+          (this.cancellationRecovery && controller.snapshot().phase === "terminalizing"))) {
+      if (resume.agentSettled) {
+        if (this.cancellationRecovery) this.invalidateResumeEvidence(resume);
+        return;
+      }
       resume.agentSettled = true;
       // sendCustomMessage is the public ownership promise. agent_settled may
       // precede a later rejection, so success is committed only after both.
       if (resume.runCompleted) {
-        controller.resumedSettled(resume.token);
+        const cancelled = resume.abortedEvidence;
+        controller.resumedSettled(resume.token, cancelled ? "cancelled" : "completed");
         resume.settled.resolve();
-        this.activeResume = undefined;
+        if (!cancelled) this.activeResume = undefined;
       }
       return;
     }
@@ -1091,6 +1488,16 @@ class ChildCheckpointCoordinator {
     const started = childDeferred();
     const providerOpen = childDeferred();
     const settled = childDeferred();
+    if (!this.cancellationRecovery) return this.resumeWithoutCancellationRecovery(context, session);
+    const triggerAccepted = childDeferred();
+    const triggerEnvelope = {};
+    const triggerAdmission = this.gate.hostInputAdmission("continuation-trigger");
+    if (triggerAdmission.kind !== "lease") {
+      throw new Error(triggerAdmission.kind === "refuse-settling"
+        ? "checkpoint continuation admission was revoked"
+        : "checkpoint continuation trigger lacks generation custody");
+    }
+    const triggerLease = triggerAdmission.lease;
     let resume!: NonNullable<ChildCheckpointCoordinator["activeResume"]>;
     const isCurrent = (): boolean => {
       const controller = this.gate.currentController();
@@ -1101,7 +1508,181 @@ class ChildCheckpointCoordinator {
     // Defer the SDK call by one microtask so ownership is installed first, then
     // authenticate again immediately before the public send side effect.
     const run = Promise.resolve().then(() => {
+      if (resume.triggerInvocation === "prevented") return;
       if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+      resume.triggerInvocation = "invoked";
+      if (!context.advancePostCommitStage("continuation-start")) {
+        throw new Error("checkpoint continuation stage authority is stale");
+      }
+      return session.sendCustomMessage!({
+        customType: "picc-checkpoint-resume",
+        content: "Context was compacted. Continue the same pending task from the preserved state.",
+        display: false,
+        details: { piccCheckpointResume: triggerEnvelope },
+      }, { triggerTurn: true });
+    });
+    resume = {
+      generation: context.generation,
+      token: context.token,
+      context,
+      started,
+      providerOpen,
+      settled,
+      run,
+      agentSettled: false,
+      runCompleted: false,
+      runRejected: false,
+      abortedEvidence: false,
+      triggerLease,
+      triggerEnvelope,
+      triggerAccepted,
+      triggerStarted: false,
+      triggerInvocation: "scheduled",
+      activeStreaming: false,
+      invalidEvidence: false,
+      checkpointStopEligibility: Object.freeze({
+        agentId: this.agentId,
+        dispatchGeneration: this.dispatchGeneration,
+        checkpointGeneration: context.generation,
+        owner: Object.freeze({}),
+      }),
+    };
+    this.activeResume = resume;
+    if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) {
+      this.activeResume = undefined;
+      void run.catch(() => undefined);
+      throw new Error("Cannot install child resumed provider barrier");
+    }
+    this.cancellationRecovery.onTriggerScheduledForTest?.();
+    void run.then(() => {
+      resume.runCompleted = true;
+      if (resume.triggerInvocation === "prevented") return;
+      if (resume.agentSettled && this.activeResume === resume) {
+        const cancelled = resume.abortedEvidence;
+        this.gate.currentController().resumedSettled(resume.token, cancelled ? "cancelled" : "completed");
+        resume.settled.resolve();
+        if (!cancelled) this.activeResume = undefined;
+      }
+    }, (error) => {
+      // A rejection before or after turn_start must open every local wait while
+      // rejecting controller settlement; otherwise replay can hang or finish as
+      // a false successful/empty continuation.
+      resume.runRejected = true;
+      started.resolve();
+      providerOpen.resolve();
+      if (resume.triggerLease && !resume.triggerStarted) {
+        this.gate.settleHostInput(resume.triggerLease);
+        resume.triggerLease = undefined;
+        resume.triggerAccepted.resolve();
+      }
+      this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
+      const snapshot = this.gate.currentController().snapshot();
+      if (snapshot.phase === "terminalizing") {
+        if (resume.triggerStarted) this.invalidateResumeEvidence(resume);
+        return;
+      }
+      if (resume.triggerStarted && (resume.abortedEvidence || resume.agentSettled)) {
+        this.invalidateResumeEvidence(resume);
+        return;
+      }
+      settled.reject(error);
+      if (this.activeResume === resume) this.activeResume = undefined;
+    });
+    let replayCompleted = false;
+    return {
+      replay: async (input: QueuedInputShadow) => {
+        await started.promise;
+        // Cancellation settles `started` to release this waiter; it never grants
+        // replay authority. Re-authenticate the supported streaming send class before touching Pi.
+        if (!isCurrent() || (input.delivery !== "steer" && input.delivery !== "followUp")) {
+          return { delivered: false as const };
+        }
+        const envelope: RetainedInputOccurrenceEnvelope = Object.freeze({
+          sessionId: input.sessionId,
+          generation: input.generation,
+          id: input.id,
+          delivery: input.delivery,
+          nonce: {},
+        });
+        const admission = this.gate.hostInputAdmission("retained-replay");
+        if (admission.kind !== "lease") return { delivered: false as const };
+        const details = { piccCheckpointInput: envelope };
+        this.pendingReplayEnvelopes.set(envelope, {
+          shadow: input,
+          lease: admission.lease,
+          delivery: input.delivery,
+          content: input.content,
+        });
+        try {
+          await session.sendCustomMessage!({
+            customType: "picc-retained-parent-input",
+            content: input.content,
+            display: false,
+            details,
+          }, { deliverAs: input.delivery });
+          // The physical SDK call is complete, but custody remains pending until
+          // its exact authenticated message_start consumes the shadow.
+          this.gate.settleHostInput(admission.lease);
+          const pending = this.pendingReplayEnvelopes.get(envelope);
+          if (pending) pending.lease = undefined;
+        } catch (error) {
+          this.pendingReplayEnvelopes.delete(envelope);
+          this.gate.settleHostInput(admission.lease);
+          throw error;
+        }
+        return { delivered: isCurrent() as true | false, pendingHostStart: true };
+      },
+      replayComplete: () => {
+        if (!isCurrent() || replayCompleted) throw new Error("checkpoint resume provider release is not current");
+        replayCompleted = true;
+        providerOpen.resolve();
+      },
+      cancelAndJoin: async () => {
+        started.resolve();
+        providerOpen.resolve();
+        this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
+        if (resume.triggerInvocation === "scheduled") resume.triggerInvocation = "prevented";
+        if (!session.clearQueue || !session.abort) throw new Error("Child queue purge or abort is unavailable");
+        session.clearQueue();
+        if (resume.triggerInvocation === "prevented") {
+          if (resume.triggerLease) {
+            this.gate.settleHostInput(resume.triggerLease);
+            resume.triggerLease = undefined;
+            resume.triggerAccepted.resolve();
+          }
+          await run.catch(() => undefined);
+          return { ending: "pre-start" as const };
+        }
+        const aborting = Promise.resolve(session.abort());
+        await Promise.all([aborting, run.catch(() => undefined), resume.triggerAccepted.promise]);
+        if (resume.runRejected && !resume.triggerStarted) return { ending: "pre-start" as const };
+        if (resume.triggerStarted) await resume.settled.promise;
+        if (resume.runRejected) throw new Error("Child resumed run rejected after authenticated start");
+        if (resume.invalidEvidence || (!resume.runCompleted && !resume.runRejected)) {
+          throw new Error("Child resumed run lacks exact run settlement evidence");
+        }
+        if (!resume.agentSettled) throw new Error("Child resumed run lacks exact final settlement evidence");
+        if (!resume.triggerStarted || !resume.abortedEvidence) {
+          throw new Error("Child resumed run lacks exact aborted terminal evidence");
+        }
+        return { ending: "aborted" as const };
+      },
+    };
+  }
+
+  private resumeWithoutCancellationRecovery(context: ResumeContext, session: PiSession) {
+    const started = childDeferred();
+    const providerOpen = childDeferred();
+    const settled = childDeferred();
+    let resume!: NonNullable<ChildCheckpointCoordinator["activeResume"]>;
+    const isCurrent = () => {
+      const snapshot = this.gate.currentController().snapshot();
+      return this.activeResume === resume && !context.signal.aborted &&
+        snapshot.generation === context.generation && snapshot.phase === "resuming";
+    };
+    const run = Promise.resolve().then(() => {
+      if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+      context.advancePostCommitStage("continuation-start");
       return session.sendCustomMessage!({
         customType: "picc-checkpoint-resume",
         content: "Context was compacted. Continue the same pending task from the preserved state.",
@@ -1111,30 +1692,33 @@ class ChildCheckpointCoordinator {
     resume = {
       generation: context.generation,
       token: context.token,
+      context,
       started,
       providerOpen,
       settled,
       run,
       agentSettled: false,
       runCompleted: false,
+      runRejected: false,
+      abortedEvidence: false,
+      triggerEnvelope: {},
+      triggerAccepted: childDeferred(),
+      triggerStarted: false,
+      triggerInvocation: "invoked",
+      activeStreaming: false,
+      invalidEvidence: false,
     };
     this.activeResume = resume;
-    if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) {
-      this.activeResume = undefined;
-      void run.catch(() => undefined);
-      throw new Error("Cannot install child resumed provider barrier");
-    }
+    if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) throw new Error("Cannot install child resumed provider barrier");
     void run.then(() => {
       resume.runCompleted = true;
       if (resume.agentSettled && this.activeResume === resume) {
         this.gate.currentController().resumedSettled(resume.token);
-        resume.settled.resolve();
+        settled.resolve();
         this.activeResume = undefined;
       }
     }, (error) => {
-      // A rejection before or after turn_start must open every local wait while
-      // rejecting controller settlement; otherwise replay can hang or finish as
-      // a false successful/empty continuation.
+      resume.runRejected = true;
       started.resolve();
       providerOpen.resolve();
       this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
@@ -1146,8 +1730,6 @@ class ChildCheckpointCoordinator {
       settled: settled.promise,
       replay: async (input: QueuedInputShadow) => {
         await started.promise;
-        // Cancellation settles `started` to release this waiter; it never grants
-        // replay authority. Re-authenticate immediately before touching Pi.
         if (!isCurrent()) return { delivered: false as const };
         await session.sendCustomMessage!({
           customType: "picc-retained-parent-input",
@@ -1232,11 +1814,11 @@ class ChildCheckpointCoordinator {
         try {
           if (!isCurrent()) return;
           if (!session.sendCustomMessage) throw new Error("child hook restoration unavailable");
-          await session.sendCustomMessage({
+          await this.hostOperation("restoration-control", () => session.sendCustomMessage!({
             customType: "picc-hook-context",
             content: startedContext,
             display: true,
-          }, { deliverAs: "steer" });
+          }, { deliverAs: "steer" }));
           if (!isCurrent()) return;
         } catch {
           this.restorationFailed = true;
@@ -1272,11 +1854,11 @@ class ChildCheckpointCoordinator {
         try {
           if (!isCurrent()) return;
           if (!session.sendCustomMessage) throw new Error("child skill restoration unavailable");
-          await session.sendCustomMessage({
+          await this.hostOperation("restoration-control", () => session.sendCustomMessage!({
             customType: "picc-preserved",
             content: `Context preserved across compaction (PiCC):\n\n${preserved.text}`,
             display: false,
-          }, { deliverAs: "steer" });
+          }, { deliverAs: "steer" }));
           if (!isCurrent()) return;
         } catch {
           this.restorationFailed = true;
@@ -1284,7 +1866,7 @@ class ChildCheckpointCoordinator {
       }
     } finally {
       if (!operation.proactive && operation.trigger === "auto" && this.restorationFailed && isCurrent()) {
-        await operation.controller.failAfterCommittedSummary(operation.generation);
+        await operation.controller.failAfterCommittedSummary(operation.generation, "restoration");
       }
       if (this.compactOperation === operation) this.compactOperation = undefined;
     }
@@ -1292,6 +1874,10 @@ class ChildCheckpointCoordinator {
 
   private progress(event: CheckpointProgress): void {
     const controller = this.gate.currentController();
+    this.cancellationRecovery?.onControllerProgressForTest?.(event, controller);
+    if (event.failureCategory === "unconfirmed-host") {
+      this.cancellationRecovery?.registry.quarantineCheckpoint(this.agentId);
+    }
     if (this.gate.isLogicalRunStopped() && this.gate.stoppedRunMatches(controller, event.generation)) return;
     const activity = event.category === "checkpoint-exhausted"
       ? "checkpoint paused: recovery required"
@@ -1313,6 +1899,22 @@ class ChildCheckpointCoordinator {
   }
 }
 
+function quarantineRefusal(record: SubagentRegistryRecord, action: string): string {
+  const reportGuidance = record.retainedInputReport
+    ? `Recover represented retained input only with ${taskOutputAgentLocator(record.agentId)}; inspect the transcript for any unrepresentable input.`
+    : "No canonical retained-input report is available; inspect the transcript for retained input.";
+  return `Agent ${record.agentId} ("${record.agentName}") is quarantined for this process lifetime. The requested ${action} was not performed. ${reportGuidance} Do not retry in this process. Exit PiCC completely, start a fresh process and session, then inspect the transcript, worktree, and possible files, tools, and external effects.`;
+}
+
+function scrubEnvelope(details: unknown, key: string): boolean {
+  if (!details || typeof details !== "object") return false;
+  try {
+    return delete (details as Record<string, unknown>)[key] && !(key in details);
+  } catch {
+    return false;
+  }
+}
+
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -1324,8 +1926,26 @@ export function extractText(content: unknown): string {
   return "";
 }
 
+export interface StopAllSubagentOutcome {
+  agentId: string;
+  disposition: "confirmed" | "unconfirmed";
+  report?: RetainedInputReport;
+  stopRequested: boolean;
+  persisted?: boolean;
+  cleanupReleased?: boolean;
+}
+
+export interface StopAllSubagentSessionResult {
+  outcomes: StopAllSubagentOutcome[];
+  confirmed: number;
+  unconfirmed: number;
+}
+
 export class SubagentRuntime {
   private readonly semaphore: Semaphore;
+  private readonly attemptedRetainedPersistence = new WeakSet<object>();
+  private readonly persistedRetainedReports = new WeakSet<object>();
+  private readonly releasedRetainedCleanup = new WeakSet<object>();
   /**
    * Per-depth budgets for nested BACKGROUND dispatches. Each `depth ≥ 2`
    * gets its own `Semaphore` sized like the root, created lazily. A dispatch
@@ -1380,18 +2000,160 @@ export class SubagentRuntime {
 
   /** Stop one retained child owned by this runtime and join its cleanup. */
   async stopCheckpoint(agentId: string): Promise<void> {
-    const record = this.deps.subagentRegistry?.get(agentId);
-    if (record?.state === "running" && record.checkpointPaused) {
-      await record.session?.stopCheckpoint?.();
+    const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
+    const record = (recoveryRegistry ?? this.deps.subagentRegistry)?.get(agentId);
+    if (record?.checkpointQuarantined) throw new Error(quarantineRefusal(record, "stop"));
+    if (record?.state === "running" && (recoveryRegistry
+      ? recoveryRegistry.checkpointStopOwned(agentId)
+      : record.checkpointPaused === true)) {
+      if (recoveryRegistry) {
+        await recoveryRegistry.stopCheckpoint(agentId, "session");
+      } else {
+        // Capability omission preserves the existing direct adapter contract.
+        await record.session?.stopCheckpoint?.();
+      }
     }
   }
 
+  /** Opted-in session boundary for confirmed reports and fail-closed quarantine. */
+  async stopAllRetainedSubagents(options: {
+    persist?: (report: RetainedInputReport) => boolean | Promise<boolean>;
+  } = {}): Promise<StopAllSubagentSessionResult> {
+    const registry = this.deps.compactionCancellationRecovery?.registry;
+    if (!registry) return { outcomes: [], confirmed: 0, unconfirmed: 0 };
+    const outcomes: StopAllSubagentOutcome[] = [];
+    for (const initial of registry.list()) {
+      let record = registry.get(initial.agentId);
+      let stopRequested = false;
+      if (record?.checkpointQuarantined) {
+        // Quarantine is process-terminal authority: never call the adapter again.
+      } else if (record?.state === "running" && registry.checkpointStopOwned(record.agentId)) {
+        stopRequested = true;
+        const stopped = await registry.stopCheckpoint(record.agentId, "session");
+        if (stopped.disposition === "ordinary-cleanup") continue;
+        record = registry.get(initial.agentId);
+      } else if (!record?.retainedInputReport) {
+        continue;
+      } else if (record.checkpointStopState !== "confirmed") {
+        registry.quarantineCheckpoint(record.agentId);
+        record = registry.get(initial.agentId);
+      }
+      const report = record?.retainedInputReport;
+      outcomes.push({
+        agentId: initial.agentId,
+        disposition: record?.checkpointQuarantined || record?.checkpointStopState !== "confirmed" || !report
+          ? "unconfirmed" : "confirmed",
+        ...(report ? { report } : {}),
+        stopRequested,
+      });
+    }
+
+    // Ambiguous cancellation/ownership is not a storage failure. Establish every
+    // disposition before persistence or destructive cleanup so it remains fail-closed.
+    if (outcomes.some((outcome) => outcome.disposition === "unconfirmed")) {
+      return {
+        outcomes,
+        confirmed: outcomes.filter((outcome) => outcome.disposition === "confirmed").length,
+        unconfirmed: outcomes.filter((outcome) => outcome.disposition === "unconfirmed").length,
+      };
+    }
+
+    for (const outcome of outcomes) {
+      const report = outcome.report!;
+      if (this.persistedRetainedReports.has(report.reportId)) {
+        outcome.persisted = true;
+      } else if (options.persist && !this.attemptedRetainedPersistence.has(report.reportId)) {
+        this.attemptedRetainedPersistence.add(report.reportId);
+        try {
+          outcome.persisted = await options.persist(report) === true;
+        } catch {
+          outcome.persisted = false;
+        }
+        if (outcome.persisted) this.persistedRetainedReports.add(report.reportId);
+      } else if (this.attemptedRetainedPersistence.has(report.reportId)) {
+        outcome.persisted = false;
+      }
+
+      // Confirmed shutdown persistence is best effort. Cleanup still releases exactly
+      // once after the one persistence attempt; only ambiguous cleanup authority blocks.
+      if (this.releasedRetainedCleanup.has(report.reportId)) {
+        outcome.cleanupReleased = true;
+      } else {
+        try {
+          await registry.releaseCheckpointCleanup(outcome.agentId, report);
+          this.releasedRetainedCleanup.add(report.reportId);
+          outcome.cleanupReleased = true;
+        } catch {
+          outcome.cleanupReleased = false;
+        }
+      }
+    }
+    return { outcomes, confirmed: outcomes.length, unconfirmed: 0 };
+  }
+
+  private readonly activeMcpScopes = new Set<AgentMcpScope>();
+  private readonly closedMcpScopes = new WeakSet<AgentMcpScope>();
+  private readonly retryMcpScopes = new Set<AgentMcpScope>();
+  private readonly activeMcpPreparations = new Set<{
+    readonly abort: () => void;
+    readonly settled: Promise<void>;
+  }>();
+  private readonly activeGenerations = new Set<{
+    readonly abort: () => void;
+    readonly settled: Promise<void>;
+  }>();
+  private shuttingDown = false;
+
   /** Session-local shutdown barrier for every retained child of this runtime. */
   async shutdownCheckpointPaused(): Promise<void> {
-    const records = this.deps.subagentRegistry?.list() ?? [];
+    const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
+    const records = (recoveryRegistry ?? this.deps.subagentRegistry)?.list() ?? [];
     await Promise.allSettled(records
-      .filter((record) => record.state === "running" && record.checkpointPaused)
-      .map((record) => record.session?.stopCheckpoint?.() ?? Promise.resolve()));
+      .filter((record) => record.state === "running" && !record.checkpointQuarantined &&
+        (recoveryRegistry
+          ? recoveryRegistry.checkpointStopOwned(record.agentId)
+          : record.checkpointPaused === true))
+      .map((record) => recoveryRegistry
+        ? recoveryRegistry.stopCheckpoint(record.agentId, "session")
+        : record.session?.stopCheckpoint?.() ?? Promise.resolve()));
+  }
+
+  /** Stop every admitted generation and join through hooks, scope close, and worktree release. */
+  async shutdownActiveGenerations(): Promise<void> {
+    // Fence synchronously so a dispatch invoked while shutdown is draining can
+    // never enter admission after the active-generation snapshot.
+    this.shuttingDown = true;
+    const generations = [...this.activeGenerations];
+    for (const generation of generations) generation.abort();
+    await Promise.allSettled(generations.map((generation) => generation.settled));
+  }
+
+  /** Abort and join setup before closing scopes; no preparation may outlive SessionEnd. */
+  async shutdownMcpScopes(): Promise<void> {
+    const preparations = [...this.activeMcpPreparations];
+    for (const preparation of preparations) preparation.abort();
+    await Promise.allSettled(preparations.map((preparation) => preparation.settled));
+    const active = [...this.activeMcpScopes];
+    await Promise.allSettled(active.map((scope) => this.closeMcpScope(scope)));
+    const retries = [...this.retryMcpScopes];
+    await Promise.allSettled(retries.map(async (scope) => {
+      const outcome = await scope.retryUnconfirmedShutdown();
+      if (outcome.unconfirmed.length === 0) this.retryMcpScopes.delete(scope);
+    }));
+  }
+
+  private async closeMcpScope(scope: AgentMcpScope, diagnostics?: Diagnostic[]): Promise<void> {
+    this.activeMcpScopes.delete(scope);
+    if (this.closedMcpScopes.has(scope)) return;
+    this.closedMcpScopes.add(scope);
+    const outcome = await scope.shutdown();
+    if (outcome.unconfirmed.length > 0) {
+      this.retryMcpScopes.add(scope);
+      diagnostics?.push({
+        severity: "warning",
+        message: `${AGENT_MCP_CLEANUP_WARNING_PREFIX} cleanup could not be confirmed for ${outcome.unconfirmed.length} scoped server(s); preserved output is qualified and session shutdown will retry.`,
+      });
+    }
   }
 
   /**
@@ -1455,7 +2217,56 @@ export class SubagentRuntime {
     return this.resolveAgentDefinition(requested)?.color;
   }
 
-  async dispatch(opts: {
+  dispatch(opts: Parameters<SubagentRuntime["dispatchGeneration"]>[0]): Promise<DispatchResult> {
+    if (this.shuttingDown) {
+      const agentId = opts.agentId && isAgentId(opts.agentId) ? opts.agentId : mintAgentId();
+      const result: DispatchResult = {
+        ok: false,
+        outcome: "aborted",
+        finalMessage: "",
+        agentId,
+        resumable: false,
+        error: "Subagent dispatch was cancelled because the session is shutting down.",
+        diagnostics: [],
+      };
+      if (opts.resume) this.deps.subagentRegistry?.markSettled(agentId, { outcome: "aborted" });
+      return Promise.resolve(result);
+    }
+
+    // Mint generation cancellation before resolution, semaphore admission, or
+    // preparation can yield. TaskStop and session shutdown therefore own every
+    // queued, preparing, foreground, background, and nested run.
+    const generation = new AbortController();
+    const signal = opts.abortSignal
+      ? AbortSignal.any([opts.abortSignal, generation.signal])
+      : generation.signal;
+    let settle!: () => void;
+    const owner = {
+      abort: () => generation.abort(),
+      settled: new Promise<void>((resolve) => { settle = resolve; }),
+    };
+    this.activeGenerations.add(owner);
+    const run = this.dispatchGeneration({ ...opts, abortSignal: signal });
+    void run.then(
+      (result) => {
+        // A resumed dispatch has owned settlement since markResuming. This
+        // backstop closes every pre-construction validation/admission return;
+        // retained checkpoints deliberately transfer ownership instead.
+        if (opts.resume && !result.checkpointPaused) {
+          this.deps.subagentRegistry?.markSettled(result.agentId, { outcome: result.outcome });
+        }
+      },
+      () => {
+        if (opts.resume) this.deps.subagentRegistry?.markSettled(opts.agentId!, { outcome: "failed" });
+      },
+    ).finally(() => {
+      this.activeGenerations.delete(owner);
+      settle();
+    });
+    return run;
+  }
+
+  private async dispatchGeneration(opts: {
     subagentType: string;
     prompt: string;
     model?: string;
@@ -1525,6 +2336,8 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /** Generation-local setup warning sink, delivered immediately after MCP settlement. */
+    onMcpWarning?: (warning: string) => void;
     /** Runtime-only concurrency admission sink for task-record mirroring. */
     onAdmission?: (admission: SubagentAdmission) => void;
     /** Opaque dispatcher-run stop authority captured before the Agent tool awaits. */
@@ -1539,6 +2352,8 @@ export class SubagentRuntime {
      * the identical dispatch code. The caller passes the SAME `agentId`.
      */
     resume?: {
+      /** Canonical source identity captured from the original definition. */
+      agentProvenance?: SubagentAgentProvenance;
       /** The persisted transcript to reopen (from the registry record, never `to`). */
       transcriptPath: string;
       /** The cwd the original run used (worktree path when isolated) — reused as-is. */
@@ -1736,9 +2551,27 @@ export class SubagentRuntime {
         emitForkDegrade(forkDegrade!.tone, forkDegrade!.modelReason, forkDegrade!.devReason);
       }
     } else {
-      // Shared resolver: one home for the resolution order so
-      // isOneShotBuiltin() can't desync from this dispatch's settled resumability.
-      resolved = opts.agentOverride ?? this.resolveAgentDefinition(requested);
+      // A resume must reconstruct the original canonical identity. Missing current
+      // definitions fail before hook/provider/MCP/worktree activity; never widen to
+      // general-purpose through the ordinary unknown-name fallback.
+      resolved = opts.agentOverride ?? (opts.resume
+        ? [...agents, ...builtins].find((candidate) =>
+            candidate.name === requested &&
+            (opts.resume?.agentProvenance === undefined ||
+              sameAgentProvenance(agentProvenance(candidate), opts.resume.agentProvenance)))
+        : this.resolveAgentDefinition(requested));
+      if (opts.resume && !resolved) {
+        this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
+        return {
+          ok: false,
+          outcome: "failed",
+          finalMessage: "",
+          agentId,
+          resumable: false,
+          error: `Cannot resume agent ${agentId}: original agent definition ${JSON.stringify(requested)} is no longer available.`,
+          diagnostics,
+        };
+      }
     }
     // Claude fallback: an unknown subagent_type runs as
     // general-purpose instead of hard-erroring — with a VISIBLE degrade in
@@ -1817,9 +2650,19 @@ export class SubagentRuntime {
     // SendMessage-resumable).
     const overrideDispatch = opts.agentOverride !== undefined;
 
+    // Quarantine admission precedes every hook, transcript, SDK-session, and worktree side effect.
+    // register() repeats this check as a backstop so no future dispatch path can silently replace
+    // the same stable identity after process-terminal ambiguity.
+    this.deps.compactionCancellationRecovery?.registry.assertDispatchAdmission(agentId);
+    if (this.deps.subagentRegistry !== this.deps.compactionCancellationRecovery?.registry) {
+      this.deps.subagentRegistry?.assertDispatchAdmission(agentId);
+    }
+
     try {
       agent = this.deps.prepareAgent?.(agent) ?? agent;
+      this.deps.validateMcpAgent?.(agent);
     } catch (err) {
+      if (opts.resume) this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
       return {
         ok: false,
         outcome: "failed",
@@ -1854,6 +2697,7 @@ export class SubagentRuntime {
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
+        agentProvenance: agentProvenance(agent),
         depth: opts.depth,
         cwd: this.deps.getCwd(),
         resumable: false,
@@ -2004,6 +2848,15 @@ export class SubagentRuntime {
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
     let dispatchCwd: CwdState | undefined;
+    let mcpContext: DispatchMcpContext | undefined;
+    let mcpPreparationController: AbortController | undefined;
+    let removeMcpPreparationAbort = () => {};
+    let preparingMcp = false;
+    let mcpSetupCancelled = false;
+    const generationAborted = () => opts.abortSignal?.aborted === true;
+    const requireActiveGeneration = () => {
+      if (generationAborted()) throw new Error("subagent generation cancelled");
+    };
     let started = false;
     let stopFired = false;
     let abortListener: (() => void) | undefined;
@@ -2020,11 +2873,13 @@ export class SubagentRuntime {
     let capturedUsage: DispatchUsage | undefined;
     let settledOutcome: DispatchOutcome | undefined;
     let checkpointPaused = false;
+    let dispatchCheckpoint: ChildCheckpointCoordinator | undefined;
     let dispatchCheckpointGate: MainSessionCheckpointGate | undefined;
     let dispatchAuthoritySettled = false;
     const settleDispatchAuthority = () => {
       if (dispatchAuthoritySettled) return;
       dispatchAuthoritySettled = true;
+      dispatchCheckpoint?.settleDispatch();
       dispatchCheckpointGate?.logicalRunSettled();
     };
     // The final answer text for the registry record (panel drill-down): the
@@ -2203,6 +3058,58 @@ export class SubagentRuntime {
       // with the orchestrator or a sibling dispatch.
       const subCwd = new CwdState(cwd);
       dispatchCwd = subCwd;
+      // Inline startup belongs after initial worktree admission and its abort gate,
+      // but before gateTools freezes the child universe or any child session exists.
+      if (!isFork && !agent.builtin && this.deps.prepareMcpFor) {
+        preparingMcp = true;
+        const prepController = new AbortController();
+        mcpPreparationController = prepController;
+        const abortPreparation = () => prepController.abort();
+        if (generationAborted()) abortPreparation();
+        else opts.abortSignal?.addEventListener("abort", abortPreparation, { once: true });
+        removeMcpPreparationAbort = () => opts.abortSignal?.removeEventListener("abort", abortPreparation);
+        const preparationPromise = this.deps.prepareMcpFor(agent, cwd, prepController.signal)
+          .then(async (prepared) => {
+            // Claim a newly established scope synchronously in the promise continuation,
+            // before dispatch code can await another lifecycle boundary.
+            this.activeMcpScopes.add(prepared.scope);
+            mcpContext = {
+              ...prepared,
+              reportPinWarning: (warning) => collectPreloadDiagnostic({ severity: "warning", message: warning }),
+            };
+            if (prepController.signal.aborted) await this.closeMcpScope(prepared.scope, diagnostics);
+            return mcpContext;
+          });
+        let settlePreparation!: () => void;
+        const settled = new Promise<void>((resolve) => { settlePreparation = resolve; });
+        const preparationOwner = {
+          abort: () => prepController.abort(),
+          settled,
+        };
+        this.activeMcpPreparations.add(preparationOwner);
+        try {
+          await preparationPromise;
+        } finally {
+          this.activeMcpPreparations.delete(preparationOwner);
+          settlePreparation();
+          removeMcpPreparationAbort();
+          mcpSetupCancelled = generationAborted() || prepController.signal.aborted;
+          preparingMcp = false;
+        }
+        if (generationAborted() || prepController.signal.aborted) {
+          settledOutcome = "aborted";
+          return {
+            ok: false, outcome: "aborted", finalMessage: "", agentId, resumable: false,
+            agentName: agent.name, worktreePath,
+            error: `Subagent "${agent.name}" was stopped during MCP setup.`, diagnostics,
+          };
+        }
+        if (mcpContext?.setupWarning) {
+          collectPreloadDiagnostic({ severity: "warning", message: mcpContext.setupWarning });
+          try { opts.onMcpWarning?.(mcpContext.setupWarning); } catch { /* presentation only */ }
+          prompt = `[${mcpContext.setupWarning}]\n\n${prompt}`;
+        }
+      }
       let notebookSessionManager: PiSessionManagerLike | undefined;
       const notebookSession = new NotebookSessionState({
         onChange: (snapshot) => {
@@ -2219,6 +3126,7 @@ export class SubagentRuntime {
         agent.name,
         hookAgentType,
         agentId,
+        this.deps.subagentRegistry?.get(agentId)?.dispatchGeneration ?? 1,
         subCwd,
         hookRunner,
         diagnostics,
@@ -2227,14 +3135,16 @@ export class SubagentRuntime {
           this.deps.subagentRegistry?.noteProgress(agentId, snapshot);
           opts.onProgress?.(snapshot);
         },
+        this.deps.compactionCancellationRecovery,
       );
+      dispatchCheckpoint = checkpoint;
       dispatchCheckpointGate = checkpoint.gate;
       hookRunner = checkpoint.hookFacade(hookRunner);
 
       let granted = this.deps.permissionEngine.gateTools(
         agent.tools,
         agent.disallowedTools,
-        this.deps.allKnownToolNames(),
+        this.deps.allKnownToolNames(mcpContext?.scope),
       );
       if (opts.background && !isFork) {
         // Claude excludes these built-in resource surfaces only from real
@@ -2265,9 +3175,11 @@ export class SubagentRuntime {
         notebookSession,
         checkpoint.activation,
         customToolsStop,
+        mcpContext,
       );
 
       const sdk = await this.sdk();
+      requireActiveGeneration();
 
       // Subagent built-ins from the SHARED factory: the exact same seven tool
       // implementations the main session builds (index.ts), constructed here
@@ -2347,6 +3259,7 @@ export class SubagentRuntime {
         extensionFactories,
       });
       await loader.reload();
+      requireActiveGeneration();
 
       // Model resolution order: CLAUDE_CODE_SUBAGENT_MODEL env beats
       // the per-invocation `model` param, which beats agent frontmatter `model:`,
@@ -2517,8 +3430,10 @@ export class SubagentRuntime {
       if (model) sessionOptions.model = model;
       if (thinking) sessionOptions.thinkingLevel = thinking;
 
+      requireActiveGeneration();
       const created = await sdk.createAgentSession(sessionOptions);
       session = created.session;
+      requireActiveGeneration();
       checkpoint.attach(session);
       const recoveryProgress = new SubagentRecoveryProgress(session.messages, !isFork);
       if (typeof session.subscribe === "function") {
@@ -2543,6 +3458,7 @@ export class SubagentRuntime {
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
+        agentProvenance: agentProvenance(agent),
         depth: opts.depth,
         cwd,
         worktreePath,
@@ -2557,10 +3473,11 @@ export class SubagentRuntime {
         resumable: actualResumable,
         oneShot,
         session: {
-          steer: (text: string) => checkpoint.steer(text),
+          steer: (text: string, metadata) => checkpoint.steer(text, metadata),
           recoverCheckpoint: (text: string) => checkpoint.recover(text),
-          stopCheckpoint: () => checkpoint.cancel("task-stop"),
-          followUp: (text: string) => session?.followUp?.(text),
+          checkpointStopEligibility: () => checkpoint.checkpointStopEligibility(),
+          stopCheckpoint: (attempt) => checkpoint.stopCheckpoint(attempt),
+          followUp: (text: string) => checkpoint.followUp(text),
         },
         // Set-once in the registry: on a fresh dispatch these reconfirm the
         // minimal register's values; on a resume the original prompt/
@@ -2685,6 +3602,7 @@ export class SubagentRuntime {
             worktreePath,
             isFork,
             usage: captureUsage(),
+            retainedInputReport: checkpoint.report(),
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
             diagnostics,
           };
@@ -2730,6 +3648,11 @@ export class SubagentRuntime {
           // Session statistics must be sampled while the public session is live.
           captureUsage();
           try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
+          if (started && !stopFired) {
+            stopFired = true;
+            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
+          }
+          if (mcpContext) await this.closeMcpScope(mcpContext.scope, diagnostics);
           this.deps.subagentRegistry?.markSettled(agentId, {
             outcome,
             usage: capturedUsage,
@@ -2740,10 +3663,6 @@ export class SubagentRuntime {
           // recovery generation must not independently release that same checkout.
           if (worktreePath && this.deps.worktrees && !opts.resume) {
             await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-          }
-          if (started && !stopFired) {
-            stopFired = true;
-            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
           }
         } finally {
           // A paused dispatch remains authoritative through its final retained
@@ -2790,16 +3709,17 @@ export class SubagentRuntime {
       async function classifyCompletedTurn(): Promise<DispatchResult> {
         const paused = await checkpointOutcome();
         if (paused) return paused;
-        const terminal = terminalOutcome();
-        if (terminal) return terminal;
         if (checkpoint.consumeStoppedRun()) {
           settledOutcome = "aborted";
           return {
             ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
             resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+            retainedInputReport: checkpoint.report(),
             error: `Subagent "${agent.name}" was stopped by a universal hook.`, diagnostics,
           };
         }
+        const terminal = terminalOutcome();
+        if (terminal) return terminal;
 
         // The returned assistant text is a verbatim contract: callers may parse
         // strict JSON/YAML, so classification must not summarize or wrap it.
@@ -2807,6 +3727,7 @@ export class SubagentRuntime {
         // Retry only a genuinely successful empty reply. terminalOutcome() above
         // has already classified API errors/aborts, which must not be re-prompted.
         if (!finalMessage.trim()) {
+          requireActiveGeneration();
           await session!.prompt(
             "Your previous reply was empty. Reply now with your final answer in the requested format.",
           );
@@ -2834,6 +3755,7 @@ export class SubagentRuntime {
             return {
               ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
               resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+              retainedInputReport: checkpoint.report(),
               error: `Subagent "${agent.name}" was aborted before completing its task.`, diagnostics,
             };
           }
@@ -2845,6 +3767,7 @@ export class SubagentRuntime {
             return {
               ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
               resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+              retainedInputReport: checkpoint.report(),
               error: `Subagent "${agent.name}" was stopped by its SubagentStop hook: ${reason}`,
               diagnostics,
             };
@@ -2857,6 +3780,7 @@ export class SubagentRuntime {
             });
             break;
           }
+          requireActiveGeneration();
           await session!.prompt(
             `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
           );
@@ -2886,17 +3810,54 @@ export class SubagentRuntime {
         };
       }
 
-      await session.prompt(fullPrompt);
+      requireActiveGeneration();
+      const promptRun = session.prompt(fullPrompt);
+      const recoveryRegistry = this.deps.compactionCancellationRecovery?.registry;
+      if (recoveryRegistry) {
+        let unsubscribe: () => void = () => {};
+        const quarantined = new Promise<"quarantined">((resolve) => {
+          const observe = () => {
+            if (recoveryRegistry.get(agentId)?.checkpointQuarantined) {
+              unsubscribe();
+              resolve("quarantined");
+            }
+          };
+          unsubscribe = recoveryRegistry.onChange(observe);
+          observe();
+        });
+        const ending = await Promise.race([
+          promptRun.then(() => "settled" as const),
+          quarantined,
+        ]);
+        unsubscribe();
+        if (ending === "quarantined") {
+          checkpointPaused = true;
+          settledOutcome = "failed";
+          void promptRun.catch(() => undefined);
+          return {
+            ok: false, outcome: "failed", finalMessage: "", agentId, transcriptPath,
+            resumable: false, agentName: agent.name, worktreePath, isFork,
+            usage: captureUsage(), checkpointPaused: true,
+            retainedInputReport: checkpoint.report(),
+            error: checkpoint.failureMessage(), diagnostics,
+          };
+        }
+      } else {
+        await promptRun;
+      }
       return await classifyCompletedTurn();
     } catch (err) {
-      // Catch-all: covers createAgentSession itself throwing — the "API dead
-      // before the session exists" case — and any other dispatch-internal error.
-      // Conservative: not resumable (the session may never have run), but the
-      // transcript path (when one was allocated) stays visible for diagnosis.
-      settledOutcome = "failed";
+      // Cancellation during setup is an intentional stop, not a construction
+      // failure. The preparation owner above has already joined any scope cleanup.
+      // Other failures here include createAgentSession() construction failures:
+      // retain any transcript path for diagnosis, but conservatively keep them
+      // non-resumable because no usable live session was established.
+      const cancelled = generationAborted() || mcpPreparationController?.signal.aborted === true;
+      const setupAborted = cancelled && (preparingMcp || mcpSetupCancelled);
+      settledOutcome = cancelled ? "aborted" : "failed";
       return {
         ok: false,
-        outcome: "failed",
+        outcome: cancelled ? "aborted" : "failed",
         finalMessage: "",
         agentId,
         transcriptPath,
@@ -2906,13 +3867,22 @@ export class SubagentRuntime {
         worktreePath,
         // Partial usage when the session ran at all before throwing.
         usage: captureUsage(),
-        error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
+        ...(dispatchCheckpoint?.isQuarantined()
+          ? { retainedInputReport: dispatchCheckpoint.report() }
+          : {}),
+        error: setupAborted
+          ? `Subagent "${agent.name}" was stopped during MCP setup.`
+          : cancelled
+            ? `Subagent "${agent.name}" was aborted before completing its task.`
+            : `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
         diagnostics,
       };
     } finally {
       // Capture while the public session is still live: dispose may release the
       // aggregate stats that failed/aborted results still need to report.
       captureUsage();
+      removeMcpPreparationAbort();
+      mcpPreparationController?.abort();
       if (!checkpointPaused) {
         if (abortListener && opts.abortSignal) {
           try {
@@ -2936,19 +3906,6 @@ export class SubagentRuntime {
         } catch {
           // dispose failures must not mask results
         }
-        this.deps.subagentRegistry?.markSettled(agentId, {
-          outcome: settledOutcome,
-          usage: capturedUsage,
-          // Sanitized+capped by the registry; conversation content, never for
-          // error/log interpolation.
-          finalText: settledFinalText,
-          assistantIdentityText: settledAssistantIdentityText,
-        });
-        // A resumed run reused a worktree owned by its original dispatch and
-        // must not unlock or release ownership it never acquired.
-        if (worktreePath && this.deps.worktrees && !opts.resume) {
-          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-        }
         // Error/abort paths still fire SubagentStop once for observability;
         // blocking is moot because no continuation can safely recover this dispatch.
         if (started && !stopFired) {
@@ -2956,6 +3913,20 @@ export class SubagentRuntime {
             subagent_type: agent.name,
             cwd: dispatchCwd?.get() ?? this.deps.getCwd(),
           }).catch(() => undefined);
+        }
+        if (mcpContext) await this.closeMcpScope(mcpContext.scope, diagnostics).catch(() => {
+          diagnostics.push({ severity: "warning", message: `${AGENT_MCP_CLEANUP_WARNING_PREFIX} scoped cleanup failed unexpectedly; preserved output is qualified.` });
+        });
+        this.deps.subagentRegistry?.markSettled(agentId, {
+          outcome: settledOutcome,
+          usage: capturedUsage,
+          finalText: settledFinalText,
+          assistantIdentityText: settledAssistantIdentityText,
+        });
+        // A resumed run reused a worktree owned by its original dispatch and
+        // must not unlock or release ownership it never acquired.
+        if (worktreePath && this.deps.worktrees && !opts.resume) {
+          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
         }
         // The dispatch and its final lifecycle hooks are now truly settled.
         // Physical agent_settled events during checkpoint/reentry never rotate it.
@@ -3073,6 +4044,13 @@ export function presentDispatchResult(
   const recoveryGuidance = guidanceInput
     ? formatSubagentRecoveryGuidance(guidanceInput)
     : undefined;
+  const mcpQualification = result.diagnostics
+    .map((diagnostic) => diagnostic.message)
+    .filter((message) => message.startsWith(AGENT_MCP_WARNING_PREFIX) || message.startsWith(AGENT_MCP_CLEANUP_WARNING_PREFIX))
+    .filter((message, index, all) => all.indexOf(message) === index)
+    .join("\n");
+  const qualify = (text: string, separator = "\n\n") =>
+    mcpQualification ? `${text}${separator}---\n${mcpQualification}\n---` : text;
   const neutralIdentity = result.outcome === "failed" && result.terminalAssistantError === true &&
       result.resumable && agentId && !recoveryGuidance
     ? `Agent ID: ${agentId}.`
@@ -3084,11 +4062,11 @@ export function presentDispatchResult(
     const cut = appendCutOffNote(finalMessage, result.error ?? DEFAULT_CUT_OFF_NOTE);
     return {
       kind: "result",
-      text: recoveryGuidance
+      text: qualify(recoveryGuidance
         ? `${cut}\n${recoveryGuidance}`
         : neutralIdentity
           ? `${cut}\n${neutralIdentity}`
-          : cut,
+          : cut),
       cutOff: true,
     };
   }
@@ -3098,11 +4076,11 @@ export function presentDispatchResult(
     const base = result.error ?? "subagent failed";
     return {
       kind: "failure",
-      message: recoveryGuidance
+      message: qualify(recoveryGuidance
         ? `${base}\n\n${recoveryGuidance}`
         : neutralIdentity
           ? `${base}\n\n${neutralIdentity}`
-          : base,
+          : base),
     };
   }
 
@@ -3118,7 +4096,7 @@ export function presentDispatchResult(
   } else {
     text = `${finalMessage}${agentTrailerFrame(result.agentId, { completed: true })}`;
   }
-  return { kind: "result", text, cutOff: result.truncated === true };
+  return { kind: "result", text: qualify(text), cutOff: result.truncated === true };
 }
 
 /**
@@ -3185,6 +4163,8 @@ export function createAgentToolDefinition(
     dispatchCwd?: () => string;
     /** Captures opaque stop authority for the dispatching logical run. */
     captureUniversalStop?: () => () => boolean;
+    /** Dormant canonical retained-outcome presentation; production omits it until assembled activation. */
+    retainedOutcomes?: { registry: SubagentRegistry };
   },
 ): Record<string, unknown> {
   return {
@@ -3338,6 +4318,9 @@ export function createAgentToolDefinition(
             agentId,
             abortSignal: controller.signal,
             onProgress,
+            onMcpWarning: (warning) => {
+              if (taskId) registry.noteSetupWarning(taskId, warning);
+            },
             onAdmission: (next) => {
               admission = next;
               if (taskId) registry.noteAdmission(taskId, next);
@@ -3399,6 +4382,12 @@ export function createAgentToolDefinition(
         ...dispatchOpts,
         abortSignal: signal,
         onProgress,
+        onMcpWarning: onUpdate
+          ? (warning) => onUpdate({
+              content: [{ type: "text", text: warning }],
+              details: { agent: label, live: true, diagnostics: [{ severity: "warning", message: warning }] } satisfies SubagentRenderDetails,
+            })
+          : undefined,
       });
       const settledAt = Date.now();
       const durationMs = settledAt - dispatchedAtMs;
@@ -3425,6 +4414,19 @@ export function createAgentToolDefinition(
         // completion clock keeps duration and settlement instant in agreement.
         ...timing,
       } satisfies SubagentRenderDetails;
+      const retainedReport = opts.retainedOutcomes?.registry.get(result.agentId)?.retainedInputReport;
+      const canonicalReport = retainedReport && retainedReport === result.retainedInputReport
+        ? retainedReport
+        : undefined;
+      const retainedText = canonicalReport ? formatRetainedInputReport(canonicalReport) : undefined;
+      const retainedDetails = canonicalReport ? {
+        retainedOutcome: true,
+        reportId: canonicalReport.reportId,
+        occurrences: canonicalReport.occurrences,
+        representedCount: canonicalReport.occurrences.length,
+        unrepresentableCount: canonicalReport.unrepresentableCount,
+        retainedCount: retainedInputCount(canonicalReport),
+      } : {};
       // Claude 2.1.200 outcome→presentation mapping: successful identity
       // trailers, failed guidance or neutral identity metadata, cut-off framing,
       // and throw-vs-return decisions live in the shared, pure
@@ -3439,7 +4441,9 @@ export function createAgentToolDefinition(
         // wording naming the abort) both surface on the isError channel.
         // Failed recovery guidance is disposition-dependent; a cause-only ordinary
         // error may expose neutral stable identity without turning it into advice.
-        throw new Error(presentation.message);
+        throw new Error(retainedText
+          ? `${presentation.message}\n\n${retainedText}`
+          : presentation.message);
       }
       // A `kind:"result"` with outcome "failed" is necessarily the cut-off case:
       // presentDispatchResult only routes failed-WITH-partial to `result` (aborted
@@ -3450,9 +4454,10 @@ export function createAgentToolDefinition(
         // partial output and cause stay in the delimited frame, while any trusted,
         // disposition-dependent recovery guidance follows outside it.
         return {
-          content: [{ type: "text", text: presentation.text }],
+          content: [{ type: "text", text: retainedText ? `${presentation.text}\n\n${retainedText}` : presentation.text }],
           details: {
             agent: result.agentName,
+            ...retainedDetails,
             worktreePath: result.worktreePath,
             diagnostics: result.diagnostics,
             outcome: result.outcome,
@@ -3471,9 +4476,10 @@ export function createAgentToolDefinition(
       // the trailer rides INSIDE that frame (single `\n`, non-"completed"
       // wording) rather than stacking a second frame.
       return {
-        content: [{ type: "text", text: presentation.text }],
+        content: [{ type: "text", text: retainedText ? `${presentation.text}\n\n${retainedText}` : presentation.text }],
         details: {
           agent: result.agentName,
+          ...retainedDetails,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
@@ -3576,6 +4582,9 @@ export function createSendMessageToolDefinition(
       const resolved = opts.registry.resolve(to);
       if (!resolved.ok) throw new Error(resolved.error);
       const record = resolved.record;
+      if (record.checkpointQuarantined) {
+        throw new Error(quarantineRefusal(record, "message/recovery"));
+      }
 
       // A checkpoint-paused record is "running" only because it retains the
       // exact guarded session. This coordinator-authenticated path deliberately
@@ -3610,7 +4619,7 @@ export function createSendMessageToolDefinition(
       // live in the shared guardSteer — the same guard the panel drill-down
       // steer calls — so the two surfaces cannot drift.
       if (record.state === "running") {
-        const guard = guardSteer(record);
+        const guard = guardSteer(record, "send-message");
         if (!guard.ok) throw new Error(guard.refusal);
         await Promise.resolve(guard.steer(message));
         return {
@@ -3711,6 +4720,7 @@ export function createSendMessageToolDefinition(
           background: true,
           agentId: record.agentId,
           resume: {
+            agentProvenance: record.agentProvenance,
             transcriptPath: record.transcriptPath,
             cwd: record.cwd,
             worktreePath: record.worktreePath,
@@ -3734,11 +4744,14 @@ export function createSendMessageToolDefinition(
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
+      const retainedGuidance = record.retainedInputReport
+        ? ` Reported input was not auto-replayed. The unchanged canonical report remains at ${taskOutputAgentLocator(record.agentId)}; inspect possible existing effects before this deliberate retry.`
+        : "";
       return {
         content: [
           {
             type: "text",
-            text: `${identity} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${id}").`,
+            text: `${identity} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${id}").${retainedGuidance}`,
           },
         ],
         details: {

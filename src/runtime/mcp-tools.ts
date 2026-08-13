@@ -6,14 +6,12 @@ import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { semanticDisplayRow } from "./tool-display.js";
 import { sanitizeDisplayText, themedFg } from "./render-util.js";
 import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
-import type { McpRuntime } from "./mcp.js";
+import type { McpRuntime, McpToolInfo } from "./mcp.js";
 
 /**
- * MCP proxy-tool builder: turns a runtime's retained initial tool catalog into
- * Pi `ToolDefinition`s named `mcp__<server>__<tool>` whose execute delegates to
- * `McpRuntime.callTool`. Consumed by the main-session registration in index.ts
- * and per-dispatch by the subagent path — called fresh wherever instances are
- * needed.
+ * MCP proxy-tool builder: turns a retained initial tool catalog into Pi
+ * `ToolDefinition`s named `mcp__<server>__<tool>`. The structural source keeps
+ * main-session and dispatch-scoped routing behind the same proxy behavior.
  *
  * HARD INVARIANT: no proxy ever sets `promptSnippet` or `promptGuidelines` —
  * Pi rebuilds the base system prompt from tool prompt snippets on registration,
@@ -51,11 +49,15 @@ function sliceForDiag(value: string): string {
 }
 
 /**
- * The slice of {@link McpRuntime} the proxies consume. Structural so unit tests
- * can drive the builder without spawning stdio servers; every production caller
- * passes the real runtime.
+ * The runtime operations proxies consume. Structural so session and dispatch
+ * scopes share schema, timeout-result, and rendering behavior.
  */
 export type McpToolSource = Pick<McpRuntime, "tools" | "callTool">;
+
+export function mcpProxyToolName(info: Pick<McpToolInfo, "serverName" | "toolName">): string | undefined {
+  const name = `mcp__${info.serverName}__${info.toolName}`;
+  return name.length <= WIRE_NAME_MAX_CHARS ? name : undefined;
+}
 
 export interface McpSchemaNormalization {
   /** The schema to expose to Pi (the original object when nothing changed). */
@@ -458,19 +460,20 @@ function mapLocalAvailabilityError(error: unknown, serverName: string, toolName:
 
 /**
  * Build one proxy `ToolDefinition` per tool in the retained initial catalog.
- * Fresh proxy instances delegate every execution to the live session-global
- * runtime, so a retained proxy follows recovery without registration or schema changes.
+ * Fresh proxy instances delegate every execution to their live source, so a
+ * retained proxy follows recovery without registration or schema changes.
  */
 export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
   const out: ToolDefinition[] = [];
   for (const info of runtime.tools()) {
     const { serverName, toolName } = info;
-    const name = `mcp__${serverName}__${toolName}`;
-    if (name.length > WIRE_NAME_MAX_CHARS) {
+    const name = mcpProxyToolName(info);
+    if (name === undefined) {
+      const droppedName = `mcp__${serverName}__${toolName}`;
       // The runtime keeps long names (Claude parity — sanitized, not dropped);
       // the WIRE cannot: registering one would 400 every subsequent request.
       reportBuilderDiagnostic(
-        `MCP tool "${sliceForDiag(name)}" dropped: its registered name is ${name.length} chars, ` +
+        `MCP tool "${sliceForDiag(droppedName)}" dropped: its registered name is ${droppedName.length} chars, ` +
           `over the ${WIRE_NAME_MAX_CHARS}-char model tool-name limit`,
       );
       continue;

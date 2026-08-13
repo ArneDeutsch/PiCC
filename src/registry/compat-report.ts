@@ -140,7 +140,8 @@ const PLUGIN_SHARED_STATE_ORDER = [
   "blocklist-unreadable",
   "blocklist-malformed",
 ] as const satisfies readonly PluginSharedStateCause[];
-const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
+const CANONICAL_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
+const PLUGIN_REFRESH_ACTION = CANONICAL_REFRESH_ACTION;
 const PLUGIN_SHARED_STATE_DETAILS: Readonly<Record<PluginSharedStateCause, string>> = {
   "installed-state-unreadable": `Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
   "installed-state-malformed": `Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
@@ -409,7 +410,9 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     for (const evidence of pluginInventory.capabilityEvidence) {
       const capability = lookupCapability(evidence.capabilityId);
       const component = evidence.component === undefined ? "" : ` component ${JSON.stringify(evidence.component)}`;
-      const rendered = `${evidence.qualifiedIdentity}${component}: ${evidence.observation}`;
+      const rendered = evidence.capabilityId === "agent.frontmatter.mcpServers"
+        ? `${evidence.qualifiedIdentity}${component}: plugin-agent mcpServers was removed before runtime construction. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then ${CANONICAL_REFRESH_ACTION}.`
+        : `${evidence.qualifiedIdentity}${component}: ${evidence.observation}`;
       if (capability) addFinding(capability, rendered);
       else unassessed.push(`plugin capability ${JSON.stringify(evidence.capabilityId)} (${evidence.qualifiedIdentity})`);
     }
@@ -688,6 +691,16 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // --- Agents --------------------------------------------------------------
   let strippedAgentFindingCount = 0;
   let strippedAgentFindingsOmitted = 0;
+  let agentMcpFindingCount = 0;
+  let agentMcpFindingsOmitted = 0;
+  const addAgentMcpFinding = (capability: CapabilityEntry, evidence: string): void => {
+    if (agentMcpFindingCount < 32) {
+      agentMcpFindingCount += 1;
+      addFinding(capability, evidence);
+    } else {
+      agentMcpFindingsOmitted += 1;
+    }
+  };
   for (const agent of project.agents) {
     if (pluginInventory === undefined && agent.source.scope === "plugin" && agent.source.pluginId) {
       const pluginId = safePluginIdentity(agent.source.pluginId);
@@ -700,7 +713,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
           const alternative = field === "hooks"
             ? "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."
             : field === "mcpServers"
-              ? "Configure session MCP servers and gate their tools, or remove this field; per-agent MCP configuration is not retained."
+              ? `Move the agent to user or project scope, or remove this field; mcpServers is not retained on plugin-provided agents. Then ${CANONICAL_REFRESH_ACTION}.`
               : "Use deny rules and tools gating, or remove this field; plugin agents cannot retain permissionMode.";
           addFinding(
             capability,
@@ -717,7 +730,95 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
     if (agent.mcpServers !== undefined) {
       const cap = lookupCapability("agent.frontmatter.mcpServers");
-      if (cap) addFinding(cap, `agent "${agent.name}" sets mcpServers:`);
+      if (cap) {
+        const safeAgent = quotedMcpName(agent.name, 128);
+        const dispatchBoundary = "Startup health and deterministic cleanup are dispatch-time only and appear in bounded Agent/TaskOutput results; agent-local servers do not appear in parent /mcp live status.";
+        if (agent.source.scope === "managed") {
+          addAgentMcpFinding(cap, `managed agent ${safeAgent} remains dispatchable, but its mcpServers field is retained only as inert declaration evidence and ignored. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the declaration, then ${CANONICAL_REFRESH_ACTION}.`);
+        } else if (agent.agentMcp !== undefined) {
+          const scope = agent.source.scope === "user" ? "user" : "project";
+          const declaration = agent.agentMcp;
+          const configuredEnabledSessionNames = new Set((project.mcp?.servers ?? [])
+            .filter((server) => server.status === "enabled")
+            .map((server) => server.name));
+          const declarationDiagnostics = declaration.diagnostics.map((diagnostic, index) => ({
+            diagnostic,
+            owner: declaration.diagnosticOwnership[index],
+          }));
+          const dispatchCollisionQualification = " If a same-name main-session route publishes at dispatch time, runtime quietly borrows it and bypasses this inline outcome or diagnostic; publication is dispatch-time and is not known by this static finding.";
+          if (declarationDiagnostics.length > 0) {
+            const ownedNames = declarationDiagnostics.flatMap(({ owner }) =>
+              owner?.kind === "server" ? [owner.serverName] : []
+            );
+            const attribution = ownedNames.length > 0
+              ? ` for ${mcpNameList([...new Set(ownedNames)])}`
+              : "";
+            const omission = declarationDiagnostics.some(({ diagnostic }) => /omitted/iu.test(diagnostic))
+              ? " Some diagnostic detail was omitted by the bounded parser."
+              : "";
+            const collisionQualification = declarationDiagnostics.some(({ owner }) =>
+              owner?.kind === "server" && configuredEnabledSessionNames.has(owner.serverName)
+            ) ? dispatchCollisionQualification : "";
+            addAgentMcpFinding(cap, `${scope} agent ${safeAgent} has invalid, skipped, or adjusted mcpServers declaration diagnostics${attribution}.${omission}${collisionQualification} ${dispatchBoundary} Inspect the documented list of string references or one-key inline mappings and repair or remove affected items, then ${CANONICAL_REFRESH_ACTION}.`);
+          }
+          for (const item of declaration.items) {
+            if (item.kind === "reference" && !configuredEnabledSessionNames.has(item.name)) {
+              addAgentMcpFinding(cap, `${scope} agent ${safeAgent} references MCP server ${quotedMcpName(item.name, 128)}, but that name is absent from the resolved enabled main-session set. ${dispatchBoundary} Configure and enable that main-session server, or remove the reference, then ${CANONICAL_REFRESH_ACTION}.`);
+            }
+          }
+
+          let inlineConfig;
+          try {
+            inlineConfig = project.agentMcpAdmission?.resolve(declaration);
+          } catch {
+            inlineConfig = undefined;
+          }
+          if (inlineConfig === undefined && declaration.items.some((item) => item.kind === "inline")) {
+            addAgentMcpFinding(cap, `${scope} agent ${safeAgent} has inline mcpServers, but static admission is unavailable or threw; inline servers remain inactive. ${dispatchBoundary} Restore valid MCP policy/configuration, then ${CANONICAL_REFRESH_ACTION}.`);
+          }
+          for (const server of inlineConfig?.servers ?? []) {
+            const identity = `inline MCP server ${quotedMcpName(server.name, 128)}`;
+            const policyReason = server.status === "blocked"
+              ? server.inactiveReason ?? (project.mcp?.policyPosture === "fail-closed"
+                ? "policy fail-closed"
+                : project.mcp?.policyPosture === "exclusive" || project.mcp?.policyPosture === "exclusive-empty"
+                  ? "exclusive managed control"
+                  : "policy state unavailable")
+              : undefined;
+            const guidance = server.status === "blocked"
+              ? policyReason === "policy-denied"
+                ? `${identity} is blocked by an explicit managed-policy deny; ask the policy owner to remove or narrow the deny, or remove the declaration.`
+                : policyReason === "policy-allow-miss"
+                  ? `${identity} is blocked because it misses the applicable managed allowlist; ask the policy owner to admit this exact transport identity, or remove the declaration.`
+                  : policyReason === "policy-managed-only"
+                    ? `${identity} is blocked by managed-only policy; an administrator must define and allow an equivalent managed server identity, or the declaration must be removed.`
+                    : policyReason === "policy-candidate-invalid"
+                      ? `${identity} is blocked because its candidate identity is invalid or over limit; repair the bounded inline command or URL identity, or remove the declaration.`
+                      : policyReason === "exclusive managed control"
+                        ? `${identity} is blocked by exclusive managed MCP control; ask the administrator whether an equivalent managed route is appropriate, or remove the declaration.`
+                        : policyReason === "policy fail-closed"
+                          ? `${identity} is blocked because managed MCP policy is fail closed; the policy owner must repair the authoritative policy, or the declaration must be removed.`
+                          : `${identity} is blocked because admission policy state is unavailable; restore the authoritative policy/configuration, or remove the declaration.`
+              : server.status === "disabled"
+                ? `${identity} was declined by disabledMcpjsonServers; after reviewing the definition, remove its exact name from that list to enable it or remove the declaration.`
+                : server.status === "pending-approval"
+                  ? `${identity} is pending PiCC project approval; review the definition, then add its exact name to enabledMcpjsonServers in user-controlled settings or add it to disabledMcpjsonServers to decline it.`
+                  : server.status === "not-configured"
+                    ? `${identity} is not configured with a usable transport; add one supported inline command or URL definition, or remove it.`
+                    : server.status === "skipped" && server.inactiveReason === "admission-unavailable"
+                      ? `${identity} was skipped because admission is unavailable; restore valid policy/configuration.`
+                      : server.status === "skipped"
+                        ? `${identity} was skipped because its supported inline definition is invalid; repair its one-key declaration or remove it.`
+                        : undefined;
+            if (guidance !== undefined) {
+              const collisionQualification = configuredEnabledSessionNames.has(server.name)
+                ? dispatchCollisionQualification
+                : "";
+              addAgentMcpFinding(cap, `${scope} agent ${safeAgent}: ${guidance}${collisionQualification} ${dispatchBoundary} Then ${CANONICAL_REFRESH_ACTION}.`);
+            }
+          }
+        }
+      }
     }
     if (agent.hooks !== undefined) {
       const cap = lookupCapability("agent.frontmatter.hooks");
@@ -741,9 +842,13 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       unassessed.push(`agent "${agent.name}" frontmatter key "${key}"`);
     }
   }
+  if (agentMcpFindingsOmitted > 0) {
+    const capability = lookupCapability("agent.frontmatter.mcpServers");
+    if (capability) addFinding(capability, `${agentMcpFindingsOmitted} additional agent MCP declaration finding(s) omitted after the 32-finding report bound. Repair or remove the affected mcpServers declarations, or correct the applicable policy, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.`);
+  }
   if (strippedAgentFindingsOmitted > 0) {
     const capability = lookupCapability("feature.plugins-agents");
-    if (capability) addFinding(capability, `${strippedAgentFindingsOmitted} additional stripped plugin-agent field finding(s) omitted.`);
+    if (capability) addFinding(capability, `${strippedAgentFindingsOmitted} additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then ${CANONICAL_REFRESH_ACTION}.`);
   }
 
   // --- Skills (allowed-tools + unknown frontmatter) ------------------------
@@ -1876,6 +1981,7 @@ export function renderDoctorReport(
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
     retentionPostureLine(project),
+    "Main-session MCP status (agent declaration findings and remediation appear under Compatibility findings):",
     mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
     ...(mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyObservationSummary(project.mcp ?? EMPTY_MCP)!] : []),
     ...(mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP) ? [mcpPolicyFailureSummary(project.mcp ?? EMPTY_MCP)!] : []),

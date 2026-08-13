@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
 import { renderMainSessionTool } from "../src/runtime/main-session-tool-render.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
+import { UnconfirmedHostDeadlineError } from "../src/runtime/mid-run-compaction.js";
 import { WorktreeManager, type WorktreeReapResult } from "../src/runtime/worktrees.js";
 import type { SubagentTranscriptReapResult } from "../src/runtime/subagent-transcript-retention.js";
 import { deferred, waitUntil } from "./helpers/async.js";
@@ -1498,7 +1500,36 @@ describe("lifecycle wiring", () => {
     expect(fs.existsSync(log)).toBe(true);
   });
 
-  it("production session_shutdown joins retained child cleanup before worktree release and SessionEnd", async () => {
+  it("atomically enables canonical child report, background, and panel composition", async () => {
+    const wired = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    picc(wired.api as never, {
+      onInitializationSettled: wired.captureInitialization,
+      onWired: (value) => { internals = value; },
+    });
+    await wired.waitForInitialization();
+    expect(wired.tools.has("TaskOutput")).toBe(true);
+    expect(wired.tools.has("TaskStop")).toBe(true);
+    expect(wired.shortcuts.has("alt+a")).toBe(true);
+    const agentId = "agent-333333333333";
+    internals.subagentRegistry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      checkpointPaused: true,
+    });
+    const report = createRetainedInputReport({
+      agentId, sessionId: "session-composed", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, sessionId: "session-composed", generation: 1, delivery: "steer", content: "retained" }],
+      guidance: "Inspect effects.",
+    });
+    internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+    internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+    const output = await wired.tools.get("TaskOutput")!.execute("composed", { task_id: agentId });
+    expect(output.content[0].text).toContain("stage resumed-cancellation");
+    expect(output.details).toMatchObject({ reportId: report.reportId, stage: "resumed-cancellation" });
+  });
+
+  it("rejects unconfirmed main shutdown before MCP release or SessionEnd", async () => {
     const shutdownPi = fakePi();
     type Seam = NonNullable<Parameters<typeof picc>[1]>;
     let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
@@ -1509,45 +1540,452 @@ describe("lifecycle wiring", () => {
     await shutdownPi.waitForInitialization();
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
-    const cleanup = deferred<void>();
-    let worktreeReleased = false;
-    const agentId = "agent-444444444444";
+    let scopedMcpReleased = false;
+    let mcpReleased = false;
+    let childStops = 0;
+    internals.subagentRegistry.register({
+      agentId: "agent-333333333333", agentName: "reviewer", depth: 1, cwd: dir,
+      resumable: true, oneShot: false, checkpointPaused: true,
+      session: { stopCheckpoint: async () => { childStops++; } },
+    });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
+    internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
+    internals.mainCheckpointGate.cancel = async () => { throw new UnconfirmedHostDeadlineError(); };
+    const shutdown = shutdownPi.fire("session_shutdown", { reason: "new" });
+    await expect(shutdown).rejects.toBeInstanceOf(UnconfirmedHostDeadlineError);
+    await expect(shutdown).rejects.toThrow(/fresh PiCC process.*fresh session/iu);
+    expect(childStops).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
+    expect(mcpReleased).toBe(false);
+    expect(fs.existsSync(log)).toBe(false);
+  });
+
+  it("rejects stale non-deadline main cancellation before child cleanup, MCP release, or SessionEnd", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+    });
+    await shutdownPi.waitForInitialization();
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    let scopedMcpReleased = false;
+    let mcpReleased = false;
+    let childStops = 0;
+    let ordinaryCleanup = 0;
+    internals.subagentRegistry.register({
+      agentId: "agent-334444444444", agentName: "reviewer", depth: 1, cwd: dir,
+      resumable: true, oneShot: false, checkpointPaused: true,
+      session: { stopCheckpoint: async () => { childStops++; } },
+    });
+    internals.backgroundTasks.start("agent:reviewer", new Promise(() => {}), () => { ordinaryCleanup++; });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
+    internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
+    internals.mainCheckpointGate.cancel = async () => { throw new Error("stale shutdown cancellation evidence"); };
+
+    await expect(shutdownPi.fire("session_shutdown", { reason: "new" })).rejects.toThrow(
+      /Main checkpoint shutdown custody could not be confirmed.*fresh PiCC process.*fresh session/iu,
+    );
+    expect(childStops).toBe(0);
+    expect(ordinaryCleanup).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
+    expect(mcpReleased).toBe(false);
+    expect(fs.existsSync(log)).toBe(false);
+  });
+
+  it.each([
+    { reason: "other", live: true },
+    { reason: "quit", live: false },
+  ] as const)("blocks unconfirmed active resumed child $reason shutdown with surface-accurate recovery guidance", async ({ reason, live }) => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+    });
+    await shutdownPi.waitForInitialization();
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    const agentId = "agent-332222222222";
+    const noPathAgentId = "agent-332222222223";
+    const transcriptPath = `C:\\safe dir\\child [review] "quoted"\\${"long segment ".repeat(30)}transcript.jsonl`;
+    let destructiveCleanup = 0;
+    let scopedMcpReleased = false;
+    let mcpReleased = false;
     const taskId = internals.backgroundTasks.start(
       "agent:reviewer",
       Promise.resolve({
         ok: false, outcome: "failed" as const, finalMessage: "", agentId,
-        agentName: "reviewer", checkpointPaused: true, error: "paused",
+        agentName: "reviewer", error: "ordinary prior generation",
       }),
-      async () => {
-        await cleanup.promise;
-        worktreeReleased = true;
-      },
+      async () => { destructiveCleanup++; },
       agentId,
       "reviewer",
     );
     await internals.backgroundTasks.wait(taskId);
+    const epochOwner = {};
+    const noPathEpochOwner = {};
+    internals.subagentRegistry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      transcriptPath,
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+        }),
+        stopCheckpoint: async () => undefined,
+      },
+    });
+    internals.subagentRegistry.register({
+      agentId: noPathAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: false, oneShot: false,
+      session: {
+        checkpointStopEligibility: () => ({
+          agentId: noPathAgentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: noPathEpochOwner,
+        }),
+        stopCheckpoint: async () => undefined,
+      },
+    });
+    internals.subagentRegistry.register({
+      agentId: "agent-339999999999", agentName: "other", depth: 1, cwd: dir,
+      resumable: true, oneShot: false, transcriptPath: "C:/secret/unaffected.jsonl",
+    });
+    internals.subagentRegistry.markSettled("agent-339999999999", { outcome: "completed" });
+    internals.subagentRuntime.shutdownMcpScopes = async () => { scopedMcpReleased = true; };
+    internals.mcpRuntime.shutdown = async () => { mcpReleased = true; };
+
+    const failure = await shutdownPi.fire("session_shutdown", { reason }).then(
+      () => "",
+      (error: unknown) => String(error),
+    );
+    const quotedAgentId = JSON.stringify(agentId);
+    const quotedTranscriptPath = JSON.stringify(transcriptPath);
+    expect(JSON.parse(quotedAgentId)).toBe(agentId);
+    expect(JSON.parse(quotedTranscriptPath)).toBe(transcriptPath);
+    expect(failure).toContain(`Bounded subset of affected agents: agent ID ${quotedAgentId}, exact transcript path value ${quotedTranscriptPath}; agent ID ${JSON.stringify(noPathAgentId)}, no transcript path was recorded.`);
+    expect(failure).toMatch(/JSON-quoted agent ID and transcript path value above is exact and reversible.*decode the quoted value as JSON.*copy its decoded contents.*quote delimiters are not part of the ID or path/isu);
+    expect(failure).not.toContain("C:/secret/unaffected.jsonl");
+    expect(failure).not.toContain("…");
+    if (live) {
+      expect(failure).toMatch(/process remains live.*decode or copy each exact quoted agent ID.*attempt TaskOutput with the decoded ID.*only if a canonical report exists.*no canonical report exists or TaskOutput is absent or unavailable.*corresponding exact quoted transcript path value.*decoded path before exit.*no transcript path recorded.*caller-owned parent\/client request history is the remaining source.*Transcript paths survive process replacement, but agent IDs do not.*After restart.*decoded transcript paths directly/isu);
+    } else {
+      expect(failure).toMatch(/process is exiting.*renderer is already stopped.*no further TaskOutput invocation is possible.*Before and after restart.*decode or copy each exact quoted transcript path value.*decoded path as its child recovery locator.*no transcript path recorded.*caller-owned parent\/client request history is the remaining source.*Transcript paths survive process replacement, but agent IDs do not/isu);
+      expect(failure).not.toMatch(/attempt TaskOutput/iu);
+    }
+    expect(destructiveCleanup).toBe(0);
+    expect(scopedMcpReleased).toBe(false);
+    expect(mcpReleased).toBe(false);
+    expect(fs.existsSync(log)).toBe(false);
+  });
+
+  it("production session_shutdown fences active generations before its one retained scan and completes confirmed cleanup in order", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    const order: string[] = [];
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+      persistRetainedInputReport: (() => {
+        order.push("retained-persist");
+        return { kind: "session-entry", sessionFile: path.join(dir, "shutdown-order.jsonl"), entryId: "entry-order" };
+      }) as never,
+      mcpRuntime: {
+        whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [],
+        callTool: async () => ({}), getPrompt: async () => ({}), readResource: async () => ({}),
+        diagnostics: () => [], serverStates: () => [],
+        shutdown: async () => { order.push("global-mcp-shutdown"); },
+      },
+    });
+    await shutdownPi.waitForInitialization();
+    await shutdownPi.fire("session_start", { reason: "startup" }, shutdownPi.printCtx({
+      sessionManager: persistedManager(path.join(dir, "shutdown-order.jsonl")),
+    }));
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    const agentId = "agent-444444444444";
+    const linkedAgentId = "agent-444444444446";
+    internals.backgroundTasks.start("agent:linked", new Promise(() => {}), undefined, linkedAgentId, "reviewer");
+    internals.backgroundTasks.start("agent:ordinary", new Promise(() => {}), undefined, "agent-444444444445", "reviewer");
+
+    internals.subagentRuntime.shutdownActiveGenerations = async () => {
+      order.push("active-generations-fenced-and-joined");
+      internals.subagentRegistry.register({
+        agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          const report = createRetainedInputReport({
+            agentId, sessionId: "session-order", generation: 1, stage: "resumed-cancellation",
+            occurrences: [{ id: 1, sessionId: "session-order", generation: 1, delivery: "steer", content: "retained" }],
+            guidance: "Inspect effects.",
+          });
+          internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+          return {
+            confirmed: true, attemptId: attempt!.attemptId, report,
+            releaseCleanup: async () => { order.push("retained-cleanup-released"); },
+          };
+        } },
+      });
+      await internals.subagentRegistry.stopCheckpoint(agentId, "session");
+      internals.subagentRegistry.register({
+        agentId: linkedAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => ({
+          confirmed: true, attemptId: attempt!.attemptId, kind: "ordinary-cleanup",
+        }) },
+      });
+    };
+    const stopAll = internals.subagentRuntime.stopAllRetainedSubagents.bind(internals.subagentRuntime);
+    internals.subagentRuntime.stopAllRetainedSubagents = async (...args) => {
+      order.push("retained-scan-start");
+      const result = await stopAll(...args);
+      order.push("retained-scan-finished");
+      return result;
+    };
+    internals.backgroundTasks.stopAgentAndWait = async () => {
+      order.push("linked-background-joined");
+      return { found: true, alreadySettled: false, abortRequested: true };
+    };
+    internals.backgroundTasks.stopAndWait = async () => {
+      order.push("ordinary-background-joined");
+      return { found: true, alreadySettled: false, abortRequested: true };
+    };
+    internals.subagentRuntime.shutdownCheckpointPaused = async () => { order.push("checkpoint-paused-cleanup"); };
+    internals.subagentRuntime.shutdownMcpScopes = async () => { order.push("scoped-mcp-shutdown"); };
+    const fireHook = internals.inputHooks.fire.bind(internals.inputHooks);
+    internals.inputHooks.fire = async (...args: any[]) => {
+      if (args[0] === "SessionEnd") order.push("session-end");
+      return fireHook(...args);
+    };
+
+    await shutdownPi.fire("session_shutdown", { reason: "other" });
+    expect(fs.existsSync(log)).toBe(true);
+    expect(order).toEqual([
+      "active-generations-fenced-and-joined",
+      "retained-scan-start",
+      "retained-persist",
+      "retained-cleanup-released",
+      "retained-scan-finished",
+      "linked-background-joined",
+      "ordinary-background-joined",
+      "checkpoint-paused-cleanup",
+      "scoped-mcp-shutdown",
+      "global-mcp-shutdown",
+      "session-end",
+    ]);
+  });
+
+  it("joins and persists an active resumed child before cleanup and SessionEnd", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    const persisted: unknown[] = [];
+    const order: string[] = [];
+    const stderr: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+    try {
+      picc(shutdownPi.api as never, {
+        onInitializationSettled: shutdownPi.captureInitialization,
+        onWired: (value) => { internals = value; },
+        persistRetainedInputReport: ((report: unknown) => {
+          persisted.push(report);
+          order.push("persist");
+          return { kind: "session-entry", sessionFile: path.join(dir, "shutdown.jsonl"), entryId: "entry-safe" };
+        }) as never,
+      });
+      await shutdownPi.waitForInitialization();
+      await shutdownPi.fire("session_start", { reason: "startup" }, shutdownPi.printCtx({
+        sessionManager: persistedManager(path.join(dir, "shutdown.jsonl")),
+      }));
+      const agentId = "agent-555555555555";
+      let report: ReturnType<typeof createRetainedInputReport>;
+      let stopCalls = 0;
+      let stopStarted = false;
+      let releaseStop!: () => void;
+      const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+      const epochOwner = {};
+      internals.subagentRegistry.register({
+        agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+        session: {
+          checkpointStopEligibility: () => stopStarted ? undefined : ({
+            agentId, dispatchGeneration: 1, checkpointGeneration: 1, owner: epochOwner,
+          }),
+          stopCheckpoint: async (attempt) => {
+            stopCalls++;
+            stopStarted = true;
+            await stopGate;
+            report = createRetainedInputReport({
+              agentId, sessionId: "session-shutdown", generation: 1, stage: "resumed-cancellation",
+              occurrences: [{ id: 1, sessionId: "session-shutdown", generation: 1, delivery: "steer", content: "retained" }],
+              guidance: "Inspect effects.",
+            });
+            internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+            internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+            return {
+              confirmed: true, attemptId: attempt!.attemptId, report,
+              releaseCleanup: async (attemptId: object) => {
+                if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+                order.push("cleanup");
+              },
+            };
+          },
+        },
+      });
+
+      const alreadySettling = internals.subagentRegistry.stopCheckpoint(agentId, "session");
+      await waitUntil({
+        description: "active child stop to enter registry-owned settlement",
+        predicate: () => internals.subagentRegistry.get(agentId)?.checkpointStopState === "stopping",
+      });
+      expect(internals.subagentRegistry.get(agentId)?.checkpointPaused).not.toBe(true);
+      expect(internals.subagentRegistry.checkpointStopEligible(agentId)).toBe(false);
+      expect(stopCalls).toBe(1);
+      expect(persisted).toHaveLength(0);
+      expect(order).toEqual([]);
+      releaseStop();
+      await alreadySettling;
+      const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" });
+      await shutdown;
+      order.push("shutdown");
+      expect(stopCalls).toBe(1);
+      expect(persisted).toHaveLength(1);
+      expect(order).toEqual(["persist", "cleanup", "shutdown"]);
+      expect(stderr.join("\n")).toContain(`session ${path.join(dir, "shutdown.jsonl")}, entry entry-safe`);
+      expect(stderr.join("\n")).toContain("Open/search that named JSONL for exact entry id entry-safe and customType picc-retained-input-report");
+      expect(stderr.join("\n")).toContain("ordered data.report.occurrences");
+      expect(fs.existsSync(path.join(dir, ".claude", ".session-end-log"))).toBe(true);
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it("emits mixed successful locators and possible-loss warning while releasing cleanup once", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    const persistenceAttempts = new Map<string, number>();
+    const stderr: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+      persistRetainedInputReport: ((report: { agentId: string }) => {
+        const count = (persistenceAttempts.get(report.agentId) ?? 0) + 1;
+        persistenceAttempts.set(report.agentId, count);
+        if (report.agentId === "agent-667777777777") throw new Error("storage unavailable");
+        if (report.agentId === "agent-666666666666") {
+          return {
+            kind: "recovery-file", sessionFile: path.join(dir, "failed-shutdown.jsonl"),
+            path: path.join(dir, "retained-second.json"),
+          };
+        }
+        return {
+          kind: "session-entry", sessionFile: path.join(dir, "failed-shutdown.jsonl"), entryId: "entry-first",
+        };
+      }) as never,
+    });
+    await shutdownPi.waitForInitialization();
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    await shutdownPi.fire("session_start", { reason: "startup" }, shutdownPi.printCtx({
+      sessionManager: persistedManager(path.join(dir, "failed-shutdown.jsonl")),
+    }));
+    const firstAgentId = "agent-665555555555";
+    let firstCleanupReleases = 0;
+    internals.subagentRegistry.register({
+      agentId: firstAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        const report = createRetainedInputReport({
+          agentId: firstAgentId, sessionId: "session-first", generation: 1, stage: "resumed-cancellation",
+          occurrences: [{ id: 1, sessionId: "session-first", generation: 1, delivery: "steer", content: "first" }],
+          guidance: "Inspect effects.",
+        });
+        internals.subagentRegistry.storeRetainedInputReport(firstAgentId, report);
+        internals.subagentRegistry.markSettled(firstAgentId, { outcome: "aborted" });
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            firstCleanupReleases++;
+          },
+        };
+      } },
+    });
+    const agentId = "agent-666666666666";
+    let cleanupReleases = 0;
     internals.subagentRegistry.register({
       agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
       checkpointPaused: true,
-      session: {
-        recoverCheckpoint: async () => { throw new Error("unused"); },
-        stopCheckpoint: async () => cleanup.promise,
-      },
+      session: { stopCheckpoint: async (attempt) => {
+        const report = createRetainedInputReport({
+          agentId, sessionId: "session-failed", generation: 1, stage: "resumed-cancellation",
+          occurrences: [{ id: 1, sessionId: "session-failed", generation: 1, delivery: "followUp", content: "retained" }],
+          guidance: "Inspect effects.",
+        });
+        internals.subagentRegistry.storeRetainedInputReport(agentId, report);
+        internals.subagentRegistry.markSettled(agentId, { outcome: "aborted" });
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            cleanupReleases++;
+          },
+        };
+      } },
     });
 
-    let shutdownSettled = false;
-    const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" })
-      .then(() => { shutdownSettled = true; });
-    await Promise.resolve();
-    expect(shutdownSettled).toBe(false);
-    expect(worktreeReleased).toBe(false);
-    expect(fs.existsSync(log)).toBe(false);
-    expect(internals.backgroundTasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    const failedAgentId = "agent-667777777777";
+    let failedCleanupReleases = 0;
+    internals.subagentRegistry.register({
+      agentId: failedAgentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        const report = createRetainedInputReport({
+          agentId: failedAgentId, sessionId: "session-failed", generation: 1, stage: "resumed-cancellation",
+          occurrences: [{ id: 1, sessionId: "session-failed", generation: 1, delivery: "followUp", content: "at risk" }],
+          guidance: "Inspect effects.",
+        });
+        internals.subagentRegistry.storeRetainedInputReport(failedAgentId, report);
+        internals.subagentRegistry.markSettled(failedAgentId, { outcome: "aborted" });
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            failedCleanupReleases++;
+          },
+        };
+      } },
+    });
 
-    cleanup.resolve();
-    await shutdown;
-    expect(worktreeReleased).toBe(true);
+    await expect(shutdownPi.fire("session_shutdown", { reason: "other" })).resolves.toBeUndefined();
     expect(fs.existsSync(log)).toBe(true);
+    expect(firstCleanupReleases).toBe(1);
+    expect(cleanupReleases).toBe(1);
+    expect(failedCleanupReleases).toBe(1);
+    expect(persistenceAttempts.get(firstAgentId)).toBe(1);
+    expect(persistenceAttempts.get(agentId)).toBe(1);
+    expect(persistenceAttempts.get(failedAgentId)).toBe(1);
+    expect(stderr.join("\n")).toContain("entry entry-first");
+    expect(stderr.join("\n")).toContain(`recovery file ${path.join(dir, "retained-second.json")}`);
+    expect(stderr.join("\n")).toMatch(
+      /no durable retained-input locator was established for this bounded subset of generated agent IDs agent-667777777777.*may be lost.*parent\/child transcripts or request history.*inspect the worktree.*possible files, tools, and external effects/isu,
+    );
+    const missingLocatorWarning = stderr.find((line) => line.includes("no durable retained-input locator"));
+    expect(missingLocatorWarning).not.toContain(firstAgentId);
+    expect(missingLocatorWarning).not.toContain(agentId);
+
+    await expect(shutdownPi.fire("session_shutdown", { reason: "other" })).resolves.toBeUndefined();
+    expect(persistenceAttempts.get(firstAgentId)).toBe(1);
+    expect(persistenceAttempts.get(agentId)).toBe(1);
+    expect(persistenceAttempts.get(failedAgentId)).toBe(1);
+    expect(firstCleanupReleases).toBe(1);
+    expect(cleanupReleases).toBe(1);
+    expect(failedCleanupReleases).toBe(1);
+    console.error = originalError;
   });
 
   it("PostToolUse exit-2 feedback reaches the model in the tool result (lint-and-fix loop)", async () => {

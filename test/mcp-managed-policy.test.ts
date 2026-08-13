@@ -75,6 +75,21 @@ describe("managed MCP policy compiler and evaluator", () => {
     expect(decision({ settings }, stdio({ name: "named", command: "other", args: [] }))).toMatchObject({ status: "blocked", reason: "denied" });
   });
 
+  it("admits subagent-inline identities through the same deny-first and managed-only evaluator", () => {
+    const candidate = stdio({ source: "subagent-inline", name: "agent-tools" });
+    expect(decision({ settings: [entry("managed", 1, {
+      allowedMcpServers: [{ serverCommand: ["node", "server.js"] }],
+      deniedMcpServers: [{ serverName: "agent-tools" }],
+    })] }, candidate)).toMatchObject({ status: "blocked", reason: "denied" });
+    expect(decision({ settings: [entry("managed", 1, {
+      allowManagedMcpServersOnly: true,
+      allowedMcpServers: [{ serverName: "other" }],
+    })] }, candidate)).toMatchObject({ status: "blocked", reason: "managed-only" });
+    expect(decision({ settings: [entry("managed", 1, {
+      allowedMcpServers: [{ serverCommand: ["node", "server.js"] }],
+    })] }, candidate)).toMatchObject({ status: "allowed" });
+  });
+
   it("uses transport-specific allow rules before names and never lets irrelevant kinds authorize", () => {
     const settings = [entry("managed", 1, { allowedMcpServers: [
       { serverName: "tools" },

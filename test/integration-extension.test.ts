@@ -23,6 +23,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/f
 import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadSkills } from "../src/claude/skills.js";
+import { loadAgents } from "../src/claude/agents.js";
 import type { NotebookSessionState } from "../src/runtime/notebook-session.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
 import { createLifecycleLocations, pluginDataPath } from "../src/plugin-lifecycle/locations.js";
@@ -1418,6 +1419,11 @@ describe("session lifecycle hooks", () => {
     expect(postureLine).not.toContain("enabledMcpjsonServers");
     expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
     expect(doctor).toContain("disabledMcpjsonServers");
+    expect(doctor).toContain("Main-session MCP status (agent declaration findings and remediation appear under Compatibility findings):");
+    expect(doctor).toContain('project agent "future-agent" references MCP server "fixture-session"');
+    expect(doctor).toContain('inline MCP server "fixture-inline" is pending PiCC project approval');
+    expect(doctor).toContain("Startup health and deterministic cleanup are dispatch-time only");
+    expect(doctor).not.toContain("declares dispatch-local mcpServers");
     expect(doctor).not.toContain("MCP servers will not start");
   });
 
@@ -2657,13 +2663,13 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     await expect(sub1Stop.execute("r3", { task_id: coordTaskId })).rejects.toThrow(/Unknown task_id/);
 
     // Non-leak: an "unknown id" message echoes the QUERIED id back (the caller's
-    // own input — no leak) but its "Known background tasks" list must reveal only
+    // own input — no leak) but its "Known task/report ids" list must reveal only
     // subagent1's OWN task, never the coordinator's or the sibling's id.
     const errMsg = (r: Promise<unknown>) => r.then(() => "", (e: Error) => e.message);
     const foreignRefusal = await errMsg(
       sub1Output.execute("r4", { task_id: coordTaskId, wait: false }),
     );
-    const knownList = foreignRefusal.split("Known background tasks:")[1] ?? "";
+    const knownList = foreignRefusal.split("Known task/report ids:")[1] ?? "";
     expect(knownList).toContain(ownTaskId1!);
     expect(knownList).not.toContain(coordTaskId);
     expect(knownList).not.toContain(siblingTaskId!);
@@ -2673,7 +2679,7 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     const unknownRefusal = await errMsg(
       sub1Output.execute("r4b", { task_id: "task-99999", wait: false }),
     );
-    expect(unknownRefusal.split("Known background tasks:")[1] ?? "").toBe(knownList);
+    expect(unknownRefusal.split("Known task/report ids:")[1] ?? "").toBe(knownList);
 
     // No side effect: the refused TaskStop did not stop the coordinator's task.
     expect(internals.backgroundTasks.get(coordTaskId)?.status).not.toBe("stopped");
@@ -2744,14 +2750,25 @@ describe("degradation floor", () => {
   it("unknown hook event, degraded handler types, future settings keys — nothing crashed at load", () => {
     // The extension registered tools/commands despite FuturisticUnknownEvent,
     // a prompt-type PreCompact handler, futureUnknownSetting, outputStyle, .mcp.json,
-    // future-agent with mcpServers/memory, and unknown skill frontmatter.
+    // future-agent with supported mcpServers syntax plus memory, and unknown skill frontmatter.
     expect(pi.tools.size).toBeGreaterThan(15);
     expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, quota, skills
   });
 
-  it("future-agent (memory/mcpServers/unknown keys) is still dispatchable via the catalog", async () => {
+  it("future-agent loads the exact supported inert MCP topology without obsolete deferred wording", async () => {
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toContain("future-agent:");
+
+    const loaded = loadAgents([{ dir: path.join(dir, ".claude", "agents"), scope: "project" }]);
+    const agent = loaded.agents.find(({ name }) => name === "future-agent");
+    expect(agent?.description).toContain("supported agent MCP declarations");
+    expect(agent?.description).toContain("reference is absent and an inline server is unapproved");
+    expect(agent?.body).toContain("supported absent-reference and unapproved-inline MCP topology");
+    expect(`${agent?.description}\n${agent?.body}`).not.toMatch(/runtime-deferred|parser-only|Runtime MCP remains deferred/u);
+    expect(agent?.agentMcp?.items).toEqual([
+      { kind: "reference", name: "fixture-session" },
+      expect.objectContaining({ kind: "inline", name: "fixture-inline" }),
+    ]);
   });
 });
 

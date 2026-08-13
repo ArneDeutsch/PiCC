@@ -134,9 +134,10 @@ and no further classification occurs after a blocked winner is known. Present-bu
 authoritative native state or standalone managed MCP fails MCP closed, while absence preserves the
 applicable lower inputs.
 
-Every current MCP source crosses this admission seam before post-admission materialization. A future
-plugin, agent-inline, or explicit runtime/CLI adapter must do the same before its source can be
-claimed as supported; those adapters do not exist today.
+Every current MCP source crosses this admission seam before post-admission materialization. Agent-inline
+admission uses the same immutable policy and approval snapshot, then materializes only inside its named
+dispatch; it never widens ordinary MCP sources or the parent inventory. Future plugin or explicit
+runtime/CLI adapters must cross the same seam before their sources can be claimed as supported.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -299,9 +300,10 @@ where to start reading, not the extent of its cluster.
   joined into the status panel. Registry addresses, including the stable agent id accepted by
   `TaskStop` for a checkpoint-retained child, exist only for the originating
   process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
-  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
-  `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
-  registry).
+  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from an ordinary
+  model `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
+  registry). A confirmed post-commit retained child remains terminal even when model `TaskStop` owns
+  its abandonment.
 
   `subagent-transcript-retention.ts` owns bounded cleanup of persisted child collections.
   Activation starts detached orphan-worktree reaping; only the startup `session_start` may run the
@@ -355,6 +357,23 @@ where to start reading, not the extent of its cluster.
   The enablement gate is enforced by construction: no enabled server means no MCP context; no
   published prompt means no prompt metadata; and no advertised resource capability in the settled
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
+  `agent-mcp.ts` composes immutable named-dispatch catalogs and routing from borrowed eligible session
+  servers plus one owned agent-inline runtime; a published session route quietly wins any same-name
+  inline admission result. Dispatch starts the scope after initial worktree admission and before tool
+  gating or the first provider request. It retains the scope through scoped stop hooks and checkpoint
+  recovery, then awaits shutdown before worktree release and terminal settlement. A successful later
+  EnterWorktree queries live published owned-stdio routes at that boundary before adding pin guidance.
+  After main custody is confirmed, session shutdown fences and joins active generations before its one
+  retained persistence/quarantine scan, joins linked and other background tasks, cleans checkpoint-paused
+  children, shuts down scoped MCP and then the global runtime, and only then fires SessionEnd. Unconfirmed
+  main or child custody stops before scoped or global MCP shutdown and before SessionEnd. Agent-inline capabilities never
+  enter the parent inventory or a sibling/nested agent. Nested agents with omitted or clean-empty
+  declarations still inherit eligible published main-session routes; parent-inline routes do not
+  propagate. Claude documents the agent declaration's list/reference/inline shape and
+  plugin/managed-policy boundaries. Non-empty declaration selection and parent-inline
+  non-propagation are inferred, unverified PiCC choices. Dispatch ordering, session-wins collision precedence,
+  worktree-cwd pinning, warning and result framing, and in-process resume reconstruction are also
+  PiCC-defined coherence choices, not parity claims.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
@@ -364,8 +383,22 @@ where to start reading, not the extent of its cluster.
   may start one physical Pi-owned compaction transaction if the checkpoint is still required, and only
   after no provider response or tool batch remains unresolved; the controller then owns queued-input
   reconciliation, resume, cancellation, and exhaustion. Confirmed pre-commit operational or hook
-  exhaustion remains recoverable in-session;
-  any post-commit restoration, replay, or continuation-start failure is terminal for that session.
+  exhaustion remains recoverable in-session. After a committed summary, the only safe cancellation
+  exception is an exact aborted assistant terminal followed by settlement of that same selected-branch
+  message: the main TUI restores text to the editor, while child input becomes one canonical retained
+  report. The main-session reuse exception is TUI-only. Pi 0.83 RPC abort does not reclaim native
+  queued input, so any authenticated live-RPC cancellation outcome leaves the shared controller
+  exhausted with admission closed, requires status 3 and external PiCC process plus session
+  replacement, and never permits same-session resubmission. The cancellation handoff authenticates
+  a `reusable`, `terminal`, or `restart-required` disposition; publication derives its action from
+  that authority. The accepted session epoch latches a readable mode only for the same session, so
+  a stale terminal context preserves known RPC without inferring it or leaking it to a successor.
+  Pi may drain the queues
+  before PiCC can present that outcome; PiCC does not intercept or purge them. Every other
+  post-commit restoration, replay, provider/tool, or continuation failure remains terminal.
+  `SubagentRegistry` is the sole report and quarantine authority; `TaskOutput`, foreground
+  Agent/Task results, settlement notices, and the panel all consume that same immutable report identity.
+  Unconfirmed child records stay quarantined and cannot be stopped, disposed, or released twice.
   If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
   confirm host quiescence: admission and recovery stay closed, and in-process controller replacement
   is unsafe. Clean PiCC-owned tool batches terminate after
@@ -507,12 +540,15 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    run through PreToolUse hooks, and — on file-touching tools — triggers nested-CLAUDE.md and
    path-scoped rule/skill injection. PostToolUse / PostToolUseFailure hooks fire on the result.
 
-6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
-   session with the gated tool set and returns either the final message verbatim or a loud,
-   classified failure. Dispatch is background-by-default: the call returns a task id, and
-   `TaskOutput`/`TaskStop` manage the lifecycle. `SendMessage` (parent-only) resumes a finished
-   subagent by agent id or steers a running background one — never a user-stopped one; a panel stop
-   is permanent.
+6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`. A supported named
+   agent resolves its admitted MCP declaration after SubagentStart and initial worktree admission;
+   startup settles before the combined tool universe is gated and before the first child request.
+   The runtime then returns either the final message verbatim or a loud, classified failure, with
+   bounded MCP qualification outside that body when setup or cleanup degraded. Dispatch is
+   background-by-default: the call returns a task id, and `TaskOutput`/`TaskStop` manage the lifecycle.
+   `SendMessage` (parent-only) resumes a finished agent only from its captured canonical definition
+   provenance, using the current definition/policy and original cwd, or steers a running background
+   one — never a user-stopped one; a panel stop is permanent.
 
 7. **Cycle boundary / compaction / shutdown.** On supported model APIs, final usage from a fresh
    successful assistant response that requests tools can queue threshold pressure while the requested
@@ -530,13 +566,33 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    character budget; PostCompact output is diagnostic-only, and the system-prompt
    suffix preserves durable instructions. SessionStart(compact) and PostCompact ordinary block output
    is diagnostic-only, while universal hook stop closes the committed-summary session. Confirmed
-   pre-commit operational or hook exhaustion leaves admission paused and recoverable; any post-commit
-   failure closes the session and requires replacement. An unconfirmed-host ending is process-terminal:
-   neither manual recovery nor in-process replacement is safe. Pi's internally
+   pre-commit operational or hook exhaustion leaves admission paused and recoverable. An exact
+   aborted-terminal/same-branch settlement after resume may instead reconcile retained main input
+   without replaying work in the TUI. A presented live-RPC outcome requires terminating PiCC and
+   starting a fresh process and fresh session; print and JSON remain partial/nonzero
+   retrieve-and-relaunch outcomes. The authenticated RPC ending is process-terminal despite confirmed
+   quiescence: neither manual recovery nor in-process new/resume/fork/reload replacement is safe. All
+   ambiguous or other post-commit failures close the session and require replacement. An
+   unconfirmed-host ending is likewise process-terminal. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
    only at a successfully completed logical settlement boundary; logically unsuccessful outcomes
-   bypass ordinary Stop handling. `session_shutdown` joins checkpoint work and shuts down the MCP
-   servers before firing `SessionEnd`.
+   bypass ordinary Stop handling. Confirmed `session_shutdown` follows the active-generation, retained
+   scan, background-join, checkpoint-paused, scoped-MCP, global-MCP, then `SessionEnd` order described
+   above; unconfirmed main or child custody reaches neither MCP shutdown nor `SessionEnd`. Confirmed child retained-input reports receive one bounded
+   best-effort persistence attempt before retained cleanup. Exact reopen verification of either one Pi
+   session custom entry or one restrictive atomic recovery file under the verified Pi session owner
+   produces a locator; complete storage failure names a bounded subset of affected generated agent IDs,
+   emits an explicit possible-loss warning with transcript and caller-owned request-history recovery where
+   available plus effect inspection, and continues
+   ordinary cleanup and `SessionEnd`. Unconfirmed reports remain quarantined and block cleanup rather
+   than being serialized as confirmed data. Their bounded affected-agent projection includes only each
+   outcome's exact current-registry ID and transcript path as reversible JSON-quoted values, or an
+   explicit no-path marker; path characters are not truncated or collapsed. Quote delimiters frame the
+   value and are not path characters. A live non-quit boundary makes `TaskOutput` conditional on a
+   canonical report and otherwise names those decoded paths for copying before exit; after
+   renderer-stopped `quit`, it names them for recovery before or after restart. Transcript paths survive process replacement, while
+   agent IDs do not; caller-owned parent/client request history is the remaining source where available
+   for an affected agent without a recorded path.
 
 ## Mechanical-fidelity decisions (load-bearing)
 

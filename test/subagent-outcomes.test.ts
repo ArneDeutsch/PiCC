@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { validateAgentMcpAdmission } from "../src/index.js";
+import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import { createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
 import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
+  createTaskStopTool,
 } from "../src/runtime/background-tasks.js";
-import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { SubagentRegistry, type SteerableSession } from "../src/runtime/subagent-registry.js";
 import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
+import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
@@ -36,6 +41,172 @@ const CALL_SHAPED_RESULT = `{
 }`;
 
 describe("dispatch outcome classification", () => {
+  it("keeps retained reports deeply immutable, finite, and claimable after failed delivery", async () => {
+    const nestedContent = [{ type: "text", text: "same retained text", nested: { value: 1 } }];
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab",
+      sessionId: "session:agent-0123456789ab",
+      generation: 4,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 7,
+        generation: 4,
+        sessionId: "session:agent-0123456789ab",
+        content: nestedContent,
+        delivery: "followUp",
+      }],
+      guidance: "Files, tools, and external effects may already exist; inspect them before explicit resend.",
+    });
+    nestedContent[0]!.text = "mutated after capture";
+    (nestedContent[0]!.nested as { value: number }).value = 2;
+    let deliveries = 0;
+    expect(await report.claim(async () => { deliveries += 1; return false; })).toBe(false);
+    const foreground = report.claim(async () => { deliveries += 1; await Promise.resolve(); return true; });
+    const settlementNotice = report.claim(async () => { deliveries += 1; return true; });
+
+    expect(await Promise.all([foreground, settlementNotice])).toEqual([true, false]);
+    expect(deliveries).toBe(2);
+    expect(report.occurrences).toEqual([expect.objectContaining({
+      disposition: "reported",
+      shadow: expect.objectContaining({
+        id: 7,
+        content: [{ type: "text", text: "same retained text", nested: { value: 1 } }],
+      }),
+    })]);
+    expect(report.guidance).toMatch(/files, tools, and external effects/iu);
+    expect(Object.isFrozen(report)).toBe(true);
+    expect(Object.isFrozen(report.occurrences)).toBe(true);
+    expect(Object.isFrozen(report.occurrences[0]!.shadow.content)).toBe(true);
+    expect(Object.isFrozen((report.occurrences[0]!.shadow.content as any[])[0]!.nested)).toBe(true);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: Number.NaN,
+      stage: "resumed-cancellation", occurrences: [], guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+    expect(() => createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], unrepresentableCount: Number.POSITIVE_INFINITY,
+      guidance: "recover",
+    })).toThrow(/finite non-negative integer/iu);
+  });
+
+  it("counts unsupported retained content while preserving bounded immutable JSON-like values", () => {
+    const mutable = { type: "text", text: "safe", nested: [1, true, null] };
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const exotic = [
+      new Map([["text", "lost"]]), new Set([1]), new Date(), new Uint8Array([1]),
+      () => undefined, Symbol("lost"), cycle, Number.NaN, Number.POSITIVE_INFINITY,
+    ];
+    const occurrences = [mutable, ...exotic].map((content, index) => ({
+      id: index + 1, generation: 2, sessionId: "session", delivery: "steer" as const,
+      content: [content] as never,
+    }));
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences, unrepresentableCount: 3, guidance: "recover\u0000 safely",
+    });
+    mutable.text = "changed";
+    mutable.nested[0] = 9;
+    expect(report.occurrences).toHaveLength(1);
+    expect(report.occurrences[0]!.shadow.content).toEqual([{
+      type: "text", text: "safe", nested: [1, true, null],
+    }]);
+    expect(report.unrepresentableCount).toBe(3 + exotic.length);
+    expect(report.guidance).toBe("recover  safely");
+
+    const tooDeep: unknown[] = [];
+    let cursor = tooDeep;
+    for (let index = 0; index < 25; index += 1) {
+      const next: unknown[] = [];
+      cursor.push(next);
+      cursor = next;
+    }
+    const capped = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation", occurrences: [{
+        id: 99, generation: 2, sessionId: "session", delivery: "followUp", content: tooDeep,
+      }], guidance: "recover",
+    });
+    expect(capped.occurrences).toEqual([]);
+    expect(capped.unrepresentableCount).toBe(1);
+
+    const overflowSafe = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 2,
+      stage: "resumed-cancellation",
+      occurrences: [{
+        id: 100, generation: 2, sessionId: "wrong-session", delivery: "steer", content: "lost",
+      }],
+      unrepresentableCount: Number.MAX_SAFE_INTEGER,
+      guidance: `\u0000${"g".repeat(2_100)}\u007f`,
+    });
+    expect(overflowSafe.unrepresentableCount).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(overflowSafe.unrepresentableCount)).toBe(true);
+    expect(overflowSafe.guidance).not.toMatch(/[\u0000\u007f]/u);
+    expect(overflowSafe.guidance.length).toBeLessThanOrEqual(2_000);
+    expect(overflowSafe.guidance).toMatch(/\[truncated\]$/u);
+  });
+
+  it("stores one canonical report before cleanup and makes quarantine authoritative", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-0123456789ab", agentName: "reviewer", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    const report = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "Inspect side effects before resend.",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", report)).toBe(true);
+    const differentReport = createRetainedInputReport({
+      agentId: "agent-0123456789ab", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "different object",
+    });
+    expect(registry.storeRetainedInputReport("agent-0123456789ab", differentReport)).toBe(false);
+    registry.markSettled("agent-0123456789ab", { outcome: "aborted" });
+    expect(registry.get("agent-0123456789ab")?.retainedInputReport).toBe(report);
+    expect(registry.quarantineCheckpoint("agent-0123456789ab")).toBe(true);
+    expect(() => registry.assertDispatchAdmission("agent-0123456789ab")).toThrow(
+      /requested dispatch was not performed.*canonical report.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+
+    registry.register({
+      agentId: "agent-fedcba987654", agentName: "worker", depth: 1, cwd: "/repo",
+      resumable: true, oneShot: false,
+    });
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(true);
+    expect(registry.quarantineCheckpoint("agent-fedcba987654")).toBe(false);
+    const quarantined = registry.get("agent-fedcba987654")!;
+    registry.noteProgress("agent-fedcba987654", { tail: ["late"], activity: "late" });
+    registry.noteAdmission("agent-fedcba987654", "waiting");
+    registry.markCheckpointPaused("agent-fedcba987654");
+    registry.markUserStopped("agent-fedcba987654");
+    registry.markSettled("agent-fedcba987654", { outcome: "aborted" });
+    registry.markResuming("agent-fedcba987654");
+    const forbiddenReport = createRetainedInputReport({
+      agentId: "agent-fedcba987654", sessionId: "session", generation: 1,
+      stage: "resumed-cancellation", occurrences: [], guidance: "late",
+    });
+    expect(registry.storeRetainedInputReport("agent-fedcba987654", forbiddenReport)).toBe(false);
+    expect(() => registry.register({
+      agentId: "agent-fedcba987654", agentName: "replacement", depth: 2, cwd: "/other",
+      resumable: true, oneShot: false,
+    })).toThrow(/quarantined/iu);
+    expect(registry.get("agent-fedcba987654")).toBe(quarantined);
+    expect(registry.get("agent-fedcba987654")).toMatchObject({
+      agentName: "worker", state: "running", checkpointPaused: true,
+      checkpointQuarantined: true, resumable: false,
+    });
+    expect(registry.get("agent-fedcba987654")?.userStopped).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.progress).toBeUndefined();
+    expect(registry.get("agent-fedcba987654")?.admission).toBe("admitted");
+    expect(registry.isSettledNoticeArmed("agent-fedcba987654")).toBe(false);
+    expect(registry.consumeSettledNotice("agent-fedcba987654")).toBe(false);
+    expect(() => registry.assertDispatchAdmission("agent-fedcba987654")).toThrow(
+      /requested dispatch was not performed.*fresh process and session.*transcript.*worktree.*external effects/isu,
+    );
+  });
+
   it("stopReason 'error' with no prior output → failed with the error named, never an empty success", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 rate limit exceeded (mock provider)" }],
@@ -47,6 +218,339 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toMatch(API_DEATH);
     expect(result.error).toContain("429 rate limit exceeded");
     expect(result.finalMessage).toBe("");
+  });
+
+  it("opted foreground presentation reads the canonical report without consuming custody and omission leaks no detail", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+    });
+    const report = createRetainedInputReport({
+      agentId, sessionId: "session:foreground", generation: 3, stage: "resumed-cancellation",
+      occurrences: [{
+        id: 7, generation: 3, sessionId: "session:foreground", delivery: "followUp",
+        content: "please preserve this",
+      }],
+      guidance: "Inspect files, tools, and external effects before retrying.",
+    });
+    registry.storeRetainedInputReport(agentId, report);
+    const dispatchResult = {
+      ok: false as const, outcome: "aborted" as const, finalMessage: "", agentId,
+      resumable: true, agentName: "reviewer", retainedInputReport: report,
+      error: "Subagent was cancelled after compaction.", diagnostics: [],
+    };
+    const runtime = {
+      dispatch: async () => dispatchResult,
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const opted = createAgentToolDefinition(runtime as never, {
+      depth: 0,
+      retainedOutcomes: { registry },
+    }) as unknown as ToolLike;
+    const error = await opted.execute("foreground", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    }).catch((cause: Error) => cause);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/1 represented.*TaskOutput with task_id "agent-0123456789ab".*not auto-replayed.*existing files, tools, and external effects/isu);
+    expect(await report.claim(async () => true)).toBe(true);
+
+    const legacy = createAgentToolDefinition(runtime as never, { depth: 0 }) as unknown as ToolLike;
+    const legacyError = await legacy.execute("legacy", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    }).catch((cause: Error) => cause);
+    expect((legacyError as Error).message).toBe("Subagent was cancelled after compaction.");
+    expect((legacyError as Error).message).not.toContain("please preserve this");
+  });
+
+  it("foreground retained detail remains durable when renderer convenience is collapsed or narrow", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({ agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false });
+    const report = createRetainedInputReport({
+      agentId, sessionId: "session:narrow", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:narrow", delivery: "steer", content: "durable" }],
+      guidance: "Inspect possible existing effects.",
+    });
+    registry.storeRetainedInputReport(agentId, report);
+    const runtime = {
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "partial", agentId, resumable: false,
+        agentName: "reviewer", retainedInputReport: report, error: "failed", diagnostics: [],
+      }),
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const tool = createAgentToolDefinition(runtime as never, {
+      depth: 0, retainedOutcomes: { registry },
+    }) as unknown as ToolLike & {
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+    };
+    const returned = await tool.execute("narrow", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    });
+    expect(returned.content[0]!.text).toMatch(/failed.*agent-0123456789ab.*1 represented.*1 total.*TaskOutput with task_id "agent-0123456789ab".*not auto-replayed.*existing effects/isu);
+    const render = (width: number) => tool.renderResult(returned, { expanded: false, isPartial: false }, undefined, {
+      state: {}, args: { subagent_type: "reviewer" }, isError: false,
+    }).render(width).join("\n");
+    const collapsed = render(120);
+    expect(collapsed).toMatch(/failed.*agent-0123456789ab.*1 retained input occurrence.*TaskOutput with task_id "agent-0123456789ab"/isu);
+    expect(collapsed).not.toContain("durable");
+    const narrow = render(7);
+    expect(narrow.split("\n")[0]).toMatch(/^✗\s+r/iu);
+    expect(narrow).toContain("resize");
+    expect(returned.details).toMatchObject({
+      outcome: "failed", agentId, reportId: report.reportId, retainedCount: 1,
+    });
+    expect(returned.details.occurrences).toBe(report.occurrences);
+    expect(await report.claim(async () => true)).toBe(true);
+  });
+
+  it("does not project retained detail for a noncanonical report or a generic failure", async () => {
+    const agentId = "agent-0123456789ab";
+    const registry = new SubagentRegistry();
+    registry.register({ agentId, agentName: "reviewer", depth: 1, cwd: "/repo", resumable: true, oneShot: false });
+    const canonical = createRetainedInputReport({
+      agentId, sessionId: "session:canonical", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 1, generation: 1, sessionId: "session:canonical", delivery: "steer", content: "canonical secret" }],
+      guidance: "canonical guidance",
+    });
+    const mismatched = createRetainedInputReport({
+      agentId, sessionId: "session:mismatch", generation: 1, stage: "resumed-cancellation",
+      occurrences: [{ id: 2, generation: 1, sessionId: "session:mismatch", delivery: "followUp", content: "mismatch secret" }],
+      guidance: "mismatch guidance",
+    });
+    registry.storeRetainedInputReport(agentId, canonical);
+    const outcomes = [
+      { retainedInputReport: mismatched, error: "mismatched failure" },
+      { error: "generic failure" },
+    ];
+    const runtime = {
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "partial", agentId, resumable: false,
+        agentName: "reviewer", diagnostics: [], ...outcomes.shift()!,
+      }),
+      isBackgroundAgent: () => false,
+      agentDisplayColor: () => undefined,
+    };
+    const tool = createAgentToolDefinition(runtime as never, {
+      depth: 0, retainedOutcomes: { registry },
+    }) as unknown as ToolLike;
+    for (const call of ["mismatch", "generic"]) {
+      const shown = await tool.execute(call, {
+        subagent_type: "reviewer", prompt: "work", run_in_background: false,
+      });
+      expect(shown.details).not.toHaveProperty("reportId");
+      expect(shown.details).not.toHaveProperty("retainedCount");
+      expect(shown.content[0]!.text).not.toMatch(/canonical secret|mismatch secret|canonical guidance|mismatch guidance|TaskOutput with task_id/iu);
+    }
+
+    const causeOnly = createAgentToolDefinition({
+      ...runtime,
+      dispatch: async () => ({
+        ok: false, outcome: "failed", finalMessage: "", agentId, resumable: false,
+        agentName: "reviewer", error: "generic cause only", diagnostics: [],
+      }),
+    } as never, { depth: 0, retainedOutcomes: { registry } }) as unknown as ToolLike;
+    let failure: Error | undefined;
+    try {
+      await causeOnly.execute("cause-only", {
+        subagent_type: "reviewer", prompt: "work", run_in_background: false,
+      });
+    } catch (error) {
+      failure = error as Error;
+    }
+    expect(failure?.message).toBe("generic cause only");
+    expect(failure?.message).not.toMatch(/canonical secret|session:canonical|canonical guidance|report-|agent-0123456789ab|retained|occurrence|TaskOutput|auto-replayed|effects/iu);
+  });
+
+  it("omitted stop-all is a no-touch empty capability", async () => {
+    const touched = { registry: 0, session: 0, callback: 0 };
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: new Proxy(new SubagentRegistry(), {
+        get() { touched.registry++; throw new Error("registry must not be read"); },
+      }),
+    });
+    const result = await runtime.stopAllRetainedSubagents({ persist: async () => {
+      touched.callback++;
+      return true;
+    } });
+    expect(result).toEqual({ outcomes: [], confirmed: 0, unconfirmed: 0 });
+    expect(touched).toEqual({ registry: 0, session: 0, callback: 0 });
+  });
+
+  it("accepts a synchronous-void checkpoint stop and quarantines it once as unconfirmed", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    let stops = 0;
+    const session: SteerableSession = { stopCheckpoint: () => { stops++; } };
+    registry.register({
+      agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session,
+    });
+    await expect(registry.stopCheckpoint(agentId, "session")).resolves.toMatchObject({ disposition: "unconfirmed" });
+    await expect(registry.stopCheckpoint(agentId, "session")).resolves.toMatchObject({ disposition: "unconfirmed" });
+    expect(stops).toBe(1);
+    expect(registry.get(agentId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+  });
+
+  it("runtime stop and shutdown helpers use the shared opt-in owner instead of accepting void adapters", async () => {
+    const registry = new SubagentRegistry();
+    const agentId = "agent-0123456789ab";
+    const shutdownId = "agent-fedcba987654";
+    let calls = 0;
+    registry.register({
+      agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session: { stopCheckpoint: async () => { calls++; } },
+    });
+    registry.register({
+      agentId: shutdownId, agentName: "shutdown worker", depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+      checkpointPaused: true, session: { stopCheckpoint: async () => { calls++; } },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    await runtime.stopCheckpoint(agentId);
+    expect(calls).toBe(1);
+    expect(registry.get(agentId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+    await runtime.shutdownCheckpointPaused();
+    expect(calls).toBe(2);
+    expect(registry.get(shutdownId)).toMatchObject({
+      checkpointQuarantined: true, checkpointPaused: true, checkpointStopState: "unconfirmed",
+    });
+  });
+
+  it("stop-all attempts confirmed persistence once and releases cleanup after failure", async () => {
+    const registry = new SubagentRegistry();
+    const confirmedId = "agent-0123456789ab";
+    let stops = 0;
+    let cleanups = 0;
+    let report: ReturnType<typeof createRetainedInputReport>;
+    registry.register({
+      agentId: confirmedId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+      oneShot: false, checkpointPaused: true,
+      session: { stopCheckpoint: async (attempt) => {
+        stops++;
+        report = createRetainedInputReport({
+          agentId: confirmedId, sessionId: "session:stop-all", generation: 1,
+          stage: "resumed-cancellation", occurrences: [], guidance: "Inspect effects.",
+        });
+        registry.storeRetainedInputReport(confirmedId, report);
+        registry.markSettled(confirmedId, { outcome: "aborted" });
+        return {
+          confirmed: true, attemptId: attempt!.attemptId, report,
+          releaseCleanup: async (attemptId: object) => {
+            if (attemptId !== attempt!.attemptId) throw new Error("wrong cleanup identity");
+            cleanups++;
+          },
+        };
+      } },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    const persisted: object[] = [];
+    const first = await runtime.stopAllRetainedSubagents({ persist: async (candidate) => {
+      persisted.push(candidate.reportId);
+      return false;
+    } });
+    expect(first).toMatchObject({ confirmed: 1, unconfirmed: 0 });
+    expect(first.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: true, persisted: false, cleanupReleased: true,
+    });
+    expect(cleanups).toBe(1);
+
+    const repeated = await runtime.stopAllRetainedSubagents({ persist: async () => {
+      throw new Error("must not repeat");
+    } });
+    expect(repeated.outcomes[0]).toMatchObject({
+      disposition: "confirmed", stopRequested: false, persisted: false, cleanupReleased: true,
+    });
+    expect(persisted).toEqual([report!.reportId]);
+    expect(stops).toBe(1);
+    expect(cleanups).toBe(1);
+  });
+
+  it.each(["task-stop", "panel"] as const)(
+    "reuses exact-generation cleanup evidence from ordinary %s before shutdown persistence",
+    async (source) => {
+      const registry = new SubagentRegistry();
+      const agentId = source === "task-stop" ? "agent-111111111111" : "agent-222222222222";
+      let cleanups = 0;
+      let persistenceAttempts = 0;
+      registry.register({
+        agentId, agentName: "worker", depth: 1, cwd: "/repo", resumable: true,
+        oneShot: false, checkpointPaused: true,
+        session: { stopCheckpoint: async (attempt) => {
+          const report = createRetainedInputReport({
+            agentId, sessionId: `session:${source}`, generation: 1, stage: "resumed-cancellation",
+            occurrences: [], guidance: "Inspect effects.",
+          });
+          registry.storeRetainedInputReport(agentId, report);
+          cleanups++;
+          registry.markSettled(agentId, { outcome: "aborted" });
+          return { confirmed: true, attemptId: attempt!.attemptId, report };
+        } },
+      });
+      const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+        subagentRegistry: registry,
+        compactionCancellationRecovery: { registry },
+      });
+
+      await expect(registry.stopCheckpoint(agentId, source)).resolves.toMatchObject({ disposition: "confirmed" });
+      expect(registry.get(agentId)?.retainedInputCleanupReleasedDispatchGeneration).toBe(1);
+      const shutdown = await runtime.stopAllRetainedSubagents({ persist: async () => {
+        persistenceAttempts++;
+        return true;
+      } });
+      expect(shutdown.outcomes[0]).toMatchObject({
+        disposition: "confirmed", persisted: true, cleanupReleased: true,
+      });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+
+      await runtime.stopAllRetainedSubagents({ persist: async () => {
+        throw new Error("must not repeat");
+      } });
+      expect({ cleanups, persistenceAttempts }).toEqual({ cleanups: 1, persistenceAttempts: 1 });
+    },
+  );
+
+  it("stop-all quarantines missing, void, throw, false, and truthy nonboolean evidence once", async () => {
+    const registry = new SubagentRegistry();
+    const modes = ["missing", "void", "throw", "false", "truthy"] as const;
+    const calls = new Map<string, number>();
+    for (const [index, mode] of modes.entries()) {
+      const agentId = `agent-${String(index + 1).repeat(12)}`;
+      registry.register({
+        agentId, agentName: mode, depth: 1, cwd: "/repo", resumable: true, oneShot: false,
+        checkpointPaused: true,
+        ...(mode === "missing" ? {} : { session: { stopCheckpoint: async () => {
+          calls.set(mode, (calls.get(mode) ?? 0) + 1);
+          if (mode === "throw") throw new Error("stop failed");
+          if (mode === "false") return false as never;
+          if (mode === "truthy") return { confirmed: "yes" } as never;
+        } } }),
+      });
+    }
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["unused"] }).sdk, {
+      subagentRegistry: registry,
+      compactionCancellationRecovery: { registry },
+    });
+    const first = await runtime.stopAllRetainedSubagents();
+    const repeated = await runtime.stopAllRetainedSubagents();
+    expect(first).toMatchObject({ confirmed: 0, unconfirmed: modes.length });
+    expect(repeated.outcomes).toEqual(first.outcomes.map((outcome) => ({ ...outcome, stopRequested: false })));
+    expect([...calls.values()]).toEqual([1, 1, 1, 1]);
+    for (const record of registry.list()) {
+      expect(record).toMatchObject({ checkpointQuarantined: true, checkpointPaused: true });
+    }
   });
 
   it("fails closed on a terminal pending assistant response without retrying or reporting completion", async () => {
@@ -558,6 +1062,239 @@ describe("dispatch outcome classification", () => {
     expect(exits).toEqual([{ worktreePath: result.worktreePath, action: "keep" }]);
   });
 
+  it("passes the admitted worktree path to MCP preparation", async () => {
+    const h = fakeSdk({ replies: ["done"] });
+    const preparedCwds: string[] = [];
+    const admittedWorktree = path.join(process.cwd(), ".claude", "worktrees", "admitted");
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
+      worktrees: {
+        enter: async () => ({ ok: true, worktreePath: admittedWorktree, diagnostics: [] }),
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async (_agent, cwd) => {
+        preparedCwds.push(cwd);
+        return { scope, activeOwnedStdioServerNames: () => [] };
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("completed");
+    expect(preparedCwds).toEqual([admittedWorktree]);
+    expect(h.created[0]?.cwd).toBe(admittedWorktree);
+  });
+
+  it("rejects inline MCP without project admission before hooks, worktree, provider, or MCP activity", async () => {
+    const effects: string[] = [];
+    const h = fakeSdk({ replies: ["must not run"] });
+    const agent = makeAgent({
+      isolation: "worktree",
+      agentMcp: normalizeAgentMcpDeclaration([{ inline: { command: "unused" } }], "project"),
+    });
+    const runtime = makeSubagentRuntime([agent], h.sdk, {
+      validateMcpAgent: (candidate) => validateAgentMcpAdmission(candidate, {}),
+      hookRunner: {
+        fire: async () => {
+          effects.push("hook");
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async () => {
+          effects.push("worktree");
+          return { ok: true, worktreePath: "/must-not-enter", diagnostics: [] };
+        },
+        exit: async () => ({}),
+      },
+      prepareMcpFor: async () => {
+        effects.push("mcp");
+        throw new Error("must not prepare MCP");
+      },
+    });
+
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("project MCP admission authority is unavailable");
+    expect(effects).toEqual([]);
+    expect(h.created).toHaveLength(0);
+    expect(h.promptCalls()).toBe(0);
+  });
+
+  it("orders SubagentStop before scoped MCP shutdown, worktree release, and terminal return", async () => {
+    const order: string[] = [];
+    const h = fakeSdk({ replies: ["ordered result"] });
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => {
+        order.push("mcp-shutdown");
+        return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] };
+      },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
+      hookRunner: {
+        fire: async (event: string) => {
+          if (event === "SubagentStop") order.push("subagent-stop");
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async () => ({ ok: true, worktreePath: "/worktrees/ordered", diagnostics: [] }),
+        exit: async () => { order.push("worktree-release"); return {}; },
+      },
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    order.push("terminal-return");
+    expect(result.outcome).toBe("completed");
+    expect(order).toEqual(["subagent-stop", "mcp-shutdown", "worktree-release", "terminal-return"]);
+  });
+
+  it("preserves and qualifies output on unconfirmed cleanup, then transfers one retry to shutdown", async () => {
+    const h = fakeSdk({ replies: ["VERBATIM CHILD BODY"] });
+    let shutdowns = 0;
+    let retries = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => {
+        shutdowns += 1;
+        return { confirmed: [], unconfirmed: ["inline"], diagnostics: ["RAW cleanup detail"] };
+      },
+      retryUnconfirmedShutdown: async () => {
+        retries += 1;
+        return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] };
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async () => ({ scope, activeOwnedStdioServerNames: () => [] }),
+    });
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as any;
+    const result = await tool.execute("uncertain", {
+      subagent_type: "reviewer", prompt: "work", run_in_background: false,
+    });
+    const canonical = result.content[0].text as string;
+    expect(canonical).toContain("VERBATIM CHILD BODY");
+    expect(canonical.match(/Agent MCP cleanup warning:/gu)).toHaveLength(1);
+    expect(canonical).not.toContain("RAW cleanup detail");
+    const expanded = tool.renderResult(
+      result, { expanded: true, isPartial: false }, undefined, { isError: false, state: {} },
+    ).render(200).join("\n");
+    expect(expanded).toContain("VERBATIM CHILD BODY");
+    expect(expanded.match(/Agent MCP cleanup warning:/gu)).toHaveLength(1);
+    expect(shutdowns).toBe(1);
+    expect(retries).toBe(0);
+    await runtime.shutdownMcpScopes();
+    await runtime.shutdownMcpScopes();
+    expect(shutdowns).toBe(1);
+    expect(retries).toBe(1);
+  });
+
+  it("closes an owned MCP scope exactly once across provider, construction, startup, hook-stop, and max-turn endings", async () => {
+    const scenarios: Array<{
+      name: string;
+      build: (h: ReturnType<typeof fakeSdk>) => { sdk: PiSdk; overrides?: Parameters<typeof makeSubagentRuntime>[2]; agent?: ReturnType<typeof makeAgent> };
+      outcome: "completed" | "failed" | "aborted";
+    }> = [
+      { name: "provider", build: (h) => ({ sdk: h.sdk }), outcome: "failed" },
+      {
+        name: "construction",
+        build: (h) => ({ sdk: { ...h.sdk, createAgentSession: async () => { throw new Error("construction failed"); } } }),
+        outcome: "failed",
+      },
+      {
+        name: "startup",
+        build: (h) => ({
+          sdk: {
+            ...h.sdk,
+            DefaultResourceLoader: class {
+              constructor(_options: Record<string, unknown>) {}
+              async reload() { throw new Error("startup failed"); }
+            },
+          },
+        }),
+        outcome: "failed",
+      },
+      {
+        name: "hook-stop",
+        build: (h) => ({
+          sdk: h.sdk,
+          overrides: {
+            hookRunner: {
+              fire: async (event: string) => event === "SubagentStop"
+                ? { block: false, stop: true, stopReason: "hook stopped", askDowngraded: false, diagnostics: [] }
+                : { block: false, stop: false, askDowngraded: false, diagnostics: [] },
+            },
+          },
+        }),
+        outcome: "aborted",
+      },
+      { name: "max-turn", build: (h) => ({ sdk: h.sdk, agent: makeAgent({ maxTurns: 1 }) }), outcome: "completed" },
+    ];
+
+    for (const scenario of scenarios) {
+      const h = fakeSdk({ replies: scenario.name === "provider"
+        ? [{ stopReason: "error", errorMessage: "provider failed" }]
+        : ["done"] });
+      let closes = 0;
+      const scope = {
+        whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+        diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+        callTool: async () => ({}), readResource: async () => ({}),
+        shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      };
+      const built = scenario.build(h);
+      const runtime = makeSubagentRuntime([built.agent ?? makeAgent()], built.sdk, {
+        ...built.overrides,
+        prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+      });
+      const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(result.outcome, scenario.name).toBe(scenario.outcome);
+      expect(closes, scenario.name).toBe(1);
+    }
+  });
+
+  it("session shutdown aborts and joins a blocked MCP preparation before provider construction", async () => {
+    const h = fakeSdk({ replies: ["must not run"] });
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    let releaseResolve!: () => void;
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let shutdownCalls = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { shutdownCalls++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async (_agent, _cwd, signal) => {
+        enteredResolve();
+        signal.addEventListener("abort", releaseResolve, { once: true });
+        await release;
+        return { scope, ownedStdioServerNames: [] };
+      },
+    });
+    const dispatch = runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    await entered;
+    await runtime.shutdownActiveGenerations();
+    const result = await dispatch;
+    expect(result.outcome).toBe("aborted");
+    expect(shutdownCalls).toBe(1);
+    expect(h.created).toHaveLength(0);
+  });
+
   it("an API death during a SubagentStop-forced continuation classifies failed, not a stale success", async () => {
     const h = fakeSdk({
       replies: ["first answer", { stopReason: "error", errorMessage: "429 rate limit exceeded" }],
@@ -575,6 +1312,81 @@ describe("dispatch outcome classification", () => {
     expect(result.error).toMatch(API_DEATH); // the pinned API-error wording
     expect(result.error).toContain("429 rate limit exceeded");
     expect(h.promptCalls()).toBe(2); // initial reply + the one forced continuation
+  });
+
+  it("session shutdown fences admission and drains a live holder plus its queued generation without another provider request", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { concurrency: 1 });
+
+    const live = runtime.dispatch({ subagentType: "reviewer", prompt: "live", depth: 1 });
+    await h.waitForPromptCalls(1);
+    const queued = runtime.dispatch({ subagentType: "reviewer", prompt: "queued", depth: 1 });
+
+    await runtime.shutdownActiveGenerations();
+    const [liveResult, queuedResult] = await Promise.all([live, queued]);
+    expect(liveResult.outcome).toBe("aborted");
+    expect(queuedResult.outcome).toBe("aborted");
+    expect(h.promptCalls()).toBe(1);
+
+    const afterStop = await runtime.dispatch({ subagentType: "reviewer", prompt: "too late", depth: 1 });
+    expect(afterStop.outcome).toBe("aborted");
+    expect(h.promptCalls()).toBe(1);
+  });
+
+  it("session shutdown force-aborts and joins live foreground, background, and nested generations", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { concurrency: 2, maxDepth: 3 });
+    const foreground = runtime.dispatch({ subagentType: "reviewer", prompt: "fg", depth: 1 });
+    const background = runtime.dispatch({ subagentType: "reviewer", prompt: "bg", depth: 2, background: true });
+    const nested = runtime.dispatch({ subagentType: "reviewer", prompt: "nested", depth: 2 });
+    await h.waitForPromptCalls(3);
+
+    await runtime.shutdownActiveGenerations();
+    const results = await Promise.all([foreground, background, nested]);
+    expect(results.map((result) => result.outcome)).toEqual(["aborted", "aborted", "aborted"]);
+    expect(h.abortCalls()).toBeGreaterThanOrEqual(3);
+    expect(h.promptCalls()).toBe(3);
+  });
+
+  it("post-MCP construction cancellation closes the scope and never reaches provider/session creation", async () => {
+    const h = fakeSdk({ replies: ["must not run"] });
+    let reloadEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { reloadEntered = resolve; });
+    let releaseReload!: () => void;
+    const release = new Promise<void>((resolve) => { releaseReload = resolve; });
+    let closes = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const sdk: PiSdk = {
+      ...h.sdk,
+      DefaultResourceLoader: class {
+        constructor(_options: Record<string, unknown>) {}
+        async reload() { reloadEntered(); await release; }
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+
+    const dispatch = runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    await entered;
+    const shutdown = runtime.shutdownActiveGenerations();
+    releaseReload();
+    await shutdown;
+    const result = await dispatch;
+    expect(result.outcome).toBe("aborted");
+    expect(result.error).toContain("aborted before completing");
+    expect(result.error).not.toContain("during MCP setup");
+    expect(closes).toBe(1);
+    expect(h.created).toHaveLength(0);
+    expect(h.promptCalls()).toBe(0);
   });
 
   it("signal fired during SubagentStop-hook evaluation classifies aborted, not completed (abort-race consistency)", async () => {
@@ -929,6 +1741,21 @@ describe("Agent tool failure mapping (Claude 2.1.200 semantics)", () => {
 });
 
 describe("background dispatch failure mapping (through dispatch — not registry literals)", () => {
+  it("stopAndWait joins a stop already pending after the task status flipped to stopped", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let releaseAbort!: () => void;
+    const abortPending = new Promise<void>((resolve) => { releaseAbort = resolve; });
+    const taskPending = new Promise<never>(() => {});
+    const id = registry.start("agent:reviewer", taskPending, () => abortPending);
+    expect(registry.stop(id)).toMatchObject({ found: true, abortRequested: true });
+
+    let joined = false;
+    const joining = registry.stopAndWait(id).then((result) => { joined = true; return result; });
+    await Promise.resolve();
+    expect(joined).toBe(false);
+    releaseAbort();
+    await expect(joining).resolves.toMatchObject({ found: true, abortRequested: true });
+  });
   it("a rate-limit death lands as status 'failed' with the error in TaskOutput — never 'completed' + empty", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 too many requests" }],
@@ -1020,6 +1847,32 @@ describe("background dispatch failure mapping (through dispatch — not registry
     expect(out.content[0]!.text).toContain("500 exploded");
     expect(out.content[0]!.text).toContain("Partial output before the failure:");
     expect(out.content[0]!.text).toContain("work in progress");
+  });
+
+  it("TaskStop's background stop path aborts the live generation and closes its owned MCP scope once", async () => {
+    const gate = new Promise<void>(() => {});
+    const h = fakeSdk({ replies: [{ text: "late", gate }] });
+    let closes = 0;
+    const scope = {
+      whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+      diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [],
+      callTool: async () => ({}), readResource: async () => ({}),
+      shutdown: async () => { closes++; return { confirmed: ["inline"], unconfirmed: [], diagnostics: [] }; },
+      retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+    };
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      prepareMcpFor: async () => ({ scope, ownedStdioServerNames: ["inline"] }),
+    });
+    const registry = new BackgroundTaskRegistry();
+    const tool = createAgentToolDefinition(runtime, { depth: 0, backgroundTasks: registry }) as unknown as ToolLike;
+    const accepted = await tool.execute("start", { subagent_type: "reviewer", prompt: "p", run_in_background: true });
+    const taskId = String(accepted.details.taskId);
+    await h.waitForPromptCalls(1);
+    const taskStop = createTaskStopTool(registry) as unknown as ToolLike;
+    await taskStop.execute("stop", { task_id: taskId });
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.status).toBe("stopped");
+    expect(closes).toBe(1);
   });
 
   it("an aborted background run lands as status 'stopped', not failed or completed", async () => {

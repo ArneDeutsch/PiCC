@@ -19,6 +19,7 @@ import {
   buildCompatReport,
   renderDoctorReport,
 } from "../src/registry/compat-report.js";
+import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
 import { resolveInstalledPlugins } from "../src/claude/plugins.js";
 import { resolveMcpConfig } from "../src/discovery/mcp.js";
@@ -305,11 +306,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/present standalone managed-mcp\.json suppresses this source entirely/, /authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /central policy admission before approval, native disablement, or materialization/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
-    { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
+    { id: "setting.disabledMcpjsonServers", tier: "partial", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-verified Claude Code 2.1.218/, /accumulate-and-dedupe across settings files are PiCC-defined or inferred/] },
     { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /admitted from standalone managed MCP or selected from native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], precedence: [/Standalone exclusive control and settings policy are resolved before post-admission materialization/, /blocked servers never reach runtime/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
     { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /bounded individual server definitions retain skip-or-adjust handling/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent project record semantics.*remain inferred or unverified/], precedence: [/Native state is acquired only when standalone managed MCP is absent/, /central policy admission before native disablement or materialization/, /local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/not verified Claude behavior for multiple canonical-equivalent project records/, /State is never modified/] },
     { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], precedence: [/after central policy admission/, /when standalone exclusive control is absent/], visibility: [/cannot edit the list/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/after central policy admission/, /only when standalone exclusive control is absent/, /disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/after central policy admission/, /only when standalone exclusive control is absent/, /disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/Ordinary main-session pending servers/, /session-start notice/, /\/mcp carries bounded approval/, /Agent-inline static pending declarations appear only in \/doctor/, /bounded Agent\/TaskOutput results/, /absent from the parent \/mcp/, /re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -369,6 +370,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(proactive).toMatch(boundary);
     }
     expect(proactive).toContain("feature.compaction-summary-recovery");
+    expect(proactive).toMatch(/exact aborted terminal object identity followed by same-run selected-branch settlement/);
+    expect(proactive).toMatch(/TUI steering\/follow-up\/draft order and no automatic replay/);
+    expect(proactive).toMatch(/Live RPC post-compaction retained-replay cancellation is unsupported/);
+    expect(proactive).toMatch(/distinct confirmed restart-required terminal category/);
+    expect(proactive).toMatch(/restart-process with status 3, leaves controller admission closed, refuses in-process new\/resume\/fork\/reload replacement/);
+    expect(proactive).toMatch(/requires an external fresh PiCC process plus fresh session/);
+    expect(proactive).toMatch(/Pi may drain those queues before PiCC can present the outcome/);
+    expect(proactive).not.toMatch(/TUI and live RPC may remain reusable|reusable live RPC cancellation/);
+    expect(proactive).toMatch(/canonical report shared by all consumers/);
+    expect(proactive).toMatch(/ambiguous records remain quarantined/);
     expect(proactive).not.toMatch(
       /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
     );
@@ -407,7 +418,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "project-root cwd-pinned",
       "launcher-only marker removal",
       "no tool search",
-      "NOT reported to the model",
+      "main-session startup failures are not injected into MAIN-SESSION model context, and raw failure details are not model-reported",
       "NO MCP context of any kind",
       "aggregate initial-settlement opportunity",
       "feature.mcp-remote-transports",
@@ -494,11 +505,68 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(oauth).toContain("server still runs when otherwise usable");
     expect(oauth).toContain("must not rely on `oauth` under PiCC");
     expect(oauth).toContain("static headers are PiCC's supported alternative");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the session's gated MCP tool proxies and conditional resource tools");
+    expect(lookupCapability("agent.frontmatter.mcpServers")).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("references borrow published routes without duplicate clients");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("disabledMcpjsonServers project-decline gate");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).not.toContain("runtime disablement");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
     // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
+  });
+
+  it("pins the finite agent-scoped MCP registry audit", () => {
+    const pins: ReadonlyArray<readonly [string, string, RegExp]> = [
+      ["agent.frontmatter.mcpServers", "partial", /Claude documents list syntax/],
+      ["tool.Agent", "partial", /setup and cleanup qualification/],
+      ["tool.TaskOutput", "partial", /Agent-scoped MCP setup or cleanup degradation/],
+      ["tool.ToolSearch", "not-supported", /Named-agent setup degradation/],
+      ["tool.WaitForMcpServers", "not-supported", /named-agent setup settles/],
+      ["tool.mcp__*", "partial", /dispatch-local universe/],
+      ["tool.ListMcpResourcesTool", "partial", /non-fork background subagents/],
+      ["tool.ReadMcpResourceTool", "partial", /non-fork background subagents/],
+      ["setting.allowedMcpServers", "partial", /agent-inline MCP source classes/],
+      ["setting.deniedMcpServers", "partial", /agent-inline MCP source classes/],
+      ["setting.allowManagedMcpServersOnly", "partial", /agent-inline source classes/],
+      ["setting.enableAllProjectMcpServers", "partial", /project-agent inline servers/],
+      ["setting.enabledMcpjsonServers", "partial", /project-agent inline servers/],
+      ["setting.disabledMcpjsonServers", "partial", /PiCC-defined application covers ordinary project and agent-inline/],
+      ["setting.strictPluginOnlyCustomization.mcp", "not-supported", /does not stop.*supported agent-inline/],
+      ["feature.mcp", "partial", /agent-owned inline runtime/],
+      ["feature.mcp-prompts", "partial", /agent-inline prompt catalogs are intentionally not published/],
+      ["feature.mcp-model-failure-visibility", "partial", /PiCC-defined warning/],
+      ["feature.mcp-tool-search", "not-supported", /named-agent setup degradation/],
+      ["feature.mcp-resources", "partial", /agent-inline advertised resources/],
+      ["feature.mcp-hook-matching", "partial", /owning-agent inline tools/],
+      ["feature.mcp-remote-transports", "partial", /dispatch-owned agent-inline remote servers/],
+      ["feature.mcp-runtime-disabled", "partial", /does not disable settings-extension winners/],
+      ["feature.mcp-managed-config", "partial", /agent-inline entries cross the same immutable managed policy/],
+      ["feature.mcp-project-approval", "partial", /project-agent inline declarations/],
+      ["feature.mcp-control-status", "partial", /ephemeral agent-owned runtimes do not appear/],
+      ["feature.mcp-cli-invocation-controls", "not-supported", /do not disable or narrow supported agent-inline declarations/],
+    ];
+    for (const [id, tier, phrase] of pins) {
+      const entry = lookupCapability(id);
+      expect(entry, id).toMatchObject({ tier });
+      expect(entry?.note, id).toMatch(phrase);
+    }
+
+    const evidence = lookupCapability("agent.frontmatter.mcpServers")?.evidence;
+    expect(evidence).toEqual([{
+      quality: "documented",
+      source: "Subagents reference — MCP servers",
+      reviewed: "2026-07-31",
+    }]);
+    const note = lookupCapability("agent.frontmatter.mcpServers")?.note ?? "";
+    for (const piCcDefined of [
+      "PiCC's name-based project approval",
+      "PiCC-defined collision precedence",
+      "PiCC-defined lifecycle behavior",
+      "pins stdio to that launch cwd",
+      "Completed in-process resume reconstructs",
+      "ephemeral scopes never enter parent /mcp or /doctor live status",
+      "verified selection/nesting/collision/diagnostic parity",
+    ]) expect(note, piCcDefined).toContain(piCcDefined);
   });
 
   it("pins managed MCP enforcement, hardening, reporting, and deferred-source boundaries", () => {
@@ -510,7 +578,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "URL rules take precedence over names",
       "one frozen launch-environment snapshot",
       "PiCC additionally makes over-limit allow material active-empty",
-      "deferred plugin/agent-inline/explicit-runtime sources",
+      "deferred plugin/explicit-runtime sources",
       "silently hidden blocked UI",
     ]) expect(allowed?.note, phrase).toContain(phrase);
 
@@ -529,7 +597,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(managedOnly?.note).toContain("does not turn an ordinary soft allowlist into an immutable administrator list");
 
     for (const setting of [allowed, denied, managedOnly]) {
-      expect(setting?.note).toContain("all currently loaded ordinary and standalone-managed");
+      expect(setting?.note).toContain("all currently loaded ordinary");
+      expect(setting?.note).toContain("agent-inline");
     }
 
     const managedConfig = lookupCapability("feature.mcp-managed-config");
@@ -544,14 +613,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "single startup notice",
       "not Claude UI parity",
       "server-managed delivery is absent",
-      "deferred plugin/agent-inline/explicit-runtime sources are not loaded",
+      "deferred plugin/explicit-runtime sources are not loaded",
     ]) expect(managedConfig?.note, phrase).toContain(phrase);
 
     expect(lookupCapability("setting.strictPluginOnlyCustomization.mcp")?.note).toContain(
       "manual/CLI/runtime source delivery are themselves unsupported rather than governed",
     );
     expect(lookupCapability("feature.mcp-plugin-servers")?.note).toContain("plugin-bundled MCP servers are deferred");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("per-agent MCP server configs are a deferred surface");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inline stdio/HTTP/SSE servers are dispatch-owned");
     expect(lookupCapability("feature.mcp-cli-invocation-controls")?.note).toContain("Claude CLI invocation/loading controls");
   });
 
@@ -614,8 +683,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const predicate of [
       /standalone `managed-mcp\.json`[\s\S]*exclusive administrator authority/,
       /managed-settings[\s\S]*policy and admits each raw effective winner before expansion, approval, native disablement, or[\s\S]*runtime materialization/,
-      /future[\s\S]*plugin, agent-inline, or explicit runtime\/CLI adapter must do the same/,
-      /those adapters do not exist today/,
+      /Agent-inline\s+admission uses the same immutable policy and approval snapshot[\s\S]*materializes only inside its named\s+dispatch/,
+      /never widens ordinary MCP sources or the parent inventory[\s\S]*Future plugin or explicit\s+runtime\/CLI adapters must cross the same seam before their sources can be claimed as supported/,
     ]) expect(discoverySection).toMatch(predicate);
     const loaderSection = section(architecture, "### `claude/` — parse each artifact format (loaders only, no runtime)");
     expect(loaderSection).toMatch(/MCP server entries \(standalone `managed-mcp\.json`[\s\S]*`managed-mcp\.ts`/);
@@ -737,7 +806,17 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it("qualifies plugin-agent global fields, retained managed-policy sources, and unsupported Windows registry delivery", () => {
     expect(lookupCapability("agent.frontmatter.hooks")?.note).toContain("for non-plugin agents");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("for non-plugin agents");
+    const agentMcp = lookupCapability("agent.frontmatter.mcpServers")?.note;
+    expect(agentMcp).toContain("Plugin agents diagnose and strip the field");
+    expect(agentMcp).toContain("managed agents remain dispatchable but retain the field only as inert evidence");
+    expect(agentMcp).toContain("managed-agent MCP execution");
+    expect(agentMcp).not.toContain("managed-agent execution");
+    expect(agentMcp).toContain("omitted or clean-empty declarations, including on nested agents, inherit eligible published main-session routes");
+    expect(agentMcp).toContain("Parent-inline routes do not propagate to nested children");
+    expect(agentMcp).toContain("non-empty declaration selection and parent-inline non-propagation");
+    expect(agentMcp).toContain("inferred, unverified choices");
+    expect(agentMcp).not.toContain("only capabilities they independently declare");
+    expect(agentMcp).toContain("every published session route win quietly");
     expect(lookupCapability("agent.frontmatter.permissionMode")?.note).toContain("for non-plugin agents");
     const managed = lookupCapability("feature.managed-policy");
     expect(managed?.tier).toBe("partial");
@@ -862,7 +941,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible completed or truncated-completed resumable retrieval/],
       parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
     },
-    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
+    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /pre-commit compaction-paused dispatch/, /authenticated post-commit resumed abort\/join epoch/, /linked background settlement join/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/current dispatch generation/, /stale task generations cannot stop a newer generation/, /subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });
@@ -894,6 +973,19 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ["multiline/detail history", "The detail view retains multiline activity history."],
   ])("detects duplicated panel mechanic: %s", (_category, canary) => {
     expect(duplicatesPanelMechanics(canary)).toBe(true);
+  });
+
+  it("pins canonical retained-input custody and shutdown truth across affected capability owners", () => {
+    const expected = ["tool.Agent", "tool.Task", "tool.TaskOutput", "tool.TaskStop", "tool.SendMessage", "feature.background-agents"];
+    for (const id of expected) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).toMatch(/canonical|canonical owner/);
+      expect(note, id).toMatch(/quarantined|quarantine/);
+    }
+    const background = lookupCapability("feature.background-agents")?.note ?? "";
+    expect(background).toMatch(/exactly reopens.*session entry.*recovery file/);
+    expect(background).toMatch(/best-effort.*warns of possible loss.*cleanup continues/);
+    expect(background).toMatch(/unconfirmed work still blocks cleanup/);
   });
 
   it("keeps panel mechanics in feature.background-agents and tool entries reference that owner", () => {
@@ -1337,6 +1429,7 @@ describe("buildCompatReport", () => {
         { capabilityId: "feature.plugins-other-components", qualifiedIdentity: "broken@community", component: "channels", observation: "Selected manifest declares an unsupported plugin component" },
         { capabilityId: "feature.hook-handler.prompt", qualifiedIdentity: "broken@community", component: "hooks", observation: "Plugin hook handler support is degraded-noop" },
         { capabilityId: "agent.frontmatter.hooks", qualifiedIdentity: "broken@community", component: "worker", observation: "Plugin agent field hooks was stripped before runtime construction" },
+        { capabilityId: "agent.frontmatter.mcpServers", qualifiedIdentity: "broken@community", component: "worker", observation: "HOSTILE OBSERVATION MUST NOT DEFINE REPAIR" },
         { capabilityId: "feature.future-plugin-capability", qualifiedIdentity: "broken@community", observation: "Capability observation is unassessed because its registry entry is absent" },
       ],
       omissions: { "loader.installed.diagnostics": 3, "snapshot.evidence": 2, "snapshot.items": 4 },
@@ -1353,7 +1446,7 @@ describe("buildCompatReport", () => {
     expect(report.pluginInventory?.diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ qualifiedIdentity: "broken@community", status: "enabled-but-uninstalled", nextCommand: "/plugin details broken@community" }),
     ]));
-    for (const id of ["feature.plugins-content", "feature.plugins-other-components", "feature.hook-handler.prompt", "agent.frontmatter.hooks"]) {
+    for (const id of ["feature.plugins-content", "feature.plugins-other-components", "feature.hook-handler.prompt", "agent.frontmatter.hooks", "agent.frontmatter.mcpServers"]) {
       expect([...report.findings, ...report.safetyFindings].some((finding) => finding.capability.id === id), id).toBe(true);
     }
     expect(report.unassessed).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
@@ -1363,6 +1456,8 @@ describe("buildCompatReport", () => {
     expect(doctor).toContain("known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1");
     expect(doctor).toContain("broken@community");
     expect(doctor).toContain("Selected manifest declares an unsupported plugin component");
+    expect(doctor).toContain("Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+    expect(doctor).not.toContain("HOSTILE OBSERVATION");
     expect(doctor).toContain("<redacted-field>");
     expect(doctor).toContain("A non-boolean enabledPlugins value was ignored");
     expect(doctor).toContain("managed-policy override was malformed; this source was ignored. Correct the managed-policy override format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
@@ -1553,27 +1648,219 @@ describe("buildCompatReport", () => {
     expect(doctor).not.toContain("SAFETY feature.hook-handler.mcp_tool —");
   });
 
-  it("flags agents with memory/mcpServers/hooks set", () => {
+  it("does not report a clean supported agent MCP declaration as a generic degradation", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      "shared",
+      { local: { command: "node", args: ["server.mjs"] } },
+    ], "user");
     const project = makeProject({
-      agents: [
-        makeAgent({
-          name: "stateful",
-          memory: { scope: "project" },
-          mcpServers: { fetcher: {} },
-          hooks: { PreToolUse: [] },
+      agents: [makeAgent({ name: "stateful", mcpServers: ["shared"], agentMcp: declaration })],
+      mcp: makeMcp({ servers: [makeMcpServer({ name: "shared", status: "enabled" })] }),
+      agentMcpAdmission: {
+        resolve: () => ({
+          servers: [{ name: "local", source: "subagent-inline", status: "enabled", transport: "stdio", command: "node", rawCommand: "node", args: ["server.mjs"], env: {}, diagnostics: [] }],
+          diagnostics: [],
+          diagnosticOwnership: [],
         }),
-      ],
+      },
     });
     const report = buildCompatReport(project);
-    for (const id of [
-      "agent.frontmatter.memory",
-      "agent.frontmatter.mcpServers",
-      "agent.frontmatter.hooks",
-    ]) {
-      const finding = report.findings.find((f) => f.capability.id === id);
-      expect(finding, id).toBeDefined();
-      expect(finding?.evidence).toContain('agent "stateful"');
+    expect(report.findings.some(({ capability }) => capability.id === "agent.frontmatter.mcpServers")).toBe(false);
+  });
+
+  it("reports every statically knowable unusable agent MCP outcome with bounded attribution", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      "missing-session",
+      42,
+      { blocked: { command: "blocked" } },
+      { disabled: { command: "disabled" } },
+      { pending: { command: "pending" } },
+      { skipped: { command: "skipped" } },
+    ], "project");
+    const project = makeProject({
+      agents: [makeAgent({ name: "stateful\u202eagent", source: { path: "agent.md", scope: "project" }, mcpServers: [], agentMcp: declaration })],
+      mcp: makeMcp(),
+      agentMcpAdmission: {
+        resolve: () => ({
+          servers: [
+            { name: "blocked", source: "subagent-inline", status: "blocked", transport: "stdio", diagnostics: [] },
+            { name: "disabled", source: "subagent-inline", status: "disabled", transport: "stdio", diagnostics: [] },
+            { name: "pending", source: "subagent-inline", status: "pending-approval", transport: "stdio", diagnostics: [] },
+            { name: "skipped", source: "subagent-inline", status: "skipped", transport: "stdio", diagnostics: [] },
+          ],
+          diagnostics: [],
+          diagnosticOwnership: [],
+        }),
+      },
+    });
+    const report = buildCompatReport(project);
+    const evidence = report.findings
+      .filter(({ capability }) => capability.id === "agent.frontmatter.mcpServers")
+      .map((finding) => finding.evidence)
+      .join("\n");
+    for (const phrase of [
+      "invalid, skipped, or adjusted mcpServers declaration diagnostics",
+      'references MCP server "missing-session"',
+      'inline MCP server "blocked" is blocked because admission policy state is unavailable',
+      'inline MCP server "disabled" was declined by disabledMcpjsonServers',
+      'inline MCP server "pending" is pending PiCC project approval',
+      'inline MCP server "skipped" was skipped because its supported inline definition is invalid',
+      "Startup health and deterministic cleanup are dispatch-time only",
+      "do not appear in parent /mcp live status",
+    ]) expect(evidence, phrase).toContain(phrase);
+    expect(evidence).toContain("stateful\\\\u202Eagent");
+    expect(evidence).not.toContain("stateful\u202eagent");
+    expect(evidence).not.toContain("Agent mcpServers item 2");
+    expect(renderDoctorReport(project, report)).toContain("enabledMcpjsonServers");
+  });
+
+  it("retains structured declaration diagnostics when a configured route may be unpublished", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      { collision: { command: "node", adjustedField: true } },
+      { sibling: { command: "node", adjustedField: true } },
+    ], "project");
+    expect(declaration.diagnostics).toHaveLength(2);
+    expect(declaration.diagnosticOwnership).toEqual([
+      { kind: "server", serverName: "collision" },
+      { kind: "server", serverName: "sibling" },
+    ]);
+    const project = makeProject({
+      agents: [makeAgent({ mcpServers: [], agentMcp: declaration })],
+      mcp: makeMcp({ servers: [makeMcpServer({ name: "collision", status: "enabled" })] }),
+      agentMcpAdmission: { resolve: () => ({ servers: [], diagnostics: [], diagnosticOwnership: [] }) },
+    });
+    const evidence = buildCompatReport(project).findings
+      .filter(({ capability }) => capability.id === "agent.frontmatter.mcpServers")
+      .map((finding) => finding.evidence)
+      .join("\n");
+    expect(evidence).toContain('for "collision", "sibling"');
+    expect(evidence).toContain("If a same-name main-session route publishes at dispatch time, runtime quietly borrows it and bypasses this inline outcome or diagnostic");
+    expect(evidence).toContain("publication is dispatch-time and is not known by this static finding");
+  });
+
+  it("retains inactive inline findings when configured enabled routes may be unpublished", () => {
+    const names = ["blocked", "disabled", "pending", "skipped", "not-configured"];
+    const declaration = normalizeAgentMcpDeclaration(names.map((name) => ({
+      [name]: { command: "node", args: [name] },
+    })), "project");
+    const project = makeProject({
+      agents: [makeAgent({ mcpServers: names, agentMcp: declaration })],
+      mcp: makeMcp({ servers: names.map((name) => makeMcpServer({ name, status: "enabled" })) }),
+      agentMcpAdmission: { resolve: () => ({
+        servers: [
+          { name: "blocked", source: "subagent-inline", status: "blocked", inactiveReason: "policy-denied", diagnostics: [] },
+          { name: "disabled", source: "subagent-inline", status: "disabled", inactiveReason: "mcpjson-rejected", diagnostics: [] },
+          { name: "pending", source: "subagent-inline", status: "pending-approval", inactiveReason: "mcpjson-unapproved", diagnostics: [] },
+          { name: "skipped", source: "subagent-inline", status: "skipped", inactiveReason: "admission-unavailable", diagnostics: [] },
+          { name: "not-configured", source: "subagent-inline", status: "not-configured", diagnostics: [] },
+        ], diagnostics: [], diagnosticOwnership: [],
+      }) },
+    });
+    const evidence = buildCompatReport(project).findings
+      .filter(({ capability }) => capability.id === "agent.frontmatter.mcpServers")
+      .map((finding) => finding.evidence);
+    expect(evidence).toHaveLength(names.length);
+    for (const name of names) {
+      const finding = evidence.find((item) => item.includes(`inline MCP server "${name}"`));
+      expect(finding, name).toContain("If a same-name main-session route publishes at dispatch time, runtime quietly borrows it and bypasses this inline outcome or diagnostic");
+      expect(finding, name).toContain("publication is dispatch-time and is not known by this static finding");
     }
+  });
+
+  it("classifies all inactive reasons, missing admission, hostile names, and bounded omissions safely", () => {
+    const declaration = normalizeAgentMcpDeclaration([
+      { denied: { command: "node" } }, { allowmiss: { command: "node" } },
+      { managedonly: { command: "node" } }, { invalid: { command: "node" } },
+      { exclusive: { command: "node" } }, { failclosed: { command: "node" } },
+      { unavailable: { command: "node" } }, { notconfigured: {} },
+    ], "project");
+    const policyServers = [
+      { name: "denied", source: "subagent-inline", status: "blocked", inactiveReason: "policy-denied", diagnostics: [] },
+      { name: "allowmiss", source: "subagent-inline", status: "blocked", inactiveReason: "policy-allow-miss", diagnostics: [] },
+      { name: "managedonly", source: "subagent-inline", status: "blocked", inactiveReason: "policy-managed-only", diagnostics: [] },
+      { name: "invalid", source: "subagent-inline", status: "blocked", inactiveReason: "policy-candidate-invalid", diagnostics: [] },
+      { name: "exclusive", source: "subagent-inline", status: "blocked", diagnostics: [] },
+      { name: "unavailable\u202e\nserver", source: "subagent-inline", status: "skipped", inactiveReason: "admission-unavailable", diagnostics: [] },
+      { name: "notconfigured", source: "subagent-inline", status: "not-configured", diagnostics: [] },
+    ] as const;
+    const agentName = `${"a".repeat(180)}\u202e\nagent`;
+    const project = makeProject({
+      agents: [makeAgent({ name: agentName, mcpServers: [], agentMcp: declaration })],
+      mcp: makeMcp({ policyPosture: "exclusive" }),
+      agentMcpAdmission: { resolve: () => ({ servers: [...policyServers], diagnostics: [], diagnosticOwnership: [] }) },
+    });
+    const evidence = buildCompatReport(project).findings.map((finding) => finding.evidence).join("\n");
+    for (const phrase of [
+      "explicit managed-policy deny", "misses the applicable managed allowlist", "managed-only policy",
+      "candidate identity is invalid or over limit", "exclusive managed MCP control", "admission is unavailable",
+      "not configured with a usable transport",
+    ]) expect(evidence, phrase).toContain(phrase);
+    expect(evidence).toContain("\\u202E server");
+    expect(evidence).not.toContain("\u202e");
+    expect(evidence.length).toBeLessThan(12_000);
+
+    const failClosed = makeProject({
+      agents: [makeAgent({ mcpServers: [], agentMcp: declaration })],
+      mcp: makeMcp({ policyPosture: "fail-closed" }),
+      agentMcpAdmission: { resolve: () => ({
+        servers: [{ name: "failclosed", source: "subagent-inline", status: "blocked", diagnostics: [] }],
+        diagnostics: [], diagnosticOwnership: [],
+      }) },
+    });
+    expect(buildCompatReport(failClosed).findings.map((finding) => finding.evidence).join("\n"))
+      .toContain("managed MCP policy is fail closed");
+
+    const missingAdmission = makeProject({
+      agents: [makeAgent({ mcpServers: [], agentMcp: declaration })],
+    });
+    expect(buildCompatReport(missingAdmission).findings.map((finding) => finding.evidence).join("\n"))
+      .toContain("static admission is unavailable or threw");
+
+    const throwing = makeProject({
+      agents: [makeAgent({ mcpServers: [], agentMcp: declaration })],
+      agentMcpAdmission: { resolve: () => { throw new Error("secret"); } },
+    });
+    const throwingEvidence = buildCompatReport(throwing).findings.map((finding) => finding.evidence).join("\n");
+    expect(throwingEvidence).toContain("static admission is unavailable or threw");
+    expect(throwingEvidence).not.toContain("secret");
+
+    const manyOwned = normalizeAgentMcpDeclaration(Array.from({ length: 12 }, (_, index) => ({
+      [`server${index}`]: { type: "ws", url: "ws://unsupported" },
+    })), "project");
+    const ownedEvidence = buildCompatReport(makeProject({
+      agents: [makeAgent({ mcpServers: [], agentMcp: manyOwned })],
+    })).findings.map((finding) => finding.evidence).join("\n");
+    expect(ownedEvidence).toContain('"server0"');
+    expect(ownedEvidence).toContain('"server7"');
+    expect(ownedEvidence).toContain("and 4 more");
+    expect(ownedEvidence).not.toContain('"server8"');
+
+    const manyAgents = Array.from({ length: 40 }, (_, index) => makeAgent({
+      name: `agent-${index}`,
+      mcpServers: ["missing"],
+      agentMcp: normalizeAgentMcpDeclaration([`missing-${index}`], "project"),
+    }));
+    const bounded = buildCompatReport(makeProject({ agents: manyAgents }));
+    const agentFindings = bounded.findings.filter(({ capability }) => capability.id === "agent.frontmatter.mcpServers");
+    expect(agentFindings.length).toBe(33);
+    expect(agentFindings.at(-1)?.evidence).toBe("8 additional agent MCP declaration finding(s) omitted after the 32-finding report bound. Repair or remove the affected mcpServers declarations, or correct the applicable policy, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+  });
+
+  it("reports managed-agent MCP as inert evidence without implying runtime support", () => {
+    const project = makeProject({
+      agents: [makeAgent({
+        name: "managed-specialist",
+        source: { path: "managed.md", scope: "managed" },
+        mcpServers: ["shared"],
+      })],
+    });
+    const report = buildCompatReport(project);
+    const finding = report.findings.find(({ capability }) => capability.id === "agent.frontmatter.mcpServers");
+    expect(finding?.evidence).toContain("remains dispatchable");
+    expect(finding?.evidence).toContain("retained only as inert declaration evidence and ignored");
+    expect(finding?.evidence).toContain("Define an equivalent user-scoped agent when no project change is wanted");
+    expect(finding?.evidence).not.toContain("managed-agent execution is unsupported");
+    expect(finding?.evidence).not.toContain("dispatch-local MCP is effective");
   });
 
   it("classifies agent-scoped mcp_tool handlers by their effective events", () => {
@@ -2057,7 +2344,7 @@ describe("buildCompatReport", () => {
     expect(enablementLine).not.toContain("/new");
     for (const [field, alternative] of [
       ["hooks", "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."],
-      ["mcpServers", "Configure session MCP servers and gate their tools, or remove this field; per-agent MCP configuration is not retained."],
+      ["mcpServers", "Move the agent to user or project scope, or remove this field; mcpServers is not retained on plugin-provided agents."],
       ["permissionMode", "Use deny rules and tools gating, or remove this field; plugin agents cannot retain permissionMode."],
     ]) {
       expect(doctor).toContain(`forbidden ${field} was stripped before subagent construction`);
@@ -2134,7 +2421,7 @@ describe("buildCompatReport", () => {
     const report = buildCompatReport(project);
     const allFindings = [...report.safetyFindings, ...report.findings];
     expect(allFindings.filter((finding) => finding.evidence.includes("was stripped before subagent construction"))).toHaveLength(20);
-    expect(report.findings.some((finding) => finding.evidence === "10 additional stripped plugin-agent field finding(s) omitted.")).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence === "10 additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.")).toBe(true);
     const hookDetails = report.findings.filter((finding) => finding.evidence.includes("installed plugin \"hook-"));
     expect(hookDetails).toHaveLength(20);
     expect(report.findings.some((finding) => finding.evidence === "30 additional installed-plugin hook limitation(s) omitted.")).toBe(true);
