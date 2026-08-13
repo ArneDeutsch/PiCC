@@ -255,8 +255,8 @@ export function loadClaudeProject(opts: {
   if (rejectedAtLoad.size > 0) {
     const finalDependencyDecisions = admitDependencyGraph(selectedPlugins.map((plugin) => ({
       pluginId: plugin.pluginId, version: plugin.version, enabled: true, available: !rejectedAtLoad.has(plugin.pluginId),
-      ownership: plugin.ownership ?? "claude-imported-readonly", dependencies: plugin.manifestProjection.dependencies,
-      dependencyDeclaration: plugin.manifestProjection.dependencyDeclaration,
+      ownership: plugin.ownership ?? "claude-imported-readonly", dependencies: plugin.dependencies ?? plugin.manifestProjection.dependencies,
+      dependencyDeclaration: plugin.dependencyDeclaration ?? plugin.manifestProjection.dependencyDeclaration,
       ...(plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: plugin.allowedCrossMarketplaceDependencies }),
     })));
     const mergedDependencyDecisions = new Map(finalActualDependencyDecisions.map((decision) => [decision.pluginId, decision]));

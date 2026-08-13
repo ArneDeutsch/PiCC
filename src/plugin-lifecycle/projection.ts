@@ -1,7 +1,9 @@
 import type { EffectivePluginEnablement, NormalizedPluginInstallation, PluginInstallationScope } from "../types.js";
+import type { SafePluginManifestDependency } from "../claude/plugin-metadata.js";
+import type { ExecutableCatalogRelease } from "../util/plugin-marketplace-descriptor.js";
 import type { LifecycleLocations } from "./locations.js";
 import { pluginDataPath } from "./locations.js";
-import type { AdmittedOwnedInstallation, AdmissionRecordObservation, OwnedMarketplaceRecord, OwnedMarketplaceSnapshotRecord } from "./admission.js";
+import type { AdmittedOwnedInstallation, AdmissionRecordObservation, OwnedMarketplaceRecord, OwnedMarketplaceSnapshotRecord, ResolvedPluginVersionAuthority } from "./admission.js";
 import { projectIdentities } from "../util/project-identity.js";
 import { observePersistedTransactionsSync } from "./transaction.js";
 
@@ -21,6 +23,12 @@ export interface OwnedInstallationProjection {
   readonly dataRoot: string;
   readonly executableGenerationId: string;
   readonly allowedCrossMarketplaceDependencies: readonly string[];
+  readonly dependencies: readonly SafePluginManifestDependency[];
+  readonly dependencyDeclaration: "absent" | "complete";
+  readonly catalogDependencies: readonly SafePluginManifestDependency[];
+  readonly catalogDependencyDeclaration: "absent" | "complete";
+  readonly catalogRelease?: ExecutableCatalogRelease;
+  readonly resolvedVersionAuthority?: ResolvedPluginVersionAuthority;
   readonly marketplaceDefaultEnabled?: boolean;
   readonly authority: AdmittedOwnedInstallation;
 }
@@ -64,7 +72,9 @@ export function projectOwnedAndImportedInstallations(inputs: {
     const owned: OwnedInstallationProjection = Object.freeze({ ownership: "picc-owned", pluginId: record.pluginId, scope: record.scope,
       ...(projectPath === undefined ? {} : { projectPath }), installPath: record.installRoot, version: record.version,
       dataPath: pluginDataPath(inputs.locations, record.pluginId), profileRoot: inputs.locations.profileRoot, dataRoot: inputs.locations.dataRoot, executableGenerationId: record.executableGenerationId,
-      allowedCrossMarketplaceDependencies: record.allowedCrossMarketplaceDependencies,
+      allowedCrossMarketplaceDependencies: record.allowedCrossMarketplaceDependencies, dependencies: record.dependencies, dependencyDeclaration: record.dependencyDeclaration,
+      catalogDependencies: record.catalogDependencies, catalogDependencyDeclaration: record.catalogDependencyDeclaration,
+      ...(record.catalogRelease === undefined ? {} : { catalogRelease: record.catalogRelease }), resolvedVersionAuthority: record.resolvedVersionAuthority,
       ...(record.marketplaceDefaultEnabled === undefined ? {} : { marketplaceDefaultEnabled: record.marketplaceDefaultEnabled }), authority });
     ownedProjectionAuthorities.add(owned);
     const sameAuthority = projections.find((candidate) => {

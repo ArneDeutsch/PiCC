@@ -10,7 +10,7 @@ import type { PluginSettingsEffectSummary } from "../src/plugin-lifecycle/settin
 
 const digest = `sha256:${"a".repeat(64)}` as const;
 const source = { kind: "https-catalog", url: "https://catalog.example.org/catalog.json" } as const;
-const target: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "official", snapshotId: `marketplace-${createHash("sha256").update(`${digest}\0${source.url}`).digest("base64url")}`, source, catalogDigest: digest, provenance: { adapter: "public-https-catalog", canonicalUrl: source.url } };
+const target: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "official", snapshotId: `marketplace-${createHash("sha256").update(`${digest}\0${source.url}`).digest("base64url")}`, source, catalogDigest: digest, executableCatalog: { marketplaceName: "official", allowedCrossMarketplaceDependencies: [], declarations: [] }, provenance: { adapter: "public-https-catalog", canonicalUrl: source.url } };
 const grant = createMarketplaceSnapshotTrustGrant(target); if (!grant.ok) throw new Error(grant.message);
 const registration = { ownership: "picc-owned", name: "official", profileKey: "profile-test", scope: "user", source, selectedSnapshotId: target.snapshotId } as const;
 const snapshot = { ownership: "picc-owned", profileKey: "profile-test", ...target, trust: grant.value } as const;

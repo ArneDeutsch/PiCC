@@ -267,6 +267,120 @@ export interface MarketplaceCatalogDeclarationSummary {
   readonly omittedEntries: number;
 }
 
+export interface ExecutableCatalogDependency {
+  readonly name: string;
+  readonly marketplace?: string;
+  readonly version?: string;
+  readonly itemIndex: number;
+}
+export interface ExecutableCatalogRelease { readonly kind: "version" | "revision" | "source-sha"; readonly value: string }
+export interface ExecutableCatalogDeclaration {
+  readonly pluginId: `${string}@${string}`;
+  readonly source: CatalogPluginSource;
+  readonly defaultEnabled?: boolean;
+  readonly release?: ExecutableCatalogRelease;
+  readonly dependencies: readonly ExecutableCatalogDependency[];
+  readonly dependencyDeclaration: "absent" | "complete";
+}
+export interface ExecutableMarketplaceCatalogProjection {
+  readonly marketplaceName: string;
+  readonly allowedCrossMarketplaceDependencies: readonly string[];
+  readonly declarations: readonly ExecutableCatalogDeclaration[];
+}
+
+const MAX_EXECUTABLE_ALLOWLIST = 128;
+const MAX_EXECUTABLE_DEPENDENCIES = 128;
+function safeOption(value: unknown): string | undefined { return text(value, 256); }
+function dependencyFields(value: unknown, allowedKeys: readonly string[]): Omit<ExecutableCatalogDependency, "itemIndex"> | undefined {
+  if (typeof value === "string") return isDocumentedMarketplaceName(value) ? Object.freeze({ name: value }) : undefined;
+  if (!plain(value) || !exactKeys(value, allowedKeys) || !isDocumentedMarketplaceName(String(own(value, "name")))) return undefined;
+  const marketplace = own(value, "marketplace"); const version = own(value, "version");
+  if (marketplace !== undefined && (typeof marketplace !== "string" || !isDocumentedMarketplaceName(marketplace))) return undefined;
+  if (version !== undefined && safeOption(version) === undefined) return undefined;
+  return Object.freeze({ name: own(value, "name") as string, ...(marketplace === undefined ? {} : { marketplace }), ...(version === undefined ? {} : { version: version as string }) });
+}
+function rawExecutableDependency(value: unknown, itemIndex: number): ExecutableCatalogDependency | undefined {
+  const fields = dependencyFields(value, ["name", "marketplace", "version"]);
+  return fields === undefined ? undefined : Object.freeze({ ...fields, itemIndex });
+}
+function persistedExecutableDependency(value: unknown, itemIndex: number): ExecutableCatalogDependency | undefined {
+  if (!plain(value) || own(value, "itemIndex") !== itemIndex) return undefined;
+  const fields = dependencyFields(value, ["name", "marketplace", "version", "itemIndex"]);
+  return fields === undefined ? undefined : Object.freeze({ ...fields, itemIndex });
+}
+function sameShallowRecord(left: Readonly<Record<string, unknown>>, right: Readonly<Record<string, unknown>>): boolean {
+  const leftKeys = Object.keys(left).sort(); const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length && leftKeys.every((key, index) => key === rightKeys[index] && left[key] === right[key]);
+}
+function exactCatalogSource(value: unknown, sourceKind: MarketplaceRegistrationSource["kind"]): CatalogPluginSource | undefined {
+  if (!plain(value)) return undefined;
+  const raw = value.kind === "relative" && typeof value.path === "string" ? `./${value.path}`
+    : value.kind === "github" ? { source: "github", repo: value.repository, ...(value.ref === undefined ? {} : { ref: value.ref }), ...(value.sha === undefined ? {} : { sha: value.sha }) }
+    : value.kind === "https-git" ? { source: "url", url: value.url, ...(value.ref === undefined ? {} : { ref: value.ref }), ...(value.sha === undefined ? {} : { sha: value.sha }) }
+    : value.kind === "https-git-subdir" ? { source: "git-subdir", url: value.url, path: value.path, ...(value.ref === undefined ? {} : { ref: value.ref }), ...(value.sha === undefined ? {} : { sha: value.sha }) }
+    : value.kind === "npm" ? { source: "npm", package: value.package, ...(value.version === undefined ? {} : { version: value.version }), registry: value.registry }
+    : value.kind === "https-zip" ? { source: "archive", url: value.url, ...(value.sha256 === undefined ? {} : { sha256: value.sha256 }) }
+    : undefined;
+  if (raw === undefined) return undefined;
+  const routed = routeCatalogPluginSource(raw, { marketplaceSourceKind: sourceKind, ...(value.kind === "relative" && typeof value.pluginRoot === "string" ? { metadataPluginRoot: value.pluginRoot } : {}) });
+  return routed.ok && sameShallowRecord(routed.value.descriptor, value) ? routed.value.descriptor : undefined;
+}
+
+export function decodeExecutableMarketplaceCatalogProjection(value: unknown, sourceKind: MarketplaceRegistrationSource["kind"]): ExecutableMarketplaceCatalogProjection | undefined {
+  if (!plain(value) || !exactKeys(value, ["marketplaceName", "allowedCrossMarketplaceDependencies", "declarations"]) || typeof value.marketplaceName !== "string" || !isDocumentedMarketplaceName(value.marketplaceName)
+    || !Array.isArray(value.allowedCrossMarketplaceDependencies) || value.allowedCrossMarketplaceDependencies.length > MAX_EXECUTABLE_ALLOWLIST
+    || value.allowedCrossMarketplaceDependencies.some((item) => typeof item !== "string" || !isDocumentedMarketplaceName(item))
+    || value.allowedCrossMarketplaceDependencies.some((item, index, values) => index > 0 && values[index - 1]! >= item)
+    || !Array.isArray(value.declarations) || value.declarations.length > 1024) return undefined;
+  const declarations: ExecutableCatalogDeclaration[] = [];
+  for (const raw of value.declarations) {
+    if (!plain(raw) || !exactKeys(raw, ["pluginId", "source", "defaultEnabled", "release", "dependencies", "dependencyDeclaration"])
+      || typeof raw.pluginId !== "string" || !raw.pluginId.endsWith(`@${value.marketplaceName}`) || !isDocumentedMarketplaceName(raw.pluginId.slice(0, raw.pluginId.lastIndexOf("@"))) || raw.pluginId.length > 257
+      || raw.defaultEnabled !== undefined && typeof raw.defaultEnabled !== "boolean" || raw.dependencyDeclaration !== "absent" && raw.dependencyDeclaration !== "complete"
+      || !Array.isArray(raw.dependencies) || raw.dependencies.length > MAX_EXECUTABLE_DEPENDENCIES || raw.dependencyDeclaration === "absent" && raw.dependencies.length !== 0) return undefined;
+    const source = exactCatalogSource(raw.source, sourceKind); if (source === undefined) return undefined;
+    const release = raw.release;
+    if (release !== undefined && (!plain(release) || !exactKeys(release, ["kind", "value"]) || !["version", "revision", "source-sha"].includes(String(release.kind)) || safeOption(release.value) === undefined)) return undefined;
+    const dependencies = raw.dependencies.map((item, index) => persistedExecutableDependency(item, index));
+    if (dependencies.some((item) => item === undefined) || new Set(dependencies.map((item) => `${item!.name}@${item!.marketplace ?? value.marketplaceName}`)).size !== dependencies.length) return undefined;
+    declarations.push(Object.freeze({ pluginId: raw.pluginId as `${string}@${string}`, source, ...(raw.defaultEnabled === undefined ? {} : { defaultEnabled: raw.defaultEnabled }), ...(release === undefined ? {} : { release: Object.freeze({ kind: release.kind, value: release.value }) as ExecutableCatalogRelease }), dependencies: Object.freeze(dependencies as ExecutableCatalogDependency[]), dependencyDeclaration: raw.dependencyDeclaration }));
+  }
+  if (declarations.some((item, index) => index > 0 && declarations[index - 1]!.pluginId >= item.pluginId)) return undefined;
+  return Object.freeze({ marketplaceName: value.marketplaceName, allowedCrossMarketplaceDependencies: Object.freeze([...value.allowedCrossMarketplaceDependencies] as string[]), declarations: Object.freeze(declarations) });
+}
+
+export function deriveExecutableMarketplaceCatalogProjection(bytes: Uint8Array, sourceKind: MarketplaceRegistrationSource["kind"]): ExecutableMarketplaceCatalogProjection | undefined {
+  let parsed: unknown; try { parsed = JSON.parse(Buffer.from(bytes).toString("utf8")); } catch { return undefined; }
+  if (!plain(parsed) || typeof parsed.name !== "string" || !isDocumentedMarketplaceName(parsed.name) || !Array.isArray(parsed.plugins) || parsed.plugins.length > 1024) return undefined;
+  const metadata = plain(parsed.metadata) ? parsed.metadata : undefined; const rawPluginRoot = metadata?.pluginRoot;
+  const pluginRoot = rawPluginRoot === undefined ? undefined : typeof rawPluginRoot === "string" ? rawPluginRoot : undefined;
+  if (rawPluginRoot !== undefined && pluginRoot === undefined) return undefined;
+  const rawAllowlist = own(parsed, "allowCrossMarketplaceDependenciesOn");
+  if (rawAllowlist !== undefined && (!Array.isArray(rawAllowlist) || rawAllowlist.length > MAX_EXECUTABLE_ALLOWLIST)) return undefined;
+  const allowlist = (rawAllowlist ?? []) as unknown[];
+  if (allowlist.some((item) => typeof item !== "string" || !isDocumentedMarketplaceName(item)) || new Set(allowlist).size !== allowlist.length) return undefined;
+  const declarations: ExecutableCatalogDeclaration[] = [];
+  const validIdentities = parsed.plugins.flatMap((raw) => plain(raw) && typeof raw.name === "string" && isDocumentedMarketplaceName(raw.name) ? [raw.name] : []);
+  if (new Set(validIdentities).size !== validIdentities.length) return undefined;
+  for (const raw of parsed.plugins) {
+    if (!plain(raw) || typeof raw.name !== "string" || !isDocumentedMarketplaceName(raw.name)) return undefined;
+    const routed = routeCatalogPluginSource(raw.source, { marketplaceSourceKind: sourceKind, ...(pluginRoot === undefined ? {} : { metadataPluginRoot: pluginRoot }) });
+    if (!routed.ok) continue;
+    if (raw.defaultEnabled !== undefined && typeof raw.defaultEnabled !== "boolean") return undefined;
+    const dependencyRaw = raw.dependencies;
+    if (dependencyRaw !== undefined && (!Array.isArray(dependencyRaw) || dependencyRaw.length > MAX_EXECUTABLE_DEPENDENCIES)) return undefined;
+    const dependencies = ((dependencyRaw ?? []) as unknown[]).map(rawExecutableDependency); if (dependencies.some((item) => item === undefined) || new Set(dependencies.map((item) => `${item!.name}@${item!.marketplace ?? parsed.name}`)).size !== dependencies.length) return undefined;
+    const version = raw.version === undefined ? undefined : safeOption(raw.version); const revision = raw.revision === undefined ? undefined : safeOption(raw.revision);
+    if (raw.version !== undefined && version === undefined || raw.revision !== undefined && revision === undefined) return undefined;
+    const sourceSha = "sha" in routed.value.descriptor ? routed.value.descriptor.sha : undefined;
+    const release: ExecutableCatalogRelease | undefined = version !== undefined ? { kind: "version", value: version } : revision !== undefined ? { kind: "revision", value: revision } : sourceSha !== undefined ? { kind: "source-sha", value: sourceSha } : undefined;
+    declarations.push(Object.freeze({ pluginId: `${raw.name}@${parsed.name}`, source: routed.value.descriptor, ...(raw.defaultEnabled === undefined ? {} : { defaultEnabled: raw.defaultEnabled }), ...(release === undefined ? {} : { release: Object.freeze(release) }), dependencies: Object.freeze(dependencies as ExecutableCatalogDependency[]), dependencyDeclaration: dependencyRaw === undefined ? "absent" : "complete" }));
+  }
+  declarations.sort((left, right) => left.pluginId.localeCompare(right.pluginId));
+  if (declarations.some((item, index) => index > 0 && declarations[index - 1]!.pluginId === item.pluginId)) return undefined;
+  return decodeExecutableMarketplaceCatalogProjection({ marketplaceName: parsed.name, allowedCrossMarketplaceDependencies: [...allowlist].sort(), declarations }, sourceKind);
+}
+
 export function normalizeMarketplaceCatalogDocument(value: unknown, marketplaceSourceKind: MarketplaceRegistrationSource["kind"] = "local-directory"): MarketplaceCatalogDeclarationSummary | undefined {
   if (!plain(value) || typeof own(value, "name") !== "string" || !isDocumentedMarketplaceName(own(value, "name") as string)
     || !plain(own(value, "owner")) || text(own(own(value, "owner") as Record<string, unknown>, "name"), 256) === undefined

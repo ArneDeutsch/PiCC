@@ -48,6 +48,8 @@ export interface InstalledPlugin {
   root: string;
   dataDir: string;
   manifestProjection: SafePluginManifestProjection;
+  dependencies?: readonly import("./plugin-metadata.js").SafePluginManifestDependency[];
+  dependencyDeclaration?: "absent" | "complete" | "invalid" | "truncated";
   skillSources: PluginSkillLoaderSource[];
   commandSources: PluginSkillLoaderSource[];
   agentSources: PluginAgentLoaderSource[];
@@ -362,8 +364,29 @@ function resolveComponents(options: {
   const manifestSourcePath = manifestResult.manifestPath?.lexicalPath ?? path.join(options.root.lexicalPath, ".claude-plugin", "plugin.json");
   const projectedManifest = projectPluginManifest(manifest, manifestSourcePath);
   if (isOwnedInstallation(options.installation)) {
+    const record = options.installation.authority.record;
     const executable = executableDigestForProjection(projectedManifest.projection);
-    if (!executable.ok || executable.value !== options.installation.authority.record.executableDigest) return { ok: false, diagnostics: [{ severity: "warning", message: "Owned plugin executable projection does not match its trusted executable digest" }], manifestProjection: projectedManifest.projection };
+    const merged = new Map<string, import("./plugin-metadata.js").SafePluginManifestDependency>();
+    let dependencyConflict = false;
+    for (const dependency of [...record.catalogDependencies, ...(projectedManifest.projection.dependencies ?? [])]) {
+      const identity = `${dependency.name}@${dependency.marketplace ?? record.source.marketplaceName}`; const existing = merged.get(identity);
+      if (existing !== undefined && existing.version !== dependency.version) dependencyConflict = true;
+      else if (existing === undefined) merged.set(identity, dependency);
+    }
+    const mergedDependencies = [...merged.values()].sort((left, right) => `${left.name}@${left.marketplace ?? record.source.marketplaceName}`.localeCompare(`${right.name}@${right.marketplace ?? record.source.marketplaceName}`)).map((dependency, itemIndex) => ({ name: dependency.name, ...(dependency.marketplace === undefined ? {} : { marketplace: dependency.marketplace }), ...(dependency.version === undefined ? {} : { version: dependency.version }), itemIndex }));
+    const declaration = record.catalogDependencyDeclaration === "absent" && projectedManifest.projection.dependencyDeclaration === "absent" ? "absent" : "complete";
+    const authority = record.resolvedVersionAuthority;
+    const authorityMismatch = (() => {
+      if (authority.kind === "manifest-version") return projectedManifest.projection.version !== authority.version || record.version !== authority.version;
+      if (authority.kind === "catalog-release") return projectedManifest.projection.version !== undefined || record.catalogRelease === undefined || JSON.stringify(authority.release) !== JSON.stringify(record.catalogRelease) || record.version !== authority.release.value;
+      if (projectedManifest.projection.version !== undefined || record.catalogRelease !== undefined) return true;
+      if (authority.kind === "npm-resolved-version") return record.source.kind !== "npm" || authority.version !== record.source.version || record.version !== authority.version;
+      if (authority.kind === "git-commit") return record.source.kind !== "git" || authority.commit !== record.source.commit || record.version !== authority.commit;
+      if (authority.kind === "relative-marketplace-snapshot") return record.source.kind !== "marketplace-relative" || authority.snapshotId !== record.source.marketplaceSnapshotId || record.version !== authority.snapshotId;
+      return record.source.kind !== "zip" || authority.digest !== record.source.zipDigest || record.version !== `zip-${authority.digest.slice("sha256:".length)}`;
+    })();
+    const sameDependencies = mergedDependencies.length === record.dependencies.length && mergedDependencies.every((dependency, index) => { const retained = record.dependencies[index]; return retained !== undefined && dependency.name === retained.name && dependency.marketplace === retained.marketplace && dependency.version === retained.version && retained.itemIndex === index; });
+    if (!executable.ok || executable.value !== record.executableDigest || dependencyConflict || projectedManifest.projection.dependencyDeclaration === "invalid" || projectedManifest.projection.dependencyDeclaration === "truncated" || declaration !== record.dependencyDeclaration || !sameDependencies || authorityMismatch) return { ok: false, diagnostics: [{ severity: "warning", message: "Owned plugin executable, release, or dependency projection does not match retained trusted authority" }], manifestProjection: projectedManifest.projection };
   }
   const pluginName = manifestResult.manifestPath ? manifest["name"] as string : options.lifecycleName;
   if (!COMPONENT_NAME.test(pluginName)) return {
@@ -482,6 +505,7 @@ function resolveComponents(options: {
     root: options.root.canonicalPath,
     dataDir: dataPath,
     manifestProjection: projectedManifest.projection,
+    ...(ownedInstallation === undefined ? {} : { dependencies: ownedInstallation.dependencies, dependencyDeclaration: ownedInstallation.dependencyDeclaration }),
     skillSources,
     commandSources,
     agentSources,
@@ -624,7 +648,7 @@ export function resolveInstalledPlugins(options: {
     for (const items of groups.values()) if (items.length > 1) for (const item of items) rejectedIds.add(item.plugin.pluginId);
   }
   const dependencyDecisions = admitDependencyGraph([
-    ...provisional.map((item) => ({ pluginId: item.plugin.pluginId, version: item.plugin.version, enabled: true, available: !rejectedIds.has(item.plugin.pluginId), ownership: item.plugin.ownership ?? "claude-imported-readonly" as const, dependencies: item.plugin.manifestProjection.dependencies, dependencyDeclaration: item.plugin.manifestProjection.dependencyDeclaration, ...(item.plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: item.plugin.allowedCrossMarketplaceDependencies }) })),
+    ...provisional.map((item) => ({ pluginId: item.plugin.pluginId, version: item.plugin.version, enabled: true, available: !rejectedIds.has(item.plugin.pluginId), ownership: item.plugin.ownership ?? "claude-imported-readonly" as const, dependencies: item.plugin.dependencies ?? item.plugin.manifestProjection.dependencies, dependencyDeclaration: item.plugin.dependencyDeclaration ?? item.plugin.manifestProjection.dependencyDeclaration, ...(item.plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: item.plugin.allowedCrossMarketplaceDependencies }) })),
     ...disabledDependencyEvidence.map((item) => ({ ...item, enabled: false })),
   ]);
   const dependencyRejected = new Set(dependencyDecisions.filter((decision) => !decision.admitted && !rejectedIds.has(decision.pluginId) && provisional.find((item) => item.plugin.pluginId === decision.pluginId)?.plugin.ownership === "picc-owned").map((decision) => decision.pluginId));

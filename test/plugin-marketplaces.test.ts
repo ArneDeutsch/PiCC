@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadPluginMarketplaceState, type PluginMarketplaceSettingsInputContribution } from "../src/claude/plugin-marketplaces.js";
 import { loadSettings } from "../src/discovery/settings.js";
-import { normalizeMarketplaceCatalogDocument, normalizeMarketplacePolicyDescriptor } from "../src/util/plugin-marketplace-descriptor.js";
+import { decodeExecutableMarketplaceCatalogProjection, deriveExecutableMarketplaceCatalogProjection, normalizeMarketplaceCatalogDocument, normalizeMarketplacePolicyDescriptor } from "../src/util/plugin-marketplace-descriptor.js";
 import type { PluginMarketplaceComponentField } from "../src/types.js";
 
 const knownFixture = fileURLToPath(new URL("./fixtures/claude-plugins/known-marketplaces.json", import.meta.url));
@@ -91,6 +91,14 @@ afterEach(() => {
 });
 
 describe("loadPluginMarketplaceState", () => {
+  it("derives one bounded canonical executable projection from exact catalog bytes", () => {
+    const bytes = Buffer.from(JSON.stringify({ name: "official-marketplace", owner: { name: "Example" }, metadata: { pluginRoot: "plugins" }, allowCrossMarketplaceDependenciesOn: ["zeta", "partner"], plugins: [{ name: "tool", source: "./tool", version: "1.2.3", dependencies: ["base", { name: "cross", marketplace: "partner", version: "^2" }] }, { name: "archive", source: { source: "archive", url: "https://archive.example.org/plugin.zip" }, defaultEnabled: false, revision: "release-2" }] }));
+    const projection = deriveExecutableMarketplaceCatalogProjection(bytes, "local-directory"); expect(projection).toEqual({ marketplaceName: "official-marketplace", allowedCrossMarketplaceDependencies: ["partner", "zeta"], declarations: [{ pluginId: "archive@official-marketplace", source: { kind: "https-zip", url: "https://archive.example.org/plugin.zip" }, defaultEnabled: false, release: { kind: "revision", value: "release-2" }, dependencies: [], dependencyDeclaration: "absent" }, { pluginId: "tool@official-marketplace", source: { kind: "relative", path: "tool", pluginRoot: "plugins" }, release: { kind: "version", value: "1.2.3" }, dependencies: [{ name: "base", itemIndex: 0 }, { name: "cross", marketplace: "partner", version: "^2", itemIndex: 1 }], dependencyDeclaration: "complete" }] }); expect(decodeExecutableMarketplaceCatalogProjection(projection, "local-directory")).toEqual(projection);
+    const reorderedNpm = { marketplaceName: "official-marketplace", allowedCrossMarketplaceDependencies: [], declarations: [{ pluginId: "npm-tool@official-marketplace", source: { registry: "https://registry.npmjs.org", package: "npm-tool", kind: "npm" }, dependencies: [], dependencyDeclaration: "absent" }] }; expect(decodeExecutableMarketplaceCatalogProjection(reorderedNpm, "local-directory")).toMatchObject({ declarations: [{ source: { kind: "npm", package: "npm-tool", registry: "https://registry.npmjs.org" } }] }); expect(decodeExecutableMarketplaceCatalogProjection({ ...reorderedNpm, declarations: [{ ...reorderedNpm.declarations[0], pluginId: "bad@@official-marketplace" }] }, "local-directory")).toBeUndefined();
+    const duplicate = Buffer.from(JSON.stringify({ name: "official-marketplace", plugins: [{ name: "tool", source: "./tool" }, { name: "tool", source: "./other" }] })); expect(deriveExecutableMarketplaceCatalogProjection(duplicate, "local-directory")).toBeUndefined();
+    const duplicateAllowlist = Buffer.from(JSON.stringify({ name: "official-marketplace", allowCrossMarketplaceDependenciesOn: ["partner", "partner"], plugins: [] })); expect(deriveExecutableMarketplaceCatalogProjection(duplicateAllowlist, "local-directory")).toBeUndefined();
+    const truncatedDependencies = Buffer.from(JSON.stringify({ name: "official-marketplace", plugins: [{ name: "tool", source: "./tool", dependencies: Array.from({ length: 129 }, () => "base") }] })); expect(deriveExecutableMarketplaceCatalogProjection(truncatedDependencies, "local-directory")).toBeUndefined();
+  });
   it("derives primary catalogs beneath the user marketplace root and keeps declarations non-authoritative", () => {
     const root = temporaryRoot();
     const userDir = path.join(root, ".claude");

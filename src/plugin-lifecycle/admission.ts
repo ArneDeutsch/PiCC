@@ -7,8 +7,10 @@ import { digestArtifactEntries, type ArtifactDigestEntry } from "./artifact-dige
 import { PORTABLE_TREE_LIMITS } from "./tree-validator.js";
 import { canonicalJsonBytes, createProducerCodecRegistry, isContainedPath, ownedRecordPartition, readRecordEnvelope, revalidateOwnedStateStore, sha256, type OwnedStateStore, type ProducerCodec, type ProducerCodecRegistry, type StoreResult } from "./state-store.js";
 import type { CatalogPluginSource, CheckoutFamilyKey, LifecycleProfileKey, MarketplaceRegistrationSource, MutablePluginScope, QualifiedPluginIdentity, Sha256 } from "./types.js";
+import type { SafePluginManifestDependency } from "../claude/plugin-metadata.js";
 import type { PluginRootSelection } from "./plugin-root.js";
 import { isQualifiedPluginId } from "../util/plugin-id.js";
+import { decodeExecutableMarketplaceCatalogProjection, deriveExecutableMarketplaceCatalogProjection, type ExecutableCatalogRelease, type ExecutableMarketplaceCatalogProjection } from "../util/plugin-marketplace-descriptor.js";
 import { issueMarketplaceGenerationFromOwnedAdmission, type MarketplaceGeneration } from "./marketplace-generation.js";
 import { acquisitionFailure, issueRetainedMarketplaceGenerationAuthority, type RetainedMarketplaceGenerationEvidence } from "./acquisition/common.js";
 
@@ -16,7 +18,7 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const GENERATION = /^admission-[A-Za-z0-9_-]{1,96}$/;
 const SNAPSHOT = /^marketplace-[A-Za-z0-9_-]{1,128}$/;
 const PROFILE = /^profile-[A-Za-z0-9_-]+$/;
-const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$/;
+const MAX_MANIFEST_VERSION_LENGTH = 2048;
 const CHECKOUT = /^checkout-[A-Za-z0-9_-]+$/;
 const MARKETPLACE = /^[a-z0-9][a-z0-9.-]{0,127}$/;
 const MAX_RECORDS = 4096;
@@ -33,6 +35,14 @@ export type PersistedPluginSource = InstallationCatalogProvenance & (
   | { readonly kind: "zip"; readonly url: string; readonly zipDigest: Sha256 }
 );
 
+export type ResolvedPluginVersionAuthority =
+  | { readonly kind: "manifest-version"; readonly version: string }
+  | { readonly kind: "catalog-release"; readonly release: ExecutableCatalogRelease }
+  | { readonly kind: "npm-resolved-version"; readonly version: string }
+  | { readonly kind: "git-commit"; readonly commit: string }
+  | { readonly kind: "relative-marketplace-snapshot"; readonly snapshotId: `marketplace-${string}` }
+  | { readonly kind: "zip-artifact-digest"; readonly digest: Sha256 };
+
 export interface ExecutableTrustGrant {
   readonly target: QualifiedPluginIdentity;
   readonly artifactDigest: Sha256;
@@ -41,6 +51,12 @@ export interface ExecutableTrustGrant {
   readonly executableDigest: Sha256;
   readonly selectedRoot: PersistedSelectedRoot;
   readonly allowedCrossMarketplaceDependencies: readonly string[];
+  readonly dependencies: readonly SafePluginManifestDependency[];
+  readonly dependencyDeclaration: "absent" | "complete";
+  readonly catalogDependencies: readonly SafePluginManifestDependency[];
+  readonly catalogDependencyDeclaration: "absent" | "complete";
+  readonly catalogRelease?: ExecutableCatalogRelease;
+  readonly resolvedVersionAuthority: ResolvedPluginVersionAuthority;
 }
 export interface OwnedPluginInstallationRecord {
   readonly ownership: "picc-owned";
@@ -61,6 +77,12 @@ export interface OwnedPluginInstallationRecord {
   readonly executableGenerationId: string;
   readonly trust: ExecutableTrustGrant;
   readonly allowedCrossMarketplaceDependencies: readonly string[];
+  readonly dependencies: readonly SafePluginManifestDependency[];
+  readonly dependencyDeclaration: "absent" | "complete";
+  readonly catalogDependencies: readonly SafePluginManifestDependency[];
+  readonly catalogDependencyDeclaration: "absent" | "complete";
+  readonly catalogRelease?: ExecutableCatalogRelease;
+  readonly resolvedVersionAuthority: ResolvedPluginVersionAuthority;
   readonly marketplaceDefaultEnabled?: boolean;
 }
 export interface ExecutableAdmissionGenerationMember {
@@ -82,11 +104,13 @@ export type OwnedMarketplaceRecord = OwnedMarketplaceRecordBase & (
 export interface CatalogOnlyMarketplaceSnapshotTrustTarget {
   readonly authorityKind: "catalog-only"; readonly marketplaceName: string; readonly snapshotId: `marketplace-${string}`;
   readonly source: Extract<MarketplaceRegistrationSource, { readonly kind: "https-catalog" }>; readonly catalogDigest: Sha256;
+  readonly executableCatalog: ExecutableMarketplaceCatalogProjection;
   readonly provenance: Readonly<{ readonly adapter: "public-https-catalog"; readonly canonicalUrl: string }>;
 }
 export interface MaterializedMarketplaceSnapshotTrustTarget {
   readonly authorityKind: "materialized"; readonly marketplaceName: string; readonly snapshotId: `marketplace-${string}`;
   readonly source: Exclude<MarketplaceRegistrationSource, { readonly kind: "https-catalog" }>; readonly catalogDigest: Sha256;
+  readonly executableCatalog: ExecutableMarketplaceCatalogProjection;
   readonly artifactDigest: Sha256; readonly treeDigest: Sha256; readonly rootDigest: Sha256;
   readonly selectedRoot: PluginRootSelection; readonly artifactRoot: string; readonly installRoot: string; readonly catalogRelativePath: string;
   readonly provenance: Readonly<
@@ -152,13 +176,61 @@ function decodeSource(value: unknown): PersistedPluginSource | undefined {
   if (value.kind === "zip" && exact(value, ["kind", ...common, "url", "zipDigest"])) { const routed = routeCatalogPluginSource({ source: "archive", url: value.url, sha256: typeof value.zipDigest === "string" ? value.zipDigest.slice(7) : value.zipDigest }, { marketplaceSourceKind: "local-directory" }); return routed.ok && routed.value.descriptor.kind === "https-zip" && digest(value.zipDigest) ? value as unknown as PersistedPluginSource : undefined; }
   return undefined;
 }
-function decodeTrust(value: unknown): ExecutableTrustGrant | undefined { return exact(value, ["target", "artifactDigest", "treeDigest", "rootDigest", "executableDigest", "selectedRoot", "allowedCrossMarketplaceDependencies"]) && safeIdentity(value.target) && digest(value.artifactDigest) && digest(value.treeDigest) && digest(value.rootDigest) && digest(value.executableDigest) && decodeRootSelection(value.selectedRoot) !== undefined && Array.isArray(value.allowedCrossMarketplaceDependencies) ? value as unknown as ExecutableTrustGrant : undefined; }
+function decodeDependencies(value: unknown): readonly SafePluginManifestDependency[] | undefined {
+  if (!Array.isArray(value) || value.length > 128) return undefined;
+  const result: SafePluginManifestDependency[] = [];
+  for (let index = 0; index < value.length; index++) {
+    const item = value[index];
+    if (!exact(item, ["name", "itemIndex"], ["marketplace", "version"]) || typeof item.name !== "string" || !MARKETPLACE.test(item.name) || item.itemIndex !== index
+      || item.marketplace !== undefined && (typeof item.marketplace !== "string" || !MARKETPLACE.test(item.marketplace))
+      || item.version !== undefined && (typeof item.version !== "string" || item.version.length === 0 || item.version.length > 256 || /[\u0000-\u001f\u007f]/.test(item.version))) return undefined;
+    result.push(Object.freeze({ name: item.name, ...(item.marketplace === undefined ? {} : { marketplace: item.marketplace }), ...(item.version === undefined ? {} : { version: item.version }), itemIndex: index }));
+  }
+  const identities = result.map((item) => `${item.name}@${item.marketplace ?? ""}`);
+  return new Set(identities).size === identities.length ? Object.freeze(result) : undefined;
+}
+function decodeRelease(value: unknown): ExecutableCatalogRelease | undefined {
+  return exact(value, ["kind", "value"]) && ["version", "revision", "source-sha"].includes(String(value.kind)) && typeof value.value === "string" && value.value.length > 0 && value.value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value.value)
+    ? Object.freeze({ kind: value.kind as ExecutableCatalogRelease["kind"], value: value.value }) : undefined;
+}
+function safeManifestVersion(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_MANIFEST_VERSION_LENGTH && !/[\u0000-\u001f\u007f]/.test(value);
+}
+function decodeResolvedVersionAuthority(value: unknown): ResolvedPluginVersionAuthority | undefined {
+  if (!plain(value) || typeof value.kind !== "string") return undefined;
+  if (value.kind === "manifest-version" && exact(value, ["kind", "version"]) && safeManifestVersion(value.version)) return Object.freeze({ kind: value.kind, version: value.version });
+  if (value.kind === "catalog-release" && exact(value, ["kind", "release"])) { const release = decodeRelease(value.release); return release === undefined ? undefined : Object.freeze({ kind: value.kind, release }); }
+  if (value.kind === "npm-resolved-version" && exact(value, ["kind", "version"]) && typeof value.version === "string" && semver.valid(value.version) === value.version) return Object.freeze({ kind: value.kind, version: value.version });
+  if (value.kind === "git-commit" && exact(value, ["kind", "commit"]) && typeof value.commit === "string" && /^[a-f0-9]{40}$/.test(value.commit)) return Object.freeze({ kind: value.kind, commit: value.commit });
+  if (value.kind === "relative-marketplace-snapshot" && exact(value, ["kind", "snapshotId"]) && typeof value.snapshotId === "string" && SNAPSHOT.test(value.snapshotId)) return Object.freeze({ kind: value.kind, snapshotId: value.snapshotId as `marketplace-${string}` });
+  if (value.kind === "zip-artifact-digest" && exact(value, ["kind", "digest"]) && digest(value.digest)) return Object.freeze({ kind: value.kind, digest: value.digest });
+  return undefined;
+}
+function resolvedVersionRelationship(version: unknown, source: PersistedPluginSource | undefined, release: ExecutableCatalogRelease | undefined, authority: ResolvedPluginVersionAuthority | undefined): boolean {
+  if (typeof version !== "string" || authority === undefined || source === undefined) return false;
+  if (authority.kind === "manifest-version") return authority.version === version;
+  if (authority.kind === "catalog-release") return release !== undefined && sameCanonical(authority.release, release) && authority.release.value === version;
+  if (release !== undefined) return false;
+  if (authority.kind === "npm-resolved-version") return source.kind === "npm" && authority.version === source.version && version === source.version;
+  if (authority.kind === "git-commit") return source.kind === "git" && authority.commit === source.commit && version === source.commit;
+  if (authority.kind === "relative-marketplace-snapshot") return source.kind === "marketplace-relative" && authority.snapshotId === source.marketplaceSnapshotId && version === source.marketplaceSnapshotId;
+  return source.kind === "zip" && authority.digest === source.zipDigest && version === `zip-${source.zipDigest.slice("sha256:".length)}`;
+}
+function decodeTrust(value: unknown): ExecutableTrustGrant | undefined {
+  if (!exact(value, ["target", "artifactDigest", "treeDigest", "rootDigest", "executableDigest", "selectedRoot", "allowedCrossMarketplaceDependencies", "dependencies", "dependencyDeclaration", "catalogDependencies", "catalogDependencyDeclaration", "resolvedVersionAuthority"], ["catalogRelease"])) return undefined;
+  const dependencies = decodeDependencies(value.dependencies); const catalogDependencies = decodeDependencies(value.catalogDependencies); const release = value.catalogRelease === undefined ? undefined : decodeRelease(value.catalogRelease); const authority = decodeResolvedVersionAuthority(value.resolvedVersionAuthority);
+  return safeIdentity(value.target) && digest(value.artifactDigest) && digest(value.treeDigest) && digest(value.rootDigest) && digest(value.executableDigest) && decodeRootSelection(value.selectedRoot) !== undefined && Array.isArray(value.allowedCrossMarketplaceDependencies)
+    && dependencies !== undefined && catalogDependencies !== undefined && (value.dependencyDeclaration === "absent" || value.dependencyDeclaration === "complete") && (value.catalogDependencyDeclaration === "absent" || value.catalogDependencyDeclaration === "complete")
+    && (value.dependencyDeclaration !== "absent" || dependencies.length === 0) && (value.catalogDependencyDeclaration !== "absent" || catalogDependencies.length === 0) && (value.catalogRelease === undefined || release !== undefined) && authority !== undefined
+    ? value as unknown as ExecutableTrustGrant : undefined;
+}
 function validScope(payload: Record<string, unknown>): boolean { return payload.scope === "user" ? payload.checkoutFamilyKey === undefined && payload.projectKey === undefined : (payload.scope === "project" || payload.scope === "local") && safeProjectKey(payload.checkoutFamilyKey) && CHECKOUT.test(payload.checkoutFamilyKey) && payload.projectKey === payload.checkoutFamilyKey; }
 
 export function createOwnedPluginInstallationCodec(context: AdmissionContext): ProducerCodec<OwnedPluginInstallationRecord> {
   return Object.freeze({ schema: "plugin-installation", version: 1, decode: (payload: unknown) => {
-    if (!exact(payload, ["ownership", "pluginId", "scope", "profileKey", "version", "source", "artifactDigest", "treeDigest", "rootDigest", "executableDigest", "selectedRoot", "installRoot", "dataIdentity", "executableGenerationId", "trust", "allowedCrossMarketplaceDependencies"], ["checkoutFamilyKey", "projectKey", "marketplaceDefaultEnabled"])) return fail("invalid-admission", "Owned installation payload has an inexact shape");
+    if (!exact(payload, ["ownership", "pluginId", "scope", "profileKey", "version", "source", "artifactDigest", "treeDigest", "rootDigest", "executableDigest", "selectedRoot", "installRoot", "dataIdentity", "executableGenerationId", "trust", "allowedCrossMarketplaceDependencies", "dependencies", "dependencyDeclaration", "catalogDependencies", "catalogDependencyDeclaration", "resolvedVersionAuthority"], ["checkoutFamilyKey", "projectKey", "marketplaceDefaultEnabled", "catalogRelease"])) return fail("invalid-admission", "Owned installation payload has an inexact shape");
     const source = decodeSource(payload.source); const trust = decodeTrust(payload.trust); const data = exact(payload.dataIdentity, ["profileKey", "identity"]) ? payload.dataIdentity : undefined;
+    const dependencies = decodeDependencies(payload.dependencies); const catalogDependencies = decodeDependencies(payload.catalogDependencies); const catalogRelease = payload.catalogRelease === undefined ? undefined : decodeRelease(payload.catalogRelease); const versionAuthority = decodeResolvedVersionAuthority(payload.resolvedVersionAuthority);
     const allow = payload.allowedCrossMarketplaceDependencies; const validAllow = Array.isArray(allow) && allow.length <= 128 && allow.every((item) => typeof item === "string" && MARKETPLACE.test(item)) && allow.every((item, i) => i === 0 || allow[i - 1]! < item);
     const selectedRoot = decodeRootSelection(payload.selectedRoot);
     const artifactRoot = digest(payload.treeDigest) ? path.join(path.resolve(context.artifactsRoot), payload.treeDigest.slice(7)) : "";
@@ -167,15 +239,30 @@ export function createOwnedPluginInstallationCodec(context: AdmissionContext): P
     const catalogAuthorities = source === undefined || source.marketplaceName !== pluginMarketplace(String(payload.pluginId)) ? [] : snapshots.filter((snapshot) => snapshot.snapshotId === source.marketplaceSnapshotId && snapshot.marketplaceName === source.marketplaceName && snapshot.catalogDigest === source.catalogDigest);
     const catalogRelationship = catalogAuthorities.length > 0;
     const relativePath = source?.kind === "marketplace-relative" ? [source.pluginRoot, source.path].filter((item): item is string => item !== undefined && item !== "").join("/") : "";
-    const snapshotDeclarationRelationship = source !== undefined && catalogAuthorities.every((snapshot) => snapshot.authorityKind === "catalog-only" || verifyMaterializedMarketplaceCatalog(snapshot, context.artifactsRoot, { pluginId: String(payload.pluginId), source }));
+    const snapshotDeclarationRelationship = source !== undefined && catalogAuthorities.every((snapshot) => {
+      const declarations = snapshot.executableCatalog?.declarations.filter((declaration) => declaration.pluginId === payload.pluginId) ?? [];
+      if (declarations.length !== 1) return false; const declaration = declarations[0]!;
+      const sourceMatches = source.kind === "marketplace-relative" ? declaration.source.kind === "relative" && declaration.source.path === source.path && declaration.source.pluginRoot === source.pluginRoot
+        : source.kind === "git" ? sameCanonical(declaration.source, source.declaration)
+        : source.kind === "npm" ? declaration.source.kind === "npm" && declaration.source.package === source.package && declaration.source.registry === source.registry
+        : declaration.source.kind === "https-zip" && declaration.source.url === source.url && (declaration.source.sha256 === undefined || `sha256:${declaration.source.sha256}` === source.zipDigest);
+      return sourceMatches && sameCanonical(snapshot.executableCatalog.allowedCrossMarketplaceDependencies, payload.allowedCrossMarketplaceDependencies)
+        && declaration.defaultEnabled === payload.marketplaceDefaultEnabled
+        && sameCanonical(declaration.dependencies, catalogDependencies)
+        && declaration.dependencyDeclaration === payload.catalogDependencyDeclaration
+        && (declaration.release === undefined && catalogRelease === undefined || declaration.release !== undefined && catalogRelease !== undefined && sameCanonical(declaration.release, catalogRelease));
+    });
     const relativeSnapshotRelationship = source?.kind !== "marketplace-relative" || catalogAuthorities.length > 0 && catalogAuthorities.every((snapshot) => snapshot.authorityKind === "materialized" && snapshot.artifactDigest === payload.artifactDigest && snapshot.treeDigest === payload.treeDigest);
     const selectionRelationship = source?.kind === "marketplace-relative" ? selectedRoot?.requested === "relative-subtree" && selectedRoot.path === relativePath && !selectedRoot.usedSingleWrapper
       : source?.kind === "git" ? selectedRoot?.requested === "tree-root" && selectedRoot.path === "" && !selectedRoot.usedSingleWrapper
       : source?.kind === "npm" ? selectedRoot?.requested === "package/" && selectedRoot.path === "" && selectedRoot.usedSingleWrapper
       : source?.kind === "zip" ? selectedRoot?.requested === "root-or-single-wrapper" && ((selectedRoot.path === "" && !selectedRoot.usedSingleWrapper) || (selectedRoot.usedSingleWrapper && selectedRoot.path.length > 0 && !selectedRoot.path.includes("/"))) : false;
-    const sourceRelationship = source?.kind === "npm" ? source.version === payload.version : source?.kind === "zip" ? source.zipDigest === payload.artifactDigest : source?.kind === "git" || source?.kind === "marketplace-relative" ? payload.artifactDigest === payload.treeDigest : false;
-    const versionRelationship = typeof payload.version === "string" && (source?.kind === "npm" ? semver.valid(payload.version) === payload.version : VERSION.test(payload.version));
-    if (payload.ownership !== "picc-owned" || !safeIdentity(payload.pluginId) || payload.profileKey !== context.profileKey || !PROFILE.test(String(payload.profileKey)) || !validScope(payload) || !versionRelationship || source === undefined || !catalogRelationship || !snapshotDeclarationRelationship || !relativeSnapshotRelationship || !selectionRelationship || !sourceRelationship || !digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || !digest(payload.executableDigest) || selectedRoot === undefined || typeof payload.installRoot !== "string" || !path.isAbsolute(payload.installRoot) || path.resolve(payload.installRoot) !== path.resolve(expectedRoot) || trust === undefined || trust.target !== payload.pluginId || trust.artifactDigest !== payload.artifactDigest || trust.treeDigest !== payload.treeDigest || trust.rootDigest !== payload.rootDigest || trust.executableDigest !== payload.executableDigest || JSON.stringify(trust.selectedRoot) !== JSON.stringify(selectedRoot) || JSON.stringify(trust.allowedCrossMarketplaceDependencies) !== JSON.stringify(allow) || !data || data.profileKey !== payload.profileKey || data.identity !== payload.pluginId || typeof payload.executableGenerationId !== "string" || !GENERATION.test(payload.executableGenerationId) || !validAllow || (payload.marketplaceDefaultEnabled !== undefined && typeof payload.marketplaceDefaultEnabled !== "boolean")) return fail("invalid-admission", "Owned installation authority or relationship is invalid");
+    const npmDeclaration = source?.kind === "npm" ? catalogAuthorities[0]?.executableCatalog.declarations.find((item) => item.pluginId === payload.pluginId)?.source : undefined;
+    const npmSelectorRelationship = source?.kind !== "npm" || npmDeclaration?.kind === "npm" && (npmDeclaration.version === undefined || (semver.valid(npmDeclaration.version) === npmDeclaration.version ? source.version === npmDeclaration.version : semver.validRange(npmDeclaration.version) !== null && semver.satisfies(source.version, npmDeclaration.version)));
+    const sourceRelationship = source?.kind === "npm" ? npmSelectorRelationship : source?.kind === "zip" ? source.zipDigest === payload.artifactDigest : source?.kind === "git" || source?.kind === "marketplace-relative" ? payload.artifactDigest === payload.treeDigest : false;
+    const versionRelationship = resolvedVersionRelationship(payload.version, source, catalogRelease, versionAuthority);
+    const dependencyShape = dependencies !== undefined && catalogDependencies !== undefined && (payload.dependencyDeclaration === "absent" || payload.dependencyDeclaration === "complete") && (payload.catalogDependencyDeclaration === "absent" || payload.catalogDependencyDeclaration === "complete") && (payload.dependencyDeclaration !== "absent" || dependencies.length === 0) && (payload.catalogDependencyDeclaration !== "absent" || catalogDependencies.length === 0) && catalogDependencies.every((dependency) => dependencies.some((item) => item.name === dependency.name && item.marketplace === dependency.marketplace && item.version === dependency.version));
+    if (payload.ownership !== "picc-owned" || !safeIdentity(payload.pluginId) || payload.profileKey !== context.profileKey || !PROFILE.test(String(payload.profileKey)) || !validScope(payload) || !versionRelationship || source === undefined || !catalogRelationship || !snapshotDeclarationRelationship || !relativeSnapshotRelationship || !selectionRelationship || !sourceRelationship || !dependencyShape || (payload.catalogRelease !== undefined && catalogRelease === undefined) || !digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || !digest(payload.executableDigest) || selectedRoot === undefined || typeof payload.installRoot !== "string" || !path.isAbsolute(payload.installRoot) || path.resolve(payload.installRoot) !== path.resolve(expectedRoot) || trust === undefined || trust.target !== payload.pluginId || trust.artifactDigest !== payload.artifactDigest || trust.treeDigest !== payload.treeDigest || trust.rootDigest !== payload.rootDigest || trust.executableDigest !== payload.executableDigest || JSON.stringify(trust.selectedRoot) !== JSON.stringify(selectedRoot) || !sameCanonical(trust.allowedCrossMarketplaceDependencies, allow) || !sameCanonical(trust.dependencies, dependencies) || trust.dependencyDeclaration !== payload.dependencyDeclaration || !sameCanonical(trust.catalogDependencies, catalogDependencies) || trust.catalogDependencyDeclaration !== payload.catalogDependencyDeclaration || !(trust.catalogRelease === undefined && catalogRelease === undefined || trust.catalogRelease !== undefined && catalogRelease !== undefined && sameCanonical(trust.catalogRelease, catalogRelease)) || !sameCanonical(trust.resolvedVersionAuthority, versionAuthority) || !data || data.profileKey !== payload.profileKey || data.identity !== payload.pluginId || typeof payload.executableGenerationId !== "string" || !GENERATION.test(payload.executableGenerationId) || !validAllow || (payload.marketplaceDefaultEnabled !== undefined && typeof payload.marketplaceDefaultEnabled !== "boolean")) return fail("invalid-admission", "Owned installation authority or relationship is invalid");
     return { ok: true as const, value: Object.freeze(payload as unknown as OwnedPluginInstallationRecord) };
   } });
 }
@@ -197,13 +284,18 @@ export function createOwnedMarketplaceCodec(profileKey: LifecycleProfileKey): Pr
 }
 function sameCanonical(left: unknown, right: unknown): boolean { const leftBytes = canonicalJsonBytes(left); const rightBytes = canonicalJsonBytes(right); return leftBytes.ok && rightBytes.ok && Buffer.from(leftBytes.value).equals(Buffer.from(rightBytes.value)); }
 function snapshotTargetDigest(target: MarketplaceSnapshotTrustTarget): Sha256 | undefined { const bytes = canonicalJsonBytes(target); return bytes.ok ? sha256(bytes.value) : undefined; }
-export function createMarketplaceSnapshotTrustGrant(target: MarketplaceSnapshotTrustTarget): StoreResult<MarketplaceSnapshotTrustGrant> { const targetDigest = snapshotTargetDigest(target); return targetDigest === undefined ? fail("invalid-marketplace-trust", "Marketplace snapshot trust target is not canonical") : { ok: true, value: Object.freeze({ kind: "marketplace-snapshot-trust", target, targetDigest }) }; }
+export function createMarketplaceSnapshotTrustGrant(target: MarketplaceSnapshotTrustTarget): StoreResult<MarketplaceSnapshotTrustGrant> {
+  const projection = decodeExecutableMarketplaceCatalogProjection(target.executableCatalog, target.source.kind);
+  const targetDigest = projection !== undefined && projection.marketplaceName === target.marketplaceName && sameCanonical(projection, target.executableCatalog) ? snapshotTargetDigest(target) : undefined;
+  return targetDigest === undefined ? fail("invalid-marketplace-trust", "Marketplace snapshot trust target is not canonical") : { ok: true, value: Object.freeze({ kind: "marketplace-snapshot-trust", target, targetDigest }) };
+}
 function validSnapshotTrust(value: unknown, target: MarketplaceSnapshotTrustTarget): value is MarketplaceSnapshotTrustGrant {
   if (!exact(value, ["kind", "target", "targetDigest"]) || value.kind !== "marketplace-snapshot-trust" || !digest(value.targetDigest) || !sameCanonical(value.target, target)) return false;
   return snapshotTargetDigest(target) === value.targetDigest;
 }
 function catalogOnlyTarget(payload: Record<string, unknown>, source: MarketplaceRegistrationSource): CatalogOnlyMarketplaceSnapshotTrustTarget | undefined {
-  if (source.kind !== "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "provenance", "trust"]) || !exact(payload.provenance, ["adapter", "canonicalUrl"]) || payload.provenance.adapter !== "public-https-catalog" || typeof payload.provenance.canonicalUrl !== "string") return undefined;
+  if (source.kind !== "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "executableCatalog", "provenance", "trust"]) || !exact(payload.provenance, ["adapter", "canonicalUrl"]) || payload.provenance.adapter !== "public-https-catalog" || typeof payload.provenance.canonicalUrl !== "string") return undefined;
+  const executableCatalog = decodeExecutableMarketplaceCatalogProjection(payload.executableCatalog, source.kind); if (executableCatalog === undefined || executableCatalog.marketplaceName !== payload.marketplaceName) return undefined;
   let canonicalUrl: URL; try { canonicalUrl = new URL(payload.provenance.canonicalUrl); } catch { return undefined; }
   const routedFinal = routeMarketplaceSource({ source: "url", url: payload.provenance.canonicalUrl });
   let declaredUrl: URL; try { declaredUrl = new URL(source.url); } catch { return undefined; }
@@ -211,10 +303,11 @@ function catalogOnlyTarget(payload: Record<string, unknown>, source: Marketplace
   if (!routedFinal.ok || routedFinal.value.descriptor.kind !== "https-catalog" || routedFinal.value.descriptor.url !== payload.provenance.canonicalUrl
     || canonicalUrl.toString() !== payload.provenance.canonicalUrl || declaredPort !== 443 && declaredPort !== 8443 || finalPort !== 443 && finalPort !== 8443
     || payload.snapshotId !== `marketplace-${createHash("sha256").update(`${payload.catalogDigest}\0${payload.provenance.canonicalUrl}`).digest("base64url")}`) return undefined;
-  return Object.freeze({ authorityKind: "catalog-only", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, provenance: payload.provenance }) as CatalogOnlyMarketplaceSnapshotTrustTarget;
+  return Object.freeze({ authorityKind: "catalog-only", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, executableCatalog, provenance: payload.provenance }) as CatalogOnlyMarketplaceSnapshotTrustTarget;
 }
 function materializedTarget(payload: Record<string, unknown>, source: MarketplaceRegistrationSource, artifactsRoot: string): MaterializedMarketplaceSnapshotTrustTarget | undefined {
-  if (source.kind === "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "artifactDigest", "treeDigest", "rootDigest", "selectedRoot", "artifactRoot", "installRoot", "catalogRelativePath", "provenance", "trust"])) return undefined;
+  if (source.kind === "https-catalog" || !exact(payload, ["ownership", "profileKey", "authorityKind", "marketplaceName", "snapshotId", "source", "catalogDigest", "executableCatalog", "artifactDigest", "treeDigest", "rootDigest", "selectedRoot", "artifactRoot", "installRoot", "catalogRelativePath", "provenance", "trust"])) return undefined;
+  const executableCatalog = decodeExecutableMarketplaceCatalogProjection(payload.executableCatalog, source.kind); if (executableCatalog === undefined || executableCatalog.marketplaceName !== payload.marketplaceName) return undefined;
   const selectedRoot = decodeRootSelection(payload.selectedRoot); const expectedArtifactRoot = digest(payload.treeDigest) ? path.join(path.resolve(artifactsRoot), payload.treeDigest.slice(7)) : "";
   const expectedCatalogPath = source.kind === "local-catalog-file" ? path.basename(source.path) : ".claude-plugin/marketplace.json";
   const localAdapter = source.kind === "local-directory" ? "local-directory-snapshot" : source.kind === "local-catalog-file" ? "local-catalog-snapshot" : undefined; const provenance = plain(payload.provenance) ? payload.provenance : {};
@@ -223,7 +316,7 @@ function materializedTarget(payload: Record<string, unknown>, source: Marketplac
   const identitySeed = gitProvenance ? `${String(provenance.commit)}\0${payload.catalogDigest}\0${payload.treeDigest}` : `${payload.catalogDigest}\0${payload.treeDigest}`; const expectedSnapshotId = `marketplace-${createHash("sha256").update(identitySeed).digest("base64url")}`;
   if (!digest(payload.artifactDigest) || !digest(payload.treeDigest) || !digest(payload.rootDigest) || payload.snapshotId !== expectedSnapshotId || payload.artifactDigest !== payload.treeDigest || payload.rootDigest !== payload.treeDigest || selectedRoot?.requested !== "tree-root" || selectedRoot.path !== "" || selectedRoot.usedSingleWrapper || typeof payload.artifactRoot !== "string" || !path.isAbsolute(payload.artifactRoot) || !samePath(path.resolve(payload.artifactRoot), expectedArtifactRoot) || typeof payload.installRoot !== "string" || !samePath(path.resolve(payload.installRoot), expectedArtifactRoot) || typeof payload.catalogRelativePath !== "string" || payload.catalogRelativePath === "" || normalizePortableRelativePath(payload.catalogRelativePath) !== payload.catalogRelativePath || payload.catalogRelativePath !== expectedCatalogPath || (!localProvenance && !gitProvenance)) return undefined;
   const catalogPath = path.resolve(expectedArtifactRoot, ...payload.catalogRelativePath.split("/")); if (!isContainedPath(expectedArtifactRoot, catalogPath) || samePath(expectedArtifactRoot, catalogPath)) return undefined;
-  return Object.freeze({ authorityKind: "materialized", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, artifactDigest: payload.artifactDigest, treeDigest: payload.treeDigest, rootDigest: payload.rootDigest, selectedRoot: payload.selectedRoot, artifactRoot: payload.artifactRoot, installRoot: payload.installRoot, catalogRelativePath: payload.catalogRelativePath, provenance: payload.provenance }) as MaterializedMarketplaceSnapshotTrustTarget;
+  return Object.freeze({ authorityKind: "materialized", marketplaceName: payload.marketplaceName, snapshotId: payload.snapshotId, source, catalogDigest: payload.catalogDigest, executableCatalog, artifactDigest: payload.artifactDigest, treeDigest: payload.treeDigest, rootDigest: payload.rootDigest, selectedRoot: payload.selectedRoot, artifactRoot: payload.artifactRoot, installRoot: payload.installRoot, catalogRelativePath: payload.catalogRelativePath, provenance: payload.provenance }) as MaterializedMarketplaceSnapshotTrustTarget;
 }
 export function createOwnedMarketplaceSnapshotCodec(context: MarketplaceSnapshotCodecContext): ProducerCodec<OwnedMarketplaceSnapshotRecord> {
   return Object.freeze({ schema: "marketplace-catalog-snapshot", version: 1, decode: (payload: unknown): StoreResult<OwnedMarketplaceSnapshotRecord> => {
@@ -288,6 +381,7 @@ function verifyMaterializedMarketplaceCatalog(snapshot: MaterializedMarketplaceS
     let basic: unknown; try { basic = JSON.parse(catalog.toString("utf8")); } catch { return false; }
     if (!plain(basic) || basic.name !== snapshot.marketplaceName || !Array.isArray(basic.plugins) || basic.plugins.length > 1024 || sha256(catalog) !== snapshot.catalogDigest) return false;
     if (installation === undefined) return true;
+    const retainedProjection = deriveExecutableMarketplaceCatalogProjection(catalog, snapshot.source.kind); if (retainedProjection === undefined || !sameCanonical(retainedProjection, snapshot.executableCatalog)) return false;
     const projection = decodeExecutableMarketplaceCatalog(catalog, snapshot.source.kind); if (projection === undefined) return false;
     const pluginName = installation.pluginId.slice(0, installation.pluginId.lastIndexOf("@"));
     return projection.declarations.filter((item) => {
@@ -527,4 +621,13 @@ export async function reopenAdmittedMarketplaceSnapshot(
 export type GenerationMarkerObservation = { readonly status: "absent" } | { readonly status: "valid"; readonly generation: ExecutableAdmissionGeneration } | { readonly status: "membership-invalid"; readonly code: string; readonly generation: ExecutableAdmissionGeneration } | { readonly status: "malformed" | "noncanonical" | "unreadable"; readonly code: string };
 export function observeExecutableGenerationFile(file: string, codec: ProducerCodec<ExecutableAdmissionGeneration>): GenerationMarkerObservation { try { const parent = path.dirname(file); try { const parentStat = fs.lstatSync(parent); if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || !samePath(fs.realpathSync.native(parent), path.resolve(parent))) return { status: "unreadable", code: "invalid-generation-root" }; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" }; return { status: "unreadable", code: "invalid-generation-root" }; } const bytes = readOpenedOrdinaryFile(file, MAX_RECORD_BYTES).bytes; let parsed: unknown; try { parsed = JSON.parse(bytes.toString("utf8")); } catch { return { status: "malformed", code: "invalid-generation" }; } const canonical = canonicalJsonBytes(parsed); if (!canonical.ok) return { status: "malformed", code: canonical.code }; if (!Buffer.from(canonical.value).equals(bytes)) return { status: "noncanonical", code: "invalid-generation" }; const decoded = codec.decode(parsed); return decoded.ok ? { status: "valid", generation: decoded.value } : { status: "malformed", code: decoded.code }; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { status: "absent" } : { status: "unreadable", code: "invalid-generation" }; } }
 export function decodeExecutableGenerationFile(file: string, codec: ProducerCodec<ExecutableAdmissionGeneration>): StoreResult<ExecutableAdmissionGeneration | undefined> { const observed = observeExecutableGenerationFile(file, codec); return observed.status === "absent" ? { ok: true, value: undefined } : observed.status === "valid" ? { ok: true, value: observed.generation } : fail(observed.code, `Generation marker is ${observed.status}`); }
-export function executableDigestForProjection(value: unknown): StoreResult<Sha256> { const bytes = canonicalJsonBytes(value); return bytes.ok ? { ok: true, value: sha256(bytes.value) } : bytes; }
+export function executableDigestForProjection(value: unknown): StoreResult<Sha256> {
+  if (!plain(value)) return fail("invalid-executable-projection", "Executable projection is malformed");
+  const normalized = { ...value };
+  if (plain(normalized.defaultEnabled)) {
+    const { sourcePath: _diagnosticSourcePath, ...semanticDefault } = normalized.defaultEnabled;
+    normalized.defaultEnabled = semanticDefault;
+  }
+  const bytes = canonicalJsonBytes(normalized);
+  return bytes.ok ? { ok: true, value: sha256(bytes.value) } : bytes;
+}
