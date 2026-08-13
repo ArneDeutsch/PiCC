@@ -34,6 +34,7 @@ import { createOwnedDataRetirementAuthorizer, ownedPluginDataDeletionEligible } 
 import { PORTABLE_TREE_LIMITS } from "../src/plugin-lifecycle/tree-validator.js";
 import { pluginMutableRecordKey } from "../src/plugin-lifecycle/plugin-service.js";
 import { deriveExecutableMarketplaceCatalogProjection } from "../src/util/plugin-marketplace-descriptor.js";
+import { captureImportedExecutableTrees, captureReloadCandidateBinding, clearReloadHandoff, readReloadHandoff, sameImportedExecutableTrees, sameReloadBinding, writeReloadHandoff } from "../src/plugin-lifecycle/reload-handoff.js";
 
 /**
  * Assembly-level coverage for loadClaudeProject: settings,
@@ -246,6 +247,16 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.pluginInventory.find("beta@official")).toMatchObject({ outcome: { status: "disabled" } });
     expect(project.pluginInventory.find("beta@official")!.selectedInstallation).toBeUndefined();
     expect(Object.isFrozen(project.pluginInventory)).toBe(true);
+    expect(project.reloadCandidate.status).toBe("ready");
+    if (project.reloadCandidate.status !== "ready") throw new Error(project.reloadCandidate.reason);
+    expect(project.reloadCandidate.binding.importedExecutableTrees).toEqual([
+      expect.objectContaining({ kind: "tree", status: "present", digest: expect.stringMatching(/^sha256:/u) }),
+    ]);
+    fs.appendFileSync(path.join(alphaRoot, "skills", "alpha-skill", "SKILL.md"), "\nmutated");
+    const changed = project.reloadCandidate.recapture();
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.message);
+    expect(sameReloadBinding(changed.value, project.reloadCandidate.binding)).toBe(false);
   });
 
   it("uses one injected environment for marketplace discovery, installed selection, and metadata authorization", () => {
@@ -658,7 +669,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
     const nativeRealpath = fs.realpathSync.native.bind(fs.realpathSync);
     let hookLookups = 0;
     const spy = vi.spyOn(fs.realpathSync, "native").mockImplementation((value) => {
-      if (path.normalize(String(value)) === path.normalize(hookPath) && ++hookLookups === 2) {
+      if (path.normalize(String(value)) === path.normalize(hookPath) && ++hookLookups === 4) {
         const error = new Error("private close-to-use path");
         Object.assign(error, { code: "EACCES" });
         throw error;
@@ -1604,6 +1615,167 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     const hookPath = path.join(required.root, "hooks", "hooks.json"); const original = fs.readFileSync; const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: unknown, ...args: unknown[]) => path.normalize(String(candidate)) === path.normalize(hookPath) ? (() => { throw Object.assign(new Error("deterministic hook rejection"), { code: "EACCES" }); })() : (original as (...values: unknown[]) => unknown)(candidate, ...args)) as typeof fs.readFileSync);
     try { const project = load(repo, userDir); expect(project.plugins).toEqual([]); for (const pluginId of ["required@official", "dependent@official"]) expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === pluginId)).toMatchObject({ status: "rejected" }); expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "dependent@official")?.diagnostics.map((item) => item.message).join("\n")).toContain("final dependency admission"); expect(project.pluginInventory.find("required@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); expect(project.pluginInventory.find("dependent@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); }
     finally { spy.mockRestore(); }
+  });
+
+  it("rejects an imported manifest mutation between root discovery and authoritative resolution", () => {
+    const { repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+    const originalRead = fs.readFileSync;
+    let manifestReads = 0;
+    const read = vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: unknown, ...args: unknown[]) => {
+      if (path.normalize(String(candidate)) === path.normalize(manifestPath)) {
+        manifestReads += 1;
+        if (manifestReads === 3) fs.writeFileSync(manifestPath, JSON.stringify({ name: "beta" }));
+      }
+      return (originalRead as (...values: unknown[]) => unknown)(candidate, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const project = load(repo, userDir);
+      expect(manifestReads).toBeGreaterThanOrEqual(4);
+      expect(project.plugins).toEqual([expect.objectContaining({ pluginId: "alpha@official", name: "beta" })]);
+      expect(project.skills.some((skill) => skill.name === "beta:alpha-skill")).toBe(true);
+      expect(project.pluginResolutionOutcomes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ pluginId: "alpha@official", status: "loaded" }),
+      ]));
+      expect(project.reloadCandidate).toMatchObject({
+        status: "invalid",
+        reason: "imported plugin inputs changed or could not be verified during component assembly",
+      });
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it("constructs initial binding from verified post-bracket imported fingerprints without rescanning", () => {
+    const { base, repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    const captured = captureImportedExecutableTrees([pluginRoot]);
+    if (!captured.ok) throw new Error(captured.message);
+    const skillPath = path.join(pluginRoot, "skills", "alpha-skill", "SKILL.md");
+    fs.appendFileSync(skillPath, "\nchanged after post-capture");
+    const profileRoot = path.join(base, "profile");
+    const binding = captureReloadCandidateBinding({
+      cwd: repo,
+      projectRoot: repo,
+      userDir,
+      profileRoot,
+      profileKey: "profile-test",
+      generationPath: path.join(profileRoot, "generations", "current.json"),
+      expectedGeneration: { status: "absent" },
+      effectivePluginEnablement: sha256(Buffer.from("enablement")),
+      importedExecutableRoots: [pluginRoot],
+      initialImportedExecutableTrees: captured.value,
+      managedSettingsPaths: [],
+    });
+    if (!binding.ok) throw new Error(binding.message);
+    expect(sameImportedExecutableTrees(binding.value.binding.importedExecutableTrees, captured.value)).toBe(true);
+    const recaptured = binding.value.recapture();
+    expect(recaptured.ok).toBe(true);
+    if (!recaptured.ok) throw new Error(recaptured.message);
+    expect(sameImportedExecutableTrees(recaptured.value.importedExecutableTrees, captured.value)).toBe(false);
+    expect(captureReloadCandidateBinding({
+      cwd: repo,
+      projectRoot: repo,
+      userDir,
+      profileRoot,
+      profileKey: "profile-test",
+      generationPath: path.join(profileRoot, "generations", "current.json"),
+      effectivePluginEnablement: sha256(Buffer.from("enablement")),
+      importedExecutableRoots: [path.join(base, "other-root")],
+      initialImportedExecutableTrees: captured.value,
+      managedSettingsPaths: [],
+    })).toMatchObject({ ok: false, code: "imported-root-mismatch" });
+  });
+
+  it("binds reload handoff to exact committed generation and authentic settings inputs", () => {
+    const { base, repo, userDir } = makeBase();
+    installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { hooks: true });
+    const project = load(repo, userDir);
+    expect(project.reloadCandidate.status).toBe("ready");
+    if (project.reloadCandidate.status !== "ready") throw new Error(project.reloadCandidate.reason);
+    expect(project.reloadCandidate.binding.executableGeneration).toMatchObject({ status: "present", digest: expect.stringMatching(/^sha256:/u) });
+    expect(project.reloadCandidate.binding.settings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "file", status: "absent" }),
+    ]));
+    expect(project.skills.some((skill) => skill.name === "owned:owned-skill")).toBe(true);
+    expect(project.pluginContexts.has("owned@official")).toBe(true);
+    expect(project.pluginInventory.find("owned@official")?.outcome?.status).toBe("loaded");
+    expect(Object.keys(project.mergedHooks)).toContain("PreToolUse");
+
+    const written = writeReloadHandoff(project.reloadCandidate.handoffPath, project.reloadCandidate.binding, "assembly-test-nonce", 1_000);
+    expect(written.ok).toBe(true);
+    const observed = readReloadHandoff(project.reloadCandidate.handoffPath, 1_001);
+    expect(observed.ok && observed.value?.outcome).toBe("pending");
+    expect(observed.ok && observed.value !== undefined && sameReloadBinding(observed.value.binding, project.reloadCandidate.binding)).toBe(true);
+
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "owned@official": false } }));
+    const changed = project.reloadCandidate.recapture();
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.message);
+    expect(sameReloadBinding(changed.value, project.reloadCandidate.binding)).toBe(false);
+    expect(clearReloadHandoff(project.reloadCandidate.handoffPath).ok).toBe(true);
+  });
+
+  it("rejects an imported executable tree containing an external hardlink where the platform permits links", () => {
+    const { base, repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "linked");
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "linked@official": true } }));
+    const skillPath = path.join(pluginRoot, "skills", "linked-skill", "SKILL.md");
+    const external = path.join(base, "external-plugin-bytes.md");
+    fs.writeFileSync(external, fs.readFileSync(skillPath));
+    fs.rmSync(skillPath);
+    try {
+      fs.linkSync(external, skillPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (["EACCES", "EPERM", "ENOTSUP", "EXDEV"].includes(String(code))) return;
+      throw error;
+    }
+    const project = load(repo, userDir);
+    expect(fs.statSync(skillPath, { bigint: true }).nlink).toBeGreaterThan(1n);
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "imported plugin inputs changed or could not be verified during component assembly",
+    });
+  });
+
+  it("does not call an unreadable authentic settings authority a ready reload candidate", () => {
+    const { repo, userDir } = makeBase();
+    fs.mkdirSync(path.join(userDir, "settings.json"), { recursive: true });
+    const project = load(repo, userDir);
+    expect(project.settings.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "Settings file unreadable; skipped" }),
+    ]));
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "reload input fingerprint is unreadable or exceeds its bound",
+    });
+  });
+
+  it("does not call an overflowed authentic settings authority a ready reload candidate", () => {
+    const { repo, userDir } = makeBase();
+    fs.writeFileSync(path.join(userDir, "settings.json"), Buffer.alloc(4 * 1024 * 1024 + 1, 0x20));
+    const project = load(repo, userDir);
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "reload input fingerprint is unreadable or exceeds its bound",
+    });
+  });
+
+  it("rejects a mutated candidate without changing the previously assembled runtime", () => {
+    const { base, repo, userDir } = makeBase();
+    const owned = installOwnedPlugin(base, repo, userDir);
+    const active = load(repo, userDir);
+    const activeSkillNames = active.skills.map((skill) => skill.name);
+    fs.appendFileSync(path.join(owned.root, "skills", "owned-skill", "SKILL.md"), "\nMUTATED");
+
+    const candidate = load(repo, userDir);
+    expect(candidate.reloadCandidate).toMatchObject({ status: "invalid" });
+    expect(candidate.executableGenerationObservation.status).toBe("membership-invalid");
+    expect(active.skills.map((skill) => skill.name)).toEqual(activeSkillNames);
+    expect(active.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]);
   });
 
   it("keeps retained snapshot authority executable when current registration is removed", () => {

@@ -31,6 +31,8 @@ import { createExecutableAdmissionGenerationCodec, createMarketplaceSnapshotTrus
 import { canonicalJsonBytes, createRecordEnvelope, ownedRecordPartition, sha256, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
 import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
 import { deriveExecutableMarketplaceCatalogProjection } from "../src/util/plugin-marketplace-descriptor.js";
+import { loadClaudeProject } from "../src/project.js";
+import { RELOAD_ACTIVATION_UNCONFIRMED, readReloadHandoff, writeReloadHandoff } from "../src/plugin-lifecycle/reload-handoff.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -2743,6 +2745,389 @@ describe("subagent built-ins via the shared factory (offline-integration)", () =
     expect(path.resolve(out.env.CLAUDE_PROJECT_DIR!)).toBe(path.resolve(dir));
     // Inherited env is preserved.
     expect(out.env.PATH).toBe("/usr/bin");
+  });
+});
+
+describe("plugin reload handoff wiring", () => {
+  function expectNoPublication(replacement: FakePi | undefined): void {
+    expect(replacement).toBeDefined();
+    expect(replacement?.commands.size).toBe(0);
+    expect(replacement?.tools.size).toBe(0);
+    expect(replacement?.activeTools.size).toBe(0);
+    expect(replacement?.handlers.size).toBe(0);
+    expect(replacement?.shortcuts.size).toBe(0);
+    expect(replacement?.providerRegistrations).toEqual([]);
+    expect(replacement?.entryRenderers.size).toBe(0);
+    expect(replacement?.messageRenderers.size).toBe(0);
+    expect(replacement?.entries).toEqual([]);
+    expect(replacement?.messages).toEqual([]);
+    expect(replacement?.userMessages).toEqual([]);
+    expect(replacement?.modelSets).toEqual([]);
+    expect(replacement?.thinkingLevels).toEqual([]);
+  }
+
+  async function withReloadProject(
+    run: (fixture: string, userDir: string, owner: FakePi, pluginRoot: string) => Promise<void>,
+    beforeFactory?: (initial: ReturnType<typeof loadClaudeProject>) => void,
+    testSeam?: PiccTestSeam,
+  ): Promise<void> {
+    const fixture = materializeFixture("hello-claude");
+    const userDir = path.join(fixture, ".reload-user");
+    const previousCwd = process.cwd();
+    const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+    let reloadProfileRoot: string | undefined;
+    const pluginId = "reload-fixture@fixture-market";
+    const pluginRoot = path.join(userDir, "plugins", "cache", "fixture-market", "reload-fixture", "1.0.0");
+    try {
+      fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "reload-fixture", version: "1.0.0" }));
+      fs.mkdirSync(path.join(pluginRoot, "skills", "reload-skill"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, "skills", "reload-skill", "SKILL.md"), "---\nname: reload-skill\ndescription: Reload skill witness\n---\nRELOAD-SKILL $CLAUDE_PLUGIN_ROOT\n");
+      fs.mkdirSync(path.join(pluginRoot, "commands"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, "commands", "reload-command.md"), "---\ndescription: Reload command witness\n---\nRELOAD-COMMAND $ARGUMENTS $CLAUDE_PLUGIN_ROOT\n");
+      fs.mkdirSync(path.join(pluginRoot, "agents"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, "agents", "reload-agent.md"), "---\nname: reload-agent\ndescription: Reload agent witness\n---\nRELOAD-AGENT\n");
+      fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, "hooks", "hooks.json"), JSON.stringify({ PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo reload-hook" }] }] }));
+      fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { [pluginId]: true } }));
+      fs.writeFileSync(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { [pluginId]: [{ scope: "user", installPath: pluginRoot, version: "1.0.0" }] } }));
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      process.chdir(fixture);
+      const initial = loadClaudeProject({ cwd: fixture, userDir, homeDir: os.homedir() });
+      if (initial.reloadCandidate.status === "ready") reloadProfileRoot = path.dirname(path.dirname(initial.reloadCandidate.handoffPath));
+      beforeFactory?.(initial);
+      const owner = fakePi();
+      picc(owner.api as never, { ...testSeam, onInitializationSettled: owner.captureInitialization });
+      await owner.waitForInitialization();
+      await run(fixture, userDir, owner, pluginRoot);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+      if (reloadProfileRoot !== undefined) fs.rmSync(reloadProfileRoot, { recursive: true, force: true });
+      cleanupFixture(fixture);
+    }
+  }
+
+  it("runs one terminal TUI reload and accepts one exact reason-reload reconstruction", async () => {
+    await withReloadProject(async (fixture, userDir, owner) => {
+      let reloads = 0;
+      let stale = false;
+      let replacement: FakePi | undefined;
+      const base = owner.tuiCtx();
+      const context = new Proxy(base, {
+        get(target, property, receiver) {
+          if (stale && property !== "reload") throw new Error(`stale-context-use:${String(property)}`);
+          if (property === "reload") return async () => {
+            reloads += 1;
+            replacement = fakePi();
+            picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+            await replacement.waitForInitialization();
+            stale = true;
+            await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx());
+          };
+          return Reflect.get(target, property, receiver);
+        },
+      });
+
+      await owner.commands.get("reload-plugins").handler("IGNORED-SECRET", context);
+      expect(reloads).toBe(1);
+      expect(replacement?.commands.has("reload-plugins")).toBe(true);
+      expect(replacement?.tools.has("Skill")).toBe(true);
+      if (replacement === undefined) throw new Error("replacement was not constructed");
+      const skill = await replacement.tools.get("Skill").execute("reload-skill", { name: "reload-fixture:reload-skill", arguments: "" });
+      expect(skill.content[0].text).toContain("RELOAD-SKILL");
+      expect(skill.content[0].text).toContain(path.join(userDir, "plugins", "cache"));
+      const command = await replacement.tools.get("SlashCommand").execute("reload-command", { command: "/reload-fixture:reload-command witness" });
+      expect(command.content[0].text).toContain("RELOAD-COMMAND witness");
+      const prompt = String((await replacement.fire("before_agent_start", { systemPrompt: "RELOAD-BASE" })).systemPrompt);
+      expect(prompt).toContain("reload-fixture:reload-agent");
+      expect(prompt).toContain("Reload agent witness");
+      replacement.entries.length = 0;
+      await replacement.commands.get("plugin").handler("details reload-fixture@fixture-market", replacement.tuiCtx());
+      const inventory = String(replacement.entries.at(-1)?.data?.output ?? "");
+      expect(inventory).toContain("reload-fixture@fixture-market");
+      expect(inventory).toContain("final-runtime/skills: count=1");
+      expect(inventory).toContain("final-runtime/commands: count=1");
+      expect(inventory).toContain("final-runtime/agents: count=1");
+      expect(inventory).toContain("final-runtime/hooks: count=1");
+      replacement.entries.length = 0;
+      await replacement.commands.get("doctor").handler("", replacement.tuiCtx());
+      expect(String(replacement.entries.at(-1)?.data?.output ?? "")).toContain("Plugin inventory (captured snapshot):");
+      expect(owner.messages).toEqual([]);
+      expect(owner.userMessages).toEqual([]);
+      expect(owner.entries.filter((entry) => entry.data?.command === "reload-plugins")).toEqual([]);
+      const assembled = loadClaudeProject({ cwd: fixture, userDir, homeDir: os.homedir() });
+      expect(assembled.reloadCandidate.status).toBe("ready");
+      if (assembled.reloadCandidate.status === "ready") {
+        expect(readReloadHandoff(assembled.reloadCandidate.handoffPath)).toEqual({ ok: true, value: undefined });
+      }
+    });
+  });
+
+  it("reserves the attempt before handoff replacement so a concurrent loser cannot disturb it", async () => {
+    await withReloadProject(async (_fixture, userDir, owner) => {
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      let reloads = 0;
+      const first = owner.commands.get("reload-plugins").handler("", owner.tuiCtx({
+        reload: async () => {
+          reloads += 1;
+          entered.resolve();
+          await release.promise;
+          const replacement = fakePi();
+          picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx());
+        },
+      }));
+      await entered.promise;
+      const candidate = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+      if (candidate.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      const active = readReloadHandoff(candidate.reloadCandidate.handoffPath);
+      if (!active.ok || active.value === undefined) throw new Error("active handoff unavailable");
+      owner.entries.length = 0;
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx({ reload: async () => { reloads += 1; } }));
+      expect(reloads).toBe(1);
+      const loserOutput = String(owner.entries.at(-1)?.data?.output ?? "");
+      expect(loserOutput).toContain("already underway");
+      expect(loserOutput).not.toContain("current captured runtime remains usable");
+      const unchanged = readReloadHandoff(candidate.reloadCandidate.handoffPath);
+      expect(unchanged.ok && unchanged.value?.nonce).toBe(active.value.nonce);
+      expect(unchanged.ok && unchanged.value?.outcome).toBe("pending");
+      release.resolve();
+      await first;
+    });
+  });
+
+  it("marks an unarmed pending handoff restart-superseded before ordinary publication", async () => {
+    let handoffPath = "";
+    await withReloadProject(async (_fixture, _userDir, owner) => {
+      expect(owner.commands.has("reload-plugins")).toBe(true);
+      expect(owner.tools.has("Skill")).toBe(true);
+      const observed = readReloadHandoff(handoffPath);
+      expect(observed.ok && observed.value?.outcome).toBe("restart-superseded");
+    }, (initial) => {
+      if (initial.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      handoffPath = initial.reloadCandidate.handoffPath;
+      expect(writeReloadHandoff(handoffPath, initial.reloadCandidate.binding, "unarmed-restart-nonce").ok).toBe(true);
+    });
+  });
+
+  it("records operational failure when replacement project assembly throws before publication", async () => {
+    let loadCalls = 0;
+    const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
+      loadCalls += 1;
+      if (loadCalls === 4) throw new Error("replacement assembly failed");
+      return loadClaudeProject(options);
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await withReloadProject(async (_fixture, userDir, owner) => {
+        const candidate = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+        if (candidate.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+        let replacement: FakePi | undefined;
+        let stale = false;
+        const base = owner.tuiCtx();
+        const context = new Proxy(base, {
+          get(target, property, receiver) {
+            if (stale && property !== "reload") throw new Error(`stale-context-use:${String(property)}`);
+            if (property === "reload") return async () => {
+              replacement = fakePi();
+              picc(replacement.api as never, { loadProject, onInitializationSettled: replacement.captureInitialization });
+              stale = true;
+            };
+            return Reflect.get(target, property, receiver);
+          },
+        });
+
+        const failure = owner.commands.get("reload-plugins").handler("", context);
+        await expect(failure).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+        await failure.catch((error: Error) => expect(error.message).toBe(RELOAD_ACTIVATION_UNCONFIRMED));
+        expect(loadCalls).toBe(4);
+        const handoff = readReloadHandoff(candidate.reloadCandidate.handoffPath);
+        expect(handoff.ok && handoff.value?.outcome).toBe("operational-failure");
+        expectNoPublication(replacement);
+      }, undefined, { loadProject });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("rejects a mutation in the replacement factory before any PiCC publication", async () => {
+    await withReloadProject(async (_fixture, userDir, owner) => {
+      let replacement: FakePi | undefined;
+      const before = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+      if (before.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      const handoffPath = before.reloadCandidate.handoffPath;
+      const context = owner.tuiCtx({
+        reload: async () => {
+          fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "changed@market": true } }));
+          replacement = fakePi();
+          picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+          // Real Pi would later swallow session_start handler errors. Authorization
+          // has already rejected this factory before any handler can exist.
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx()).catch(() => undefined);
+        },
+      });
+      await expect(owner.commands.get("reload-plugins").handler("", context)).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      const handoff = readReloadHandoff(handoffPath);
+      expect(handoff.ok && handoff.value?.outcome).toBe("input-mismatch");
+      expectNoPublication(replacement);
+    });
+  });
+
+  it("rejects a valid imported plugin mutation during reload with input-mismatch and zero publication", async () => {
+    await withReloadProject(async (_fixture, userDir, owner, pluginRoot) => {
+      const before = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+      if (before.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      let replacement: FakePi | undefined;
+      await expect(owner.commands.get("reload-plugins").handler("", owner.tuiCtx({
+        reload: async () => {
+          fs.appendFileSync(path.join(pluginRoot, "skills", "reload-skill", "SKILL.md"), "\nVALID-MUTATION\n");
+          replacement = fakePi();
+          picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx()).catch(() => undefined);
+        },
+      }))).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      const handoff = readReloadHandoff(before.reloadCandidate.handoffPath);
+      expect(handoff.ok && handoff.value?.outcome).toBe("input-mismatch");
+      expectNoPublication(replacement);
+    });
+  });
+
+  it("does not authorize a malformed armed handoff or publish its replacement", async () => {
+    await withReloadProject(async (_fixture, userDir, owner) => {
+      const before = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+      if (before.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      let replacement: FakePi | undefined;
+      await expect(owner.commands.get("reload-plugins").handler("", owner.tuiCtx({
+        reload: async () => {
+          fs.writeFileSync(before.reloadCandidate.status === "ready" ? before.reloadCandidate.handoffPath : "", "{malformed", "utf8");
+          replacement = fakePi();
+          picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+        },
+      }))).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      expectNoPublication(replacement);
+      expect(readReloadHandoff(before.reloadCandidate.handoffPath).ok).toBe(false);
+    });
+  });
+
+  it("gives distinct current guidance when candidate assembly fails", async () => {
+    let calls = 0;
+    const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
+      calls += 1;
+      if (calls === 2) throw new Error("private assembly path must not escape");
+      return loadClaudeProject(options);
+    };
+    await withReloadProject(async (_fixture, _userDir, owner) => {
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx());
+      const output = String(owner.entries.at(-1)?.data?.output ?? "");
+      expect(output).toContain("candidate assembly failed");
+      expect(output).toContain("picc plugin --help");
+      expect(output).not.toMatch(/private assembly|\/doctor|Inspect \/plugin/u);
+    }, undefined, { loadProject });
+  });
+
+  it("distinguishes inputs changing during validation from candidate rejection", async () => {
+    let calls = 0;
+    const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
+      calls += 1;
+      if (calls === 3) fs.writeFileSync(path.join(options.userDir!, "settings.json"), JSON.stringify({ enabledPlugins: { "changed@market": true } }));
+      return loadClaudeProject(options);
+    };
+    await withReloadProject(async (_fixture, _userDir, owner) => {
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx());
+      const output = String(owner.entries.at(-1)?.data?.output ?? "");
+      expect(output).toContain("inputs changed or could not be verified during validation");
+      expect(output).toContain("after local lifecycle writes have finished");
+      expect(output).not.toMatch(/\/doctor|Inspect \/plugin/u);
+    }, undefined, { loadProject });
+  });
+
+  it("gives local storage guidance when the handoff write fails", async () => {
+    await withReloadProject(async (_fixture, _userDir, owner) => {
+      const original = fs.renameSync;
+      const rename = vi.spyOn(fs, "renameSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+        if (String(target).endsWith("reload-handoff.json")) throw Object.assign(new Error("private storage failure"), { code: "ENOSPC" });
+        return original(source, target);
+      }) as typeof fs.renameSync);
+      try {
+        await owner.commands.get("reload-plugins").handler("", owner.tuiCtx());
+      } finally {
+        rename.mockRestore();
+      }
+      const output = String(owner.entries.at(-1)?.data?.output ?? "");
+      expect(output).toContain("handoff could not be stored");
+      expect(output).toContain("storage permissions and free space");
+      expect(output).not.toMatch(/private storage|\/doctor|Inspect \/plugin/u);
+    });
+  });
+
+  it("rejects an invalid candidate before reload and leaves the captured runtime usable", async () => {
+    await withReloadProject(async (_fixture, userDir, owner) => {
+      fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "missing@market": true } }));
+      let reloads = 0;
+      owner.entries.length = 0;
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx({ reload: async () => { reloads += 1; } }));
+      const output = String(owner.entries.find((entry) => entry.data?.command === "reload-plugins")?.data?.output ?? "");
+      expect(output).toContain("preflight was rejected");
+      expect(output).toContain("current captured runtime remains usable");
+      expect(output).toContain("picc plugin --help");
+      expect(output).not.toMatch(/Inspect \/plugin|\/doctor/);
+      expect(output).toContain("Rejection reason: plugin candidate validation rejected one or more effective identities");
+      expect(output).not.toContain(userDir);
+      expect(reloads).toBe(0);
+      expect(owner.tools.has("Skill")).toBe(true);
+    });
+  });
+
+  it("records operational failure when the replacement factory publishes but receives no reload start", async () => {
+    await withReloadProject(async (_fixture, userDir, owner) => {
+      const candidate = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
+      if (candidate.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
+      let stale = false;
+      let replacement: FakePi | undefined;
+      const context = new Proxy(owner.tuiCtx(), {
+        get(target, property, receiver) {
+          if (stale && property !== "reload") throw new Error(`stale-context-use:${String(property)}`);
+          if (property === "reload") return async () => {
+            replacement = fakePi();
+            picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+            await replacement.waitForInitialization();
+            stale = true;
+          };
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const failure = owner.commands.get("reload-plugins").handler("", context);
+      await expect(failure).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      await failure.catch((error: Error) => {
+        expect(error.message).toBe(RELOAD_ACTIVATION_UNCONFIRMED);
+        expect(error.message).not.toMatch(/recover|rollback|success/iu);
+      });
+      expect(replacement?.commands.has("reload-plugins")).toBe(true);
+      expect(replacement?.tools.has("Skill")).toBe(true);
+      const handoff = readReloadHandoff(candidate.reloadCandidate.handoffPath);
+      expect(handoff.ok && handoff.value?.outcome).toBe("operational-failure");
+      expect(owner.entries.filter((entry) => entry.data?.command === "reload-plugins")).toEqual([]);
+    });
+  });
+
+  it("keeps print, JSON, and RPC reload guidance passive and provider-free", async () => {
+    await withReloadProject(async (_fixture, _userDir, owner) => {
+      for (const context of [owner.printCtx(), owner.ctx({ mode: "json", hasUI: false }), owner.rpcCtx()]) {
+        let reloads = 0;
+        owner.entries.length = 0;
+        await owner.commands.get("reload-plugins").handler("SECRET-NOT-REFLECTED", { ...context, reload: async () => { reloads += 1; } });
+        const output = String(owner.entries.find((entry) => entry.data?.command === "reload-plugins")?.data?.output ?? "");
+        expect(output).toContain("standalone PiCC plugin commands");
+        expect(output).toContain("requires /reload-plugins in the live interactive session or a new PiCC session");
+        expect(output).not.toContain("SECRET-NOT-REFLECTED");
+        expect(reloads).toBe(0);
+      }
+      expect(owner.messages).toEqual([]);
+      expect(owner.userMessages).toEqual([]);
+    });
   });
 });
 

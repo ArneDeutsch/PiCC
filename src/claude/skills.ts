@@ -11,15 +11,15 @@ import type {
 import type { PluginPathFailure, ValidatedPluginPath } from "./plugin-paths.js";
 import { resolvePluginPath, revalidatePluginPath, walkPluginFiles } from "./plugin-paths.js";
 import { parseMarkdown, toBool, toStringList } from "../util/markdown.js";
-import { isDirectory, readTextSafe, walkFiles } from "../util/fs.js";
+import { isDirectory, readTextSafe, stripBom, walkFiles } from "../util/fs.js";
 
 /**
  * Skills subsystem core.
  *
- * Progressive disclosure is a hard requirement: `loadSkills` parses ONLY the
- * frontmatter — the SKILL.md body is never stored on the returned objects
- * (`body: undefined`). The body enters context only via `loadSkillBody`,
- * which re-reads the file fresh on activation.
+ * Progressive disclosure is a hard requirement: returned objects expose metadata
+ * while keeping `body: undefined`. Imported plugin Markdown is held behind its
+ * lazy-source capability so activation uses the assembly snapshot; ordinary skill
+ * bodies are read fresh by `loadSkillBody`.
  */
 
 // ---------------------------------------------------------------------------
@@ -203,22 +203,7 @@ interface PluginIdentity {
   pluginName: string;
 }
 
-interface LazyPluginSource {
-  source: ValidatedPluginPath;
-  skills: Set<ClaudeSkill>;
-  reportedDiagnostics: WeakSet<Diagnostic[]>;
-}
-
-const lazyPluginSources = new WeakMap<ClaudeSkill["source"], LazyPluginSource>();
-
-function bindLazyPluginSource(skill: ClaudeSkill, source: ValidatedPluginPath): void {
-  let lazy = lazyPluginSources.get(skill.source);
-  if (!lazy) {
-    lazy = { source, skills: new Set(), reportedDiagnostics: new WeakSet() };
-    lazyPluginSources.set(skill.source, lazy);
-  }
-  lazy.skills.add(skill);
-}
+const lazyPluginSources = new WeakMap<ClaudeSkill["source"], Buffer>();
 
 /**
  * Colon-qualified fallback name for an entry nested under intermediate
@@ -296,9 +281,18 @@ export function loadPluginSkills(
     if (!validated) continue;
     const files = pluginSkillFiles(input, validated, diagnostics, pathFailures);
     for (const file of files) {
-      const skill = parseSkillFile(file.lexicalPath, "plugin", pluginIdentity(input.source), diagnostics);
-      if (!skill) continue;
-      bindLazyPluginSource(skill, file);
+      let markdownBytes: Buffer | undefined;
+      const skill = parseSkillFile(
+        file.lexicalPath,
+        "plugin",
+        pluginIdentity(input.source),
+        diagnostics,
+        (bytes) => {
+          markdownBytes = bytes;
+        },
+      );
+      if (!skill || markdownBytes === undefined) continue;
+      lazyPluginSources.set(skill.source, markdownBytes);
       const qualified = qualifiedNameFor(validated.lexicalPath, path.dirname(skill.baseDir), skill.name);
       skills.push({ skill, qualified });
     }
@@ -316,6 +310,7 @@ export function loadPluginSkills(
       pathFailures,
     );
     for (const file of files) {
+      let markdownBytes: Buffer | undefined;
       const command = parseCommandFile(
         file.lexicalPath,
         path.dirname(file.lexicalPath),
@@ -341,9 +336,12 @@ export function loadPluginSkills(
             failure,
           });
         },
+        (bytes) => {
+          markdownBytes = bytes;
+        },
       );
-      if (!command) continue;
-      bindLazyPluginSource(command, file);
+      if (!command || markdownBytes === undefined) continue;
+      lazyPluginSources.set(command.source, markdownBytes);
       const qualified = qualifiedNameFor(validated.lexicalPath, path.dirname(file.lexicalPath), command.name);
       commands.push({ skill: command, qualified });
     }
@@ -485,8 +483,6 @@ function finalizeSkills(
       // Keep nested entries slash-addressable without listing the same content twice.
       if (qualified && !byName.has(qualified)) {
         const alias = { ...entry, name: qualified, disableModelInvocation: true };
-        const pluginSource = lazyPluginSources.get(entry.source);
-        if (pluginSource) pluginSource.skills.add(alias);
         byName.set(qualified, alias);
       }
       continue;
@@ -514,13 +510,25 @@ function finalizeSkills(
   };
 }
 
+function readMarkdownFile(file: string, onRead?: (bytes: Buffer) => void): string | undefined {
+  if (!onRead) return readTextSafe(file);
+  try {
+    const bytes = fs.readFileSync(file);
+    onRead(bytes);
+    return stripBom(bytes.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 function parseSkillFile(
   file: string,
   scope: Scope,
   plugin: PluginIdentity | undefined,
   outDiagnostics: Diagnostic[],
+  onRead?: (bytes: Buffer) => void,
 ): ClaudeSkill | undefined {
-  const raw = readTextSafe(file);
+  const raw = readMarkdownFile(file, onRead);
   if (raw === undefined) {
     outDiagnostics.push({
       severity: "warning",
@@ -592,8 +600,9 @@ function parseCommandFile(
   plugin: PluginIdentity | undefined,
   outDiagnostics: Diagnostic[],
   onUnreadable?: () => void,
+  onRead?: (bytes: Buffer) => void,
 ): ClaudeSkill | undefined {
-  const raw = readTextSafe(file);
+  const raw = readMarkdownFile(file, onRead);
   if (raw === undefined) {
     outDiagnostics.push({
       severity: "warning",
@@ -646,54 +655,21 @@ export interface LoadSkillBodyResult {
   diagnostics: Diagnostic[];
 }
 
-/** Result-bearing lazy body load for callers that need typed plugin path failures. */
 export function loadSkillBodyResult(skill: ClaudeSkill): LoadSkillBodyResult {
   const pluginSource = lazyPluginSources.get(skill.source);
-  pluginSource?.skills.add(skill);
-
-  let readPath = skill.source.path;
-  if (pluginSource) {
-    const current = revalidatePluginPath(pluginSource.source);
-    if (!current.ok) return recordLazyPluginFailure(pluginSource, skill, current);
-    readPath = current.value.lexicalPath;
-  }
-
-  const raw = readTextSafe(readPath);
-  if (raw === undefined) {
-    if (!pluginSource) return { body: "", diagnostics: [] };
-    const failure: PluginPathFailure = {
-      ok: false,
-      code: "unreadable-path",
-      diagnostic: {
-        severity: "warning",
-        message: "Plugin skill body became unreadable after path revalidation",
-        source: readPath,
-      },
-    };
-    return recordLazyPluginFailure(pluginSource, skill, failure);
-  }
-  const body = parseMarkdown(raw, readPath).body;
+  const raw = pluginSource
+    ? stripBom(pluginSource.toString("utf8"))
+    : readTextSafe(skill.source.path);
+  if (raw === undefined) return { body: "", diagnostics: [] };
+  const body = parseMarkdown(raw, skill.source.path).body;
   skill.body = body;
   return { body, diagnostics: [] };
 }
 
-function recordLazyPluginFailure(
-  pluginSource: LazyPluginSource,
-  skill: ClaudeSkill,
-  failure: PluginPathFailure,
-): LoadSkillBodyResult {
-  for (const boundSkill of pluginSource.skills) boundSkill.body = undefined;
-  if (!pluginSource.reportedDiagnostics.has(skill.diagnostics)) {
-    skill.diagnostics.push(failure.diagnostic);
-    pluginSource.reportedDiagnostics.add(skill.diagnostics);
-  }
-  return { body: "", failure, diagnostics: [failure.diagnostic] };
-}
-
 /**
- * Load the skill body on activation. Reads the file fresh (live reload) and
- * returns the content after the frontmatter. Never throws: a missing/unreadable
- * file yields "". On success the body is also cached on `skill.body`.
+ * Load the skill body on activation. Imported plugins use their assembly-captured
+ * Markdown; ordinary skills read the live file. Never throws: a missing ordinary
+ * file yields "". On success the body is cached on `skill.body`.
  */
 export function loadSkillBody(skill: ClaudeSkill): string {
   return loadSkillBodyResult(skill).body;

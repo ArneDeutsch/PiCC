@@ -34,9 +34,10 @@ import { projectIdentities } from "./util/project-identity.js";
 import type { PluginResolutionOutcome } from "./types.js";
 import { createLifecycleLocations } from "./plugin-lifecycle/locations.js";
 import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, observeExecutableGenerationFile, readOwnedAdmissionRecords, type AdmittedOwnedInstallation, type CompleteOwnedProfileReference, type GenerationMarkerObservation, type MarketplaceSnapshotAuthority, type OwnedMarketplaceRecord } from "./plugin-lifecycle/admission.js";
-import { createProducerCodecRegistry, type OwnedStateStore } from "./plugin-lifecycle/state-store.js";
+import { canonicalJsonBytes, createProducerCodecRegistry, sha256, type OwnedStateStore, type StoreResult } from "./plugin-lifecycle/state-store.js";
 import { assembledEnablement, observeLifecycleEnvelope, ownedMarketplaceProjection, projectOwnedAndImportedInstallations, uniquelySelectedApplicableOwnedWinner, type InstallationProjection, type LifecycleObservationEnvelope } from "./plugin-lifecycle/projection.js";
 import { admitDependencyGraph } from "./plugin-lifecycle/dependency-admission.js";
+import { captureImportedExecutableTrees, captureReloadCandidateBinding, sameImportedExecutableTrees, type ReloadCandidateBinding } from "./plugin-lifecycle/reload-handoff.js";
 
 /**
  * Assemble the full Claude-artifact model of a project: settings with
@@ -57,6 +58,10 @@ export interface LoadedProject extends ClaudeProject {
   lifecycleObservation: LifecycleObservationEnvelope;
   executableGenerationObservation: GenerationMarkerObservation;
   ownedProfileReference?: CompleteOwnedProfileReference;
+  reloadCandidate: Readonly<
+    | { status: "ready"; binding: ReloadCandidateBinding; handoffPath: string; recapture: () => StoreResult<ReloadCandidateBinding> }
+    | { status: "invalid" | "unavailable"; reason: string; handoffPath?: string }
+  >;
   /** Auto memory: dir + truncated MEMORY.md; undefined when disabled. */
   autoMemory?: MemorySnapshot;
 }
@@ -170,15 +175,37 @@ export function loadClaudeProject(opts: {
     lifecycleObservation = observeLifecycleEnvelope(store, admission.records);
   }
   const runtimeInstallations = pluginAdmissions.map((projection) => projection.ownership === "picc-owned" ? projection : projection.installation);
-  let effectivePluginEnablement = assembledEnablement({ projections: pluginAdmissions, explicit: settings.effectivePluginEnablement ?? {}, projectPath: root });
-  let pluginResult = resolveInstalledPlugins({ userDir, projectRoot: root, enablement: effectivePluginEnablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
-  const manifestDisabled = pluginResult.outcomes.filter((outcome) => outcome.manifestDefaultEnabled?.presence === "explicit" && outcome.manifestDefaultEnabled.value === false
-    && !Object.hasOwn(settings.effectivePluginEnablement ?? {}, outcome.pluginId)
-    && uniquelySelectedApplicableOwnedWinner(pluginAdmissions, outcome.pluginId, root)?.marketplaceDefaultEnabled === undefined);
-  if (manifestDisabled.length > 0) {
-    effectivePluginEnablement = Object.freeze({ ...effectivePluginEnablement, ...Object.fromEntries(manifestDisabled.map((outcome) => [outcome.pluginId, { enabled: false, scope: "user" as const, source: outcome.manifestDefaultEnabled!.sourcePath }])) });
-    pluginResult = resolveInstalledPlugins({ userDir, projectRoot: root, enablement: effectivePluginEnablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
-  }
+  const resolveCompletePluginCandidate = () => {
+    let enablement = assembledEnablement({ projections: pluginAdmissions, explicit: settings.effectivePluginEnablement ?? {}, projectPath: root });
+    let result = resolveInstalledPlugins({ userDir, projectRoot: root, enablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
+    const manifestDisabled = result.outcomes.filter((outcome) => outcome.manifestDefaultEnabled?.presence === "explicit" && outcome.manifestDefaultEnabled.value === false
+      && !Object.hasOwn(settings.effectivePluginEnablement ?? {}, outcome.pluginId)
+      && uniquelySelectedApplicableOwnedWinner(pluginAdmissions, outcome.pluginId, root)?.marketplaceDefaultEnabled === undefined);
+    if (manifestDisabled.length > 0) {
+      enablement = Object.freeze({ ...enablement, ...Object.fromEntries(manifestDisabled.map((outcome) => [outcome.pluginId, { enabled: false, scope: "user" as const, source: outcome.manifestDefaultEnabled!.sourcePath }])) });
+      result = resolveInstalledPlugins({ userDir, projectRoot: root, enablement, installations: runtimeInstallations, installedStateStatus: installedState.status, env });
+    }
+    return { enablement, result };
+  };
+  const importedRootsOf = (candidate: ReturnType<typeof resolveCompletePluginCandidate>["result"]): string[] => candidate.plugins
+    .filter((plugin) => plugin.ownership === "claude-imported-readonly")
+    .map((plugin) => plugin.root);
+  const canonicalRootSet = (roots: readonly string[]): string[] => [...new Set(roots.map((candidate) => path.resolve(candidate)))]
+    .sort((left, right) => left.localeCompare(right));
+
+  // The first complete pass discovers only the exact imported roots that must
+  // bracket the authoritative pass and all subsequent component consumption.
+  const discovery = resolveCompletePluginCandidate();
+  const selectedImportedRoots = importedRootsOf(discovery.result);
+  const importedTreesBeforeAssembly = captureImportedExecutableTrees(selectedImportedRoots);
+  const finalResolution = resolveCompletePluginCandidate();
+  const effectivePluginEnablement = finalResolution.enablement;
+  const pluginResult = finalResolution.result;
+  const finalSelectedImportedRoots = importedRootsOf(pluginResult);
+  const discoveredRootSet = canonicalRootSet(selectedImportedRoots);
+  const finalRootSet = canonicalRootSet(finalSelectedImportedRoots);
+  const selectedImportedRootsStable = discoveredRootSet.length === finalRootSet.length
+    && discoveredRootSet.every((candidate, index) => candidate === finalRootSet[index]);
   diagnostics.push(...pluginResult.diagnostics);
   const selectedPlugins = pluginResult.plugins;
   let plugins = selectedPlugins;
@@ -425,6 +452,65 @@ export function loadClaudeProject(opts: {
     explicitEnablementIdentities: Object.keys(settings.effectivePluginEnablement ?? {}),
   });
 
+  const importedTreesAfterAssembly = captureImportedExecutableTrees(selectedImportedRoots);
+  const importedTreesStableDuringAssembly = selectedImportedRootsStable
+    && importedTreesBeforeAssembly.ok && importedTreesAfterAssembly.ok
+    && importedTreesBeforeAssembly.value.every((fingerprint) => fingerprint.status === "present")
+    && importedTreesAfterAssembly.value.every((fingerprint) => fingerprint.status === "present")
+    && sameImportedExecutableTrees(importedTreesBeforeAssembly.value, importedTreesAfterAssembly.value);
+  const observedGenerationBytes = executableGenerationObservation.status === "valid"
+    ? canonicalJsonBytes(executableGenerationObservation.generation)
+    : undefined;
+  const effectiveEnablementBytes = canonicalJsonBytes(effectivePluginEnablement);
+  const expectedGeneration = executableGenerationObservation.status === "absent"
+    ? { status: "absent" as const }
+    : executableGenerationObservation.status === "valid" && observedGenerationBytes?.ok
+      ? { status: "present" as const, digest: sha256(observedGenerationBytes.value) }
+      : undefined;
+  const reloadBinding = lifecycleLocationsResult.ok
+    ? captureReloadCandidateBinding({
+      cwd,
+      projectRoot: root,
+      userDir,
+      profileRoot: lifecycleLocationsResult.value.profileRoot,
+      profileKey: lifecycleLocationsResult.value.profileKey,
+      generationPath: path.join(lifecycleLocationsResult.value.profileRoot, "generations", "current.json"),
+      ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
+      effectivePluginEnablement: effectiveEnablementBytes.ok ? sha256(effectiveEnablementBytes.value) : sha256(Buffer.from("unavailable")),
+      importedExecutableRoots: selectedImportedRoots,
+      initialImportedExecutableTrees: importedTreesAfterAssembly.ok ? importedTreesAfterAssembly.value : Object.freeze([]),
+      ...(opts.managedSettingsPaths === undefined ? {} : { managedSettingsPaths: opts.managedSettingsPaths }),
+      ...(opts.managedPolicyPlatform === undefined ? {} : { managedPolicyPlatform: opts.managedPolicyPlatform }),
+    })
+    : undefined;
+  const invalidPluginCandidate = pluginResolutionOutcomes.some((outcome) => outcome.status !== "loaded" && outcome.status !== "disabled");
+  const uncertainReloadFingerprint = reloadBinding?.ok === true && [
+    reloadBinding.value.binding.executableGeneration,
+    reloadBinding.value.binding.importedInstallations,
+    ...reloadBinding.value.binding.importedExecutableTrees,
+    ...reloadBinding.value.binding.settings,
+  ].some((fingerprint) => fingerprint.status === "unreadable" || fingerprint.status === "overflow");
+  const reloadCandidate: LoadedProject["reloadCandidate"] = reloadBinding === undefined
+    ? Object.freeze({ status: "unavailable", reason: "owned reload handoff storage is unavailable" })
+    : !reloadBinding.ok
+      ? Object.freeze({ status: "unavailable", reason: reloadBinding.code })
+      : !effectiveEnablementBytes.ok
+        ? Object.freeze({ status: "unavailable", reason: "effective plugin settings exceed the bounded reload fingerprint limit", handoffPath: reloadBinding.value.handoffPath })
+      : !importedTreesStableDuringAssembly
+        ? Object.freeze({ status: "invalid", reason: "imported plugin inputs changed or could not be verified during component assembly", handoffPath: reloadBinding.value.handoffPath })
+      : uncertainReloadFingerprint
+        ? Object.freeze({ status: "invalid", reason: "reload input fingerprint is unreadable or exceeds its bound", handoffPath: reloadBinding.value.handoffPath })
+      : executableGenerationObservation.status !== "valid" && executableGenerationObservation.status !== "absent"
+        ? Object.freeze({ status: "invalid", reason: `executable admission ${executableGenerationObservation.status}`, handoffPath: reloadBinding.value.handoffPath })
+        : invalidPluginCandidate
+          ? Object.freeze({ status: "invalid", reason: "plugin candidate validation rejected one or more effective identities", handoffPath: reloadBinding.value.handoffPath })
+          : Object.freeze({
+            status: "ready",
+            binding: reloadBinding.value.binding,
+            handoffPath: reloadBinding.value.handoffPath,
+            recapture: reloadBinding.value.recapture,
+          });
+
   return {
     root,
     cwd,
@@ -447,6 +533,7 @@ export function loadClaudeProject(opts: {
     lifecycleObservation,
     executableGenerationObservation,
     ...(ownedProfileReference === undefined ? {} : { ownedProfileReference }),
+    reloadCandidate,
     autoMemory,
   };
 }
