@@ -1,5 +1,9 @@
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
-import { killProcessTreeByPid, listDescendantPids } from "../util/process-tree.js";
+import {
+  killProcessTreeByPid,
+  killProcessTreeByPidAndWait,
+  listDescendantPids,
+} from "../util/process-tree.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type {
   EnabledRemoteAgentMcpServer,
@@ -249,7 +253,7 @@ interface DiscoverySnapshot {
 
 interface ProcessCleanupDeps {
   snapshot(pid: number): readonly number[];
-  killTree(pid: number): void;
+  killTree(pid: number, maxWaitMs: number): boolean | Promise<boolean>;
   kill(pid: number, signal: 0 | "SIGKILL"): void;
   now(): number;
   delay(delayMs: number): Promise<void>;
@@ -1474,25 +1478,32 @@ export class McpRuntime {
     // Snapshot the tree BEFORE the graceful close: once the direct child exits
     // on stdin-EOF its children reparent and no later walk can find them.
     const snapshot = pid !== undefined ? this.processCleanup.snapshot(pid) : [];
+    const initialDeadline = this.processCleanup.now() + SHUTDOWN_GRACE_MS;
+    let treeKillCompleted = true;
     if (process.platform === "win32" && pid !== undefined) {
       // Windows has no graceful SIGTERM (process.kill is already a hard
-      // terminate) — tree-kill immediately, while the tree is still intact.
-      this.processCleanup.killTree(pid);
+      // terminate). Keep the root alive until taskkill has finished walking
+      // the tree: killing it concurrently can strand already-spawned children.
+      treeKillCompleted = await this.processCleanup.killTree(pid, SHUTDOWN_GRACE_MS);
     }
     const client = handle.client;
-    // Keep the observable completion promise: a no-PID transport that misses the first grace can
-    // become confirmable before the owner retries, without issuing close twice.
-    const closeCompletion = beginCleanup([() => client?.close()]);
-    // Sweep the pre-close snapshot (POSIX grandchildren; win32 backstop).
-    // pid-reuse inside the grace window could kill an unrelated process —
-    // accepted, same class as the hook-runner taskkill pattern.
-    for (const target of snapshot) {
-      try {
-        this.processCleanup.kill(target, "SIGKILL");
-      } catch {
-        /* already gone */
+    let closeCompletion: Promise<boolean> | undefined;
+    const beginRootCleanup = (): Promise<boolean> => {
+      // Do not close or sweep the root before Windows tree traversal succeeds:
+      // either action can detach descendants and make the retained retry blind.
+      closeCompletion ??= beginCleanup([() => client?.close()]);
+      // Sweep the pre-close snapshot (POSIX grandchildren; win32 backstop).
+      // pid-reuse inside the grace window could kill an unrelated process —
+      // accepted, same class as the hook-runner taskkill pattern.
+      for (const target of snapshot) {
+        try {
+          this.processCleanup.kill(target, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
       }
-    }
+      return closeCompletion;
+    };
     // Post-shutdown truthfulness: a killed server must not keep reporting
     // "connected" to the bounded status surfaces. "failed" is the minimal
     // honest state within the fixed contract union; the diagnostic stays out
@@ -1502,11 +1513,28 @@ export class McpRuntime {
       handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
       handle.statusSummary = "Connection closed because the session shut down.";
     }
-    const confirmStopped = async (): Promise<boolean> => snapshot.length > 0
-      ? await confirmProcessSnapshotAbsent(snapshot, SHUTDOWN_GRACE_MS, this.processCleanup)
-      : await this.raceCleanup(closeCompletion);
-    const confirmed = await confirmStopped();
-    if (!confirmed) this.cleanupRetries.set(handle.server.name, confirmStopped);
+    const confirmSnapshotWithin = async (deadline: number): Promise<boolean> => snapshot.length > 0
+      ? await confirmProcessSnapshotAbsent(
+        snapshot,
+        Math.max(0, deadline - this.processCleanup.now()),
+        this.processCleanup,
+      )
+      : await this.raceCleanup(beginRootCleanup());
+    if (treeKillCompleted) beginRootCleanup();
+    const confirmed = treeKillCompleted
+      ? await confirmSnapshotWithin(initialDeadline)
+      : false;
+    if (!confirmed) {
+      this.cleanupRetries.set(handle.server.name, async () => {
+        const retryDeadline = this.processCleanup.now() + SHUTDOWN_GRACE_MS;
+        if (process.platform === "win32" && pid !== undefined && !treeKillCompleted) {
+          treeKillCompleted = await this.processCleanup.killTree(pid, SHUTDOWN_GRACE_MS);
+          if (!treeKillCompleted) return false;
+          beginRootCleanup();
+        }
+        return await confirmSnapshotWithin(retryDeadline);
+      });
+    }
     return confirmed;
   }
 
@@ -1645,7 +1673,7 @@ function resolveProcessCleanupDeps(deps: McpRuntimeDeps): ProcessCleanupDeps {
   if (injected !== undefined) return injected as ProcessCleanupDeps;
   return {
     snapshot: (pid) => [pid, ...listDescendantPids(pid)],
-    killTree: killProcessTreeByPid,
+    killTree: killProcessTreeByPidAndWait,
     kill: (pid, signal) => { process.kill(pid, signal); },
     now: () => performance.now(),
     delay: referencedSleep,

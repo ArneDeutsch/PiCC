@@ -1970,11 +1970,132 @@ describe("McpRuntime kill discipline", () => {
     }
   }, 25_000);
 
+  it.skipIf(process.platform !== "win32")(
+    "awaits Windows tree termination before sweeping the captured root",
+    async () => {
+      const testDepsKey = Symbol.for("picc.test.mcp-process-cleanup");
+      const treeKill = deferred<void>();
+      const events: string[] = [];
+      let now = 0;
+      let probes = 0;
+      const pid = 4_000_000;
+      class FakeTransport {
+        readonly pid = pid;
+        readonly stderr = undefined;
+      }
+      class FakeClient {
+        async connect(): Promise<void> {}
+        async listTools(): Promise<{ tools: never[] }> { return { tools: [] }; }
+        async close(): Promise<void> {}
+      }
+      const deps = makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      });
+      Object.defineProperty(deps, testDepsKey, {
+        value: {
+          snapshot: (target: number) => [target],
+          killTree: async () => {
+            events.push("tree-start");
+            await treeKill.promise;
+            now = 4_990;
+            events.push("tree-done");
+            return true;
+          },
+          kill: (_target: number, signal: 0 | "SIGKILL") => {
+            events.push(String(signal));
+            if (signal === 0 && probes++ > 0) {
+              throw Object.assign(new Error("gone"), { code: "ESRCH" });
+            }
+          },
+          now: () => now,
+          delay: async (delayMs: number) => {
+            events.push(`delay:${delayMs}`);
+            now += delayMs;
+          },
+        },
+      });
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: "awaited-tree" })), deps);
+      await runtime.whenSettled();
+
+      const shutdown = runtime.shutdownAgent();
+      await waitUntil({
+        description: "Windows MCP tree cleanup to start",
+        predicate: () => events.includes("tree-start"),
+      });
+      expect(events).toEqual(["tree-start"]);
+
+      treeKill.resolve();
+      await expect(shutdown).resolves.toEqual({
+        confirmed: ["awaited-tree"], unconfirmed: [], diagnostics: [],
+      });
+      expect(events).toEqual([
+        "tree-start", "tree-done", "SIGKILL", "0", "delay:10", "0",
+      ]);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "keeps failed Windows tree termination unconfirmed and retries the tree operation",
+    async () => {
+      const testDepsKey = Symbol.for("picc.test.mcp-process-cleanup");
+      const treeKillResults = [false, true];
+      const treeKillBudgets: number[] = [];
+      const cleanupSignals: Array<0 | "SIGKILL"> = [];
+      let closeCalls = 0;
+      const pid = 4_000_003;
+      class FakeTransport {
+        readonly pid = pid;
+        readonly stderr = undefined;
+      }
+      class FakeClient {
+        async connect(): Promise<void> {}
+        async listTools(): Promise<{ tools: never[] }> { return { tools: [] }; }
+        async close(): Promise<void> { closeCalls += 1; }
+      }
+      const deps = makeDeps({
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      });
+      Object.defineProperty(deps, testDepsKey, {
+        value: {
+          snapshot: (target: number) => [target],
+          killTree: (_target: number, maxWaitMs: number) => {
+            treeKillBudgets.push(maxWaitMs);
+            return treeKillResults.shift() ?? false;
+          },
+          kill: (_target: number, signal: 0 | "SIGKILL") => {
+            cleanupSignals.push(signal);
+            if (signal === 0) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+          },
+          now: () => 0,
+          delay: async () => {},
+        },
+      });
+      const runtime = McpRuntime.start(makeConfig(makeServer({ name: "uncertain-tree" })), deps);
+      await runtime.whenSettled();
+
+      await expect(runtime.shutdownAgent()).resolves.toEqual({
+        confirmed: [],
+        unconfirmed: ["uncertain-tree"],
+        diagnostics: ["Cleanup could not be confirmed for 1 agent MCP server(s)."],
+      });
+      expect(treeKillBudgets).toEqual([5_000]);
+      expect(cleanupSignals).toEqual([]);
+      expect(closeCalls).toBe(0);
+
+      await expect(runtime.retryAgentShutdown(["uncertain-tree"])).resolves.toEqual({
+        confirmed: ["uncertain-tree"], unconfirmed: [], diagnostics: [],
+      });
+      expect(treeKillBudgets).toEqual([5_000, 5_000]);
+      expect(cleanupSignals).toEqual(["SIGKILL", 0]);
+      expect(closeCalls).toBe(1);
+    },
+  );
+
   it("confirms PID cleanup only after absence and retains bounded uncertainty for retry", async () => {
     const testDepsKey = Symbol.for("picc.test.mcp-process-cleanup");
     type TestProcessCleanup = {
       snapshot(pid: number): readonly number[];
-      killTree(pid: number): void;
+      killTree(pid: number, maxWaitMs: number): boolean | Promise<boolean>;
       kill(pid: number, signal: 0 | "SIGKILL"): void;
       now(): number;
       delay(delayMs: number): Promise<void>;
@@ -2002,7 +2123,7 @@ describe("McpRuntime kill discipline", () => {
     let settlingProbe = 0;
     const settlingRuntime = await startRuntime(4_000_001, {
       snapshot: (pid) => [pid],
-      killTree: () => {},
+      killTree: () => true,
       kill: (_pid, signal) => {
         settlingCalls.push(signal);
         if (signal === "SIGKILL") return;
@@ -2023,7 +2144,7 @@ describe("McpRuntime kill discipline", () => {
     let retrying = false;
     const retainedRuntime = await startRuntime(4_000_002, {
       snapshot: (pid) => [pid],
-      killTree: () => {},
+      killTree: () => true,
       kill: (_pid, signal) => {
         retainedCalls.push(signal);
         if (signal === "SIGKILL") return;
