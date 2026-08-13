@@ -52,7 +52,8 @@ adds tasks.>
 ## Context & seams
 <Where this hooks into existing code (files/functions/concepts) and the exact
 contracts shared with other tasks — names, shapes, behavior at the boundary.
-Everything the implementer can't safely invent alone.>
+Everything the implementer can't safely invent alone. When Phase 5's orchestration-readiness
+rule applies, include its compact contract chain here; ordinary tasks need none.>
 
 ## Writable surface
 <Paths this task may create/modify. Everything else is read-only.>
