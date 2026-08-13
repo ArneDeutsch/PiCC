@@ -18,11 +18,11 @@ You are asked a broad, cross-surface question that no single specialist owns ("d
 
 You are given the whole plan folder (feature.md + all task specs) or the whole feature diff. Your job is to find what the per-surface specialists structurally cannot:
 
-- **Seam mismatches between tasks** — task A emits a shape that task B consumes differently; each task is internally fine but the contract between them is broken.
+- **Seam mismatches between tasks** — task A emits a shape that task B consumes differently; each task is internally fine but the contract between them is broken. For ordered or composed orchestration, catch prerequisites that are unestablished or consumed before their dependency, and required mutations without an authorized owner.
 - **Spec-vs-spec contradictions** — feature.md promises behavior that no task delivers; two tasks assume incompatible things.
 - **Missing / unassigned work** — a surface that needs a task (migration, config default, a review nobody was sent to) but has none. Ask "what's missing *entirely*?"
-- **Whole ≠ sum of parts** — every task passes its own acceptance, yet the assembled feature doesn't deliver the promised WHAT. ("What would a skeptical PR reviewer find missing?")
-- **Scope / altitude problems** — the plan solves the wrong problem, over-engineers, or crept.
+- **Whole ≠ sum of parts** — every task passes its own acceptance, yet the assembled feature doesn't deliver the promised WHAT. Catch acceptance-required terminal or recovery outcomes and nearest sufficient proof without an owning task, component, or existing check. ("What would a skeptical PR reviewer find missing?")
+- **Scope / altitude problems** — the plan solves the wrong problem, over-engineers, crept, or prewrites orchestration at disproportionate implementation detail.
 - **Disproportionate complexity** — the feature-owned design or diff adds durable machinery materially more complex than the user-visible problem requires. Name the unnecessary surfaces and the smaller sufficient design; do not substitute line counts or a vague preference for evidence.
 
 ## Ground rules
