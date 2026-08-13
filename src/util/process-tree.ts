@@ -1,10 +1,18 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import path from "node:path";
 import { sanitizedSubprocessEnv } from "./env.js";
 
 export function processTreeSpawnEnv(
   inherited: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   return sanitizedSubprocessEnv(inherited);
+}
+
+/** Trusted native executable path; never resolve taskkill through a project cwd. */
+export function windowsTaskkillPath(inherited: NodeJS.ProcessEnv = process.env): string {
+  const configured = inherited.SystemRoot ?? inherited.SYSTEMROOT;
+  const root = configured && path.win32.isAbsolute(configured) ? configured : "C:\\Windows";
+  return path.win32.join(root, "System32", "taskkill.exe");
 }
 
 /**
@@ -19,7 +27,7 @@ export function killProcessTree(child: ChildProcess): void {
   try {
     if (process.platform === "win32" && child.pid) {
       // taskkill /T kills the whole tree (bash + whatever it spawned).
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      const killer = spawn(windowsTaskkillPath(), ["/pid", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
         env: processTreeSpawnEnv(),
@@ -56,18 +64,12 @@ export function killProcessTree(child: ChildProcess): void {
 export function killProcessTreeByPid(pid: number): void {
   try {
     if (process.platform === "win32") {
-      const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      const killer = spawn(windowsTaskkillPath(), ["/pid", String(pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
         env: processTreeSpawnEnv(),
       });
-      killer.on("error", () => {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      });
+      killer.on("error", () => killPidBestEffort(pid));
       killer.unref();
       return;
     }
@@ -75,11 +77,90 @@ export function killProcessTreeByPid(pid: number): void {
     /* fall through to the POSIX path */
   }
   for (const target of [pid, ...listDescendantPids(pid)]) {
+    killPidBestEffort(target);
+  }
+}
+
+interface AwaitedTreeKillChild {
+  once(event: "error", listener: () => void): this;
+  once(event: "close", listener: (code: number | null) => void): this;
+  kill(): boolean;
+  unref(): void;
+}
+
+export interface AwaitedTreeKillIo {
+  platform: NodeJS.Platform;
+  taskkillPath: string;
+  spawnTaskkill(command: string, args: readonly string[]): AwaitedTreeKillChild;
+}
+
+function defaultAwaitedTreeKillIo(): AwaitedTreeKillIo {
+  return {
+    platform: process.platform,
+    taskkillPath: windowsTaskkillPath(),
+    spawnTaskkill: (command, args) => spawn(command, args, {
+      stdio: "ignore",
+      windowsHide: true,
+      env: processTreeSpawnEnv(),
+    }),
+  };
+}
+
+/**
+ * Kill a process tree and wait until the platform tree-kill operation settles.
+ *
+ * Windows callers that immediately kill the root after starting `taskkill /T`
+ * can win the race against taskkill's descendant discovery and strand the
+ * descendants. A `true` result proves taskkill completed successfully. Failure
+ * paths remain explicitly uncertain and leave the root intact so a later tree
+ * traversal can still discover its descendants.
+ */
+export function killProcessTreeByPidAndWait(
+  pid: number,
+  maxWaitMs: number,
+  io: AwaitedTreeKillIo = defaultAwaitedTreeKillIo(),
+): Promise<boolean> {
+  if (io.platform !== "win32") {
+    killProcessTreeByPid(pid);
+    return Promise.resolve(true);
+  }
+  if (maxWaitMs <= 0) return Promise.resolve(false);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let killer: AwaitedTreeKillChild | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (completed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(completed);
+    };
+
     try {
-      process.kill(target, "SIGKILL");
+      killer = io.spawnTaskkill(io.taskkillPath, ["/pid", String(pid), "/T", "/F"]);
+      killer.once("error", () => finish(false));
+      killer.once("close", (code) => finish(code === 0));
+      timer = setTimeout(() => {
+        try {
+          killer?.kill();
+          killer?.unref();
+        } catch {
+          /* taskkill already settled */
+        }
+        finish(false);
+      }, maxWaitMs);
     } catch {
-      /* already gone */
+      finish(false);
     }
+  });
+}
+
+function killPidBestEffort(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone */
   }
 }
 
