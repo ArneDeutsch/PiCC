@@ -4,6 +4,7 @@ import type { MarketplaceMutationPreview } from "../plugin-lifecycle/planner.js"
 import type { PluginMutationPreview } from "../plugin-lifecycle/plugin-service.js";
 import type { RecoveryPreview } from "../plugin-lifecycle/recovery.js";
 import type { PluginSettingsEffectSummary, SettingsValueState } from "../plugin-lifecycle/settings-plan.js";
+import { routeCatalogPluginSource } from "../plugin-lifecycle/source-matrix.js";
 import type { StoreResult } from "../plugin-lifecycle/state-store.js";
 import type { PluginLifecycleExactTarget, PluginLifecyclePort, PluginLifecycleReceipt } from "../plugin-inventory-cli.js";
 import type { PluginInventoryOperation } from "./plugin-inventory-text.js";
@@ -80,18 +81,37 @@ function printableText(data: string): string | undefined {
 
 function authorityFingerprint(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16); }
 function sourceFingerprint(source: unknown): string { try { return authorityFingerprint(JSON.stringify(source)); } catch { return authorityFingerprint("unavailable"); } }
+function immutableEvidence(value: unknown): unknown { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value) ? `sha256 ${value.slice(7)}` : value; }
+function validatedReadableSource(value: Record<string, unknown>, kind: "github" | "npm"): Record<string, unknown> | undefined {
+  const raw = kind === "github"
+    ? { source: "github", repo: value.repository, ...(value.ref === undefined ? {} : { ref: value.ref }), ...(value.sha === undefined ? {} : { sha: value.sha }) }
+    : { source: "npm", package: value.package, ...(value.version === undefined ? {} : { version: value.version }), ...(value.registry === undefined ? {} : { registry: value.registry }) };
+  const routed = routeCatalogPluginSource(raw, { marketplaceSourceKind: "local-directory" });
+  if (!routed.ok || routed.value.descriptor.kind !== kind) return undefined;
+  const descriptor = routed.value.descriptor as unknown as Record<string, unknown>;
+  const keys = Object.keys(value);
+  return keys.length === Object.keys(descriptor).length && keys.every((key) => descriptor[key] === value[key]) ? descriptor : undefined;
+}
 function safeSourceAuthority(source: unknown): string {
   if (typeof source !== "object" || source === null) return "unchanged existing authority";
   const value = source as Record<string, unknown>; const kind = typeof value.kind === "string" ? value.kind : "unknown"; const fingerprint = sourceFingerprint(source);
-  if (kind === "github" && typeof value.repository === "string") return `github repository · full authority ${fingerprint}`;
+  if (kind === "github") {
+    const validated = validatedReadableSource(value, kind);
+    if (validated !== undefined) { const [owner, repository] = (validated.repository as string).split("/"); return `GitHub repository ${owner} · ${repository} · authority fingerprint ${fingerprint}`; }
+    return `${kind} · hidden-source fingerprint ${fingerprint}`;
+  }
+  if (kind === "npm") {
+    const validated = validatedReadableSource(value, kind);
+    if (validated !== undefined) return `npm package ${(validated.package as string).replace("/", " · ")} · authority fingerprint ${fingerprint}`;
+    return `${kind} · hidden-source fingerprint ${fingerprint}`;
+  }
   if ((kind === "https-git" || kind === "https-git-subdir" || kind === "https-catalog" || kind === "https-zip") && typeof value.url === "string") {
-    try { const url = new URL(value.url); return url.protocol === "https:" ? `${kind} host ${url.host} · full authority ${fingerprint}` : `${kind}:unsupported-origin · full authority ${fingerprint}`;  } catch { return `${kind}:invalid-origin · full authority ${fingerprint}`; }
+    try { const url = new URL(value.url); return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash ? `${kind} host ${url.host} · hidden-source fingerprint ${fingerprint}` : `${kind} · hidden-source fingerprint ${fingerprint}`;  } catch { return `${kind} · hidden-source fingerprint ${fingerprint}`; }
   }
   if ((kind === "local-directory" || kind === "local-catalog-file" || kind === "relative" || kind === "marketplace-relative") && typeof value.path === "string") {
-    const leaf = value.path.replace(/\\/gu, "/").split("/").filter(Boolean).at(-1) ?? "."; return `${kind} basename ${leaf} · full authority ${fingerprint}`;
+    const leaf = value.path.replace(/\\/gu, "/").split("/").filter(Boolean).at(-1) ?? "."; return `${kind} basename ${leaf} · authority fingerprint ${fingerprint}`;
   }
-  if (kind === "npm" && typeof value.package === "string") return `npm:${value.package} · full authority ${fingerprint}`;
-  return `${kind} · full authority ${fingerprint}`;
+  return `${kind} · hidden-source fingerprint ${fingerprint}`;
 }
 
 function settingsValue(value: unknown): string {
@@ -136,7 +156,7 @@ function confirmationProjection(preview: MarketplaceMutationPreview | PluginMuta
   if ("registration" in preview) {
     const catalog = preview.catalog; const trust = preview.snapshot.trust; const authority = boundedAuthority(preview.registration.scope, preview.registration.profileKey, preview.registration.checkoutFamilyKey);
     return Object.freeze({ operationId: scalar(preview.operationId), action, target: scalar(preview.registration.name), authority, sourceAuthority: scalar(safeSourceAuthority(preview.registration.source)),
-      resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `snapshot ${scalar(preview.snapshot.snapshotId)}`, `catalog digest ${scalar(preview.snapshot.catalogDigest)}`, `state ${scalar(preview.stateFingerprint)}`, `settings ${scalar(preview.settingsFingerprint)}`]),
+      resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `snapshot ${scalar(preview.snapshot.snapshotId)}`, `catalog digest ${scalar(immutableEvidence(preview.snapshot.catalogDigest))}`, `state ${scalar(immutableEvidence(preview.stateFingerprint))}`, `settings ${scalar(immutableEvidence(preview.settingsFingerprint))}`]),
       trust: Object.freeze([`critical trust target ${scalar(trust.targetDigest)}`]), dependencies: list(catalog.plugins, (value) => { const row = value as Record<string, unknown>; return `${scalar(row.name)} · ${scalar(row.supported)} · ${scalar(row.sourceKind ?? row.error)}`; }),
       settings: Object.freeze([...settingsProjection(preview.settingsEffect), "default not applicable to marketplace registration"]), executable: Object.freeze(["marketplace catalog is inert; installed executable membership is unchanged"]),
       destructive: Object.freeze([`preserve installed plugins ${preview.acknowledgement === "preserve-installations" ? "yes" : scalar(undefined)}`, ...list(preview.dependents, (value) => `dependent ${scalar(value)}`)]),
@@ -146,7 +166,7 @@ function confirmationProjection(preview: MarketplaceMutationPreview | PluginMuta
   if ("pluginId" in preview) {
     const authority = boundedAuthority(preview.scope, preview.profileKey, preview.checkoutFamilyKey);
     return Object.freeze({ operationId: scalar(preview.operationId), action, target: scalar(preview.pluginId), authority, sourceAuthority: scalar(safeSourceAuthority(preview.requestedSource ?? preview.source)),
-      resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `revision ${scalar(preview.immutableRevision ?? "unchanged")}`, `artifact ${scalar(preview.artifactDigest ?? "unchanged")}`, `tree ${scalar(preview.treeDigest ?? "unchanged")}`, `root ${scalar(preview.rootDigest ?? "unchanged")}`, `executable ${scalar(preview.executableDigest ?? "unchanged")}`, `generation ${scalar(preview.generationId ?? "unchanged")}`]),
+      resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `revision ${scalar(immutableEvidence(preview.immutableRevision ?? "unchanged"))}`, `artifact ${scalar(immutableEvidence(preview.artifactDigest ?? "unchanged"))}`, `tree ${scalar(immutableEvidence(preview.treeDigest ?? "unchanged"))}`, `root ${scalar(immutableEvidence(preview.rootDigest ?? "unchanged"))}`, `executable ${scalar(immutableEvidence(preview.executableDigest ?? "unchanged"))}`, `generation ${scalar(preview.generationId ?? "unchanged")}`]),
       trust: Object.freeze([preview.trust === undefined ? "existing trust authority" : `critical approval ${scalar(preview.trust.target)} · ${scalar(preview.trust.executableDigest)}`]),
       dependencies: Object.freeze([`admitted ${scalar(preview.dependencies.selected.admitted)} · blocking ${scalar(preview.dependencies.blocking)}`, ...list(preview.dependencies.selected.reasons, (value) => scalar(value)), ...list(preview.dependencies.graph, (value) => scalar(JSON.stringify(value))), ...list(preview.dependencies.decisions ?? [], (value) => scalar(JSON.stringify(value)))]),
       settings: Object.freeze([...settingsProjection(preview.settingsEffect), `initial enablement source ${scalar(preview.enablement?.source ?? "existing explicit setting")}`]),

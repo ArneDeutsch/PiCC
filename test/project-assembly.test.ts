@@ -1,6 +1,10 @@
-import { spawnSync } from "node:child_process";
+import childProcess, { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
+import { syncBuiltinESMExports } from "node:module";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -460,18 +464,60 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(item.installations[0]?.projectLocation).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
   });
 
-  it("keeps a locally cataloged plugin observational when no installed record exists", () => {
-    const { repo, userDir } = makeBase();
-    write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "owner/catalog" } } }));
-    write(path.join(userDir, "plugins", "marketplaces", "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Owner" }, plugins: [{ name: "catalog-only", source: { source: "github", repo: "owner/plugin" }, agents: "./agents" }] }));
-    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "catalog-only@official": true } }));
+  it("keeps a project-declared remote plugin passive without acquisition or lifecycle authority", () => {
+    const { repo, userDir } = makeBase(); const lifecycleRoot = path.join(path.dirname(userDir), ".picc");
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "unavailable-owner/unavailable-catalog" } } }));
+    write(path.join(userDir, "plugins", "marketplaces", "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Owner" }, plugins: [{ name: "catalog-only", source: { source: "github", repo: "unavailable-owner/unavailable-plugin", ref: "hostile-content-must-stay-unresolved" }, commands: "./commands", agents: "./agents", hooks: "./hooks/hooks.json" }] }));
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "catalog-only@official": true } }));
+    expect(fs.existsSync(lifecycleRoot)).toBe(false);
+    const processTraps = [
+      vi.spyOn(childProcess, "spawn").mockImplementation((() => { throw new Error("passive load attempted spawn"); }) as typeof childProcess.spawn),
+      vi.spyOn(childProcess, "spawnSync").mockImplementation((() => { throw new Error("passive load attempted spawnSync"); }) as typeof childProcess.spawnSync),
+      vi.spyOn(childProcess, "exec").mockImplementation((() => { throw new Error("passive load attempted exec"); }) as unknown as typeof childProcess.exec),
+      vi.spyOn(childProcess, "execSync").mockImplementation((() => { throw new Error("passive load attempted execSync"); }) as typeof childProcess.execSync),
+      vi.spyOn(childProcess, "execFile").mockImplementation((() => { throw new Error("passive load attempted execFile"); }) as unknown as typeof childProcess.execFile),
+      vi.spyOn(childProcess, "execFileSync").mockImplementation((() => { throw new Error("passive load attempted execFileSync"); }) as typeof childProcess.execFileSync),
+      vi.spyOn(childProcess, "fork").mockImplementation((() => { throw new Error("passive load attempted fork"); }) as typeof childProcess.fork),
+    ];
+    const networkTraps = [
+      vi.spyOn(http, "request").mockImplementation((() => { throw new Error("passive load attempted HTTP request"); }) as typeof http.request),
+      vi.spyOn(http, "get").mockImplementation((() => { throw new Error("passive load attempted HTTP get"); }) as typeof http.get),
+      vi.spyOn(https, "request").mockImplementation((() => { throw new Error("passive load attempted HTTPS request"); }) as typeof https.request),
+      vi.spyOn(https, "get").mockImplementation((() => { throw new Error("passive load attempted HTTPS get"); }) as typeof https.get),
+      vi.spyOn(net, "connect").mockImplementation((() => { throw new Error("passive load attempted network connect"); }) as typeof net.connect),
+      vi.spyOn(net, "createConnection").mockImplementation((() => { throw new Error("passive load attempted network connection"); }) as typeof net.createConnection),
+    ];
+    const originalFetch = globalThis.fetch; const fetchTrap = vi.fn(() => Promise.reject(new Error("passive load attempted fetch"))); globalThis.fetch = fetchTrap;
+    try {
+      syncBuiltinESMExports();
+      expect(() => spawn("")).toThrow("passive load attempted spawn");
+      for (const trap of processTraps) trap.mockClear();
 
-    const project = load(repo, userDir);
-
-    expect(project.plugins).toEqual([]);
-    expect(project.pluginContexts.size).toBe(0);
-    expect(project.pluginInventory.find("catalog-only@official")).toMatchObject({ catalogPresence: true, outcome: { status: "enabled-but-uninstalled" } });
-    expect(project.pluginInventory.find("catalog-only@official")!.components).toContainEqual(expect.objectContaining({ kind: "agents", origin: "catalog" }));
+      const project = load(repo, userDir);
+      for (const trap of [...processTraps, ...networkTraps]) expect(trap).not.toHaveBeenCalled(); expect(fetchTrap).not.toHaveBeenCalled();
+      expect(project.plugins).toEqual([]);
+      expect(project.pluginContexts.size).toBe(0);
+      expect(project.skills.some((value) => value.source.pluginId === "catalog-only@official")).toBe(false);
+      expect(project.agents.some((value) => value.source.pluginId === "catalog-only@official")).toBe(false);
+      expect(JSON.stringify(project.mergedHooks)).not.toContain("catalog-only@official");
+      expect(project.pluginInventory.find("catalog-only@official")).toMatchObject({ catalogPresence: true, outcome: { status: "enabled-but-uninstalled" } });
+      expect(project.pluginInventory.find("catalog-only@official")!.components).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "commands", origin: "catalog" }),
+        expect.objectContaining({ kind: "agents", origin: "catalog" }),
+        expect.objectContaining({ kind: "hooks", origin: "catalog" }),
+      ]));
+      expect(project.pluginAdmissions).toEqual([]);
+      expect(project.ownedMarketplaces).toEqual([]);
+      expect(project.ownedProfileReference).toBeUndefined();
+      expect(project.executableGenerationObservation).toEqual({ status: "absent" });
+      expect(project.lifecycleObservation).toEqual({ records: [], receipts: [], pending: [] });
+      expect(fs.existsSync(path.join(userDir, "plugins", "installed_plugins.json"))).toBe(false);
+      expect(fs.existsSync(lifecycleRoot)).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const trap of [...processTraps, ...networkTraps]) trap.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 
   it("loads no installed content when enabledPlugins is absent", () => {

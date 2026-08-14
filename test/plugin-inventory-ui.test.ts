@@ -696,6 +696,67 @@ describe("plugin inventory focused UI", () => {
     await vi.waitFor(() => expect(edited.view().workflow?.phase).toBe("preview")); expect(planned.at(-1)).not.toHaveProperty("ref"); expect(JSON.stringify(edited.view())).not.toContain("STALE_REF_CANARY");
   });
 
+  it("reviews every remote plugin source family through the install form and cancels before mutation", async () => {
+    const catalogOnly = item("remote@official", { installationRecords: false, enablement: false, runtime: false });
+    const commit = "a".repeat(40); const artifactDigest = `sha256:${"b".repeat(64)}`; const declaredZipDigest = `sha256:${"c".repeat(64)}`; let discards = 0; let executes = 0;
+    const cases = [
+      {
+        label: "GitHub", source: { kind: "github", repository: "validated-owner/validated-repository", ref: "release/v2", sha: commit },
+        immutableRevision: commit, authority: "GitHub repository validated-owner · validated-repository · authority fingerprint", expected: [`revision ${commit}`, `artifact sha256 ${artifactDigest.slice(7)}`], hidden: [] as string[],
+      },
+      {
+        label: "HTTPS Git", source: { kind: "https-git", url: "https://git.example.com/PATH_TOKEN_CANARY/repository.git", ref: "refs/heads/REF_SECRET_CANARY", sha: commit },
+        immutableRevision: commit, authority: "https-git host git.example.com · hidden-source fingerprint", expected: [`revision ${commit}`, `artifact sha256 ${artifactDigest.slice(7)}`], hidden: ["PATH_TOKEN_CANARY", "REF_SECRET_CANARY"],
+      },
+      {
+        label: "HTTPS Git subdirectory", source: { kind: "https-git-subdir", url: "https://git.example.com/SECOND_PATH_CANARY/repository.git", path: "plugins/SUBDIR_SECRET_CANARY", ref: "refs/tags/SECOND_REF_CANARY", sha: commit },
+        immutableRevision: commit, authority: "https-git-subdir host git.example.com · hidden-source fingerprint", expected: [`revision ${commit}`, `artifact sha256 ${artifactDigest.slice(7)}`], hidden: ["SECOND_PATH_CANARY", "SUBDIR_SECRET_CANARY", "SECOND_REF_CANARY"],
+      },
+      {
+        label: "HTTPS ZIP", source: { kind: "https-zip", url: "https://archive.example.org/ZIP_PATH_CANARY/plugin.zip", sha256: declaredZipDigest.slice(7) },
+        immutableRevision: declaredZipDigest, authority: "https-zip host archive.example.org · hidden-source fingerprint", expected: [`revision sha256 ${declaredZipDigest.slice(7)}`, `artifact sha256 ${artifactDigest.slice(7)}`], hidden: ["ZIP_PATH_CANARY"],
+      },
+      {
+        label: "npm", source: { kind: "npm", package: "@validated/plugin", version: "2.3.4", registry: "https://registry.npmjs.org" },
+        immutableRevision: "2.3.4", authority: "npm package @validated · plugin · authority fingerprint", expected: ["revision 2.3.4", `artifact sha256 ${artifactDigest.slice(7)}`], hidden: [] as string[],
+      },
+    ] as const;
+    const fingerprints = new Map<string, string>();
+    for (const sourceCase of cases) {
+      const fingerprint = createHash("sha256").update(JSON.stringify(sourceCase.source), "utf8").digest("hex").slice(0, 16); fingerprints.set(sourceCase.label, fingerprint);
+      const preview = { operationId: `plugin_${sourceCase.label.replace(/[^A-Za-z]/gu, "_")}`, action: "install", pluginId: "remote@official", scope: "user", mutableRecordKey: "record", profileKey: "profile-test", requestedSource: sourceCase.source, immutableRevision: sourceCase.immutableRevision, artifactDigest, treeDigest: `sha256:${"d".repeat(64)}`, rootDigest: `sha256:${"e".repeat(64)}`, executableDigest: `sha256:${"f".repeat(64)}`, generationId: "generation-next", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: ["skills"], removeDeclaration: false, removeData: false, participants: [], consequences: ["install remote@official"], confirmationDigest: `sha256:${"9".repeat(64)}` } as never;
+      const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => { executes += 1; return { ok: false, code: "unused", message: "unused" }; }, discardPreview: async () => { discards += 1; return { ok: true, value: undefined }; } }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+      const c = component(snapshot({ items: [catalogOnly] }), { lifecycle: port, initialAction: "install" });
+      c.handleInput("\r"); for (const value of ["remote@official", "user", "no"]) { c.handleInput(value); c.handleInput("\r"); }
+      await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
+      const rows: string[] = []; for (let index = 0; index < 40; index += 1) { rows.push(...c.render(120)); c.handleInput("\u001b[B"); }
+      const rendered = normalizedOutput(rows);
+      expect(rendered, sourceCase.label).toContain(`${sourceCase.authority} ${fingerprint}`);
+      for (const evidence of sourceCase.expected) expect(rendered, sourceCase.label).toContain(evidence);
+      for (const secret of sourceCase.hidden) expect(rendered, sourceCase.label).not.toContain(secret);
+      expect(c.view().workflow).toMatchObject({ phase: "preview", confirmationEnabled: true });
+      c.handleInput("\u001b"); await vi.waitFor(() => expect(c.view().workflow).toBeUndefined());
+    }
+    expect(fingerprints.get("HTTPS Git")).not.toBe(fingerprints.get("HTTPS Git subdirectory"));
+    expect(discards).toBe(cases.length); expect(executes).toBe(0);
+  });
+
+  it("keeps malformed GitHub and npm recovery-summary identities opaque", async () => {
+    const cases = [
+      { operationId: "recover_github", source: { kind: "github", repository: "valid-owner/GITHUB_RECOVERY_CANARY/extra", ref: "release" }, kind: "github", canary: "GITHUB_RECOVERY_CANARY" },
+      { operationId: "recover_npm", source: { kind: "npm", package: "@valid/NPM_RECOVERY_CANARY/extra", version: "2.3.4", registry: "https://registry.npmjs.org" }, kind: "npm", canary: "NPM_RECOVERY_CANARY" },
+    ] as const;
+    for (const recoveryCase of cases) {
+      const summary = { pluginId: "remote@official", scope: "user", profileKey: "profile-test", requestedSource: recoveryCase.source, dependencies: { selected: { admitted: true, reasons: [] }, graph: [], decisions: [] }, executableComponents: [], participants: [], consequences: [] };
+      const preview = { operationId: recoveryCase.operationId, producerSchema: "plugin-lifecycle", producerVersion: 1, confirmationDigest: `sha256:${"c".repeat(64)}`, planDigest: `sha256:${"d".repeat(64)}`, completed: 0, remaining: 1, rolledBack: 0, actions: ["complete"], confirmationSummary: summary } as never;
+      const port = { marketplaces: {}, plugins: {}, recovery: { preview: async () => ({ ok: true, value: preview }), recover: async () => { throw new Error("recovery must not execute"); } }, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
+      const c = component(snapshot(), { lifecycle: port, initialAction: "recover" }); c.handleInput("\r"); c.handleInput(recoveryCase.operationId); c.handleInput("\r"); c.handleInput("complete"); c.handleInput("\r");
+      await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
+      const fingerprint = createHash("sha256").update(JSON.stringify(recoveryCase.source), "utf8").digest("hex").slice(0, 16);
+      const rendered = normalizedOutput(c.render(120)); expect(rendered).toContain(`${recoveryCase.kind} · hidden-source fingerprint ${fingerprint}`); expect(rendered).not.toContain(recoveryCase.canary); expect(JSON.stringify(c.view())).not.toContain(recoveryCase.canary);
+    }
+  });
+
   it("requires a new explicit declaration-only choice after precedence refusal and renders planner effective-state truth", async () => {
     const owned = { ...item("alpha@official"), lifecycle: { ownership: "picc-owned" as const, candidates: [], selectionRequired: false, availableActions: ["enable" as const], installed: true, loaded: false, dependency: { state: "satisfied" as const }, pendingReload: false, retainedErrors: [] } };
     const operations: any[] = [];
@@ -824,7 +885,7 @@ describe("plugin inventory focused UI", () => {
     const rendered: string[] = [];
     for (const [scope, sourceValue] of [["user", "/first/same"], ["project", "/second/same"], ["local", "/third/same"]] as const) {
       const port = { marketplaces: { plan: async (operation: any) => ({ ok: true, value: { operationId: `market_${scope}`, action: "add", registration: { name: operation.name, scope, profileKey: "profile-secret-key", ...(scope === "user" ? {} : { checkoutFamilyKey: "checkout-secret-key", projectKey: "checkout-secret-key" }), source: { kind: "local-directory", path: operation.sourceValue } }, snapshot: { snapshotId: `marketplace-${scope}`, catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: `sha256:${"d".repeat(64)}`, settingsFingerprint: `sha256:${"e".repeat(64)}`, settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"] } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
-      const c = component(snapshot(), { lifecycle: port, initialAction: "marketplace-add" }); c.handleInput("\r"); for (const value of ["new-market", "local-directory", sourceValue, scope, "no"]) { c.handleInput(value); c.handleInput("\r"); } await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); const text = normalizedOutput(c.render(120)); rendered.push(text); const sourceFingerprint = createHash("sha256").update(JSON.stringify({ kind: "local-directory", path: sourceValue }), "utf8").digest("hex").slice(0, 16); expect(text).toContain(`local-directory basename same · full authority ${sourceFingerprint}`); expect(text).toContain(`requested scope ${scope}`); expect(text).toMatch(/profile [a-f0-9]{16}/u); expect(text).toContain(scope === "user" ? "checkout user-global" : "checkout "); expect(text).not.toContain("profile-secret-key"); expect(text).not.toContain("checkout-secret-key"); expect(text).not.toContain(sourceValue); expect(c.view().workflow).toMatchObject({ confirmationEnabled: true });
+      const c = component(snapshot(), { lifecycle: port, initialAction: "marketplace-add" }); c.handleInput("\r"); for (const value of ["new-market", "local-directory", sourceValue, scope, "no"]) { c.handleInput(value); c.handleInput("\r"); } await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview")); const text = normalizedOutput(c.render(120)); rendered.push(text); const sourceFingerprint = createHash("sha256").update(JSON.stringify({ kind: "local-directory", path: sourceValue }), "utf8").digest("hex").slice(0, 16); expect(text).toContain(`local-directory basename same · authority fingerprint ${sourceFingerprint}`); expect(text).toContain(`requested scope ${scope}`); expect(text).toMatch(/profile [a-f0-9]{16}/u); expect(text).toContain(scope === "user" ? "checkout user-global" : "checkout "); expect(text).not.toContain("profile-secret-key"); expect(text).not.toContain("checkout-secret-key"); expect(text).not.toContain(sourceValue); expect(c.view().workflow).toMatchObject({ confirmationEnabled: true });
     }
     expect(new Set(rendered).size).toBe(3);
     const incompletePort = { marketplaces: { plan: async () => ({ ok: true, value: { operationId: "market_incomplete", action: "add", registration: { name: "new-market", scope: "project", profileKey: "profile-secret-key", source: { kind: "local-directory", path: "/fourth/same" } }, snapshot: { snapshotId: "marketplace-incomplete", catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } }, catalog: { plugins: [], omittedEntries: 0 }, stateFingerprint: `sha256:${"d".repeat(64)}`, settingsFingerprint: `sha256:${"e".repeat(64)}`, settingsEffect: { requested: true, effective: true }, acknowledgement: "preserve-installations", dependents: [], participants: [], consequences: ["add"] } }), discardPreview: async () => ({ ok: true, value: undefined }) }, plugins: {}, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
@@ -836,7 +897,7 @@ describe("plugin inventory focused UI", () => {
     let executes = 0; let discards = 0;
     const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: true, value: preview }), execute: async () => { executes += 1; return { ok: false, code: "unused", message: "unused" }; }, discardPreview: async () => { discards += 1; return { ok: true, value: undefined }; } }, recovery: {}, targets: { plugin: () => ({ ok: false, code: "unused", message: "unused" }), marketplace: () => ({ ok: false, code: "unused", message: "unused" }) }, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
     const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); c.handleInput("no"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("preview"));
-    expect(JSON.stringify(c.view())).not.toMatch(/password|requestedSource|confirmationDigest/u); const projected = normalizedOutput(c.render(72)); expect(projected).toContain("https-git host example.com · full authority"); expect(projected).toContain("requested scope user"); expect(projected).toMatch(/profile [a-f0-9]{16}/u);
+    expect(JSON.stringify(c.view())).not.toMatch(/password|requestedSource|confirmationDigest/u); const projected = normalizedOutput(c.render(72)); expect(projected).toContain("https-git · hidden-source fingerprint"); expect(projected).toContain("requested scope user"); expect(projected).toMatch(/profile [a-f0-9]{16}/u);
     c.handleInput("\r"); expect(c.view().workflow?.phase).toBe("confirmation"); c.invalidate(); c.handleInput("\r"); await vi.waitFor(() => expect(discards).toBe(1)); expect(executes).toBe(0); expect(c.view().workflow?.phase).toBe("failed");
 
     const narrow = component(snapshot(), { lifecycle: port, initialAction: "enable" }); narrow.handleInput("\r"); narrow.handleInput("alpha@official"); narrow.handleInput("\r"); narrow.handleInput("no"); narrow.handleInput("\r"); await vi.waitFor(() => expect(narrow.view().workflow?.phase).toBe("preview")); const narrowText = normalizedOutput(narrow.render(7)); expect(narrowText).toContain("Resize"); expect(narrowText.replace(/\s/gu, "")).toContain("nodurablechangeuntilexplicitconfirmation"); expect(narrowText).not.toContain("read-only"); expect(discards).toBe(1); expect(executes).toBe(0); expect(narrow.view().workflow?.phase).toBe("preview");
