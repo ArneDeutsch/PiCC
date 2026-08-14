@@ -134,12 +134,6 @@ export function createTransactionCodecRegistry(codecs: readonly TransactionProdu
   return { ok: true, value: Object.freeze({ lookup: (schema: string, version: number) => map.get(`${schema}\0${version}`) }) };
 }
 
-// Generic path lists are not semantic authority; external targets require trusted producer callbacks.
-export interface TransactionTargetAuthority { readonly targets: readonly string[] }
-export async function bindTransactionTargetsForTrustedCode(_targets: readonly string[]): Promise<StoreResult<TransactionTargetAuthority>> {
-  return fail("unsafe-target", "Generic external path authority is unsupported; register a reconstructible producer callback");
-}
-
 interface Identity { readonly dev: bigint; readonly ino: bigint }
 function identity(stat: BigIntStats): Identity { return { dev: stat.dev, ino: stat.ino }; }
 function samePath(a: string, b: string): boolean { return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b; }
@@ -326,11 +320,10 @@ export async function createOwnedDataRetirementParticipant(inputs: { readonly st
   } catch { return fail("invalid-participant", "Exact owned data retirement participant could not be derived"); }
 }
 
-export async function prepareTransaction<T>(inputs: { readonly store: OwnedStateStore; readonly codec: TransactionProducerCodec<T>; readonly operationId: string; readonly confirmationSummary: unknown; readonly participants: readonly TransactionParticipant[]; readonly targetAuthority?: TransactionTargetAuthority }): Promise<StoreResult<PreparedTransaction>> {
+export async function prepareTransaction<T>(inputs: { readonly store: OwnedStateStore; readonly codec: TransactionProducerCodec<T>; readonly operationId: string; readonly confirmationSummary: unknown; readonly participants: readonly TransactionParticipant[] }): Promise<StoreResult<PreparedTransaction>> {
   const storeValid = await revalidateOwnedStateStore(inputs.store); if (!storeValid.ok) return storeValid;
   if (!validCodecIdentity(inputs.codec.schema, inputs.codec.version) || typeof inputs.codec.decodeSummary !== "function" || typeof inputs.codec.validatePlan !== "function" || typeof inputs.codec.requiredLocks !== "function") return fail("invalid-codec", "Producer codec identity or callbacks are invalid at preparation");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(inputs.operationId)) return fail("invalid-operation", "Operation id is invalid");
-  if (inputs.targetAuthority !== undefined) return fail("unsafe-target", "Generic external authority cannot prepare a transaction");
   const decodeSummary = inputs.codec.decodeSummary.bind(inputs.codec); const validatePlan = inputs.codec.validatePlan.bind(inputs.codec);
   const deriveRequiredLocks = inputs.codec.requiredLocks.bind(inputs.codec); const authorizeExternal = inputs.codec.authorizeExternal?.bind(inputs.codec); const authorizeOwnedDelete = inputs.codec.authorizeOwnedDelete?.bind(inputs.codec); const authorizeOwnedDataRetirement = inputs.codec.authorizeOwnedDataRetirement?.bind(inputs.codec);
   const codecSnapshot: TransactionProducerCodec = Object.freeze({ schema: inputs.codec.schema, version: inputs.codec.version, decodeSummary, validatePlan, requiredLocks: deriveRequiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }), ...(authorizeOwnedDataRetirement === undefined ? {} : { authorizeOwnedDataRetirement }) });
@@ -415,7 +408,7 @@ function retirementContext(transaction: PreparedTransaction, participant: OwnedD
   retirementMutationContexts.add(context); return context;
 }
 
-export async function revalidatePersistedTransaction(store: OwnedStateStore, transaction: PreparedTransaction, codec: TransactionProducerCodec, _targetAuthority?: TransactionTargetAuthority): Promise<StoreResult<void>> {
+export async function revalidatePersistedTransaction(store: OwnedStateStore, transaction: PreparedTransaction, codec: TransactionProducerCodec): Promise<StoreResult<void>> {
   if (!validCodecIdentity(codec.schema, codec.version) || codec.schema !== transaction.producerSchema || codec.version !== transaction.producerVersion
     || !codec.decodeSummary(transaction.confirmationSummary).ok || !transaction.participants.every(validParticipantShape) || !validRequiredLocks(store, transaction.requiredLocks)) return fail("invalid-producer-data", "Persisted transaction or producer identity is invalid");
   const generation = validateGenerationRelationship(transaction.participants); if (!generation.ok) return generation;

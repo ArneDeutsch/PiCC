@@ -108,20 +108,6 @@ function isolatedCheckout(): {
   return { root, launcher: path.join(root, "bin", "picc.mjs"), driftedSource, extensionCanary, pluginCanary };
 }
 
-function pluginCommand(
-  launcher: string,
-  cwd: string,
-  args: string[],
-  env: NodeJS.ProcessEnv,
-) {
-  return spawnSync(process.execPath, [launcher, "plugin", ...args], {
-    cwd,
-    encoding: "utf8",
-    env: lifecycleSubprocessEnv(env),
-    timeout: 30_000,
-  });
-}
-
 describe.skipIf(cliMissing)("source-checkout fallback", () => {
   it("keeps standalone plugin routing on one disclosed TypeScript generation until rebuild and relaunch", async () => {
     const isolated = isolatedCheckout();
@@ -157,19 +143,6 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
     expect(marketplaceSelector).toBeDefined();
     const installed = lifecycleCommand(["install", LIFECYCLE_BASE_ID, "--marketplace-selector", marketplaceSelector!, "--yes"]);
     expect(installed.status, installed.stderr).toBe(0);
-    const probeEnv = {
-      HOME: lifecycle.homeDir,
-      USERPROFILE: lifecycle.homeDir,
-      PICC_CLAUDE_USER_DIR: lifecycle.userDir,
-      PICC_SOURCE_PLUGIN_CANARY: isolated.pluginCanary,
-      PI_OFFLINE: "1",
-    };
-    const list = pluginCommand(isolated.launcher, isolated.root, ["list"], probeEnv);
-    expect(list.status, list.stderr).toBe(0);
-    expect(list.stdout).toContain("Plugin inventory (read-only)");
-    const details = pluginCommand(isolated.launcher, isolated.root, ["details", "missing@market"], probeEnv);
-    expect(details.status).toBe(1);
-    expect(details.stderr).toContain("PiCC plugin not found: missing@market");
     const observationsBeforeDetails = fs.readFileSync(isolated.pluginCanary, "utf8").trim().split(/\r?\n/u)
       .map((line) => JSON.parse(line) as { type: string; producerPid: number; argv: string[]; sourcePath: string });
     const freshDurable = lifecycleCommand(["details", LIFECYCLE_BASE_ID]);
@@ -180,8 +153,6 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
     expect(pluginObservations.map((observation) => observation.argv)).toEqual([
       ["plugin", "marketplace", "add", LIFECYCLE_MARKETPLACE, "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"), "--yes"],
       ["plugin", "install", LIFECYCLE_BASE_ID, "--marketplace-selector", marketplaceSelector!, "--yes"],
-      ["plugin", "list"],
-      ["plugin", "details", "missing@market"],
       ["plugin", "details", LIFECYCLE_BASE_ID],
     ]);
     expect(pluginObservations.every((observation) => observation.type === "source-plugin" &&

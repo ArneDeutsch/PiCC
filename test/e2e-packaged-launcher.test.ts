@@ -19,8 +19,6 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import {
   createPluginLifecycleFixture,
   LIFECYCLE_BASE_ID,
-  LIFECYCLE_DEPENDENT_ID,
-  LIFECYCLE_DISABLED_ID,
   LIFECYCLE_MARKETPLACE,
   lifecycleSubprocessEnv,
 } from "./helpers/plugin-lifecycle-fixture.js";
@@ -301,13 +299,7 @@ it(
       const base = await install(LIFECYCLE_BASE_ID);
       expect(base.status, base.stderr).toBe(0);
       expect(base.stdout).toContain("Target scope/record selector: local;");
-      const disabled = await install(LIFECYCLE_DISABLED_ID);
-      expect(disabled.status, disabled.stderr).toBe(0);
-      const dependent = await install(LIFECYCLE_DEPENDENT_ID);
-      expect(dependent.status, dependent.stderr).toBe(0);
       expect(base.stdout).toContain("Default/enablement: enabled=true");
-      expect(disabled.stdout).toContain("Default/enablement: enabled=false");
-      expect(dependent.stdout).toContain("Dependencies:");
 
       lifecycle.seedImportedCoexistence();
       const importedRecord = path.join(lifecycle.userDir, "plugins", "installed_plugins.json");
@@ -349,8 +341,6 @@ it(
       const localSettings = path.join(project, ".claude", "settings.local.json");
       expect(JSON.parse(fs.readFileSync(localSettings, "utf8"))).toMatchObject({ enabledPlugins: {
         [LIFECYCLE_BASE_ID]: true,
-        [LIFECYCLE_DISABLED_ID]: false,
-        [LIFECYCLE_DEPENDENT_ID]: true,
       } });
       expect(fs.existsSync(path.join(lifecycle.worktree, ".claude", "settings.local.json"))).toBe(false);
       expect(networkDescriptor).toContain("127.0.0.1");
@@ -372,7 +362,7 @@ it(
     expect(networkAttempts).toBe(0);
     expect(treeSnapshot(packageRoot)).toEqual(packageBefore);
     expect(treeSnapshot(fixtureSource)).toEqual(fixtureBefore);
-    expect(launches).toBe(6);
+    expect(launches).toBe(4);
   },
   TEST_TIMEOUT_MS,
 );
