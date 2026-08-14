@@ -704,7 +704,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("feature.plugins-manifest-metadata")?.note).toMatch(/defaultEnabled participates only in initial PiCC-owned install[\s\S]*PiCC-owned activation checks dependencies[\s\S]*imported dependency metadata remains observational/);
 
     const enabled = lookupCapability("setting.enabledPlugins")?.note ?? "";
-    for (const phrase of ["active Claude profile settings.json", "active checkout .claude/settings.json", "canonical main checkout shared .claude/settings.local.json", "Existing explicit effective enablement survives install and update", "Declaration-only consent", "never overrides a higher-precedence effective declaration"]) expect(enabled).toContain(phrase);
+    for (const phrase of ["active Claude profile settings.json", "active checkout .claude/settings.json", "canonical main checkout shared .claude/settings.local.json", "user, then each root-to-cwd project/local pair", "for a reciprocally verified linked worktree, the canonical main checkout's shared .claude/settings.local.json", "finally managed policy", "diverge from Claude's documented global Local > Project > User priority", "Existing explicit effective enablement survives install and update", "Declaration-only consent", "never overrides a higher-precedence effective declaration"]) expect(enabled).toContain(phrase);
     expect(enabled).not.toContain("reinstall");
     expect(lookupCapability("setting.extraKnownMarketplaces")?.note).toMatch(/PiCC can write selected[\s\S]*Claude-owned, seed, and managed.*read-only/);
 
@@ -735,6 +735,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(id), id).toMatchObject({ tier: "partial", safetyRelevant: true });
       expect(lookupCapability(id)?.note, id).toMatch(/read-only observation[\s\S]*does not enforce/);
     }
+    const currentPluginSettings = [
+      { id: "setting.disableCommandPluginSources", tier: "not-supported", note: /does not support command plugin sources[\s\S]*does not enforce this managed policy as a general restriction/ },
+      { id: "setting.pluginConfigs", tier: "not-supported", note: /observes the bounded marketplace userConfig declaration shape[\s\S]*does not consume configured values or apply plugin user configuration/ },
+      { id: "setting.pluginSuggestionMarketplaces", tier: "degraded-noop", note: /does not perform organization-governed plugin suggestions/ },
+    ] as const;
+    for (const expected of currentPluginSettings) {
+      const capability = lookupCapability(expected.id);
+      expect(capability, expected.id).toMatchObject({ tier: expected.tier });
+      expect(capability?.note, expected.id).toMatch(expected.note);
+      expect(capability?.evidence, expected.id).toEqual([{ quality: "documented", source: "Settings reference — Available settings", reviewed: "2026-07-31" }]);
+    }
+    expect(lookupCapability("setting.disableCommandPluginSources")?.safetyRelevant).toBe(true);
     expect(lookupCapability("setting.disableSideloadFlags")?.note).toMatch(/unsupported Claude sideload flags[\s\S]*neither disables nor authorizes PiCC's explicit/);
   });
 
@@ -1508,6 +1520,27 @@ describe("buildCompatReport", () => {
     const report = buildCompatReport(project);
     expect(report.unassessed.some((u) => u.includes('"futureThing"'))).toBe(true);
     expect(report.findings).toEqual([]);
+  });
+
+  it("recognizes current plugin settings through assessed registry findings", () => {
+    const project = makeProject({
+      settings: makeSettings({
+        unknownKeys: [
+          { key: "disableCommandPluginSources", scope: "managed" },
+          { key: "pluginConfigs", scope: "user" },
+          { key: "pluginSuggestionMarketplaces", scope: "project" },
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    expect(report.unassessed).toEqual([]);
+    expect(report.safetyFindings).toEqual([
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.disableCommandPluginSources", tier: "not-supported", safetyRelevant: true }), evidence: 'settings key "disableCommandPluginSources" (managed scope)' }),
+    ]);
+    expect(report.findings).toEqual([
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.pluginConfigs", tier: "not-supported" }), evidence: 'settings key "pluginConfigs" (user scope)' }),
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.pluginSuggestionMarketplaces", tier: "degraded-noop" }), evidence: 'settings key "pluginSuggestionMarketplaces" (project scope)' }),
+    ]);
   });
 
   it("routes registry-known managed MCP policy keys to safety findings without honoring them", () => {

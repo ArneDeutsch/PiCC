@@ -279,30 +279,46 @@ picc plugin recover
 Marketplace `--source` values are a quoted absolute local directory or catalog-file path (for
 example, `"/srv/shared plugins/catalog.json"`), a GitHub `owner/repository`, or a public HTTPS Git or
 catalog URL, matching the selected source kind. Scope defaults to `user`; project and local scope require an
-explicit flag. Every mutation displays a bounded preview. Without `--yes`, a TTY then requires the
-literal response `yes`; `--yes` is advance consent and skips that prompt after the preview. A
-cancelled or unavailable confirmation commits nothing. `--declaration-only` permits the selected
-settings declaration to be written even when a higher-precedence value makes it ineffective; it does
-not override that value. User scope writes `settings.json` in the active Claude profile. Project
-scope writes the active checkout's `.claude/settings.json`; local scope writes the canonical main
-checkout's shared `.claude/settings.local.json`, including from a linked worktree. Imported Claude
-plugin records and Claude-owned, seed, or managed marketplace registrations remain inspectable and
-read-only; only exact PiCC-owned records and selected authentic declarations are mutated. Adding a
-same-name marketplace with different authority is refused rather than replacing it.
+explicit flag. Project/local local sources must be contained beneath the canonical main-checkout
+family and are stored relative to it; an external absolute local source is user-scope only. Every
+mutation displays a bounded preview. Planning an acquisition-capable standalone action may acquire
+and validate immutable candidate content for that review. Without `--yes`, a TTY then requires the
+literal response `yes`; `--yes` is advance consent and skips that prompt after the preview. Final
+confirmation governs durable desired-state and settings publication, so cancelled or unavailable
+confirmation publishes neither. `--declaration-only` permits the selected settings declaration to be
+written even when a higher-precedence value makes it ineffective; it does not override that value.
+User scope writes `settings.json` in the active Claude profile. Project scope writes the active
+checkout's `.claude/settings.json`; local scope writes the canonical main checkout's shared
+`.claude/settings.local.json`, including from a linked worktree. Imported Claude plugin records and
+Claude-owned, seed, or managed marketplace registrations remain inspectable and read-only; only
+exact PiCC-owned records and selected authentic declarations are mutated. Adding a same-name
+marketplace with different authority is refused rather than replacing it.
 
 Marketplace acquisition supports local directories/files, GitHub repositories, anonymous public
 HTTPS Git repositories, and public HTTPS catalog descriptors. Catalog plugins may use immutable
 relative content only from retained materialized local or Git-backed marketplace trees; a standalone
 HTTPS catalog descriptor cannot confer relative content authority. Remote HTTPS acquisition accepts
-only ports 443 and 8443. Other plugin sources are GitHub or anonymous public HTTPS Git repositories and subdirectories, public npm packages from
-`registry.npmjs.org` without lifecycle scripts, or public HTTPS ZIP archives. Private credentials,
-SSH, private-network destinations, custom npm registries, and enterprise distribution are unsupported. **Plugins are executable code:** inspect the preview's immutable revision/digests,
+only ports 443 and 8443. Other plugin sources are GitHub or anonymous public HTTPS Git repositories
+and subdirectories, public npm packages from `registry.npmjs.org` without lifecycle scripts, or
+public HTTPS ZIP archives. An accepted anonymous public HTTPS locator is credential-free canonical
+authority: lifecycle records, applicable settings, confirmation/recovery evidence, and receipts
+retain its complete path, subdirectory, and ref where exact recovery or audit requires them, while
+generic paths and refs remain opaque in previews and output. Do not put secrets in locator paths or
+refs. URL userinfo, query, fragment, request headers, ambient credentials, raw rejected input, and
+other credential material are prohibited and absent from persisted descriptors, diagnostics, logs,
+Pi transcripts, receipts, and user-facing failures. Private credentials,
+SSH, private-network destinations, custom npm registries, and enterprise distribution are
+unsupported. **Plugins are executable code:** inspect the preview's immutable revision/digests,
 components, dependencies, and trust target before confirming. Trust is bound to immutable acquired
 content; a mutable name or later marketplace refresh does not extend it.
 
 Installation, authentic `enabledPlugins` declaration, precedence-resolved effective state, immutable
-code, and optional plugin data are separate. Existing explicit effective enablement survives install
-and update; otherwise initial install uses marketplace `defaultEnabled`, then manifest
+code, and optional plugin data are separate. Effective declarations load from user settings, then
+each root-to-cwd project/local pair, then, for a reciprocally verified linked worktree, the canonical
+main checkout's shared `.claude/settings.local.json`, and finally managed policy; later declarations
+win per plugin identity. This interleaving can diverge from Claude's documented global
+`Local > Project > User` priority. Existing explicit effective enablement survives install and
+update; otherwise initial install uses marketplace `defaultEnabled`, then manifest
 `defaultEnabled`, then enabled by default. PiCC-owned lifecycle activation checks dependencies
 against already-installed effective plugins and can block activation when missing, incompatible,
 cyclic, ambiguous, or indeterminate; imported dependency metadata is observational. PiCC never
