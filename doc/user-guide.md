@@ -274,9 +274,9 @@ picc plugin list | details | install | enable | disable | update | uninstall
 picc plugin recover
 ```
 
-Marketplace `--source` values are a quoted local directory or catalog-file path (for example,
-`"../shared plugins/catalog.json"`), a GitHub `owner/repository`, or a public HTTPS Git or catalog
-URL, matching the selected source kind. Scope defaults to `user`; project and local scope require an
+Marketplace `--source` values are a quoted absolute local directory or catalog-file path (for
+example, `"/srv/shared plugins/catalog.json"`), a GitHub `owner/repository`, or a public HTTPS Git or
+catalog URL, matching the selected source kind. Scope defaults to `user`; project and local scope require an
 explicit flag. Every mutation displays a bounded preview. Without `--yes`, a TTY then requires the
 literal response `yes`; `--yes` is advance consent and skips that prompt after the preview. A
 cancelled or unavailable confirmation commits nothing. `--declaration-only` permits the selected
@@ -285,13 +285,14 @@ not override that value. User scope writes `settings.json` in the active Claude 
 scope writes the active checkout's `.claude/settings.json`; local scope writes the canonical main
 checkout's shared `.claude/settings.local.json`, including from a linked worktree. Imported Claude
 plugin records and Claude-owned, seed, or managed marketplace registrations remain inspectable and
-read-only; only exact PiCC-owned records and selected authentic declarations are mutated.
+read-only; only exact PiCC-owned records and selected authentic declarations are mutated. Adding a
+same-name marketplace with different authority is refused rather than replacing it.
 
 Marketplace acquisition supports local directories/files, GitHub repositories, anonymous public
 HTTPS Git repositories, and public HTTPS catalog descriptors. Catalog plugins may use immutable
 relative content only from retained materialized local or Git-backed marketplace trees; a standalone
-HTTPS catalog descriptor cannot confer relative content authority. Other plugin sources are GitHub
-or anonymous public HTTPS Git repositories and subdirectories, public npm packages from
+HTTPS catalog descriptor cannot confer relative content authority. Remote HTTPS acquisition accepts
+only ports 443 and 8443. Other plugin sources are GitHub or anonymous public HTTPS Git repositories and subdirectories, public npm packages from
 `registry.npmjs.org` without lifecycle scripts, or public HTTPS ZIP archives. Private credentials,
 SSH, private-network destinations, custom npm registries, and enterprise distribution are unsupported. **Plugins are executable code:** inspect the preview's immutable revision/digests,
 components, dependencies, and trust target before confirming. Trust is bound to immutable acquired
@@ -303,7 +304,9 @@ and update; otherwise initial install uses marketplace `defaultEnabled`, then ma
 `defaultEnabled`, then enabled by default. PiCC-owned lifecycle activation checks dependencies
 against already-installed effective plugins and can block activation when missing, incompatible,
 cyclic, ambiguous, or indeterminate; imported dependency metadata is observational. PiCC never
-acquires, updates, or enables dependencies automatically. Opening a project,
+acquires, updates, or enables dependencies automatically. Uninstalling with plugin-data removal
+logically retires the selected data into PiCC-owned quarantine; it does not provide secure erasure.
+Opening a project,
 viewing inventory, or encountering a missing declaration never acquires, installs, trusts, recovers,
 or executes new plugin content.
 
