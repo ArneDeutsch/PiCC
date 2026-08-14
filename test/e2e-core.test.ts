@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -14,6 +15,7 @@ import {
   createE2ELive,
   findSessionFiles,
   readJsonLines,
+  REPO_ROOT,
   systemText,
   toolResultText,
   TEST_TIMEOUT_MS,
@@ -23,6 +25,14 @@ import {
   CLI_PATH,
 } from "./helpers/e2e-live.js";
 import { createResponseGate } from "./helpers/mock-openai.js";
+import { createLifecycleLocations, pluginDataPath } from "../src/plugin-lifecycle/locations.js";
+import {
+  createPluginLifecycleFixture,
+  LIFECYCLE_BASE_ID,
+  LIFECYCLE_MARKETPLACE,
+  lifecycleSubprocessEnv,
+  type PluginLifecycleFixture,
+} from "./helpers/plugin-lifecycle-fixture.js";
 
 /**
  * E2E — core wiring: full Claude project context assembled into the real
@@ -30,7 +40,7 @@ import { createResponseGate } from "./helpers/mock-openai.js";
  * See test/helpers/e2e-live.ts for the shared runPi harness.
  */
 
-const { startPi, runPi, cleanup } = createE2ELive({ runtime: "compiled" });
+const { startPi, runPi, launchedProcessCount, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 const TOOL_ROW_PRESENTATION = /[○●✗■]|\u001b\[[0-?]*[ -/]*[@-~]/u;
@@ -158,9 +168,269 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const result = await runPi({ script: [], prompt: "/plugin install ignored" });
       expect(result.requests).toHaveLength(0);
       expect(result.stdout).toContain("Usage: /plugin list | /plugin details <plugin@marketplace>");
-      expect(result.stdout).toContain("Lifecycle changes are standalone: run `picc plugin --help` in a terminal");
+      expect(result.stdout).toContain("run `picc plugin --help` in a terminal for standalone commands");
       expect(result.stdout).toContain("No changes were made");
       expect(result.stdout).not.toContain("install ignored");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "drives the actual interactive plugin reload command through retention, adoption, terminal failure, and relaunch",
+    async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-real-plugin-lifecycle-"));
+      let lifecycle: PluginLifecycleFixture | undefined;
+      let durableMarketplaceSelector = "";
+      let repairedSettings = Buffer.alloc(0);
+      const canary = "PICC_CREDENTIAL_CANARY_T16";
+      const preloadCanary = path.join(root, "ambient-preload-canary");
+      const preloadScript = path.join(root, "ambient-preload-canary.cjs");
+      fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
+      let standaloneLaunches = 0;
+      const runStandalone = (args: string[]) => {
+        standaloneLaunches += 1;
+        if (lifecycle === undefined) throw new Error("lifecycle fixture is unavailable");
+        return spawnSync(process.execPath, [path.join(REPO_ROOT, "bin", "picc.mjs"), "plugin", ...args], {
+          cwd: lifecycle.project,
+          encoding: "utf8",
+          env: lifecycleSubprocessEnv({
+            HOME: lifecycle.homeDir,
+            USERPROFILE: lifecycle.homeDir,
+            PICC_CLAUDE_USER_DIR: lifecycle.userDir,
+            PI_OFFLINE: "1",
+          }),
+          timeout: 30_000,
+        });
+      };
+      const setup = (fixtureDir: string) => {
+        lifecycle = createPluginLifecycleFixture(fixtureDir, root);
+        const added = runStandalone([
+          "marketplace", "add", LIFECYCLE_MARKETPLACE, "--source", "local-directory",
+          path.join(fixtureDir, "lifecycle-marketplace"), "--scope", "user", "--yes",
+        ]);
+        expect(added.status, added.stderr).toBe(0);
+        const marketplaceSelector = /Selected marketplace scope\/selector: user; ([A-Za-z0-9_-]+)/u.exec(added.stdout)?.[1];
+        expect(marketplaceSelector).toBeDefined();
+        durableMarketplaceSelector = marketplaceSelector!;
+        const installed = runStandalone([
+          "install", LIFECYCLE_BASE_ID, "--marketplace-selector", marketplaceSelector!, "--scope", "user", "--yes",
+        ]);
+        expect(installed.status, installed.stderr).toBe(0);
+        const settingsPath = path.join(lifecycle.userDir, "settings.json");
+        const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { enabledPlugins?: Record<string, boolean> };
+        settings.enabledPlugins = { ...settings.enabledPlugins, [LIFECYCLE_BASE_ID]: true, "missing@full-surface-local": true };
+        fs.writeFileSync(settingsPath, JSON.stringify(settings));
+      };
+      const command = "/lifecycle-base:generation";
+      const launchesBefore = launchedProcessCount();
+      let originalPid = 0;
+      const assertTreeSecretFree = (scanRoot: string) => {
+        let regularFiles = 0;
+        const visit = (directory: string) => {
+          for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+            const filename = path.join(directory, entry.name);
+            const metadata = fs.lstatSync(filename);
+            if (metadata.isSymbolicLink()) continue;
+            if (metadata.isDirectory()) visit(filename);
+            else if (metadata.isFile()) {
+              regularFiles += 1;
+              if (regularFiles > 10_000 || metadata.size > 16 * 1024 * 1024) throw new Error(`secrecy scan bound exceeded at ${filename}`);
+              expect(fs.readFileSync(filename).includes(Buffer.from(canary))).toBe(false);
+            }
+          }
+        };
+        visit(scanRoot);
+      };
+      try {
+        const live = await startPi({
+          interactiveTerminal: true,
+          lifecycleIsolation: true,
+          persistSession: true,
+          prompt: "unused",
+          fixture: "full-surface",
+          setup,
+          extraEnv: {
+            PICC_CLAUDE_USER_DIR: path.join(root, "claude-profile"),
+            HOME: path.join(root, "home"),
+            USERPROFILE: path.join(root, "home"),
+            NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+          },
+          script: [
+            { text: "GENERATION_A_FIRST" },
+            { text: "GENERATION_A_RETAINED" },
+            { text: "GENERATION_B_RELOADED" },
+          ],
+        });
+        try {
+          live.sendInput(command);
+          const first = await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 1, 30_000);
+          await live.waitForText("GENERATION_A_FIRST", 30_000);
+          expect(first).toBeDefined();
+          const dataMatch = /DATA=([^\s]+)/u.exec(allText(first));
+          expect(dataMatch).toBeDefined();
+          const locations = createLifecycleLocations({
+            homeDir: lifecycle!.homeDir,
+            profilePath: lifecycle!.userDir,
+            platform: process.platform === "win32" ? "win32" : "posix",
+            project: { activeCheckoutPath: lifecycle!.project, checkoutFamilyPath: lifecycle!.project },
+          });
+          if (!locations.ok) throw new Error(locations.error.message);
+          const dataDir = pluginDataPath(locations.value, LIFECYCLE_BASE_ID);
+          fs.mkdirSync(dataDir, { recursive: true });
+          fs.writeFileSync(path.join(dataDir, "preserved.txt"), "preserved across immutable update\n");
+
+          const settingsPath = path.join(lifecycle!.userDir, "settings.json");
+          const requestCountBeforeDiagnosis = live.requests.length;
+          live.sendInput("/plugin details missing@full-surface-local");
+          await live.waitForText("missing@full-surface-local", 30_000);
+          await live.waitForText("enabled-but-uninstalled", 30_000);
+          await live.waitForText("/reload-plugins", 30_000);
+          await live.waitForText("PiCC session", 30_000);
+          expect(live.requests).toHaveLength(requestCountBeforeDiagnosis);
+          expect(live.capturedText()).not.toContain("picc plugin recover");
+          live.sendInput(`/reload-plugins ${canary}`);
+          await live.waitForText("Plugin reload preflight was rejected", 30_000);
+          const repaired = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { enabledPlugins: Record<string, boolean> };
+          delete repaired.enabledPlugins["missing@full-surface-local"];
+          fs.writeFileSync(settingsPath, JSON.stringify(repaired));
+          live.sendInput(command);
+          await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 2, 30_000);
+          await live.waitForText("GENERATION_A_RETAINED", 30_000);
+
+          lifecycle!.writeGeneration("2.0.0");
+          const marketplaceDetails = runStandalone(["marketplace", "details", LIFECYCLE_MARKETPLACE]);
+          expect(marketplaceDetails.status, `${marketplaceDetails.stdout}\n${marketplaceDetails.stderr}`).toBe(0);
+          const refreshed = runStandalone(["marketplace", "refresh", LIFECYCLE_MARKETPLACE, "--selector", durableMarketplaceSelector, "--yes"]);
+          expect(refreshed.status, refreshed.stderr).toBe(0);
+          const pluginDetails = runStandalone(["details", LIFECYCLE_BASE_ID]);
+          const pluginSelector = /selector=([A-Za-z0-9_-]+)/u.exec(pluginDetails.stdout)?.[1];
+          expect(pluginSelector).toBeDefined();
+          const updated = runStandalone([
+            "update", LIFECYCLE_BASE_ID, "--selector", pluginSelector!, "--marketplace-selector", durableMarketplaceSelector, "--yes",
+          ]);
+          expect(updated.status, updated.stderr).toBe(0);
+          expect(fs.readFileSync(path.join(dataDir, "preserved.txt"), "utf8")).toContain("preserved across immutable update");
+
+          const pidBeforeReload = live.pid;
+          originalPid = pidBeforeReload;
+          live.sendInput("/reload-plugins");
+          const reloadDeadline = Date.now() + 30_000;
+          while (true) {
+            const trace = fs.existsSync(lifecycle!.lifecycleTrace) ? fs.readFileSync(lifecycle!.lifecycleTrace, "utf8") : "";
+            if ((trace.match(/SessionStart/gu)?.length ?? 0) >= 2 && trace.includes("SessionEnd")) break;
+            if (Date.now() >= reloadDeadline) throw new Error(`Timed out waiting for real reload lifecycle; trace=${JSON.stringify(trace)} output=${JSON.stringify(live.capturedText())}`);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          expect(live.pid).toBe(pidBeforeReload);
+          await live.waitForText("Reloaded keybindings, extensions", 30_000);
+          live.sendInput(command);
+          await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
+          await live.waitForText("GENERATION_B_RELOADED", 30_000);
+          const successfulTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
+            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; reason: string | null; hookParentPid: number; hookChildPid: number });
+          expect(successfulTrace.slice(0, 3).map((record) => [record.hookEvent, record.source, record.reason])).toEqual([
+            ["SessionStart", "startup", null],
+            ["SessionEnd", null, "reload"],
+            ["SessionStart", "startup", null],
+          ]);
+          if (!successfulTrace.slice(0, 3).every((record) => record.hookParentPid === pidBeforeReload)) {
+            throw new Error(`hook Pi PID mismatch: expected ${pidBeforeReload}; trace=${JSON.stringify(successfulTrace)}`);
+          }
+          expect(fs.existsSync(lifecycle!.runtimeCanary)).toBe(false);
+          expect(fs.existsSync(preloadCanary)).toBe(false);
+
+          repairedSettings = fs.readFileSync(settingsPath);
+          fs.writeFileSync(lifecycle!.shutdownMutationGate, "fail replacement after shutdown");
+          const requestCountBeforeFailure = live.requests.length;
+          live.sendInput("/reload-plugins");
+          await live.waitForText("Activation is unconfirmed and this session cannot", 30_000);
+          const failed = await live.completion;
+          expect(failed.pid).toBe(pidBeforeReload);
+          expect(failed.forcedTermination).toBeNull();
+          expect(failed.code).not.toBeNull();
+          expect(failed.requests).toHaveLength(requestCountBeforeFailure);
+          const normalizedFailure = `${failed.stdout}\n${failed.stderr}`
+            .replace(/\u001b\][^\u0007]*\u0007/gu, "")
+            .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+            .replace(/\s/gu, "");
+          expect(normalizedFailure).toContain("Activationisunconfirmedandthissessioncannotcontinuesafely.StartanewPiCCsession.");
+          expect(`${failed.stdout}\n${failed.stderr}`).not.toMatch(/rollback|offline recovery/iu);
+          expect(`${failed.stdout}\n${failed.stderr}`).not.toContain(canary);
+          expect(JSON.stringify(failed.requests)).not.toContain(canary);
+          assertTreeSecretFree(failed.agentDir);
+          assertTreeSecretFree(failed.fixture);
+          assertTreeSecretFree(root);
+          const completedTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
+            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; reason: string | null; hookParentPid: number; hookChildPid: number });
+          expect(completedTrace.slice(0, 3)).toEqual(successfulTrace.slice(0, 3));
+          for (const record of completedTrace) {
+            expect(record.hookParentPid).toBe(pidBeforeReload);
+            expect(() => process.kill(record.hookChildPid, 0)).toThrow();
+          }
+        } finally {
+          live.closeInput();
+          await live.stop();
+        }
+
+        fs.rmSync(lifecycle!.shutdownMutationGate, { force: true });
+        fs.writeFileSync(path.join(lifecycle!.userDir, "settings.json"), repairedSettings);
+        const relaunchTraceBaseline = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u).length;
+        const relaunched = await startPi({
+          interactiveTerminal: true,
+          lifecycleIsolation: true,
+          persistSession: true,
+          prompt: "unused",
+          fixture: "full-surface",
+          setup(fixtureDir) {
+            fs.cpSync(path.join(lifecycle!.project, "lifecycle-marketplace"), path.join(fixtureDir, "lifecycle-marketplace"), { recursive: true });
+          },
+          extraEnv: {
+            PICC_CLAUDE_USER_DIR: lifecycle!.userDir,
+            HOME: lifecycle!.homeDir,
+            USERPROFILE: lifecycle!.homeDir,
+            NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+          },
+          script: [{ text: "GENERATION_B_RELAUNCHED" }],
+        });
+        try {
+          expect(relaunched.pid).not.toBe(originalPid);
+          relaunched.sendInput(command);
+          await relaunched.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
+          await relaunched.waitForText("GENERATION_B_RELAUNCHED", 30_000);
+          const relaunchTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
+            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; hookParentPid: number; hookChildPid: number });
+          expect(relaunchTrace.length).toBeGreaterThan(relaunchTraceBaseline);
+          expect(relaunchTrace.at(-1)).toMatchObject({ hookEvent: "SessionStart", source: "startup", hookParentPid: relaunched.pid });
+          const traceLengthBeforeQuit = relaunchTrace.length;
+          relaunched.sendInput("/quit");
+          relaunched.closeInput();
+          const result = await relaunched.completion;
+          expect(result.code, result.stderr).toBe(0);
+          expect(result.forcedTermination).toBeNull();
+          expect(result.pid).not.toBeUndefined();
+          expect(`${result.stdout}\n${result.stderr}`).not.toContain(canary);
+          expect(JSON.stringify(result.requests)).not.toContain(canary);
+          assertTreeSecretFree(result.agentDir);
+          assertTreeSecretFree(result.fixture);
+          assertTreeSecretFree(root);
+          expect(fs.existsSync(preloadCanary)).toBe(false);
+          const finalTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
+            .map((line) => JSON.parse(line) as { hookEvent: string; hookParentPid: number; hookChildPid: number });
+          expect(finalTrace.length).toBeGreaterThan(traceLengthBeforeQuit);
+          expect(finalTrace.at(-1)).toMatchObject({ hookEvent: "SessionEnd", hookParentPid: relaunched.pid });
+          for (const record of finalTrace) {
+            expect(() => process.kill(record.hookChildPid, 0)).toThrow();
+          }
+        } finally {
+          relaunched.closeInput();
+          await relaunched.stop();
+        }
+        expect(launchedProcessCount() - launchesBefore).toBe(2);
+        expect(standaloneLaunches).toBe(6);
+      } finally {
+        lifecycle?.cleanup();
+        fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      }
     },
     TEST_TIMEOUT_MS,
   );

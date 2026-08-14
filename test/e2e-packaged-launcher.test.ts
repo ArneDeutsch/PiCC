@@ -10,10 +10,20 @@ import { PI_SUITE_PACKAGES, discoverNpmCommand, validatePiSuite } from "../bin/p
 import {
   BASH_AVAILABLE,
   createE2ELive,
+  REPO_ROOT,
   TEST_TIMEOUT_MS,
   toolNames,
   toolResultText,
 } from "./helpers/e2e-live.js";
+import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import {
+  createPluginLifecycleFixture,
+  LIFECYCLE_BASE_ID,
+  LIFECYCLE_DEPENDENT_ID,
+  LIFECYCLE_DISABLED_ID,
+  LIFECYCLE_MARKETPLACE,
+  lifecycleSubprocessEnv,
+} from "./helpers/plugin-lifecycle-fixture.js";
 
 interface SourceManifest {
   name: string;
@@ -64,13 +74,17 @@ function treeSnapshot(root: string): string[] {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const filename = path.join(directory, entry.name);
       const relative = path.relative(root, filename).split(path.sep).join("/");
-      if (entry.isDirectory()) {
-        values.push(`${relative}/`);
+      const metadata = fs.lstatSync(filename);
+      const mode = (metadata.mode & 0o7777).toString(8);
+      if (metadata.isSymbolicLink()) {
+        values.push(`${relative}:link:${mode}:${fs.readlinkSync(filename)}`);
+      } else if (metadata.isDirectory()) {
+        values.push(`${relative}/:directory:${mode}`);
         visit(filename);
-      } else if (entry.isFile()) {
-        values.push(`${relative}:${fs.readFileSync(filename).toString("base64")}`);
+      } else if (metadata.isFile()) {
+        values.push(`${relative}:file:${mode}:${fs.readFileSync(filename).toString("base64")}`);
       } else {
-        values.push(`${relative}:other`);
+        values.push(`${relative}:other:${mode}`);
       }
     }
   };
@@ -221,144 +235,144 @@ afterAll(() => {
 }, 120_000);
 
 it(
-  "installed release tarball > runs the smallest packaged standalone plugin route without PiCC runtime startup",
+  "installed release tarball > commits a local lifecycle in an active linked worktree without runtime egress",
   async () => {
-    const root = temporaryDirectory("picc-packaged-inventory-");
-    const project = path.join(root, "project");
-    const userDir = path.join(root, "profile");
-    const pluginRoot = path.join(userDir, "plugins", "cache", "market", "hostile", "1.0.0");
-    const executionCanary = path.join(root, "executed");
-    const runtimeCanary = path.join(root, "runtime-executed");
-    const tsconfigCanary = path.join(root, "tsconfig-executed");
-    const cacheCanary = path.join(root, "jiti-cache");
-    const managedPolicyIsolation = path.join(root, "isolate-managed-policy.cjs");
-    fs.mkdirSync(path.join(project, ".git"), { recursive: true });
-    fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
-
-    let networkRequests = 0;
+    const project = materializeFixture("full-surface");
+    const root = temporaryDirectory("picc-packaged-lifecycle-");
+    const lifecycle = createPluginLifecycleFixture(project, root);
+    const fixtureSource = path.join(REPO_ROOT, "examples", "full-surface");
+    const fixtureBefore = treeSnapshot(fixtureSource);
+    const packageBefore = treeSnapshot(packageRoot);
+    const runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
+    const savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
+    const packagedRuntimeCanary = path.join(root, "packaged-runtime-canary");
+    const preloadCanary = path.join(root, "packaged-preload-canary");
+    const preloadScript = path.join(root, "packaged-preload-canary.cjs");
+    fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
+    let networkAttempts = 0;
+    let launches = 0;
     const server = http.createServer((_request, response) => {
-      networkRequests += 1;
+      networkAttempts += 1;
       response.writeHead(500).end();
     });
-    let runtimeEntrypoint: string | undefined;
-    let savedRuntimeEntrypoint: Buffer | undefined;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
-    try {
-      const address = server.address();
-      if (address === null || typeof address === "string") throw new Error("network canary did not bind");
-
-      const writeJson = (filename: string, value: unknown) => {
-        fs.mkdirSync(path.dirname(filename), { recursive: true });
-        fs.writeFileSync(filename, JSON.stringify(value));
-      };
-    writeJson(path.join(userDir, "settings.json"), {
-      enabledPlugins: { "hostile@market": true },
-      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'settings-hook')`] }] }] },
-    });
-    writeJson(path.join(userDir, "plugins", "installed_plugins.json"), {
-      version: 2,
-      plugins: { "hostile@market": [{ scope: "user", installPath: pluginRoot, version: "1.0.0" }] },
-    });
-    writeJson(path.join(userDir, "plugins", "known_marketplaces.json"), {
-      market: { source: { source: "url", url: `http://127.0.0.1:${address.port}/must-not-fetch` } },
-    });
-    writeJson(path.join(pluginRoot, ".claude-plugin", "plugin.json"), {
-      name: "hostile",
-      hooks: { SessionStart: [{ hooks: [{ type: "command", command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'plugin-hook')`] }] }] },
-      mcpServers: { canary: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(executionCanary)},'mcp')`] } },
-    });
-    fs.writeFileSync(path.join(project, "redirect-yaml.ts"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(tsconfigCanary)}, "executed"); export const parse = () => ({});\n`);
-    writeJson(path.join(project, "tsconfig.json"), {
-      compilerOptions: { baseUrl: ".", paths: { yaml: ["./redirect-yaml.ts"] } },
-    });
-
-    const installedManifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as {
-      dependencies: Record<string, string>;
-    };
-    assertSameStringMap(
-      installedManifest.dependencies,
-      sourceManifest.dependencies,
-      "installed tarball dependencies",
-    );
-    expect(installedManifest.dependencies).not.toHaveProperty("jiti");
-    expect(sourceManifest.devDependencies.jiti).toBe("2.7.0");
-    const installedNodeModules = path.dirname(path.dirname(packageRoot));
-    expect(fs.existsSync(path.join(installedNodeModules, "tsx"))).toBe(false);
-    expect(fs.existsSync(path.join(installedNodeModules, "esbuild"))).toBe(false);
-
-    fs.writeFileSync(managedPolicyIsolation, `
-const fs = require("node:fs");
-const denied = value => typeof value === "string" && value.toLowerCase().startsWith("c:\\\\program files\\\\claudecode");
-const missing = value => Object.assign(new Error("test-isolated managed policy"), { code: "ENOENT", path: value });
-for (const name of ["statSync", "readFileSync", "readdirSync"]) {
-  const original = fs[name];
-  fs[name] = function(value, ...rest) { if (denied(value)) throw missing(value); return original.call(this, value, ...rest); };
-}
-require("node:module").syncBuiltinESMExports();
-`);
-    const beforeProject = treeSnapshot(project);
-    const beforeProfile = treeSnapshot(userDir);
-    const run = (args: string[]) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("network canary did not bind");
+    const networkDescriptor = `http://127.0.0.1:${address.port}/must-not-fetch`;
+    const run = (args: string[]) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      launches += 1;
       execFile(process.execPath, [launcher, "plugin", ...args], {
-        cwd: project,
-        env: {
-          ...process.env,
-          JITI_FS_CACHE: cacheCanary,
-          PICC_CLAUDE_USER_DIR: userDir,
-          ...(process.platform === "win32"
-            ? { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(managedPolicyIsolation)}`.trim() }
-            : {}),
-        },
+        cwd: lifecycle.worktree,
         encoding: "utf8",
+        env: lifecycleSubprocessEnv({
+          HOME: lifecycle.homeDir,
+          USERPROFILE: lifecycle.homeDir,
+          PICC_CLAUDE_USER_DIR: lifecycle.userDir,
+          PI_OFFLINE: "1",
+          NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+        }),
         timeout: 30_000,
       }, (error, stdout, stderr) => {
-        if (error && error.code === undefined) return reject(error);
-        resolve({ code: error ? Number(error.code) : 0, stdout, stderr });
+        if (error && typeof error.code !== "number") {
+          reject(error);
+          return;
+        }
+        resolve({ status: error && typeof error.code === "number" ? error.code : 0, stdout, stderr });
       });
     });
+    try {
+      fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(packagedRuntimeCanary)}, "executed"); export default function canary() {}\n`);
+      const added = await run([
+        "marketplace", "add", LIFECYCLE_MARKETPLACE,
+        "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"),
+        "--scope", "local", "--yes",
+      ]);
+      expect(added.status, added.stderr).toBe(0);
+      expect(added.stdout).toContain("Marketplace state changed");
+      const marketplaceSelector = /Selected marketplace scope\/selector: local; ([A-Za-z0-9_-]+)/u.exec(added.stdout)?.[1];
+      expect(marketplaceSelector).toBeDefined();
 
-      runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
-      savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
-      fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(runtimeCanary)}, "executed"); export default function canary() {}\n`);
+      const install = (identity: string) => run([
+        "install", identity, "--marketplace-selector", marketplaceSelector!, "--scope", "local", "--yes",
+      ]);
+      const base = await install(LIFECYCLE_BASE_ID);
+      expect(base.status, base.stderr).toBe(0);
+      expect(base.stdout).toContain("Target scope/record selector: local;");
+      const disabled = await install(LIFECYCLE_DISABLED_ID);
+      expect(disabled.status, disabled.stderr).toBe(0);
+      const dependent = await install(LIFECYCLE_DEPENDENT_ID);
+      expect(dependent.status, dependent.stderr).toBe(0);
+      expect(base.stdout).toContain("Default/enablement: enabled=true");
+      expect(disabled.stdout).toContain("Default/enablement: enabled=false");
+      expect(dependent.stdout).toContain("Dependencies:");
+
+      lifecycle.seedImportedCoexistence();
+      const importedRecord = path.join(lifecycle.userDir, "plugins", "installed_plugins.json");
+      const importedCache = path.join(lifecycle.userDir, "plugins", "cache");
+      const importedRecordBefore = fs.readFileSync(importedRecord);
+      const importedTreeBefore = treeSnapshot(importedCache);
+      fs.writeFileSync(path.join(lifecycle.userDir, "plugins", "known_marketplaces.json"), JSON.stringify({
+        foreign: { source: { source: "url", url: networkDescriptor } },
+      }));
       const list = await run(["list"]);
-      expect(list).toMatchObject({
-        code: 0,
-        stderr: "",
+      expect(list.status).toBe(0);
+      expect(list.stderr).toBe("");
+      const pluginBlocks = list.stdout.split(/^Plugin: /mu).slice(1).map((section) => {
+        const [identity = "", ...body] = section.split(/\r?\n/u);
+        return { identity, body: body.join("\n") };
       });
-      expect(list.stdout).toBe([
-        "Plugin inventory (read-only)",
-        "Snapshot: captured for this command; rerun this command to refresh",
-        "Loaded generation: not identified",
-        "Durable desired generation: not identified",
-        "Plugin: hostile@market",
-        "  installed: 1 valid",
-        "  enabled: yes",
-        "  runtime: loaded",
-        "  lifecycle: owner=claude-imported-readonly; desired-installed=yes; declared=yes; effective=yes; loaded=yes; reload=not pending",
-        "  catalog: not known",
-        "Scoped candidate: hostile@market; scope=user; owner=claude-imported-readonly; read-only; selector=eyJwbHVnaW5JZCI6Imhvc3RpbGVAbWFya2V0Iiwib3duZXIiOiJjbGF1ZGUtaW1wb3J0ZWQtcmVhZG9ubHkiLCJzY29wZSI6InVzZXIifQ",
-        "",
-      ].join("\n"));
+      const baseBlocks = pluginBlocks.filter((block) => block.identity === LIFECYCLE_BASE_ID);
+      expect(baseBlocks).toHaveLength(1);
+      expect(baseBlocks[0]!.body).toContain("owner=picc-owned");
+      const foreignBlocks = pluginBlocks.filter((block) => block.identity === "imported-visible@foreign");
+      expect(foreignBlocks).toHaveLength(1);
+      expect(foreignBlocks[0]!.body).toContain("owner=claude-imported-readonly");
+      expect(list.stdout).toContain(`Scoped candidate: ${LIFECYCLE_BASE_ID}; scope=user; owner=claude-imported-readonly; read-only`);
+      expect(list.stdout).not.toContain(`Plugin: ${LIFECYCLE_BASE_ID}\n  installed: 2`);
+      expect(fs.readFileSync(importedRecord)).toEqual(importedRecordBefore);
+      expect(treeSnapshot(importedCache)).toEqual(importedTreeBefore);
+      expect(importedRecordBefore.toString("utf8")).not.toMatch(/installedAt|lastUpdated|updatedAt/u);
 
+      const operationId = /Operation ID: (plugin_[A-Za-z0-9_-]+)/u.exec(base.stdout)?.[1];
+      expect(operationId).toBeDefined();
+      const receipt = await run(["recover", operationId!]);
+      expect(receipt.status).toBe(0);
+      expect(receipt.stderr).toBe("");
+      expect(receipt.stdout).toContain(`Operation ID: ${operationId}`);
+      expect(receipt.stdout).toContain("Outcome: committed");
+      expect(fs.readFileSync(importedRecord)).toEqual(importedRecordBefore);
+      expect(treeSnapshot(importedCache)).toEqual(importedTreeBefore);
 
-      expect(networkRequests).toBe(0);
-      expect(fs.existsSync(executionCanary)).toBe(false);
-      expect(fs.existsSync(runtimeCanary)).toBe(false);
-      expect(fs.existsSync(tsconfigCanary)).toBe(false);
-      expect(fs.existsSync(cacheCanary)).toBe(false);
-      expect(fs.existsSync(path.join(packageRoot, "node_modules", ".cache", "jiti"))).toBe(false);
-      expect(fs.existsSync(path.join(userDir, "plugins", "data"))).toBe(false);
-      expect(fs.existsSync(path.join(project, ".claude", ".picc"))).toBe(false);
-      expect(fs.existsSync(path.join(project, ".git", "info", "exclude"))).toBe(false);
-      expect(treeSnapshot(project)).toEqual(beforeProject);
-      expect(treeSnapshot(userDir)).toEqual(beforeProfile);
+      const localSettings = path.join(project, ".claude", "settings.local.json");
+      expect(JSON.parse(fs.readFileSync(localSettings, "utf8"))).toMatchObject({ enabledPlugins: {
+        [LIFECYCLE_BASE_ID]: true,
+        [LIFECYCLE_DISABLED_ID]: false,
+        [LIFECYCLE_DEPENDENT_ID]: true,
+      } });
+      expect(fs.existsSync(path.join(lifecycle.worktree, ".claude", "settings.local.json"))).toBe(false);
+      expect(networkDescriptor).toContain("127.0.0.1");
+      expect(fs.existsSync(lifecycle.lifecycleTrace)).toBe(false);
+      expect(fs.existsSync(lifecycle.runtimeCanary)).toBe(false);
+      expect(fs.existsSync(packagedRuntimeCanary)).toBe(false);
+      expect(fs.existsSync(preloadCanary)).toBe(false);
     } finally {
-      if (runtimeEntrypoint !== undefined && savedRuntimeEntrypoint !== undefined) fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint);
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      const cleanupErrors: unknown[] = [];
+      const cleanupStep = async (step: () => void | Promise<void>) => {
+        try { await step(); } catch (error) { cleanupErrors.push(error); }
+      };
+      await cleanupStep(() => fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint));
+      await cleanupStep(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+      await cleanupStep(() => lifecycle.cleanup());
+      await cleanupStep(() => cleanupFixture(project));
+      if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "packaged lifecycle cleanup failed");
     }
+    expect(networkAttempts).toBe(0);
+    expect(treeSnapshot(packageRoot)).toEqual(packageBefore);
+    expect(treeSnapshot(fixtureSource)).toEqual(fixtureBefore);
+    expect(launches).toBe(6);
   },
   TEST_TIMEOUT_MS,
 );

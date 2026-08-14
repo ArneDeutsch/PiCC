@@ -178,6 +178,51 @@ import {
   writeReloadHandoff,
 } from "./plugin-lifecycle/reload-handoff.js";
 
+type ActiveReplacementShutdown = () => void | Promise<void>;
+interface ActiveReplacementShutdownRegistry {
+  eligibleNonce?: string;
+  pending?: { nonce: string; shutdown: ActiveReplacementShutdown };
+}
+const ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL = Symbol.for("@arnedeutsch/picc.active-replacement-shutdown.v1");
+
+function activeReplacementShutdownRegistry(): ActiveReplacementShutdownRegistry {
+  const host = globalThis as typeof globalThis & Record<symbol, unknown>;
+  const existing = host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL];
+  if (typeof existing === "object" && existing !== null) return existing as ActiveReplacementShutdownRegistry;
+  const created: ActiveReplacementShutdownRegistry = Object.seal({ eligibleNonce: undefined, pending: undefined });
+  host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL] = created;
+  return created;
+}
+
+function beginActiveReplacementShutdown(nonce: string): void {
+  const registry = activeReplacementShutdownRegistry();
+  registry.eligibleNonce = nonce;
+  registry.pending = undefined;
+}
+
+function storeActiveReplacementShutdown(nonce: string, shutdown: ActiveReplacementShutdown): boolean {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce || registry.pending !== undefined) return false;
+  registry.pending = { nonce, shutdown };
+  return true;
+}
+
+function consumeActiveReplacementShutdown(nonce: string): ActiveReplacementShutdown | undefined {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce) return undefined;
+  const pending = registry.pending?.nonce === nonce ? registry.pending.shutdown : undefined;
+  registry.eligibleNonce = undefined;
+  registry.pending = undefined;
+  return pending;
+}
+
+function clearActiveReplacementShutdown(nonce: string): void {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce) return;
+  registry.eligibleNonce = undefined;
+  registry.pending = undefined;
+}
+
 /**
  * PiCC — the Pi extension entry.
  *
@@ -810,16 +855,29 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       : {}),
   };
   const loadProject = testSeam?.loadProject ?? loadClaudeProject;
+  const armedReloadNonce = armedReloadAttemptNonce();
+  const rejectArmedReplacement = (resolveAttempt = true): void => {
+    if (armedReloadNonce === undefined) return;
+    let handled = false;
+    pi.on("session_start", (event: { reason?: string }, ctx: { shutdown?: () => void | Promise<void> }) => {
+      if (handled || event.reason !== "reload") return;
+      handled = true;
+      const shutdown = ctx?.shutdown;
+      if (typeof shutdown === "function") {
+        storeActiveReplacementShutdown(armedReloadNonce, () => shutdown.call(ctx));
+      }
+    });
+    if (resolveAttempt) resolveReloadAttempt(armedReloadNonce, "rejected");
+  };
   let project: LoadedProject;
   try {
     project = loadProject(projectLoadOptions);
   } catch (err) {
-    // Completeness floor: a broken project must never crash the harness. An armed
-    // replacement fault stays unresolved so the old frame records operational failure.
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
+    // Leave assembly failure unresolved so the outgoing reload owner records operational failure.
+    rejectArmedReplacement(false);
     return;
   }
-  const armedReloadNonce = armedReloadAttemptNonce();
   let reloadAcceptanceNonce: string | undefined;
   if (project.reloadCandidate.status === "ready") {
     const observed = readReloadHandoff(project.reloadCandidate.handoffPath);
@@ -833,13 +891,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (record?.outcome === "pending") {
           recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, record, "input-mismatch");
         }
-        resolveReloadAttempt(armedReloadNonce, "rejected");
+        rejectArmedReplacement();
         return;
       }
       const cleared = clearReloadHandoff(project.reloadCandidate.handoffPath);
       if (!cleared.ok) {
         recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, record, "input-mismatch");
-        resolveReloadAttempt(armedReloadNonce, "rejected");
+        rejectArmedReplacement();
         return;
       }
       reloadAcceptanceNonce = armedReloadNonce;
@@ -853,7 +911,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, observed.value, "input-mismatch");
       }
     }
-    resolveReloadAttempt(armedReloadNonce, "rejected");
+    rejectArmedReplacement();
     return;
   } else if (project.reloadCandidate.handoffPath !== undefined) {
     const observed = readReloadHandoff(project.reloadCandidate.handoffPath);
@@ -866,6 +924,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Pi's earliest replacement-start event, not extension-factory entry.
   pi.on("session_start", (event: { reason?: string }) => {
     if (event.reason === "reload" && reloadAcceptanceNonce !== undefined) {
+      clearActiveReplacementShutdown(reloadAcceptanceNonce);
       resolveReloadAttempt(reloadAcceptanceNonce, "accepted");
       reloadAcceptanceNonce = undefined;
     }
@@ -5552,17 +5611,31 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     const nonce = reserved.value;
+    beginActiveReplacementShutdown(nonce);
     const written = writeReloadHandoff(handoffPath, candidate.reloadCandidate.binding, nonce);
     if (!written.ok) {
       consumeReloadAttempt(nonce);
+      clearActiveReplacementShutdown(nonce);
       await appendControlOutput("reload-plugins", PLUGIN_RELOAD_HANDOFF_WRITE_FAILED, ctx);
       return;
     }
     const handoffRecord = written.value;
     try { await ctx.reload(); } catch { /* Pi may throw instead of returning its operational failure. */ }
     const outcome = consumeReloadAttempt(nonce);
-    if (outcome === "accepted") return;
-    if (outcome !== "rejected") {
+    if (outcome === "accepted") {
+      clearActiveReplacementShutdown(nonce);
+      return;
+    }
+    if (outcome === "rejected") {
+      const shutdown = consumeActiveReplacementShutdown(nonce);
+      if (shutdown !== undefined) {
+        setTimeout(() => {
+          try { void Promise.resolve(shutdown()).catch(() => undefined); }
+          catch { /* Activation failure remains authoritative. */ }
+        }, 0);
+      }
+    } else {
+      clearActiveReplacementShutdown(nonce);
       recordReloadHandoffOutcome(handoffPath, handoffRecord, "operational-failure");
     }
     throw new Error(RELOAD_ACTIVATION_UNCONFIRMED);

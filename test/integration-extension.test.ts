@@ -2754,7 +2754,8 @@ describe("plugin reload handoff wiring", () => {
     expect(replacement?.commands.size).toBe(0);
     expect(replacement?.tools.size).toBe(0);
     expect(replacement?.activeTools.size).toBe(0);
-    expect(replacement?.handlers.size).toBe(0);
+    expect([...replacement?.handlers.keys() ?? []]).toEqual(["session_start"]);
+    expect(replacement?.handlers.get("session_start")).toHaveLength(1);
     expect(replacement?.shortcuts.size).toBe(0);
     expect(replacement?.providerRegistrations).toEqual([]);
     expect(replacement?.entryRenderers.size).toBe(0);
@@ -2812,9 +2813,11 @@ describe("plugin reload handoff wiring", () => {
   it("runs one terminal TUI reload and accepts one exact reason-reload reconstruction", async () => {
     await withReloadProject(async (fixture, userDir, owner) => {
       let reloads = 0;
+      let outgoingShutdowns = 0;
+      let replacementShutdowns = 0;
       let stale = false;
       let replacement: FakePi | undefined;
-      const base = owner.tuiCtx();
+      const base = owner.tuiCtx({ shutdown: async () => { outgoingShutdowns += 1; } });
       const context = new Proxy(base, {
         get(target, property, receiver) {
           if (stale && property !== "reload") throw new Error(`stale-context-use:${String(property)}`);
@@ -2824,7 +2827,9 @@ describe("plugin reload handoff wiring", () => {
             picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
             await replacement.waitForInitialization();
             stale = true;
-            await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx());
+            await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx({
+              shutdown: async () => { replacementShutdowns += 1; },
+            }));
           };
           return Reflect.get(target, property, receiver);
         },
@@ -2832,6 +2837,8 @@ describe("plugin reload handoff wiring", () => {
 
       await owner.commands.get("reload-plugins").handler("IGNORED-SECRET", context);
       expect(reloads).toBe(1);
+      expect(outgoingShutdowns).toBe(0);
+      expect(replacementShutdowns).toBe(0);
       expect(replacement?.commands.has("reload-plugins")).toBe(true);
       expect(replacement?.tools.has("Skill")).toBe(true);
       if (replacement === undefined) throw new Error("replacement was not constructed");
@@ -2917,7 +2924,7 @@ describe("plugin reload handoff wiring", () => {
     let loadCalls = 0;
     const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
       loadCalls += 1;
-      if (loadCalls === 4) throw new Error("replacement assembly failed");
+      if (loadCalls === 4 || loadCalls === 5) throw new Error("replacement assembly failed");
       return loadClaudeProject(options);
     };
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -2926,7 +2933,10 @@ describe("plugin reload handoff wiring", () => {
         const candidate = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
         if (candidate.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
         let replacement: FakePi | undefined;
+        let trailingReplacement: FakePi | undefined;
         let stale = false;
+        let replacementShutdowns = 0;
+        let trailingReplacementShutdowns = 0;
         const base = owner.tuiCtx();
         const context = new Proxy(base, {
           get(target, property, receiver) {
@@ -2934,6 +2944,8 @@ describe("plugin reload handoff wiring", () => {
             if (property === "reload") return async () => {
               replacement = fakePi();
               picc(replacement.api as never, { loadProject, onInitializationSettled: replacement.captureInitialization });
+              trailingReplacement = fakePi();
+              picc(trailingReplacement.api as never, { loadProject, onInitializationSettled: trailingReplacement.captureInitialization });
               stale = true;
             };
             return Reflect.get(target, property, receiver);
@@ -2943,10 +2955,40 @@ describe("plugin reload handoff wiring", () => {
         const failure = owner.commands.get("reload-plugins").handler("", context);
         await expect(failure).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
         await failure.catch((error: Error) => expect(error.message).toBe(RELOAD_ACTIVATION_UNCONFIRMED));
-        expect(loadCalls).toBe(4);
+        expect(loadCalls).toBe(5);
+        expect(replacementShutdowns).toBe(0);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(replacementShutdowns).toBe(0);
         const handoff = readReloadHandoff(candidate.reloadCandidate.handoffPath);
         expect(handoff.ok && handoff.value?.outcome).toBe("operational-failure");
         expectNoPublication(replacement);
+
+        let nextReplacement: FakePi | undefined;
+        let nextReplacementShutdowns = 0;
+        const nextFailure = owner.commands.get("reload-plugins").handler("", owner.tuiCtx({
+          reload: async () => {
+            fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "next-attempt@market": true } }));
+            await replacement!.fire("session_start", { reason: "reload" }, replacement!.tuiCtx({
+              shutdown: async () => { replacementShutdowns += 1; },
+            }));
+            nextReplacement = fakePi();
+            picc(nextReplacement.api as never, { loadProject, onInitializationSettled: nextReplacement.captureInitialization });
+            await nextReplacement.fire("session_start", { reason: "reload" }, nextReplacement.tuiCtx({
+              shutdown: async () => { nextReplacementShutdowns += 1; },
+            }));
+            await trailingReplacement!.fire("session_start", { reason: "reload" }, trailingReplacement!.tuiCtx({
+              shutdown: async () => { trailingReplacementShutdowns += 1; },
+            }));
+          },
+        }));
+        await expect(nextFailure).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+        expect(replacementShutdowns).toBe(0);
+        expect(nextReplacementShutdowns).toBe(0);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(replacementShutdowns).toBe(0);
+        expect(nextReplacementShutdowns).toBe(1);
+        expect(trailingReplacementShutdowns).toBe(0);
+        expectNoPublication(nextReplacement);
       }, undefined, { loadProject });
     } finally {
       consoleError.mockRestore();
@@ -2959,17 +3001,28 @@ describe("plugin reload handoff wiring", () => {
       const before = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
       if (before.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
       const handoffPath = before.reloadCandidate.handoffPath;
+      let replacementShutdowns = 0;
       const context = owner.tuiCtx({
         reload: async () => {
           fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "changed@market": true } }));
           replacement = fakePi();
           picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
-          // Real Pi would later swallow session_start handler errors. Authorization
-          // has already rejected this factory before any handler can exist.
-          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx()).catch(() => undefined);
+          await replacement.fire("session_start", { reason: "startup" }, replacement.tuiCtx({
+            shutdown: async () => { replacementShutdowns += 1; },
+          }));
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx({
+            shutdown: async () => { replacementShutdowns += 1; },
+          }));
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx({
+            shutdown: async () => { replacementShutdowns += 10; },
+          }));
         },
       });
-      await expect(owner.commands.get("reload-plugins").handler("", context)).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      const failure = owner.commands.get("reload-plugins").handler("", context);
+      await expect(failure).rejects.toThrow(RELOAD_ACTIVATION_UNCONFIRMED);
+      expect(replacementShutdowns).toBe(0);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(replacementShutdowns).toBe(1);
       const handoff = readReloadHandoff(handoffPath);
       expect(handoff.ok && handoff.value?.outcome).toBe("input-mismatch");
       expectNoPublication(replacement);
@@ -3086,8 +3139,9 @@ describe("plugin reload handoff wiring", () => {
       const candidate = loadClaudeProject({ cwd: process.cwd(), userDir, homeDir: os.homedir() });
       if (candidate.reloadCandidate.status !== "ready") throw new Error("reload candidate unavailable");
       let stale = false;
+      let outgoingShutdowns = 0;
       let replacement: FakePi | undefined;
-      const context = new Proxy(owner.tuiCtx(), {
+      const context = new Proxy(owner.tuiCtx({ shutdown: async () => { outgoingShutdowns += 1; } }), {
         get(target, property, receiver) {
           if (stale && property !== "reload") throw new Error(`stale-context-use:${String(property)}`);
           if (property === "reload") return async () => {
@@ -3105,6 +3159,7 @@ describe("plugin reload handoff wiring", () => {
         expect(error.message).toBe(RELOAD_ACTIVATION_UNCONFIRMED);
         expect(error.message).not.toMatch(/recover|rollback|success/iu);
       });
+      expect(outgoingShutdowns).toBe(0);
       expect(replacement?.commands.has("reload-plugins")).toBe(true);
       expect(replacement?.tools.has("Skill")).toBe(true);
       const handoff = readReloadHandoff(candidate.reloadCandidate.handoffPath);
