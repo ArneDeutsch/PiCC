@@ -239,11 +239,7 @@ fails closed; no affected plugin content, catalog copy, or stale-cache copy is s
 installed state is authorization evidence, not a publisher-authenticity guarantee or an OS sandbox.
 Use `/doctor` for the bounded reason.
 
-PiCC's realized enablement order is directory-interleaved: user first; then, from the project root
-toward the current directory, each directory's project settings followed by local settings; managed
-policy last. A nested project's value can therefore override an ancestor's local value, unlike
-Claude Code's documented global local-over-project order. Later values replace only the same
-qualified identity. Managed policy is read from the platform system `managed-settings.json`, then
+Managed policy is read from the platform system `managed-settings.json`, then
 JSON drop-ins in `managed-settings.d` by filename. The system file is
 `C:\Program Files\ClaudeCode\managed-settings.json` on Windows,
 `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, and
