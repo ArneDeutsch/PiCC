@@ -12,7 +12,7 @@ import { materializePluginTree, validatePluginTree } from "../src/plugin-lifecyc
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))); });
-async function home(): Promise<string> { const value = await fs.mkdtemp(path.join(os.tmpdir(), "picc-store-")); roots.push(value); if (process.platform !== "win32") await fs.chmod(value, 0o700); return value; }
+async function home(): Promise<string> { const value = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "picc-store-"))); roots.push(value); if (process.platform !== "win32") await fs.chmod(value, 0o700); return value; }
 async function fixture(base?: string, profile = "profile-a"): Promise<OwnedStateStore> {
   base ??= await home();
   const locations = createLifecycleLocations({ homeDir: base, profilePath: path.join(base, profile), platform: process.platform === "win32" ? "win32" : "posix" });

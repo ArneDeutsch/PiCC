@@ -36,7 +36,7 @@ afterEach(async () => {
 });
 
 async function store(): Promise<OwnedStateStore> {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "picc-git-acquire-")); roots.push(home);
+  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "picc-git-acquire-"))); roots.push(home);
   if (process.platform !== "win32") await fs.chmod(home, 0o700);
   const locations = createLifecycleLocations({ homeDir: home, profilePath: path.join(home, "profile"), platform: process.platform === "win32" ? "win32" : "posix" });
   if (!locations.ok) throw new Error(locations.error.message);

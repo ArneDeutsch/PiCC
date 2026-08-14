@@ -69,7 +69,7 @@ async function materializePluginTree(plan: ValidatedPluginTree, parent: string) 
 
 const temporaryRoots = new Set<string>();
 function privateParent(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-tree-"));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugin-tree-")));
   fs.chmodSync(root, 0o700);
   temporaryRoots.add(root);
   return root;

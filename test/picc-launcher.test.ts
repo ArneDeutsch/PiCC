@@ -36,7 +36,7 @@ const sourcePluginStderr = `${sourceFallbackNotice}\n`;
 const tempDirs: string[] = [];
 
 function temp(prefix: string): string {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   tempDirs.push(directory);
   return directory;
 }

@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 async function store(): Promise<OwnedStateStore> {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "picc-npm-acquire-"));
+  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "picc-npm-acquire-")));
   roots.push(home);
   if (process.platform !== "win32") await fs.chmod(home, 0o700);
   const locations = createLifecycleLocations({

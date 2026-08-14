@@ -166,7 +166,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "drives the actual interactive plugin lifecycle through secrecy, retention, adoption, terminal failure, and relaunch",
     async () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-real-plugin-lifecycle-"));
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-real-plugin-lifecycle-")));
       let lifecycle: PluginLifecycleFixture | undefined;
       let durableMarketplaceSelector = "";
       let repairedSettings = Buffer.alloc(0);
