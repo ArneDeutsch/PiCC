@@ -386,11 +386,17 @@ export function createE2ELive({
       const terminalShim = path.join(agentDir, "interactive-terminal.cjs");
       if (opts.interactiveTerminal) {
         fs.writeFileSync(terminalShim, [
+          'const path=require("node:path");',
+          `const direct=process.argv[1]!==undefined&&path.resolve(process.argv[1])===${JSON.stringify(path.resolve(CLI_PATH))};`,
+          'const launcherChild=process.env.PICC_LAUNCHER_PID!==undefined&&process.env.PICC_E2E_PI_PID===undefined;',
+          'if(direct||launcherChild){',
           'Object.defineProperty(process.stdin,"isTTY",{value:true});',
           'Object.defineProperty(process.stdout,"isTTY",{value:true});',
           'Object.defineProperty(process.stderr,"isTTY",{value:true});',
           'process.stdin.setRawMode=()=>process.stdin;',
           'process.stdout.columns=120; process.stdout.rows=200;',
+          'process.env.PICC_E2E_PI_PID=String(process.pid);',
+          '}',
         ].join("\n"));
       }
       const inheritedEnv = { ...process.env };

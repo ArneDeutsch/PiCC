@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -45,6 +45,104 @@ const { startPi, runPi, launchedProcessCount, cleanup } = createE2ELive({ runtim
 afterEach(cleanup);
 
 const TOOL_ROW_PRESENTATION = /[○●✗■]|\u001b\[[0-?]*[ -/]*[@-~]/u;
+
+interface LifecycleHookTraceRecord {
+  readonly event: string | null;
+  readonly source: string | null;
+  readonly reason: string | null;
+  readonly hookRunId: string | null;
+  readonly hookPiPid: number | null;
+  readonly hookChildPid: number;
+}
+
+function readBoundedLifecycleHookTrace(filename: string): { readonly text: string; readonly bytes: number } {
+  const limit = 64 * 1024;
+  const buffer = Buffer.allocUnsafe(limit + 1);
+  const fd = fs.openSync(filename, "r");
+  let bytes = 0;
+  try {
+    while (bytes < buffer.byteLength) {
+      const read = fs.readSync(fd, buffer, bytes, buffer.byteLength - bytes, null);
+      if (read === 0) break;
+      bytes += read;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (bytes > limit) {
+    throw new Error(`Lifecycle trace file byte count ${bytes}: limit exceeded`);
+  }
+  return { text: buffer.toString("utf8", 0, bytes), bytes };
+}
+
+function readLifecycleHookTrace(
+  filename: string,
+  mode: "complete" | "polling" = "complete",
+): LifecycleHookTraceRecord[] {
+  const trace = readBoundedLifecycleHookTrace(filename);
+  const text = mode === "polling" && !trace.text.endsWith("\n")
+    ? trace.text.slice(0, trace.text.lastIndexOf("\n") + 1)
+    : trace.text;
+  const lines = text.split(/\r?\n/u);
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.some((line) => line.length === 0)) {
+    throw new Error("Lifecycle trace contains an empty completed record");
+  }
+  if (lines.length > 16) {
+    throw new Error(`Lifecycle trace record count ${lines.length}: limit exceeded`);
+  }
+  return lines.map((line, index) => {
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (lineBytes > 1024) {
+      throw new Error(`Lifecycle trace record ${index}: line byte count ${lineBytes} exceeds limit`);
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      throw new Error(`Lifecycle trace record ${index}: invalid JSON`);
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`Lifecycle trace record ${index}: not an object`);
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    const expectedKeys = ["event", "hookChildPid", "hookPiPid", "hookRunId", "reason", "source"];
+    if (keys.length !== expectedKeys.length || keys.some((key, keyIndex) => key !== expectedKeys[keyIndex])) {
+      throw new Error(`Lifecycle trace record ${index}: unexpected fields`);
+    }
+    if (![record.event, record.source, record.reason].every((field) =>
+      field === null || (typeof field === "string" && field.length <= 64))) {
+      throw new Error(`Lifecycle trace record ${index}: invalid lifecycle field`);
+    }
+    if (record.hookRunId !== null && (typeof record.hookRunId !== "string" || !/^[0-9a-f]{32}$/u.test(record.hookRunId))) {
+      throw new Error(`Lifecycle trace record ${index}: invalid hook run ID`);
+    }
+    if (record.hookPiPid !== null && (typeof record.hookPiPid !== "number" || !Number.isSafeInteger(record.hookPiPid) || record.hookPiPid <= 0)) {
+      throw new Error(`Lifecycle trace record ${index}: invalid Pi PID`);
+    }
+    if (typeof record.hookChildPid !== "number" || !Number.isSafeInteger(record.hookChildPid) || record.hookChildPid <= 0) {
+      throw new Error(`Lifecycle trace record ${index}: invalid hook child PID`);
+    }
+    return record as unknown as LifecycleHookTraceRecord;
+  });
+}
+
+function expectLifecycleAttribution(
+  records: readonly LifecycleHookTraceRecord[],
+  expectedRunId: string,
+  expectedPiPid: number,
+  offset = 0,
+): void {
+  records.forEach((record, index) => {
+    if (record.hookRunId !== expectedRunId) {
+      throw new Error(`Lifecycle trace record ${index + offset}: hook run ID mismatch`);
+    }
+    if (record.hookPiPid !== expectedPiPid) {
+      throw new Error(`Lifecycle trace record ${index + offset}: Pi PID mismatch`);
+    }
+  });
+}
 
 it.skipIf(cliMissing)("e2e core: Pi loads and reloads the compiled wrapper with the picc label", async () => {
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-e2e-loader-"));
@@ -171,6 +269,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       let durableMarketplaceSelector = "";
       let repairedSettings = Buffer.alloc(0);
       const canary = "PICC_CREDENTIAL_CANARY_T24";
+      const hookRunId = randomBytes(16).toString("hex");
       const credentialSource = `https://user:${canary}@example.test/repo.git`;
       const gitTrace = path.join(root, "git-process-trace.json");
       const preloadCanary = path.join(root, "ambient-preload-canary");
@@ -263,6 +362,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             USERPROFILE: path.join(root, "home"),
             GIT_TRACE2_EVENT: gitTrace,
             NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+            PICC_E2E_HOOK_RUN_ID: hookRunId,
           },
           script: [
             { text: "GENERATION_A_FIRST" },
@@ -366,9 +466,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           live.sendInput("/reload-plugins");
           const reloadDeadline = Date.now() + 30_000;
           while (true) {
-            const trace = fs.existsSync(lifecycle!.lifecycleTrace) ? fs.readFileSync(lifecycle!.lifecycleTrace, "utf8") : "";
-            if ((trace.match(/SessionStart/gu)?.length ?? 0) >= 2 && trace.includes("SessionEnd")) break;
-            if (Date.now() >= reloadDeadline) throw new Error(`Timed out waiting for real reload lifecycle; trace=${JSON.stringify(trace)} output=${JSON.stringify(live.capturedText())}`);
+            const trace = fs.existsSync(lifecycle!.lifecycleTrace) ? readLifecycleHookTrace(lifecycle!.lifecycleTrace, "polling") : [];
+            if (trace.filter((record) => record.event === "SessionStart").length >= 2
+              && trace.some((record) => record.event === "SessionEnd")) break;
+            if (Date.now() >= reloadDeadline) {
+              throw new Error(`Timed out waiting for real reload lifecycle; observed ${trace.length} trace records`);
+            }
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
           expect(live.pid).toBe(pidBeforeReload);
@@ -376,16 +479,14 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           live.sendInput(command);
           await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
           await live.waitForText("GENERATION_B_RELOADED", 30_000);
-          const successfulTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
-            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; reason: string | null; hookParentPid: number; hookChildPid: number });
-          expect(successfulTrace.slice(0, 3).map((record) => [record.hookEvent, record.source, record.reason])).toEqual([
+          const successfulTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
+          const successfulReloadTrace = successfulTrace.slice(0, 3);
+          expect(successfulReloadTrace.map((record) => [record.event, record.source, record.reason])).toEqual([
             ["SessionStart", "startup", null],
             ["SessionEnd", null, "reload"],
             ["SessionStart", "startup", null],
           ]);
-          if (!successfulTrace.slice(0, 3).every((record) => record.hookParentPid === pidBeforeReload)) {
-            throw new Error(`hook Pi PID mismatch: expected ${pidBeforeReload}; trace=${JSON.stringify(successfulTrace)}`);
-          }
+          expectLifecycleAttribution(successfulReloadTrace, hookRunId, live.pid);
           expect(fs.existsSync(lifecycle!.runtimeCanary)).toBe(false);
           expect(fs.existsSync(preloadCanary)).toBe(false);
 
@@ -410,11 +511,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           assertTreeSecretFree(failed.agentDir);
           assertTreeSecretFree(failed.fixture);
           assertTreeSecretFree(root);
-          const completedTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
-            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; reason: string | null; hookParentPid: number; hookChildPid: number });
+          const completedTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(completedTrace.slice(0, 3)).toEqual(successfulTrace.slice(0, 3));
+          expectLifecycleAttribution(completedTrace, hookRunId, live.pid);
           for (const record of completedTrace) {
-            expect(record.hookParentPid).toBe(pidBeforeReload);
             expect(() => process.kill(record.hookChildPid, 0)).toThrow();
           }
         } finally {
@@ -424,7 +524,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
 
         fs.rmSync(lifecycle!.shutdownMutationGate, { force: true });
         fs.writeFileSync(path.join(lifecycle!.userDir, "settings.json"), repairedSettings);
-        const relaunchTraceBaseline = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u).length;
+        const relaunchTraceBaseline = readLifecycleHookTrace(lifecycle!.lifecycleTrace).length;
         const relaunched = await startPi({
           interactiveTerminal: true,
           lifecycleIsolation: true,
@@ -439,6 +539,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             HOME: lifecycle!.homeDir,
             USERPROFILE: lifecycle!.homeDir,
             NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+            PICC_E2E_HOOK_RUN_ID: hookRunId,
           },
           script: [{ text: "GENERATION_B_RELAUNCHED" }],
         });
@@ -447,10 +548,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           relaunched.sendInput(command);
           await relaunched.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
           await relaunched.waitForText("GENERATION_B_RELAUNCHED", 30_000);
-          const relaunchTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
-            .map((line) => JSON.parse(line) as { hookEvent: string; source: string | null; hookParentPid: number; hookChildPid: number });
+          const relaunchTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(relaunchTrace.length).toBeGreaterThan(relaunchTraceBaseline);
-          expect(relaunchTrace.at(-1)).toMatchObject({ hookEvent: "SessionStart", source: "startup", hookParentPid: relaunched.pid });
+          expect(relaunchTrace.at(-1)).toMatchObject({ event: "SessionStart", source: "startup" });
+          expectLifecycleAttribution(relaunchTrace.slice(relaunchTraceBaseline), hookRunId, relaunched.pid, relaunchTraceBaseline);
           const traceLengthBeforeQuit = relaunchTrace.length;
           relaunched.sendInput("/quit");
           relaunched.closeInput();
@@ -464,10 +565,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           assertTreeSecretFree(result.fixture);
           assertTreeSecretFree(root);
           expect(fs.existsSync(preloadCanary)).toBe(false);
-          const finalTrace = fs.readFileSync(lifecycle!.lifecycleTrace, "utf8").trim().split(/\r?\n/u)
-            .map((line) => JSON.parse(line) as { hookEvent: string; hookParentPid: number; hookChildPid: number });
+          const finalTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(finalTrace.length).toBeGreaterThan(traceLengthBeforeQuit);
-          expect(finalTrace.at(-1)).toMatchObject({ hookEvent: "SessionEnd", hookParentPid: relaunched.pid });
+          expect(finalTrace.at(-1)).toMatchObject({ event: "SessionEnd" });
+          expectLifecycleAttribution(finalTrace.slice(relaunchTraceBaseline), hookRunId, relaunched.pid, relaunchTraceBaseline);
           for (const record of finalTrace) {
             expect(() => process.kill(record.hookChildPid, 0)).toThrow();
           }
