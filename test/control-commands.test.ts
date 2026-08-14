@@ -803,40 +803,48 @@ describe("reserved plugin-management commands", () => {
             expect(output).toContain("did not reload or mutate this process");
             expect(output).toContain("standalone PiCC plugin commands");
             expect(output).toContain("requires /reload-plugins in the live interactive session or a new PiCC session");
+          } else if (name === "plugin" && mode !== "tui") {
+            expect(output).toContain("Headless modes are guidance-only");
+            expect(output).toContain("run picc plugin --help");
+            expect(output).not.toContain("Plugin inventory (read-only)");
           } else {
             expect(output).toContain("Plugin inventory (read-only)");
-            expect(output).toContain("captured for this session");
+            expect(output).toContain("Plugin: same@market");
+            if (name === "plugins") expect(output).toContain("captured for this session");
           }
           expect(fresh.customs).toHaveLength(customBaseline);
         }
       }
 
-      const bareOutputs: string[] = [];
+      const guidanceOutputs: string[] = [];
       for (const [mode, makeCtx] of admissionModes.filter(([mode]) => mode !== "tui")) {
-        fresh.entries.length = 0;
         const customBaseline = fresh.customs.length;
-        expect(await fresh.fire("input", { text: "/plugin list", source: mode }, makeCtx())).toEqual({ action: "handled" });
-        const explicit = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-        expect(explicit).toContain("Plugin: same@market");
-        fresh.entries.length = 0;
-        expect(await fresh.fire("input", { text: "/plugin", source: mode }, makeCtx())).toEqual({ action: "handled" });
-        const bare = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-        bareOutputs.push(bare);
-        expect(bare).toBe(explicit);
+        let modeGuidance: string | undefined;
+        for (const text of ["/plugin", "/plugin list", "/plugin details same@market"]) {
+          fresh.entries.length = 0;
+          expect(await fresh.fire("input", { text, source: mode }, makeCtx())).toEqual({ action: "handled" });
+          const guidance = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+          expect(guidance).toContain("Headless modes are guidance-only");
+          expect(guidance).not.toContain("Plugin inventory (read-only)");
+          expect(guidance).not.toContain("Plugin: same@market");
+          if (modeGuidance === undefined) modeGuidance = guidance;
+          else expect(guidance).toBe(modeGuidance);
+        }
+        guidanceOutputs.push(modeGuidance!);
         expect(fresh.customs).toHaveLength(customBaseline);
       }
-      expect(new Set(bareOutputs).size).toBe(1);
-      expect(bareOutputs[0]).toContain("Plugin inventory (read-only)");
+      expect(new Set(guidanceOutputs).size).toBe(1);
       expect(fresh.messages).toEqual([]);
       expect(fresh.userMessages).toEqual([]);
       expect(sdk.promptCalls()).toBe(0);
 
       fresh.entries.length = 0;
       await fresh.commands.get("plugins").handler("", fresh.printCtx());
-      const alias = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      const fixedInventory = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      expect(fixedInventory).toContain("Plugin: same@market");
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(alias);
+      expect(await fresh.fire("input", { text: "/plugins", source: "print" }, fresh.printCtx())).toEqual({ action: "handled" });
+      expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toBe(fixedInventory);
 
       for (const invalid of ["install same@market", "details same", "details --force", "list extra", "--help"]) {
         fresh.entries.length = 0;
@@ -969,22 +977,25 @@ describe("reserved plugin-management commands", () => {
     }
   });
 
-  it("keeps qualified same-name identities distinct and opens/closes the TUI without a transcript row", async () => {
+  it("keeps qualified same-name identities and each session profile distinct while opening and closing the TUI", async () => {
     const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
       installPluginFixture(projectRoot, "same@market-a", "same", () => undefined);
       installPluginFixture(projectRoot, "same@market-b", "same", () => undefined);
     });
+    const { fresh: other, root: otherRoot } = await freshControlPi(undefined, (projectRoot) => {
+      installPluginFixture(projectRoot, "profile-b-only@market-b", "profile-b-only", () => undefined);
+    });
     try {
-      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
-      const list = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      await other.commands.get("plugins").handler("", other.printCtx());
+      const otherList = String(controlEntry("plugins", other)?.data?.output ?? "");
+      expect(otherList).toContain("Plugin: profile-b-only@market-b");
+      expect(otherList).not.toContain("same@market-a");
+
+      await fresh.commands.get("plugins").handler("", fresh.printCtx());
+      const list = String(controlEntry("plugins", fresh)?.data?.output ?? "");
       expect(list).toContain("Plugin: same@market-a");
       expect(list).toContain("Plugin: same@market-b");
-
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details same@market-b", fresh.rpcCtx());
-      const details = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-      expect(details).toContain("Plugin: same@market-b");
-      expect(details).not.toContain("Plugin: same@market-a");
+      expect(list).not.toContain("profile-b-only@market-b");
 
       fresh.entries.length = 0;
       const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
@@ -992,10 +1003,14 @@ describe("reserved plugin-management commands", () => {
       const custom = fresh.customs.at(-1)!;
       await custom.ready;
       custom.input("\u001b[C");
-      expect(custom.render(72).join("\n")).toContain("same@market-a");
+      const installed = custom.render(72).join("\n");
+      expect(installed).toContain("same@market-a");
+      expect(installed).not.toContain("profile-b-only@market-b");
       custom.input("\u001b[B");
       custom.input("\r");
-      expect(custom.render(72).join("\n")).toContain("same@market-b");
+      const details = custom.render(72).join("\n");
+      expect(details).toContain("same@market-b");
+      expect(details).not.toContain("profile-b-only@market-b");
       custom.input("\u001b");
       custom.input("\u001b");
       await opening;
@@ -1004,6 +1019,7 @@ describe("reserved plugin-management commands", () => {
       expect(fresh.userMessages).toEqual([]);
     } finally {
       cleanupFixture(root);
+      cleanupFixture(otherRoot);
     }
   });
 
@@ -1156,11 +1172,9 @@ describe("reserved plugin-management commands", () => {
       try {
       const compactBaseline = fresh.compactCalls.length;
       const customBaseline = fresh.customs.length;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
-      const listBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
-      const detailsBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
+      const listBefore = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      expect(listBefore).toContain("locked@market");
       expect(tree(root)).toEqual(projectBefore);
       expect(tree(path.join(root, ".claude-user"))).toEqual(profileBefore);
 
@@ -1169,19 +1183,17 @@ describe("reserved plugin-management commands", () => {
       const projectAfterBackingChange = tree(root);
       const profileAfterBackingChange = tree(path.join(root, ".claude-user"));
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(listBefore);
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(detailsBefore);
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
+      expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toBe(listBefore);
 
       fresh.entries.length = 0;
       const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
       await Promise.resolve();
       const custom = fresh.customs.at(-1)!;
       await custom.ready;
-      custom.input("\u001b[C");
       expect(custom.render(72).join("\n")).toContain("locked@market");
+      custom.input("\u001b[C");
+      expect(custom.render(72).join("\n")).not.toContain("locked@market");
       custom.input("\u001b[D");
       custom.input("\u001b");
       await opening;
@@ -1329,8 +1341,8 @@ describe("plugin startup warning wiring", () => {
       expect(omissionNotices[0]!.text.split("\n").at(-1)).toBe("This startup notice is abbreviated.");
       expect(omissionNotices[0]!.text).not.toMatch(/\/plugin list|\/doctor|all omission|omission counts|complete inventory|recovery/i);
       expect(omissionNotices[0]!.text).not.toMatch(/malformed-299|SECRET_RAW_DIAGNOSTIC_PATH|C:\/private/i);
-      await omitted.fresh.commands.get("plugin").handler("list", omitted.fresh.tuiCtx());
-      const omittedList = String(controlEntry("plugin", omitted.fresh)?.data?.output ?? "");
+      await omitted.fresh.commands.get("plugins").handler("", omitted.fresh.tuiCtx());
+      const omittedList = String(controlEntry("plugins", omitted.fresh)?.data?.output ?? "");
       expect(omittedList).toContain("Snapshot-capture evidence omissions:");
       expect(omittedList).toContain("loader.marketplace.diagnostics=172");
       expect(omittedList).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
@@ -1453,7 +1465,7 @@ describe("plugin activation runtime behavior", () => {
       expect(report).not.toContain("Reconcile or reinstall");
 
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
       const inventory = String(fresh.entries.at(-1)?.data?.output ?? "");
       expect(inventory).toContain("Plugin: snapshot-owner@market");
       expect(inventory).toContain("runtime: loaded");

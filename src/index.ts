@@ -988,6 +988,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const loadEffectiveProject = (): LoadedProject => loadProject({
     ...projectLoadOptions,
     cwd: cwdState.get(),
+    userDir: project.userDir,
   });
   let activeMainNotebookState = new NotebookSessionState();
   const installMainNotebookState = (branch: unknown): void => {
@@ -5558,9 +5559,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   async function renderPluginControl(args: string, ctx: any): Promise<string | undefined> {
     const requestedAction = requestedPluginAction(args);
-    if (ctx?.mode !== "tui") return /^[ \t]*$/.test(args)
-      ? withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))
-      : pluginReadOnlyUsage(ctx);
+    if (ctx?.mode !== "tui") return pluginReadOnlyUsage(ctx);
     let effectiveDesired: LoadedProject;
     try {
       effectiveDesired = loadEffectiveProject();
