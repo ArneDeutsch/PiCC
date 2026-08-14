@@ -95,7 +95,7 @@ async function freshControlPi(
   seam?: PiccTestSeam,
   setup?: (root: string) => void,
 ): Promise<{ fresh: FakePi; root: string }> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-control-"));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-control-")));
   fs.writeFileSync(path.join(root, "CLAUDE.md"), "Temporary control-command project.\n", "utf8");
   setup?.(root);
   const userDir = path.join(root, ".claude-user");
