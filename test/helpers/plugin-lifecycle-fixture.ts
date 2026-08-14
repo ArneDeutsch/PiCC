@@ -45,13 +45,15 @@ export interface PluginLifecycleFixture {
 
 /** Adds execution-created plugin trees and a linked checkout to a copied full-surface fixture. */
 export function createPluginLifecycleFixture(project: string, root: string): PluginLifecycleFixture {
-  const worktree = path.join(root, "linked-worktree");
-  const userDir = path.join(root, "claude-profile");
-  const homeDir = path.join(root, "home");
-  const marketplace = path.join(project, "lifecycle-marketplace", ".claude-plugin");
-  const lifecycleTrace = path.join(root, "lifecycle-trace.jsonl");
-  const shutdownMutationGate = path.join(root, "mutate-on-shutdown");
-  const runtimeCanary = path.join(root, "runtime-canary");
+  const canonicalProject = fs.realpathSync.native(project);
+  const canonicalRoot = fs.realpathSync.native(root);
+  const worktree = path.join(canonicalRoot, "linked-worktree");
+  const userDir = path.join(canonicalRoot, "claude-profile");
+  const homeDir = path.join(canonicalRoot, "home");
+  const marketplace = path.join(canonicalProject, "lifecycle-marketplace", ".claude-plugin");
+  const lifecycleTrace = path.join(canonicalRoot, "lifecycle-trace.jsonl");
+  const shutdownMutationGate = path.join(canonicalRoot, "mutate-on-shutdown");
+  const runtimeCanary = path.join(canonicalRoot, "runtime-canary");
   fs.mkdirSync(userDir, { recursive: true });
   fs.mkdirSync(homeDir, { recursive: true });
 
@@ -71,7 +73,7 @@ export function createPluginLifecycleFixture(project: string, root: string): Plu
     ],
   }, null, 2));
 
-  const hookScript = path.join(root, "lifecycle-hook.cjs");
+  const hookScript = path.join(canonicalRoot, "lifecycle-hook.cjs");
   write(hookScript, [
     'const fs = require("node:fs");',
     'const cp = require("node:child_process");',
@@ -129,7 +131,7 @@ export function createPluginLifecycleFixture(project: string, root: string): Plu
   };
   writeGeneration("1.0.0");
 
-  execFileSync("git", ["worktree", "add", "--detach", worktree, "HEAD"], { cwd: project, stdio: "pipe" });
+  execFileSync("git", ["worktree", "add", "--detach", worktree, "HEAD"], { cwd: canonicalProject, stdio: "pipe" });
   // The linked checkout receives only execution-created lifecycle fixture content.
   const linkedMarketplace = path.join(worktree, "lifecycle-marketplace", ".claude-plugin");
   fs.mkdirSync(linkedMarketplace, { recursive: true });
@@ -154,11 +156,11 @@ export function createPluginLifecycleFixture(project: string, root: string): Plu
   };
 
   return {
-    project, worktree, marketplace, userDir, homeDir, lifecycleTrace, shutdownMutationGate, runtimeCanary,
+    project: canonicalProject, worktree, marketplace, userDir, homeDir, lifecycleTrace, shutdownMutationGate, runtimeCanary,
     writeGeneration,
     seedImportedCoexistence,
     cleanup() {
-      try { execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: project, stdio: "pipe" }); }
+      try { execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: canonicalProject, stdio: "pipe" }); }
       catch { fs.rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
     },
   };

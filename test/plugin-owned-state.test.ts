@@ -314,7 +314,7 @@ describe("owned durable admission", () => {
   });
 
   it("reopens only an authentic freshly revalidated retained materialized snapshot", async () => {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-retained-snapshot-"));
+    const parent = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-retained-snapshot-")));
     try {
       const home = path.join(parent, "home"); fs.mkdirSync(home, { mode: 0o700 });
       const locations = createLifecycleLocations({ homeDir: home, profilePath: path.join(home, ".claude"), platform: process.platform === "win32" ? "win32" : "posix" });

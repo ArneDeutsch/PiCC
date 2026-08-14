@@ -196,7 +196,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         lifecycle = createPluginLifecycleFixture(fixtureDir, root);
         const added = runStandalone([
           "marketplace", "add", LIFECYCLE_MARKETPLACE, "--source", "local-directory",
-          path.join(fixtureDir, "lifecycle-marketplace"), "--scope", "user", "--yes",
+          path.join(lifecycle.project, "lifecycle-marketplace"), "--scope", "user", "--yes",
         ]);
         expect(added.status, added.stderr).toBe(0);
         const marketplaceSelector = /Selected marketplace scope\/selector: user; ([A-Za-z0-9_-]+)/u.exec(added.stdout)?.[1];
