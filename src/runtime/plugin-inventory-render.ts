@@ -55,7 +55,11 @@ function pluginStatusColor(row: Extract<PluginInventoryRow, { kind: "plugin" }>)
 
 function framing(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): void {
   addWrapped(lines, theme, "accent", "PiCC plugin inventory · lifecycle", width);
-  addWrapped(lines, theme, "muted", "read-only · captured for this session · browsing is inert", width);
+  const phase = view.workflow?.phase;
+  if (phase === undefined) addWrapped(lines, theme, "muted", "read-only · captured for this session · browsing is inert", width);
+  else if (phase === "receipt") addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; this receipt is authoritative.", width);
+  else if (["progress", "pending-recovery", "terminal-fallback"].includes(phase)) addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative.", width);
+  else addWrapped(lines, theme, "muted", "Workflow active · no durable change until final confirmation; planning and preview do not execute.", width);
   addWrapped(lines, theme, "muted", "Durable desired state refreshes after receipts; loaded runtime remains captured.", width);
   addWrapped(lines, theme, "muted", `Generation: loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
   if (view.actionOverlay) addWrapped(lines, theme, view.actionOverlay.phase === "failed" || view.actionOverlay.phase === "reload-unconfirmed" ? "warning" : "accent", `Overlay: ${safe(view.actionOverlay.phase, 40)} · ${safe(view.actionOverlay.target ?? view.actionOverlay.operationId, 100)}${view.actionOverlay.message ? ` · ${safe(view.actionOverlay.message)}` : ""}`, width);
@@ -152,7 +156,7 @@ function addDetailValues(lines: DetailLine[], heading: string, values: readonly 
   for (const value of values.slice(0, DETAIL_VALUE_CAP)) pushDetail(lines, `  ${value}`, color);
   if (values.length === 0) pushDetail(lines, "  none", "muted");
   if (values.length > DETAIL_VALUE_CAP) {
-    pushDetail(lines, `  ${values.length - DETAIL_VALUE_CAP} additional retained values are not expanded here; use /plugin details ${identity}.`, "muted");
+    pushDetail(lines, `  ${values.length - DETAIL_VALUE_CAP} additional retained values are not shown here; run picc plugin details ${identity} for the larger bounded standalone view.`, "muted");
   }
 }
 function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
@@ -295,7 +299,10 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   if (width === 0) return { lines: [""], maxDetailScroll: 0, selectedVisible: false };
   const lines: string[] = [];
   if (width < 8) {
-    for (const value of ["PiCC plugin inventory", "read-only session snapshot", "width unusable", "resize wider", "Esc closes"]) addWrapped(lines, options.theme, "warning", value, width);
+    const phase = view.workflow?.phase;
+    const postConfirmation = phase !== undefined && ["progress", "receipt", "pending-recovery", "terminal-fallback"].includes(phase);
+    const framing = phase === undefined ? "read-only session snapshot" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.";
+    for (const value of ["PiCC plugin inventory", framing, "width unusable", "resize wider", "Esc closes"]) addWrapped(lines, options.theme, "warning", value, width);
     return { lines: clampLines(lines, width), maxDetailScroll: 0, selectedVisible: false };
   }
   framing(view, options.theme, width, lines);
@@ -309,8 +316,8 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
     renderOmissions(view, options.theme, width, lines);
   } else selectedVisible = renderList(view, options.theme, width, lines);
   if (!view.workflow) addWrapped(lines, options.theme, "muted", view.detail
-    ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · /plugin list · /plugin details <qualified-name>"
-    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · /plugin list", width);
+    ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · standalone: picc plugin list · picc plugin details <qualified-name>"
+    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · standalone: picc plugin list", width);
   if (!view.workflow) addWrapped(lines, options.theme, "muted", "A opens eligible lifecycle actions.", width);
   const safeLines = clampLines(lines, width).map((line) => {
     try { return visibleWidth(line) <= width ? line : ""; } catch { return ""; }

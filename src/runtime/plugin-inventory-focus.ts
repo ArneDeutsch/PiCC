@@ -3,6 +3,7 @@ import type { PluginInventorySnapshot } from "../plugin-inventory.js";
 import type { MarketplaceMutationPreview } from "../plugin-lifecycle/planner.js";
 import type { PluginMutationPreview } from "../plugin-lifecycle/plugin-service.js";
 import type { RecoveryPreview } from "../plugin-lifecycle/recovery.js";
+import type { PluginSettingsEffectSummary, SettingsValueState } from "../plugin-lifecycle/settings-plan.js";
 import type { StoreResult } from "../plugin-lifecycle/state-store.js";
 import type { PluginLifecycleExactTarget, PluginLifecyclePort, PluginLifecycleReceipt } from "../plugin-inventory-cli.js";
 import type { PluginInventoryOperation } from "./plugin-inventory-text.js";
@@ -55,11 +56,13 @@ export interface PluginInventoryFocusOptions {
 }
 
 interface ActionField { readonly name: string; readonly hint: string }
+const DECLARATION_ONLY_FIELD: ActionField = Object.freeze({ name: "declaration only", hint: "yes permits the selected-scope settings change even when higher precedence keeps effective state unchanged; no requires the requested effective result" });
+const GIT_REF_FIELD: ActionField = Object.freeze({ name: "Git ref", hint: "optional branch, tag, or commit; blank uses the default ref" });
 const ACTION_FIELDS: Readonly<Record<PluginInventoryActionName, readonly ActionField[]>> = Object.freeze({
-  "marketplace-add": [{ name: "marketplace name", hint: "lowercase marketplace name" }, { name: "source kind", hint: "local-directory | local-catalog-file | github | https-git | https-catalog" }, { name: "source", hint: "source is hidden after entry" }, { name: "scope", hint: "user | project | local" }],
-  "marketplace-refresh": [{ name: "marketplace name", hint: "exact registered marketplace name" }], "marketplace-remove": [{ name: "marketplace name", hint: "exact registered marketplace name" }, { name: "preserve installed acknowledgement", hint: "type yes to preserve installed plugins" }],
-  install: [{ name: "plugin", hint: "qualified plugin@marketplace" }, { name: "scope", hint: "user | project | local" }],
-  enable: [{ name: "plugin", hint: "qualified plugin@marketplace" }], disable: [{ name: "plugin", hint: "qualified plugin@marketplace" }], update: [{ name: "plugin", hint: "qualified plugin@marketplace" }],
+  "marketplace-add": [{ name: "marketplace name", hint: "lowercase marketplace name" }, { name: "source kind", hint: "local-directory | local-catalog-file | github | https-git | https-catalog" }, { name: "source", hint: "source is hidden after entry" }, { name: "scope", hint: "user | project | local" }, DECLARATION_ONLY_FIELD],
+  "marketplace-refresh": [{ name: "marketplace name", hint: "exact registered marketplace name" }, DECLARATION_ONLY_FIELD], "marketplace-remove": [{ name: "marketplace name", hint: "exact registered marketplace name" }, { name: "preserve installed acknowledgement", hint: "type yes to preserve installed plugins" }, DECLARATION_ONLY_FIELD],
+  install: [{ name: "plugin", hint: "qualified plugin@marketplace" }, { name: "scope", hint: "user | project | local" }, DECLARATION_ONLY_FIELD],
+  enable: [{ name: "plugin", hint: "qualified plugin@marketplace" }, DECLARATION_ONLY_FIELD], disable: [{ name: "plugin", hint: "qualified plugin@marketplace" }, DECLARATION_ONLY_FIELD], update: [{ name: "plugin", hint: "qualified plugin@marketplace" }],
   uninstall: [{ name: "plugin", hint: "qualified plugin@marketplace" }, { name: "remove declaration", hint: "yes | no" }, { name: "remove data", hint: "yes | no" }],
   recover: [{ name: "operation id", hint: "exact operation id" }, { name: "recovery result", hint: "complete | rollback" }],
 });
@@ -79,7 +82,7 @@ function sourceFingerprint(source: unknown): string { try { return authorityFing
 function safeSourceAuthority(source: unknown): string {
   if (typeof source !== "object" || source === null) return "unchanged existing authority";
   const value = source as Record<string, unknown>; const kind = typeof value.kind === "string" ? value.kind : "unknown"; const fingerprint = sourceFingerprint(source);
-  if (kind === "github" && typeof value.repository === "string") return `github:${value.repository.replace(/[^A-Za-z0-9._/-]/gu, "?")} · full authority ${fingerprint}`;
+  if (kind === "github" && typeof value.repository === "string") return `github repository · full authority ${fingerprint}`;
   if ((kind === "https-git" || kind === "https-git-subdir" || kind === "https-catalog" || kind === "https-zip") && typeof value.url === "string") {
     try { const url = new URL(value.url); return url.protocol === "https:" ? `${kind} host ${url.host} · full authority ${fingerprint}` : `${kind}:unsupported-origin · full authority ${fingerprint}`;  } catch { return `${kind}:invalid-origin · full authority ${fingerprint}`; }
   }
@@ -88,6 +91,28 @@ function safeSourceAuthority(source: unknown): string {
   }
   if (kind === "npm" && typeof value.package === "string") return `npm:${value.package} · full authority ${fingerprint}`;
   return `${kind} · full authority ${fingerprint}`;
+}
+
+function settingsValue(value: unknown): string {
+  if (value === null) return "declaration removal";
+  if (typeof value === "boolean") return value ? "enabled/present" : "disabled";
+  if (typeof value === "object" && value !== null) return "marketplace registration present";
+  return "unavailable";
+}
+function settingsState(value: SettingsValueState | undefined): string {
+  if (value?.present === false) return "absent";
+  if (value?.present !== true) return "unavailable";
+  const source = typeof value.source === "string" ? [...(value.source.replace(/\\/gu, "/").split("/").filter(Boolean).at(-1) ?? "unavailable").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")].slice(0, 80).join("") : "unavailable";
+  return `present · value ${settingsValue(value.value)} · scope ${value.scope ?? "unknown"} · source ${source}`;
+}
+function settingsProjection(value: PluginSettingsEffectSummary | undefined): readonly string[] {
+  if (value === undefined) return Object.freeze(["settings unchanged"]);
+  return Object.freeze([
+    `requested declaration ${settingsValue(value.requested)}`,
+    `requested authority achieved ${value.effective ? "yes" : "no"}`,
+    `effective after ${settingsState(value.effectiveAfter)}`,
+    `declaration only ${value.declarationOnly ? "yes" : "no"}`,
+  ]);
 }
 
 function confirmationProjection(preview: MarketplaceMutationPreview | PluginMutationPreview | RecoveryPreview, action: PluginInventoryActionName, exact: readonly PluginLifecycleExactTarget[], recoveryAction?: "complete" | "rollback"): PluginInventoryConfirmationProjection {
@@ -112,7 +137,7 @@ function confirmationProjection(preview: MarketplaceMutationPreview | PluginMuta
     return Object.freeze({ operationId: scalar(preview.operationId), action, target: scalar(preview.registration.name), authority, sourceAuthority: scalar(safeSourceAuthority(preview.registration.source)),
       resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `snapshot ${scalar(preview.snapshot.snapshotId)}`, `catalog digest ${scalar(preview.snapshot.catalogDigest)}`, `state ${scalar(preview.stateFingerprint)}`, `settings ${scalar(preview.settingsFingerprint)}`]),
       trust: Object.freeze([`critical trust target ${scalar(trust.targetDigest)}`]), dependencies: list(catalog.plugins, (value) => { const row = value as Record<string, unknown>; return `${scalar(row.name)} · ${scalar(row.supported)} · ${scalar(row.sourceKind ?? row.error)}`; }),
-      settings: Object.freeze([`requested ${scalar(preview.settingsEffect.requested)}`, `effective ${scalar(preview.settingsEffect.effective)}`, "default not applicable to marketplace registration"]), executable: Object.freeze(["marketplace catalog is inert; installed executable membership is unchanged"]),
+      settings: Object.freeze([...settingsProjection(preview.settingsEffect), "default not applicable to marketplace registration"]), executable: Object.freeze(["marketplace catalog is inert; installed executable membership is unchanged"]),
       destructive: Object.freeze([`preserve installed plugins ${preview.acknowledgement === "preserve-installations" ? "yes" : scalar(undefined)}`, ...list(preview.dependents, (value) => `dependent ${scalar(value)}`)]),
       participants: list(preview.participants, (value) => { const row = value as Record<string, unknown>; return `${scalar(row.order)} ${scalar(row.role)} ${scalar(row.effect)} ${scalar(row.scopeKey)}`; }), consequences: list(preview.consequences, (value) => scalar(value)),
       sessionBehavior: Object.freeze(["marketplace refresh does not change loaded code", "loaded plugin snapshot stays fixed for this session"]), recovery: Object.freeze([]), omissions: omissions + catalog.omittedEntries });
@@ -123,7 +148,7 @@ function confirmationProjection(preview: MarketplaceMutationPreview | PluginMuta
       resolution: Object.freeze([`preallocated ${scalar(preview.operationId)}`, `revision ${scalar(preview.immutableRevision ?? "unchanged")}`, `artifact ${scalar(preview.artifactDigest ?? "unchanged")}`, `tree ${scalar(preview.treeDigest ?? "unchanged")}`, `root ${scalar(preview.rootDigest ?? "unchanged")}`, `executable ${scalar(preview.executableDigest ?? "unchanged")}`, `generation ${scalar(preview.generationId ?? "unchanged")}`]),
       trust: Object.freeze([preview.trust === undefined ? "existing trust authority" : `critical approval ${scalar(preview.trust.target)} · ${scalar(preview.trust.executableDigest)}`]),
       dependencies: Object.freeze([`admitted ${scalar(preview.dependencies.selected.admitted)} · blocking ${scalar(preview.dependencies.blocking)}`, ...list(preview.dependencies.selected.reasons, (value) => scalar(value)), ...list(preview.dependencies.graph, (value) => scalar(JSON.stringify(value))), ...list(preview.dependencies.decisions ?? [], (value) => scalar(JSON.stringify(value)))]),
-      settings: Object.freeze([preview.settingsEffect === undefined ? "settings unchanged" : `requested ${scalar(preview.settingsEffect.requested)} · effective ${scalar(preview.settingsEffect.effective)} · scope ${scalar(preview.settingsEffect.scope)} · default ${scalar(preview.enablement?.source ?? "existing explicit setting")}`]),
+      settings: Object.freeze([...settingsProjection(preview.settingsEffect), `initial enablement source ${scalar(preview.enablement?.source ?? "existing explicit setting")}`]),
       executable: list(preview.executableComponents, (value) => scalar(value)), destructive: Object.freeze([`remove declaration ${preview.removeDeclaration ? "yes" : "no"}`, `remove data ${preview.removeData ? "yes" : "no"}`]),
       participants: list(preview.participants, (value) => { const row = value as Record<string, unknown>; return `${scalar(row.kind)} ${scalar(row.effect)} ${scalar(row.targetClass)} ${scalar(row.digest ?? "no digest")}`; }), consequences: list(preview.consequences, (value) => scalar(value)),
       sessionBehavior: Object.freeze(["durable desired state changes now", "loaded generation, components, outcomes, and badges stay fixed until successful reload or a new session"]), recovery: Object.freeze([]), omissions });
@@ -140,21 +165,39 @@ function confirmationProjection(preview: MarketplaceMutationPreview | PluginMuta
     resolution: Object.freeze([`producer ${scalar(preview.producerSchema)} v${scalar(preview.producerVersion)}`, `confirmation ${scalar(preview.confirmationDigest)}`, `plan ${scalar(preview.planDigest)}`, `completed ${scalar(preview.completed)} · remaining ${scalar(preview.remaining)} · rolled back ${scalar(preview.rolledBack)}`]),
     trust: Object.freeze([plugin ? scalar((summary.trust as Record<string, unknown> | undefined)?.target ?? "existing trust authority") : scalar(((summary.snapshot as Record<string, unknown> | undefined)?.trust as Record<string, unknown> | undefined)?.targetDigest ?? "marketplace trust authority")]),
     dependencies: plugin ? Object.freeze([`admitted ${scalar(selected.admitted)}`, ...list(selected.reasons, (value) => scalar(value)), ...list(deps.graph, (value) => scalar(JSON.stringify(value))), ...list(deps.decisions ?? [], (value) => scalar(JSON.stringify(value)))]) : list((summary.catalog as Record<string, unknown> | undefined)?.plugins, (value) => scalar(JSON.stringify(value))),
-    settings: Object.freeze([scalar(JSON.stringify(summary.settingsEffect ?? "settings unchanged"))]), executable: plugin ? list(summary.executableComponents, (value) => scalar(value)) : Object.freeze(["marketplace recovery does not load code"]),
+    settings: settingsProjection(typeof summary.settingsEffect === "object" && summary.settingsEffect !== null ? summary.settingsEffect as PluginSettingsEffectSummary : undefined), executable: plugin ? list(summary.executableComponents, (value) => scalar(value)) : Object.freeze(["marketplace recovery does not load code"]),
     destructive: Object.freeze([`selected recovery ${scalar(recoveryAction)}`, `remove declaration ${scalar(summary.removeDeclaration ?? false)}`, `remove data ${scalar(summary.removeData ?? false)}`, `preserve installed ${scalar(summary.acknowledgement ?? "not applicable")}`]),
     participants: list(summary.participants, (value) => scalar(JSON.stringify(value))), consequences: list(summary.consequences, (value) => scalar(value)),
     sessionBehavior: Object.freeze([plugin ? "desired plugin state may change; loaded runtime stays fixed until reload or a new session" : "marketplace recovery does not change loaded code"]), recovery: Object.freeze([`applicable ${preview.actions.join(" or ") || `terminal ${preview.terminalOutcome ?? "unknown"}`}`, `selected ${scalar(recoveryAction)}`]), omissions });
 }
 
-function fallbackLines(width: number, identity?: string): string[] {
+const DEPENDENCY_PLANNING_CODES = new Set(["dependency-blocked", "required-dependency"]);
+const SETTINGS_PLANNING_CODES = new Set(["ineffective-declaration"]);
+const SOURCE_PLANNING_CODES = new Set(["invalid-source", "unsafe-source", "source-changed", "invalid-catalog", "invalid-archive", "acquisition-failure", "network-failure", "download-limit"]);
+const PREPARATION_PLANNING_CODES = new Set(["pending-recovery", "ambiguous-lock", "lock-busy", "data-directory-preparation-failed"]);
+
+function planningCause(code: string): { readonly cause: string; readonly guidance: string } {
+  if (code === "managed-readonly") return { cause: "managed target", guidance: "Administrator-owned target; ask the administrator to change it." };
+  if (code === "imported-readonly") return { cause: "imported target", guidance: "Claude-owned target; use Claude Code to change it." };
+  if (code === "seed-readonly") return { cause: "seed target", guidance: "Seed-owned read-only target; manage it at its configured seed source." };
+  if (code === "stale-selector") return { cause: "stale target", guidance: "Selected exact scoped record changed; refresh inventory and select it again." };
+  if (DEPENDENCY_PLANNING_CODES.has(code)) return { cause: "dependency refusal", guidance: "Inspect installed dependency versions, repair the blocking dependency, then retry planning." };
+  if (SETTINGS_PLANNING_CODES.has(code)) return { cause: "settings refusal", guidance: "Choose another writable scope, or retry and explicitly choose declaration only if an ineffective declaration is intended." };
+  if (SOURCE_PLANNING_CODES.has(code)) return { cause: "source refusal", guidance: "Check the supported source syntax and public reachability, then retry planning." };
+  if (PREPARATION_PLANNING_CODES.has(code)) return { cause: "preparation refusal", guidance: "Inspect pending lifecycle state and storage availability, recover pending state if present, then retry planning." };
+  return { cause: "planning refusal", guidance: "Correct the lifecycle input or state, then retry planning." };
+}
+
+function fallbackLines(width: number, identity?: string, workflowPhase?: string): string[] {
   const columns = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
   if (columns === 0) return [""];
   const safeIdentity = parseQualifiedPluginId(identity)?.qualifiedIdentity;
   const lines: string[] = [];
-  pushWrapped("PiCC plugin inventory · read-only · captured for this session", columns, lines);
+  const postConfirmation = workflowPhase !== undefined && ["progress", "receipt", "pending-recovery", "terminal-fallback"].includes(workflowPhase);
+  pushWrapped(workflowPhase === undefined ? "PiCC plugin inventory · read-only · captured for this session" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.", columns, lines);
   pushWrapped(safeIdentity === undefined
-    ? "Plugin inventory display failed. Esc closes. Use /plugin list, then /plugin details <qualified-name>."
-    : `Plugin details display failed for ${safeIdentity}. Esc closes. Use /plugin list or run /plugin details ${safeIdentity}`, columns, lines);
+    ? "Plugin inventory display failed. Esc closes. Run picc plugin list, then picc plugin details <qualified-name>."
+    : `Plugin details display failed for ${safeIdentity}. Esc closes. Run picc plugin list or picc plugin details ${safeIdentity}`, columns, lines);
   return clampLines(lines, columns);
 }
 
@@ -174,7 +217,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
   private lastMaxScroll = 0;
   private lifecycle?: PluginLifecyclePort;
   private readonly lifecycleFactory?: () => Promise<StoreResult<PluginLifecyclePort>>;
-  private form?: { action: PluginInventoryActionName; target?: PluginInventoryTargetAuthority; marketplaceTarget?: PluginInventoryTargetAuthority; fields: readonly ActionField[]; index: number; values: string[]; buffer: string };
+  private form?: { action: PluginInventoryActionName; target?: PluginInventoryTargetAuthority; marketplaceTarget?: PluginInventoryTargetAuthority; fields: ActionField[]; index: number; values: string[]; buffer: string };
   private candidateQueue: PluginInventoryCandidate[][] = [];
   private abort?: AbortController;
   private prepared?: { kind: "marketplace" | "plugin"; preview: MarketplaceMutationPreview | PluginMutationPreview };
@@ -214,12 +257,13 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
     if (this.cache?.width === columns && this.cache.revision === revision && this.cache.generation === this.generation) return this.cache.lines;
     const workflow = this.model.workflow();
     if (workflow?.phase === "terminal-fallback") {
-      const lines: string[] = []; pushWrapped(`Lifecycle outcome · ${workflow.operationId}`, columns, lines); pushWrapped(workflow.message, columns, lines); if (workflow.recoveryCommand) pushWrapped(workflow.recoveryCommand, columns, lines); pushWrapped("Esc closes · Enter returns to inventory", columns, lines);
+      const lines: string[] = []; pushWrapped("Explicit confirmation authorized execution; receipt or recovery evidence is authoritative.", columns, lines); pushWrapped(`Lifecycle outcome · ${workflow.operationId}`, columns, lines); pushWrapped(workflow.message, columns, lines); if (workflow.recoveryCommand) pushWrapped(workflow.recoveryCommand, columns, lines); pushWrapped("Esc closes · Enter returns to inventory", columns, lines);
       return clampLines(lines, columns);
     }
     if ((workflow?.phase === "preview" || workflow?.phase === "confirmation") && columns < 8) {
       this.confirmationAttestation = undefined;
-      return clampLines(["Resize", "Esc"], columns);
+      const lines: string[] = []; pushWrapped("Active workflow; no durable change until explicit confirmation.", columns, lines); pushWrapped("Resize", columns, lines); pushWrapped("Esc", columns, lines);
+      return clampLines(lines, columns);
     }
     try {
       const rendered: PluginInventoryRenderResult = this.renderFn(this.model.view(), { width: columns, theme: this.theme });
@@ -245,7 +289,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
         return lines;
       } catch (recoveryError) {
         this.report(recoveryError);
-        const lines = fallbackLines(columns, identity);
+        const lines = fallbackLines(columns, identity, workflow?.phase);
         this.cache = { width: columns, revision: this.model.revision(), generation: this.generation, lines };
         return lines;
       }
@@ -347,7 +391,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
     let fields = ACTION_FIELDS[action];
     if (target !== undefined && ["marketplace-refresh", "marketplace-remove", "enable", "disable", "update", "uninstall", "recover"].includes(action)) fields = fields.filter((field) => field.name !== "plugin" && field.name !== "operation id" && field.name !== "marketplace name");
     if (action === "install" && target?.kind === "plugin") fields = fields.filter((field) => field.name !== "plugin");
-    this.form = { action, ...(target === undefined ? {} : { target }), fields, index: 0, values: [], buffer: "" };
+    this.form = { action, ...(target === undefined ? {} : { target }), fields: [...fields], index: 0, values: [], buffer: "" };
     if (fields.length === 0) void this.prepareCandidates(); else this.showCurrentField();
   }
 
@@ -358,8 +402,21 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
   private previousField(): void { const form = this.form; if (form === undefined || form.index <= 0) return; form.index -= 1; form.buffer = form.values.pop() ?? ""; this.showCurrentField(); }
   private acceptField(): void {
     const form = this.form; const field = form?.fields[form.index]; if (form === undefined || field === undefined) return; const value = form.buffer.trim();
-    const valid = field.name === "scope" ? ["user", "project", "local"].includes(value) : field.name.startsWith("remove ") ? ["yes", "no"].includes(value) : field.name === "preserve installed acknowledgement" ? value === "yes" : field.name === "source kind" ? ["local-directory", "local-catalog-file", "github", "https-git", "https-catalog"].includes(value) : value.length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+    const yesNo = field.name === "declaration only" || field.name.startsWith("remove ");
+    const valid = field.name === "Git ref" ? [...value].length <= 256 && (value.length === 0 || !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value))
+      : field.name === "scope" ? ["user", "project", "local"].includes(value) : yesNo ? ["yes", "no"].includes(value) : field.name === "preserve installed acknowledgement" ? value === "yes" : field.name === "source kind" ? ["local-directory", "local-catalog-file", "github", "https-git", "https-catalog"].includes(value) : value.length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
     if (!valid) { this.showCurrentField(`Invalid ${field.name}. ${field.hint}. Correct the value or go Back.`); return; }
+    if (field.name === "source kind") {
+      const refIndex = form.fields.findIndex((candidate) => candidate.name === "Git ref");
+      const needsRef = value === "github" || value === "https-git";
+      if (needsRef && refIndex < 0) form.fields.splice(form.fields.findIndex((candidate) => candidate.name === "source") + 1, 0, GIT_REF_FIELD);
+      else if (!needsRef && refIndex >= 0) form.fields.splice(refIndex, 1);
+    }
+    if (field.name === "remove declaration") {
+      const consentIndex = form.fields.findIndex((candidate) => candidate.name === "declaration only");
+      if (value === "yes" && consentIndex < 0) form.fields.splice(form.index + 1, 0, DECLARATION_ONLY_FIELD);
+      else if (value === "no" && consentIndex >= 0) form.fields.splice(consentIndex, 1);
+    }
     form.values.push(value); form.index += 1; form.buffer = ""; if (form.fields[form.index] === undefined) void this.prepareCandidates(); else this.showCurrentField();
   }
   private fieldValue(name: string): string | undefined { const form = this.form; if (form === undefined) return undefined; const index = form.fields.findIndex((field) => field.name === name); return index < 0 ? undefined : form.values[index]; }
@@ -383,8 +440,8 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
     const values: PluginLifecycleExactTarget[] = []; for (const authority of [form.target, form.marketplaceTarget]) { if (authority?.mutableRecordKey === undefined || authority.kind === "recovery") continue; const result = authority.kind === "plugin" ? lifecycle.targets?.plugin(authority.identity, authority.mutableRecordKey) : lifecycle.targets?.marketplace(authority.identity, authority.mutableRecordKey); if (result === undefined) return { ok: false, code: "target-port-unavailable", message: "Exact target authority is unavailable" }; if (!result.ok) return result; values.push(result.value); } return { ok: true, value: Object.freeze(values) };
   }
   private operationFor(form: NonNullable<PluginInventoryFocusController["form"]>, exact: readonly PluginLifecycleExactTarget[]): PluginInventoryOperation | undefined {
-    const by = (name: string) => this.fieldValue(name); const target = this.targetIdentity(); const flags = { yes: false, declarationOnly: false } as const; const selector = exact.find((value) => value.kind === "plugin")?.selector; const marketplaceSelector = exact.find((value) => value.kind === "marketplace")?.selector;
-    if (form.action === "marketplace-add") return { kind: "marketplace-add", name: by("marketplace name")!, sourceKind: by("source kind") as "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog", sourceValue: by("source")!, flags: { ...flags, scope: by("scope") as "user" | "project" | "local" } };
+    const by = (name: string) => this.fieldValue(name); const target = this.targetIdentity(); const flags = { yes: false, declarationOnly: by("declaration only") === "yes" } as const; const selector = exact.find((value) => value.kind === "plugin")?.selector; const marketplaceSelector = exact.find((value) => value.kind === "marketplace")?.selector;
+    if (form.action === "marketplace-add") { const ref = by("Git ref"); return { kind: "marketplace-add", name: by("marketplace name")!, sourceKind: by("source kind") as "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog", sourceValue: by("source")!, ...(ref === undefined || ref === "" ? {} : { ref }), flags: { ...flags, scope: by("scope") as "user" | "project" | "local" } }; }
     if (form.action === "marketplace-refresh") return { kind: "marketplace-refresh", name: target!, flags: { ...flags, ...(marketplaceSelector === undefined ? {} : { selector: marketplaceSelector }) } };
     if (form.action === "marketplace-remove") return { kind: "marketplace-remove", name: target!, flags: { ...flags, ...(marketplaceSelector === undefined ? {} : { selector: marketplaceSelector }), preserveInstalled: true } };
     if (form.action === "recover") return { kind: "recover", operationId: target!, flags: { ...flags, recoveryAction: by("recovery result") as "complete" | "rollback" } };
@@ -394,32 +451,37 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
   }
 
   private async planForm(): Promise<void> {
-    const form = this.form; if (form === undefined) return; const epoch = this.workflowEpoch; this.abort = new AbortController(); const planningAbort = this.abort;
+    const form = this.form; if (form === undefined) return; const privateValues = ["source", "Git ref"].map((name) => this.fieldValue(name)).filter((value): value is string => value !== undefined && value.length > 0); const epoch = this.workflowEpoch; this.abort = new AbortController(); const planningAbort = this.abort;
     this.model.setWorkflow({ phase: "planning", action: form.action, ...(form.target === undefined ? {} : { target: form.target }) }); if (!this.repaint()) { await this.cancelWorkflow(); return; }
     try {
-      const composed = await this.compose(epoch); if (epoch !== this.workflowEpoch || planningAbort.signal.aborted || this.disposed) return; if (!composed.ok) { this.planFailure(composed, form); return; }
-      const exact = this.exactTargets(composed.value, form); if (!exact.ok) { this.planFailure(exact, form); return; } const operation = this.operationFor(form, exact.value); if (operation === undefined) { this.planFailure({ code: "invalid-input", message: "Lifecycle input could not be composed" }, form); return; }
-      const sourceIndex = form.fields.findIndex((field) => field.name === "source"); if (sourceIndex >= 0) form.values[sourceIndex] = "";
+      const composed = await this.compose(epoch); if (epoch !== this.workflowEpoch || planningAbort.signal.aborted || this.disposed) return; if (!composed.ok) { this.planFailure(composed, form, privateValues); return; }
+      const exact = this.exactTargets(composed.value, form); if (!exact.ok) { this.planFailure(exact, form, privateValues); return; } const operation = this.operationFor(form, exact.value); if (operation === undefined) { this.planFailure({ code: "invalid-input", message: "Lifecycle input could not be composed" }, form, privateValues); return; }
+      for (const privateField of ["source", "Git ref"]) { const index = form.fields.findIndex((field) => field.name === privateField); if (index >= 0) form.values[index] = ""; }
       if (operation.kind === "recover") {
-        const result = await composed.value.recovery.preview(operation.operationId); if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) return; if (!result.ok) { this.planFailure(result, form); return; }
+        const result = await composed.value.recovery.preview(operation.operationId); if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) return; if (!result.ok) { this.planFailure(result, form, privateValues); return; }
         const selected = operation.flags.recoveryAction; const projection = confirmationProjection(result.value, form.action, exact.value, selected); const enabled = selected !== undefined && result.value.actions.includes(selected) && projection.omissions === 0;
         this.model.setWorkflow({ phase: "preview", action: form.action, operationId: result.value.operationId, target: { kind: "recovery", identity: operation.operationId }, projection, detailScroll: 0, confirmationEnabled: enabled });
       } else if (operation.kind.startsWith("marketplace-")) {
         const result = await composed.value.marketplaces.plan(operation as Extract<PluginInventoryOperation, { kind: "marketplace-add" | "marketplace-refresh" | "marketplace-remove" }>, planningAbort.signal);
-        if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) { if (result.ok) await composed.value.marketplaces.discardPreview(result.value.operationId); return; } if (!result.ok) { this.planFailure(result, form); return; }
+        if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) { if (result.ok) await composed.value.marketplaces.discardPreview(result.value.operationId); return; } if (!result.ok) { this.planFailure(result, form, privateValues); return; }
         const projection = confirmationProjection(result.value, form.action, exact.value); this.prepared = { kind: "marketplace", preview: result.value }; this.model.setWorkflow({ phase: "preview", action: form.action, operationId: result.value.operationId, ...(form.target === undefined ? {} : { target: form.target }), projection, detailScroll: 0, confirmationEnabled: projection.omissions === 0 });
       } else {
         const result = await composed.value.plugins.plan(operation as Extract<PluginInventoryOperation, { kind: "install" | "enable" | "disable" | "update" | "uninstall" }>, planningAbort.signal);
-        if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) { if (result.ok) await composed.value.plugins.discardPreview(result.value.operationId); return; } if (!result.ok) { this.planFailure(result, form); return; }
+        if (epoch !== this.workflowEpoch || planningAbort.signal.aborted) { if (result.ok) await composed.value.plugins.discardPreview(result.value.operationId); return; } if (!result.ok) { this.planFailure(result, form, privateValues); return; }
         const projection = confirmationProjection(result.value, form.action, exact.value); this.prepared = { kind: "plugin", preview: result.value }; this.model.setWorkflow({ phase: "preview", action: form.action, operationId: result.value.operationId, ...(form.target === undefined ? {} : { target: form.target }), projection, detailScroll: 0, confirmationEnabled: projection.omissions === 0 });
       }
-    } catch { if (epoch === this.workflowEpoch) this.model.failWorkflow("Lifecycle planning failed closed in production composition; no execution was attempted.", form.action, undefined, form.target); }
+    } catch {
+      if (epoch === this.workflowEpoch) {
+        const { action, target } = form;
+        this.clearPrivateInput();
+        this.model.failWorkflow("Lifecycle planning failed closed. Check lifecycle service availability and retry planning. Planning stopped before execution; no change was made.", action, undefined, target);
+      }
+    }
     finally { if (this.abort === planningAbort) this.abort = undefined; if (epoch === this.workflowEpoch && !this.disposed) this.repaint(); }
   }
-  private planFailure(result: { readonly code: string; readonly message: string }, form: NonNullable<PluginInventoryFocusController["form"]>): void {
-    const guidance = result.code === "managed-readonly" ? "Administrator-owned target; ask the administrator to change it." : result.code === "imported-readonly" ? "Claude-owned target; use Claude Code to change it." : result.code === "stale-selector" ? "Selected exact scoped record changed; refresh inventory and select it again." : "Production lifecycle planning refused or failed closed; no execution was attempted.";
-    const publicCode = (result.code === "stale-selector" ? "target changed" : result.code.replace(/-/gu, " ")).replace(/[^A-Za-z0-9 ]/gu, " ");
-    this.clearPrivateInput(); this.model.failWorkflow(`${publicCode}. ${guidance}`, form.action, undefined, form.target);
+  private planFailure(result: { readonly code: string; readonly message: string }, form: NonNullable<PluginInventoryFocusController["form"]>, _privateValues: readonly string[] = []): void {
+    const presentation = planningCause(result.code);
+    this.clearPrivateInput(); this.model.failWorkflow(`${presentation.cause}. ${presentation.guidance} Planning stopped before execution; no change was made.`, form.action, undefined, form.target);
   }
 
   private async executePrepared(): Promise<void> {

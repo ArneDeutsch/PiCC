@@ -1008,8 +1008,9 @@ describe("reserved plugin-management commands", () => {
   });
 
   it("keeps headless lifecycle requests inert and collects TUI workflow values without transcript egress", async () => {
-    let compositions = 0; const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] }); let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
-    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk, pluginLifecycle: async () => { compositions += 1; return { ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }; } }, (projectRoot) => {
+    let compositions = 0; let marketplaceOperation: any; const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] }); let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
+    const lifecycle = { marketplaces: { plan: async (operation: unknown) => { marketplaceOperation = operation; return { ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }; } }, plugins: { plan: async () => ({ ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true as const, value: undefined }), projection: () => ({ ok: false as const, code: "unused", message: "unused" }) };
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk, pluginLifecycle: async () => { compositions += 1; return { ok: true as const, value: lifecycle as never }; } }, (projectRoot) => {
       hookFixture = createHookProcessFixture(projectRoot); const settingsPath = path.join(projectRoot, ".claude", "settings.json"); fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown> : {}; settings.env = hookFixture.env; settings.hooks = { UserPromptSubmit: [{ hooks: [{ type: "command", command: hookFixture.command, args: ["complete", "plugin-lifecycle-headless"] }] }] }; fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
     });
     try {
@@ -1028,15 +1029,23 @@ describe("reserved plugin-management commands", () => {
       custom.input("\r");
       custom.input("alpha@official"); custom.input("\r");
       custom.input("user"); custom.input("\r");
-      await vi.waitFor(() => expect(custom.render(72).join("\n")).toContain("fixture unavailable"));
+      custom.input("no"); custom.input("\r");
+      await vi.waitFor(() => expect(custom.render(72).join("\n")).toContain("planning refusal"));
+      expect(custom.render(72).join("\n")).not.toContain("fixture unavailable");
       expect(compositions).toBe(1);
       expect(custom.render(72).join("\n")).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)/u);
       custom.input("\u001b"); custom.input("\u001b"); await opening;
 
+      const sourceCanary = "https://user:MARKET_SOURCE_PASSWORD_CANARY@example.test/repo.git"; const refCanary = "MARKET_REF_TOKEN_CANARY";
+      const marketplaceOpening = fresh.commands.get("plugin").handler("marketplace add", fresh.tuiCtx()); await Promise.resolve(); const marketplacePane = fresh.customs.at(-1)!; await marketplacePane.ready;
+      marketplacePane.input("\r"); for (const value of ["new-market", "https-git", sourceCanary, refCanary, "user", "no"]) { marketplacePane.input(value); marketplacePane.input("\r"); }
+      await vi.waitFor(() => expect(marketplaceOperation).toMatchObject({ kind: "marketplace-add", sourceValue: sourceCanary, ref: refCanary, flags: { declarationOnly: false } }));
+      expect(marketplacePane.render(72).join("\n")).not.toMatch(/MARKET_(?:SOURCE_PASSWORD|REF_TOKEN)_CANARY/u); marketplacePane.input("\u001b"); marketplacePane.input("\u001b"); await marketplaceOpening;
+
       for (const [args, expected] of [["enable TRAILING_RAW_SECRET", "enable"], ["disable TRAILING_RAW_SECRET", "disable"], ["update TRAILING_RAW_SECRET", "update"], ["uninstall TRAILING_RAW_SECRET", "uninstall"], ["marketplace add TRAILING_RAW_SECRET", "marketplace-add"], ["marketplace refresh TRAILING_RAW_SECRET", "marketplace-refresh"], ["marketplace remove TRAILING_RAW_SECRET", "marketplace-remove"], ["recover TRAILING_RAW_SECRET", "recover"]] as const) {
         const routed = fresh.commands.get("plugin").handler(args, fresh.tuiCtx()); await Promise.resolve(); const pane = fresh.customs.at(-1)!; await pane.ready; const text = pane.render(72).join("\n"); expect(text).toContain(expected); expect(text).not.toContain("TRAILING_RAW_SECRET"); pane.input("\u001b"); pane.input("\u001b"); await routed;
       }
-      expect(JSON.stringify(fresh.entries)).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)|TRAILING_RAW_SECRET/u);
+      expect(JSON.stringify({ entries: fresh.entries, messages: fresh.messages, userMessages: fresh.userMessages })).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)|TRAILING_RAW_SECRET|MARKET_(?:SOURCE_PASSWORD|REF_TOKEN)_CANARY/u);
       expect(fresh.messages).toEqual([]); expect(fresh.userMessages).toEqual([]); expect(sdk.promptCalls()).toBe(0); expect(hookFixture?.spawnedChildren()).toHaveLength(0);
     } finally { await hookFixture?.cleanup("plugin-lifecycle-headless"); cleanupFixture(root); }
   });

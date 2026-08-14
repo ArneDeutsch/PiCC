@@ -363,14 +363,14 @@ export class PluginInventoryModel {
     this.detailTarget = undefined;
     this.scroll = 0;
     this.warningText = parseQualifiedPluginId(identity) !== undefined
-      ? `Plugin details display failed for ${identity}. Esc closes. Use /plugin list or run /plugin details ${identity}`
-      : "Plugin details display failed. Esc closes. Use /plugin list, then /plugin details <qualified-name>.";
+      ? `Plugin details display failed for ${identity}. Esc closes. Run picc plugin list or picc plugin details ${identity}`
+      : "Plugin details display failed. Esc closes. Run picc plugin list, then picc plugin details <qualified-name>.";
     this.bump();
   }
   failSurface(): void {
     this.detailTarget = undefined;
     this.scroll = 0;
-    this.warningText = "Plugin inventory display failed; the read-only list remains available. Esc closes. Use /plugin list or /plugin details <qualified-name>.";
+    this.warningText = "Plugin inventory display failed; the read-only list remains available. Esc closes. Run picc plugin list or picc plugin details <qualified-name>.";
     this.bump();
   }
 
