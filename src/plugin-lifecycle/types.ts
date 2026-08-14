@@ -1,4 +1,4 @@
-import type { PluginInstallationScope, PluginManifestDefaultEnabledEvidence } from "../types.js";
+import type { PluginInstallationScope } from "../types.js";
 
 export const PLUGIN_LIFECYCLE_LIMITS = Object.freeze({
   maximumArrayItems: 1024,
@@ -65,14 +65,4 @@ export type LifecycleSettingsTarget =
 export interface PluginDataIdentity {
   readonly profileKey: LifecycleProfileKey;
   readonly identity: QualifiedPluginIdentity;
-}
-
-export type DefaultEnabledEvidence =
-  | { readonly presence: "explicit"; readonly value: boolean }
-  | { readonly presence: "absent" };
-
-export interface InitialEnablementEvidence {
-  readonly existingEffective: DefaultEnabledEvidence;
-  readonly marketplaceDefault: DefaultEnabledEvidence;
-  readonly manifestDefault: PluginManifestDefaultEnabledEvidence;
 }

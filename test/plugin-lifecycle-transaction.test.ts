@@ -10,7 +10,7 @@ import { previewRecovery, recoverTransaction } from "../src/plugin-lifecycle/rec
 import { createPluginSettingsTransactionCodec } from "../src/plugin-lifecycle/settings-writer.js";
 import { canonicalJsonBytes, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore, type StoreResult } from "../src/plugin-lifecycle/state-store.js";
 import {
-  cleanupCommittedOwnedDataRetirement, completeJournal, createOwnedDataRetirementParticipant, createTransactionCodecRegistry, executeTransaction, observePersistedTransactionsSync, prepareTransaction, readTransactionJournal, readTransactionReceipt, rollbackJournal,
+  completeJournal, createOwnedDataRetirementParticipant, createTransactionCodecRegistry, executeTransaction, observePersistedTransactionsSync, prepareTransaction, readTransactionJournal, readTransactionReceipt, rollbackJournal,
   isOwnedDataRetirementParticipant, type OrdinaryTransactionParticipant, type OwnedDataRetirementParticipant, type PreparedTransaction, type TransactionFaultPhase, type TransactionParticipant, type TransactionProducerCodec,
 } from "../src/plugin-lifecycle/transaction.js";
 
@@ -71,7 +71,7 @@ async function recovery(store: OwnedStateStore, operationId: string, action: "co
 }
 
 describe("owned lifecycle transactions", () => {
-  it("retires one exact owned data directory, recovers prefixes, and cleans quarantine without following links", async () => {
+  it("retires one exact owned data directory and recovers prefixes", async () => {
     const makeCodec = (store: OwnedStateStore): TransactionProducerCodec => ({ ...codec, schema: "test.owned-data-retirement", requiredLocks: () => ({ ok: true, value: lockVector(store) }),
       authorizeOwnedDataRetirement(context) { return (context.participant.producerEvidence as { authority?: string }).authority === "last-reference" ? { ok: true, value: undefined } : { ok: false, code: "denied", message: "denied" }; } });
     for (const selected of ["present", "absent", "complete", "rollback"] as const) {
@@ -90,20 +90,6 @@ describe("owned lifecycle transactions", () => {
       }
       expect(outcome).toMatchObject({ state: "committed", receipt: { participants: [{ kind: "owned-data-retirement", state: selected === "absent" ? "absent" : "present" }] } });
       expect(await exists(item.dataPath)).toBe(false); expect(await exists(item.destinationPath)).toBe(selected === "present");
-      if (selected === "present") {
-        const cleaned = await cleanupCommittedOwnedDataRetirement({ store, operationId, registry: registry(selectedCodec) }); expect(cleaned).toMatchObject({ ok: true, value: { removed: false, retained: true } });
-        expect(await exists(item.destinationPath)).toBe(true);
-      }
-    }
-
-    for (const selectedPhase of ["before-data-cleanup-entry", "after-data-cleanup-entry"] as const) {
-      const cleanupStore = await fixture(); const cleanupId = `data-retirement-cleanup-${selectedPhase}`; const cleanupIdentity = `cleanup-${selectedPhase}@official`; const cleanupSource = path.join(cleanupStore.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(cleanupIdentity).digest("base64url")}`); await fs.mkdir(cleanupSource);
-      const cleanupItem = await createOwnedDataRetirementParticipant({ store: cleanupStore, operationId: cleanupId, participantIndex: 0, key: "data", qualifiedIdentity: cleanupIdentity, producerEvidence: { authority: "last-reference" } }); if (!cleanupItem.ok) throw new Error(cleanupItem.message); const cleanupCodec = makeCodec(cleanupStore); const cleanupPlan = await prepared(cleanupStore, cleanupId, [cleanupItem.value], cleanupCodec); const cleanupLease = await lease(cleanupStore, cleanupId); expect(await executeTransaction(cleanupStore, cleanupPlan, { lease: cleanupLease })).toMatchObject({ state: "committed" }); let cleanupFault = false;
-      const expected = selectedPhase === "before-data-cleanup-entry" ? { removed: false, retained: true } : { removed: true, retained: false };
-      expect(await cleanupCommittedOwnedDataRetirement({ store: cleanupStore, operationId: cleanupId, registry: registry(cleanupCodec), faults: { hit(phase) { if (!cleanupFault && phase === selectedPhase) { cleanupFault = true; throw new Error("cleanup-interrupted"); } } } })).toMatchObject({ ok: true, value: expected });
-      expect(await exists(cleanupItem.value.destinationPath)).toBe(selectedPhase === "before-data-cleanup-entry"); expect(await readTransactionReceipt(cleanupStore, cleanupId)).toMatchObject({ ok: true, value: { outcome: "committed" } });
-      expect(await cleanupCommittedOwnedDataRetirement({ store: cleanupStore, operationId: cleanupId, registry: registry(cleanupCodec) })).toMatchObject({ ok: true, value: { removed: true, retained: false } });
-      expect(await exists(cleanupItem.value.destinationPath)).toBe(false);
     }
 
     const store = await fixture(); const operationId = "data-retirement-recreated"; const identity = "recreated@official"; const expected = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); await fs.mkdir(expected);
@@ -123,7 +109,7 @@ describe("owned lifecycle transactions", () => {
     await fs.rm(unsafePath, { recursive: true, force: true }); await fs.writeFile(unsafePath, "wrong-kind"); expect(await createOwnedDataRetirementParticipant({ store: unsafeStore, operationId: "wrong-kind", participantIndex: 0, key: "data", qualifiedIdentity: unsafeIdentity, producerEvidence: {} })).toMatchObject({ ok: false });
   });
 
-  it.skipIf(!LINK_AVAILABLE)("retains retired link trees without touching an outside canary", async () => {
+  it.skipIf(!LINK_AVAILABLE)("logically retires link trees without touching an outside canary", async () => {
     const store = await fixture(); const operationId = "data-retirement-link-tree"; const identity = "link-tree@official";
     const source = path.join(store.dataRoot, `plugin-${(await import("node:crypto")).createHash("sha256").update(identity).digest("base64url")}`); const outside = path.join(path.dirname(store.profileRoot), "outside-link-canary");
     await fs.mkdir(source); await fs.writeFile(outside, "outside"); await fs.symlink(outside, path.join(source, "link"), "file");
@@ -132,7 +118,6 @@ describe("owned lifecycle transactions", () => {
     const selectedCodec: TransactionProducerCodec = { ...codec, schema: "test.link-retirement", requiredLocks: () => ({ ok: true, value: lockVector(store) }), authorizeOwnedDataRetirement: () => ({ ok: true, value: undefined }) };
     const plan = await prepared(store, operationId, [item.value], selectedCodec); const held = await lease(store, operationId); expect(await executeTransaction(store, plan, { lease: held })).toMatchObject({ state: "committed" });
     expect((await fs.lstat(path.join(item.value.destinationPath, "link"))).isSymbolicLink()).toBe(true);
-    expect(await cleanupCommittedOwnedDataRetirement({ store, operationId, registry: registry(selectedCodec) })).toMatchObject({ ok: true, value: { removed: false, retained: true } });
     expect(await exists(item.value.destinationPath)).toBe(true); expect(await bytes(outside)).toBe("outside");
   });
 

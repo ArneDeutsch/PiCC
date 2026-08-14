@@ -10,8 +10,6 @@ import { MAX_QUALIFIED_PLUGIN_ID_LENGTH, parseQualifiedPluginId } from "../util/
 import { lifecycleError, type ContractResult } from "./errors.js";
 import type {
   CatalogPluginSource,
-  DefaultEnabledEvidence,
-  InitialEnablementEvidence,
   MarketplaceRegistrationSource,
   MarketplaceSourceAdapter,
   PluginSourceAdapter,
@@ -366,16 +364,3 @@ export function qualifiedPluginIdentity(name: string, marketplace: string): Cont
     ? { ok: true, value: candidate as QualifiedPluginIdentity }
     : lifecycleError("invalid-identity", "Plugin identity must use the bounded documented qualified identity grammar");
 }
-
-export function resolveInitialEnablement(evidence: InitialEnablementEvidence): boolean {
-  for (const candidate of [evidence.existingEffective, evidence.marketplaceDefault, evidence.manifestDefault]) {
-    if (candidate.presence === "explicit") return candidate.value;
-  }
-  return true;
-}
-
-export function explicitDefault(value: boolean): DefaultEnabledEvidence {
-  return Object.freeze({ presence: "explicit", value });
-}
-
-export const ABSENT_DEFAULT: DefaultEnabledEvidence = Object.freeze({ presence: "absent" });

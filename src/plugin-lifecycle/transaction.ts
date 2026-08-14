@@ -480,7 +480,7 @@ async function authorizeRetirement(codec: TransactionProducerCodec, journal: Pre
   if (result === undefined || !result.ok) throw new Error("owned-data-retirement-authority");
 }
 
-export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-parent-creation" | "after-parent-creation" | "before-parent-identity-journal" | "after-parent-identity-journal" | "before-parent-publication" | "after-parent-publication" | "before-parent-removal" | "after-parent-removal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-forward-deletion" | "after-forward-deletion-marker" | "after-forward-deletion-mutation" | "after-forward-deletion" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement" | "before-data-retirement-rename" | "after-data-retirement-rename" | "after-data-retirement-sync" | "before-data-rollback-rename" | "after-data-rollback-rename" | "after-data-rollback-sync" | "before-data-cleanup-entry" | "after-data-cleanup-entry";
+export type TransactionFaultPhase = "before-journal" | "after-journal" | "before-parent-creation" | "after-parent-creation" | "before-parent-identity-journal" | "after-parent-identity-journal" | "before-parent-publication" | "after-parent-publication" | "before-parent-removal" | "after-parent-removal" | "before-temp-write" | "after-temp-write" | "after-flush" | "before-replacement" | "after-replacement" | "before-forward-deletion" | "after-forward-deletion-marker" | "after-forward-deletion-mutation" | "after-forward-deletion" | "before-generation-marker" | "after-generation-marker" | "before-receipt" | "after-receipt" | "before-retirement" | "after-retirement" | "before-data-retirement-rename" | "after-data-retirement-rename" | "after-data-retirement-sync" | "before-data-rollback-rename" | "after-data-rollback-rename" | "after-data-rollback-sync";
 export interface TransactionFaultSeam { readonly hit: (phase: TransactionFaultPhase, participantIndex?: number) => void | Promise<void> }
 const NO_FAULTS: TransactionFaultSeam = Object.freeze({ hit: () => undefined });
 export interface TransactionJournal extends PreparedTransaction {
@@ -1064,31 +1064,6 @@ export async function completeJournal(store: OwnedStateStore, journal: Transacti
     const receipt = receiptFrom(current, "committed"); await persistReceipt(store, receipt, lease, faults); await retireTerminalDeletionMarkers(store, current, lease).catch(() => undefined); await retireJournal(store, current, lease, faults).catch(() => undefined); return { ok: true, value: receipt };
   } catch { const receipt = await readTransactionReceipt(store, current.operationId); return receipt.ok && receipt.value !== undefined ? { ok: true, value: receipt.value } : fail("recovery-interrupted", "Explicit completion remains pending"); }
 }
-export interface OwnedDataRetirementCleanupResult { readonly removed: boolean; readonly retained: boolean }
-async function removeEmptyRetiredDirectory(store: OwnedStateStore, participant: OwnedDataRetirementParticipant, faults: TransactionFaultSeam, index: number): Promise<void> {
-  if (await retirementStatus(store, participant) !== "retired") throw new Error("cleanup-identity-changed");
-  await faults.hit("before-data-cleanup-entry", index);
-  if (await retirementStatus(store, participant) !== "retired") throw new Error("cleanup-identity-changed");
-  await fs.rmdir(participant.destinationPath);
-  await faults.hit("after-data-cleanup-entry", index);
-}
-export async function cleanupCommittedOwnedDataRetirement(inputs: { readonly store: OwnedStateStore; readonly operationId: string; readonly registry: TransactionCodecRegistry; readonly faults?: TransactionFaultSeam }): Promise<StoreResult<OwnedDataRetirementCleanupResult>> {
-  const storeValid = await revalidateOwnedStateStore(inputs.store); if (!storeValid.ok) return storeValid;
-  const receipt = await readTransactionReceipt(inputs.store, inputs.operationId); if (!receipt.ok || receipt.value === undefined || receipt.value.outcome !== "committed") return fail("cleanup-ineligible", "Only an exact committed retirement receipt authorizes physical cleanup");
-  const codec = inputs.registry.lookup(receipt.value.producerSchema, receipt.value.producerVersion); if (codec === undefined) return fail("unknown-producer", "Retirement cleanup producer is unavailable");
-  const valid = await revalidatePersistedTransaction(inputs.store, receipt.value, codec); if (!valid.ok) return valid;
-  const faults = inputs.faults ?? NO_FAULTS; let removed = false; let retained = false;
-  for (const [index, participant] of receipt.value.participants.entries()) {
-    if (!isOwnedDataRetirement(participant) || participant.state === "absent") continue;
-    const status = await retirementStatus(inputs.store, participant);
-    if (status === "invalid" || status === "source") { retained = true; continue; }
-    if (status === "absent-noop" || status === "cleaned") { removed = true; continue; }
-    try { await removeEmptyRetiredDirectory(inputs.store, participant, faults, index); await syncDirectory(inputs.store.quarantineRoot); removed = true; }
-    catch { if (await retirementStatus(inputs.store, participant) === "cleaned") removed = true; else retained = true; }
-  }
-  return { ok: true, value: Object.freeze({ removed, retained }) };
-}
-
 export async function rollbackJournal(store: OwnedStateStore, journal: TransactionJournal, codec: TransactionProducerCodec, lease: LifecycleLockLease, faults: TransactionFaultSeam = NO_FAULTS): Promise<StoreResult<TransactionReceipt>> {
   let current = Object.freeze({ ...journal, state: "rolling-back" as const });
   try {

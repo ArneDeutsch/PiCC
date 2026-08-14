@@ -9,13 +9,11 @@ import {
   pluginDataPath,
   profileLocationKey,
 } from "../src/plugin-lifecycle/locations.js";
+import { resolveInitialPluginEnablement } from "../src/plugin-lifecycle/enablement.js";
 import {
-  ABSENT_DEFAULT,
   SOURCE_MATRIX,
-  explicitDefault,
   normalizePortableRelativePath,
   qualifiedPluginIdentity,
-  resolveInitialEnablement,
   routeCatalogPluginSource,
   routeMarketplaceSource,
 } from "../src/plugin-lifecycle/source-matrix.js";
@@ -427,11 +425,11 @@ describe("cross-assembly declaration and evidence vocabulary", () => {
     const manifestTrue = { presence: "explicit", value: true, sourcePath: "/plugin/plugin.json" } as const;
     const manifestFalse = { ...manifestTrue, value: false } as const;
     const manifestAbsent: PluginManifestDefaultEnabledEvidence = { presence: "absent", sourcePath: "/plugin/plugin.json" };
-    expect(resolveInitialEnablement({ existingEffective: explicitDefault(false), marketplaceDefault: explicitDefault(true), manifestDefault: manifestTrue })).toBe(false);
-    expect(resolveInitialEnablement({ existingEffective: explicitDefault(true), marketplaceDefault: explicitDefault(false), manifestDefault: manifestFalse })).toBe(true);
-    expect(resolveInitialEnablement({ existingEffective: ABSENT_DEFAULT, marketplaceDefault: explicitDefault(false), manifestDefault: manifestTrue })).toBe(false);
-    expect(resolveInitialEnablement({ existingEffective: ABSENT_DEFAULT, marketplaceDefault: explicitDefault(true), manifestDefault: manifestFalse })).toBe(true);
-    expect(resolveInitialEnablement({ existingEffective: ABSENT_DEFAULT, marketplaceDefault: ABSENT_DEFAULT, manifestDefault: manifestFalse })).toBe(false);
-    expect(resolveInitialEnablement({ existingEffective: ABSENT_DEFAULT, marketplaceDefault: ABSENT_DEFAULT, manifestDefault: manifestAbsent })).toBe(true);
+    expect(resolveInitialPluginEnablement({ existingEffective: false, marketplaceDefault: true, manifestDefault: manifestTrue })).toEqual({ enabled: false, source: "existing-effective" });
+    expect(resolveInitialPluginEnablement({ existingEffective: true, marketplaceDefault: false, manifestDefault: manifestFalse })).toEqual({ enabled: true, source: "existing-effective" });
+    expect(resolveInitialPluginEnablement({ marketplaceDefault: false, manifestDefault: manifestTrue })).toEqual({ enabled: false, source: "marketplace-default" });
+    expect(resolveInitialPluginEnablement({ marketplaceDefault: true, manifestDefault: manifestFalse })).toEqual({ enabled: true, source: "marketplace-default" });
+    expect(resolveInitialPluginEnablement({ manifestDefault: manifestFalse })).toEqual({ enabled: false, source: "manifest-default" });
+    expect(resolveInitialPluginEnablement({ manifestDefault: manifestAbsent })).toEqual({ enabled: true, source: "default-enabled" });
   });
 });

@@ -15,7 +15,3 @@ export function resolveInitialPluginEnablement(inputs: {
   if (manifest !== undefined) return Object.freeze({ enabled: manifest, source: "manifest-default" });
   return Object.freeze({ enabled: true, source: "default-enabled" });
 }
-
-export function preservedPluginEnablement(existingExplicit: boolean | undefined): boolean | undefined {
-  return existingExplicit;
-}
