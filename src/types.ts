@@ -1023,7 +1023,7 @@ export interface CapabilityEntry {
 export interface ClaudeProject {
   /** Repo root (or cwd when not in a repo). */
   root: string;
-  /** Launch cwd. */
+  /** Effective cwd used for this project assembly. */
   cwd: string;
   userDir: string; // ~/.claude
   settings: ClaudeSettings;

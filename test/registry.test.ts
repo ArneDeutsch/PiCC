@@ -709,7 +709,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("setting.extraKnownMarketplaces")?.note).toMatch(/PiCC can write selected[\s\S]*Claude-owned, seed, and managed.*read-only/);
 
     for (const id of ["feature.plugins-inventory", "feature.plugins-launcher-inventory", "feature.plugins-marketplace-observation"] as const) expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
-    expect(lookupCapability("feature.plugins-inventory")?.note).toMatch(/observational snapshot[\s\S]*`\/plugins`[\s\S]*passive browsing remain inert[\s\S]*No stable JSON automation/);
+    expect(lookupCapability("feature.plugins-inventory")?.note).toMatch(/observational projection[\s\S]*Fixed `\/plugins` and `\/doctor` consume the startup capture[\s\S]*Interactive `\/plugin` keeps loaded-runtime truth captured while freshly assembling effective desired authority from the active checkout[\s\S]*Every passive view remains inert and acquisition-free[\s\S]*No stable JSON automation/);
     expect(lookupCapability("feature.plugins-launcher-inventory")?.note).toMatch(/explicit marketplace, install, enable, disable, update, uninstall, and offline recovery[\s\S]*previews and confirmation/);
     expect(lookupCapability("feature.plugins-marketplace-observation")?.note).toMatch(/Claude-owned, seed, and managed[\s\S]*exact selected PiCC-owned records[\s\S]*refresh changes retained catalog snapshots but never installed executable generation membership/);
 

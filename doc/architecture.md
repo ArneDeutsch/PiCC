@@ -216,12 +216,13 @@ separate bounded, contained read capability and cannot authorize execution.
 
 The snapshot is observational, never an execution input. Catalog declarations can describe
 components, dependencies, and renames for inventory, but never authorize a root, merge content,
-resolve dependencies, rewrite settings, or start unsupported components. Session `/plugin` views,
-startup diagnostics, and `/doctor` consume the same fixed snapshot for the extension lifetime;
-launcher inventory commands build one command-scoped snapshot without normal runtime startup.
-Consumers produce bounded, redacted projections without rereading plugin state. Post-capture
-point-of-use refusals remain separate live evidence. Refreshing a session snapshot requires `/reload-plugins` in the interactive TUI or a new PiCC
-session. Construction and viewing perform no
+resolve dependencies, rewrite settings, or start unsupported components. Fixed `/plugins`, startup
+diagnostics, and `/doctor` consume the startup snapshot for the extension lifetime. Interactive
+`/plugin` keeps loaded-runtime truth from that capture but freshly assembles desired authority from
+the active checkout at each open; launcher inventory commands build one command-scoped snapshot
+without normal runtime startup. These passive projections are bounded and redacted. Post-capture
+point-of-use refusals remain separate live evidence. Loaded runtime changes only after
+`/reload-plugins` succeeds or a new PiCC session starts. Construction and viewing perform no
 marketplace refresh or acquisition, settings or registry writes, plugin process startup, hook
 execution, usage mutation, or prompt-cache invalidation.
 

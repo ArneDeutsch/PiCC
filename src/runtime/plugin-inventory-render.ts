@@ -56,12 +56,12 @@ function pluginStatusColor(row: Extract<PluginInventoryRow, { kind: "plugin" }>)
 function framing(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): void {
   addWrapped(lines, theme, "accent", "PiCC plugin inventory · lifecycle", width);
   const phase = view.workflow?.phase;
-  if (phase === undefined) addWrapped(lines, theme, "muted", "read-only · captured for this session · browsing is inert", width);
+  if (phase === undefined) addWrapped(lines, theme, "muted", "read-only · captured loaded runtime + active-checkout desired state · browsing is inert", width);
   else if (phase === "receipt") addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; this receipt is authoritative.", width);
   else if (["progress", "pending-recovery", "terminal-fallback"].includes(phase)) addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative.", width);
   else addWrapped(lines, theme, "muted", "Workflow active · no durable change until final confirmation; planning and preview do not execute.", width);
-  addWrapped(lines, theme, "muted", "Durable desired state refreshes after receipts; loaded runtime remains captured.", width);
-  addWrapped(lines, theme, "muted", `Generation: loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
+  addWrapped(lines, theme, "muted", "Effective desired state comes from the active checkout at /plugin open and refreshes after receipts; loaded runtime remains session-captured.", width);
+  addWrapped(lines, theme, "muted", `Generation: captured loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · effective desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
   if (view.actionOverlay) addWrapped(lines, theme, view.actionOverlay.phase === "failed" || view.actionOverlay.phase === "reload-unconfirmed" ? "warning" : "accent", `Overlay: ${safe(view.actionOverlay.phase, 40)} · ${safe(view.actionOverlay.target ?? view.actionOverlay.operationId, 100)}${view.actionOverlay.message ? ` · ${safe(view.actionOverlay.message)}` : ""}`, width);
   addWrapped(lines, theme, "muted", "Refresh loaded runtime: run /reload-plugins in the interactive TUI, or exit and relaunch PiCC.", width);
   if (view.activeView === "Discover" || view.activeView === "Marketplaces") {
@@ -101,7 +101,7 @@ function rowSummary(row: PluginInventoryRow): { identity: string; summary: strin
   const invalid = item.installations.length - valid;
   return {
     identity: qualifiedIdentity(row.identity),
-    summary: `installation records ${valid} valid / ${invalid} invalid · session outcome ${safe(item.outcome?.status ?? "not resolved", 80)} · owner ${safe(item.lifecycle?.ownership ?? "unknown", 40)} · desired ${item.lifecycle === undefined ? "unknown" : item.lifecycle.installed ? "installed" : "not installed"}/${item.lifecycle?.effectiveEnabled === undefined ? "enablement unknown" : item.lifecycle.effectiveEnabled ? "enabled" : "disabled"} · loaded ${item.lifecycle?.loaded ? "yes" : "no"} · eligibility ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(",") : "none"}${item.lifecycle?.selectionRequired ? " · scope selection required" : ""} · ${support.text}`,
+    summary: `installation records ${valid} valid / ${invalid} invalid · captured runtime outcome ${safe(item.outcome?.status ?? "not resolved", 80)} · owner ${safe(item.lifecycle?.ownership ?? "unknown", 40)} · active-checkout desired ${item.lifecycle === undefined ? "unknown" : item.lifecycle.installed ? "installed" : "not installed"}/${item.lifecycle?.effectiveEnabled === undefined ? "enablement unknown" : item.lifecycle.effectiveEnabled ? "enabled" : "disabled"} · captured loaded ${item.lifecycle?.loaded ? "yes" : "no"} · eligibility ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(",") : "none"}${item.lifecycle?.selectionRequired ? " · scope selection required" : ""} · ${support.text}`,
     color: pluginStatusColor(row),
   };
 }
@@ -117,7 +117,7 @@ function renderList(view: PluginInventoryModelView, theme: unknown, width: numbe
   if (view.warning) addWrapped(lines, theme, "warning", `Warning: ${view.warning}`, width);
   addWrapped(lines, theme, view.filter ? "accent" : "muted", `Filter: ${view.filter ? safe(view.filter) : "(type to filter literally)"}`, width);
   if (view.rows.length === 0) {
-    addWrapped(lines, theme, "warning", view.filter ? "No matches for the active literal filter." : `No ${view.activeView.toLocaleLowerCase()} entries in this captured snapshot.`, width);
+    addWrapped(lines, theme, "warning", view.filter ? "No matches for the active literal filter." : `No ${view.activeView.toLocaleLowerCase()} entries in this active-checkout projection.`, width);
     renderOmissions(view, theme, width, lines);
     return false;
   }
@@ -156,7 +156,7 @@ function addDetailValues(lines: DetailLine[], heading: string, values: readonly 
   for (const value of values.slice(0, DETAIL_VALUE_CAP)) pushDetail(lines, `  ${value}`, color);
   if (values.length === 0) pushDetail(lines, "  none", "muted");
   if (values.length > DETAIL_VALUE_CAP) {
-    pushDetail(lines, `  ${values.length - DETAIL_VALUE_CAP} additional retained values are not shown here; run picc plugin details ${identity} for the larger bounded standalone view.`, "muted");
+    pushDetail(lines, `  ${values.length - DETAIL_VALUE_CAP} additional retained values are not shown here; from the active checkout run picc plugin details ${identity} for the larger bounded standalone view.`, "muted");
   }
 }
 function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
@@ -172,7 +172,7 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
   pushDetail(lines, `Source: selected state ${location(item.selectedInstallation?.provenance.state)} · enablement ${location(item.enablement?.source)}`);
   pushDetail(lines, `Version: installed ${safe(item.selectedInstallation?.version ?? "not available", 100)} · manifest ${safe(metadata?.version ?? "not available", 100)} · catalog ${safe(item.catalogDeclarations[0]?.version ?? "not available", 100)}`);
   pushDetail(lines, `Revision: catalog ${safe(item.catalogDeclarations[0]?.revision ?? "not available", 100)} · evidence ${safe(item.catalogDeclarations[0]?.revisionEvidence ?? "not available", 100)}`);
-  pushDetail(lines, `Lifecycle: owner ${safe(item.lifecycle?.ownership ?? "unknown", 60)} · desired installed ${item.lifecycle?.installed ? "yes" : "no"} · declared ${item.lifecycle?.declared ? "explicit" : "derived/default"} · effective enabled ${item.lifecycle?.effectiveEnabled ? "yes" : "no"} · loaded ${item.lifecycle?.loaded ? "yes" : "no"}`);
+  pushDetail(lines, `Lifecycle: owner ${safe(item.lifecycle?.ownership ?? "unknown", 60)} · active-checkout desired installed ${item.lifecycle?.installed ? "yes" : "no"} · declared ${item.lifecycle?.declared ? "explicit" : "derived/default"} · effective enabled ${item.lifecycle?.effectiveEnabled ? "yes" : "no"} · captured loaded ${item.lifecycle?.loaded ? "yes" : "no"}`);
   pushDetail(lines, `Eligibility: ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(", ") : "none"}${item.lifecycle?.readOnlyReason ? ` · ${safe(item.lifecycle.readOnlyReason)}` : ""}`);
   pushDetail(lines, `Trust/content: trusted ${item.lifecycle?.trusted === undefined ? "unknown" : item.lifecycle.trusted ? "yes" : "no"} · revision ${safe(item.lifecycle?.immutableRevision ?? "not available", 100)} · integrity ${safe(item.lifecycle?.integrity ?? "not available", 100)}`);
   pushDetail(lines, `Pending/recovery: reload ${item.lifecycle?.pendingReload ? "pending" : "not pending"} · step ${safe(item.lifecycle?.pendingStep ?? "none", 120)} · recovery ${safe(item.lifecycle?.recoveryCommand ?? "none", 160)}`, item.lifecycle?.pendingReload || item.lifecycle?.pendingStep ? "warning" : "text");
@@ -185,7 +185,7 @@ function pluginDetail(view: PluginInventoryModelView): DetailLine[] {
     const diagnostics = value.diagnostics.length ? value.diagnostics.map((diagnostic) => `${safe(diagnostic.severity, 30)}:${safe(diagnostic.message, 160)}`).join(", ") : "none";
     return `scope ${safe(value.scope ?? "not available", 80)} · version ${safe(value.version ?? "not available", 100)} · validity ${value.validity} · ${value.selected ? "selected" : "not selected"} · location ${location(value.location)} · project ${location(value.projectLocation)} · problems ${problems} · diagnostics ${diagnostics}`;
   }), identity, item.installations.some((value) => value.validity === "invalid") ? "warning" : "text");
-  pushDetail(lines, `Session outcome: ${safe(item.outcome?.status ?? "not resolved", 80)}`, pluginStatusColor({ kind: "plugin", key: `plugin:${item.qualifiedIdentity}`, identity: item.qualifiedIdentity, item }));
+  pushDetail(lines, `Captured runtime outcome: ${safe(item.outcome?.status ?? "not resolved", 80)}`, pluginStatusColor({ kind: "plugin", key: `plugin:${item.qualifiedIdentity}`, identity: item.qualifiedIdentity, item }));
   addDetailValues(lines, "Dependencies (declared only; not resolved)", item.dependencies.map((value) => `${qualifiedIdentity(value.targetIdentity)} · origin ${value.origin} · version ${safe(value.version ?? "not declared", 80)} · qualification ${safe(value.crossMarketplace, 80)} · ${safe(value.posture, 100)} · ${provenance(value.provenance)}`), identity);
   addDetailValues(lines, "Renames (declared only; not applied)", item.renames.map((value) => `${safe(value.from, 100)} → ${safe(value.target ?? "removed", 100)} · ${safe(value.status, 80)} · ${provenance(value.provenance)}`), identity);
   addDetailValues(lines, "Components", item.components.map((value) => `${safe(value.origin, 50)}/${safe(value.kind, 50)} · count ${value.count} ${safe(value.countSemantics, 80)} · support ${safe(value.supportTier, 50)} · risk ${safe(value.executionRisk, 60)} · ${provenance(value.provenance)}`), identity, support.limited ? "warning" : "text");
@@ -277,7 +277,7 @@ function renderWorkflow(state: PluginInventoryWorkflow, theme: unknown, width: n
   if (state.phase === "progress") { addWrapped(lines, theme, "accent", `Executing ${state.action} · ${safe(state.operationId, 128)}`, width); addWrapped(lines, theme, "warning", state.cancellationRequested ? "Esc intent was recorded locally after execution began; it was not sent as an execution cancellation. Waiting for authoritative receipt or recovery evidence; no rollback is claimed." : "Commit progress is authoritative; Esc records local intent and waits, but does not cancel execution or erase committed steps.", width); return 0; }
   if (state.phase === "receipt") { const target = state.receipt.target === undefined ? "" : ` · ${safe(state.receipt.target, 256)}`; addWrapped(lines, theme, state.receipt.outcome === "committed" ? "success" : "warning", `${state.receipt.kind === "plugin" ? "Plugin" : "Marketplace"} lifecycle receipt${target} · ${safe(state.operationId, 128)} · ${state.receipt.outcome} · completed ${state.receipt.completed}`, width); const truth = state.receipt.outcome === "committed" ? state.receipt.kind === "plugin" ? "Durable desired plugin state changed. Loaded runtime badges remain fixed until /reload-plugins succeeds or PiCC restarts." : "Durable marketplace state changed. Installed plugin code and loaded runtime are unchanged." : state.receipt.outcome === "rolled-back" ? "The operation rolled back; no committed desired change is claimed." : "The operation failed before commit; no committed desired change is claimed."; addWrapped(lines, theme, state.pendingReload ? "warning" : "text", truth, width); if (state.projectionFailure) addWrapped(lines, theme, "error", state.projectionFailure, width); addWrapped(lines, theme, "muted", "Enter returns to inventory.", width); return 0; }
   if (state.phase === "terminal-fallback") { addWrapped(lines, theme, "warning", `Lifecycle outcome · ${safe(state.operationId, 128)}`, width); addWrapped(lines, theme, "warning", state.message, width); if (state.recoveryCommand) addWrapped(lines, theme, "accent", state.recoveryCommand, width); return 0; }
-  addWrapped(lines, theme, state.phase === "pending-recovery" ? "warning" : "error", `${state.phase === "pending-recovery" ? "Pending recovery" : state.phase === "refused" ? "Lifecycle refused" : "Lifecycle failed"}${"operationId" in state && state.operationId ? ` · ${safe(state.operationId, 128)}` : ""}`, width); addWrapped(lines, theme, "warning", workflowMessage("message" in state ? state.message : "Lifecycle state is unavailable"), width); addWrapped(lines, theme, "muted", state.phase === "pending-recovery" ? `Exact fallback: picc plugin recover ${state.operationId}` : "Enter returns; no unconfirmed action will execute.", width); return 0;
+  addWrapped(lines, theme, state.phase === "pending-recovery" ? "warning" : "error", `${state.phase === "pending-recovery" ? "Pending recovery" : state.phase === "refused" ? "Lifecycle refused" : "Lifecycle failed"}${"operationId" in state && state.operationId ? ` · ${safe(state.operationId, 128)}` : ""}`, width); addWrapped(lines, theme, "warning", workflowMessage("message" in state ? state.message : "Lifecycle state is unavailable"), width); addWrapped(lines, theme, "muted", state.phase === "pending-recovery" ? `Exact fallback from the active checkout: picc plugin recover ${state.operationId}` : "Enter returns; no unconfirmed action will execute.", width); return 0;
 }
 
 function renderDetail(view: PluginInventoryModelView, theme: unknown, width: number, lines: string[]): number {
@@ -301,7 +301,7 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   if (width < 8) {
     const phase = view.workflow?.phase;
     const postConfirmation = phase !== undefined && ["progress", "receipt", "pending-recovery", "terminal-fallback"].includes(phase);
-    const framing = phase === undefined ? "read-only session snapshot" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.";
+    const framing = phase === undefined ? "captured loaded + active desired" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.";
     for (const value of ["PiCC plugin inventory", framing, "width unusable", "resize wider", "Esc closes"]) addWrapped(lines, options.theme, "warning", value, width);
     return { lines: clampLines(lines, width), maxDetailScroll: 0, selectedVisible: false };
   }
@@ -316,8 +316,8 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
     renderOmissions(view, options.theme, width, lines);
   } else selectedVisible = renderList(view, options.theme, width, lines);
   if (!view.workflow) addWrapped(lines, options.theme, "muted", view.detail
-    ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · standalone: picc plugin list · picc plugin details <qualified-name>"
-    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · standalone: picc plugin list", width);
+    ? "↑/↓ scroll · Esc leaves details · then Esc clears filter · then Esc closes · re-open /plugin, or from active checkout: picc plugin list · picc plugin details <qualified-name>"
+    : "←/→ or Tab/Shift-Tab views · ↑/↓ select · type literal filter · Backspace edit · Enter details · Esc clear/close · re-open /plugin, or from active checkout: picc plugin list", width);
   if (!view.workflow) addWrapped(lines, options.theme, "muted", "A opens eligible lifecycle actions.", width);
   const safeLines = clampLines(lines, width).map((line) => {
     try { return visibleWidth(line) <= width ? line : ""; } catch { return ""; }

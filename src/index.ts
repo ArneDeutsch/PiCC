@@ -152,7 +152,7 @@ import {
 } from "./runtime/plugin-inventory-text.js";
 import { openPluginInventory } from "./runtime/plugin-inventory-focus.js";
 import { createProductionPluginLifecyclePort, type PluginLifecyclePort } from "./plugin-inventory-cli.js";
-import type { PluginInventoryActionName } from "./runtime/plugin-inventory-model.js";
+import { mergeCapturedLoadedWithEffectiveDesired, type PluginInventoryActionName } from "./runtime/plugin-inventory-model.js";
 import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
@@ -179,25 +179,46 @@ import {
 } from "./plugin-lifecycle/reload-handoff.js";
 
 type ActiveReplacementShutdown = () => void | Promise<void>;
+interface ReplacementCwdHandoff {
+  readonly nonce: string;
+  readonly baseCwd: string;
+  readonly ownerProjectRoot: string;
+  readonly worktreeCwd?: string;
+}
 interface ActiveReplacementShutdownRegistry {
   eligibleNonce?: string;
+  cwdHandoff?: ReplacementCwdHandoff;
   pending?: { nonce: string; shutdown: ActiveReplacementShutdown };
 }
-const ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL = Symbol.for("@arnedeutsch/picc.active-replacement-shutdown.v1");
+const ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL = Symbol.for("@arnedeutsch/picc.active-replacement-shutdown.v3");
 
 function activeReplacementShutdownRegistry(): ActiveReplacementShutdownRegistry {
   const host = globalThis as typeof globalThis & Record<symbol, unknown>;
   const existing = host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL];
   if (typeof existing === "object" && existing !== null) return existing as ActiveReplacementShutdownRegistry;
-  const created: ActiveReplacementShutdownRegistry = Object.seal({ eligibleNonce: undefined, pending: undefined });
+  const created: ActiveReplacementShutdownRegistry = Object.seal({ eligibleNonce: undefined, cwdHandoff: undefined, pending: undefined });
   host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL] = created;
   return created;
 }
 
-function beginActiveReplacementShutdown(nonce: string): void {
+function beginActiveReplacementShutdown(nonce: string, cwdState: CwdState, ownerProjectRoot: string): void {
   const registry = activeReplacementShutdownRegistry();
   registry.eligibleNonce = nonce;
+  const worktreeCwd = cwdState.getWorktree();
+  registry.cwdHandoff = {
+    nonce,
+    baseCwd: cwdState.getBase(),
+    ownerProjectRoot,
+    ...(worktreeCwd === undefined ? {} : { worktreeCwd }),
+  };
   registry.pending = undefined;
+}
+
+function activeReplacementCwdHandoff(nonce: string): ReplacementCwdHandoff | undefined {
+  const registry = activeReplacementShutdownRegistry();
+  return registry.eligibleNonce === nonce && registry.cwdHandoff?.nonce === nonce
+    ? registry.cwdHandoff
+    : undefined;
 }
 
 function storeActiveReplacementShutdown(nonce: string, shutdown: ActiveReplacementShutdown): boolean {
@@ -212,6 +233,7 @@ function consumeActiveReplacementShutdown(nonce: string): ActiveReplacementShutd
   if (registry.eligibleNonce !== nonce) return undefined;
   const pending = registry.pending?.nonce === nonce ? registry.pending.shutdown : undefined;
   registry.eligibleNonce = undefined;
+  registry.cwdHandoff = undefined;
   registry.pending = undefined;
   return pending;
 }
@@ -220,6 +242,7 @@ function clearActiveReplacementShutdown(nonce: string): void {
   const registry = activeReplacementShutdownRegistry();
   if (registry.eligibleNonce !== nonce) return;
   registry.eligibleNonce = undefined;
+  registry.cwdHandoff = undefined;
   registry.pending = undefined;
 }
 
@@ -842,8 +865,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
 
+  const armedReloadNonce = armedReloadAttemptNonce();
+  const replacementCwdHandoff = armedReloadNonce === undefined ? undefined : activeReplacementCwdHandoff(armedReloadNonce);
   const projectLoadOptions: Parameters<typeof loadClaudeProject>[0] = {
-    cwd: process.cwd(),
+    cwd: replacementCwdHandoff?.worktreeCwd ?? replacementCwdHandoff?.baseCwd ?? process.cwd(),
     ...(testSeam?.managedSettingsPaths
       ? { managedSettingsPaths: testSeam.managedSettingsPaths }
       : {}),
@@ -855,7 +880,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       : {}),
   };
   const loadProject = testSeam?.loadProject ?? loadClaudeProject;
-  const armedReloadNonce = armedReloadAttemptNonce();
   const rejectArmedReplacement = (resolveAttempt = true): void => {
     if (armedReloadNonce === undefined) return;
     let handled = false;
@@ -873,6 +897,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   try {
     project = loadProject(projectLoadOptions);
   } catch (err) {
+    // Malformed Claude-compatible project state must degrade to diagnostics, not crash the harness.
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
     // Leave assembly failure unresolved so the outgoing reload owner records operational failure.
     rejectArmedReplacement(false);
@@ -957,7 +982,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     codexProviderRegistries.add(pi);
     registerCodexAbortGuard(pi);
   }
-  const cwdState = new CwdState(project.cwd);
+  const cwdState = new CwdState(replacementCwdHandoff?.baseCwd ?? project.cwd);
+  if (replacementCwdHandoff?.worktreeCwd !== undefined) cwdState.enterWorktree(replacementCwdHandoff.worktreeCwd);
+  const ownerProjectRoot = replacementCwdHandoff?.ownerProjectRoot ?? project.root;
+  const loadEffectiveProject = (): LoadedProject => loadProject({
+    ...projectLoadOptions,
+    cwd: cwdState.get(),
+  });
   let activeMainNotebookState = new NotebookSessionState();
   const installMainNotebookState = (branch: unknown): void => {
     let installed!: NotebookSessionState;
@@ -1247,7 +1278,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
   const retentionCleanupAllowed = project.settings.retentionCleanupAllowed === true;
   const worktrees = new WorktreeManager({
-    projectRoot: project.root,
+    projectRoot: ownerProjectRoot,
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
     retentionCleanupAllowed,
@@ -5374,7 +5405,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const PLUGIN_RELOAD_REJECTED =
     "Plugin reload preflight was rejected. No reload started and the current captured runtime remains usable. Use picc plugin --help to inspect or repair current lifecycle state, then retry /reload-plugins.";
   const PLUGIN_RELOAD_ASSEMBLY_FAILED =
-    "Plugin reload candidate assembly failed. No reload started and the current captured runtime remains usable. Use picc plugin --help to inspect or repair current lifecycle state, then retry /reload-plugins.";
+    "PiCC could not assemble plugin authority from the active checkout. Captured loaded runtime is unchanged and no reload started. Repair that checkout or leave it with ExitWorktree, then retry /reload-plugins. For standalone inspection, run picc plugin --help from the active checkout.";
   const PLUGIN_RELOAD_INPUTS_CHANGED =
     "Plugin reload inputs changed or could not be verified during validation. No reload started and the current captured runtime remains usable. Retry /reload-plugins after local lifecycle writes have finished.";
   const PLUGIN_RELOAD_HANDOFF_WRITE_FAILED =
@@ -5515,7 +5546,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   function pluginReadOnlyUsage(ctx: any): string {
     const adoption = ctx?.mode === "tui" ? "After a committed plugin change, use /reload-plugins in this live interactive session or start a new PiCC session." : "Headless mode cannot reload plugins. If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session.";
-    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. In the interactive TUI, /plugin install|enable|disable|update|uninstall, /plugin marketplace add|refresh|remove, and /plugin recover enter the focused workflow; values and destructive choices are collected there. Headless modes are guidance-only; run picc plugin --help for standalone commands. ${adoption}`;
+    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. In the interactive TUI, /plugin install|enable|disable|update|uninstall, /plugin marketplace add|refresh|remove, and /plugin recover enter the focused workflow; values and destructive choices are collected there. Headless modes are guidance-only; from the active checkout run picc plugin --help for standalone commands. ${adoption}`;
   }
 
   function requestedPluginAction(args: string): PluginInventoryActionName | undefined {
@@ -5527,25 +5558,41 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   async function renderPluginControl(args: string, ctx: any): Promise<string | undefined> {
     const requestedAction = requestedPluginAction(args);
+    if (ctx?.mode !== "tui") return /^[ \t]*$/.test(args)
+      ? withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))
+      : pluginReadOnlyUsage(ctx);
+    let effectiveDesired: LoadedProject;
+    try {
+      effectiveDesired = loadEffectiveProject();
+    } catch {
+      return "PiCC could not assemble plugin authority from the active checkout. Captured loaded runtime is unchanged; no lifecycle execution started. Repair that checkout or leave it with ExitWorktree, then re-open /plugin. For standalone inspection, run picc plugin --help from the active checkout.";
+    }
+    const mergedInventory = mergeCapturedLoadedWithEffectiveDesired(project.pluginInventory, effectiveDesired.pluginInventory);
     if (/^[ \t]*$/.test(args) || requestedAction !== undefined) {
-      if (ctx?.mode !== "tui") return requestedAction === undefined ? withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory)) : pluginReadOnlyUsage(ctx);
       const overlay = pluginRuntimeOverlay();
       if (overlay !== undefined) {
         try { ctx.ui?.notify?.(overlay, "warning"); } catch { /* overlay is additive */ }
       }
-      const lifecycleFactory = () => testSeam?.pluginLifecycle?.(project) ?? createProductionPluginLifecyclePort(project, { cwd: project.cwd, env: process.env, platform: process.platform });
-      const opened = await openPluginInventory(project.pluginInventory, ctx, { lifecycleFactory, ...(requestedAction === undefined ? {} : { initialAction: requestedAction }) });
+      const lifecycleFactory = async () => {
+        try {
+          const effectiveProject = loadEffectiveProject();
+          return await (testSeam?.pluginLifecycle?.(effectiveProject) ?? createProductionPluginLifecyclePort(effectiveProject, { cwd: effectiveProject.cwd, env: process.env, platform: process.platform }));
+        } catch {
+          return { ok: false as const, code: "active-checkout-assembly-failed", message: "Active-checkout plugin authority is unavailable" };
+        }
+      };
+      const opened = await openPluginInventory(project.pluginInventory, ctx, { durableDesired: effectiveDesired.pluginInventory, lifecycleFactory, ...(requestedAction === undefined ? {} : { initialAction: requestedAction }) });
       if (opened.opened) return undefined;
       const warning = opened.reason === "unavailable"
-        ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only list instead."
-        : "Interactive plugin inventory could not open; showing the bounded read-only list instead.";
+        ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only active-checkout projection instead."
+        : "Interactive plugin inventory could not open; showing the bounded read-only active-checkout projection instead.";
       try { ctx.ui?.notify?.(warning, "warning"); } catch { /* text fallback remains authoritative */ }
-      return `${warning} Run picc plugin --help for standalone lifecycle commands.\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))}`;
+      return `${warning} Re-open /plugin, or from the active checkout run picc plugin --help for standalone lifecycle commands.\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(mergedInventory))}`;
     }
     const parsed = parsePluginInventorySlash(`/plugin ${args}`);
     return parsed.kind === "usage"
       ? pluginReadOnlyUsage(ctx)
-      : withPluginRuntimeOverlay(renderPluginInventoryOperation(project.pluginInventory, parsed.operation));
+      : withPluginRuntimeOverlay(renderPluginInventoryOperation(mergedInventory, parsed.operation));
   }
 
   async function appendControlOutput(name: string, output: string, ctx: any): Promise<void> {
@@ -5586,7 +5633,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     let candidate: LoadedProject;
     try {
-      candidate = loadProject(projectLoadOptions);
+      candidate = loadEffectiveProject();
     } catch {
       await appendControlOutput("reload-plugins", PLUGIN_RELOAD_ASSEMBLY_FAILED, ctx);
       return;
@@ -5596,7 +5643,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     let confirmation: LoadedProject | undefined;
-    try { confirmation = loadProject(projectLoadOptions); } catch { confirmation = undefined; }
+    try { confirmation = loadEffectiveProject(); } catch { confirmation = undefined; }
     const exact = confirmation?.reloadCandidate.status === "ready" ? confirmation.reloadCandidate.recapture() : undefined;
     if (confirmation?.reloadCandidate.status !== "ready"
       || !sameReloadBinding(confirmation.reloadCandidate.binding, candidate.reloadCandidate.binding)
@@ -5611,7 +5658,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     const nonce = reserved.value;
-    beginActiveReplacementShutdown(nonce);
+    beginActiveReplacementShutdown(nonce, cwdState, ownerProjectRoot);
     const written = writeReloadHandoff(handoffPath, candidate.reloadCandidate.binding, nonce);
     if (!written.ok) {
       consumeReloadAttempt(nonce);

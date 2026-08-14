@@ -1728,6 +1728,288 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     }
   });
 
+  it("binds lifecycle composition and reload validation to the entered checkout", async () => {
+    const fixture = materializeFixture("hello-claude");
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const userDir = path.join(fixture, ".effective-cwd-user");
+    const homeDir = path.join(fixture, ".effective-cwd-home");
+    const loadedCwds: string[] = [];
+    let startupProject: ReturnType<typeof loadClaudeProject> | undefined;
+    let lifecycleProject: ReturnType<typeof loadClaudeProject> | undefined;
+    let effectiveWorktree: string | undefined;
+    let rejectEffectiveOpen = false;
+    let plannedMarketplace: string | undefined;
+    let selectedMarketplaceKey: string | undefined;
+    let lifecycleCompositions = 0;
+    let owner: FakePi | undefined;
+    let firstReplacement: FakePi | undefined;
+    let secondReplacement: FakePi | undefined;
+    let activeWorktree = false;
+    const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
+      const cwd = path.resolve(options.cwd);
+      loadedCwds.push(cwd);
+      if (rejectEffectiveOpen && effectiveWorktree !== undefined && cwd === path.resolve(effectiveWorktree)) {
+        throw new Error("credential=https://user:secret@example.test/private LOADER_ERROR_CANARY");
+      }
+      const loaded = loadClaudeProject({ ...options, homeDir });
+      startupProject ??= loaded;
+      return loaded;
+    };
+    const lifecycle = {
+      marketplaces: { plan: async (operation: { name: string }) => { plannedMarketplace = operation.name; return { ok: false as const, code: "fixture-stop", message: "fixture stop" }; } },
+      plugins: { plan: async () => ({ ok: false as const, code: "fixture-stop", message: "fixture stop" }) },
+      recovery: {}, targets: {
+        marketplace: (identity: string, mutableRecordKey: string) => {
+          selectedMarketplaceKey = mutableRecordKey;
+          return { ok: true as const, value: { kind: "marketplace" as const, identity, scope: "local", mutableRecordKey, selector: "worktree-selector" } };
+        },
+      },
+      lookup: async () => ({ ok: true as const, value: undefined }),
+      projection: () => ({ ok: false as const, code: "unused", message: "unused" }),
+    };
+    try {
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      owner = fakePi();
+      picc(owner.api as never, {
+        loadProject,
+        pluginLifecycle: async (effectiveProject) => {
+          lifecycleCompositions += 1;
+          lifecycleProject = effectiveProject;
+          return { ok: true as const, value: lifecycle as never };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      await owner.waitForTools(["EnterWorktree", "ExitWorktree"]);
+      expect(loadedCwds).toEqual([path.resolve(fixture)]);
+
+      const entered = await owner.tools.get("EnterWorktree").execute(
+        "effective-cwd-enter", { name: `it/effective-cwd-${Date.now()}` },
+      );
+      activeWorktree = true;
+      const worktree = entered.details.worktreePath as string;
+      effectiveWorktree = worktree;
+      const localSettings = path.join(worktree, ".claude", "settings.local.json");
+      const worktreeSkill = path.join(worktree, ".claude", "skills", "worktree-only", "SKILL.md");
+      const worktreeCatalog = path.join(worktree, "worktree-marketplace", ".claude-plugin", "marketplace.json");
+      const baseMarker = path.join(fixture, ".base-checkout-only");
+      fs.mkdirSync(path.dirname(worktreeSkill), { recursive: true });
+      fs.mkdirSync(path.dirname(worktreeCatalog), { recursive: true });
+      fs.writeFileSync(localSettings, JSON.stringify({
+        env: { EFFECTIVE_CHECKOUT: "worktree" },
+        extraKnownMarketplaces: { "worktree-market": { source: { source: "directory", path: "./worktree-marketplace" } } },
+      }), "utf8");
+      fs.writeFileSync(worktreeCatalog, JSON.stringify({ name: "worktree-market", owner: { name: "Worktree" }, plugins: [{ name: "worktree-only", source: "./plugin" }] }), "utf8");
+      const cachedCatalog = path.join(userDir, "plugins", "marketplaces", "worktree-market", ".claude-plugin", "marketplace.json");
+      fs.mkdirSync(path.dirname(cachedCatalog), { recursive: true });
+      fs.copyFileSync(worktreeCatalog, cachedCatalog);
+      fs.writeFileSync(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({
+        "worktree-market": { source: { source: "directory", path: path.join(worktree, "worktree-marketplace") } },
+      }));
+      fs.writeFileSync(worktreeSkill, "---\ndescription: WORKTREE-ONLY-DESCRIPTION\n---\nWORKTREE-ONLY-BODY\n", "utf8");
+      fs.writeFileSync(baseMarker, "BASE-CHECKOUT-ONLY\n", "utf8");
+      const locationsResult = createLifecycleLocations({
+        homeDir,
+        profilePath: userDir,
+        platform: process.platform === "win32" ? "win32" : "posix",
+        project: { activeCheckoutPath: worktree, checkoutFamilyPath: fixture },
+      });
+      if (!locationsResult.ok) throw new Error("worktree lifecycle locations unavailable");
+      const locations = locationsResult.value;
+      const checkoutFamilyKey = locations.checkoutFamilyKey;
+      if (checkoutFamilyKey === undefined) throw new Error("worktree checkout family unavailable");
+      const store: OwnedStateStore = {
+        root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey,
+        artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"),
+        stagingRoot: path.join(locations.profileRoot, "staging"), generationsRoot: path.join(locations.profileRoot, "generations"),
+        journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"),
+        locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine"), dataRoot: locations.dataRoot,
+      };
+      const catalogBytes = fs.readFileSync(worktreeCatalog);
+      const catalogDigest = sha256(catalogBytes);
+      const artifactEntries: ArtifactDigestEntry[] = [
+        { path: ".claude-plugin", kind: "directory" },
+        { path: ".claude-plugin/marketplace.json", kind: "file", data: catalogBytes },
+      ];
+      const treeDigest = digestArtifactEntries(artifactEntries);
+      const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${treeDigest}`).digest("base64url")}` as const;
+      const artifactRoot = path.join(store.artifactsRoot, treeDigest.slice(7));
+      fs.mkdirSync(path.join(artifactRoot, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalogBytes);
+      const source = { kind: "local-directory", path: path.join(worktree, "worktree-marketplace") } as const;
+      const executableCatalog = deriveExecutableMarketplaceCatalogProjection(catalogBytes, source.kind);
+      if (executableCatalog === undefined) throw new Error("worktree catalog projection unavailable");
+      const snapshotTarget: MarketplaceSnapshotTrustTarget = {
+        authorityKind: "materialized", marketplaceName: "worktree-market", snapshotId, source, catalogDigest,
+        executableCatalog, artifactDigest: treeDigest, treeDigest, rootDigest: treeDigest,
+        selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot,
+        catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: treeDigest },
+      };
+      const snapshotTrust = createMarketplaceSnapshotTrustGrant(snapshotTarget);
+      if (!snapshotTrust.ok) throw new Error(snapshotTrust.message);
+      const snapshotRecord = { ownership: "picc-owned", profileKey: locations.profileKey, ...snapshotTarget, trust: snapshotTrust.value } as const;
+      const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot }), "picc-owned", ownedMarketplaceSnapshotScopeKey(snapshotRecord), snapshotRecord);
+      if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message);
+      const snapshotPartition = ownedRecordPartition(store, "picc-owned", ownedMarketplaceSnapshotScopeKey(snapshotRecord));
+      if (!snapshotPartition.ok) throw new Error(snapshotPartition.message);
+      fs.mkdirSync(snapshotPartition.value, { recursive: true });
+      fs.writeFileSync(path.join(snapshotPartition.value, "marketplace-snapshot.json"), snapshotEnvelope.value.bytes);
+      const marketplaceRecord = {
+        ownership: "picc-owned", name: "worktree-market", profileKey: locations.profileKey, scope: "local",
+        checkoutFamilyKey, projectKey: checkoutFamilyKey, source, selectedSnapshotId: snapshotId,
+      } as const;
+      const expectedMarketplaceKey = ownedMarketplaceScopeKey(marketplaceRecord);
+      const marketplaceEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(locations.profileKey), "picc-owned", expectedMarketplaceKey, marketplaceRecord);
+      if (!marketplaceEnvelope.ok) throw new Error(marketplaceEnvelope.message);
+      const marketplacePartition = ownedRecordPartition(store, "picc-owned", expectedMarketplaceKey);
+      if (!marketplacePartition.ok) throw new Error(marketplacePartition.message);
+      fs.mkdirSync(marketplacePartition.value, { recursive: true });
+      fs.writeFileSync(path.join(marketplacePartition.value, "marketplace-registration.json"), marketplaceEnvelope.value.bytes);
+      expect(startupProject?.pluginInventory.find("worktree-only@worktree-market")).toBeUndefined();
+      expect(startupProject?.skills.some((skill) => skill.name === "worktree-only")).toBe(false);
+
+      const entriesBeforeFailure = owner.entries.length;
+      const customsBeforeFailure = owner.customs.length;
+      rejectEffectiveOpen = true;
+      await owner.commands.get("plugin").handler("", owner.tuiCtx());
+      rejectEffectiveOpen = false;
+      expect(owner.customs).toHaveLength(customsBeforeFailure);
+      const assemblyFailure = String(owner.entries.slice(entriesBeforeFailure).at(-1)?.data?.output ?? "");
+      expect(assemblyFailure).toContain("active checkout");
+      expect(assemblyFailure).toContain("Captured loaded runtime is unchanged; no lifecycle execution started");
+      expect(assemblyFailure).toContain("re-open /plugin");
+      expect(assemblyFailure).toContain("from the active checkout");
+      expect(assemblyFailure).not.toMatch(/user:secret|example\.test|worktree-only@worktree-market|LOADER_ERROR_CANARY/u);
+
+      const entriesBeforeFallback = owner.entries.length;
+      await owner.commands.get("plugin").handler("", owner.tuiCtx({ ui: {} }));
+      const unavailableFallback = String(owner.entries.slice(entriesBeforeFallback).at(-1)?.data?.output ?? "");
+      expect(unavailableFallback).toContain("active-checkout projection");
+      expect(unavailableFallback).toContain("worktree-only@worktree-market");
+      expect(unavailableFallback).toContain("from the active checkout run picc plugin --help");
+
+      const browsing = owner.commands.get("plugin").handler("", owner.tuiCtx());
+      await Promise.resolve();
+      const browser = owner.customs.at(-1)!;
+      await browser.ready;
+      expect(browser.render(100).join("\n")).toContain("worktree-only@worktree-market");
+      browser.input("\u001b");
+      await browsing;
+
+      const compositionFailureOpening = owner.commands.get("plugin").handler("marketplace refresh", owner.tuiCtx());
+      await Promise.resolve();
+      const compositionFailurePane = owner.customs.at(-1)!;
+      await compositionFailurePane.ready;
+      compositionFailurePane.input("\r");
+      compositionFailurePane.input("worktree-market");
+      compositionFailurePane.input("\r");
+      compositionFailurePane.input("no");
+      rejectEffectiveOpen = true;
+      compositionFailurePane.input("\r");
+      await vi.waitFor(() => expect(compositionFailurePane.render(120).join(" ").replace(/\s+/gu, " ")).toContain("Active-checkout plugin authority could not be assembled"));
+      rejectEffectiveOpen = false;
+      const compositionFailureText = compositionFailurePane.render(120).join(" ").replace(/\s+/gu, " ");
+      expect(compositionFailureText).toContain("no lifecycle execution started");
+      expect(compositionFailureText).toContain("ExitWorktree");
+      expect(compositionFailureText).toContain("from the active checkout");
+      expect(compositionFailureText).not.toMatch(/user:secret|example\.test|credential|LOADER_ERROR_CANARY/u);
+      expect(lifecycleCompositions).toBe(0);
+      expect(plannedMarketplace).toBeUndefined();
+      compositionFailurePane.input("\u001b");
+      compositionFailurePane.input("\u001b");
+      await compositionFailureOpening;
+
+      const opening = owner.commands.get("plugin").handler("marketplace refresh", owner.tuiCtx());
+      await Promise.resolve();
+      const pane = owner.customs.at(-1)!;
+      await pane.ready;
+      pane.input("\r");
+      for (const value of ["worktree-market", "no"]) {
+        pane.input(value);
+        pane.input("\r");
+      }
+      await vi.waitFor(() => expect(plannedMarketplace).toBe("worktree-market"));
+      expect(lifecycleProject).toBeDefined();
+      expect(selectedMarketplaceKey).toBe(expectedMarketplaceKey);
+      expect(path.resolve(lifecycleProject!.cwd)).toBe(path.resolve(worktree));
+      expect(path.resolve(lifecycleProject!.root)).toBe(path.resolve(worktree));
+      expect(lifecycleProject!.skills.some((skill) => skill.name === "worktree-only")).toBe(true);
+      expect(loadedCwds.at(-1)).toBe(path.resolve(worktree));
+      const startupPrompt = String((await owner.fire("before_agent_start", { systemPrompt: "BASE" })).systemPrompt);
+      expect(startupPrompt).not.toContain("WORKTREE-ONLY-DESCRIPTION");
+      pane.input("\u001b");
+      pane.input("\u001b");
+      await opening;
+
+      let rejectedReloadStarts = 0;
+      const entriesBeforeReloadFailure = owner.entries.length;
+      rejectEffectiveOpen = true;
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx({ reload: async () => { rejectedReloadStarts += 1; } }));
+      rejectEffectiveOpen = false;
+      expect(rejectedReloadStarts).toBe(0);
+      const reloadAssemblyFailure = String(owner.entries.slice(entriesBeforeReloadFailure).at(-1)?.data?.output ?? "");
+      expect(reloadAssemblyFailure).toContain("active checkout");
+      expect(reloadAssemblyFailure).toContain("no reload started");
+      expect(reloadAssemblyFailure).toContain("ExitWorktree");
+      expect(reloadAssemblyFailure).toContain("from the active checkout");
+      expect(reloadAssemblyFailure).not.toMatch(/user:secret|example\.test|credential|LOADER_ERROR_CANARY/u);
+
+      const beforeReloadLoads = loadedCwds.length;
+      let reloads = 0;
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx({
+        reload: async () => {
+          reloads += 1;
+          firstReplacement = fakePi();
+          picc(firstReplacement.api as never, { loadProject, onInitializationSettled: firstReplacement.captureInitialization });
+          await firstReplacement.fire("session_start", { reason: "reload" }, firstReplacement.tuiCtx());
+        },
+      }));
+      expect(loadedCwds.slice(beforeReloadLoads).every((cwd) => cwd === path.resolve(worktree))).toBe(true);
+      expect(reloads).toBe(1);
+      expect(firstReplacement?.tools.has("Skill")).toBe(true);
+      expect(owner.tools.has("Skill")).toBe(true);
+      const firstAdoptedSkill = await firstReplacement!.tools.get("Skill").execute("effective-cwd-skill-first", { name: "worktree-only" });
+      expect(firstAdoptedSkill.content.map((part: { text?: string }) => part.text ?? "").join("\n")).toContain("WORKTREE-ONLY-BODY");
+      await firstReplacement!.waitForInitialization();
+
+      await firstReplacement!.commands.get("reload-plugins").handler("", firstReplacement!.tuiCtx({
+        reload: async () => {
+          reloads += 1;
+          secondReplacement = fakePi();
+          picc(secondReplacement.api as never, { loadProject, onInitializationSettled: secondReplacement.captureInitialization });
+          await secondReplacement.fire("session_start", { reason: "reload" }, secondReplacement.tuiCtx());
+        },
+      }));
+      expect(reloads).toBe(2);
+      expect(secondReplacement?.tools.has("Skill")).toBe(true);
+      const secondAdoptedSkill = await secondReplacement!.tools.get("Skill").execute("effective-cwd-skill-second", { name: "worktree-only" });
+      expect(secondAdoptedSkill.content.map((part: { text?: string }) => part.text ?? "").join("\n")).toContain("WORKTREE-ONLY-BODY");
+      await secondReplacement!.waitForInitialization();
+      await secondReplacement!.waitForTools(["read", "ExitWorktree"]);
+      const exited = await secondReplacement!.tools.get("ExitWorktree").execute("effective-cwd-exit", { action: "remove" });
+      expect(exited.content.map((part: { text?: string }) => part.text ?? "").join("\n")).toContain("Exited and removed worktree");
+      expect(exited.details).toMatchObject({ ok: true, removed: true, orphaned: false, outcome: "removed", restorePath: path.resolve(fixture), worktreePath: worktree });
+      expect(fs.existsSync(worktree)).toBe(false);
+      const baseRead = await secondReplacement!.tools.get("read").execute("effective-cwd-base-read", { path: ".base-checkout-only" });
+      expect(baseRead.content.map((part: { text?: string }) => part.text ?? "").join("\n")).toContain("BASE-CHECKOUT-ONLY");
+      activeWorktree = false;
+      expect(fs.existsSync(path.join(fixture, ".claude", "settings.local.json"))).toBe(false);
+      expect(fs.existsSync(path.join(fixture, ".claude", "skills", "worktree-only"))).toBe(false);
+      fs.rmSync(path.join(fixture, ".base-checkout-only"), { force: true });
+    } finally {
+      if (activeWorktree) {
+        const active = secondReplacement ?? firstReplacement ?? owner;
+        if (active !== undefined) await active.tools.get("ExitWorktree").execute("effective-cwd-cleanup", { action: "remove" });
+      }
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      cleanupFixture(fixture);
+    }
+  });
+
   it("re-registered built-in execute re-resolves the live cwd after a worktree swap", async () => {
     // Proves the wrap did NOT drop the factory(cwdState.get()) re-resolution: call
     // a built-in's execute, swap cwdState via EnterWorktree, call again, and observe
@@ -3069,15 +3351,19 @@ describe("plugin reload handoff wiring", () => {
     let calls = 0;
     const loadProject: NonNullable<PiccTestSeam["loadProject"]> = (options) => {
       calls += 1;
-      if (calls === 2) throw new Error("private assembly path must not escape");
+      if (calls === 2) throw new Error("private assembly path LOADER_ERROR_CANARY must not escape");
       return loadClaudeProject(options);
     };
     await withReloadProject(async (_fixture, _userDir, owner) => {
-      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx());
+      let reloads = 0;
+      await owner.commands.get("reload-plugins").handler("", owner.tuiCtx({ reload: async () => { reloads += 1; } }));
       const output = String(owner.entries.at(-1)?.data?.output ?? "");
-      expect(output).toContain("candidate assembly failed");
-      expect(output).toContain("picc plugin --help");
-      expect(output).not.toMatch(/private assembly|\/doctor|Inspect \/plugin/u);
+      expect(output).toContain("active checkout");
+      expect(output).toContain("no reload started");
+      expect(output).toContain("ExitWorktree");
+      expect(output).toContain("from the active checkout");
+      expect(reloads).toBe(0);
+      expect(output).not.toMatch(/private assembly|LOADER_ERROR_CANARY|\/doctor|Inspect \/plugin/u);
     }, undefined, { loadProject });
   });
 

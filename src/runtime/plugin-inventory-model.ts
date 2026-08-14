@@ -116,18 +116,31 @@ function lifecycleOperationSignature(value: PluginInventoryLifecycleOperation): 
   return JSON.stringify([value.operationId, value.status, value.semanticStep, value.category, value.target ?? "", value.recoveryCommand]);
 }
 
-function desiredWithCapturedRuntime(loaded: PluginInventorySnapshot, desired: PluginInventorySnapshot): PluginInventorySnapshot {
+export function mergeCapturedLoadedWithEffectiveDesired(loaded: PluginInventorySnapshot, desired: PluginInventorySnapshot): PluginInventorySnapshot {
   const capturedById = new Map(loaded.items.map((item) => [item.qualifiedIdentity, item]));
   const compose = (desiredItem: PluginInventoryItem | undefined, captured: PluginInventoryItem | undefined): PluginInventoryItem => {
     const item = desiredItem ?? captured!;
     const capturedLoaded = captured?.lifecycle?.loaded ?? captured?.outcome?.status === "loaded";
     const desiredGeneration = desired.durableDesired?.generationId; const generationDiverged = desiredGeneration !== undefined && desiredGeneration !== loaded.loadedGenerationId;
     const desiredActivation = desiredItem?.lifecycle?.installed === true && desiredItem.lifecycle.effectiveEnabled === true && desiredItem.lifecycle.dependency.state === "satisfied";
-    const pendingReload = generationDiverged || capturedLoaded && desiredItem?.lifecycle?.installed !== true || desiredActivation !== capturedLoaded;
+    const pendingReload = desiredItem === undefined
+      ? capturedLoaded
+      : generationDiverged || capturedLoaded && desiredItem.lifecycle?.installed !== true || desiredActivation !== capturedLoaded;
     const desiredLifecycle = desiredItem?.lifecycle;
     const lifecycle = desiredLifecycle !== undefined
       ? Object.freeze({ ...desiredLifecycle, loaded: capturedLoaded, pendingReload })
-      : captured?.lifecycle === undefined ? undefined : Object.freeze({ ...captured.lifecycle, availableActions: Object.freeze([]), installed: false, declared: false, effectiveEnabled: undefined, loaded: capturedLoaded, pendingReload, readOnlyReason: "No durable desired lifecycle target is present" });
+      : captured?.lifecycle === undefined ? undefined : Object.freeze({
+        ownership: "unknown" as const,
+        availableActions: Object.freeze([]),
+        installed: false,
+        declared: false,
+        effectiveEnabled: false,
+        loaded: capturedLoaded,
+        dependency: Object.freeze({ state: "not-evaluated" as const }),
+        readOnlyReason: "No durable desired lifecycle target is present",
+        pendingReload,
+        retainedErrors: Object.freeze([]),
+      });
     const capturedManifestComponents = captured?.components.filter((component) => component.origin === "selected-manifest") ?? [];
     const capturedRuntimeComponents = captured?.components.filter((component) => component.origin === "final-runtime") ?? [];
     const desiredCatalogComponents = desiredItem?.components.filter((component) => component.origin === "catalog") ?? [];
@@ -136,9 +149,11 @@ function desiredWithCapturedRuntime(loaded: PluginInventorySnapshot, desired: Pl
     const capturedManifestDependencies = captured?.dependencies.filter((dependency) => dependency.origin === "selected-manifest") ?? [];
     const desiredCatalogDependencies = desiredItem?.dependencies.filter((dependency) => dependency.origin === "catalog") ?? [];
     const dependencies = Object.freeze([...capturedManifestDependencies, ...desiredCatalogDependencies]);
-    const { outcome: _outcome, lifecycle: _lifecycle, selectedInstallation: _selectedInstallation, components: _components, executionRisk: _executionRisk, dependencies: _dependencies, manifestNamespace: _manifestNamespace, metadata: _metadata, ...baseAxes } = item;
-    const desiredAxes = desiredItem === undefined ? { ...baseAxes, catalogPresence: false, installations: Object.freeze([]), catalogDeclarations: Object.freeze([]), renames: Object.freeze([]), diagnostics: Object.freeze([]) } : baseAxes;
-    return Object.freeze({ ...desiredAxes, ...(captured?.manifestNamespace === undefined ? {} : { manifestNamespace: captured.manifestNamespace }), ...(captured?.metadata === undefined ? {} : { metadata: captured.metadata }), ...(captured?.selectedInstallation === undefined ? {} : { selectedInstallation: captured.selectedInstallation }), ...(captured?.outcome === undefined ? {} : { outcome: captured.outcome }), dependencies, components, executionRisk, ...(lifecycle === undefined ? {} : { lifecycle }) });
+    const { outcome: _outcome, lifecycle: _lifecycle, enablement: _enablement, selectedInstallation: _selectedInstallation, components: _components, executionRisk: _executionRisk, dependencies: _dependencies, manifestNamespace: _manifestNamespace, metadata: _metadata, ...baseAxes } = item;
+    const desiredAxes = desiredItem === undefined
+      ? { ...baseAxes, catalogPresence: false, installations: Object.freeze([]), catalogDeclarations: Object.freeze([]), renames: Object.freeze([]), diagnostics: Object.freeze([]) }
+      : { ...baseAxes, ...(desiredItem.enablement === undefined ? {} : { enablement: desiredItem.enablement }) };
+    return Object.freeze({ ...desiredAxes, ...(captured?.manifestNamespace === undefined ? {} : { manifestNamespace: captured.manifestNamespace }), ...(captured?.metadata === undefined ? {} : { metadata: captured.metadata }), ...(desiredItem === undefined || captured?.selectedInstallation === undefined ? {} : { selectedInstallation: captured.selectedInstallation }), ...(captured?.outcome === undefined ? {} : { outcome: captured.outcome }), dependencies, components, executionRisk, ...(lifecycle === undefined ? {} : { lifecycle }) });
   };
   const desiredIds = new Set(desired.items.map((item) => item.qualifiedIdentity));
   const items = Object.freeze([
@@ -174,9 +189,9 @@ export class PluginInventoryModel {
   private workflowState?: PluginInventoryWorkflow;
   private revisionNumber = 0;
 
-  constructor(snapshot: PluginInventorySnapshot, durableDesired: PluginInventorySnapshot = snapshot) { this.snapshot = snapshot; this.desiredSnapshot = durableDesired === snapshot ? snapshot : desiredWithCapturedRuntime(snapshot, durableDesired); this.reconcile(); }
+  constructor(snapshot: PluginInventorySnapshot, durableDesired: PluginInventorySnapshot = snapshot) { this.snapshot = snapshot; this.desiredSnapshot = durableDesired === snapshot ? snapshot : mergeCapturedLoadedWithEffectiveDesired(snapshot, durableDesired); this.reconcile(); }
 
-  replaceDurableDesired(snapshot: PluginInventorySnapshot): void { if (snapshot === this.desiredSnapshot) return; this.desiredSnapshot = desiredWithCapturedRuntime(this.snapshot, snapshot); this.detailTarget = undefined; this.scroll = 0; this.reconcile(); this.bump(); }
+  replaceDurableDesired(snapshot: PluginInventorySnapshot): void { if (snapshot === this.desiredSnapshot) return; this.desiredSnapshot = mergeCapturedLoadedWithEffectiveDesired(this.snapshot, snapshot); this.detailTarget = undefined; this.scroll = 0; this.reconcile(); this.bump(); }
   setActionOverlay(value: PluginInventoryActionOverlay | undefined): void {
     if (value === undefined) { if (this.overlay === undefined) return; this.overlay = undefined; this.bump(); return; }
     const token = (text: string, fallback: string): string => /^[A-Za-z0-9._:@/+ -]{1,256}$/u.test(text) ? text : fallback;
@@ -363,14 +378,14 @@ export class PluginInventoryModel {
     this.detailTarget = undefined;
     this.scroll = 0;
     this.warningText = parseQualifiedPluginId(identity) !== undefined
-      ? `Plugin details display failed for ${identity}. Esc closes. Run picc plugin list or picc plugin details ${identity}`
-      : "Plugin details display failed. Esc closes. Run picc plugin list, then picc plugin details <qualified-name>.";
+      ? `Plugin details display failed for ${identity}. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list or picc plugin details ${identity}`
+      : "Plugin details display failed. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list, then picc plugin details <qualified-name>.";
     this.bump();
   }
   failSurface(): void {
     this.detailTarget = undefined;
     this.scroll = 0;
-    this.warningText = "Plugin inventory display failed; the read-only list remains available. Esc closes. Run picc plugin list or picc plugin details <qualified-name>.";
+    this.warningText = "Plugin inventory display failed; the read-only list remains available. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list or picc plugin details <qualified-name>.";
     this.bump();
   }
 

@@ -50,6 +50,7 @@ export interface PluginInventoryOpenContext {
 export interface PluginInventoryFocusOptions {
   readonly render?: typeof renderPluginInventory;
   readonly onError?: (error: unknown) => void;
+  readonly durableDesired?: PluginInventorySnapshot;
   readonly lifecycle?: PluginLifecyclePort;
   readonly lifecycleFactory?: () => Promise<StoreResult<PluginLifecyclePort>>;
   readonly initialAction?: PluginInventoryActionName;
@@ -177,6 +178,7 @@ const SOURCE_PLANNING_CODES = new Set(["invalid-source", "unsafe-source", "sourc
 const PREPARATION_PLANNING_CODES = new Set(["pending-recovery", "ambiguous-lock", "lock-busy", "data-directory-preparation-failed"]);
 
 function planningCause(code: string): { readonly cause: string; readonly guidance: string } {
+  if (code === "active-checkout-assembly-failed") return { cause: "Active-checkout plugin authority could not be assembled", guidance: "Captured loaded runtime is unchanged and no lifecycle execution started. Repair that checkout or leave it with ExitWorktree, then re-open /plugin. For standalone inspection, run picc plugin --help from the active checkout." };
   if (code === "managed-readonly") return { cause: "managed target", guidance: "Administrator-owned target; ask the administrator to change it." };
   if (code === "imported-readonly") return { cause: "imported target", guidance: "Claude-owned target; use Claude Code to change it." };
   if (code === "seed-readonly") return { cause: "seed target", guidance: "Seed-owned read-only target; manage it at its configured seed source." };
@@ -194,10 +196,10 @@ function fallbackLines(width: number, identity?: string, workflowPhase?: string)
   const safeIdentity = parseQualifiedPluginId(identity)?.qualifiedIdentity;
   const lines: string[] = [];
   const postConfirmation = workflowPhase !== undefined && ["progress", "receipt", "pending-recovery", "terminal-fallback"].includes(workflowPhase);
-  pushWrapped(workflowPhase === undefined ? "PiCC plugin inventory · read-only · captured for this session" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.", columns, lines);
+  pushWrapped(workflowPhase === undefined ? "PiCC plugin inventory · read-only · captured loaded runtime + active-checkout desired state" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.", columns, lines);
   pushWrapped(safeIdentity === undefined
-    ? "Plugin inventory display failed. Esc closes. Run picc plugin list, then picc plugin details <qualified-name>."
-    : `Plugin details display failed for ${safeIdentity}. Esc closes. Run picc plugin list or picc plugin details ${safeIdentity}`, columns, lines);
+    ? "Plugin inventory display failed. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list, then picc plugin details <qualified-name>."
+    : `Plugin details display failed for ${safeIdentity}. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list or picc plugin details ${safeIdentity}`, columns, lines);
   return clampLines(lines, columns);
 }
 
@@ -229,6 +231,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
 
   constructor(options: {
     snapshot: PluginInventorySnapshot;
+    durableDesired?: PluginInventorySnapshot;
     tui: PluginInventoryTuiPort;
     theme: unknown;
     keybindings?: PluginInventoryKeybindingsPort;
@@ -239,7 +242,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
     lifecycleFactory?: () => Promise<StoreResult<PluginLifecyclePort>>;
     initialAction?: PluginInventoryActionName;
   }) {
-    this.model = new PluginInventoryModel(options.snapshot);
+    this.model = new PluginInventoryModel(options.snapshot, options.durableDesired ?? options.snapshot);
     this.tui = options.tui;
     this.theme = options.theme;
     this.keybindings = options.keybindings;
@@ -508,7 +511,7 @@ export class PluginInventoryFocusController implements PluginInventoryFocusCompo
   private async lookupOnce(operationId: string, message: string): Promise<void> {
     if (this.fallbackLatched) return; this.fallbackLatched = true; const lookup = await this.lifecycle?.lookup(operationId); const projection = this.lifecycle?.projection(); if (projection?.ok) this.model.replaceDurableDesired(projection.value); const projectionWarning = projection !== undefined && !projection.ok ? " Desired-state projection refresh failed; authoritative operation evidence remains separate." : ""; let text: string; let command: string | undefined;
     if (lookup?.ok && lookup.value?.state === "terminal") text = `Authoritative terminal receipt: ${lookup.value.receipt.outcome}; completed ${lookup.value.receipt.completed}. Operation ${operationId}. Reopen /plugin for a fresh projection or start a new PiCC session.${projectionWarning}`;
-    else if (lookup?.ok && lookup.value?.state === "pending") { text = `Authoritative pending operation: completed ${lookup.value.completed}/${lookup.value.total}; recovery ${lookup.value.recoveryActions.join(" or ")}.${projectionWarning}`; command = `Exact fallback: picc plugin recover ${operationId}`; }
+    else if (lookup?.ok && lookup.value?.state === "pending") { text = `Authoritative pending operation: completed ${lookup.value.completed}/${lookup.value.total}; recovery ${lookup.value.recoveryActions.join(" or ")}.${projectionWarning}`; command = `Exact fallback from the active checkout: picc plugin recover ${operationId}`; }
     else text = `${message}. Operation lookup did not produce terminal or pending authority; inspect exact operation ${operationId}.${projectionWarning}`;
     this.prepared = undefined; this.clearPrivateInput(); this.model.setWorkflow({ phase: "terminal-fallback", operationId, message: text, ...(command === undefined ? {} : { recoveryCommand: command }) }); this.cache = undefined;
   }
@@ -572,6 +575,7 @@ export async function openPluginInventory(
     await Promise.resolve(custom((tui, theme, keybindings, done) => {
       component = new PluginInventoryFocusController({
         snapshot, tui, theme, keybindings, done,
+        ...(options.durableDesired === undefined ? {} : { durableDesired: options.durableDesired }),
         ...(options.render === undefined ? {} : { render: options.render }),
         ...(options.onError === undefined ? {} : { onError: options.onError }),
         ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }),

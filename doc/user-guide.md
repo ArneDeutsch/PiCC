@@ -258,11 +258,13 @@ while the former user fallback has no exact user-writable managed replacement. T
 `managed-mcp.json` authority is separate from managed settings and is not a migration target.
 
 The interactive TUI's bare `/plugin` opens observational **Discover**, **Installed**,
-**Marketplaces**, and **Errors** views. Filtering, details, `/plugin list`, `/plugin details
-name@marketplace`, `/plugins`, and `/doctor` remain inert over the snapshot captured at extension
-load. In the TUI, `/plugin install|enable|disable|update|uninstall`, `/plugin marketplace
-add|refresh|remove`, and `/plugin recover` enter a focused workflow that collects exact selectors,
-source and scope, destructive choices, preview, and confirmation. Headless slash use is guidance-only.
+**Marketplaces**, and **Errors** views. Each open keeps loaded-runtime evidence from extension startup
+but freshly projects desired state and lifecycle targets from the active checkout. Filtering and
+details remain passive: they do not acquire content, mutate state, or reload plugins. The fixed
+`/plugins` list and `/doctor` continue to use the extension-start snapshot. In the TUI, `/plugin
+install|enable|disable|update|uninstall`, `/plugin marketplace add|refresh|remove`, and `/plugin
+recover` enter a focused workflow that collects exact selectors, source and scope, destructive
+choices, preview, and confirmation. Headless slash use is guidance-only.
 
 Standalone commands run from the target project's working directory and build a fresh command-scoped
 view without normal Pi, MCP, hook, or plugin-runtime startup. The following is an orientation, not a
@@ -1006,7 +1008,7 @@ behaviors worth knowing:
 | `picc -p` exited with status **3** | A main-session checkpoint ended partially or was abandoned; resumed work may already have started, and files, tools, or external effects may exist. Treat stdout as partial, inspect the lifecycle stage in the `PiCC: ` stderr line or `picc-checkpoint-lifecycle` JSON/RPC entry, and follow its recovery guidance before resubmitting. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
-| Unexpected skills/agents from plugins | Use `/plugin list` for qualified identities, `/plugin details name@marketplace` for captured declarations and runtime posture, and `/doctor` for actionable compatibility findings. Healthy identities stay out of doctor diagnostics. Runtime loading requires effective literal `true` enablement plus matching imported installation authority or a committed PiCC-owned executable generation. |
+| Unexpected skills/agents from plugins | Use `/plugin list` for qualified identities, `/plugin details name@marketplace` for active-checkout declarations and captured runtime posture, and `/doctor` for actionable compatibility findings. Healthy identities stay out of doctor diagnostics. Runtime loading requires effective literal `true` enablement plus matching imported installation authority or a committed PiCC-owned executable generation. |
 | An enabled imported plugin is reported as uninstalled or its Claude-owned installed state is rejected | Inspect the exact qualified identity in `/plugin details`. Relative to the active Claude user directory, fix access/permissions for `plugins/installed_plugins.json` when unreadable or repair/regenerate it through Claude Code when malformed. For an unsupported format, update PiCC or contact PiCC support. After repair, use `/reload-plugins` in the interactive TUI or start a new PiCC session; `/new` does not reload the session snapshot. PiCC-owned pending operations instead use the explicit offline `picc plugin recover` flow above. |
 | The qualified plugin blocklist rejects every enabled plugin | Relative to the active Claude user directory, fix access/permissions for `plugins/blocklist.json` when unreadable. When malformed, ensure it is a valid JSON object, its optional `plugins` field is an array, and each entry's `plugin` field is a qualified `name@marketplace` identity. After repair, use `/reload-plugins` in the interactive TUI or start a new PiCC session. |
 | Managed plugin policy is ignored or Windows registry policy did not migrate | `/doctor` identifies a managed system file or ordered drop-in by safe source class, not by concrete path. Ask the administrator to repair that source, then use `/reload-plugins` in the interactive TUI or start a new PiCC session. Windows registry-only policy is intentionally silent and must be migrated manually as described under project loading. PiCC does not enforce `strictKnownMarketplaces`, `blockedMarketplaces`, or `allowManagedHooksOnly` against its lifecycle/runtime. |

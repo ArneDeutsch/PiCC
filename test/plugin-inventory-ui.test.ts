@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginInventoryDiagnostic, PluginInventoryItem, PluginInventoryMarketplace, PluginInventorySnapshot } from "../src/plugin-inventory.js";
 import { PluginInventoryFocusController, openPluginInventory } from "../src/runtime/plugin-inventory-focus.js";
-import { PluginInventoryModel, type PluginInventoryActionName } from "../src/runtime/plugin-inventory-model.js";
+import { mergeCapturedLoadedWithEffectiveDesired, PluginInventoryModel, type PluginInventoryActionName } from "../src/runtime/plugin-inventory-model.js";
 import { renderPluginInventory } from "../src/runtime/plugin-inventory-render.js";
 import type { PluginLifecyclePort } from "../src/plugin-inventory-cli.js";
 
@@ -59,8 +59,8 @@ function snapshot(options: {
 const plainTheme = { fg: (_color: string, value: string) => value };
 const output = (lines: readonly string[]): string => lines.join("\n");
 const normalizedOutput = (lines: readonly string[]): string => output(lines).replace(/\s+/gu, " ");
-function component(snap = snapshot(), options: { render?: typeof renderPluginInventory; requestRender?: () => void; done?: () => void; keybindings?: { matches(data: string, id: string): boolean }; onError?: (error: unknown) => void; lifecycle?: PluginLifecyclePort; lifecycleFactory?: () => Promise<{ ok: true; value: PluginLifecyclePort } | { ok: false; code: string; message: string }>; initialAction?: PluginInventoryActionName } = {}) {
-  return new PluginInventoryFocusController({ snapshot: snap, tui: { requestRender: options.requestRender ?? (() => {}) }, theme: plainTheme, done: options.done ?? (() => {}), ...(options.keybindings === undefined ? {} : { keybindings: options.keybindings }), ...(options.render === undefined ? {} : { render: options.render }), ...(options.onError === undefined ? {} : { onError: options.onError }), ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }), ...(options.lifecycleFactory === undefined ? {} : { lifecycleFactory: options.lifecycleFactory }), ...(options.initialAction === undefined ? {} : { initialAction: options.initialAction }) });
+function component(snap = snapshot(), options: { durableDesired?: PluginInventorySnapshot; render?: typeof renderPluginInventory; requestRender?: () => void; done?: () => void; keybindings?: { matches(data: string, id: string): boolean }; onError?: (error: unknown) => void; lifecycle?: PluginLifecyclePort; lifecycleFactory?: () => Promise<{ ok: true; value: PluginLifecyclePort } | { ok: false; code: string; message: string }>; initialAction?: PluginInventoryActionName } = {}) {
+  return new PluginInventoryFocusController({ snapshot: snap, tui: { requestRender: options.requestRender ?? (() => {}) }, theme: plainTheme, done: options.done ?? (() => {}), ...(options.durableDesired === undefined ? {} : { durableDesired: options.durableDesired }), ...(options.keybindings === undefined ? {} : { keybindings: options.keybindings }), ...(options.render === undefined ? {} : { render: options.render }), ...(options.onError === undefined ? {} : { onError: options.onError }), ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }), ...(options.lifecycleFactory === undefined ? {} : { lifecycleFactory: options.lifecycleFactory }), ...(options.initialAction === undefined ? {} : { initialAction: options.initialAction }) });
 }
 function allDetail(model: PluginInventoryModel, width = 100): string {
   let result = renderPluginInventory(model.view(), { width, theme: plainTheme });
@@ -102,13 +102,13 @@ describe("plugin inventory focused UI", () => {
     const unsupportedRuntime = new PluginInventoryModel(snapshot({ items: [item("runtime@one", { status: "unsupported", components: 0 })] }));
     unsupportedRuntime.setView(1);
     renderPluginInventory(unsupportedRuntime.view(), { width: 120, theme: { fg(color: string, value: string) { unsupportedColors.push(`${color}:${value}`); return value; } } });
-    expect(unsupportedColors.some((value) => value.startsWith("error:") && value.includes("session outcome unsupported"))).toBe(true);
+    expect(unsupportedColors.some((value) => value.startsWith("error:") && value.includes("captured runtime outcome unsupported"))).toBe(true);
     for (const status of ["enabled-but-uninstalled", "ambiguous", "blocked", "malformed", "rejected"] as const) {
       const failedColors: string[] = [];
       const failedUnsupported = new PluginInventoryModel(snapshot({ items: [item(`${status}@one`, { status, components: 2 })] }));
       failedUnsupported.setView(1);
       renderPluginInventory(failedUnsupported.view(), { width: 160, theme: { fg(color: string, value: string) { failedColors.push(`${color}:${value}`); return value; } } });
-      expect(failedColors.some((value) => value.startsWith("error:") && value.includes(`session outcome ${status}`) && value.includes("unsupported"))).toBe(true);
+      expect(failedColors.some((value) => value.startsWith("error:") && value.includes(`captured runtime outcome ${status}`) && value.includes("unsupported"))).toBe(true);
     }
 
     const empty = new PluginInventoryModel(snapshot({ items: [], marketplaces: [], diagnostics: [] }));
@@ -127,10 +127,68 @@ describe("plugin inventory focused UI", () => {
     model.appendFilter("[");
     const zero = output(renderPluginInventory(model.view(), { width: 90 }).lines);
     expect(zero).toContain("No matches for the active literal filter");
-    expect(zero).toContain("read-only · captured for this session");
+    expect(zero).toContain("read-only · captured loaded runtime + active-checkout desired state");
     expect(zero).toContain("run /reload-plugins in the interactive TUI");
     expect(zero).toMatch(/exit and relaunch\s+PiCC/);
     expect(zero).toContain("Local known catalogs/registrations only");
+  });
+
+  it("merges captured loaded runtime with effective active-checkout desired authority", () => {
+    const capturedItem = item("alpha@official", { description: "STARTUP-CAPTURED" });
+    const effectiveItem: PluginInventoryItem = {
+      ...item("alpha@official", { description: "ACTIVE-CHECKOUT", runtime: false }),
+      lifecycle: {
+        ownership: "picc-owned", candidates: [{ mutableRecordKey: "worktree-record", scope: "local", ownership: "picc-owned", selected: true, installed: true }],
+        selectionRequired: false, availableActions: ["disable"], installed: true, declared: true, effectiveEnabled: true,
+        loaded: false, dependency: { state: "satisfied" }, pendingReload: true, retainedErrors: [],
+      },
+    };
+    const captured = { ...snapshot({ items: [capturedItem], marketplaces: [] }), loadedGenerationId: "startup-generation" };
+    const effective = snapshot({ items: [effectiveItem], marketplaces: [marketplace("worktree-market")], durableDesired: { generationId: "worktree-generation", pluginIdentities: ["alpha@official"], marketplaceNames: ["worktree-market"], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } });
+    const merged = mergeCapturedLoadedWithEffectiveDesired(captured, effective);
+    expect(merged.find("alpha@official")?.outcome?.status).toBe("loaded");
+    expect(merged.find("alpha@official")?.metadata?.description).toBe("STARTUP-CAPTURED");
+    expect(merged.find("alpha@official")?.lifecycle?.availableActions).toEqual(["disable"]);
+    expect(merged.find("alpha@official")?.lifecycle?.candidates?.[0]?.mutableRecordKey).toBe("worktree-record");
+    expect(merged.marketplaces.map((value) => value.name)).toEqual(["worktree-market"]);
+
+    const focused = component(captured, { durableDesired: effective });
+    const text = normalizedOutput(focused.render(120));
+    expect(text).toContain("captured loaded runtime + active-checkout desired state");
+    expect(text).toContain("captured runtime outcome loaded");
+    expect(text).toContain("active-checkout desired installed/enabled");
+  });
+
+  it("strips captured-only desired authority and badges only loaded runtime for removal", () => {
+    const staleLifecycle = {
+      ownership: "picc-owned" as const, marketplaceOwnership: "picc-owned" as const, mutableRecordKey: "stale-key", selectedScope: "local",
+      candidates: [{ mutableRecordKey: "stale-key", scope: "local", ownership: "picc-owned" as const, selected: true, installed: true, trusted: true, immutableRevision: "rev", integrity: "sha256:stale", root: { kind: "plugin-cache" as const, display: "<plugin-cache>/stale" } }],
+      selectionRequired: true, selectionGuidance: "stale selection", availableActions: ["disable" as const], installed: true, declared: true, effectiveEnabled: true, loaded: true,
+      trusted: true, immutableRevision: "rev", integrity: "sha256:stale", root: { kind: "plugin-cache" as const, display: "<plugin-cache>/stale" }, defaultEnablementSource: "catalog",
+      dependency: { state: "satisfied" as const }, pendingStep: "commit", recoveryCategory: "complete-or-rollback" as const, recoveryCommand: "picc plugin recover stale",
+      lifecycleOperations: [{ operationId: "stale", status: "pending" as const, semanticStep: "commit", recoveryCommand: "picc plugin recover stale", category: "complete-or-rollback" as const }],
+      pendingReload: false, retainedErrors: ["stale failure"],
+    };
+    const loadedOnly: PluginInventoryItem = { ...item("loaded-only@official"), lifecycle: staleLifecycle };
+    const observedOnly: PluginInventoryItem = { ...item("observed-only@official", { status: "blocked" }), lifecycle: { ...staleLifecycle, loaded: false } };
+    const desired = snapshot({ items: [], marketplaces: [], durableDesired: { generationId: "effective", pluginIdentities: [], marketplaceNames: [], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } });
+    const merged = mergeCapturedLoadedWithEffectiveDesired(snapshot({ items: [loadedOnly, observedOnly], marketplaces: [] }), desired);
+
+    const loadedLifecycle = merged.find("loaded-only@official")!.lifecycle!;
+    expect(loadedLifecycle).toEqual({
+      ownership: "unknown", availableActions: [], installed: false, declared: false, effectiveEnabled: false, loaded: true,
+      dependency: { state: "not-evaluated" }, readOnlyReason: "No durable desired lifecycle target is present", pendingReload: true, retainedErrors: [],
+    });
+    expect(merged.find("loaded-only@official")).not.toHaveProperty("enablement");
+    expect(merged.find("loaded-only@official")).not.toHaveProperty("selectedInstallation");
+    expect(merged.find("loaded-only@official")?.components.every((value) => value.origin === "selected-manifest" || value.origin === "final-runtime")).toBe(true);
+
+    const observed = merged.find("observed-only@official")!;
+    expect(observed.lifecycle?.effectiveEnabled).toBe(false);
+    expect(observed.lifecycle?.pendingReload).toBe(false);
+    const model = new PluginInventoryModel(snapshot({ items: [observed], marketplaces: [] }));
+    expect(model.enterDetail()).toBe("entered");
+    expect(allDetail(model, 120)).toContain("Pending/recovery: reload not pending");
   });
 
   it("re-resolves plugins to the exact current object and marketplaces by their complete deterministic projection", () => {
@@ -159,7 +217,7 @@ describe("plugin inventory focused UI", () => {
     marketModel.leaveDetail();
     expect(marketModel.enterDetail()).toBe("stale");
     marketModel.failDetail("official");
-    expect(marketModel.view().warning).toContain("picc plugin list, then picc plugin details");
+    expect(marketModel.view().warning).toContain("from the active checkout run picc plugin list, then picc plugin details");
     expect(marketModel.view().warning).not.toContain("/plugin details");
 
     const stalePlugin = new PluginInventoryModel(snapshot({ items: [staleItem], find: () => undefined }));
@@ -220,8 +278,8 @@ describe("plugin inventory focused UI", () => {
     expect(detail).toContain("source kind=github");
     expect(detail).toContain("selected-manifest/mcpServers");
     expect(detail).toContain("<plugin-cache>/complete@official/plugin.json");
-    expect(normalizedOutput(detail.split("\n"))).toContain("2 additional retained values are not shown here; run picc plugin details complete@official for the larger bounded standalone view");
-    expect(normalizedOutput(detail.split("\n"))).toContain("4 additional retained values are not shown here; run picc plugin details complete@official for the larger bounded standalone view");
+    expect(normalizedOutput(detail.split("\n"))).toContain("2 additional retained values are not shown here; from the active checkout run picc plugin details complete@official for the larger bounded standalone view");
+    expect(normalizedOutput(detail.split("\n"))).toContain("4 additional retained values are not shown here; from the active checkout run picc plugin details complete@official for the larger bounded standalone view");
     expect(detail).toContain("<plugin-cache>/complete@official/1.2.3");
   });
 
@@ -244,7 +302,7 @@ describe("plugin inventory focused UI", () => {
     }
   });
 
-  it("shows valid/invalid installation evidence independently from session outcome", () => {
+  it("shows valid/invalid installation evidence independently from captured runtime outcome", () => {
     const base = item("invalid-only@official", { status: "blocked", components: 0 });
     const invalidOnly: PluginInventoryItem = { ...base, installations: [
       { scope: "project", version: "broken", validity: "invalid", selected: false, location: { kind: "external", display: "C:/unsafe/plugin" }, projectLocation: { kind: "project", display: "<project>/packages/broken" }, problems: ["missing-root"], diagnostics: [{ severity: "error", message: "invalid record" }] },
@@ -253,7 +311,7 @@ describe("plugin inventory focused UI", () => {
     model.setView(1);
     const list = output(renderPluginInventory(model.view(), { width: 120, theme: plainTheme }).lines);
     expect(list).toContain("installation records 0 valid / 1 invalid");
-    expect(list).toContain("session outcome blocked");
+    expect(list).toContain("captured runtime outcome blocked");
     expect(list).not.toContain("not installed");
     expect(model.enterDetail()).toBe("entered");
     const detail = allDetail(model);
@@ -261,7 +319,7 @@ describe("plugin inventory focused UI", () => {
     expect(detail).toContain("scope project · version broken · validity invalid · not selected");
     expect(normalizedOutput(detail.split("\n"))).toContain("location <external> · project <project>/packages/broken");
     expect(normalizedOutput(detail.split("\n"))).toContain("problems missing-root · diagnostics error:invalid record");
-    expect(detail).toContain("Session outcome: blocked");
+    expect(detail).toContain("Captured runtime outcome: blocked");
   });
 
   it("keeps list-window, local-cap, and snapshot-capture omission axes distinct in list and detail states", () => {
@@ -410,7 +468,7 @@ describe("plugin inventory focused UI", () => {
     for (const width of [1, 4, 7]) {
       const lines = renderPluginInventory(model.view(), { width, theme: plainTheme }).lines;
       const reconstructed = lines.join("").replace(/\s+/gu, "");
-      for (const signal of ["PiCCplugininventory", "read-onlysessionsnapshot", "widthunusable", "resizewider", "Esccloses"]) expect(reconstructed, `width ${width}`).toContain(signal);
+      for (const signal of ["PiCCplugininventory", "capturedloaded+activedesired", "widthunusable", "resizewider", "Esccloses"]) expect(reconstructed, `width ${width}`).toContain(signal);
       expect(reconstructed, `width ${width}`).not.toMatch(/Discover|Installed|Marketplaces|Errors|installation records|Filter:|←|Enter details|\/plugin list/u);
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
@@ -517,7 +575,7 @@ describe("plugin inventory focused UI", () => {
     const opened = await openPluginInventory(snapshot(), { mode: "tui", ui: { custom(factory, options) {
       expect(options).toBeUndefined();
       const c = factory({ requestRender() {} }, plainTheme, undefined, () => {});
-      expect(normalizedOutput(c.render(80))).toContain("Plugin inventory display failed. Esc closes. Run picc plugin list, then picc plugin details");
+      expect(normalizedOutput(c.render(80))).toContain("Plugin inventory display failed. Esc closes. Re-open /plugin, or from the active checkout run picc plugin list, then picc plugin details");
       expect(normalizedOutput(c.render(80))).not.toContain("/plugin details");
       const dispose = c.dispose.bind(c);
       c.dispose = () => { dispose(); throw new Error("dispose fault"); };
@@ -548,7 +606,7 @@ describe("plugin inventory focused UI", () => {
     const snap = { ...snapshot({ items: [lifecycleItem], marketplaces: [lifecycleMarketplace] }), loadedGenerationId: "loaded-generation", durableDesired: { generationId: "desired-generation", pluginIdentities: ["owned@official"], marketplaceNames: ["official"], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } };
     const model = new PluginInventoryModel(snap); model.setView(1);
     const normal = output(renderPluginInventory(model.view(), { width: 120, theme: plainTheme }).lines);
-    for (const truth of ["loaded loaded-generation", "desired desired-generation", "scope selection required", "eligibility none"]) expect(normal).toContain(truth);
+    for (const truth of ["captured loaded loaded-generation", "effective desired desired-generation", "scope selection required", "eligibility none"]) expect(normal).toContain(truth);
     expect(model.enterDetail()).toBe("entered"); const detail = allDetail(model, 120);
     for (const truth of ["declared derived/default", "Dependency: blocked", "plugin_pending", "complete-or-rollback", "picc plugin recover plugin_pending", "Scoped lifecycle candidates", "Retained lifecycle failures", "Lifecycle update ended failed-before-commit"]) expect(detail).toContain(truth);
     model.leaveDetail(); model.setView(2); expect(model.enterDetail()).toBe("entered"); const marketDetail = allDetail(model, 120);
@@ -654,7 +712,7 @@ describe("plugin inventory focused UI", () => {
   });
 
   it("bounds actionable ordinary planning causes and keeps active framing distinct from passive browsing", async () => {
-    expect(normalizedOutput(renderPluginInventory(new PluginInventoryModel(snapshot()).view(), { width: 100 }).lines)).toContain("read-only · captured for this session");
+    expect(normalizedOutput(renderPluginInventory(new PluginInventoryModel(snapshot()).view(), { width: 100 }).lines)).toContain("read-only · captured loaded runtime + active-checkout desired state");
     const framed = new PluginInventoryModel(snapshot()); framed.setWorkflow({ phase: "progress", action: "enable", operationId: "operation-1", cancellationRequested: false });
     const progressFrame = normalizedOutput(renderPluginInventory(framed.view(), { width: 100 }).lines); const narrowProgress = normalizedOutput(renderPluginInventory(framed.view(), { width: 7 }).lines); expect(progressFrame).toContain("Explicit confirmation authorized execution"); expect(progressFrame).toContain("receipt or recovery evidence is authoritative"); expect(narrowProgress.replace(/\s/gu, "")).toContain("Explicitconfirmationauthorizedexecution"); expect(narrowProgress).not.toContain("read-only");
     framed.setWorkflow({ phase: "receipt", action: "enable", operationId: "operation-1", receipt: { kind: "plugin", outcome: "committed", completed: 1 }, pendingReload: true }); const receiptFrame = normalizedOutput(renderPluginInventory(framed.view(), { width: 100 }).lines); expect(receiptFrame).toContain("Explicit confirmation authorized execution; this receipt is authoritative"); expect(receiptFrame).not.toContain("read-only");
@@ -673,7 +731,7 @@ describe("plugin inventory focused UI", () => {
     for (const [code, message, cause, guidance] of cases) {
       const port = { marketplaces: {}, plugins: { plan: async () => ({ ok: false, code, message }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true, value: undefined }), projection: () => ({ ok: true, value: snapshot() }) } as unknown as PluginLifecyclePort;
       const c = component(snapshot(), { lifecycle: port, initialAction: "enable" }); c.handleInput("\r");
-      expect(normalizedOutput(c.render(100))).toContain("Workflow active · no durable change until final confirmation"); expect(normalizedOutput(c.render(100))).not.toContain("read-only · captured for this session");
+      expect(normalizedOutput(c.render(100))).toContain("Workflow active · no durable change until final confirmation"); expect(normalizedOutput(c.render(100))).not.toContain("read-only · captured loaded runtime + active-checkout desired state");
       c.handleInput("alpha@official"); c.handleInput("\r"); c.handleInput("no"); c.handleInput("\r"); await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("failed"));
       const text = normalizedOutput(c.render(100)); expect(text).toContain(cause); expect(text).toContain(guidance); expect(text).toContain("Planning stopped before execution"); expect(text.length).toBeLessThan(1600); expect(text).not.toContain(code); expect(text).not.toContain(message); expect(text).not.toMatch(/ghp_MESSAGE_CANARY|xoxb-MESSAGE-CANARY|TAIL_CANARY|\[31m|\u001b/u);
     }
@@ -700,6 +758,21 @@ describe("plugin inventory focused UI", () => {
     const editedRemoval = component(snapshot(), { lifecycle: port, initialAction: "uninstall" }); editedRemoval.handleInput("\r"); editedRemoval.handleInput("alpha@official"); editedRemoval.handleInput("\r"); editedRemoval.handleInput("yes"); editedRemoval.handleInput("\r"); editedRemoval.handleInput("yes"); editedRemoval.handleInput("\r"); expect(editedRemoval.view().workflow).toMatchObject({ phase: "input", field: "remove data" }); editedRemoval.handleInput("\u001b[D"); expect(editedRemoval.view().workflow).toMatchObject({ phase: "input", field: "declaration only" }); editedRemoval.handleInput("\u001b[D"); expect(editedRemoval.view().workflow).toMatchObject({ phase: "input", field: "remove declaration" }); for (let index = 0; index < "yes".length; index += 1) editedRemoval.handleInput("\u007f"); editedRemoval.handleInput("no"); editedRemoval.handleInput("\r"); expect(editedRemoval.view().workflow).toMatchObject({ phase: "input", field: "remove data" }); editedRemoval.handleInput("no"); editedRemoval.handleInput("\r"); await vi.waitFor(() => expect(editedRemoval.view().workflow?.phase).toBe("preview")); expect(pluginOps.at(-1)).toMatchObject({ kind: "uninstall", flags: { removeDeclaration: false, declarationOnly: false, removeData: false } });
 
     const recovery = component(snapshot(), { lifecycle: port, initialAction: "recover" }); recovery.handleInput("\r"); recovery.handleInput("operation-1"); recovery.handleInput("\r"); expect(recovery.view().workflow).toMatchObject({ phase: "input", field: "recovery result" }); expect(normalizedOutput(recovery.render(100))).not.toContain("declaration only");
+  });
+
+  it("curates active-checkout lifecycle composition failure before planning", async () => {
+    const c = component(snapshot(), {
+      initialAction: "enable",
+      lifecycleFactory: async () => ({ ok: false, code: "active-checkout-assembly-failed", message: "LOADER_ERROR_CANARY credential=https://user:secret@example.test" }),
+    });
+    c.handleInput("\r"); c.handleInput("alpha@official"); c.handleInput("\r"); c.handleInput("no"); c.handleInput("\r");
+    await vi.waitFor(() => expect(c.view().workflow?.phase).toBe("failed"));
+    const rendered = normalizedOutput(c.render(120));
+    expect(rendered).toContain("Active-checkout plugin authority could not be assembled");
+    expect(rendered).toContain("no lifecycle execution started");
+    expect(rendered).toContain("ExitWorktree");
+    expect(rendered).toContain("from the active checkout");
+    expect(rendered).not.toMatch(/LOADER_ERROR_CANARY|user:secret|example\.test|credential/u);
   });
 
   it("clears credential-bearing form state when lifecycle composition throws", async () => {
