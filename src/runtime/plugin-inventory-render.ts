@@ -59,7 +59,7 @@ function framing(view: PluginInventoryModelView, theme: unknown, width: number, 
   if (phase === undefined) addWrapped(lines, theme, "muted", "read-only · captured loaded runtime + active-checkout desired state · browsing is inert", width);
   else if (phase === "receipt") addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; this receipt is authoritative.", width);
   else if (["progress", "pending-recovery", "terminal-fallback"].includes(phase)) addWrapped(lines, theme, "warning", "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative.", width);
-  else addWrapped(lines, theme, "muted", "Workflow active · no durable change until final confirmation; planning and preview do not execute.", width);
+  else addWrapped(lines, theme, "muted", "Workflow active · candidate acquisition or staging may occur during planning; lifecycle transaction execution and durable desired-state commit require final confirmation.", width);
   addWrapped(lines, theme, "muted", "Effective desired state comes from the active checkout at /plugin open and refreshes after receipts; loaded runtime remains session-captured.", width);
   addWrapped(lines, theme, "muted", `Generation: captured loaded ${safe(view.loadedSnapshot.loadedGenerationId ?? "not identified", 80)} · effective desired ${safe(view.durableDesired.durableDesired?.generationId ?? "not identified", 80)}`, width);
   if (view.actionOverlay) addWrapped(lines, theme, view.actionOverlay.phase === "failed" || view.actionOverlay.phase === "reload-unconfirmed" ? "warning" : "accent", `Overlay: ${safe(view.actionOverlay.phase, 40)} · ${safe(view.actionOverlay.target ?? view.actionOverlay.operationId, 100)}${view.actionOverlay.message ? ` · ${safe(view.actionOverlay.message)}` : ""}`, width);
@@ -301,7 +301,7 @@ export function renderPluginInventory(view: PluginInventoryModelView, options: P
   if (width < 8) {
     const phase = view.workflow?.phase;
     const postConfirmation = phase !== undefined && ["progress", "receipt", "pending-recovery", "terminal-fallback"].includes(phase);
-    const framing = phase === undefined ? "captured loaded + active desired" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; no durable change until explicit confirmation.";
+    const framing = phase === undefined ? "captured loaded + active desired" : postConfirmation ? "Explicit confirmation authorized execution; receipt or recovery evidence is authoritative." : "Active workflow; candidate acquisition or staging may occur during planning; lifecycle transaction execution and durable desired-state commit require confirmation.";
     for (const value of ["PiCC plugin inventory", framing, "width unusable", "resize wider", "Esc closes"]) addWrapped(lines, options.theme, "warning", value, width);
     return { lines: clampLines(lines, width), maxDetailScroll: 0, selectedVisible: false };
   }
