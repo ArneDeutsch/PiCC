@@ -18,7 +18,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
  */
 export function materializeFixture(name: string): string {
   const src = path.join(REPO_ROOT, "examples", name);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`)));
   fs.cpSync(src, dir, { recursive: true });
   const git = (...args: string[]) =>
     execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });

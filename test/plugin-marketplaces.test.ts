@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadPluginMarketplaceState, type PluginMarketplaceSettingsInputContribution } from "../src/claude/plugin-marketplaces.js";
 import { loadSettings } from "../src/discovery/settings.js";
-import { normalizeMarketplacePolicyDescriptor } from "../src/util/plugin-marketplace-descriptor.js";
+import { decodeExecutableMarketplaceCatalogProjection, deriveExecutableMarketplaceCatalogProjection, normalizeMarketplaceCatalogDocument, normalizeMarketplacePolicyDescriptor } from "../src/util/plugin-marketplace-descriptor.js";
 import type { PluginMarketplaceComponentField } from "../src/types.js";
 
 const knownFixture = fileURLToPath(new URL("./fixtures/claude-plugins/known-marketplaces.json", import.meta.url));
@@ -91,6 +91,14 @@ afterEach(() => {
 });
 
 describe("loadPluginMarketplaceState", () => {
+  it("derives one bounded canonical executable projection from exact catalog bytes", () => {
+    const bytes = Buffer.from(JSON.stringify({ name: "official-marketplace", owner: { name: "Example" }, metadata: { pluginRoot: "plugins" }, allowCrossMarketplaceDependenciesOn: ["zeta", "partner"], plugins: [{ name: "tool", source: "./tool", version: "1.2.3", dependencies: ["base", { name: "cross", marketplace: "partner", version: "^2" }] }, { name: "archive", source: { source: "archive", url: "https://archive.example.org/plugin.zip" }, defaultEnabled: false, revision: "release-2" }] }));
+    const projection = deriveExecutableMarketplaceCatalogProjection(bytes, "local-directory"); expect(projection).toEqual({ marketplaceName: "official-marketplace", allowedCrossMarketplaceDependencies: ["partner", "zeta"], declarations: [{ pluginId: "archive@official-marketplace", source: { kind: "https-zip", url: "https://archive.example.org/plugin.zip" }, defaultEnabled: false, release: { kind: "revision", value: "release-2" }, dependencies: [], dependencyDeclaration: "absent" }, { pluginId: "tool@official-marketplace", source: { kind: "relative", path: "tool", pluginRoot: "plugins" }, release: { kind: "version", value: "1.2.3" }, dependencies: [{ name: "base", itemIndex: 0 }, { name: "cross", marketplace: "partner", version: "^2", itemIndex: 1 }], dependencyDeclaration: "complete" }] }); expect(decodeExecutableMarketplaceCatalogProjection(projection, "local-directory")).toEqual(projection);
+    const reorderedNpm = { marketplaceName: "official-marketplace", allowedCrossMarketplaceDependencies: [], declarations: [{ pluginId: "npm-tool@official-marketplace", source: { registry: "https://registry.npmjs.org", package: "npm-tool", kind: "npm" }, dependencies: [], dependencyDeclaration: "absent" }] }; expect(decodeExecutableMarketplaceCatalogProjection(reorderedNpm, "local-directory")).toMatchObject({ declarations: [{ source: { kind: "npm", package: "npm-tool", registry: "https://registry.npmjs.org" } }] }); expect(decodeExecutableMarketplaceCatalogProjection({ ...reorderedNpm, declarations: [{ ...reorderedNpm.declarations[0], pluginId: "bad@@official-marketplace" }] }, "local-directory")).toBeUndefined();
+    const duplicate = Buffer.from(JSON.stringify({ name: "official-marketplace", plugins: [{ name: "tool", source: "./tool" }, { name: "tool", source: "./other" }] })); expect(deriveExecutableMarketplaceCatalogProjection(duplicate, "local-directory")).toBeUndefined();
+    const duplicateAllowlist = Buffer.from(JSON.stringify({ name: "official-marketplace", allowCrossMarketplaceDependenciesOn: ["partner", "partner"], plugins: [] })); expect(deriveExecutableMarketplaceCatalogProjection(duplicateAllowlist, "local-directory")).toBeUndefined();
+    const truncatedDependencies = Buffer.from(JSON.stringify({ name: "official-marketplace", plugins: [{ name: "tool", source: "./tool", dependencies: Array.from({ length: 129 }, () => "base") }] })); expect(deriveExecutableMarketplaceCatalogProjection(truncatedDependencies, "local-directory")).toBeUndefined();
+  });
   it("derives primary catalogs beneath the user marketplace root and keeps declarations non-authoritative", () => {
     const root = temporaryRoot();
     const userDir = path.join(root, ".claude");
@@ -1168,6 +1176,31 @@ describe("loadPluginMarketplaceState", () => {
     const contributionOmitted = loadPluginMarketplaceState({ userDir, projectRoot: root, seedDirs: [], settings: contributionCapped });
     expect(contributionCapped.pluginMarketplaceSettingsOmissions).toEqual({ contributions: 1, declarations: 0 });
     expect(contributionOmitted.policies[0]?.match).toBe("indeterminate-because-evidence-omitted");
+  });
+
+  it("normalizes bounded catalog declarations without I/O or executable authority", () => {
+    expect(normalizeMarketplaceCatalogDocument({ name: "official", owner: { name: "Example" }, plugins: [{ name: "safe", source: "./safe" }, { name: "remote", source: { source: "npm", package: "example" } }, { name: "broken" }, null] })).toEqual({ name: "official", ownerName: "Example", plugins: [{ name: "safe", supported: true, sourceKind: "relative" }, { name: "remote", supported: true, sourceKind: "npm" }, { name: "broken", supported: false, error: "Unsupported, malformed, or unsafe plugin source declaration" }], unsupportedEntries: 1, omittedEntries: 1 });
+    expect(normalizeMarketplaceCatalogDocument({ name: "official", owner: { name: "Example" }, plugins: Array.from({ length: 1025 }, () => ({ name: "safe", source: "./safe" })) })).toMatchObject({ plugins: { length: 1024 }, unsupportedEntries: 0, omittedEntries: 1 });
+    expect(normalizeMarketplaceCatalogDocument({ name: "official", owner: { name: "Example" }, plugins: [{ name: "relative", source: "./safe" }] }, "https-catalog")).toMatchObject({ plugins: [{ name: "relative", supported: false }], unsupportedEntries: 1, omittedEntries: 0 });
+  });
+
+  it("classifies every delivered catalog source family through the contextual source matrix", () => {
+    const plugins = [
+      { name: "relative", source: "./relative" },
+      { name: "github", source: { source: "github", repo: "owner/repository" } },
+      { name: "git", source: { source: "url", url: "https://example.org/plugin.git" } },
+      { name: "subdir", source: { source: "git-subdir", url: "https://example.org/plugin.git", path: "packages/plugin" } },
+      { name: "npm", source: { source: "npm", package: "example-plugin" } },
+      { name: "archive", source: { source: "archive", url: "https://example.org/plugin.zip" } },
+      { name: "unknown", source: { source: "future" } },
+    ];
+    expect(normalizeMarketplaceCatalogDocument({ name: "official", owner: { name: "Owner" }, plugins })).toMatchObject({
+      ownerName: "Owner", plugins: [
+        { name: "relative", supported: true, sourceKind: "relative" }, { name: "github", supported: true, sourceKind: "github" },
+        { name: "git", supported: true, sourceKind: "https-git" }, { name: "subdir", supported: true, sourceKind: "https-git-subdir" },
+        { name: "npm", supported: true, sourceKind: "npm" }, { name: "archive", supported: true, sourceKind: "https-zip" }, { name: "unknown", supported: false },
+      ], unsupportedEntries: 1, omittedEntries: 0,
+    });
   });
 
   it("isolates malformed registration, entry, rename, and prototype-key siblings", () => {

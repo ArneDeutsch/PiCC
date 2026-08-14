@@ -14,7 +14,7 @@ function boundedRuntimeLabel(value: string): string {
   return neutral.length <= 128 ? neutral : `${neutral.slice(0, 127)}…`;
 }
 
-const PLUGIN_RECONCILE_RECOVERY = "Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.";
+const PLUGIN_RECONCILE_RECOVERY = "Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run /reload-plugins in the interactive TUI or start a new PiCC session.";
 
 /** Mutable preservation state owned by one main session or one child dispatch. */
 export interface SkillActivationState {

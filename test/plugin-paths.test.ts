@@ -4,6 +4,11 @@ import path from "node:path";
 import { afterAll, afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   authorizePluginRoot,
+  authorizeOwnedPluginDataLocation,
+  bindPluginRuntimeDataAuthorization,
+  ownedPluginDataDeletionEligible,
+  pluginRuntimeDataAuthorization,
+  prepareAuthorizedPluginDataLocation,
   resolvePluginDataLocation,
   resolvePluginPath,
   revalidatePluginDataLocation,
@@ -163,6 +168,34 @@ describe("installed root authorization", () => {
     } finally {
       process.chdir(previous);
     }
+  });
+});
+
+describe("owned plugin data authorization", () => {
+  it("authorizes profile-wide owned data and prepares only the exact bound identity", () => {
+    const profileRoot = temporaryDirectory("picc-owned-profile-");
+    const dataRoot = path.join(profileRoot, "data");
+    const authorized = authorizeOwnedPluginDataLocation({ profileRoot, dataRoot, profileKey: "profile-test", qualifiedIdentity: "tool@official" });
+    expect(authorized).toMatchObject({ ok: true, value: { ownership: "picc-owned", qualifiedIdentity: "tool@official", lexicalBasePath: dataRoot } });
+    if (!authorized.ok) throw new Error("authority");
+    const context = { pluginId: "tool@official", pluginName: "tool", root: path.join(profileRoot, "artifact"), dataDir: authorized.value.lexicalPath, projectDir: profileRoot };
+    expect(bindPluginRuntimeDataAuthorization(context, authorized.value)).toBe(true);
+    expect(pluginRuntimeDataAuthorization(context)).toBe(authorized.value);
+    expect(prepareAuthorizedPluginDataLocation(authorized.value)).toMatchObject({ ok: true });
+    expect(fs.statSync(authorized.value.lexicalPath).isDirectory()).toBe(true);
+    expect(bindPluginRuntimeDataAuthorization({ ...context, pluginId: "other@official" }, authorized.value)).toBe(false);
+  });
+
+  it("fails close when an owned data base is retargeted and never treats imported references as owned deletion authority", () => {
+    const profileRoot = temporaryDirectory("picc-owned-retarget-"); const dataRoot = path.join(profileRoot, "data"); fs.mkdirSync(dataRoot);
+    const authorized = authorizeOwnedPluginDataLocation({ profileRoot, dataRoot, profileKey: "profile-test", qualifiedIdentity: "tool@official" });
+    if (!authorized.ok) throw new Error("authority");
+    if (directoryLinkProbe) {
+      const outside = temporaryDirectory("picc-owned-outside-"); fs.rmSync(dataRoot, { recursive: true }); directoryLink(outside, dataRoot);
+      expect(prepareAuthorizedPluginDataLocation(authorized.value)).toMatchObject({ ok: false });
+    }
+    expect(ownedPluginDataDeletionEligible("tool@official", { installations: [] } as never)).toBe(false);
+    expect(ownedPluginDataDeletionEligible("tool@official", [] as never)).toBe(false);
   });
 });
 

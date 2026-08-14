@@ -70,8 +70,8 @@ Release archives and notes are on [GitHub Releases](https://github.com/ArneDeuts
   source-specific controls; see the [capability matrix](doc/supported-features.md) for exact limits.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
-- **Plugins** — read-only local inventory and diagnostics accompany exact installed-state loading;
-  see [Installed plugins](doc/user-guide.md#installed-plugins).
+- **Plugins** — explicit local marketplace and plugin lifecycle management, immutable admission,
+  inventory, recovery, and session reload; see [Installed plugins](doc/user-guide.md#installed-plugins).
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a
   non-vision model; notebooks can be edited cell-by-cell with `NotebookEdit`; a genuinely unsupported

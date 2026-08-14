@@ -675,7 +675,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(managedMcpRow).toMatch(/Then use `\/reload` or restart PiCC; `\/new` does not reload policy/);
     expect(managedMcpRow).not.toMatch(/override|user-controlled/);
     const managedPluginRow = troubleshooting.match(/^\| Managed plugin policy is ignored[^\n]+$/m)?.[0];
-    expect(managedPluginRow).toMatch(/Windows registry policy did not migrate[\s\S]*managed system file or ordered drop-in[\s\S]*administrator[\s\S]*`\/reload`[\s\S]*exit and relaunch PiCC[\s\S]*registry-only policy[\s\S]*migrated manually[\s\S]*project loading/);
+    expect(managedPluginRow).toMatch(/Windows registry policy did not migrate[\s\S]*managed system file or ordered drop-in[\s\S]*administrator[\s\S]*`\/reload-plugins`[\s\S]*start a new PiCC session[\s\S]*registry-only policy[\s\S]*migrated manually[\s\S]*project loading/);
+    expect(managedPluginRow).toMatch(/does not enforce[\s\S]*`strictKnownMarketplaces`[\s\S]*`blockedMarketplaces`[\s\S]*`allowManagedHooksOnly`/);
     expect(managedPluginRow).not.toMatch(/`override`|user-controlled/);
 
     const architecture = readDoc("../doc/architecture.md");
@@ -696,112 +697,57 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(inScope).toMatch(/Windows registry state is not an applicable enforcement input/);
   });
 
-  it("splits installed plugin support truth by selection, component, management, and lifecycle", () => {
-    expectDisclosure({
-      id: "feature.plugins-installed-selection",
-      tier: "partial",
-      core: [/read-only exact-version runtime selection/, /separate declaration observation/, /qualified name@marketplace/, /load no fallback content/],
-      gap: [/undocumented/, /not PiCC's permanent API/],
-      parity: [/FIXTURE-DERIVED/, /Captured Claude installed-state v2/, /PiCC-defined/],
-    });
-    expectDisclosure({
-      id: "feature.plugins-enablement",
-      tier: "partial",
-      core: [/literal booleans only/, /source-aware key-wise precedence/],
-      gap: [/defaultEnabled.*unsupported/, /strict-overlay execution/, /lifecycle policy enforcement/, /cannot establish development or bundled-root trust/],
-    });
-    const umbrella = lookupCapability("feature.plugins-content");
-    expect(umbrella).toMatchObject({ tier: "partial" });
-    for (const phrase of ["selected installed-plugin skills, commands, agents, and hooks", "fixture-derived", "catalog roots remain inert", "strict marketplace overlays", "unsupported component execution", "feature.mcp-plugin-servers"]) {
-      expect(umbrella?.note).toContain(phrase);
-    }
-    const enablementNote = lookupCapability("setting.enabledPlugins")?.note ?? "";
-    expect(enablementNote).toContain(
-      "Realized load order is user settings, then for each directory from project root to cwd that directory's project settings followed by its local settings, then managed policy; the later value wins per qualified identity. A nested project's value can therefore override an ancestor's local value, unlike Claude's documented global local-over-project precedence.",
-    );
-    expect(enablementNote).not.toContain("managed > local > project > user");
-    for (const id of [
-      "feature.plugins-skills",
-      "feature.plugins-commands",
-      "feature.plugins-agents",
-      "feature.plugins-hooks",
-    ]) {
-      const entry = lookupCapability(id);
-      expect(entry?.tier, id).toBe("partial");
-      expect(entry?.note, id).toContain("qualified");
-      expect(entry?.note, id).toContain("lazy");
-      expect(entry?.note, id).toContain("VERIFIED rejected");
-      expect(entry?.note, id).toContain("PiCC-defined whole-plugin rejection");
-    }
-    const skills = lookupCapability("feature.plugins-skills")?.note ?? "";
-    expect(skills).toContain("explicit skill directories");
-    expect(skills).toContain("directory directly containing SKILL.md");
-    expect(skills).toContain("individual files are not skill declarations");
-    for (const [id, namespace] of [
-      ["feature.plugins-skills", "skill"],
-      ["feature.plugins-commands", "command"],
-      ["feature.plugins-agents", "agent"],
-    ] as const) {
-      const note = lookupCapability(id)?.note ?? "";
-      expect(note).toContain("Installed qualified name@marketplace identity owns selection, variable/data context");
-      expect(note).toContain(`present validated kebab-case manifest name owns the visible ${namespace} namespace`);
-      expect(note).toContain("manifestless content uses the validated installed lifecycle name");
-    }
-    const selection = lookupCapability("feature.plugins-installed-selection")?.note ?? "";
-    for (const phrase of ["CLAUDE_CODE_PLUGIN_CACHE_DIR", "path-delimited", "<seed>/cache", "existing accessible directories", "exact imported record", "does not import seed marketplaces", "first-seed lifecycle behavior", "Highest-applicable winner", "canonical equivalent deduplication", "qualified blocklist schema and global fail-closed", "namespace/data-key collision rejection", "no fallback", "PiCC-defined"]) expect(selection).toContain(phrase);
-    const agents = lookupCapability("feature.plugins-agents")?.note ?? "";
-    for (const phrase of ["plugin-agent local names are validated", "Global ordinary-agent parser gaps", "hooks", "mcpServers", "permissionMode"]) expect(agents).toContain(phrase);
-    const hooks = lookupCapability("feature.plugins-hooks")?.note ?? "";
-    for (const phrase of ["command and argument fields alone", "canonical authorized root", "matcher, condition, URL, and arbitrary raw fields remain literal"]) expect(hooks).toContain(phrase);
-    const metadata = lookupCapability("feature.plugins-manifest-metadata")?.note ?? "";
-    for (const phrase of ["present validated kebab-case plugin manifest name owns the visible runtime component namespace", "manifestless content uses the validated installed lifecycle name", "bounded same-read projection", "name, description, version, author, homepage, repository, license, keywords, dependencies", "supported or unsupported component declaration shapes", "Skills, commands, agents, and hooks declarations can affect runtime only after selection and validation", "manifest dependencies remain unresolved inventory evidence", "renames remain catalog-only inert declarations", "Broader recognized metadata validation", "defaultEnabled execution", "marketplace strict overlays", "settings rewrite are unsupported"]) expect(metadata).toContain(phrase);
-    expect(lookupCapability("feature.plugins-development-trust")).toMatchObject({ tier: "not-supported" });
-    expect(lookupCapability("feature.plugins-development-trust")?.note).toContain("repository-bundled");
-    expect(lookupCapability("feature.plugins-command-plugin")).toMatchObject({ tier: "partial" });
-    for (const phrase of ["PiCC-defined read-only four-view session inventory", "Discover, Installed, Marketplaces, and Errors", "list/details", "No install, update, enable, disable, uninstall", "stable JSON automation contract"]) {
-      expect(lookupCapability("feature.plugins-command-plugin")?.note).toContain(phrase);
-    }
-    expect(lookupCapability("feature.plugins-command-plugins")).toMatchObject({ tier: "partial" });
-    for (const phrase of ["PiCC-defined exact-list alias", "same captured read-only session snapshot", "not Claude parity", "no lifecycle mutation", "no stable JSON automation contract"]) {
-      expect(lookupCapability("feature.plugins-command-plugins")?.note).toContain(phrase);
-    }
-    expect(lookupCapability("feature.plugins-command-reload")).toMatchObject({ tier: "degraded-noop" });
-    expect(lookupCapability("feature.plugins-command-reload")?.note).toContain("performs no reload");
-    expect(lookupCapability("feature.plugins-command-reload")?.note).toContain("canonical interactive /reload");
-    for (const [id, phrase] of [
-      ["feature.plugin-install", "installation is not implemented"],
-      ["feature.plugin-update", "update is not implemented"],
-      ["feature.plugin-uninstall", "uninstall is not implemented"],
-      ["feature.plugin-marketplace", "marketplace add, update, remove, refresh"],
-      ["feature.plugins-other-components", "LSP, workflows, output styles, top-level and experimental themes and monitors, channels"],
-    ] as const) {
-      expect(lookupCapability(id)?.tier, id).toBe("not-supported");
-      expect(lookupCapability(id)?.note, id).toContain(phrase);
-    }
-    for (const id of ["feature.plugin-install", "feature.plugin-update", "feature.plugin-uninstall"]) {
-      expect(lookupCapability(id)?.note, id).toContain("canonical interactive /reload");
-      expect(lookupCapability(id)?.note, id).toContain("or relaunch PiCC");
-    }
-    expect(lookupCapability("feature.plugins-other-components")?.note).toContain("bounded shape-only inventory evidence");
-    expect(lookupCapability("feature.plugins-other-components")?.note).toContain("feature.mcp-plugin-servers");
+  it("pins observational inventory, owned lifecycle, source, policy, dependency, and reload boundaries", () => {
+    expect(lookupCapability("feature.plugins-installed-selection")).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("feature.plugins-installed-selection")?.note).toMatch(/PiCC-owned committed installation authority[\s\S]*Claude-owned and managed records remain read-only[\s\S]*seed bases.*never authorize content alone/);
+    expect(lookupCapability("feature.plugins-enablement")?.note).toMatch(/Installed record, authentic enabledPlugins declaration, precedence-resolved effective state, immutable code, and optional data remain distinct[\s\S]*marketplace defaultEnabled, then manifest defaultEnabled, then true[\s\S]*never acquires or enables them automatically[\s\S]*imported dependency metadata remains observational/);
+    expect(lookupCapability("feature.plugins-manifest-metadata")?.note).toMatch(/defaultEnabled participates only in initial PiCC-owned install[\s\S]*PiCC-owned activation checks dependencies[\s\S]*imported dependency metadata remains observational/);
 
-    for (const id of ["feature.plugins-inventory", "feature.plugins-launcher-inventory", "feature.plugins-marketplace-observation"] as const) {
-      expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
+    const enabled = lookupCapability("setting.enabledPlugins")?.note ?? "";
+    for (const phrase of ["active Claude profile settings.json", "active checkout .claude/settings.json", "canonical main checkout shared .claude/settings.local.json", "user, then each root-to-cwd project/local pair", "for a reciprocally verified linked worktree, the canonical main checkout's shared .claude/settings.local.json", "finally managed policy", "diverge from Claude's documented global Local > Project > User priority", "Existing explicit effective enablement survives install and update", "Declaration-only consent", "never overrides a higher-precedence effective declaration"]) expect(enabled).toContain(phrase);
+    expect(enabled).not.toContain("reinstall");
+    expect(lookupCapability("setting.extraKnownMarketplaces")?.note).toMatch(/PiCC can write selected[\s\S]*Claude-owned, seed, and managed.*read-only/);
+
+    for (const id of ["feature.plugins-inventory", "feature.plugins-launcher-inventory", "feature.plugins-marketplace-observation"] as const) expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("feature.plugins-inventory")?.note).toMatch(/observational projection[\s\S]*Fixed `\/plugins` and `\/doctor` consume the startup capture[\s\S]*Interactive `\/plugin` keeps loaded-runtime truth captured while freshly assembling effective desired authority from the active checkout[\s\S]*Every passive view remains inert and acquisition-free[\s\S]*No stable JSON automation/);
+    expect(lookupCapability("feature.plugins-launcher-inventory")?.note).toMatch(/explicit marketplace, install, enable, disable, update, uninstall, and offline recovery[\s\S]*previews and confirmation/);
+    expect(lookupCapability("feature.plugins-marketplace-observation")?.note).toMatch(/Claude-owned, seed, and managed[\s\S]*exact selected PiCC-owned records[\s\S]*refresh changes retained catalog snapshots but never installed executable generation membership/);
+
+    expect(lookupCapability("feature.plugins-command-plugin")?.note).toMatch(/passive Discover, Installed, Marketplaces, and Errors[\s\S]*focused install, enable, disable, update, uninstall[\s\S]*headless slash use is guidance-only/);
+    expect(lookupCapability("feature.plugins-command-plugins")?.note).toMatch(/exact-list alias[\s\S]*no lifecycle mutation/);
+    expect(lookupCapability("feature.plugins-command-reload")).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("feature.plugins-command-reload")?.note).toMatch(/validates a fresh complete candidate[\s\S]*ctx.reload\(\)[\s\S]*Validation failure starts no Pi reload and preserves the current snapshot[\s\S]*cannot roll back[\s\S]*generic reload success[\s\S]*Pi's own reload-error reporting[\s\S]*Headless use is guidance-only/);
+
+    for (const id of ["feature.plugin-install", "feature.plugin-update", "feature.plugin-uninstall", "feature.plugin-marketplace", "feature.plugin-source-acquisition", "feature.plugin-dependencies"] as const) expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
+    expect(lookupCapability("feature.plugin-install")?.note).toMatch(/PiCC-owned user, project, and local records[\s\S]*exact retained PiCC-owned marketplace snapshot[\s\S]*previews immutable source\/revision\/digests[\s\S]*atomically admits one complete executable generation/);
+    expect(lookupCapability("feature.plugin-update")?.note).toMatch(/explicit update preserves existing explicit enablement[\s\S]*immutable replacement[\s\S]*complete generation[\s\S]*safe pending recovery[\s\S]*manual only/);
+    expect(lookupCapability("feature.plugin-update")?.note).not.toContain("reinstall");
+    expect(lookupCapability("feature.plugin-uninstall")?.note).toMatch(/one exact PiCC-owned record[\s\S]*separately confirms enabledPlugins declaration removal and optional plugin-data removal[\s\S]*Imported Claude and managed records remain read-only/);
+    expect(lookupCapability("feature.plugin-marketplace")?.note).toMatch(/local directory\/file[\s\S]*GitHub[\s\S]*anonymous public HTTPS Git[\s\S]*public HTTPS catalog[\s\S]*user, project, and local[\s\S]*Private\/SSH/);
+    expect(lookupCapability("feature.plugin-source-acquisition")?.note).toMatch(/relative content only from retained materialized local or Git-backed marketplace trees[\s\S]*standalone public HTTPS catalog descriptors cannot confer relative content authority[\s\S]*Git repositories and subdirectories[\s\S]*public npm[\s\S]*without lifecycle scripts[\s\S]*public HTTPS ZIP/);
+    expect(lookupCapability("feature.plugin-dependencies")?.note).toMatch(/PiCC-owned lifecycle activation[\s\S]*already-installed effective plugins[\s\S]*missing, incompatible, cyclic, ambiguous, or indeterminate[\s\S]*Imported dependency metadata remains observational[\s\S]*never acquires, updates, or enables dependencies automatically/);
+    expect(lookupCapability("feature.plugin-lifecycle-automation")).toMatchObject({ tier: "not-supported" });
+    expect(lookupCapability("feature.plugins-other-components")).toMatchObject({ tier: "not-supported" });
+
+    expect(lookupCapability("setting.allowManagedHooksOnly")).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    expect(lookupCapability("setting.allowManagedHooksOnly")?.note).toMatch(/does not enforce[\s\S]*PiCC-owned or imported plugins[\s\S]*command hook can run/);
+    for (const id of ["setting.strictKnownMarketplaces", "setting.blockedMarketplaces"] as const) {
+      expect(lookupCapability(id), id).toMatchObject({ tier: "partial", safetyRelevant: true });
+      expect(lookupCapability(id)?.note, id).toMatch(/read-only observation[\s\S]*does not enforce/);
     }
-    const inventory = lookupCapability("feature.plugins-inventory")?.note ?? "";
-    for (const phrase of ["bounded read-only snapshot", "by qualified identity", "marketplace registrations and policy stay global", "selected-manifest and catalog dependencies retain distinct unresolved provenance", "renames remain catalog-only inert declarations", "Session UI/text/doctor consumers share one immutable capture", "command consumers build one fresh snapshot", "No disk reread", "stable JSON automation contract", "exact Claude rendering parity"]) expect(inventory).toContain(phrase);
-    const launcher = lookupCapability("feature.plugins-launcher-inventory")?.note ?? "";
-    for (const phrase of ["picc plugin list", "picc plugin details <qualified-name>", "one fresh command-scoped", "avoid normal Pi extension, hook, MCP, and plugin-runtime startup", "not stable JSON automation"]) expect(launcher).toContain(phrase);
-    const marketplace = lookupCapability("feature.plugins-marketplace-observation")?.note ?? "";
-    for (const phrase of ["local-only observation", "fixture-derived known_marketplaces.json serialization", "supported and unsupported component shapes", "dependencies", "renames", "Catalogs are inventory-only and never authorize content", "no network refresh", "dependency resolution", "rename migration", "strict-overlay execution"]) expect(marketplace).toContain(phrase);
-    for (const id of ["setting.extraKnownMarketplaces", "setting.strictKnownMarketplaces", "setting.blockedMarketplaces"] as const) {
-      expect(lookupCapability(id), id).toMatchObject({ tier: "partial" });
-      expect(lookupCapability(id)?.note, id).toContain("read-only observation");
-      expect(lookupCapability(id)?.note, id).toMatch(/lifecycle enforcement|Blocking is observational only/);
+    const currentPluginSettings = [
+      { id: "setting.disableCommandPluginSources", tier: "not-supported", note: /does not support command plugin sources[\s\S]*does not enforce this managed policy as a general restriction/ },
+      { id: "setting.pluginConfigs", tier: "not-supported", note: /observes the bounded marketplace userConfig declaration shape[\s\S]*does not consume configured values or apply plugin user configuration/ },
+      { id: "setting.pluginSuggestionMarketplaces", tier: "degraded-noop", note: /does not perform organization-governed plugin suggestions/ },
+    ] as const;
+    for (const expected of currentPluginSettings) {
+      const capability = lookupCapability(expected.id);
+      expect(capability, expected.id).toMatchObject({ tier: expected.tier });
+      expect(capability?.note, expected.id).toMatch(expected.note);
+      expect(capability?.evidence, expected.id).toEqual([{ quality: "documented", source: "Settings reference — Available settings", reviewed: "2026-07-31" }]);
     }
-    const lifecycle = lookupCapability("feature.plugin-marketplace");
-    expect(lifecycle).toMatchObject({ tier: "not-supported" });
-    for (const phrase of ["add, update, remove, refresh", "network acquisition", "lifecycle mutation", "observation-only"]) expect(lifecycle?.note).toContain(phrase);
+    expect(lookupCapability("setting.disableCommandPluginSources")?.safetyRelevant).toBe(true);
+    expect(lookupCapability("setting.disableSideloadFlags")?.note).toMatch(/unsupported Claude sideload flags[\s\S]*neither disables nor authorizes PiCC's explicit/);
   });
 
   it("qualifies plugin-agent global fields, retained managed-policy sources, and unsupported Windows registry delivery", () => {
@@ -1456,20 +1402,56 @@ describe("buildCompatReport", () => {
     expect(doctor).toContain("known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1");
     expect(doctor).toContain("broken@community");
     expect(doctor).toContain("Selected manifest declares an unsupported plugin component");
-    expect(doctor).toContain("Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+    expect(doctor).toContain("Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then run /reload-plugins in the interactive TUI or start a new PiCC session.");
     expect(doctor).not.toContain("HOSTILE OBSERVATION");
     expect(doctor).toContain("<redacted-field>");
     expect(doctor).toContain("A non-boolean enabledPlugins value was ignored");
-    expect(doctor).toContain("managed-policy override was malformed; this source was ignored. Correct the managed-policy override format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
+    expect(doctor).toContain("managed-policy override was malformed; this source was ignored. Correct the managed-policy override format, then run /reload-plugins in the interactive TUI, or start a new PiCC session.");
     expect(doctor).toContain("Capture omissions may make these retained counts incomplete: snapshot.items=4.");
-    expect(doctor).toContain("Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+    expect(doctor).toContain("Captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh.");
     expect(doctor).toContain("Repair boundary: PiCC inventory is read-only; repair plugin state, declarations, or policy outside this command.");
-    expect(doctor).toContain("Refresh: Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+    expect(doctor).toContain("Refresh: Captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh.");
     expect(doctor.match(/Repair the captured declaration/gu)).toHaveLength(1);
     expect(doctor.match(/3 additional captured diagnostic\(s\) omitted/gu)).toHaveLength(1);
     expect(doctor.match(/2 additional captured capability observation\(s\) omitted/gu)).toHaveLength(1);
     expect(doctor).toContain('plugin capability "feature.future-plugin-capability" (broken@community)');
     for (const absent of ["healthy@official", "STALE@outcomes", "STALE@hooks", "STALE@settings", "C:/SECRET", "C:/RAW/POLICY", "token=RAW", "caller-provided wording"]) expect(doctor).not.toContain(absent);
+  });
+
+  it("reports observed marketplace restrictions through their bounded safety capabilities without descriptor egress", () => {
+    const inventory = makeInventory([], {
+      policyObservations: [
+        {
+          kind: "strict", match: false, validScope: true, emptyLockdown: true,
+          posture: "claude-lifecycle-observation-not-enforced",
+          provenance: { source: { kind: "claude-user", display: "<redacted>" }, scope: "managed", field: "strictKnownMarketplaces" },
+        },
+        {
+          kind: "strict", match: true, validScope: true, emptyLockdown: false,
+          posture: "claude-lifecycle-observation-not-enforced",
+          provenance: { source: { kind: "external", display: "DUPLICATE_POLICY_SECRET" }, scope: "managed", field: "strictKnownMarketplaces" },
+        },
+        {
+          kind: "blocked", descriptor: { url: "https://user:MARKETPLACE_POLICY_SECRET@example.test/catalog?token=RAW" },
+          match: true, validScope: true, emptyLockdown: false,
+          posture: "claude-lifecycle-observation-not-enforced",
+          provenance: { source: { kind: "external", display: "MARKETPLACE_SOURCE_SECRET" }, scope: "managed", field: "blockedMarketplaces" },
+        },
+        {
+          kind: "blocked", match: true, validScope: false, emptyLockdown: false,
+          posture: "claude-lifecycle-observation-not-enforced",
+          provenance: { source: { kind: "external", display: "INVALID_SCOPE_SECRET" }, scope: "user", field: "blockedMarketplaces" },
+        },
+      ],
+    });
+    const report = buildCompatReport({ ...makeProject(), pluginInventory: inventory } as ClaudeProject);
+    expect(report.safetyFindings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.strictKnownMarketplaces", safetyRelevant: true }), evidence: 'settings key "strictKnownMarketplaces" (managed scope)' }),
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.blockedMarketplaces", safetyRelevant: true }), evidence: 'settings key "blockedMarketplaces" (managed scope)' }),
+    ]));
+    expect(report.safetyFindings.filter(({ capability }) => capability.id === "setting.strictKnownMarketplaces" || capability.id === "setting.blockedMarketplaces")).toHaveLength(2);
+    expect(report.safetyFindings).not.toEqual(expect.arrayContaining([expect.objectContaining({ evidence: expect.stringContaining("user scope") })]));
+    expect(JSON.stringify(report)).not.toMatch(/MARKETPLACE_POLICY_SECRET|MARKETPLACE_SOURCE_SECRET|DUPLICATE_POLICY_SECRET|INVALID_SCOPE_SECRET|example\.test|token=RAW/u);
   });
 
   it("flags permissions.ask rules as a safety finding", () => {
@@ -1538,6 +1520,27 @@ describe("buildCompatReport", () => {
     const report = buildCompatReport(project);
     expect(report.unassessed.some((u) => u.includes('"futureThing"'))).toBe(true);
     expect(report.findings).toEqual([]);
+  });
+
+  it("recognizes current plugin settings through assessed registry findings", () => {
+    const project = makeProject({
+      settings: makeSettings({
+        unknownKeys: [
+          { key: "disableCommandPluginSources", scope: "managed" },
+          { key: "pluginConfigs", scope: "user" },
+          { key: "pluginSuggestionMarketplaces", scope: "project" },
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    expect(report.unassessed).toEqual([]);
+    expect(report.safetyFindings).toEqual([
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.disableCommandPluginSources", tier: "not-supported", safetyRelevant: true }), evidence: 'settings key "disableCommandPluginSources" (managed scope)' }),
+    ]);
+    expect(report.findings).toEqual([
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.pluginConfigs", tier: "not-supported" }), evidence: 'settings key "pluginConfigs" (user scope)' }),
+      expect.objectContaining({ capability: expect.objectContaining({ id: "setting.pluginSuggestionMarketplaces", tier: "degraded-noop" }), evidence: 'settings key "pluginSuggestionMarketplaces" (project scope)' }),
+    ]);
   });
 
   it("routes registry-known managed MCP policy keys to safety findings without honoring them", () => {
@@ -2231,7 +2234,7 @@ describe("buildCompatReport", () => {
         expect(report.findings.filter((finding) => finding.capability.id === "feature.plugins-installed-selection")).toHaveLength(1);
         expect(doctor.match(/all enabled plugins were rejected/g)).toHaveLength(1);
         expect(doctor.split(scenario.recovery)).toHaveLength(2);
-        expect(doctor).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+        expect(doctor).toContain("run /reload-plugins in the interactive TUI or start a new PiCC session");
         expect(doctor).not.toContain("/new");
         for (const incompatible of recoveries.filter((recovery) => recovery !== scenario.recovery)) expect(doctor).not.toContain(incompatible);
         for (const secret of ["private-one", "private-two", root, "C:/RAW", "unqualified RAW"]) expect(doctor).not.toContain(secret);
@@ -2333,14 +2336,16 @@ describe("buildCompatReport", () => {
     }
     for (const identity of ["missing@market", "future@market", "ambiguous@market", "blocked@market", "broken@market", "escape@market"]) {
       const outcomeLine = doctor.split("\n").find((line) => line.includes(identity)) ?? "";
-      expect(outcomeLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
-      expect(outcomeLine).not.toContain("/new");
+      expect(outcomeLine).toContain("Inspect exact ownership with /plugin details <qualified identity>");
+      expect(outcomeLine).toContain("use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code");
+      expect(outcomeLine).toContain("run /reload-plugins in the interactive TUI or start a new PiCC session");
+      expect(outcomeLine).not.toMatch(/\/new|PiCC lifecycle|reinstall/u);
     }
     expect(doctor.match(/no fallback content loaded/g)?.length).toBeGreaterThanOrEqual(6);
     expect(doctor).toContain("Administrator policy (system-file) was unreadable; that source was ignored");
     expect(doctor).toContain("non-boolean enablement value was ignored");
     const enablementLine = doctor.split("\n").find((line) => line.includes("non-boolean enablement value was ignored")) ?? "";
-    expect(enablementLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(enablementLine).toContain("run /reload-plugins in the interactive TUI or start a new PiCC session");
     expect(enablementLine).not.toContain("/new");
     for (const [field, alternative] of [
       ["hooks", "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."],
@@ -2394,7 +2399,7 @@ describe("buildCompatReport", () => {
     expect(selection[0]?.evidence).toContain("plugins/installed_plugins.json");
     expect(selection[4]?.evidence).toContain("missing@market");
     expect(selection[19]?.evidence).toContain("reject-14@market");
-    expect(selection[20]?.evidence).toBe("5 additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+    expect(selection[20]?.evidence).toBe("5 additional plugin detail(s) omitted. Review plugin enablement, installed state, qualified blocklist, and selected plugin content as applicable, then run /reload-plugins in the interactive TUI or start a new PiCC session.");
     expect(selection[20]?.evidence).not.toMatch(/outcome|repair/i);
     expect(selection.map((finding) => finding.evidence).join("\n")).not.toContain("reject-15@market");
   });
@@ -2421,7 +2426,7 @@ describe("buildCompatReport", () => {
     const report = buildCompatReport(project);
     const allFindings = [...report.safetyFindings, ...report.findings];
     expect(allFindings.filter((finding) => finding.evidence.includes("was stripped before subagent construction"))).toHaveLength(20);
-    expect(report.findings.some((finding) => finding.evidence === "10 additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.")).toBe(true);
+    expect(report.findings.some((finding) => finding.evidence === "10 additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then run /reload-plugins in the interactive TUI or start a new PiCC session.")).toBe(true);
     const hookDetails = report.findings.filter((finding) => finding.evidence.includes("installed plugin \"hook-"));
     expect(hookDetails).toHaveLength(20);
     expect(report.findings.some((finding) => finding.evidence === "30 additional installed-plugin hook limitation(s) omitted.")).toBe(true);
@@ -2459,7 +2464,7 @@ describe("buildCompatReport", () => {
     const managedPolicyLine = doctor.split("\n").find((line) =>
       line.includes("Administrator policy (system-file) was malformed")
     ) ?? "";
-    expect(managedPolicyLine).toContain("run the canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(managedPolicyLine).toContain("run /reload-plugins in the interactive TUI or start a new PiCC session");
     expect(managedPolicyLine).not.toContain("/new");
   });
 
@@ -2500,10 +2505,9 @@ describe("buildCompatReport", () => {
     const doctor = renderDoctorReport(limited, limitedReport);
     expect(doctor).toContain("feature.plugins-content");
     expect(doctor).toContain("limited@market: loaded with wrong component kind; some declared content was skipped");
-    expect(doctor).toContain("Correct the applicable component declaration, access, or installed file/directory kind in Claude Code");
     expect(doctor).toContain("stripped@market: loaded with unsupported component content; some declared content was stripped");
-    expect(doctor).toContain("Remove or replace the unsupported declaration or content in Claude Code");
-    expect(doctor.match(/run the canonical \/reload in the interactive TUI or exit and relaunch PiCC/g)).toHaveLength(2);
+    expect(doctor.match(/Inspect exact ownership with \/plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run \/reload-plugins in the interactive TUI or start a new PiCC session\./g)).toHaveLength(2);
+    expect(doctor).not.toContain("canonical /reload");
     expect(doctor).toMatch(/skipped|ignored|stripped|degraded/i);
     expect(doctor).not.toContain("no fallback content loaded");
     expect(doctor).not.toMatch(/affected component did not load|whole plugin failed|component failed|plugin failed/i);
@@ -2585,15 +2589,15 @@ describe("buildCompatReport", () => {
       ],
     } as unknown as ClaudeProject;
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("Check for or update to PiCC support for this format");
-    expect(doctor).toContain("Reconcile or reinstall this qualified identity through Claude Code");
+    expect(doctor).toContain("installed-state format is unsupported");
+    expect(doctor).toContain("highest-scope installed records are ambiguous");
     expect(doctor).toContain("listed in the qualified plugin blocklist");
-    expect(doctor).toContain("Review that blocklist entry");
     expect(doctor).toContain("plugin installed-state or blocklist data is malformed");
-    expect(doctor).toContain("Check those Claude Code state inputs");
-    expect(doctor).toContain("Check the applicable component declaration and installed file or directory kind");
-    expect(doctor).toContain("Reconcile or reinstall the qualified plugin through Claude Code");
-    expect(doctor).not.toContain("reinstall or reconcile");
+    expect(doctor).toContain("installed content was rejected (unreadable content)");
+    expect(doctor).toContain("installed content was rejected (path validation)");
+    expect(doctor.match(/Inspect exact ownership with \/plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run \/reload-plugins in the interactive TUI or start a new PiCC session\./g)).toHaveLength(6);
+    expect(doctor).not.toContain("PiCC lifecycle");
+    expect(doctor).not.toContain("reinstall");
     expect(doctor).not.toMatch(/administrator|untrusted by administrator|Ask the administrator/i);
     expect(doctor).not.toContain("Inspect /doctor");
   });
@@ -3015,9 +3019,9 @@ describe("renderDoctorReport", () => {
       "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
       "skill owner: persistent data directory validation or creation failed (unreadable-path). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
       "agent owner: persistent data directory validation or creation failed (wrong-kind). Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required; execution did not occur",
-      "fallback owner: persistent data directory validation or creation failed (data-directory-preparation-failed). Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC; execution did not occur",
-      "hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch). Reconcile or reinstall the plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC; execution did not occur",
-      "legacy owner: preparation failed for an unknown reason; execution did not occur. Reconcile or reinstall the affected plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.",
+      "fallback owner: persistent data directory validation or creation failed (data-directory-preparation-failed). Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run /reload-plugins in the interactive TUI or start a new PiCC session; execution did not occur",
+      "hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch). Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run /reload-plugins in the interactive TUI or start a new PiCC session; execution did not occur",
+      "legacy owner: preparation failed for an unknown reason; execution did not occur. Reconcile or reinstall the affected plugin through Claude Code, then run /reload-plugins in the interactive TUI or start a new PiCC session.",
       ...Array.from({ length: 15 }, (_, index) => `agent failure ${index} ${"x".repeat(600)}`),
     ];
     report.pluginRuntimeFindingsOmitted = 6;
@@ -3034,7 +3038,8 @@ describe("renderDoctorReport", () => {
     expect(runtime).toContain("hook owner: persistent data directory validation or creation failed (qualified-projection-mismatch); execution did not occur");
     expect(runtime).toContain("at least 6 additional distinct failure(s) omitted");
     expect(runtime).toContain("Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required.");
-    expect(runtime).toContain("Recovery: reconcile or reinstall the qualified plugin through Claude Code, then run the canonical /reload in the interactive TUI or exit and relaunch PiCC.");
+    expect(runtime).toContain("Recovery: Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run /reload-plugins in the interactive TUI or start a new PiCC session.");
+    expect(runtime).not.toContain("PiCC lifecycle");
     expect(runtime).not.toContain("if plugin-data access");
     expect(runtime).not.toContain("Reconcile or reinstall the plugin through Claude Code");
     expect(runtime).not.toContain("Reconcile or reinstall the affected plugin");

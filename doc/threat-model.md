@@ -54,14 +54,21 @@ loading supported project resources and running declared command hooks. That dec
 not itself a permission bypass. Project input remains untrusted where PiCC parses it, constructs a
 surrounding command or path from it, or applies an explicit gate to it.
 
-Plugin executable roots have a narrower authorization boundary: a matching exact record in imported
-Claude installed state is necessary evidence that a qualified identity was installed. Repository
-settings may enable an applicable separately installed identity. Environment configuration cannot
-authorize executable content by itself; settings, repository bundles, development roots, marketplace
-catalogs, and cache presence without a record likewise cannot create authorization. Development roots
-remain inert because PiCC exposes no external development-trust channel. This installed-state evidence is
-neither a publisher-authenticity claim nor an OS sandbox; the baseline local-user trust and
-isolation limits above still apply.
+Plugin executable roots have a narrower authorization boundary: authority requires either a matching
+exact imported Claude installation record or one complete committed PiCC-owned admission generation.
+Project assembly composes applicable owned and imported installations before selecting the effective
+winner. Environment configuration cannot authorize executable content by itself; settings, repository
+bundles, development roots, marketplace catalogs, and cache presence without committed installation
+authority likewise remain inert. This evidence is neither a publisher-authenticity claim nor an OS
+sandbox; the baseline local-user trust and isolation limits above still apply.
+
+Plugin acquisition is an explicit user-authorized executable-content boundary. Source descriptors,
+remote responses, repositories, packages, archives, catalogs, paths, links, names, and dependency
+metadata are untrusted until PiCC validates a bounded portable tree and binds trust to immutable
+content. Opening or merely observing a project grants no new acquisition, trust approval, lifecycle
+recovery, installation, or settings-write authority; execution still follows the imported-or-committed
+boundary above. PiCC does not accept ambient credentials, SSH/private sources, private-network
+destinations, package lifecycle scripts, or mutable source identity as substitutes for that boundary.
 
 ## Out of scope
 

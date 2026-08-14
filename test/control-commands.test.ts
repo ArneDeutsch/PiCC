@@ -11,6 +11,7 @@ import { deferred } from "./helpers/async.js";
 import { fakeSdk } from "./helpers/fake-sdk.js";
 import { createHookProcessFixture } from "./helpers/hook-process.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import { loadClaudeProject } from "../src/project.js";
 
 /**
  * Control commands render through transcript entries outside model context.
@@ -94,7 +95,7 @@ async function freshControlPi(
   seam?: PiccTestSeam,
   setup?: (root: string) => void,
 ): Promise<{ fresh: FakePi; root: string }> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-control-"));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-control-")));
   fs.writeFileSync(path.join(root, "CLAUDE.md"), "Temporary control-command project.\n", "utf8");
   setup?.(root);
   const userDir = path.join(root, ".claude-user");
@@ -765,8 +766,22 @@ describe("reserved plugin-management commands", () => {
       }
     });
     try {
+      let reloadCalls = 0;
+      const performReload = async (): Promise<void> => {
+        reloadCalls += 1;
+        const previous = process.cwd();
+        try {
+          process.chdir(root);
+          const replacement = fakePi();
+          picc(replacement.api as never, { onInitializationSettled: replacement.captureInitialization });
+          await replacement.waitForInitialization();
+          await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx());
+        } finally {
+          process.chdir(previous);
+        }
+      };
       const admissionModes = [
-        ["tui", () => fresh.tuiCtx()],
+        ["tui", () => fresh.tuiCtx({ reload: performReload })],
         ["print", () => fresh.printCtx()],
         ["json", () => fresh.ctx({ mode: "json", hasUI: false })],
         ["rpc", () => fresh.rpcCtx()],
@@ -781,52 +796,67 @@ describe("reserved plugin-management commands", () => {
           const customBaseline = fresh.customs.length;
           expect(await fresh.fire("input", { text: command, source: mode }, makeCtx())).toEqual({ action: "handled" });
           const output = String(controlEntry(name, fresh)?.data?.output ?? "");
-          if (name === "reload-plugins") expect(output).toContain("/reload-plugins did no reload");
-          else {
+          if (name === "reload-plugins" && mode === "tui") {
+            expect(controlEntry(name, fresh)).toBeUndefined();
+            expect(reloadCalls).toBe(1);
+          } else if (name === "reload-plugins") {
+            expect(output).toContain("did not reload or mutate this process");
+            expect(output).toContain("standalone PiCC plugin commands");
+            expect(output).toContain("requires /reload-plugins in the live interactive session or a new PiCC session");
+          } else if (name === "plugin" && mode !== "tui") {
+            expect(output).toContain("Headless modes are guidance-only");
+            expect(output).toContain("run picc plugin --help");
+            expect(output).not.toContain("Plugin inventory (read-only)");
+          } else {
             expect(output).toContain("Plugin inventory (read-only)");
-            expect(output).toContain("captured for this session");
+            expect(output).toContain("Plugin: same@market");
+            if (name === "plugins") expect(output).toContain("captured for this session");
           }
           expect(fresh.customs).toHaveLength(customBaseline);
         }
       }
 
-      const bareOutputs: string[] = [];
+      const guidanceOutputs: string[] = [];
       for (const [mode, makeCtx] of admissionModes.filter(([mode]) => mode !== "tui")) {
-        fresh.entries.length = 0;
         const customBaseline = fresh.customs.length;
-        expect(await fresh.fire("input", { text: "/plugin list", source: mode }, makeCtx())).toEqual({ action: "handled" });
-        const explicit = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-        expect(explicit).toContain("Plugin: same@market");
-        fresh.entries.length = 0;
-        expect(await fresh.fire("input", { text: "/plugin", source: mode }, makeCtx())).toEqual({ action: "handled" });
-        const bare = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-        bareOutputs.push(bare);
-        expect(bare).toBe(explicit);
+        let modeGuidance: string | undefined;
+        for (const text of ["/plugin", "/plugin list", "/plugin details same@market"]) {
+          fresh.entries.length = 0;
+          expect(await fresh.fire("input", { text, source: mode }, makeCtx())).toEqual({ action: "handled" });
+          const guidance = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+          expect(guidance).toContain("Headless modes are guidance-only");
+          expect(guidance).not.toContain("Plugin inventory (read-only)");
+          expect(guidance).not.toContain("Plugin: same@market");
+          if (modeGuidance === undefined) modeGuidance = guidance;
+          else expect(guidance).toBe(modeGuidance);
+        }
+        guidanceOutputs.push(modeGuidance!);
         expect(fresh.customs).toHaveLength(customBaseline);
       }
-      expect(new Set(bareOutputs).size).toBe(1);
-      expect(bareOutputs[0]).toContain("Plugin inventory (read-only)");
+      expect(new Set(guidanceOutputs).size).toBe(1);
       expect(fresh.messages).toEqual([]);
       expect(fresh.userMessages).toEqual([]);
       expect(sdk.promptCalls()).toBe(0);
 
       fresh.entries.length = 0;
       await fresh.commands.get("plugins").handler("", fresh.printCtx());
-      const alias = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      const fixedInventory = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      expect(fixedInventory).toContain("Plugin: same@market");
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(alias);
+      expect(await fresh.fire("input", { text: "/plugins", source: "print" }, fresh.printCtx())).toEqual({ action: "handled" });
+      expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toBe(fixedInventory);
 
       for (const invalid of ["install same@market", "details same", "details --force", "list extra", "--help"]) {
         fresh.entries.length = 0;
         expect(await fresh.fire("input", { text: `/plugin ${invalid}`, source: "rpc" }, fresh.rpcCtx()))
           .toEqual({ action: "handled" });
         const usage = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-        expect(usage).toContain("Read-only usage: /plugin list | /plugin details <plugin@marketplace>");
+        expect(usage).toContain("Usage: /plugin list | /plugin details <plugin@marketplace>");
         expect(usage).toContain("No changes were made");
-        expect(usage).toContain("Manage plugin installation and enablement in Claude Code.");
-        expect(usage).toContain("canonical /reload in the interactive TUI or exit and relaunch PiCC");
-        expect(usage).not.toContain(invalid);
+        expect(usage).toContain("run picc plugin --help");
+        expect(usage).toContain("Headless mode cannot reload plugins");
+        expect(usage).toContain("If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session.");
+        if (invalid !== "--help") expect(usage).not.toContain(invalid);
       }
 
       fresh.entries.length = 0;
@@ -835,13 +865,13 @@ describe("reserved plugin-management commands", () => {
       expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toContain("No changes were made");
 
       for (const [malformed, command, marker] of [
-        ["/plugin\v", "plugin", "Read-only usage:"],
-        ["/plugin\vlist", "plugin", "Read-only usage:"],
-        ["/plugins\v", "plugins", "Read-only usage:"],
-        ["/plugins\vlist", "plugins", "Read-only usage:"],
-        ["\u0001/plugin list", "plugin", "Read-only usage:"],
-        ["/reload-plugins\v", "reload-plugins", "/reload-plugins did no reload"],
-        ["/ReLoAd-PlUgInS\vSECRET-MALFORMED-TAIL", "reload-plugins", "/reload-plugins did no reload"],
+        ["/plugin\v", "plugin", "Usage:"],
+        ["/plugin\vlist", "plugin", "Usage:"],
+        ["/plugins\v", "plugins", "Usage:"],
+        ["/plugins\vlist", "plugins", "Usage:"],
+        ["\u0001/plugin list", "plugin", "Usage:"],
+        ["/reload-plugins\v", "reload-plugins", "did not reload or mutate this process"],
+        ["/ReLoAd-PlUgInS\vSECRET-MALFORMED-TAIL", "reload-plugins", "did not reload or mutate this process"],
       ] as const) {
         fresh.entries.length = 0;
         expect(await fresh.fire("input", { text: malformed, source: "rpc" }, fresh.rpcCtx()))
@@ -852,12 +882,12 @@ describe("reserved plugin-management commands", () => {
         expect(output).not.toMatch(/[\u0001\v]|SECRET-MALFORMED-TAIL/u);
       }
       for (const [command, args, marker] of [
-        ["plugin", "\v", "Read-only usage:"],
-        ["plugin", "\vlist", "Read-only usage:"],
-        ["plugins", "\v", "Read-only usage:"],
-        ["plugins", "\vlist", "Read-only usage:"],
-        ["reload-plugins", "\v", "/reload-plugins did no reload"],
-        ["reload-plugins", "\vSECRET-MALFORMED-TAIL", "/reload-plugins did no reload"],
+        ["plugin", "\v", "Usage:"],
+        ["plugin", "\vlist", "Usage:"],
+        ["plugins", "\v", "Usage:"],
+        ["plugins", "\vlist", "Usage:"],
+        ["reload-plugins", "\v", "did not reload or mutate this process"],
+        ["reload-plugins", "\vSECRET-MALFORMED-TAIL", "did not reload or mutate this process"],
       ] as const) {
         fresh.entries.length = 0;
         await fresh.commands.get(command).handler(args, fresh.rpcCtx());
@@ -871,13 +901,10 @@ describe("reserved plugin-management commands", () => {
       expect(sdk.promptCalls()).toBe(0);
 
       fresh.entries.length = 0;
-      await fresh.commands.get("reload-plugins").handler("SECRET-ARG-MUST-NOT-REFLECT", fresh.tuiCtx());
-      const reloadOutput = String(controlEntry("reload-plugins", fresh)?.data?.output ?? "");
-      expect(reloadOutput).toContain("/reload-plugins did no reload");
-      expect(reloadOutput).toContain("canonical /reload in the interactive TUI");
-      expect(reloadOutput).toContain("whole extension, including installed plugin state");
-      expect(reloadOutput).toContain("or exit and relaunch");
-      expect(reloadOutput).not.toContain("SECRET-ARG-MUST-NOT-REFLECT");
+      const terminalCtx = fresh.tuiCtx({ reload: performReload });
+      await fresh.commands.get("reload-plugins").handler("SECRET-ARG-MUST-NOT-REFLECT", terminalCtx);
+      expect(reloadCalls).toBe(2);
+      expect(controlEntry("reload-plugins", fresh)).toBeUndefined();
       expect(JSON.stringify(fresh.messages)).not.toContain("MUST-NOT-EGRESS");
 
       const slash = fresh.tools.get("SlashCommand");
@@ -919,6 +946,10 @@ describe("reserved plugin-management commands", () => {
       }
     } finally {
       await hookFixture?.cleanup("reserved-submit");
+      const candidate = loadClaudeProject({ cwd: root, userDir: path.join(root, ".claude-user"), homeDir: os.homedir() });
+      if (candidate.reloadCandidate.status === "ready") {
+        fs.rmSync(path.dirname(path.dirname(candidate.reloadCandidate.handoffPath)), { recursive: true, force: true });
+      }
       cleanupFixture(root);
     }
   });
@@ -946,22 +977,25 @@ describe("reserved plugin-management commands", () => {
     }
   });
 
-  it("keeps qualified same-name identities distinct and opens/closes the TUI without a transcript row", async () => {
+  it("keeps qualified same-name identities and each session profile distinct while opening and closing the TUI", async () => {
     const { fresh, root } = await freshControlPi(undefined, (projectRoot) => {
       installPluginFixture(projectRoot, "same@market-a", "same", () => undefined);
       installPluginFixture(projectRoot, "same@market-b", "same", () => undefined);
     });
+    const { fresh: other, root: otherRoot } = await freshControlPi(undefined, (projectRoot) => {
+      installPluginFixture(projectRoot, "profile-b-only@market-b", "profile-b-only", () => undefined);
+    });
     try {
-      await fresh.commands.get("plugin").handler("list", fresh.printCtx());
-      const list = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      await other.commands.get("plugins").handler("", other.printCtx());
+      const otherList = String(controlEntry("plugins", other)?.data?.output ?? "");
+      expect(otherList).toContain("Plugin: profile-b-only@market-b");
+      expect(otherList).not.toContain("same@market-a");
+
+      await fresh.commands.get("plugins").handler("", fresh.printCtx());
+      const list = String(controlEntry("plugins", fresh)?.data?.output ?? "");
       expect(list).toContain("Plugin: same@market-a");
       expect(list).toContain("Plugin: same@market-b");
-
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details same@market-b", fresh.rpcCtx());
-      const details = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-      expect(details).toContain("Plugin: same@market-b");
-      expect(details).not.toContain("Plugin: same@market-a");
+      expect(list).not.toContain("profile-b-only@market-b");
 
       fresh.entries.length = 0;
       const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
@@ -969,10 +1003,14 @@ describe("reserved plugin-management commands", () => {
       const custom = fresh.customs.at(-1)!;
       await custom.ready;
       custom.input("\u001b[C");
-      expect(custom.render(72).join("\n")).toContain("same@market-a");
+      const installed = custom.render(72).join("\n");
+      expect(installed).toContain("same@market-a");
+      expect(installed).not.toContain("profile-b-only@market-b");
       custom.input("\u001b[B");
       custom.input("\r");
-      expect(custom.render(72).join("\n")).toContain("same@market-b");
+      const details = custom.render(72).join("\n");
+      expect(details).toContain("same@market-b");
+      expect(details).not.toContain("profile-b-only@market-b");
       custom.input("\u001b");
       custom.input("\u001b");
       await opening;
@@ -981,7 +1019,51 @@ describe("reserved plugin-management commands", () => {
       expect(fresh.userMessages).toEqual([]);
     } finally {
       cleanupFixture(root);
+      cleanupFixture(otherRoot);
     }
+  });
+
+  it("keeps headless lifecycle requests inert and collects TUI workflow values without transcript egress", async () => {
+    let compositions = 0; let marketplaceOperation: any; const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] }); let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
+    const lifecycle = { marketplaces: { plan: async (operation: unknown) => { marketplaceOperation = operation; return { ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }; } }, plugins: { plan: async () => ({ ok: false as const, code: "fixture-unavailable", message: "SECRET_FACTORY_DETAIL" }) }, recovery: {}, targets: {}, lookup: async () => ({ ok: true as const, value: undefined }), projection: () => ({ ok: false as const, code: "unused", message: "unused" }) };
+    const { fresh, root } = await freshControlPi({ sdk: sdk.sdk, pluginLifecycle: async () => { compositions += 1; return { ok: true as const, value: lifecycle as never }; } }, (projectRoot) => {
+      hookFixture = createHookProcessFixture(projectRoot); const settingsPath = path.join(projectRoot, ".claude", "settings.json"); fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown> : {}; settings.env = hookFixture.env; settings.hooks = { UserPromptSubmit: [{ hooks: [{ type: "command", command: hookFixture.command, args: ["complete", "plugin-lifecycle-headless"] }] }] }; fs.writeFileSync(settingsPath, JSON.stringify(settings), "utf8");
+    });
+    try {
+      for (const [mode, ctx] of [["print", fresh.printCtx()], ["json", fresh.ctx({ mode: "json", hasUI: false })], ["rpc", fresh.rpcCtx()]] as const) {
+        fresh.entries.length = 0; const customs = fresh.customs.length; const messages = fresh.messages.length; const userMessages = fresh.userMessages.length;
+        expect(await fresh.fire("input", { text: "/plugin install SECRET_SOURCE_VALUE", source: mode }, ctx)).toEqual({ action: "handled" });
+        expect(compositions).toBe(0); expect(fresh.customs).toHaveLength(customs); expect(fresh.messages).toHaveLength(messages); expect(fresh.userMessages).toHaveLength(userMessages);
+        const guidance = String(controlEntry("plugin", fresh)?.data?.output ?? ""); expect(guidance.length).toBeLessThan(5000); expect(guidance).toContain("Headless modes are guidance-only"); expect(guidance).toContain("If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session."); expect(guidance).not.toContain("SECRET_SOURCE_VALUE");
+      }
+
+      fresh.entries.length = 0;
+      const opening = fresh.commands.get("plugin").handler("install SECRET_SOURCE_VALUE", fresh.tuiCtx());
+      await Promise.resolve(); const custom = fresh.customs.at(-1)!; await custom.ready;
+      expect(compositions).toBe(0);
+      expect(custom.render(72).join("\n")).not.toContain("SECRET_SOURCE_VALUE");
+      custom.input("\r");
+      custom.input("alpha@official"); custom.input("\r");
+      custom.input("user"); custom.input("\r");
+      custom.input("no"); custom.input("\r");
+      await vi.waitFor(() => expect(custom.render(72).join("\n")).toContain("planning refusal"));
+      expect(custom.render(72).join("\n")).not.toContain("fixture unavailable");
+      expect(compositions).toBe(1);
+      expect(custom.render(72).join("\n")).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)/u);
+      custom.input("\u001b"); custom.input("\u001b"); await opening;
+
+      const sourceCanary = "https://user:MARKET_SOURCE_PASSWORD_CANARY@example.test/repo.git"; const refCanary = "MARKET_REF_TOKEN_CANARY";
+      const marketplaceOpening = fresh.commands.get("plugin").handler("marketplace add", fresh.tuiCtx()); await Promise.resolve(); const marketplacePane = fresh.customs.at(-1)!; await marketplacePane.ready;
+      marketplacePane.input("\r"); for (const value of ["new-market", "https-git", sourceCanary, refCanary, "user", "no"]) { marketplacePane.input(value); marketplacePane.input("\r"); }
+      await vi.waitFor(() => expect(marketplaceOperation).toMatchObject({ kind: "marketplace-add", sourceValue: sourceCanary, ref: refCanary, flags: { declarationOnly: false } }));
+      expect(marketplacePane.render(72).join("\n")).not.toMatch(/MARKET_(?:SOURCE_PASSWORD|REF_TOKEN)_CANARY/u); marketplacePane.input("\u001b"); marketplacePane.input("\u001b"); await marketplaceOpening;
+
+      for (const [args, expected] of [["enable TRAILING_RAW_SECRET", "enable"], ["disable TRAILING_RAW_SECRET", "disable"], ["update TRAILING_RAW_SECRET", "update"], ["uninstall TRAILING_RAW_SECRET", "uninstall"], ["marketplace add TRAILING_RAW_SECRET", "marketplace-add"], ["marketplace refresh TRAILING_RAW_SECRET", "marketplace-refresh"], ["marketplace remove TRAILING_RAW_SECRET", "marketplace-remove"], ["recover TRAILING_RAW_SECRET", "recover"]] as const) {
+        const routed = fresh.commands.get("plugin").handler(args, fresh.tuiCtx()); await Promise.resolve(); const pane = fresh.customs.at(-1)!; await pane.ready; const text = pane.render(72).join("\n"); expect(text).toContain(expected); expect(text).not.toContain("TRAILING_RAW_SECRET"); pane.input("\u001b"); pane.input("\u001b"); await routed;
+      }
+      expect(JSON.stringify({ entries: fresh.entries, messages: fresh.messages, userMessages: fresh.userMessages })).not.toMatch(/SECRET_(?:SOURCE_VALUE|FACTORY_DETAIL)|TRAILING_RAW_SECRET|MARKET_(?:SOURCE_PASSWORD|REF_TOKEN)_CANARY/u);
+      expect(fresh.messages).toEqual([]); expect(fresh.userMessages).toEqual([]); expect(sdk.promptCalls()).toBe(0); expect(hookFixture?.spawnedChildren()).toHaveLength(0);
+    } finally { await hookFixture?.cleanup("plugin-lifecycle-headless"); cleanupFixture(root); }
   });
 
   it("uses a bounded list fallback when interactive opening is unavailable or rejected", async () => {
@@ -1090,11 +1172,9 @@ describe("reserved plugin-management commands", () => {
       try {
       const compactBaseline = fresh.compactCalls.length;
       const customBaseline = fresh.customs.length;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
-      const listBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
-      const detailsBefore = String(controlEntry("plugin", fresh)?.data?.output ?? "");
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
+      const listBefore = String(controlEntry("plugins", fresh)?.data?.output ?? "");
+      expect(listBefore).toContain("locked@market");
       expect(tree(root)).toEqual(projectBefore);
       expect(tree(path.join(root, ".claude-user"))).toEqual(profileBefore);
 
@@ -1103,19 +1183,17 @@ describe("reserved plugin-management commands", () => {
       const projectAfterBackingChange = tree(root);
       const profileAfterBackingChange = tree(path.join(root, ".claude-user"));
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(listBefore);
-      fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("details locked@market", fresh.rpcCtx());
-      expect(String(controlEntry("plugin", fresh)?.data?.output ?? "")).toBe(detailsBefore);
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
+      expect(String(controlEntry("plugins", fresh)?.data?.output ?? "")).toBe(listBefore);
 
       fresh.entries.length = 0;
       const opening = fresh.commands.get("plugin").handler("", fresh.tuiCtx());
       await Promise.resolve();
       const custom = fresh.customs.at(-1)!;
       await custom.ready;
-      custom.input("\u001b[C");
       expect(custom.render(72).join("\n")).toContain("locked@market");
+      custom.input("\u001b[C");
+      expect(custom.render(72).join("\n")).not.toContain("locked@market");
       custom.input("\u001b[D");
       custom.input("\u001b");
       await opening;
@@ -1263,8 +1341,8 @@ describe("plugin startup warning wiring", () => {
       expect(omissionNotices[0]!.text.split("\n").at(-1)).toBe("This startup notice is abbreviated.");
       expect(omissionNotices[0]!.text).not.toMatch(/\/plugin list|\/doctor|all omission|omission counts|complete inventory|recovery/i);
       expect(omissionNotices[0]!.text).not.toMatch(/malformed-299|SECRET_RAW_DIAGNOSTIC_PATH|C:\/private/i);
-      await omitted.fresh.commands.get("plugin").handler("list", omitted.fresh.tuiCtx());
-      const omittedList = String(controlEntry("plugin", omitted.fresh)?.data?.output ?? "");
+      await omitted.fresh.commands.get("plugins").handler("", omitted.fresh.tuiCtx());
+      const omittedList = String(controlEntry("plugins", omitted.fresh)?.data?.output ?? "");
       expect(omittedList).toContain("Snapshot-capture evidence omissions:");
       expect(omittedList).toContain("loader.marketplace.diagnostics=172");
       expect(omittedList).not.toContain("SECRET_RAW_DIAGNOSTIC_PATH");
@@ -1305,65 +1383,93 @@ describe("plugin startup warning wiring", () => {
   });
 });
 
-describe("plugin activation runtime failures", () => {
-  it("fails tools, typed slash, and context:fork before any staged state or provider egress, then reports once", async () => {
-    const sdk = fakeSdk({ replies: ["MUST-NOT-RUN"] });
+describe("plugin activation runtime behavior", () => {
+  it("serves direct, slash, typed, and context:fork activation from the imported body snapshot", async () => {
+    const sdk = fakeSdk({ replies: Array.from({ length: 3 }, () => "SNAPSHOT-FINAL") });
     let skillFile = "";
     const { fresh, root } = await freshControlPi({ sdk: sdk.sdk }, (projectRoot) => {
-      installPluginFixture(projectRoot, "broken-owner@market", "broken-owner", (installRoot) => {
-        const skillDir = path.join(installRoot, "skills", "broken-plugin-skill");
+      installPluginFixture(projectRoot, "snapshot-owner@market", "snapshot-owner", (installRoot) => {
+        const skillDir = path.join(installRoot, "skills", "snapshot-plugin-skill");
         skillFile = path.join(skillDir, "SKILL.md");
         fs.mkdirSync(skillDir, { recursive: true });
         fs.writeFileSync(skillFile, [
           "---",
-          "name: broken-plugin-skill",
-          "description: runtime failure canary",
+          "name: snapshot-plugin-skill",
+          "description: imported body snapshot canary",
           "context: fork",
           "hooks:",
           "  PreToolUse:",
           "    - hooks:",
           "        - type: command",
-          "          command: echo MUST-NOT-RUN",
+          "          command: echo SCOPED-HOOK-CANARY",
           "---",
-          "data=${CLAUDE_PLUGIN_DATA}",
+          "snapshot-data=${CLAUDE_PLUGIN_DATA}",
         ].join("\n"), "utf8");
       });
     });
     fs.rmSync(skillFile);
     try {
+      const expectedDataPath = path.join(
+        root,
+        ".claude-user",
+        "plugins",
+        "data",
+        sanitizePluginDataKey("snapshot-owner@market"),
+      );
+      const before = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
+      expect(before?.systemPrompt).toContain("base");
+      expect(String(before?.systemPrompt ?? "")).not.toContain("snapshot-data=");
+
       const skill = fresh.tools.get("Skill");
       const slash = fresh.tools.get("SlashCommand");
-      const skillError = await skill.execute("broken-skill", { name: "broken-plugin-skill" })
-        .then(() => undefined, (caught: unknown) => caught as Error);
-      expect(skillError?.message).toMatch(/Reconcile or reinstall.*canonical \/reload.*exit and relaunch PiCC/);
-      expect(skillError?.message.match(/Reconcile or reinstall/g)).toHaveLength(1);
-      await expect(slash.execute("broken-slash", { command: "/broken-plugin-skill" }))
-        .rejects.toThrow(/Reconcile or reinstall.*canonical \/reload.*exit and relaunch PiCC/);
-      const typed = await fresh.fire("input", { text: "/broken-plugin-skill", source: "interactive" }, fresh.printCtx());
-      expect(typed).toEqual({ action: "handled" });
+      const skillResult = await skill.execute("snapshot-skill", { name: "snapshot-plugin-skill" });
+      expect(skillResult.content).toEqual([{ type: "text", text: "SNAPSHOT-FINAL" }]);
+      const slashResult = await slash.execute("snapshot-slash", { command: "/snapshot-plugin-skill" });
+      expect(slashResult.content).toEqual([{ type: "text", text: "SNAPSHOT-FINAL" }]);
+      const typed = await fresh.fire("input", { text: "/snapshot-plugin-skill", source: "interactive" }, fresh.printCtx());
+      expect(typed).toEqual({
+        action: "transform",
+        text: "The snapshot-owner:snapshot-plugin-skill skill ran in a forked subagent. Its result:\n\nSNAPSHOT-FINAL",
+      });
       expect(fresh.messages).toEqual([]);
       expect(fresh.userMessages).toEqual([]);
-      expect(sdk.created).toHaveLength(0);
-      expect(sdk.promptCalls()).toBe(0);
-      const before = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
-      expect(String(before?.systemPrompt ?? "")).not.toContain("data=${CLAUDE_PLUGIN_DATA}");
+      expect(sdk.created).toHaveLength(3);
+      expect(sdk.promptCalls()).toBe(3);
+      expect(sdk.sessions).toHaveLength(3);
+      const sessionPrompts = sdk.sessions.map((session) => {
+        const userMessage = session.messages.find((message) => message.role === "user");
+        expect(userMessage).toBeDefined();
+        expect(typeof userMessage?.content).toBe("string");
+        return typeof userMessage?.content === "string" ? userMessage.content : "";
+      });
+      const assertExpandedSnapshot = (prompt: string | undefined) => {
+        expect(prompt).toContain(`snapshot-data=${expectedDataPath}`);
+        expect(prompt).not.toContain("${CLAUDE_PLUGIN_DATA}");
+      };
+      const [skillPrompt, slashCommandPrompt, typedSlashForkPrompt] = sessionPrompts;
+      assertExpandedSnapshot(skillPrompt);
+      assertExpandedSnapshot(slashCommandPrompt);
+      assertExpandedSnapshot(typedSlashForkPrompt);
+
+      const after = await fresh.fire("before_agent_start", { systemPrompt: "base" }, fresh.printCtx());
+      expect(after?.systemPrompt).toContain("base");
+      expect(String(after?.systemPrompt ?? "")).not.toContain("snapshot-data=");
       const unblocked = await fresh.fire("tool_call", {
-        toolName: "read", toolCallId: "after-failed-fork", input: { path: "safe.txt" },
+        toolName: "read", toolCallId: "after-snapshot-forks", input: { path: "safe.txt" },
       }, fresh.printCtx());
       expect(unblocked).toBeUndefined();
 
       await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
       const report = String([...fresh.entries].reverse().find((entry) => entry.data?.command === "doctor")?.data?.output ?? "");
-      expect(report).toContain("Plugin runtime failures (execution did not occur):");
-      expect(report.match(/broken-plugin-skill/g)?.length).toBe(1);
-      expect(report).not.toContain("Unassessed (unknown at baseline");
+      expect(report).not.toContain("Plugin runtime failures (execution did not occur):");
+      expect(report).not.toContain("Reconcile or reinstall");
 
       fresh.entries.length = 0;
-      await fresh.commands.get("plugin").handler("list", fresh.rpcCtx());
+      await fresh.commands.get("plugins").handler("", fresh.rpcCtx());
       const inventory = String(fresh.entries.at(-1)?.data?.output ?? "");
-      expect(inventory).toContain("Plugin: broken-owner@market");
+      expect(inventory).toContain("Plugin: snapshot-owner@market");
       expect(inventory).toContain("runtime: loaded");
-      expect(inventory).toContain("Runtime refusals observed after snapshot capture (display overlay only):");
+      expect(inventory).not.toContain("Runtime refusals observed after snapshot capture");
     } finally {
       cleanupFixture(root);
     }
@@ -1455,15 +1561,16 @@ describe("plugin activation runtime failures", () => {
     }
   });
 
-  it("omits a failed preloaded plugin skill with dispatch diagnostics and one immediate warning while the owner runs", async () => {
-    const handle = fakeSdk({ replies: Array.from({ length: 6 }, () => "LOCKED-FINAL") });
+  it("preloads a deleted imported skill from the captured body without dispatch warnings", async () => {
+    const handle = fakeSdk({ replies: Array.from({ length: 7 }, () => "SNAPSHOT-FINAL") });
+    const preloadedPrompts: string[] = [];
     const BaseLoader = handle.sdk.DefaultResourceLoader;
     const sdk = {
       ...handle.sdk,
       DefaultResourceLoader: class extends BaseLoader {
         constructor(options: any) {
           super(options);
-          options.systemPromptOverride();
+          preloadedPrompts.push(String(options.systemPromptOverride()));
         }
       },
     };
@@ -1475,15 +1582,15 @@ describe("plugin activation runtime failures", () => {
       fs.mkdirSync(agentDir, { recursive: true });
       fs.mkdirSync(forkDir, { recursive: true });
       installPluginFixture(projectRoot, "preload-owner@market", "preload-owner", (installRoot) => {
-        const skillDir = path.join(installRoot, "skills", "broken-preload");
+        const skillDir = path.join(installRoot, "skills", "snapshot-preload");
         fs.mkdirSync(skillDir, { recursive: true });
         preloadSkillFile = path.join(skillDir, "SKILL.md");
         fs.writeFileSync(preloadSkillFile, [
-          "---", "name: broken-preload", "description: preload data canary", "---", "data=${CLAUDE_PLUGIN_DATA}",
+          "---", "name: snapshot-preload", "description: preload snapshot canary", "---", "snapshot-data=${CLAUDE_PLUGIN_DATA}",
         ].join("\n"), "utf8");
       });
       fs.writeFileSync(path.join(agentDir, "preload-agent.md"), [
-        "---", "name: preload-agent", "description: preload canary", "skills:", "  - preload-owner:broken-preload", "---", "Run as owner.",
+        "---", "name: preload-agent", "description: preload canary", "skills:", "  - preload-owner:snapshot-preload", "---", "Run as owner.",
       ].join("\n"), "utf8");
       fs.writeFileSync(path.join(forkDir, "SKILL.md"), [
         "---", "name: named-fork", "description: named fork canary", "context: fork", "agent: preload-agent", "---", "run named fork",
@@ -1491,18 +1598,20 @@ describe("plugin activation runtime failures", () => {
     });
     fs.rmSync(preloadSkillFile);
     try {
+      const expectedDataPath = path.join(
+        root,
+        ".claude-user",
+        "plugins",
+        "data",
+        sanitizePluginDataKey("preload-owner@market"),
+      );
       const expectedTypedFork = {
         action: "transform",
-        text: "The named-fork skill ran in a forked subagent. Its result:\n\nLOCKED-FINAL",
+        text: "The named-fork skill ran in a forked subagent. Its result:\n\nSNAPSHOT-FINAL",
       };
       const typedPrint = await fresh.fire("input", { text: "/named-fork", source: "print" }, fresh.printCtx());
       expect(typedPrint).toEqual(expectedTypedFork);
       expect(fresh.notifications).toHaveLength(0);
-      const typedPrintWarnings = error.mock.calls.map((call) => String(call[0]))
-        .filter((line) => line.includes("omitted preloaded skill"));
-      expect(typedPrintWarnings).toHaveLength(1);
-      expect(typedPrintWarnings[0]).toContain("Reconcile or reinstall");
-      expect(typedPrintWarnings[0]).toContain("canonical /reload");
 
       const agent = fresh.tools.get("Agent");
       for (let index = 0; index < 2; index++) {
@@ -1513,43 +1622,36 @@ describe("plugin activation runtime failures", () => {
           undefined,
           index === 0 ? fresh.printCtx() : fresh.tuiCtx(),
         );
-        expect(JSON.stringify(result.content)).toContain("LOCKED-FINAL");
-        expect(JSON.stringify(result.content)).not.toContain("omitted preloaded skill");
-        expect(result.details.diagnostics).toEqual(expect.arrayContaining([
-          expect.objectContaining({ severity: "warning", message: expect.stringContaining("omitted preloaded skill") }),
-        ]));
+        expect(JSON.stringify(result.content)).toContain("SNAPSHOT-FINAL");
+        expect(JSON.stringify(result.details.diagnostics)).not.toMatch(/omitted preloaded skill|Reconcile or reinstall|canonical \/reload/);
       }
       const skill = fresh.tools.get("Skill");
       const slash = fresh.tools.get("SlashCommand");
       const printFork = await skill.execute("fork-print", { name: "named-fork" }, undefined, undefined, fresh.printCtx());
-      expect(printFork.content).toEqual([{ type: "text", text: "LOCKED-FINAL" }]);
-      expect(printFork.details.diagnostics).toEqual(expect.arrayContaining([
-        expect.objectContaining({ message: expect.stringContaining("omitted preloaded skill") }),
-      ]));
+      expect(printFork.content).toEqual([{ type: "text", text: "SNAPSHOT-FINAL" }]);
+      expect(JSON.stringify(printFork.details.diagnostics)).not.toContain("omitted preloaded skill");
       const tuiFork = await slash.execute("fork-tui", { command: "/named-fork" }, undefined, undefined, fresh.tuiCtx());
-      expect(tuiFork.content).toEqual([{ type: "text", text: "LOCKED-FINAL" }]);
-      expect(tuiFork.details.diagnostics).toEqual(expect.arrayContaining([
-        expect.objectContaining({ message: expect.stringContaining("omitted preloaded skill") }),
-      ]));
-      expect(fresh.notifications.filter((item) => item.text.includes("omitted preloaded skill"))).toHaveLength(0);
+      expect(tuiFork.content).toEqual([{ type: "text", text: "SNAPSHOT-FINAL" }]);
+      expect(JSON.stringify(tuiFork.details.diagnostics)).not.toContain("omitted preloaded skill");
 
       const typedTui = await fresh.fire("input", { text: "/named-fork", source: "interactive" }, fresh.tuiCtx());
       const repeatedTypedTui = await fresh.fire("input", { text: "/named-fork", source: "interactive" }, fresh.tuiCtx());
       expect(typedTui).toEqual(expectedTypedFork);
       expect(repeatedTypedTui).toEqual(expectedTypedFork);
-      const tuiWarnings = fresh.notifications.filter((item) => item.text.includes("omitted preloaded skill"));
-      expect(tuiWarnings).toHaveLength(1);
-      expect(tuiWarnings[0]).toMatchObject({ severity: "warning" });
-      expect(expectedTypedFork.text).not.toContain("omitted preloaded skill");
+      expect(fresh.notifications).toHaveLength(0);
 
-      const warnings = error.mock.calls.map((call) => String(call[0]))
-        .filter((line) => line.includes("omitted preloaded skill"));
-      expect(warnings).toHaveLength(1);
-      expect(warnings[0]).toContain("Reconcile or reinstall");
-      expect(warnings[0]).toContain("canonical /reload");
       expect(handle.promptCalls()).toBe(7);
+      expect(preloadedPrompts).toHaveLength(7);
+      for (const prompt of preloadedPrompts) {
+        expect(prompt).toContain("## Preloaded skill: preload-owner:snapshot-preload");
+        expect(prompt).toContain(`snapshot-data=${expectedDataPath}`);
+        expect(prompt).not.toContain("${CLAUDE_PLUGIN_DATA}");
+      }
+      const warnings = error.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(warnings).not.toMatch(/omitted preloaded skill|Reconcile or reinstall|canonical \/reload/);
       await fresh.commands.get("doctor").handler("", fresh.tuiCtx());
-      expect(String(fresh.entries.at(-1)?.data?.output ?? "")).toContain("omitted preloaded skill");
+      const report = String(fresh.entries.at(-1)?.data?.output ?? "");
+      expect(report).not.toMatch(/omitted preloaded skill|Reconcile or reinstall|Plugin runtime failures \(execution did not occur\)/);
     } finally {
       error.mockRestore();
       cleanupFixture(root);

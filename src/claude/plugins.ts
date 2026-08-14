@@ -15,8 +15,13 @@ import { isQualifiedPluginId } from "../util/plugin-id.js";
 import { canonicalDirectory as resolveCanonicalDirectory, projectIdentities } from "../util/project-identity.js";
 import type { PluginAgentLoaderSource } from "./agents.js";
 import { projectPluginManifest, type SafePluginManifestProjection } from "./plugin-metadata.js";
+import { executableDigestForProjection } from "../plugin-lifecycle/admission.js";
+import { isOwnedInstallationProjection, type OwnedInstallationProjection } from "../plugin-lifecycle/projection.js";
+import { admitDependencyGraph, type DependencyAdmissionDecision } from "../plugin-lifecycle/dependency-admission.js";
 import {
   authorizePluginRoot,
+  authorizeOwnedPluginDataLocation,
+  bindPluginRuntimeDataAuthorization,
   resolvePluginDataLocation,
   resolvePluginPath,
   revalidatePluginPath,
@@ -43,12 +48,16 @@ export interface InstalledPlugin {
   root: string;
   dataDir: string;
   manifestProjection: SafePluginManifestProjection;
+  dependencies?: readonly import("./plugin-metadata.js").SafePluginManifestDependency[];
+  dependencyDeclaration?: "absent" | "complete" | "invalid" | "truncated";
   skillSources: PluginSkillLoaderSource[];
   commandSources: PluginSkillLoaderSource[];
   agentSources: PluginAgentLoaderSource[];
   hookSources: PluginComponentSource[];
   hookPathSources: Array<{ source: Exclude<PluginComponentSource, { kind: "inline" }>; validatedPath: ValidatedPluginPath }>;
   enabled: true;
+  ownership?: "picc-owned" | "claude-imported-readonly";
+  allowedCrossMarketplaceDependencies?: readonly string[];
   diagnostics: Diagnostic[];
   installation: NormalizedPluginInstallation;
   context: PluginRuntimeContext;
@@ -58,6 +67,21 @@ export interface ResolveInstalledPluginsResult {
   plugins: InstalledPlugin[];
   outcomes: PluginResolutionOutcome[];
   diagnostics: Diagnostic[];
+  selectedInstallations: readonly { readonly pluginId: string; readonly installation: NormalizedPluginInstallation }[];
+  dependencyDecisions: readonly DependencyAdmissionDecision[];
+}
+
+type CandidateInstallation = NormalizedPluginInstallation | OwnedInstallationProjection;
+
+function isOwnedInstallation(value: CandidateInstallation): value is OwnedInstallationProjection { return isOwnedInstallationProjection(value); }
+function installationPluginId(value: CandidateInstallation): string { return isOwnedInstallation(value) ? value.pluginId : value.pluginId; }
+function installationProjectPath(value: CandidateInstallation): string | undefined { return value.projectPath; }
+function normalizedInstallation(value: CandidateInstallation): NormalizedPluginInstallation {
+  return isOwnedInstallation(value) ? {
+    pluginId: value.pluginId, scope: value.scope, ...(value.projectPath === undefined ? {} : { projectPath: value.projectPath }),
+    installPath: value.installPath, version: value.version,
+    provenance: { statePath: `picc-owned:${value.executableGenerationId}`, stateVersion: 1 },
+  } : value;
 }
 
 interface ProvisionalPlugin {
@@ -99,24 +123,24 @@ function sameFilesystemIdentity(left: string | undefined, right: string | undefi
   return leftCanonical !== undefined && rightCanonical !== undefined && leftCanonical === rightCanonical;
 }
 
-function effectiveProjectPath(record: NormalizedPluginInstallation): string | undefined {
+function effectiveProjectPath(record: CandidateInstallation): string | undefined {
   return record.scope === "project" || record.scope === "local" ? record.projectPath : undefined;
 }
 
-function equivalentInstallation(left: NormalizedPluginInstallation, right: NormalizedPluginInstallation): boolean {
-  return left.pluginId === right.pluginId && left.scope === right.scope && left.version === right.version &&
+function equivalentInstallation(left: CandidateInstallation, right: CandidateInstallation): boolean {
+  return isOwnedInstallation(left) === isOwnedInstallation(right) && installationPluginId(left) === installationPluginId(right) && left.scope === right.scope && left.version === right.version &&
     sameFilesystemIdentity(effectiveProjectPath(left), effectiveProjectPath(right)) &&
     sameFilesystemIdentity(left.installPath, right.installPath);
 }
 
-function compareInstallations(left: NormalizedPluginInstallation, right: NormalizedPluginInstallation): number {
+function compareInstallations(left: CandidateInstallation, right: CandidateInstallation): number {
   for (const [leftValue, rightValue] of [
     [left.installPath, right.installPath],
     [left.projectPath ?? "", right.projectPath ?? ""],
     [left.version, right.version],
-    [left.provenance.statePath, right.provenance.statePath],
-    [left.provenance.installedAt ?? "", right.provenance.installedAt ?? ""],
-    [left.provenance.lastUpdated ?? "", right.provenance.lastUpdated ?? ""],
+    [isOwnedInstallation(left) ? left.executableGenerationId : left.provenance.statePath, isOwnedInstallation(right) ? right.executableGenerationId : right.provenance.statePath],
+    [isOwnedInstallation(left) ? "" : left.provenance.installedAt ?? "", isOwnedInstallation(right) ? "" : right.provenance.installedAt ?? ""],
+    [isOwnedInstallation(left) ? "" : left.provenance.lastUpdated ?? "", isOwnedInstallation(right) ? "" : right.provenance.lastUpdated ?? ""],
   ] as const) {
     const compared = compareText(leftValue, rightValue);
     if (compared !== 0) return compared;
@@ -129,7 +153,7 @@ function isContained(root: string, candidate: string): boolean {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-function applicable(record: NormalizedPluginInstallation, projects: ReadonlySet<string>): boolean {
+function applicable(record: CandidateInstallation, projects: ReadonlySet<string>): boolean {
   if (record.scope === "user" || record.scope === "managed") return true;
   if (!record.projectPath || !path.isAbsolute(record.projectPath)) return false;
   const canonical = canonicalDirectory(record.projectPath);
@@ -138,10 +162,10 @@ function applicable(record: NormalizedPluginInstallation, projects: ReadonlySet<
 
 function chooseInstallation(
   pluginId: string,
-  installations: readonly NormalizedPluginInstallation[],
+  installations: readonly CandidateInstallation[],
   projects: ReadonlySet<string>,
-): { installation?: NormalizedPluginInstallation; ambiguous: boolean } {
-  const applicableRecords = installations.filter((record) => record.pluginId === pluginId && applicable(record, projects));
+): { installation?: CandidateInstallation; ambiguous: boolean } {
+  const applicableRecords = installations.filter((record) => installationPluginId(record) === pluginId && applicable(record, projects));
   if (applicableRecords.length === 0) return { ambiguous: false };
   const winnerRank = Math.max(...applicableRecords.map((record) => SCOPE_RANK[record.scope]));
   const winners = applicableRecords
@@ -202,11 +226,11 @@ export function authorizedCacheRoots(userDir: string, env: NodeJS.ProcessEnv): s
 }
 
 function authorizeInstallationRoot(
-  installation: NormalizedPluginInstallation,
+  installation: CandidateInstallation,
   cacheRoots: readonly string[],
 ): ReturnType<typeof authorizePluginRoot> {
   const root = authorizePluginRoot(installation.installPath);
-  if (!root.ok) return root;
+  if (!root.ok || isOwnedInstallation(installation)) return root;
   const cacheRoot = cacheRoots.find((candidate) => isContained(candidate, root.value.canonicalPath) && root.value.canonicalPath !== candidate);
   if (!cacheRoot) {
     return {
@@ -330,14 +354,40 @@ function resolveComponents(options: {
   version: string;
   scope: PluginInstallationScope;
   projectPath?: string;
-  installation: NormalizedPluginInstallation;
+  installation: CandidateInstallation;
   userDir: string;
   projectRoot: string;
-}): { ok: true; plugin: InstalledPlugin; dataCollisionToken: string } | { ok: false; diagnostics: Diagnostic[] } {
+}): { ok: true; plugin: InstalledPlugin; dataCollisionToken: string } | { ok: false; diagnostics: Diagnostic[]; manifestProjection?: SafePluginManifestProjection } {
   const manifestResult = readManifest(options.root);
   if (!manifestResult.ok) return { ok: false, diagnostics: [manifestResult.diagnostic] };
   const manifest = manifestResult.manifest;
-  const projectedManifest = projectPluginManifest(manifest);
+  const manifestSourcePath = manifestResult.manifestPath?.lexicalPath ?? path.join(options.root.lexicalPath, ".claude-plugin", "plugin.json");
+  const projectedManifest = projectPluginManifest(manifest, manifestSourcePath);
+  if (isOwnedInstallation(options.installation)) {
+    const record = options.installation.authority.record;
+    const executable = executableDigestForProjection(projectedManifest.projection);
+    const merged = new Map<string, import("./plugin-metadata.js").SafePluginManifestDependency>();
+    let dependencyConflict = false;
+    for (const dependency of [...record.catalogDependencies, ...(projectedManifest.projection.dependencies ?? [])]) {
+      const identity = `${dependency.name}@${dependency.marketplace ?? record.source.marketplaceName}`; const existing = merged.get(identity);
+      if (existing !== undefined && existing.version !== dependency.version) dependencyConflict = true;
+      else if (existing === undefined) merged.set(identity, dependency);
+    }
+    const mergedDependencies = [...merged.values()].sort((left, right) => `${left.name}@${left.marketplace ?? record.source.marketplaceName}`.localeCompare(`${right.name}@${right.marketplace ?? record.source.marketplaceName}`)).map((dependency, itemIndex) => ({ name: dependency.name, ...(dependency.marketplace === undefined ? {} : { marketplace: dependency.marketplace }), ...(dependency.version === undefined ? {} : { version: dependency.version }), itemIndex }));
+    const declaration = record.catalogDependencyDeclaration === "absent" && projectedManifest.projection.dependencyDeclaration === "absent" ? "absent" : "complete";
+    const authority = record.resolvedVersionAuthority;
+    const authorityMismatch = (() => {
+      if (authority.kind === "manifest-version") return projectedManifest.projection.version !== authority.version || record.version !== authority.version;
+      if (authority.kind === "catalog-release") return projectedManifest.projection.version !== undefined || record.catalogRelease === undefined || JSON.stringify(authority.release) !== JSON.stringify(record.catalogRelease) || record.version !== authority.release.value;
+      if (projectedManifest.projection.version !== undefined || record.catalogRelease !== undefined) return true;
+      if (authority.kind === "npm-resolved-version") return record.source.kind !== "npm" || authority.version !== record.source.version || record.version !== authority.version;
+      if (authority.kind === "git-commit") return record.source.kind !== "git" || authority.commit !== record.source.commit || record.version !== authority.commit;
+      if (authority.kind === "relative-marketplace-snapshot") return record.source.kind !== "marketplace-relative" || authority.snapshotId !== record.source.marketplaceSnapshotId || record.version !== authority.snapshotId;
+      return record.source.kind !== "zip" || authority.digest !== record.source.zipDigest || record.version !== `zip-${authority.digest.slice("sha256:".length)}`;
+    })();
+    const sameDependencies = mergedDependencies.length === record.dependencies.length && mergedDependencies.every((dependency, index) => { const retained = record.dependencies[index]; return retained !== undefined && dependency.name === retained.name && dependency.marketplace === retained.marketplace && dependency.version === retained.version && retained.itemIndex === index; });
+    if (!executable.ok || executable.value !== record.executableDigest || dependencyConflict || projectedManifest.projection.dependencyDeclaration === "invalid" || projectedManifest.projection.dependencyDeclaration === "truncated" || declaration !== record.dependencyDeclaration || !sameDependencies || authorityMismatch) return { ok: false, diagnostics: [{ severity: "warning", message: "Owned plugin executable, release, or dependency projection does not match retained trusted authority" }], manifestProjection: projectedManifest.projection };
+  }
   const pluginName = manifestResult.manifestPath ? manifest["name"] as string : options.lifecycleName;
   if (!COMPONENT_NAME.test(pluginName)) return {
     ok: false,
@@ -345,15 +395,21 @@ function resolveComponents(options: {
       severity: "warning",
       message: "Plugin component namespace is malformed; expected lowercase letters or digits separated by single hyphens",
     }],
+    manifestProjection: projectedManifest.projection,
   };
 
-  const data = resolvePluginDataLocation(options.userDir, options.pluginId);
-  if (!data.ok) return { ok: false, diagnostics: [data.diagnostic] };
+  const ownedInstallation = isOwnedInstallation(options.installation) ? options.installation : undefined;
+  const ownedData = ownedInstallation === undefined ? undefined : authorizeOwnedPluginDataLocation({ profileRoot: ownedInstallation.profileRoot, dataRoot: ownedInstallation.dataRoot, profileKey: ownedInstallation.authority.record.profileKey, qualifiedIdentity: options.pluginId });
+  const importedData = ownedInstallation === undefined ? resolvePluginDataLocation(options.userDir, options.pluginId) : undefined;
+  const data = ownedData ?? importedData!;
+  if (!data.ok) return { ok: false, diagnostics: [data.diagnostic], manifestProjection: projectedManifest.projection };
+  const dataPath = data.value.lexicalPath;
+  const collisionToken = ownedInstallation === undefined ? (data.value as import("./plugin-paths.js").PluginDataLocation).collisionToken : `owned:${options.pluginId.toLowerCase()}`;
   const context: PluginRuntimeContext = {
     pluginId: options.pluginId,
     pluginName,
     root: options.root.canonicalPath,
-    dataDir: data.value.lexicalPath,
+    dataDir: dataPath,
     projectDir: options.projectRoot,
   };
   const skillSources: PluginSkillLoaderSource[] = [];
@@ -436,7 +492,7 @@ function resolveComponents(options: {
       }
     }
   }
-  if (terminalDiagnostics.length > 0) return { ok: false, diagnostics: terminalDiagnostics.slice(0, 20) };
+  if (terminalDiagnostics.length > 0) return { ok: false, diagnostics: terminalDiagnostics.slice(0, 20), manifestProjection: projectedManifest.projection };
 
   const diagnostics: Diagnostic[] = projectedManifest.diagnostics;
   const plugin: InstalledPlugin = {
@@ -447,26 +503,33 @@ function resolveComponents(options: {
     scope: options.scope,
     ...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
     root: options.root.canonicalPath,
-    dataDir: data.value.lexicalPath,
+    dataDir: dataPath,
     manifestProjection: projectedManifest.projection,
+    ...(ownedInstallation === undefined ? {} : { dependencies: ownedInstallation.dependencies, dependencyDeclaration: ownedInstallation.dependencyDeclaration }),
     skillSources,
     commandSources,
     agentSources,
     hookSources,
     hookPathSources,
     enabled: true,
+    ownership: isOwnedInstallation(options.installation) ? "picc-owned" : "claude-imported-readonly",
+    ...(ownedInstallation === undefined ? {} : { allowedCrossMarketplaceDependencies: ownedInstallation.allowedCrossMarketplaceDependencies }),
     diagnostics,
-    installation: options.installation,
+    installation: normalizedInstallation(options.installation),
     context,
   };
-  return { ok: true, plugin, dataCollisionToken: data.value.collisionToken };
+  const authorization = ownedInstallation === undefined
+    ? { ownership: "claude-imported-readonly" as const, location: data.value as import("./plugin-paths.js").PluginDataLocation }
+    : data.value as import("./plugin-paths.js").OwnedPluginDataLocation;
+  if (!bindPluginRuntimeDataAuthorization(context, authorization)) return { ok: false, diagnostics: [{ severity: "warning", message: "Plugin runtime data authority could not be bound" }], manifestProjection: projectedManifest.projection };
+  return { ok: true, plugin, dataCollisionToken: collisionToken };
 }
 
 export function resolveInstalledPlugins(options: {
   userDir: string;
   projectRoot: string;
   enablement: Readonly<Record<string, EffectivePluginEnablement>>;
-  installations: readonly NormalizedPluginInstallation[];
+  installations: readonly CandidateInstallation[];
   installedStateStatus: "absent" | "valid" | "unreadable" | "unsupported" | "malformed";
   env?: NodeJS.ProcessEnv;
   readBlocklistForTest?: (file: string) => string;
@@ -474,6 +537,8 @@ export function resolveInstalledPlugins(options: {
   const outcomes: PluginResolutionOutcome[] = [];
   const diagnostics: Diagnostic[] = [];
   const provisional: ProvisionalPlugin[] = [];
+  const disabledDependencyEvidence: Array<{ pluginId: string; version: string; ownership: "picc-owned" | "claude-imported-readonly" }> = [];
+  const selectedInstallations: Array<{ pluginId: string; installation: NormalizedPluginInstallation }> = [];
   const projects = new Set(projectIdentities(options.projectRoot));
   const cacheRoots = authorizedCacheRoots(options.userDir, options.env ?? process.env);
   const blocklist = readBlocklist(options.userDir, options.readBlocklistForTest);
@@ -482,6 +547,8 @@ export function resolveInstalledPlugins(options: {
   for (const pluginId of Object.keys(options.enablement).sort(compareText)) {
     const enabled = options.enablement[pluginId]!;
     if (!enabled.enabled) {
+      const selected = chooseInstallation(pluginId, options.installations, projects);
+      if (!selected.ambiguous && selected.installation !== undefined) { disabledDependencyEvidence.push({ pluginId, version: selected.installation.version, ownership: isOwnedInstallation(selected.installation) ? "picc-owned" : "claude-imported-readonly" }); selectedInstallations.push({ pluginId, installation: normalizedInstallation(selected.installation) }); }
       outcomes.push({ pluginId, status: "disabled", diagnostics: [] });
       continue;
     }
@@ -507,14 +574,14 @@ export function resolveInstalledPlugins(options: {
       diagnostics.push(item);
       continue;
     }
-    if (options.installedStateStatus !== "valid") {
+    const selected = chooseInstallation(pluginId, options.installations, projects);
+    if (options.installedStateStatus !== "valid" && (selected.installation === undefined || !isOwnedInstallation(selected.installation))) {
       const status = options.installedStateStatus === "unsupported" ? "unsupported"
         : options.installedStateStatus === "malformed" ? "malformed"
         : options.installedStateStatus === "absent" ? "enabled-but-uninstalled" : "rejected";
       outcomes.push({ pluginId, status, ...(sharedStateCauses.length > 0 ? { sharedStateCauses } : {}), diagnostics: [] });
       continue;
     }
-    const selected = chooseInstallation(pluginId, options.installations, projects);
     if (selected.ambiguous) {
       const item = diagnostic(pluginId, "has conflicting highest-scope installation records; nothing was loaded");
       outcomes.push({ pluginId, status: "ambiguous", diagnostics: [item] });
@@ -529,7 +596,7 @@ export function resolveInstalledPlugins(options: {
     if (!root.ok) {
       const reason = { severity: "warning" as const, message: root.diagnostic.message };
       const item = diagnostic(pluginId, "has an unauthorized or invalid installed root; nothing was loaded");
-      outcomes.push({ pluginId, status: "rejected", installation: selected.installation, diagnostics: [reason, item] });
+      outcomes.push({ pluginId, status: "rejected", installation: normalizedInstallation(selected.installation), diagnostics: [reason, item] });
       diagnostics.push(reason, item);
       continue;
     }
@@ -549,14 +616,14 @@ export function resolveInstalledPlugins(options: {
     if (!resolved.ok) {
       const item = diagnostic(pluginId, "has invalid manifest or component declarations; nothing was loaded");
       const pluginDiagnostics = [item, ...resolved.diagnostics].slice(0, 20);
-      outcomes.push({ pluginId, status: "rejected", installation: selected.installation, diagnostics: pluginDiagnostics });
+      outcomes.push({ pluginId, status: "rejected", installation: normalizedInstallation(selected.installation), ...(resolved.manifestProjection?.defaultEnabled === undefined ? {} : { manifestDefaultEnabled: resolved.manifestProjection.defaultEnabled }), diagnostics: pluginDiagnostics });
       diagnostics.push(...pluginDiagnostics);
       continue;
     }
     const outcome: PluginResolutionOutcome = {
       pluginId,
       status: "loaded",
-      installation: selected.installation,
+      installation: normalizedInstallation(selected.installation),
       context: resolved.plugin.context,
       sources: [
         ...resolved.plugin.skillSources.map((entry) => entry.source),
@@ -564,6 +631,7 @@ export function resolveInstalledPlugins(options: {
         ...resolved.plugin.agentSources.map((entry) => entry.source),
         ...resolved.plugin.hookSources,
       ],
+      manifestDefaultEnabled: resolved.plugin.manifestProjection.defaultEnabled,
       diagnostics: resolved.plugin.diagnostics,
     };
     provisional.push({ plugin: resolved.plugin, outcome, dataCollisionToken: resolved.dataCollisionToken });
@@ -579,11 +647,15 @@ export function resolveInstalledPlugins(options: {
   for (const groups of [namespaceGroups, dataGroups]) {
     for (const items of groups.values()) if (items.length > 1) for (const item of items) rejectedIds.add(item.plugin.pluginId);
   }
+  const dependencyDecisions = admitDependencyGraph([
+    ...provisional.map((item) => ({ pluginId: item.plugin.pluginId, version: item.plugin.version, enabled: true, available: !rejectedIds.has(item.plugin.pluginId), ownership: item.plugin.ownership ?? "claude-imported-readonly" as const, dependencies: item.plugin.dependencies ?? item.plugin.manifestProjection.dependencies, dependencyDeclaration: item.plugin.dependencyDeclaration ?? item.plugin.manifestProjection.dependencyDeclaration, ...(item.plugin.allowedCrossMarketplaceDependencies === undefined ? {} : { allowedCrossMarketplaceDependencies: item.plugin.allowedCrossMarketplaceDependencies }) })),
+    ...disabledDependencyEvidence.map((item) => ({ ...item, enabled: false })),
+  ]);
+  const dependencyRejected = new Set(dependencyDecisions.filter((decision) => !decision.admitted && !rejectedIds.has(decision.pluginId) && provisional.find((item) => item.plugin.pluginId === decision.pluginId)?.plugin.ownership === "picc-owned").map((decision) => decision.pluginId));
+  for (const pluginId of dependencyRejected) { const item = provisional.find((candidate) => candidate.plugin.pluginId === pluginId)!; const decision = dependencyDecisions.find((candidate) => candidate.pluginId === pluginId)!; const reason = diagnostic(pluginId, `failed dependency admission (${decision.reasons.join(", ")}); owned code remained inert`); item.outcome.status = "rejected"; item.outcome.context = undefined; item.outcome.sources = undefined; item.outcome.diagnostics = [...item.outcome.diagnostics, reason].slice(-20); diagnostics.push(reason); }
   for (const item of provisional) {
-    if (!rejectedIds.has(item.plugin.pluginId)) {
-      outcomes.push(item.outcome);
-      continue;
-    }
+    if (!rejectedIds.has(item.plugin.pluginId) && !dependencyRejected.has(item.plugin.pluginId)) { outcomes.push(item.outcome); continue; }
+    if (dependencyRejected.has(item.plugin.pluginId)) { outcomes.push(item.outcome); continue; }
     const collisionDiagnostics: Diagnostic[] = [];
     if ((namespaceGroups.get(item.plugin.name)?.length ?? 0) > 1) {
       collisionDiagnostics.push(diagnostic(item.plugin.pluginId, "has a component namespace collision; conflicting content was rejected"));
@@ -603,9 +675,11 @@ export function resolveInstalledPlugins(options: {
 
   outcomes.sort((left, right) => compareText(left.pluginId, right.pluginId));
   return {
-    plugins: provisional.filter((item) => !rejectedIds.has(item.plugin.pluginId)).map((item) => item.plugin),
+    plugins: provisional.filter((item) => !rejectedIds.has(item.plugin.pluginId) && !dependencyRejected.has(item.plugin.pluginId)).map((item) => item.plugin),
     outcomes,
     diagnostics,
+    selectedInstallations: Object.freeze(selectedInstallations),
+    dependencyDecisions,
   };
 }
 

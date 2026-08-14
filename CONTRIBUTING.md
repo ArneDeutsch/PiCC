@@ -57,7 +57,8 @@ pre-commit hook and routine development gate use `verify`; use `verify:all` for 
 final integration. See `doc/testing.md` for lane selection and focused e2e commands.
 
 [`doc/architecture.md`](doc/architecture.md) is the map of `src/` — the layering, what each module
-owns, and where new code belongs. Read it before changing the harness.
+owns, and where new code belongs. Read it before changing the harness. For trust boundaries and the
+security promises a change must preserve, read [`doc/threat-model.md`](doc/threat-model.md).
 
 [`doc/testing.md`](doc/testing.md) is the reference for the test lanes and what each one covers,
 the three-layer strategy, and how to add an end-to-end scenario. Tests must pass on Windows and
@@ -226,8 +227,6 @@ Deliberately out of scope — each for a reason, not from neglect:
   [capability matrix](doc/supported-features.md) records the exact limits and tiers.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
-- **Plugin lifecycle / network acquisition.** PiCC observes local plugin and marketplace state and
-  loads eligible installed content; it does not install, update, remove, refresh, or acquire it.
 - **Fan-out / subscription economics.** How much parallelism a subscription tolerates is the
   project author's concern, not the harness's.
 - **Console UX parity — recognizable, not identical.** We render the Claude-specific concepts that

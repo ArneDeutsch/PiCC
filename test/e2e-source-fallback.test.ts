@@ -5,10 +5,18 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PI_SUITE_PACKAGES } from "../bin/picc-admin.mjs";
 import {
+  allText,
   cliMissing,
   createE2ELive,
   REPO_ROOT,
 } from "./helpers/e2e-live.js";
+import {
+  createPluginLifecycleFixture,
+  LIFECYCLE_BASE_ID,
+  LIFECYCLE_MARKETPLACE,
+  lifecycleSubprocessEnv,
+  type PluginLifecycleFixture,
+} from "./helpers/plugin-lifecycle-fixture.js";
 
 const SOURCE_WITNESS_WATCHDOG_MS = 300_000;
 const SOURCE_WITNESS_TEST_TIMEOUT_MS = 330_000;
@@ -100,45 +108,77 @@ function isolatedCheckout(): {
   return { root, launcher: path.join(root, "bin", "picc.mjs"), driftedSource, extensionCanary, pluginCanary };
 }
 
-function pluginCommand(launcher: string, cwd: string, args: string[], pluginCanary: string) {
-  const profile = path.join(cwd, ".empty-claude-profile");
-  fs.mkdirSync(profile, { recursive: true });
-  return spawnSync(process.execPath, [launcher, "plugin", ...args], {
-    cwd,
-    encoding: "utf8",
-    env: { ...process.env, PICC_CLAUDE_USER_DIR: profile, PICC_SOURCE_PLUGIN_CANARY: pluginCanary },
-    timeout: 30_000,
-  });
-}
-
 describe.skipIf(cliMissing)("source-checkout fallback", () => {
-  it("runs one disclosed TypeScript generation through real Pi and both plugin commands until relaunch", async () => {
+  it("keeps standalone plugin routing on one disclosed TypeScript generation until rebuild and relaunch", async () => {
     const isolated = isolatedCheckout();
-    const list = pluginCommand(isolated.launcher, isolated.root, ["list"], isolated.pluginCanary);
-    expect(list.status, list.stderr).toBe(0);
-    expect(list.stdout).toContain("Plugin inventory (read-only)");
-    const details = pluginCommand(isolated.launcher, isolated.root, ["details", "missing@market"], isolated.pluginCanary);
-    expect(details.status).toBe(1);
-    expect(details.stderr).toContain("PiCC plugin not found: missing@market");
+    let lifecycle: PluginLifecycleFixture | undefined;
+    const lifecycleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-source-lifecycle-state-"));
+    temporary.push(lifecycleRoot);
+    const preloadCanary = path.join(lifecycleRoot, "source-preload-canary");
+    const preloadScript = path.join(lifecycleRoot, "source-preload-canary.cjs");
+    fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
+    const sourceFixture = path.join(lifecycleRoot, "fixture");
+    fs.cpSync(path.join(REPO_ROOT, "examples", "full-surface"), sourceFixture, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: sourceFixture });
+    execFileSync("git", ["config", "user.email", "e2e@example.invalid"], { cwd: sourceFixture });
+    execFileSync("git", ["config", "user.name", "PiCC E2E"], { cwd: sourceFixture });
+    execFileSync("git", ["add", "."], { cwd: sourceFixture });
+    execFileSync("git", ["commit", "-qm", "fixture"], { cwd: sourceFixture });
+    lifecycle = createPluginLifecycleFixture(sourceFixture, lifecycleRoot);
+    const lifecycleCommand = (args: string[]) => spawnSync(process.execPath, [isolated.launcher, "plugin", ...args], {
+      cwd: lifecycle.project,
+      encoding: "utf8",
+      env: lifecycleSubprocessEnv({
+        HOME: lifecycle!.homeDir,
+        USERPROFILE: lifecycle!.homeDir,
+        PICC_CLAUDE_USER_DIR: lifecycle!.userDir,
+        PICC_SOURCE_PLUGIN_CANARY: isolated.pluginCanary,
+        PI_OFFLINE: "1",
+      }),
+      timeout: 30_000,
+    });
+    const added = lifecycleCommand(["marketplace", "add", LIFECYCLE_MARKETPLACE, "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"), "--yes"]);
+    expect(added.status, added.stderr).toBe(0);
+    const marketplaceSelector = /Selected marketplace scope\/selector: user; ([A-Za-z0-9_-]+)/u.exec(added.stdout)?.[1];
+    expect(marketplaceSelector).toBeDefined();
+    const installed = lifecycleCommand(["install", LIFECYCLE_BASE_ID, "--marketplace-selector", marketplaceSelector!, "--yes"]);
+    expect(installed.status, installed.stderr).toBe(0);
+    const observationsBeforeDetails = fs.readFileSync(isolated.pluginCanary, "utf8").trim().split(/\r?\n/u)
+      .map((line) => JSON.parse(line) as { type: string; producerPid: number; argv: string[]; sourcePath: string });
+    const freshDurable = lifecycleCommand(["details", LIFECYCLE_BASE_ID]);
+    expect(freshDurable.status, freshDurable.stderr).toBe(0);
+    expect(freshDurable.stdout).toContain("version=1.0.0");
     const pluginObservations = fs.readFileSync(isolated.pluginCanary, "utf8").trim().split(/\r?\n/u)
       .map((line) => JSON.parse(line) as { type: string; producerPid: number; argv: string[]; sourcePath: string });
     expect(pluginObservations.map((observation) => observation.argv)).toEqual([
-      ["plugin", "list"],
-      ["plugin", "details", "missing@market"],
+      ["plugin", "marketplace", "add", LIFECYCLE_MARKETPLACE, "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"), "--yes"],
+      ["plugin", "install", LIFECYCLE_BASE_ID, "--marketplace-selector", marketplaceSelector!, "--yes"],
+      ["plugin", "details", LIFECYCLE_BASE_ID],
     ]);
     expect(pluginObservations.every((observation) => observation.type === "source-plugin" &&
       Number.isSafeInteger(observation.producerPid) && observation.producerPid !== process.pid &&
       observation.sourcePath.endsWith("/src/plugin-inventory-cli.ts"))).toBe(true);
+    expect(pluginObservations.at(-1)!.producerPid).not.toBe(observationsBeforeDetails.at(-1)!.producerPid);
 
     const live = await startPi({
       launcherPath: isolated.launcher,
       script: [{ text: "SOURCE_FALLBACK_FIRST" }, { text: "SOURCE_FALLBACK_AFTER_BUILD" }],
       prompt: "unused",
       modeArgs: ["--mode", "rpc"],
+      lifecycleIsolation: true,
+      extraEnv: {
+        PICC_SOURCE_PLUGIN_CANARY: isolated.pluginCanary,
+        PICC_CLAUDE_USER_DIR: lifecycle.userDir,
+        HOME: lifecycle.homeDir,
+        USERPROFILE: lifecycle.homeDir,
+        NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
+      },
     });
     try {
-      live.sendInput(JSON.stringify({ id: "first", type: "prompt", message: "first source turn" }));
+      live.sendInput(JSON.stringify({ id: "first", type: "prompt", message: "/lifecycle-base:generation" }));
       try {
+        const sourceRequest = await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 1, 150_000);
+        expect(allText(sourceRequest)).toContain("FS-LIFECYCLE-GENERATION-1.0.0");
         await live.waitForOutput((record) => record.type === "message_end" &&
           JSON.stringify(record).includes("SOURCE_FALLBACK_FIRST"), 150_000);
       } catch (error) {
@@ -192,6 +232,7 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
       expect(result.stderr).toContain("PiCC is using TypeScript source because the compiled runtime does not match this checkout.");
       expect(result.stdout).toContain("SOURCE_FALLBACK_FIRST");
       expect(result.stdout).toContain("SOURCE_FALLBACK_AFTER_BUILD");
+      expect(fs.existsSync(preloadCanary)).toBe(false);
     } finally {
       live.closeInput();
       await live.stop();
@@ -200,6 +241,12 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
     const relaunched = execFileSync(process.execPath, [isolated.launcher, "--version"], {
       cwd: isolated.root,
       encoding: "utf8",
+      env: lifecycleSubprocessEnv({
+        HOME: lifecycle.homeDir,
+        USERPROFILE: lifecycle.homeDir,
+        PICC_CLAUDE_USER_DIR: lifecycle.userDir,
+        PI_OFFLINE: "1",
+      }),
       timeout: 30_000,
     });
     expect(relaunched).toContain("Runtime compiled (verified)");

@@ -19,12 +19,45 @@ const MAX_STARTUP_POLICY_EVIDENCE = 3;
 const MAX_DOCTOR_POLICY_EVIDENCE = 10;
 const MAX_LINE = 320;
 
-export const PLUGIN_INVENTORY_SLASH_USAGE = "Read-only usage: /plugin list | /plugin details <plugin@marketplace> (example: /plugin details formatter@official). Run /plugin list to copy an exact qualified identity.";
-export const PLUGIN_INVENTORY_ARGV_USAGE = "Read-only usage: picc plugin list | picc plugin details <plugin@marketplace> (example: picc plugin details formatter@official). Run picc plugin list to copy an exact qualified identity.";
+export const PLUGIN_INVENTORY_SLASH_USAGE = "Usage: /plugin list | /plugin details <plugin@marketplace>. In the interactive TUI, lifecycle actions open focused workflows; run `picc plugin --help` in a terminal for standalone commands. No changes were made.";
+export const PLUGIN_INVENTORY_ARGV_USAGE = `Usage: picc plugin <command>
+  marketplace list
+  marketplace details <name> [--selector <record>]
+  marketplace add <name> --source <local-directory|local-catalog-file|github|https-git|https-catalog> <value> [--ref <ref>] [--scope <user|project|local>] [--declaration-only] [--yes]
+  marketplace refresh <name> [--selector <record>] [--declaration-only] [--yes]
+  marketplace update <name> [--selector <record>] [--declaration-only] [--yes]
+  marketplace remove <name> [--selector <record>] --preserve-installed yes [--declaration-only] [--yes]
+  list
+  details <plugin@marketplace|selector>
+  install <plugin@marketplace> [--marketplace-selector <marketplace-record>] [--scope <user|project|local>] [--declaration-only] [--yes]
+  enable|disable <plugin@marketplace> [--selector <plugin-record>] [--declaration-only] [--yes]
+  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--yes]
+  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration yes --remove-data <yes|no> [--declaration-only] [--yes]
+  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration no --remove-data <yes|no> [--yes]
+  recover [operation-id] [--complete|--rollback] [--yes]
+Output is bounded human-readable text; no stable JSON schema is provided.`;
 
+export interface PluginLifecycleFlags {
+  readonly yes: boolean;
+  readonly declarationOnly: boolean;
+  readonly scope?: "user" | "project" | "local";
+  readonly selector?: string;
+  readonly marketplaceSelector?: string;
+  readonly preserveInstalled?: true;
+  readonly removeDeclaration?: boolean;
+  readonly removeData?: boolean;
+  readonly recoveryAction?: "complete" | "rollback";
+}
 export type PluginInventoryOperation =
   | { readonly kind: "list" }
-  | { readonly kind: "details"; readonly qualifiedIdentity: string };
+  | { readonly kind: "details"; readonly identity?: string; readonly qualifiedIdentity?: string }
+  | { readonly kind: "marketplace-list" }
+  | { readonly kind: "marketplace-details"; readonly name: string; readonly selector?: string }
+  | { readonly kind: "marketplace-add"; readonly name: string; readonly sourceKind: "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog"; readonly sourceValue: string; readonly ref?: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "marketplace-refresh" | "marketplace-remove"; readonly name: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "install" | "enable" | "disable" | "update" | "uninstall"; readonly qualifiedIdentity: string; readonly flags: PluginLifecycleFlags }
+  | { readonly kind: "recover-list" }
+  | { readonly kind: "recover"; readonly operationId: string; readonly flags: PluginLifecycleFlags };
 
 export type PluginInventoryOperationParseResult =
   | { readonly kind: "operation"; readonly operation: PluginInventoryOperation }
@@ -59,6 +92,11 @@ export interface PluginInventoryDoctorDiagnostic {
   readonly severity: PluginInventoryDiagnostic["severity"];
   readonly message: string;
   readonly status?: string;
+  readonly category?: "lifecycle" | "diagnostic";
+  readonly operationId?: string;
+  readonly semanticStep?: string;
+  readonly target?: string;
+  readonly recoveryCategory?: "complete-or-rollback" | "inspect";
   readonly nextCommand?: string;
   readonly repairBoundary?: string;
   readonly refreshGuidance?: string;
@@ -82,24 +120,82 @@ function validQualifiedIdentity(value: string): boolean {
   return parseQualifiedPluginId(value) !== undefined;
 }
 
-function parseTokens(tokens: readonly string[], usage: string): PluginInventoryOperationParseResult {
+function parseReadOnlyTokens(tokens: readonly string[], usage: string): PluginInventoryOperationParseResult {
   if (tokens.length === 1 && tokens[0] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "list" }) });
-  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) {
-    return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
-  }
+  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
   return Object.freeze({ kind: "usage", usage });
+}
+
+function validPlain(value: string, maximum = 256): boolean {
+  return value.length > 0 && value.length <= maximum && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+function validOperationId(value: string): boolean { return /^[A-Za-z0-9_-]{1,128}$/.test(value); }
+function validMarketplaceName(value: string): boolean { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) && value.length <= 128; }
+
+function parseFlags(tokens: readonly string[], allowed: ReadonlySet<string>): PluginLifecycleFlags | undefined {
+  let yes = false; let declarationOnly = false; let scope: PluginLifecycleFlags["scope"]; let selector: string | undefined; let marketplaceSelector: string | undefined;
+  let preserveInstalled: true | undefined; let removeDeclaration: boolean | undefined; let removeData: boolean | undefined; let recoveryAction: "complete" | "rollback" | undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (!allowed.has(token)) return undefined;
+    if (token === "--yes") { if (yes) return undefined; yes = true; continue; }
+    if (token === "--declaration-only") { if (declarationOnly) return undefined; declarationOnly = true; continue; }
+    if (token === "--complete" || token === "--rollback") { if (recoveryAction !== undefined) return undefined; recoveryAction = token.slice(2) as "complete" | "rollback"; continue; }
+    const value = tokens[++index]; if (value === undefined || value.startsWith("--") || !validPlain(value, 1024)) return undefined;
+    if (token === "--scope") { if (scope !== undefined || !["user", "project", "local"].includes(value)) return undefined; scope = value as PluginLifecycleFlags["scope"]; }
+    else if (token === "--selector") { if (selector !== undefined || !/^[A-Za-z0-9_-]{1,1024}$/.test(value)) return undefined; selector = value; }
+    else if (token === "--marketplace-selector") { if (marketplaceSelector !== undefined || !/^[A-Za-z0-9_-]{1,1024}$/.test(value)) return undefined; marketplaceSelector = value; }
+    else if (token === "--preserve-installed") { if (preserveInstalled !== undefined || value !== "yes") return undefined; preserveInstalled = true; }
+    else if (token === "--remove-declaration") { if (removeDeclaration !== undefined || !["yes", "no"].includes(value)) return undefined; removeDeclaration = value === "yes"; }
+    else if (token === "--remove-data") { if (removeData !== undefined || !["yes", "no"].includes(value)) return undefined; removeData = value === "yes"; }
+    else return undefined;
+  }
+  return Object.freeze({ yes, declarationOnly, ...(scope === undefined ? {} : { scope }), ...(selector === undefined ? {} : { selector }), ...(marketplaceSelector === undefined ? {} : { marketplaceSelector }), ...(preserveInstalled === undefined ? {} : { preserveInstalled }), ...(removeDeclaration === undefined ? {} : { removeDeclaration }), ...(removeData === undefined ? {} : { removeData }), ...(recoveryAction === undefined ? {} : { recoveryAction }) });
+}
+
+function parseArgvTokens(tokens: readonly string[]): PluginInventoryOperationParseResult {
+  if (tokens.length === 1 && tokens[0] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "list" }) });
+  if (tokens.length === 2 && tokens[0] === "details" && validQualifiedIdentity(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", qualifiedIdentity: tokens[1]! }) });
+  if (tokens.length === 2 && tokens[0] === "details" && /^[A-Za-z0-9_-]{16,1024}$/.test(tokens[1]!)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "details", identity: tokens[1]! }) });
+  if (tokens[0] === "marketplace") {
+    if (tokens.length === 2 && tokens[1] === "list") return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-list" }) });
+    if (tokens[1] === "details" && validMarketplaceName(tokens[2] ?? "")) { const flags = parseFlags(tokens.slice(3), new Set(["--selector"])); if (flags !== undefined) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-details", name: tokens[2]!, ...(flags.selector === undefined ? {} : { selector: flags.selector }) }) }); }
+    if (tokens[1] === "add" && validMarketplaceName(tokens[2] ?? "") && tokens[3] === "--source" && ["local-directory", "local-catalog-file", "github", "https-git", "https-catalog"].includes(tokens[4] ?? "") && validPlain(tokens[5] ?? "", 4096)) {
+      const tail = [...tokens.slice(6)]; let ref: string | undefined; const refIndex = tail.indexOf("--ref");
+      if (refIndex >= 0) { const value = tail[refIndex + 1]; if (value === undefined || !validPlain(value, 256) || refIndex + 2 > tail.length) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE }); ref = value; tail.splice(refIndex, 2); }
+      const flags = parseFlags(tail, new Set(["--scope", "--declaration-only", "--yes"]));
+      if (flags !== undefined && (ref === undefined || tokens[4] === "github" || tokens[4] === "https-git")) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "marketplace-add", name: tokens[2]!, sourceKind: tokens[4] as "local-directory" | "local-catalog-file" | "github" | "https-git" | "https-catalog", sourceValue: tokens[5]!, ...(ref === undefined ? {} : { ref }), flags }) });
+    }
+    if (["refresh", "update", "remove"].includes(tokens[1] ?? "") && validMarketplaceName(tokens[2] ?? "")) {
+      const remove = tokens[1] === "remove"; const flags = parseFlags(tokens.slice(3), new Set(["--selector", "--declaration-only", "--yes", ...(remove ? ["--preserve-installed"] : [])]));
+      if (flags !== undefined && (!remove || flags.preserveInstalled === true)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: remove ? "marketplace-remove" : "marketplace-refresh", name: tokens[2]!, flags }) as PluginInventoryOperation });
+    }
+    return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  }
+  if (["install", "enable", "disable", "update", "uninstall"].includes(tokens[0] ?? "") && validQualifiedIdentity(tokens[1] ?? "")) {
+    const action = tokens[0] as "install" | "enable" | "disable" | "update" | "uninstall";
+    const allowed = new Set(["--yes", ...(action === "update" ? [] : ["--declaration-only"]), ...(action === "install" || action === "update" ? ["--marketplace-selector"] : []), ...(action === "enable" || action === "disable" || action === "update" || action === "uninstall" ? ["--selector"] : []), ...(action === "install" ? ["--scope"] : []), ...(action === "uninstall" ? ["--remove-declaration", "--remove-data"] : [])]);
+    const flags = parseFlags(tokens.slice(2), allowed);
+    if (flags !== undefined && (action !== "uninstall" || flags.removeDeclaration !== undefined && flags.removeData !== undefined && (!flags.declarationOnly || flags.removeDeclaration === true))) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: action, qualifiedIdentity: tokens[1]!, flags }) });
+  }
+  if (tokens[0] === "recover") {
+    if (tokens.length === 1) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "recover-list" }) });
+    if (validOperationId(tokens[1] ?? "")) { const flags = parseFlags(tokens.slice(2), new Set(["--complete", "--rollback", "--yes"])); if (flags !== undefined) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "recover", operationId: tokens[1]!, flags }) }); }
+  }
+  return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
 }
 
 export function parsePluginInventorySlash(input: string): PluginInventoryOperationParseResult {
   if (input.length > MAX_INPUT || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.replace(/\t/gu, ""))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
   const match = /^[ \t]*\/plugin(?:[ \t]+([^\r\n]*?))?[ \t]*$/.exec(input);
   if (match === null || match[1] === undefined) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
-  return parseTokens(match[1].split(/[ \t]+/), PLUGIN_INVENTORY_SLASH_USAGE);
+  return parseReadOnlyTokens(match[1].split(/[ \t]+/), PLUGIN_INVENTORY_SLASH_USAGE);
 }
 
 export function parsePluginInventoryArgv(argv: readonly string[]): PluginInventoryOperationParseResult {
-  if (argv.some((token) => token.length > MAX_INPUT || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(token))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
-  return parseTokens(argv, PLUGIN_INVENTORY_ARGV_USAGE);
+  if (argv.some((token) => token.length > 4096 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(token))) return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+  return parseArgvTokens(argv);
 }
 
 const REDACTED_FIELD = "<redacted-field>";
@@ -238,6 +334,10 @@ function installationSummary(item: PluginInventoryItem): string {
   return valid === 0 && invalid === 0 ? "none" : `${valid} valid${invalid > 0 ? `, ${invalid} invalid` : ""}`;
 }
 function runtimeStatus(item: PluginInventoryItem): string { return item.outcome?.status ?? "not resolved"; }
+function lifecycleSummary(item: PluginInventoryItem): string {
+  const value = item.lifecycle; if (value === undefined) return "not projected";
+  return `owner=${value.ownership}; desired-installed=${yesNo(value.installed)}; declared=${yesNo(value.declared)}; effective=${yesNo(value.effectiveEnabled)}; loaded=${yesNo(value.loaded)}; reload=${value.pendingReload ? "pending" : "not pending"}`;
+}
 function lowerBoundary(value: string): string { const plain = value.endsWith(".") ? value.slice(0, -1) : value; return `${plain[0]?.toLowerCase() ?? ""}${plain.slice(1)}`; }
 function boundary(snapshot: PluginInventorySnapshot): string {
   return snapshot.lifetime === "session"
@@ -247,7 +347,7 @@ function boundary(snapshot: PluginInventorySnapshot): string {
 
 function needsAttention(item: PluginInventoryItem): boolean {
   return item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
-    (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
+    (item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0;
 }
 
 function relevance(item: PluginInventoryItem): number {
@@ -297,12 +397,13 @@ function addBoundedRecords<T>(lines: string[], heading: string, values: readonly
 }
 
 export function renderPluginInventoryList(snapshot: PluginInventorySnapshot): string {
-  const lines = ["Plugin inventory (read-only)", `Snapshot: ${boundary(snapshot)}`];
+  const lines = ["Plugin inventory (read-only)", `Snapshot: ${boundary(snapshot)}`, `Loaded generation: ${text(snapshot.loadedGenerationId ?? "not identified", 100)}`, `Durable desired generation: ${text(snapshot.durableDesired?.generationId ?? "not identified", 100)}`];
   for (const item of relevantItems(snapshot.items).slice(0, MAX_LIST_ITEMS)) {
     lines.push(`Plugin: ${qualified(item.qualifiedIdentity)}`);
     lines.push(`  installed: ${installationSummary(item)}`);
     lines.push(`  enabled: ${yesNo(item.enablement?.enabled)}`);
     lines.push(`  runtime: ${runtimeStatus(item)}`);
+    lines.push(`  lifecycle: ${lifecycleSummary(item)}`);
     lines.push(`  catalog: ${item.catalogPresence ? "known" : "not known"}`);
   }
   const localRows = Math.max(0, snapshot.items.length - MAX_LIST_ITEMS);
@@ -318,10 +419,19 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   const item = snapshot.find(qualifiedIdentity);
   if (item === undefined || item.qualifiedIdentity !== qualifiedIdentity) return [`Plugin not found: ${qualified(qualifiedIdentity)}`, `Snapshot: ${boundary(snapshot)}`, "Bounded output can omit catalog-only identities. Use the list command to copy an exact qualified identity; in the interactive TUI use the literal /plugin filter."].join("\n");
   const lines = [
-    `Plugin: ${qualified(item.qualifiedIdentity)}`, "Mode: read-only", `Snapshot: ${boundary(snapshot)}`,
+    `Plugin: ${qualified(item.qualifiedIdentity)}`, "Mode: read-only", `Snapshot: ${boundary(snapshot)}`, `Loaded generation: ${text(snapshot.loadedGenerationId ?? "not identified", 100)}; durable desired generation: ${text(snapshot.durableDesired?.generationId ?? "not identified", 100)}`,
     `Installed: ${installationSummary(item)}`,
     `Enablement: enabled=${yesNo(item.enablement?.enabled)}; scope=${item.enablement === undefined ? "not declared" : text(item.enablement.scope, 80)}; source=${location(item.enablement?.source)}`,
     `Runtime outcome: status=${text(runtimeStatus(item), 80)}; shared-state causes=${item.outcome?.sharedStateCauses.length ? item.outcome.sharedStateCauses.map((value) => text(value, 80)).join(", ") : "none"}`,
+    `Lifecycle axes: ${lifecycleSummary(item)}`,
+    `Lifecycle target: mutable-record=${text(item.lifecycle?.mutableRecordKey ?? "not available", 160)}; selected-scope=${text(item.lifecycle?.selectedScope ?? "not available", 80)}; marketplace-owner=${text(item.lifecycle?.marketplaceOwnership ?? "unknown", 80)}; trusted=${yesNo(item.lifecycle?.trusted)}`,
+    `Lifecycle eligibility: ${item.lifecycle?.availableActions.length ? item.lifecycle.availableActions.join(", ") : "none (read-only or unavailable)"}`,
+    `Scoped candidates: ${(item.lifecycle?.candidates ?? []).map((value) => `${text(value.scope, 60)}:${value.selected ? "selected" : "candidate"}:${text(value.mutableRecordKey, 160)}`).join(", ") || "none"}${item.lifecycle?.selectionRequired ? `; selection required (${text(item.lifecycle.selectionGuidance ?? "select an exact scope", 160)})` : ""}`,
+    `Immutable desired content: revision=${text(item.lifecycle?.immutableRevision ?? "not available", 100)}; integrity=${text(item.lifecycle?.integrity ?? "not available", 100)}; root=${location(item.lifecycle?.root)}`,
+    `Default enablement source: ${text(item.lifecycle?.defaultEnablementSource ?? "not available", 100)}`,
+    `Dependency posture: ${text(item.lifecycle?.dependency.state ?? "not available", 80)}${item.lifecycle?.dependency.reason === undefined ? "" : `; reason=${text(item.lifecycle.dependency.reason, 160)}`}`,
+    `Lifecycle availability: ${item.lifecycle?.readOnlyReason === undefined ? "mutable when an explicit lifecycle action is available" : `read-only; ${text(item.lifecycle.readOnlyReason, 160)}`}`,
+    `Pending lifecycle: step=${text(item.lifecycle?.pendingStep ?? "none", 160)}; reload=${item.lifecycle?.pendingReload === true ? "pending" : "not pending"}; recovery-category=${text(item.lifecycle?.recoveryCategory ?? "none", 80)}; recovery-command=${text(item.lifecycle?.recoveryCommand ?? "none", 160)}`,
     `Catalog presence: ${item.catalogPresence ? "known locally" : "not known locally"}`,
     `Selected installation: scope=${item.selectedInstallation === undefined ? "not available" : text(item.selectedInstallation.scope, 80)}; version=${item.selectedInstallation === undefined ? "not available" : text(item.selectedInstallation.version, 80)}`,
     `Selected root: ${location(item.selectedInstallation?.root)}`, `Selected project location: ${location(item.selectedInstallation?.project)}`, `Data location: ${location(item.selectedInstallation?.data)}`,
@@ -361,6 +471,11 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   addBoundedRecords(lines, "Renames (declared only; migration is not performed)", item.renames, (value) => [
     `from=${text(value.from, 100)}; target=${value.target === null ? "removed" : text(value.target, 100)}`, `status=${text(value.status, 80)}`, `posture=${value.posture}`, `provenance=${provenance(value.provenance)}`,
   ]);
+  addBoundedRecords(lines, "Lifecycle operation guidance", item.lifecycle?.lifecycleOperations ?? [], (value) => [
+    `operation=${text(value.operationId, 100)}; status=${value.status}; step=${text(value.semanticStep, 160)}`,
+    `category=${value.category}; target=${text(value.target ?? "not attributed", 120)}; recovery=${text(value.recoveryCommand, 160)}`,
+  ]);
+  addBounded(lines, "Retained lifecycle failures", item.lifecycle?.retainedErrors ?? [], (value) => text(value));
   addBounded(lines, "Item diagnostics", item.diagnostics, (value) => `${value.severity}: ${text(value.message)}`);
   addBounded(lines, "GLOBAL policy observations (not owned by this plugin; not enforced by PiCC)", snapshot.policyObservations, (value) => `kind=${text(value.kind, 80)}; descriptor=${value.descriptor === undefined ? "none" : text(JSON.stringify(value.descriptor), 160)}; descriptor-provenance=${provenance(value.descriptorProvenance)}; match=${text(String(value.match), 80)}; valid-scope=${yesNo(value.validScope)}; empty-lockdown=${yesNo(value.emptyLockdown)}; posture=${value.posture}; provenance=${provenance(value.provenance)}`);
   const capture = captureOmissions(snapshot);
@@ -368,7 +483,11 @@ export function renderPluginInventoryDetails(snapshot: PluginInventorySnapshot, 
   return lines.join("\n");
 }
 
-export function renderPluginInventoryOperation(snapshot: PluginInventorySnapshot, operation: PluginInventoryOperation): string { return operation.kind === "list" ? renderPluginInventoryList(snapshot) : renderPluginInventoryDetails(snapshot, operation.qualifiedIdentity); }
+export function renderPluginInventoryOperation(snapshot: PluginInventorySnapshot, operation: PluginInventoryOperation): string {
+  if (operation.kind === "list") return renderPluginInventoryList(snapshot);
+  if (operation.kind === "details" && operation.qualifiedIdentity !== undefined) return renderPluginInventoryDetails(snapshot, operation.qualifiedIdentity);
+  return PLUGIN_INVENTORY_ARGV_USAGE;
+}
 
 const SOURCE_LABELS: Readonly<Record<string, string>> = Object.freeze({ "system-file": "system policy file", "system-drop-in": "system policy drop-in", override: "managed-policy override" });
 const ADMIN_POLICY_SOURCES = new Set(["system-file", "system-drop-in"]);
@@ -376,7 +495,7 @@ function policyGuidance(sourceClass: string, category: PluginInventoryManagedPol
   if (ADMIN_POLICY_SOURCES.has(sourceClass)) return category === "managed-policy-malformed" ? "Ask an administrator to correct the policy format" : "Ask an administrator to correct access to the policy source";
   return category === "managed-policy-malformed" ? "Correct the managed-policy override format" : "Correct access to the managed-policy override input";
 }
-function policyRefreshAction(): string { return "run canonical /reload in the interactive TUI, or exit and relaunch PiCC"; }
+function policyRefreshAction(): string { return "run /reload-plugins in the interactive TUI, or start a new PiCC session"; }
 function policyEvidence(diagnostics: readonly PluginInventoryDiagnostic[]): PluginInventoryManagedPolicyEvidence[] {
   const seen = new Set<string>(); const values: PluginInventoryManagedPolicyEvidence[] = [];
   for (const diagnostic of diagnostics) {
@@ -393,11 +512,16 @@ function capPolicyEvidence(values: readonly PluginInventoryManagedPolicyEvidence
 }
 
 export function projectPluginInventoryStartup(snapshot: PluginInventorySnapshot): PluginInventoryStartupProjection {
-  const failed = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled");
+  const failed = snapshot.items.filter((item) => item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled" || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0);
+  const lifecycleOperations = [
+    ...(snapshot.durableDesired?.pendingOperations ?? []),
+    ...(snapshot.durableDesired?.terminalOperations.filter((value) => value.outcome === "failed-before-commit" && value.recoveryCommand !== undefined).map((value) => ({ operationId: value.operationId, status: value.outcome, semanticStep: value.semanticStep, ...(value.target === undefined ? {} : { target: value.target }), recoveryCommand: value.recoveryCommand!, category: value.category ?? "inspect" as const })) ?? []),
+  ];
   const allIdentities = [...new Set(failed.map((item) => qualified(item.qualifiedIdentity)))];
   const identities = allIdentities.slice(0, 10);
   const allPolicies = policyEvidence(snapshot.diagnostics).filter((value) => ADMIN_POLICY_SOURCES.has(value.sourceClass)); const policies = capPolicyEvidence(allPolicies, MAX_STARTUP_POLICY_EVIDENCE);
-  const lines = failed.slice(0, 10).map((item) => `Plugin ${qualified(item.qualifiedIdentity)} needs attention: ${item.outcome!.status}. Run /doctor for details.`);
+  const lines = lifecycleOperations.slice(0, 10).map((value) => `Lifecycle operation ${text(value.operationId, 100)} needs attention: step=${text(value.semanticStep, 120)}; category=${value.category}; target=${text(value.target ?? "not attributed", 100)}; recovery=${text(value.recoveryCommand, 160)}. Run /doctor for details.`);
+  lines.push(...failed.slice(0, Math.max(0, 10 - lines.length)).map((item) => `Plugin ${qualified(item.qualifiedIdentity)} needs attention: ${item.lifecycle?.pendingStep ?? item.outcome?.status ?? "retained lifecycle failure"}. Run /doctor for details.`));
   for (const value of policies) {
     lines.push(`${value.sourceLabel} was ${value.condition}; the administrator source was ignored and plugin enablement may differ. ${value.guidance}, then ${value.refreshGuidance}.`);
   }
@@ -418,15 +542,27 @@ export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot):
       const identity = qualified(item.qualifiedIdentity);
       allDiagnostics.push(Object.freeze({ qualifiedIdentity: identity, global: false, severity: "warning", message: `Plugin runtime outcome is ${item.outcome.status}`, status: item.outcome.status, nextCommand: next(identity), ...recovery }));
     }
-    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
+    for (const operation of item.lifecycle?.lifecycleOperations ?? []) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: "warning", category: "lifecycle", operationId: operation.operationId, semanticStep: operation.semanticStep, ...(operation.target === undefined ? {} : { target: operation.target }), recoveryCategory: operation.category, message: `Lifecycle ${operation.status}: ${text(operation.semanticStep)}`, nextCommand: operation.recoveryCommand, ...recovery }));
+    for (const message of item.lifecycle?.retainedErrors ?? []) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: "warning", category: "lifecycle", message: text(message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
+    for (const diagnostic of item.diagnostics) allDiagnostics.push(Object.freeze({ qualifiedIdentity: qualified(item.qualifiedIdentity), global: false, severity: diagnostic.severity, category: "diagnostic", message: text(diagnostic.message), nextCommand: next(qualified(item.qualifiedIdentity)), ...recovery }));
   }
+  const attributedOperations = new Set(snapshot.items.flatMap((item) => item.lifecycle?.lifecycleOperations?.map((value) => value.operationId) ?? []));
+  const globalLifecycleOperations = [
+    ...(snapshot.durableDesired?.pendingOperations ?? []),
+    ...(snapshot.durableDesired?.terminalOperations.filter((value) => value.outcome === "failed-before-commit" && value.recoveryCommand !== undefined).map((value) => ({ operationId: value.operationId, status: value.outcome, semanticStep: value.semanticStep, ...(value.target === undefined ? {} : { target: value.target }), recoveryCommand: value.recoveryCommand!, category: value.category ?? "inspect" as const })) ?? []),
+  ];
+  for (const operation of globalLifecycleOperations) if (!attributedOperations.has(operation.operationId)) allDiagnostics.push(Object.freeze({ global: true, severity: "warning", category: "lifecycle", operationId: operation.operationId, semanticStep: operation.semanticStep, ...(operation.target === undefined ? {} : { target: operation.target }), recoveryCategory: operation.category, message: `Lifecycle ${operation.status}: ${text(operation.semanticStep)}`, nextCommand: operation.recoveryCommand, ...recovery }));
   for (const diagnostic of snapshot.diagnostics) {
     if (diagnostic.category === "managed-policy-malformed" || diagnostic.category === "managed-policy-unreadable") continue;
-    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, message: text(diagnostic.message), ...recovery }));
+    allDiagnostics.push(Object.freeze({ global: true, severity: diagnostic.severity, category: diagnostic.category === "lifecycle-observation" ? "lifecycle" : "diagnostic", message: text(diagnostic.message), ...recovery }));
   }
   const uniqueDiagnostics = allDiagnostics.filter((value, index, values) => values.findIndex((candidate) =>
     candidate.qualifiedIdentity === value.qualifiedIdentity && candidate.global === value.global &&
-    candidate.severity === value.severity && candidate.message === value.message) === index);
+    candidate.severity === value.severity && candidate.message === value.message &&
+    (candidate.category !== "lifecycle" && value.category !== "lifecycle" ||
+      candidate.category === value.category && candidate.operationId === value.operationId &&
+      candidate.semanticStep === value.semanticStep && candidate.target === value.target &&
+      candidate.recoveryCategory === value.recoveryCategory && candidate.nextCommand === value.nextCommand)) === index);
   const diagnostics = uniqueDiagnostics.slice(0, MAX_DIAGNOSTICS);
   const uniqueEvidence = snapshot.capabilityEvidence.filter((value, index, values) => values.findIndex((candidate) =>
     candidate.capabilityId === value.capabilityId && candidate.qualifiedIdentity === value.qualifiedIdentity &&
@@ -439,13 +575,13 @@ export function projectPluginInventoryDoctor(snapshot: PluginInventorySnapshot):
   const attentionIdentities = new Set<string>();
   for (const item of snapshot.items) {
     if ((item.outcome !== undefined && item.outcome.status !== "loaded" && item.outcome.status !== "disabled") ||
-      item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") ||
+      item.diagnostics.some((value) => value.severity === "warning" || value.severity === "error") || item.lifecycle?.pendingStep !== undefined || (item.lifecycle?.retainedErrors.length ?? 0) > 0 ||
       item.components.some((value) => value.supportTier !== "full")) attentionIdentities.add(item.qualifiedIdentity);
   }
   for (const value of uniqueEvidence) if (value.supportTier !== undefined && value.supportTier !== "full") attentionIdentities.add(value.qualifiedIdentity);
   const attention = attentionIdentities.size;
   return Object.freeze({
-    counts: Object.freeze({ known: snapshot.items.length, installed: snapshot.items.filter((item) => item.installations.some((entry) => entry.validity === "valid")).length, enabled: snapshot.items.filter((item) => item.enablement?.enabled === true).length, loaded: snapshot.items.filter((item) => item.outcome?.status === "loaded").length, cataloged: snapshot.items.filter((item) => item.catalogPresence).length, attention }),
+    counts: Object.freeze({ known: snapshot.items.length, installed: snapshot.items.filter((item) => item.lifecycle?.installed ?? item.installations.some((entry) => entry.validity === "valid")).length, enabled: snapshot.items.filter((item) => item.lifecycle?.effectiveEnabled ?? item.enablement?.enabled === true).length, loaded: snapshot.items.filter((item) => item.lifecycle?.loaded ?? item.outcome?.status === "loaded").length, cataloged: snapshot.items.filter((item) => item.catalogPresence).length, attention }),
     diagnostics: Object.freeze(diagnostics), capabilityEvidence: Object.freeze(evidence), managedPolicyEvidence: Object.freeze(policies), captureOmissions: capture,
     omitted: Object.freeze({ diagnostics: Object.freeze({ capture: captureDiagnostics, projection: Math.max(0, uniqueDiagnostics.length - diagnostics.length) }), capabilityEvidence: Object.freeze({ capture: captureCapabilities, projection: Math.max(0, uniqueEvidence.length - evidence.length) }), managedPolicyEvidence: Object.freeze({ projection: Math.max(0, allPolicies.length - policies.length) }) }),
     snapshotBoundary: boundary(snapshot),

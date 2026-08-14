@@ -179,8 +179,10 @@ awareness, no I/O beyond reading the artifact.
 #### Installed-plugin assembly boundary
 
 `claude/plugin-installed-state.ts` adapts the captured Claude installed-state v2 fixture layout into
-normalized records; the upstream format is undocumented and is not a permanent PiCC API. Exact-record
-selection and no-fallback failure are PiCC-defined; the generated
+normalized imported records; the upstream format is undocumented and is not a permanent PiCC API.
+`plugin-lifecycle/admission.ts` independently validates one complete committed PiCC-owned profile
+generation before active-project projection. Exact-record selection and no-fallback failure are
+PiCC-defined; the generated
 [capability matrix](supported-features.md) owns exhaustive tiers and limits. The adapter does not scan
 storage for candidates. `claude/plugins.ts` owns qualified-identity selection and turns one
 applicable record into normalized component loader inputs. `claude/plugin-paths.ts` owns the canonical
@@ -192,9 +194,9 @@ The qualified `name@marketplace` identity owns root authorization, installed ver
 persistent-data context. A valid manifest `name` owns the visible skill, command, and agent namespace;
 manifestless content uses the installed identity's lifecycle name.
 
-`src/project.ts` is the commit point: it combines source-aware settings enablement with imported
-records, then merges successful contributions into the ordinary project registries while preserving
-qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
+`src/project.ts` is the composition point: it combines applicable owned and imported installations,
+resolves source-aware settings enablement and winning ownership, then merges successful contributions
+into the ordinary project registries while preserving qualified runtime context. Assembly-time terminal installed-root, identity, manifest, declaration,
 containment, or component-source failures reject the plugin as a unit. Safe component parse or
 loader warnings may instead omit only affected content while the plugin remains loaded. Runtime
 activation and subagent construction use qualified context for root/data/project substitution and
@@ -214,14 +216,37 @@ separate bounded, contained read capability and cannot authorize execution.
 
 The snapshot is observational, never an execution input. Catalog declarations can describe
 components, dependencies, and renames for inventory, but never authorize a root, merge content,
-resolve dependencies, rewrite settings, or start unsupported components. Session `/plugin` views,
-startup diagnostics, and `/doctor` consume the same fixed snapshot for the extension lifetime;
-launcher inventory commands build one command-scoped snapshot without normal runtime startup.
-Consumers produce bounded, redacted projections without rereading plugin state. Post-capture
-point-of-use refusals remain separate live evidence. Refreshing a session snapshot requires canonical
-`/reload` in the interactive TUI or a full PiCC relaunch. Construction and viewing perform no
+resolve dependencies, rewrite settings, or start unsupported components. Fixed `/plugins`, startup
+diagnostics, and `/doctor` consume the startup snapshot for the extension lifetime. Interactive
+`/plugin` keeps loaded-runtime truth from that capture but freshly assembles desired authority from
+the active checkout at each open; launcher inventory commands build one command-scoped snapshot
+without normal runtime startup. These passive projections are bounded and redacted. Post-capture
+point-of-use refusals remain separate live evidence. Loaded runtime changes only after
+`/reload-plugins` succeeds or a new PiCC session starts. Construction and viewing perform no
 marketplace refresh or acquisition, settings or registry writes, plugin process startup, hook
 execution, usage mutation, or prompt-cache invalidation.
+
+### `plugin-lifecycle/` — owned acquisition and durable desired state
+
+This subsystem owns safe source routing and acquisition, immutable artifact and marketplace snapshot
+storage, exact PiCC-owned installation/registration records, settings planning/writing, executable
+admission generations, transaction receipts, and offline recovery. It is the only lifecycle mutation
+authority. Imported Claude installations and Claude-owned, seed, or managed marketplace registrations
+are assembly inputs and remain read-only.
+
+`src/project.ts` remains the project-assembly authority: it captures applicable imported executable
+trees, validates the one committed PiCC-owned generation, combines both ownership families, resolves
+effective enablement and dependencies, and produces the session snapshot and reload candidate. Plugin
+skill and legacy-command Markdown is privately captured during assembly and later activated from those
+bytes; ordinary skills retain progressive disclosure by reading their file on activation. Terminal
+commands and the focused TUI share the typed `PluginLifecyclePort` composition in
+`plugin-inventory-cli.ts`; passive inventory browsing never crosses its mutation methods. Lifecycle
+receipts refresh durable desired-state projections, while the loaded runtime stays session-captured
+until a successful `/reload-plugins` replacement or a new session.
+
+**Placement:** lifecycle source, storage, transaction, settings, trust, dependency, and recovery code.
+Project contribution selection and final runtime assembly remain in `src/project.ts` and the Claude
+component loaders.
 
 ### `engine/` — the deterministic enforcement primitives
 
@@ -489,8 +514,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    launcher selection nor compiled-generation verification. The process env is then made UTF-8-safe,
    and `loadClaudeProject()` assembles the project model. MCP loading resolves standalone authority
    and immutable managed-settings policy, admits raw winners, and materializes only enabled results.
-   `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a multiplexer so
-   skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime` (admitted enabled
+   Project opening and observation perform no plugin acquisition, trust approval, lifecycle recovery,
+   or settings mutation. `CwdState`, `PermissionEngine`, `WorktreeManager`, and `HookRunner` (behind a
+   multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime` (admitted enabled
    MCP servers begin connecting in the background, non-blocking) are constructed. All
    Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard
    extension is installed on tool events, and extension load creates the MCP exposure transaction.

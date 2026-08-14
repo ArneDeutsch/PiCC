@@ -15,6 +15,7 @@ import {
   renderPluginInventoryOperation,
 } from "../src/runtime/plugin-inventory-text.js";
 import { formatPluginInventoryStructuredSource } from "../src/runtime/plugin-inventory-display.js";
+import { PluginInventoryModel } from "../src/runtime/plugin-inventory-model.js";
 
 function item(qualifiedIdentity: string, overrides: Partial<PluginInventoryItem> = {}): PluginInventoryItem {
   const separator = qualifiedIdentity.lastIndexOf("@");
@@ -97,13 +98,37 @@ describe("plugin inventory operation grammar", () => {
     }
   });
 
-  it("rejects missing, extra, unqualified, ambiguous, control, option, and mutation-looking forms without reflection", () => {
+  it("keeps slash mutation-looking input inert while argv accepts only complete lifecycle forms", () => {
     const slashValues = ["/plugin", "/plugin details", "/plugin details same", "/plugin details same@one extra", "/plugin install same@one", "/plugin --help", "/plugin list\ninstall evil", `/plugin details ${"a".repeat(520)}@m`];
-    const argvValues = [[], ["details"], ["details", "same"], ["details", "same@one", "extra"], ["install", "same@one"], ["--help"], ["details", "same@one\nremove"]];
+    const argvValues = [[], ["details"], ["details", "same"], ["details", "same@one", "extra"], ["install"], ["install", "same@one", "--unknown"], ["install", "same@one", "--yes", "--yes"], ["marketplace", "remove", "official", "--yes"], ["details", "same@one\nremove"], ["uninstall", "same@one", "--remove-data", "yes"], ["update", "same@one", "--declaration-only"], ["uninstall", "same@one", "--remove-declaration", "no", "--remove-data", "yes", "--declaration-only"]];
     for (const value of slashValues) expect(parsePluginInventorySlash(value)).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_SLASH_USAGE });
     for (const value of argvValues) expect(parsePluginInventoryArgv(value)).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    expect(parsePluginInventoryArgv(["install", "same@one", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q", "--scope", "project", "--declaration-only", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "install", qualifiedIdentity: "same@one", flags: { marketplaceSelector: "bWFya2V0cGxhY2UtZXhhY3Q", scope: "project", declarationOnly: true, yes: true } } });
+    expect(parsePluginInventoryArgv(["enable", "same@one", "--declaration-only"])).toMatchObject({ kind: "operation", operation: { kind: "enable", flags: { declarationOnly: true } } });
+    expect(parsePluginInventoryArgv(["disable", "same@one", "--declaration-only"])).toMatchObject({ kind: "operation", operation: { kind: "disable", flags: { declarationOnly: true } } });
+    expect(parsePluginInventoryArgv(["update", "same@one", "--selector", "cGx1Z2lu", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "update", flags: { selector: "cGx1Z2lu", marketplaceSelector: "bWFya2V0cGxhY2UtZXhhY3Q" } } });
+    expect(parsePluginInventoryArgv(["install", "same@one", "--selector", "bWFya2V0cGxhY2UtZXhhY3Q"])).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    expect(parsePluginInventoryArgv(["enable", "same@one", "--marketplace-selector", "bWFya2V0cGxhY2UtZXhhY3Q"])).toEqual({ kind: "usage", usage: PLUGIN_INVENTORY_ARGV_USAGE });
+    for (const value of [
+      ["marketplace", "add", "official", "--source", "github", "owner/repo", "--declaration-only"],
+      ["marketplace", "refresh", "official", "--declaration-only"],
+      ["marketplace", "update", "official", "--declaration-only"],
+      ["marketplace", "remove", "official", "--preserve-installed", "yes", "--declaration-only"],
+    ]) expect(parsePluginInventoryArgv(value)).toMatchObject({ kind: "operation", operation: { flags: { declarationOnly: true } } });
+    expect(parsePluginInventoryArgv(["uninstall", "same@one", "--remove-declaration", "no", "--remove-data", "yes", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "uninstall", flags: { removeDeclaration: false, removeData: true } } });
+    expect(parsePluginInventoryArgv(["uninstall", "same@one", "--remove-declaration", "yes", "--remove-data", "no", "--declaration-only"])).toMatchObject({ kind: "operation", operation: { kind: "uninstall", flags: { removeDeclaration: true, removeData: false, declarationOnly: true } } });
+    expect(parsePluginInventoryArgv(["recover"])).toEqual({ kind: "operation", operation: { kind: "recover-list" } });
+    expect(parsePluginInventoryArgv(["recover", "plugin_exact", "--rollback", "--yes"])).toMatchObject({ kind: "operation", operation: { kind: "recover", operationId: "plugin_exact", flags: { recoveryAction: "rollback", yes: true } } });
+    const helpLines = PLUGIN_INVENTORY_ARGV_USAGE.split("\n");
+    expect(helpLines).toContain("  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--yes]");
+    expect(helpLines).not.toContain("  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--declaration-only] [--yes]");
+    expect(helpLines).toContain("  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration yes --remove-data <yes|no> [--declaration-only] [--yes]");
+    expect(helpLines).toContain("  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration no --remove-data <yes|no> [--yes]");
+    expect(helpLines).not.toContain("  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration <yes|no> --remove-data <yes|no> [--declaration-only] [--yes]");
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("interactive TUI");
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("focused workflows");
+    expect(PLUGIN_INVENTORY_SLASH_USAGE).toContain("standalone commands");
     expect(PLUGIN_INVENTORY_SLASH_USAGE).not.toContain("evil");
-    expect(PLUGIN_INVENTORY_ARGV_USAGE).not.toContain("remove");
   });
 
   it("treats argv as exact tokens and slash whitespace as spaces or tabs only", () => {
@@ -159,6 +184,39 @@ describe("plugin inventory shared display safety", () => {
 });
 
 describe("plugin inventory deterministic text", () => {
+  it("keeps every constructor-captured manifest/runtime axis while repeated durable replacements advance", () => {
+    const loadedManifest = { origin: "selected-manifest" as const, kind: "workflows" as const, count: 1, countSemantics: "selected-manifest-declarations" as const, declaration: "shape" as const, capabilityId: "feature.plugins-other-components", supportTier: "not-supported" as const, executionRisk: "unsupported-runtime" as const };
+    const loadedRuntime = { origin: "final-runtime" as const, kind: "agents" as const, count: 1, countSemantics: "finalized-registrations" as const, posture: "final-loaded" as const, capabilityId: "feature.plugins-agents", supportTier: "partial" as const, executionRisk: "code" as const };
+    const loadedDependency = { origin: "selected-manifest" as const, targetIdentity: "dep-v1@market", posture: "selected-manifest-observed-not-resolved", crossMarketplace: "same-marketplace", provenance: { source: { kind: "plugin-cache" as const, display: "<plugin-cache>/v1/plugin.json" } } };
+    const selectedInstallation = { scope: "user", version: "1", root: { kind: "plugin-cache" as const, display: "<plugin-cache>/v1" }, data: { kind: "plugin-data" as const, display: "<plugin-data>/old" }, provenance: { state: { kind: "claude-user" as const, display: "<claude-user>/state" }, stateVersion: 2 } };
+    const loaded = snapshot([item("old@market", { manifestNamespace: "namespace-v1", metadata: { manifestName: "manifest-v1", version: "1", keywords: [], components: [] }, selectedInstallation, outcome: { status: "loaded", sharedStateCauses: ["runtime-v1"] }, dependencies: [loadedDependency], components: [loadedManifest, loadedRuntime], executionRisk: ["unsupported-runtime", "code"], lifecycle: { ownership: "picc-owned", availableActions: ["update"], installed: true, effectiveEnabled: true, loaded: true, dependency: { state: "satisfied" }, pendingReload: false, retainedErrors: [] } })], { loadedGenerationId: "loaded-generation" });
+    const replacement = (revision: string, generationId: string, enabled: boolean) => snapshot([item("old@market", { manifestNamespace: `namespace-${revision}`, metadata: { manifestName: `manifest-${revision}`, version: revision, keywords: [], components: [] }, selectedInstallation: { ...selectedInstallation, version: revision }, outcome: { status: "rejected", sharedStateCauses: [`runtime-${revision}`] }, dependencies: [{ ...loadedDependency, targetIdentity: `dep-${revision}@market` }], components: [{ ...loadedManifest, count: 99 }, { ...loadedRuntime, count: 99 }], lifecycle: { ownership: "picc-owned", availableActions: [enabled ? "disable" : "enable"], mutableRecordKey: "project-checkout", selectedScope: "project", installed: true, declared: true, effectiveEnabled: enabled, loaded: false, trusted: true, immutableRevision: revision, dependency: { state: "satisfied" }, pendingReload: false, retainedErrors: [] } })], { loadedGenerationId: generationId, durableDesired: { generationId, pluginIdentities: ["old@market"], marketplaceNames: [], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } });
+    const model = new PluginInventoryModel(loaded); model.setView(1); model.replaceDurableDesired(replacement("v2", "desired-v2", true));
+    model.setActionOverlay({ operationId: "plugin_action", phase: "reload-unconfirmed", target: "new@market", message: "Activation is unconfirmed; start a new PiCC session", recoveryCommand: "picc plugin recover plugin_action", updatedAt: "2026-01-02T00:00:00Z" });
+    const first = model.view(); const firstItem = first.durableDesired.find("old@market")!;
+    expect(first.loadedSnapshot).toBe(loaded); expect(first.durableDesired).toMatchObject({ loadedGenerationId: "loaded-generation", durableDesired: { generationId: "desired-v2" } });
+    expect(firstItem).toMatchObject({ manifestNamespace: "namespace-v1", metadata: { manifestName: "manifest-v1" }, selectedInstallation: { version: "1" }, outcome: { status: "loaded", sharedStateCauses: ["runtime-v1"] }, dependencies: [{ targetIdentity: "dep-v1@market" }], lifecycle: { loaded: true, pendingReload: true, immutableRevision: "v2" } });
+    expect(firstItem.components).toEqual([expect.objectContaining({ origin: "selected-manifest", count: 1 }), expect.objectContaining({ origin: "final-runtime", count: 1 })]); expect(firstItem.executionRisk).toEqual(["code", "unsupported-runtime"]);
+    model.replaceDurableDesired(replacement("v3", "desired-v3", false)); const second = model.view().durableDesired.find("old@market")!;
+    expect(second).toMatchObject({ manifestNamespace: "namespace-v1", metadata: { manifestName: "manifest-v1" }, outcome: { status: "loaded" }, lifecycle: { effectiveEnabled: false, immutableRevision: "v3", loaded: true, pendingReload: true } });
+    model.replaceDurableDesired(snapshot([], { durableDesired: { generationId: "desired-empty", pluginIdentities: [], marketplaceNames: [], pendingOperations: [], terminalOperations: [], retainedErrors: [], omissions: {} } }));
+    expect(model.view().durableDesired).toMatchObject({ loadedGenerationId: "loaded-generation", durableDesired: { generationId: "desired-empty" } }); expect(model.view().durableDesired.find("old@market")).toMatchObject({ manifestNamespace: "namespace-v1", outcome: { status: "loaded" }, lifecycle: { installed: false, loaded: true, pendingReload: true } });
+    expect(first.actionOverlay).toMatchObject({ phase: "reload-unconfirmed", target: "new@market" }); expect(Object.isFrozen(first.actionOverlay)).toBe(true);
+  });
+
+  it("renders lifecycle ownership, mutable target, desired-versus-loaded, dependencies, recovery, and retained failures", () => {
+    const plugin = item("owned@market", { lifecycle: { ownership: "claude-imported-readonly", availableActions: [], mutableRecordKey: "project-checkout", selectedScope: "project", installed: true, declared: true, effectiveEnabled: true, loaded: false, trusted: false, immutableRevision: "2.0.0", integrity: `sha256:${"c".repeat(64)}`, root: { kind: "plugin-cache", display: "<plugin-cache>/market/owned/2.0.0" }, defaultEnablementSource: "explicit-setting", dependency: { state: "blocked", reason: "Dependency admission blocked activation" }, readOnlyReason: "Claude-owned installation; use Claude Code to mutate it", pendingStep: "update; 1 committed step", recoveryCategory: "complete-or-rollback", recoveryCommand: "picc plugin recover plugin_pending", lifecycleOperations: [{ operationId: "plugin_pending", status: "pending", semanticStep: "update; 1 committed step", target: "owned@market", recoveryCommand: "picc plugin recover plugin_pending", category: "complete-or-rollback" }], pendingReload: true, retainedErrors: ["Candidate validation failed safely"] } });
+    const rendered = renderPluginInventoryDetails(snapshot([plugin]), "owned@market");
+    expect(rendered).toContain("owner=claude-imported-readonly; desired-installed=yes; declared=yes; effective=yes; loaded=no; reload=pending");
+    expect(rendered).toContain("mutable-record=project-checkout; selected-scope=project; marketplace-owner=unknown; trusted=no");
+    expect(rendered).toContain("Lifecycle eligibility: none (read-only or unavailable)");
+    expect(rendered).toContain("Dependency posture: blocked; reason=Dependency admission blocked activation");
+    expect(rendered).toContain("read-only; Claude-owned installation; use Claude Code to mutate it");
+    expect(rendered).toContain("recovery-command=picc plugin recover plugin_pending");
+    expect(rendered).toContain("operation=plugin_pending; status=pending; step=update; 1 committed step");
+    expect(rendered).toContain("category=complete-or-rollback; target=owned@market; recovery=picc plugin recover plugin_pending");
+    expect(rendered).toContain("Candidate validation failed safely");
+  });
   it("lists qualified identities in snapshot order while keeping every state axis independent", () => {
     const state = snapshot([
       item("same@one", { installations: [{ scope: "user", version: "1", validity: "valid", selected: true, diagnostics: [], problems: [] }], enablement: { enabled: false, scope: "user", source: { kind: "claude-user", display: "<claude-user>/settings.json" } }, outcome: { status: "disabled", sharedStateCauses: [] } }),
@@ -166,12 +224,12 @@ describe("plugin inventory deterministic text", () => {
       item("loaded@market", { installations: [{ validity: "valid", selected: true, diagnostics: [], problems: [] }, { validity: "invalid", selected: false, diagnostics: [], problems: ["bad"] }], outcome: { status: "loaded", sharedStateCauses: [] } }),
     ]);
     const rendered = renderPluginInventoryList(state);
-    expect(rendered).toContain("Plugin: same@one\n  installed: 1 valid\n  enabled: no\n  runtime: disabled\n  catalog: not known");
-    expect(rendered).toContain("Plugin: same@two\n  installed: none\n  enabled: yes\n  runtime: enabled-but-uninstalled\n  catalog: known");
-    expect(rendered).toContain("Plugin: loaded@market\n  installed: 1 valid, 1 invalid\n  enabled: not declared\n  runtime: loaded\n  catalog: not known");
+    expect(rendered).toContain("Plugin: same@one\n  installed: 1 valid\n  enabled: no\n  runtime: disabled\n  lifecycle: not projected\n  catalog: not known");
+    expect(rendered).toContain("Plugin: same@two\n  installed: none\n  enabled: yes\n  runtime: enabled-but-uninstalled\n  lifecycle: not projected\n  catalog: known");
+    expect(rendered).toContain("Plugin: loaded@market\n  installed: 1 valid, 1 invalid\n  enabled: not declared\n  runtime: loaded\n  lifecycle: not projected\n  catalog: not known");
     expect(rendered.indexOf("same@two")).toBeLessThan(rendered.indexOf("same@one"));
     expect(rendered.indexOf("loaded@market")).toBeLessThan(rendered.indexOf("same@one"));
-    expect(rendered).toContain("captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh");
+    expect(rendered).toContain("captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh");
     expect(renderPluginInventoryList(snapshot([], { lifetime: "command" }))).toContain("captured for this command; rerun this command to refresh");
   });
 
@@ -370,6 +428,28 @@ describe("plugin inventory deterministic text", () => {
 });
 
 describe("plugin inventory startup and doctor projections", () => {
+  it("keeps unattributed lifecycle failures globally discoverable and categorized", () => {
+    const state = snapshot([], { durableDesired: { generationId: "desired", pluginIdentities: [], marketplaceNames: [], pendingOperations: [{ operationId: "unattributed-pending", status: "pending", semanticStep: "refresh; 2 committed steps", recoveryCommand: "picc plugin recover unattributed-pending", category: "complete-or-rollback" }], terminalOperations: [{ operationId: "unattributed-failed", outcome: "failed-before-commit", semanticStep: "remove; failed-before-commit", recoveryCommand: "picc plugin recover unattributed-failed", category: "inspect" }], retainedErrors: [], omissions: {} } });
+    const startup = projectPluginInventoryStartup(state); expect(startup.text).toContain("Lifecycle operation unattributed-pending needs attention: step=refresh; 2 committed steps; category=complete-or-rollback; target=not attributed; recovery=picc plugin recover unattributed-pending"); expect(startup.text).toContain("unattributed-failed");
+    const doctor = projectPluginInventoryDoctor(state);
+    expect(doctor.diagnostics).toContainEqual(expect.objectContaining({ global: true, category: "lifecycle", operationId: "unattributed-pending", semanticStep: "refresh; 2 committed steps", recoveryCategory: "complete-or-rollback", nextCommand: "picc plugin recover unattributed-pending" }));
+    expect(doctor.diagnostics).toContainEqual(expect.objectContaining({ global: true, category: "lifecycle", operationId: "unattributed-failed", semanticStep: "remove; failed-before-commit", recoveryCategory: "inspect", nextCommand: "picc plugin recover unattributed-failed" }));
+  });
+
+  it("keeps distinct unattributed lifecycle recovery identities with the same status and step", () => {
+    const state = snapshot([], { durableDesired: { generationId: "desired", pluginIdentities: [], marketplaceNames: [], pendingOperations: [
+      { operationId: "plugin-install-one", status: "pending", semanticStep: "publish; 1 committed step", target: "one@market", recoveryCommand: "picc plugin recover plugin-install-one", category: "complete-or-rollback" },
+      { operationId: "marketplace-refresh-two", status: "pending", semanticStep: "publish; 1 committed step", target: "market-two", recoveryCommand: "picc plugin recover marketplace-refresh-two", category: "inspect" },
+    ], terminalOperations: [], retainedErrors: [], omissions: {} } });
+
+    const lifecycle = projectPluginInventoryDoctor(state).diagnostics.map(({ global, category, operationId, semanticStep, target, recoveryCategory, nextCommand }) =>
+      ({ global, category, operationId, semanticStep, target, recoveryCategory, nextCommand }));
+    expect(lifecycle).toEqual([
+      { global: true, category: "lifecycle", operationId: "plugin-install-one", semanticStep: "publish; 1 committed step", target: "one@market", recoveryCategory: "complete-or-rollback", nextCommand: "picc plugin recover plugin-install-one" },
+      { global: true, category: "lifecycle", operationId: "marketplace-refresh-two", semanticStep: "publish; 1 committed step", target: "market-two", recoveryCategory: "inspect", nextCommand: "picc plugin recover marketplace-refresh-two" },
+    ]);
+  });
+
   it.each(Object.entries(STATUS_EXPECTATIONS) as [PluginResolutionStatus, boolean][])("classifies %s consistently for startup and doctor", (status, needsAttention) => {
     const state = snapshot([item("status@market", { outcome: { status, sharedStateCauses: [] } })]);
     const startup = projectPluginInventoryStartup(state);
@@ -400,12 +480,12 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.qualifiedIdentities).toContain("same@m1");
     expect(projection.omissions).toEqual({ identities: 2, managedPolicyEvidence: 0, captureEvidence: [] });
     expect(projection.managedPolicyEvidence).toEqual([
-      { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
-      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" },
+      { category: "managed-policy-malformed", condition: "malformed", sourceClass: "system-file", sourceLabel: "system policy file", impact: "source-ignored", guidance: "Ask an administrator to correct the policy format", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" },
+      { category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" },
     ]);
     expect(projection.text).toContain("Run /doctor for details");
-    expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
-    expect(projection.text).toContain("system policy drop-in was unreadable; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run canonical /reload in the interactive TUI, or exit and relaunch PiCC.");
+    expect(projection.text).toContain("system policy file was malformed; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct the policy format, then run /reload-plugins in the interactive TUI, or start a new PiCC session.");
+    expect(projection.text).toContain("system policy drop-in was unreadable; the administrator source was ignored and plugin enablement may differ. Ask an administrator to correct access to the policy source, then run /reload-plugins in the interactive TUI, or start a new PiCC session.");
     expect(projection.text).not.toContain("captured for this session");
     expect(projection.text).not.toContain("raw administrator path");
   });
@@ -433,7 +513,7 @@ describe("plugin inventory startup and doctor projections", () => {
     expect(projection.counts).toEqual({ known: 2, installed: 1, enabled: 2, loaded: 1, cataloged: 1, attention: 1 });
     expect(projection.diagnostics).toContainEqual(expect.objectContaining({ qualifiedIdentity: "same@two", status: "blocked" }));
     expect(projection.capabilityEvidence).toEqual([{ capabilityId: "feature.plugins-agents", qualifiedIdentity: "same@one", component: "agents", observation: "Plugin agent field hooks was stripped before runtime construction" }]);
-    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run canonical /reload in the interactive TUI, or exit and relaunch PiCC" }]);
+    expect(projection.managedPolicyEvidence).toEqual([{ category: "managed-policy-unreadable", condition: "unreadable", sourceClass: "system-drop-in", sourceLabel: "system policy drop-in", impact: "source-ignored", guidance: "Ask an administrator to correct access to the policy source", refreshGuidance: "run /reload-plugins in the interactive TUI, or start a new PiCC session" }]);
     expect(projection.snapshotBoundary).toContain("captured for this session");
   });
 
@@ -450,7 +530,7 @@ describe("plugin inventory startup and doctor projections", () => {
     const doctor = projectPluginInventoryDoctor(snapshot([], { diagnostics }));
     expect(doctor.managedPolicyEvidence).toHaveLength(3);
     for (const [sourceClass, sourceLabel, actor] of sources) {
-      expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact: "source-ignored", guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("canonical /reload") }));
+      expect(doctor.managedPolicyEvidence).toContainEqual(expect.objectContaining({ sourceClass, sourceLabel, impact: "source-ignored", guidance: expect.stringContaining(actor), refreshGuidance: expect.stringContaining("/reload-plugins") }));
     }
     expect(JSON.stringify(doctor)).not.toMatch(/C:\/RAW/u);
 
@@ -489,7 +569,7 @@ describe("plugin inventory startup and doctor projections", () => {
       message: "repair this declaration",
       nextCommand: "/plugin details p@market",
       repairBoundary: expect.stringContaining("read-only"),
-      refreshGuidance: expect.stringContaining("canonical /reload"),
+      refreshGuidance: expect.stringContaining("/reload-plugins"),
     })]);
     expect(projection.omitted.diagnostics.projection).toBe(0);
   });

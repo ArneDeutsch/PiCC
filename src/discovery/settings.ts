@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { MCP_POLICY_LIMITS } from "../engine/mcp-policy.js";
 import { expandEnvVars as expandEnvVarsShared } from "../util/expand-env.js";
+import { projectIdentities } from "../util/project-identity.js";
 import {
   isDocumentedMarketplaceName,
   normalizeMarketplacePolicyDescriptor,
@@ -1128,14 +1129,22 @@ export function loadSettings(opts: LoadSettingsOptions): LoadedClaudeSettings {
   const settings = createDefaultSettings();
 
   // Ascending precedence: later files win on scalar conflicts. Project scope
-  // walks repo root → cwd so nested/monorepo .claude/settings.json files load
-  // too, nearest directory last (highest of the project layers).
+  // walks repo root → cwd so nested/monorepo settings load too. A reciprocally
+  // verified linked worktree additionally consumes the main checkout's shared
+  // local settings after legacy active/nested local files.
   const files: Array<{ path: string; scope: Scope }> = [
     { path: path.join(opts.userDir, "settings.json"), scope: "user" },
   ];
-  for (const dir of settingsDirChain(opts.cwd, opts.projectRoot)) {
+  const chain = settingsDirChain(opts.cwd, opts.projectRoot);
+  for (const dir of chain) {
     files.push({ path: path.join(dir, ".claude", "settings.json"), scope: "project" });
     files.push({ path: path.join(dir, ".claude", "settings.local.json"), scope: "local" });
+  }
+  const identities = projectIdentities(opts.projectRoot);
+  const mainCheckout = identities.length > 1 ? identities[0] : undefined;
+  if (mainCheckout !== undefined) {
+    const sharedLocal = path.join(mainCheckout, ".claude", "settings.local.json");
+    if (!files.some((file) => samePath(file.path, sharedLocal))) files.push({ path: sharedLocal, scope: "local" });
   }
 
   let nextMcpPolicyOrder = 0;

@@ -141,7 +141,8 @@ const PLUGIN_SHARED_STATE_ORDER = [
   "blocklist-malformed",
 ] as const satisfies readonly PluginSharedStateCause[];
 const CANONICAL_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
-const PLUGIN_REFRESH_ACTION = CANONICAL_REFRESH_ACTION;
+const PLUGIN_REFRESH_ACTION = "run /reload-plugins in the interactive TUI or start a new PiCC session";
+const PLUGIN_OWNERSHIP_ACTION = `Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, ${PLUGIN_REFRESH_ACTION}.`;
 const PLUGIN_SHARED_STATE_DETAILS: Readonly<Record<PluginSharedStateCause, string>> = {
   "installed-state-unreadable": `Installed plugin state is unreadable; all enabled plugins were rejected and no fallback content loaded. Check access and permissions for plugins/installed_plugins.json relative to the active Claude user directory, then ${PLUGIN_REFRESH_ACTION}.`,
   "installed-state-malformed": `Installed plugin state is malformed; all enabled plugins were rejected and no fallback content loaded. Repair or regenerate plugins/installed_plugins.json through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
@@ -201,20 +202,8 @@ function pluginDiagnosticClass(diagnostics: readonly Diagnostic[]): PluginDiagno
   return diagnostics.length > 0 ? "component limitation" : undefined;
 }
 
-function rejectedPluginAction(reason: PluginDiagnosticClass | undefined): string {
-  switch (reason) {
-    case "unreadable content":
-    case "wrong component kind":
-      return `Check the applicable component declaration and installed file or directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
-    case "malformed content":
-    case "unsupported component content":
-    case "component limitation":
-      return `Repair or remove the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
-    case "path validation":
-      return `Reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
-    case undefined:
-      return `Check the installed plugin declaration and files in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
-  }
+function rejectedPluginAction(): string {
+  return PLUGIN_OWNERSHIP_ACTION;
 }
 
 function loadedPluginLimitation(
@@ -226,17 +215,17 @@ function loadedPluginLimitation(
     case "wrong component kind":
       return {
         effect: "some declared content was skipped",
-        action: `Correct the applicable component declaration, access, or installed file/directory kind in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+        action: PLUGIN_OWNERSHIP_ACTION,
       };
     case "path validation":
       return {
         effect: "some declared content was skipped",
-        action: `Reconcile or reinstall the qualified plugin through Claude Code to correct the applicable component path, then ${PLUGIN_REFRESH_ACTION}.`,
+        action: PLUGIN_OWNERSHIP_ACTION,
       };
     case "malformed content":
       return {
         effect: "some declared content was ignored",
-        action: `Correct or remove the malformed declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+        action: PLUGIN_OWNERSHIP_ACTION,
       };
     case "unsupported component content": {
       const wasStripped = diagnostics.some((item) =>
@@ -244,13 +233,13 @@ function loadedPluginLimitation(
       );
       return {
         effect: `some declared content was ${wasStripped ? "stripped" : "ignored"}`,
-        action: `Remove or replace the unsupported declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+        action: PLUGIN_OWNERSHIP_ACTION,
       };
     }
     case "component limitation":
       return {
         effect: "some declared content was degraded",
-        action: `Check and correct the applicable component declaration or content in Claude Code, then ${PLUGIN_REFRESH_ACTION}.`,
+        action: PLUGIN_OWNERSHIP_ACTION,
       };
   }
 }
@@ -262,18 +251,18 @@ function pluginOutcomeDetail(outcome: PluginResolutionOutcome): string | undefin
     case "disabled":
       return undefined;
     case "enabled-but-uninstalled":
-      return `${id}: enabled but no applicable installed record was selected; no fallback content loaded. Install the qualified plugin with Claude Code or disable its qualified setting, then ${PLUGIN_REFRESH_ACTION}.`;
+      return `${id}: enabled but no applicable installed record was selected; no fallback content loaded. ${PLUGIN_OWNERSHIP_ACTION}`;
     case "unsupported":
-      return `${id}: installed-state format is unsupported; no fallback content loaded. Check for or update to PiCC support for this format, then ${PLUGIN_REFRESH_ACTION}.`;
+      return `${id}: installed-state format is unsupported; no fallback content loaded. ${PLUGIN_OWNERSHIP_ACTION}`;
     case "ambiguous":
-      return `${id}: highest-scope installed records are ambiguous; no fallback content loaded. Reconcile or reinstall this qualified identity through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+      return `${id}: highest-scope installed records are ambiguous; no fallback content loaded. ${PLUGIN_OWNERSHIP_ACTION}`;
     case "blocked":
-      return `${id}: listed in the qualified plugin blocklist; no fallback content loaded. Review that blocklist entry and remove it only if this plugin should be allowed, then ${PLUGIN_REFRESH_ACTION}.`;
+      return `${id}: listed in the qualified plugin blocklist; no fallback content loaded. ${PLUGIN_OWNERSHIP_ACTION}`;
     case "malformed":
-      return `${id}: plugin installed-state or blocklist data is malformed; no fallback content loaded. Check those Claude Code state inputs, then ${PLUGIN_REFRESH_ACTION}.`;
+      return `${id}: plugin installed-state or blocklist data is malformed; no fallback content loaded. ${PLUGIN_OWNERSHIP_ACTION}`;
     case "rejected": {
       const reason = pluginDiagnosticClass(Array.isArray(outcome.diagnostics) ? outcome.diagnostics : []);
-      return `${id}: installed content was rejected${reason ? ` (${reason})` : ""}; no fallback content loaded. ${rejectedPluginAction(reason)}`;
+      return `${id}: installed content was rejected${reason ? ` (${reason})` : ""}; no fallback content loaded. ${rejectedPluginAction()}`;
     }
   }
 }
@@ -411,7 +400,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       const capability = lookupCapability(evidence.capabilityId);
       const component = evidence.component === undefined ? "" : ` component ${JSON.stringify(evidence.component)}`;
       const rendered = evidence.capabilityId === "agent.frontmatter.mcpServers"
-        ? `${evidence.qualifiedIdentity}${component}: plugin-agent mcpServers was removed before runtime construction. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then ${CANONICAL_REFRESH_ACTION}.`
+        ? `${evidence.qualifiedIdentity}${component}: plugin-agent mcpServers was removed before runtime construction. Define an equivalent user-scoped agent when no project change is wanted, define a project agent otherwise, or remove the field from the plugin source, then ${PLUGIN_REFRESH_ACTION}.`
         : `${evidence.qualifiedIdentity}${component}: ${evidence.observation}`;
       if (capability) addFinding(capability, rendered);
       else unassessed.push(`plugin capability ${JSON.stringify(evidence.capabilityId)} (${evidence.qualifiedIdentity})`);
@@ -419,6 +408,26 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     const policyCapability = lookupCapability("feature.managed-policy");
     if (policyCapability) for (const evidence of pluginInventory.managedPolicyEvidence) {
       addFinding(policyCapability, `${evidence.sourceLabel} was ${evidence.condition}; this source was ignored. ${evidence.guidance}, then ${evidence.refreshGuidance}.`);
+    }
+
+    const marketplacePolicyDeclarations = new Set<string>();
+    for (const observation of assembled.pluginInventory?.policyObservations ?? []) {
+      const key = observation.kind === "strict"
+        ? "strictKnownMarketplaces"
+        : observation.kind === "blocked"
+          ? "blockedMarketplaces"
+          : undefined;
+      if (key === undefined || observation.validScope !== true) continue;
+      const scope = ["user", "project", "local", "managed"].includes(observation.provenance.scope ?? "")
+        ? observation.provenance.scope
+        : "unknown";
+      marketplacePolicyDeclarations.add(`${key}\0${scope}`);
+    }
+    for (const declaration of marketplacePolicyDeclarations) {
+      const [key, scope] = declaration.split("\0");
+      if (key === undefined) continue;
+      const capability = lookupCapability(`setting.${key}`);
+      if (capability?.safetyRelevant === true) addFinding(capability, `settings key ${JSON.stringify(key)} (${scope ?? "unknown"} scope)`);
     }
   }
 
@@ -713,7 +722,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
           const alternative = field === "hooks"
             ? "Use supported plugin-level hooks, or remove this field; agent-scoped hooks are retained only for non-plugin agents."
             : field === "mcpServers"
-              ? `Move the agent to user or project scope, or remove this field; mcpServers is not retained on plugin-provided agents. Then ${CANONICAL_REFRESH_ACTION}.`
+              ? `Move the agent to user or project scope, or remove this field; mcpServers is not retained on plugin-provided agents. Then ${PLUGIN_REFRESH_ACTION}.`
               : "Use deny rules and tools gating, or remove this field; plugin agents cannot retain permissionMode.";
           addFinding(
             capability,
@@ -848,7 +857,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   }
   if (strippedAgentFindingsOmitted > 0) {
     const capability = lookupCapability("feature.plugins-agents");
-    if (capability) addFinding(capability, `${strippedAgentFindingsOmitted} additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then ${CANONICAL_REFRESH_ACTION}.`);
+    if (capability) addFinding(capability, `${strippedAgentFindingsOmitted} additional stripped plugin-agent field finding(s) omitted. Define equivalent user-scoped agents when no project change is wanted, define project agents otherwise, or remove the unsupported fields from the plugin source, then ${PLUGIN_REFRESH_ACTION}.`);
   }
 
   // --- Skills (allowed-tools + unknown frontmatter) ------------------------
@@ -1890,14 +1899,23 @@ function pluginInventoryLines(inventory: PluginInventoryDoctorProjection | undef
   ];
   const countOmissions = inventory.captureOmissions.filter((value) => /^(?:snapshot\.(?:items|installations|catalog-declarations)|loader\.installed\.records|loader\.marketplace\.entries)$/u.test(value.axis));
   if (countOmissions.length > 0) lines.push(`  Capture omissions may make these retained counts incomplete: ${countOmissions.map((value) => `${value.axis}=${value.count}`).join(", ")}.`);
-  lines.push("Captured for this session; run canonical /reload in the interactive TUI, or exit and relaunch PiCC to refresh.");
+  lines.push("Captured for this session; run /reload-plugins in the interactive TUI, or start a new PiCC session to refresh.");
   for (const diagnostic of inventory.diagnostics) {
     const owner = diagnostic.qualifiedIdentity ?? "global";
     const status = diagnostic.status === undefined ? "" : ` [${diagnostic.status}]`;
-    const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
     const repair = diagnostic.repairBoundary === undefined ? "" : ` Repair boundary: ${diagnostic.repairBoundary}.`;
     const refresh = diagnostic.refreshGuidance === undefined ? "" : ` Refresh: ${diagnostic.refreshGuidance}.`;
-    lines.push(`  - ${owner}${status}: ${diagnostic.message}.${action}${repair}${refresh}`);
+    if (diagnostic.category === "lifecycle") {
+      const operationId = diagnostic.operationId ?? "not available";
+      const semanticStep = diagnostic.semanticStep ?? "not available";
+      const recoveryCategory = diagnostic.recoveryCategory ?? "not available";
+      const target = diagnostic.target ?? "not attributed";
+      const recoveryCommand = diagnostic.nextCommand ?? "not available";
+      lines.push(`  - Lifecycle evidence — owner: ${owner}${status}; operation id: ${operationId}; semantic step: ${semanticStep}; recovery category: ${recoveryCategory}; target: ${target}; observational recovery command: ${recoveryCommand}; message: ${diagnostic.message}.${repair}${refresh}`);
+    } else {
+      const action = diagnostic.nextCommand === undefined ? "" : ` Next: ${diagnostic.nextCommand}.`;
+      lines.push(`  - Diagnostic — ${owner}${status}: ${diagnostic.message}.${action}${repair}${refresh}`);
+    }
   }
   const diagnosticOmissions = inventory.omitted.diagnostics.capture + inventory.omitted.diagnostics.projection;
   if (diagnosticOmissions > 0) lines.push(`  - ${diagnosticOmissions} additional captured diagnostic(s) omitted.`);
@@ -1942,7 +1960,7 @@ function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: 
   return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
 }
 
-const GENERIC_PLUGIN_RUNTIME_REPAIR = /(?:\s*\.?)?\s*(?:Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required|(?:Repair|Reconcile) or reinstall (?:the affected |the )?plugin (?:in|through) Claude Code, then (?:run the canonical \/reload in the interactive TUI or exit and relaunch|relaunch) PiCC)\.?(?=\s*;\s*(?:execution did not occur|no provider request was made)|\s*$)/iu;
+const GENERIC_PLUGIN_RUNTIME_REPAIR = /(?:\s*\.?)?\s*(?:Repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required|(?:Repair|Reconcile) or reinstall (?:the affected |the )?plugin (?:in|through) Claude Code, then (?:(?:run the canonical \/reload in the interactive TUI or exit and relaunch|relaunch) PiCC|run \/reload-plugins in the interactive TUI or start a new PiCC session)|Inspect exact ownership in plugin inventory; update exact PiCC-owned state with PiCC lifecycle or repair imported state through Claude Code, then run \/reload-plugins in the interactive TUI or start a new PiCC session|Inspect exact ownership with \/plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, run \/reload-plugins in the interactive TUI or start a new PiCC session)\.?(?=\s*;\s*(?:execution did not occur|no provider request was made)|\s*$)/iu;
 
 interface NormalizedPluginRuntimeFinding {
   evidence: string;
@@ -1954,7 +1972,7 @@ function normalizePluginRuntimeFinding(value: string): NormalizedPluginRuntimeFi
   const classification = withoutGenericRepair.toLowerCase();
   const recovery = /\((?:unreadable-path|wrong-kind)\)/.test(classification)
     ? "Recovery: repair plugin-data ownership, writability, and directory kinds, then retry the affected action; no reload is required."
-    : `Recovery: reconcile or reinstall the qualified plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}.`;
+    : `Recovery: ${PLUGIN_OWNERSHIP_ACTION}`;
   return { evidence: mcpStatusScalar(withoutGenericRepair, 500), recovery };
 }
 

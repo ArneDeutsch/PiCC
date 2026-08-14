@@ -45,7 +45,6 @@ function supportsLink(kind: "file" | "directory"): boolean {
 }
 
 const canLinkDirectory = supportsLink("directory");
-const canLinkFile = supportsLink("file");
 
 let root: string;
 let skillsDir: string;
@@ -477,15 +476,18 @@ describe("loadSkills", () => {
 });
 
 describe("loadPluginSkills", () => {
-  it("loads validated skill directories, root skills, and explicit command files with trusted provenance", () => {
+  it("keeps imported skill and command bodies undisclosed and activates their assembly snapshots", () => {
     const pluginRoot = path.join(root, "plugin-inputs");
-    write(
+    const selectedFile = write(
       "plugin-inputs/selected/SKILL.md",
       "---\ndescription: selected skill\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: safe-hook\n---\nSELECTED BODY",
     );
     write("plugin-inputs/SKILL.md", "---\nname: root-skill\ndescription: root skill\n---\nROOT BODY");
     write("plugin-inputs/commands/z.md", "---\ndescription: z command\n---\nZ BODY");
-    write("plugin-inputs/commands/a.md", "---\ndescription: a command\n---\nA BODY");
+    const commandFile = write(
+      "plugin-inputs/commands/a.md",
+      "---\ndescription: a command\n---\nCOMMAND BODY",
+    );
 
     const result = loadPluginSkills(
       [
@@ -505,10 +507,19 @@ describe("loadPluginSkills", () => {
       });
       expect(skill.body).toBeUndefined();
     }
-    expect(result.skills[0]!.hooks).toBeDefined();
-    expect(result.skills[0]!.source.pluginId).toBe("tools@trusted-market");
+    const selected = result.skills[0]!;
+    const command = result.skills[2]!;
+    expect(selected.hooks).toBeDefined();
+    expect(selected.source.pluginId).toBe("tools@trusted-market");
     expect(JSON.stringify(result)).not.toContain("SELECTED BODY");
-    expect(loadSkillBody(result.skills[0]!)).toBe("SELECTED BODY");
+    expect(JSON.stringify(result)).not.toContain("COMMAND BODY");
+
+    fs.writeFileSync(selectedFile, "---\ndescription: changed\n---\nMUTATED BODY", "utf8");
+    fs.unlinkSync(commandFile);
+    expect(selected.body).toBeUndefined();
+    expect(command.body).toBeUndefined();
+    expect(loadSkillBodyResult(selected)).toEqual({ body: "SELECTED BODY", diagnostics: [] });
+    expect(loadSkillBodyResult(command)).toEqual({ body: "COMMAND BODY", diagnostics: [] });
   });
 
   it("reports a direct explicit command final-read failure as terminal typed evidence", () => {
@@ -596,8 +607,9 @@ describe("loadPluginSkills", () => {
     const shallowNamespaced = { ...beta, name: "plugin:group:beta" };
     beta.source.path = path.join(root, "outside-mutation.md");
     fs.writeFileSync(betaFile, "---\ndescription: beta\n---\nfresh beta", "utf8");
-    expect(loadSkillBody(alias)).toBe("fresh beta");
-    expect(loadSkillBody(shallowNamespaced)).toBe("fresh beta");
+    expect(loadSkillBody(alias)).toBe("beta");
+    fs.unlinkSync(betaFile);
+    expect(loadSkillBody(shallowNamespaced)).toBe("beta");
     expect(new Set(result.skills.map((skill) => skill.name)).size).toBe(result.skills.length);
   });
 
@@ -720,134 +732,61 @@ describe("loadPluginSkills", () => {
     expect(result.diagnostics[0]!.message).toContain("does not match");
   });
 
-  it("reports current explicit-file failures across recovery while retaining the first diagnostic", () => {
-    const pluginRoot = path.join(root, "plugin-lazy-mutations");
-    const file = write(
-      "plugin-lazy-mutations/SKILL.md",
-      "---\ndescription: mutable\n---\nINITIAL BODY",
-    );
-    const skill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
-
-    expect(loadSkillBodyResult(skill)).toEqual({ body: "INITIAL BODY", diagnostics: [] });
-
-    fs.unlinkSync(file);
-    const unreadable = loadSkillBodyResult(skill);
-    expect(unreadable.body).toBe("");
-    expect(unreadable.failure?.code).toBe("unreadable-path");
-    expect(unreadable.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
-    expect(skill.diagnostics).toHaveLength(1);
-    expect(skill.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
-
-    fs.writeFileSync(file, "---\ndescription: mutable\n---\nRESTORED BODY", "utf8");
-    expect(loadSkillBodyResult(skill)).toEqual({ body: "RESTORED BODY", diagnostics: [] });
-
-    fs.unlinkSync(file);
-    fs.mkdirSync(file);
-    const wrongKind = loadSkillBodyResult(skill);
-    expect(wrongKind.body).toBe("");
-    expect(wrongKind.failure?.code).toBe("wrong-kind");
-    expect(wrongKind.diagnostics[0]).toBe(wrongKind.failure?.diagnostic);
-    expect(wrongKind.failure?.diagnostic).not.toEqual(unreadable.failure?.diagnostic);
-    expect(skill.diagnostics).toHaveLength(1);
-    expect(skill.diagnostics[0]).toBe(unreadable.failure?.diagnostic);
-  });
-
-  it.skipIf(!canLinkDirectory)("binds lazy capability to shared source across clones and clears cached bodies on directory retarget", () => {
+  it.skipIf(!canLinkDirectory)("shares captured Markdown across aliases and clones after a live directory retarget", () => {
     const pluginRoot = path.join(root, "plugin-retarget");
     const inside = path.join(pluginRoot, "inside");
     const outside = path.join(root, "plugin-retarget-outside");
     fs.mkdirSync(inside, { recursive: true });
     fs.mkdirSync(outside, { recursive: true });
-    const trustedFile = path.join(inside, "SKILL.md");
-    const escapedFile = path.join(outside, "SKILL.md");
-    fs.writeFileSync(trustedFile, "---\ndescription: linked\n---\nTRUSTED BODY", "utf8");
-    fs.writeFileSync(escapedFile, "---\ndescription: linked\n---\nESCAPED BODY", "utf8");
+    fs.writeFileSync(path.join(inside, "SKILL.md"), "---\ndescription: linked\n---\nTRUSTED BODY", "utf8");
+    fs.writeFileSync(path.join(outside, "SKILL.md"), "---\ndescription: linked\n---\nESCAPED BODY", "utf8");
     const selected = path.join(pluginRoot, "selected");
     fs.symlinkSync(inside, selected, process.platform === "win32" ? "junction" : "dir");
 
     const result = loadPluginSkills([pluginSource(pluginRoot, "./selected", "directory")], []);
     const skill = result.skills[0]!;
     const clone = { ...skill, name: "namespaced:linked" };
-    skill.source.path = escapedFile;
-    expect(loadSkillBody(skill)).toBe("TRUSTED BODY");
-    expect(loadSkillBody(clone)).toBe("TRUSTED BODY");
-
-    fs.writeFileSync(trustedFile, "---\ndescription: linked\n---\nFRESH BODY", "utf8");
-    expect(loadSkillBody(clone)).toBe("FRESH BODY");
+    expect(skill.body).toBeUndefined();
+    expect(clone.body).toBeUndefined();
 
     fs.unlinkSync(selected);
     fs.symlinkSync(outside, selected, process.platform === "win32" ? "junction" : "dir");
-    const failed = loadSkillBodyResult(skill);
-    expect(failed.body).toBe("");
-    expect(failed.failure?.code).toBe("path-escape");
-    expect(failed.diagnostics).toEqual([failed.failure?.diagnostic]);
-    expect(skill.body).toBeUndefined();
-    expect(clone.body).toBeUndefined();
-    const repeated = loadSkillBodyResult(clone);
-    expect(repeated.failure?.code).toBe("path-escape");
-    expect(repeated.diagnostics).toEqual([repeated.failure?.diagnostic]);
-    expect(skill.diagnostics).toHaveLength(1);
-    expect(skill.diagnostics[0]).toBe(failed.failure?.diagnostic);
+    expect(loadSkillBody(skill)).toBe("TRUSTED BODY");
+    expect(loadSkillBody(clone)).toBe("TRUSTED BODY");
+    expect(skill.diagnostics).toEqual([]);
     expect(clone.diagnostics).toBe(skill.diagnostics);
   });
 
-  it("returns a typed failure when the final plugin read is denied without changing ordinary reads", () => {
+  it("reads plugin Markdown once for assembly and never reopens it while ordinary activation stays fresh", () => {
     const pluginRoot = path.join(root, "plugin-final-read");
     const pluginFile = write("plugin-final-read/SKILL.md", "---\ndescription: plugin\n---\nPLUGIN");
     const ordinaryFile = write("ordinary-final-read/skill/SKILL.md", "---\ndescription: ordinary\n---\nORDINARY");
-    const pluginSkill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
-    const clone = { ...pluginSkill, name: "plugin:clone" };
-    expect(loadSkillBody(clone)).toBe("PLUGIN");
-    const ordinary = loadSkills(
-      [{ dir: path.join(root, "ordinary-final-read"), scope: "user" }],
-      [],
-    ).skills[0]!;
     const originalReadFileSync = fs.readFileSync;
+    let pluginReads = 0;
     const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath: unknown, ...args: unknown[]) => {
-      if (filePath === pluginFile) {
-        throw Object.assign(new Error("private EACCES detail"), { code: "EACCES" });
-      }
+      if (filePath === pluginFile) pluginReads++;
       return (originalReadFileSync as (...readArgs: unknown[]) => unknown)(filePath, ...args);
     }) as typeof fs.readFileSync);
     try {
-      const failed = loadSkillBodyResult(pluginSkill);
-      expect(failed).toMatchObject({
-        body: "",
-        failure: {
-          code: "unreadable-path",
-          diagnostic: {
-            severity: "warning",
-            message: "Plugin skill body became unreadable after path revalidation",
-            source: pluginFile,
-          },
-        },
-      });
-      expect(failed.diagnostics).toEqual([failed.failure?.diagnostic]);
-      expect(pluginSkill.body).toBeUndefined();
-      expect(clone.body).toBeUndefined();
-      expect(loadSkillBody(ordinary)).toBe("ORDINARY");
+      const pluginSkill = loadPluginSkills(
+        [pluginSource(pluginRoot, "./SKILL.md", "file")],
+        [],
+      ).skills[0]!;
+      const ordinary = loadSkills(
+        [{ dir: path.join(root, "ordinary-final-read"), scope: "user" }],
+        [],
+      ).skills[0]!;
+      expect(pluginReads).toBe(1);
+
+      fs.writeFileSync(pluginFile, "---\ndescription: changed\n---\nMUTATED", "utf8");
+      fs.writeFileSync(ordinaryFile, "---\ndescription: ordinary\n---\nFRESH ORDINARY", "utf8");
+      expect(loadSkillBodyResult(pluginSkill)).toEqual({ body: "PLUGIN", diagnostics: [] });
+      expect(pluginReads).toBe(1);
+      expect(loadSkillBody(ordinary)).toBe("FRESH ORDINARY");
       expect(ordinary.source.path).toBe(ordinaryFile);
-      expect(ordinary.diagnostics).toEqual([]);
     } finally {
       readSpy.mockRestore();
     }
-  });
-
-  it.skipIf(!canLinkFile)("fails closed when an explicit plugin skill file symlink is retargeted", () => {
-    const pluginRoot = path.join(root, "plugin-file-retarget");
-    const inside = write("plugin-file-retarget/inside.md", "---\ndescription: linked\n---\nINSIDE");
-    const outside = write("plugin-file-retarget-outside.md", "---\ndescription: linked\n---\nOUTSIDE");
-    const selected = path.join(pluginRoot, "SKILL.md");
-    fs.symlinkSync(inside, selected, "file");
-    const skill = loadPluginSkills([pluginSource(pluginRoot, "./SKILL.md", "file")], []).skills[0]!;
-    expect(loadSkillBody(skill)).toBe("INSIDE");
-
-    fs.unlinkSync(selected);
-    fs.symlinkSync(outside, selected, "file");
-    const failed = loadSkillBodyResult(skill);
-    expect(failed.body).toBe("");
-    expect(failed.failure?.code).toBe("path-escape");
-    expect(skill.body).toBeUndefined();
   });
 });
 

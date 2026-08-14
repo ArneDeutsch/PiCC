@@ -154,8 +154,10 @@ describe("qualified plugin skill activation", () => {
     });
     expect(missingCallback).toMatchObject({ ok: false });
     if (missingCallback.ok) throw new Error("expected missing callback to fail activation");
-    expect(missingCallback.message).toContain("Reconcile or reinstall the plugin through Claude Code");
-    expect(missingCallback.message).toContain("canonical /reload in the interactive TUI or exit and relaunch PiCC");
+    expect(missingCallback.message).toContain("Inspect exact ownership with /plugin details <qualified identity>");
+    expect(missingCallback.message).toContain("use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code");
+    expect(missingCallback.message).toContain("run /reload-plugins in the interactive TUI or start a new PiCC session");
+    expect(missingCallback.message).not.toContain("PiCC lifecycle");
     expect(missingCallback.message).not.toMatch(/retry|no reload/i);
     expect(findings).toContain(missingCallback.message);
 

@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
+import { createProductionPluginLifecyclePort, runPluginInventoryCli, type PluginInventoryCliOptions } from "../src/plugin-inventory-cli.js";
+import { loadClaudeProject } from "../src/project.js";
+import { PLUGIN_INVENTORY_ARGV_USAGE } from "../src/runtime/plugin-inventory-text.js";
 import {
   PI_SUITE_PACKAGES,
   canonicalPath,
@@ -16,6 +18,12 @@ import {
   validatePiSuite,
 } from "../bin/picc-admin.mjs";
 import { collectCompilationIdentity } from "../bin/picc-runtime.mjs";
+import { createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, ownedMarketplaceScopeKey, type OwnedMarketplaceRecord } from "../src/plugin-lifecycle/admission.js";
+import { createMarketplaceMutationPreview } from "../src/plugin-lifecycle/planner.js";
+import { encodePluginStableSelector } from "../src/plugin-lifecycle/plugin-service.js";
+import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition } from "../src/plugin-lifecycle/state-store.js";
+import { projectIdentities } from "../src/util/project-identity.js";
 
 const repoRoot = path.resolve(".");
 const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
@@ -28,7 +36,7 @@ const sourcePluginStderr = `${sourceFallbackNotice}\n`;
 const tempDirs: string[] = [];
 
 function temp(prefix: string): string {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   tempDirs.push(directory);
   return directory;
 }
@@ -198,14 +206,27 @@ function inventoryFixture(): { project: string; userDir: string } {
   return { project, userDir };
 }
 
-function runPluginInProcess(
+function localLifecycleFixture(): { project: string; userDir: string; homeDir: string; marketplace: string; runtimeCanary: string } {
+  const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const marketplace = path.join(project, "marketplace"); const runtimeCanary = path.join(homeDir, "mutation-runtime-canary");
+  write(path.join(marketplace, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [{ name: "bare", source: "./plugins/bare", version: "2.0.0", defaultEnabled: false }, { name: "tool", source: "./plugins/tool", defaultEnabled: true }] }));
+  const hostileCommand = `${process.execPath} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(runtimeCanary)},'runtime')`)}`;
+  write(path.join(marketplace, "plugins", "tool", ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "1.0.0", skills: "./skills", commands: "./commands", hooks: "./hooks/hooks.json", mcpServers: "./.mcp.json" }));
+  write(path.join(marketplace, "plugins", "tool", "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: hostileCommand }] }] } }));
+  write(path.join(marketplace, "plugins", "tool", ".mcp.json"), JSON.stringify({ mcpServers: { hostile: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(runtimeCanary)},'mcp')`] } } }));
+  write(path.join(marketplace, "plugins", "tool", "skills", "hello", "SKILL.md"), "---\nname: hello\ndescription: local lifecycle proof\n---\nretained bytes\n");
+  write(path.join(marketplace, "plugins", "tool", "commands", "hostile.md"), `---\ndescription: runtime canary\n---\n!${hostileCommand}\n`);
+  write(path.join(marketplace, "plugins", "bare", "skills", "bare", "SKILL.md"), "---\nname: bare\ndescription: manifestless release proof\n---\nmanifestless bytes\n");
+  return { project, userDir, homeDir, marketplace, runtimeCanary };
+}
+
+async function runPluginInProcess(
   cwd: string,
   args: string[],
   options: PluginInventoryCliOptions,
 ) {
   const stdout: string[] = [];
   const stderr: string[] = [];
-  const code = runPluginInventoryCli(args, {
+  const code = await runPluginInventoryCli(args, {
     log: (message) => stdout.push(message),
     error: (message) => stderr.push(message),
   }, { cwd, platform: "linux", ...options });
@@ -611,7 +632,7 @@ process.exit(23);
     expect(fs.existsSync(piCanary)).toBe(false);
   });
 
-  it("routes installed and source-classified compiled plugin list/details through only the verified inventory entry", () => {
+  it("routes installed and source-classified compiled plugin commands through only the verified inventory entry", () => {
     for (const installationKind of ["installed", "source"] as const) {
       const root = makePackage({ source: installationKind === "source", withCli: false });
       installLauncher(root);
@@ -627,6 +648,7 @@ process.exit(23);
       for (const [argv, expected] of [
         [["plugin", "list"], "compiled:list:maps=true\n"],
         [["plugin", "details", "same@market"], "compiled:details:same@market:maps=true\n"],
+        [["plugin", "install", "same@market", "--yes"], "compiled:install:same@market:--yes:maps=true\n"],
       ] as const) {
         const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
           cwd: root, encoding: "utf8",
@@ -724,47 +746,406 @@ process.exit(23);
     expect(fs.existsSync(rejectedCanary)).toBe(false);
   });
 
-  it("runs command semantics and fresh snapshots in process through the shared grammar", () => {
+  it("exports one cancellable typed production lifecycle composition with lookup and fresh projection", async () => {
+    const { project, userDir } = inventoryFixture(); const env = { PICC_CLAUDE_USER_DIR: userDir };
+    const loaded = loadClaudeProject({ cwd: project, env, homeDir: path.dirname(project), pluginInventoryLifetime: "command" });
+    const composed = await createProductionPluginLifecyclePort(loaded, { cwd: project, env, homeDir: path.dirname(project), platform: "linux" });
+    expect(composed.ok).toBe(true); if (!composed.ok) return;
+    expect(composed.value.projection()).toMatchObject({ ok: true, value: { lifetime: "command" } });
+    await expect(composed.value.lookup("plugin_missing_operation")).resolves.toEqual({ ok: true, value: undefined });
+    const abort = new AbortController(); abort.abort();
+    await expect(composed.value.marketplaces.plan({ kind: "marketplace-add", name: "cancelled", sourceKind: "github", sourceValue: "owner/repo", flags: { yes: false, declarationOnly: false, scope: "user" } }, abort.signal)).resolves.toMatchObject({ ok: false, code: "cancelled" });
+  });
+
+  it("runs command semantics and fresh snapshots in process through the shared grammar", async () => {
     const { project, userDir } = inventoryFixture();
     const env = { PICC_CLAUDE_USER_DIR: userDir };
     write(path.join(userDir, "settings.json"), JSON.stringify({
       enabledPlugins: { "same@market-a": true, "same@market-b": true },
     }));
 
-    const list = runPluginInProcess(project, ["list"], { env });
+    const list = await runPluginInProcess(project, ["list"], { env });
     expect(list).toMatchObject({ code: 0, stderr: [] });
     expect(list.stdout.join("\n")).toContain("Snapshot: captured for this command");
     expect(list.stdout.join("\n")).toContain("Plugin: same@market-a");
     expect(list.stdout.join("\n")).toContain("Plugin: same@market-b");
 
-    const details = runPluginInProcess(project, ["details", "same@market-b"], { env });
+    const details = await runPluginInProcess(project, ["details", "same@market-b"], { env });
     expect(details).toMatchObject({ code: 0, stderr: [] });
     expect(details.stdout.join("\n")).toContain("Plugin: same@market-b");
     expect(details.stdout.join("\n")).not.toContain("Plugin: same@market-a");
 
     write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "later@market": true } }));
-    const later = runPluginInProcess(project, ["list"], { env });
+    const later = await runPluginInProcess(project, ["list"], { env });
     expect(later.stdout.join("\n")).toContain("Plugin: later@market");
     expect(later.stdout.join("\n")).not.toContain("Plugin: same@market-a");
 
-    for (const args of [[], ["LIST"], ["details"], ["details", "bare"], ["list", "extra"], ["details", "later@market", "extra"]]) {
-      const result = runPluginInProcess(project, args, { env });
+    let compositions = 0;
+    const invalidServices = (() => { compositions++; throw new Error("invalid grammar reached lifecycle composition"); }) as never;
+    for (const args of [[], ["LIST"], ["details"], ["details", "bare"], ["list", "extra"], ["details", "later@market", "extra"], ["update", "later@market", "--declaration-only"], ["uninstall", "later@market", "--remove-declaration", "no", "--remove-data", "no", "--declaration-only"]]) {
+      const result = await runPluginInProcess(project, args, { env, services: invalidServices });
       expect(result).toEqual({
         code: 2,
         stdout: [],
-        stderr: ["Read-only usage: picc plugin list | picc plugin details <plugin@marketplace> (example: picc plugin details formatter@official). Run picc plugin list to copy an exact qualified identity."],
+        stderr: [PLUGIN_INVENTORY_ARGV_USAGE],
       });
     }
+    expect(compositions).toBe(0);
 
-    const unknown = runPluginInProcess(project, ["details", "missing@market"], { env });
+    const unknown = await runPluginInProcess(project, ["details", "missing@market"], { env });
     expect(unknown).toEqual({
       code: 1,
       stdout: [],
-      stderr: ["PiCC plugin not found: missing@market. The bounded launcher list can omit catalog-only identities. Run `picc plugin list` to copy a listed qualified identity, or run PiCC interactively in the same project and profile and use the literal `/plugin` filter."],
+      stderr: ["PiCC plugin not found: missing@market. Run picc plugin list to copy a listed qualified identity."],
     });
   });
 
-  it("uses source-specific path-free profile errors and preserves resolver precedence", () => {
+  it("prints an operation-bound preview before noninteractive confirmation and cancels without execution", async () => {
+    const { project, userDir } = inventoryFixture();
+    const calls: string[] = [];
+    const preview = {
+      operationId: "marketplace_preview", action: "add", confirmationDigest: `sha256:${"a".repeat(64)}`,
+      registration: { name: "official", scope: "user", source: { kind: "github", repository: "owner/repo" }, profileKey: "profile-test", ownership: "picc-owned" },
+      snapshot: { snapshotId: "marketplace_exact", catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } },
+      catalog: { plugins: Array.from({ length: 33 }, (_, index) => ({ name: `tool-${index}`, supported: true, sourceKind: "npm" })), unsupportedEntries: 0, omittedEntries: 0 }, dependents: [], acknowledgement: "preserve-installations",
+      settingsEffect: { setting: "extraKnownMarketplaces", effective: true, declarationOnly: false }, participants: [{ order: 0, role: "settings", effect: "replace" }], consequences: ["Adds only the selected local registration", "Does not install plugins"],
+    } as never;
+    const services = () => ({ ok: true as const, value: {
+      marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "not-found", message: "missing" }), plan: async () => ({ ok: true as const, value: preview }), prepare: () => ({ ok: true as const, value: { preview, execute: async () => { calls.push("execute"); return { ok: true, value: { operationId: "marketplace_preview", outcome: "committed" } }; } } }), discardPreview: async () => { calls.push("discard"); return { ok: true as const, value: undefined }; } },
+      plugins: { list: () => [], details: () => ({ ok: false as const, code: "not-found", message: "missing" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), execute: async () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) },
+      recovery: { list: () => [], preview: async () => ({ ok: false as const, code: "unused", message: "unused" }), recover: async () => ({ ok: false as const, code: "unused", message: "unused" }) },
+    } });
+    const cancelled = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "github", "owner/repo"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: services as never });
+    expect(cancelled.code).toBe(2); const cancelledText = cancelled.stdout.join("\n"); expect(cancelledText.indexOf("Lifecycle planning may acquire")).toBeLessThan(cancelledText.indexOf("Operation ID: marketplace_preview")); expect(cancelledText).toContain("Final confirmation is required before lifecycle transaction execution or durable desired-state commit"); expect(cancelled.stdout.join("\n")).toContain("Operation ID: marketplace_preview"); expect(cancelled.stdout.join("\n")).toContain("display-anchor=opaque-sha256:"); expect(cancelled.stdout.join("\n")).toContain("repository=owner/repo"); expect(cancelled.stdout.join("\n")).toContain("Plugin tool-32 uses source kind npm"); expect(cancelled.stdout.join("\n")).not.toContain("not shown"); expect(cancelled.stderr.join("\n")).toContain("confirmation is unavailable on noninteractive input"); expect(calls).toEqual(["discard"]);
+    const mutablePreview = preview as unknown as { registration: { source: unknown } };
+    mutablePreview.registration.source = { kind: "https-catalog", url: "https://catalog.example:8443/alice:token@vault/%50ATHCANARY/catalog.json?QUERYCANARY=PRIVATECANARY#FRAGMENTCANARY" }; const httpsPreview = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "github", "owner/repo"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: services as never }); const httpsText = httpsPreview.stdout.join("\n"); expect(httpsText).toContain("host=catalog.example:8443; remote-identity=opaque-sha256:"); for (const excluded of ["alice", "token", "vault", "%50ATHCANARY", "PATHCANARY", "catalog.json", "QUERYCANARY", "PRIVATECANARY", "FRAGMENTCANARY"]) expect(httpsText).not.toContain(excluded);
+    const privateRoot = path.join(path.dirname(project), "private-parent"); const localSource = path.join(privateRoot, "catalog.json"); mutablePreview.registration.source = { kind: "local-catalog-file", path: localSource }; const localPreview = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "github", "owner/repo"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: services as never }); const localText = localPreview.stdout.join("\n"); expect(localText).toContain("local-name=catalog.json"); expect(localText).not.toContain(privateRoot); expect(localText).toContain("display-anchor=opaque-sha256:");
+    mutablePreview.registration.source = { kind: "github", repository: "owner/repo" };
+    const userCancelled = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "github", "owner/repo"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: true, confirm: async () => false, services: services as never });
+    expect(userCancelled.stderr.join("\n")).toContain("cancelled by the user"); expect(calls).toEqual(["discard", "discard", "discard", "discard"]);
+    const committed = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "github", "owner/repo", "--yes"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: services as never });
+    expect(committed.code).toBe(0); expect(committed.stdout.join("\n")).toContain("No installed plugin code or loaded session changed"); expect(calls).toEqual(["discard", "discard", "discard", "discard", "execute"]);
+    let writes = 0; const fallback: string[] = []; const outputFailure = await runPluginInventoryCli(["marketplace", "add", "official", "--source", "github", "owner/repo", "--yes"], { log: () => { writes++; if (writes === 3) throw new Error("receipt output failed"); }, error: (message) => fallback.push(message) }, { cwd: project, platform: "linux", env: { PICC_CLAUDE_USER_DIR: userDir }, services: services as never });
+    expect(outputFailure).toBe(0); expect(fallback).toEqual(["Operation ID: marketplace_preview. Result output failed; run picc plugin recover marketplace_preview."]);
+    let plannedAfterNoticeFailure = 0; const noticeFailureServices = () => { const value = services().value; return { ok: true as const, value: { ...value, marketplaces: { ...value.marketplaces, plan: async () => { plannedAfterNoticeFailure++; return { ok: true as const, value: preview }; } } } }; }; const noticeErrors: string[] = []; const noticeFailure = await runPluginInventoryCli(["marketplace", "add", "official", "--source", "github", "owner/repo", "--yes"], { log: () => { throw new Error("notice output failed"); }, error: (message) => noticeErrors.push(message) }, { cwd: project, platform: "linux", env: { PICC_CLAUDE_USER_DIR: userDir }, services: noticeFailureServices as never }); expect(noticeFailure).toBe(1); expect(plannedAfterNoticeFailure).toBe(0); expect(noticeErrors).toEqual(["Lifecycle planning notice could not be presented; planning did not start."]);
+    const noticeCases: readonly [readonly string[], boolean][] = [
+      [["marketplace", "add", "official", "--source", "github", "owner/repo", "--yes"], true], [["marketplace", "refresh", "official", "--yes"], true], [["marketplace", "remove", "official", "--preserve-installed", "yes", "--yes"], false],
+      [["install", "tool@official", "--yes"], true], [["update", "tool@official", "--yes"], true], [["enable", "tool@official", "--yes"], false], [["disable", "tool@official", "--yes"], false], [["uninstall", "tool@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"], false],
+    ];
+    for (const [args, expectedNotice] of noticeCases) { const output: string[] = []; const refusingServices = () => { const value = services().value; const refusal = async () => ({ ok: false as const, code: "planned", message: "stop after notice" }); return { ok: true as const, value: { ...value, marketplaces: { ...value.marketplaces, plan: refusal }, plugins: { ...value.plugins, plan: refusal } } }; }; await runPluginInventoryCli(args, { log: (message) => output.push(message), error: () => {} }, { cwd: project, platform: "linux", env: { PICC_CLAUDE_USER_DIR: userDir }, services: refusingServices as never }); expect(output.some((message) => message.includes("Lifecycle planning may acquire")), args.join(" ")).toBe(expectedNotice); }
+    const digestOnly = `sha256:${"9".repeat(64)}`; const existingPreview = { operationId: "plugin_existing_preview", action: "enable", pluginId: "tool@official", scope: "user", mutableRecordKey: "record", profileKey: "profile", source: { kind: "zip", marketplaceName: "official", marketplaceSnapshotId: "marketplace-exact", catalogDigest: `sha256:${"8".repeat(64)}`, url: "https://archive.example/OPAQUE_PATH/plugin.zip", zipDigest: `sha256:${"7".repeat(64)}` }, immutableRevision: `sha256:${"7".repeat(64)}`, artifactDigest: `sha256:${"6".repeat(64)}`, treeDigest: `sha256:${"5".repeat(64)}`, rootDigest: `sha256:${"4".repeat(64)}`, executableDigest: digestOnly, dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, trust: { target: "tool@official", artifactDigest: `sha256:${"6".repeat(64)}`, rootDigest: `sha256:${"4".repeat(64)}`, executableDigest: digestOnly }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["Changes settings only"], confirmationDigest: `sha256:${"3".repeat(64)}` } as never; const existingServices = () => { const value = services().value; return { ok: true as const, value: { ...value, plugins: { ...value.plugins, plan: async () => ({ ok: true as const, value: existingPreview }) } } }; }; const existing = await runPluginInProcess(project, ["enable", "tool@official"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: existingServices as never }); const existingText = existing.stdout.join("\n"); expect(existing.code).toBe(2); expect(existingText).not.toContain("Lifecycle planning may acquire"); expect(existingText).toContain(`unchanged admitted executable content; digest=${digestOnly}`); expect(existingText).toContain("host=archive.example; remote-identity=opaque-sha256:"); expect(existingText).not.toContain("OPAQUE_PATH");
+  });
+
+  it("fails closed across marketplace and plugin preview output, cleanup, preparation, and confirmation failures", async () => {
+    const { project, userDir } = inventoryFixture(); const env = { PICC_CLAUDE_USER_DIR: userDir };
+    const marketplacePreview = { operationId: "marketplace_matrix", action: "add", confirmationDigest: `sha256:${"a".repeat(64)}`, registration: { name: "official", scope: "user", source: { kind: "github", repository: "owner/repo" }, profileKey: "profile-test", ownership: "picc-owned" }, snapshot: { snapshotId: "marketplace_exact", catalogDigest: `sha256:${"b".repeat(64)}`, trust: { targetDigest: `sha256:${"c".repeat(64)}` } }, catalog: { plugins: [], unsupportedEntries: 0, omittedEntries: 0 }, dependents: [], acknowledgement: "preserve-installations", settingsEffect: { setting: "extraKnownMarketplaces", effective: true, declarationOnly: false }, participants: [], consequences: ["change"] } as never;
+    const pluginPreview = { operationId: "plugin_matrix", action: "enable", pluginId: "tool@official", scope: "user", confirmationDigest: `sha256:${"a".repeat(64)}`, dependencies: { selected: { pluginId: "tool@official", admitted: true, reasons: [] }, decisions: [], blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: ["change"] } as never;
+    for (const kind of ["marketplace", "plugin"] as const) {
+      let execute = 0; let discardOk = true; let prepareOk = true; const calls: string[] = [];
+      const services = () => ({ ok: true as const, value: { marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: true as const, value: marketplacePreview }), prepare: () => prepareOk ? { ok: true as const, value: { preview: marketplacePreview, execute: async () => { execute++; return { ok: true as const, value: { operationId: "marketplace_matrix", outcome: "committed" } }; } } } : { ok: false as const, code: "prepare-failed", message: "prepare failed" }, discardPreview: async () => { calls.push("discard"); return discardOk ? { ok: true as const, value: undefined } : { ok: false as const, code: "discard-failed", message: "discard failed" }; } }, plugins: { list: () => [], details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: true as const, value: pluginPreview }), execute: async () => { execute++; return { ok: true as const, value: { operationId: "plugin_matrix", outcome: "committed" } }; }, discardPreview: async () => { calls.push("discard"); return discardOk ? { ok: true as const, value: undefined } : { ok: false as const, code: "discard-failed", message: "discard failed" }; } }, recovery: { list: () => [], preview: async () => ({ ok: false as const, code: "unused", message: "unused" }), recover: async () => ({ ok: false as const, code: "unused", message: "unused" }) } } });
+      const args = kind === "marketplace" ? ["marketplace", "add", "official", "--source", "github", "owner/repo"] : ["enable", "tool@official"];
+      const previewFailingOutput = () => { let writes = 0; return { log: () => { writes++; if (kind !== "marketplace" || writes === 2) throw new Error("preview output"); }, error: (message: string) => message }; }; const errors: string[] = []; const failing = previewFailingOutput(); const outputFailure = await runPluginInventoryCli([...args, "--yes"], { log: failing.log, error: (message) => { failing.error(message); errors.push(message); } }, { cwd: project, env, services: services as never }); expect(outputFailure).toBe(1); expect(errors.join("\n")).toContain("Preview output failed"); expect(execute).toBe(0);
+      discardOk = false; const uncertainOutput: string[] = []; const uncertainFailing = previewFailingOutput(); const outputCleanupFailed = await runPluginInventoryCli([...args, "--yes"], { log: uncertainFailing.log, error: (message) => uncertainOutput.push(message) }, { cwd: project, env, services: services as never }); expect(outputCleanupFailed).toBe(1); expect(uncertainOutput.join("\n")).toContain("cleanup is uncertain"); expect(uncertainOutput.join("\n")).not.toContain("Staging was discarded"); expect(execute).toBe(0);
+      const cancelled = await runPluginInProcess(project, args, { env, stdinIsTTY: true, confirm: async () => false, services: services as never }); expect(cancelled.code).toBe(2); expect(cancelled.stderr.join("\n")).toContain("cleanup could not be confirmed"); expect(cancelled.stderr.join("\n")).not.toContain("recover"); expect(execute).toBe(0);
+      const callbackFailed = await runPluginInProcess(project, args, { env, stdinIsTTY: true, confirm: async () => { throw new Error("prompt unavailable"); }, services: services as never }); expect(callbackFailed.code).toBe(2); expect(callbackFailed.stderr.join("\n")).toContain("confirmation was unavailable"); expect(callbackFailed.stderr.join("\n")).toContain("cleanup could not be confirmed"); expect(callbackFailed.stderr.join("\n")).not.toContain("Staging was discarded"); expect(execute).toBe(0);
+      const unavailable = await runPluginInProcess(project, args, { env, stdinIsTTY: false, services: services as never }); expect(unavailable.code).toBe(2); expect(unavailable.stderr.join("\n")).toContain("cleanup could not be confirmed"); expect(unavailable.stderr.join("\n")).not.toContain("Staging was discarded"); expect(execute).toBe(0);
+      if (kind === "marketplace") { prepareOk = false; const prepareFailed = await runPluginInProcess(project, [...args, "--yes"], { env, services: services as never }); expect(prepareFailed.code).toBe(1); expect(prepareFailed.stderr.join("\n")).toContain("cleanup is uncertain"); expect(prepareFailed.stderr.join("\n")).not.toContain("Staging was discarded"); expect(execute).toBe(0); prepareOk = true; discardOk = true; (marketplacePreview as { catalog: { omittedEntries: number } }).catalog.omittedEntries = 1; const omitted = await runPluginInProcess(project, [...args, "--yes"], { env, services: services as never }); expect(omitted.code).toBe(1); expect(omitted.stderr.join("\n")).toContain("Staging was discarded; no lifecycle transaction execution or durable desired-state commit began"); expect(omitted.stdout.join("\n")).toContain("Lifecycle planning may acquire"); (marketplacePreview as { catalog: { omittedEntries: number } }).catalog.omittedEntries = 0; }
+      else { (pluginPreview as { executableComponents: string[] }).executableComponents = Array.from({ length: 1025 }, (_, index) => `commands:item:${index}`); const overflow = await runPluginInProcess(project, [...args, "--yes"], { env, services: services as never }); expect(overflow.code).toBe(1); expect(overflow.stderr.join("\n")).toContain("cleanup could not be confirmed"); expect(overflow.stderr.join("\n")).not.toContain("Staging was discarded"); expect(overflow.stdout).toEqual([]); }
+      expect(calls.length).toBe(kind === "marketplace" ? 7 : 6); expect(execute).toBe(0);
+    }
+  });
+
+  it("guards recovery preview output failure without changing pending state", async () => {
+    const { project, userDir } = inventoryFixture(); let recovered = 0; const operationId = "plugin_recovery_output"; const preview = { operationId, producerSchema: "plugin-lifecycle", producerVersion: 1, confirmationSummary: {}, confirmationDigest: `sha256:${"a".repeat(64)}`, planDigest: `sha256:${"b".repeat(64)}`, completed: 0, rolledBack: 0, remaining: 1, actions: ["rollback"] } as never;
+    const services = { marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), prepare: () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, plugins: { list: () => [], details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), execute: async () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, recovery: { list: () => [{ operationId, status: "pending" }], preview: async () => ({ ok: true as const, value: preview }), recover: async () => { recovered++; return { ok: false as const, code: "unexpected", message: "unexpected" }; } } };
+    const fallback: string[] = []; const code = await runPluginInventoryCli(["recover", operationId, "--rollback", "--yes"], { log: () => { throw new Error("recovery preview renderer"); }, error: (message) => fallback.push(message) }, { cwd: project, env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: services as never }) });
+    expect(code).toBe(1); expect(fallback).toEqual([`Operation ID: ${operationId}. Recovery preview output failed; pending state is unchanged and no recovery mutation was attempted.`]); expect(recovered).toBe(0); expect(services.recovery.list()).toHaveLength(1);
+  });
+
+  it("preserves pending operation identity when result rendering fails and reports bounded omissions exactly", async () => {
+    const { project, userDir } = inventoryFixture(); const preview = { operationId: "plugin_pending_output", action: "enable", pluginId: "tool@official", scope: "user", dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [] }, executableComponents: [], removeDeclaration: false, removeData: false, participants: [], consequences: [], confirmationDigest: `sha256:${"a".repeat(64)}` } as never;
+    const pendingServices = { marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), prepare: () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, plugins: { list: () => [], details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: true as const, value: preview }), execute: async () => ({ ok: false as const, code: "pending-recovery", message: "plugin_pending_output has durable progress" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, recovery: { list: () => Array.from({ length: 103 }, (_, index) => ({ operationId: `plugin_${index}`, status: "pending" })), preview: async () => ({ ok: false as const, code: "unused", message: "unused" }), recover: async () => ({ ok: false as const, code: "unused", message: "unused" }) } };
+    const output: string[] = []; const code = await runPluginInventoryCli(["enable", "tool@official", "--yes"], { log: (message) => output.push(message), error: () => { throw new Error("pending renderer failed"); } }, { cwd: project, platform: "linux", env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: pendingServices as never }) }); expect(code).toBe(1); expect(output.at(-1)).toContain("Operation ID: plugin_pending_output");
+    const recovery = await runPluginInProcess(project, ["recover"], { env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: pendingServices as never }) }); expect(recovery.stdout.at(-1)).toBe("Pending lifecycle operations: total=103; omitted=3. Run picc plugin recover <exact-operation-id> to inspect one exact operation.");
+    const marketplaceServices = { ...pendingServices, marketplaces: { ...pendingServices.marketplaces, listStatus: () => ({ rows: [], omitted: 7, uncertain: true }) } }; const marketplaces = await runPluginInProcess(project, ["marketplace", "list"], { env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: marketplaceServices as never }) }); expect(marketplaces.stdout).toContain("… 7 marketplace rows not shown; rerun details with an exact name.");
+  });
+
+  it("reports production pending totals as unknown when raw journal observation is uncertain", async () => {
+    const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const identities = projectIdentities(project); const locations = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } }); if (!locations.ok) throw new Error(locations.error.message); const established = await establishOwnedStateStore(locations.value, homeDir); if (!established.ok) throw new Error(established.message);
+    write(path.join(established.value.journalsRoot, "invalid journal name.json"), "{}");
+    const result = await runPluginInProcess(project, ["recover"], { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir }); expect(result.code).toBe(1); expect(result.stdout.join("\n")).toContain("exact total unknown"); expect(result.stdout.join("\n")).toContain("additional evidence may have been omitted"); expect(result.stdout.join("\n")).not.toContain("No pending lifecycle operations");
+  });
+
+  it("projects authenticated recovery authority and returns success for completion and terminal inspection", async () => {
+    const { project, userDir } = inventoryFixture(); let recovered = 0; const summary = { action: "uninstall", pluginId: "tool@official", scope: "user", source: { kind: "zip", marketplaceName: "official", marketplaceSnapshotId: "marketplace-exact", catalogDigest: `sha256:${"c".repeat(64)}`, url: "https://archive.example/RECOVERY_PATH_CANARY/plugin.zip", zipDigest: `sha256:${"d".repeat(64)}` }, immutableRevision: "revision-immutable", artifactDigest: `sha256:${"e".repeat(64)}`, treeDigest: `sha256:${"f".repeat(64)}`, rootDigest: `sha256:${"1".repeat(64)}`, executableDigest: `sha256:${"2".repeat(64)}`, trust: { target: "tool@official", artifactDigest: `sha256:${"e".repeat(64)}`, rootDigest: `sha256:${"1".repeat(64)}`, executableDigest: `sha256:${"2".repeat(64)}` }, dependencies: { selected: { admitted: true, reasons: [] }, blocking: false, graph: [], decisions: [] }, executableComponents: [], settingsEffect: { requested: null, effective: true, effectiveAfter: { present: false }, declarationOnly: false }, mutableRecordKey: "record", generationId: "generation-next", removeDeclaration: true, removeData: false, participants: [{ kind: "plugin-settings", effect: "replace" }], consequences: ["Removes the selected authentic enablement declaration"] }; const base = { operationId: "plugin_recovery", producerSchema: "plugin-lifecycle", producerVersion: 1, confirmationSummary: summary, confirmationDigest: `sha256:${"a".repeat(64)}`, planDigest: `sha256:${"b".repeat(64)}`, completed: 0, rolledBack: 0, remaining: 1 };
+    const services = (terminal = false) => ({ marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), prepare: () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, plugins: { list: () => [], details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), execute: async () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, recovery: { list: () => [], preview: async () => ({ ok: true as const, value: terminal ? { ...base, remaining: 0, actions: [], terminalOutcome: "failed-before-commit" } : { ...base, actions: ["complete"] } }), recover: async () => { recovered++; return { ok: true as const, value: { operationId: "plugin_recovery", producerSchema: "plugin-lifecycle", outcome: terminal ? "failed-before-commit" : "committed", confirmationSummary: summary } }; } } });
+    const completed = await runPluginInProcess(project, ["recover", "plugin_recovery", "--complete", "--yes"], { env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: services() as never }) }); expect(completed.code).toBe(0); const completedText = completed.stdout.join("\n"); expect(completedText).toContain("requested=declaration-removal; requested-authority-achieved=true; effective-after=absent; declaration-only=false"); expect(completedText).not.toContain("requested=null"); expect(completedText).toContain("Chosen recovery action/result: complete"); expect(completedText).toContain("host=archive.example; remote-identity=opaque-sha256:"); expect(completedText).not.toContain("RECOVERY_PATH_CANARY"); expect(completedText).toContain("revision=revision-immutable"); expect(completedText).toContain(`artifact=sha256:${"e".repeat(64)}`); expect(completedText).toContain(`tree=sha256:${"f".repeat(64)}`); expect(completedText).toContain(`root=sha256:${"1".repeat(64)}`); expect(completedText).toContain(`executable=sha256:${"2".repeat(64)}`); expect(completedText).toContain(`unchanged admitted executable content; digest=sha256:${"2".repeat(64)}`); expect(completedText).toContain("admitted=true; blocking=false"); expect(completedText).toContain("target=tool@official"); expect(completedText).toContain("remove-declaration=true; remove-data=false"); expect(completedText).toContain("Removes the selected authentic enablement declaration"); expect(completedText.match(/\/reload-plugins in the interactive TUI or start a new PiCC session/gu)).toHaveLength(2); expect(completedText).not.toMatch(/\/reload(?!-plugins)/u);
+    const terminal = await runPluginInProcess(project, ["recover", "plugin_recovery"], { env: { PICC_CLAUDE_USER_DIR: userDir }, services: () => ({ ok: true as const, value: services(true) as never }) }); expect(terminal.code).toBe(0); expect(terminal.stdout.join("\n")).toContain("Outcome: failed-before-commit"); expect(recovered).toBe(2);
+
+    const marketplaceSource = { kind: "https-catalog", url: "https://catalog.example.org/MARKETPLACE_RECOVERY_PATH_CANARY/catalog.json" } as const; const marketplaceCatalogDigest = `sha256:${"7".repeat(64)}` as const; const marketplaceSnapshotId = `marketplace-${createHash("sha256").update(`${marketplaceCatalogDigest}\0${marketplaceSource.url}`).digest("base64url")}` as `marketplace-${string}`; const marketplaceTarget = { authorityKind: "catalog-only", marketplaceName: "retired-market", snapshotId: marketplaceSnapshotId, source: marketplaceSource, catalogDigest: marketplaceCatalogDigest, executableCatalog: { marketplaceName: "retired-market", allowedCrossMarketplaceDependencies: [], declarations: [] }, provenance: { adapter: "public-https-catalog", canonicalUrl: marketplaceSource.url } } as const; const marketplaceTrust = createMarketplaceSnapshotTrustGrant(marketplaceTarget); if (!marketplaceTrust.ok) throw new Error(marketplaceTrust.message); const marketplaceSettingsPath = path.resolve("marketplace-recovery-settings.json"); const marketplaceRegistration = { ownership: "picc-owned", name: "retired-market", profileKey: "profile-test", scope: "user", source: marketplaceSource, selectedSnapshotId: marketplaceTarget.snapshotId } as const; const marketplaceSnapshot = { ownership: "picc-owned", profileKey: "profile-test", ...marketplaceTarget, trust: marketplaceTrust.value } as const; const marketplaceSettingsRegistration = { kind: "url", url: marketplaceSource.url } as const; const marketplaceSettingsEffect = { scope: "user", targetPath: marketplaceSettingsPath, setting: "extraKnownMarketplaces", key: "retired-market", requested: null, declarationBefore: { present: true, value: marketplaceSettingsRegistration, scope: "user", source: marketplaceSettingsPath }, declarationAfter: { present: false }, effectiveBefore: { present: true, value: marketplaceSettingsRegistration, scope: "user", source: marketplaceSettingsPath }, effectiveAfter: { present: false }, declarationOnly: false, effective: true } as const; const participantDigest = `sha256:${"6".repeat(64)}` as const; const marketplaceSummaryResult = createMarketplaceMutationPreview({ operationId: "marketplace_recovery", action: "remove", registration: marketplaceRegistration, snapshot: marketplaceSnapshot, catalog: { name: "retired-market", ownerName: "Recovery owner", plugins: [], unsupportedEntries: 0, omittedEntries: 0 }, settingsEffect: marketplaceSettingsEffect, stateFingerprint: `sha256:${"5".repeat(64)}`, settingsFingerprint: `sha256:${"4".repeat(64)}`, dependents: [], acknowledgement: "preserve-installations", consequences: ["Removes only the selected marketplace registration; installed plugins remain"], participants: [{ order: 0, role: "settings", target: marketplaceSettingsPath, effect: "replace", scopeKey: "settings-retired-market", stagedDigest: participantDigest, payloadDigest: participantDigest }, { order: 1, role: "registration", target: path.resolve("marketplace-recovery-registration.json"), effect: "delete", scopeKey: "registration-retired-market", stagedDigest: participantDigest, payloadDigest: participantDigest }] }, { profileKey: "profile-test", artifactsRoot: path.resolve("marketplace-recovery-artifacts") }); if (!marketplaceSummaryResult.ok) throw new Error(marketplaceSummaryResult.message); const marketplaceSummary = marketplaceSummaryResult.value; const marketplacePreview = { operationId: "marketplace_recovery", producerSchema: "marketplace-lifecycle", producerVersion: 1, confirmationSummary: marketplaceSummary, confirmationDigest: marketplaceSummary.confirmationDigest, planDigest: `sha256:${"0".repeat(64)}`, completed: 0, rolledBack: 0, remaining: 1, actions: ["complete"] } as never;
+    const marketplaceServices = services(); const marketplaceRecovery = await runPluginInProcess(project, ["recover", "marketplace_recovery", "--complete"], { env: { PICC_CLAUDE_USER_DIR: userDir }, stdinIsTTY: false, services: () => ({ ok: true as const, value: { ...marketplaceServices, recovery: { ...marketplaceServices.recovery, preview: async () => ({ ok: true as const, value: marketplacePreview }), recover: async () => { throw new Error("marketplace recovery must not execute"); } } } as never }) }); expect(marketplaceRecovery.code).toBe(2); const marketplaceText = marketplaceRecovery.stdout.join("\n"); expect(marketplaceText).toContain("kind=https-catalog; host=catalog.example.org; remote-identity=opaque-sha256:"); expect(marketplaceText).toContain(`snapshot=${marketplaceSnapshot.snapshotId}; catalog=${marketplaceCatalogDigest}; trust=${marketplaceTrust.value.targetDigest}`); expect(marketplaceText).toContain("marketplace catalog is inert; installed executable membership is unchanged"); expect(marketplaceText).toContain(`catalog trust=${marketplaceTrust.value.targetDigest}`); expect(marketplaceText).toContain("requested=declaration-removal; requested-authority-achieved=true; effective-after=absent; declaration-only=false"); expect(marketplaceText).toContain("acknowledgement=preserve-installations"); expect(marketplaceText).toContain("Removes only the selected marketplace registration; installed plugins remain"); expect(marketplaceText).not.toContain(marketplaceSource.url); expect(marketplaceText).not.toContain("MARKETPLACE_RECOVERY_PATH_CANARY");
+  });
+
+  it("rejects malformed, noncanonical, unknown, and wrong-record selectors before service mutation", async () => {
+    const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); let compositions = 0; const services = () => { compositions++; throw new Error("selector reached services"); };
+    const encoded = (value: unknown) => Buffer.from(typeof value === "string" ? value : JSON.stringify(value), "utf8").toString("base64url");
+    const foreignRoot = path.join(userDir, "plugins", "cache", "foreign", "1.0.0"); write(path.join(foreignRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "foreign", version: "1.0.0" })); write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "foreign@official": [{ scope: "user", installPath: foreignRoot, version: "1.0.0" }] } }));
+    const marketplaceRoot = path.join(project, "foreign-marketplace"); write(path.join(marketplaceRoot, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "foreign-market", owner: { name: "Foreign" }, plugins: [] })); write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ "foreign-market": { source: { source: "directory", path: marketplaceRoot } } }));
+    const cases = [
+      ["marketplace", "refresh", "official", "--selector", "eA", "--yes"],
+      ["marketplace", "remove", "official", "--selector", encoded(`marketplace-${"a".repeat(64)}`), "--preserve-installed", "yes", "--yes"],
+      ["enable", "tool@official", "--selector", encoded({ pluginId: "other@official", owner: "picc-owned", scope: "user" }), "--yes"],
+      ["enable", "tool@official", "--selector", encodePluginStableSelector({ pluginId: "tool@official", owner: "picc-owned", scope: "user" }), "--yes"],
+      ["enable", "foreign@official", "--selector", encodePluginStableSelector({ pluginId: "foreign@official", owner: "picc-owned", scope: "local" }), "--yes"],
+      ["marketplace", "refresh", "foreign-market", "--selector", encoded(`marketplace-${"b".repeat(64)}`), "--yes"],
+    ];
+    for (const args of cases) { const result = await runPluginInProcess(project, args, { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: services as never }); expect(result.code).toBe(2); expect(result.stderr.join("\n")).toContain("invalid-selector"); expect(result.stderr.join("\n")).not.toContain("readonly"); }
+    expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+  });
+
+  it("refuses plugin mutations when imported ownership evidence is malformed or omitted", async () => {
+    for (const fixture of ["malformed", "overflow", "omission"] as const) {
+      const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const installedFile = path.join(userDir, "plugins", "installed_plugins.json");
+      if (fixture === "malformed") write(installedFile, "{ malformed");
+      else if (fixture === "overflow") write(installedFile, JSON.stringify({ version: 2, plugins: Object.fromEntries(Array.from({ length: 1025 }, (_, index) => [`plugin-${index}@official`, [{ scope: "user", installPath: path.join(userDir, "cache"), version: "1.0.0" }]])) }));
+      else write(installedFile, JSON.stringify({ version: 2, plugins: { [`${"a".repeat(300)}@official`]: [{ scope: "user", installPath: path.join(userDir, "cache"), version: "1.0.0" }] } }));
+      let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("uncertain plugin ownership reached composition"); }) as never };
+      const malformedSelector = await runPluginInProcess(project, ["enable", "target@official", "--selector", "eA", "--yes"], options); expect(malformedSelector.code).toBe(2); expect(malformedSelector.stderr.join("\n")).toContain("invalid-selector");
+      const validSelector = encodePluginStableSelector({ pluginId: "target@official", owner: "picc-owned", scope: "user" });
+      const selectedUncertain = await runPluginInProcess(project, ["enable", "target@official", "--selector", validSelector, "--yes"], options); const selectedUncertainError = selectedUncertain.stderr.join("\n"); expect(selectedUncertain.code).toBe(1); expect(selectedUncertainError).toContain("imported-ownership-uncertain"); expect(selectedUncertainError).not.toContain("invalid-selector");
+      for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"], ["enable", "target@official", "--yes"], ["disable", "target@official", "--yes"], ["uninstall", "target@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("imported-ownership-uncertain"); expect(result.stderr.join("\n")).toContain(fixture === "omission" ? "omitted by safe bounds" : "repair the malformed state outside PiCC"); expect(result.stderr.join("\n")).toContain("passive picc plugin list or interactive /doctor"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted."); }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+    }
+  });
+
+  it("enforces fresh ownership and marketplace authority at the direct typed plan boundary", async () => {
+    const pluginFixture = inventoryFixture(); const pluginHome = path.dirname(pluginFixture.project);
+    const pluginProject = loadClaudeProject({ cwd: pluginFixture.project, env: { PICC_CLAUDE_USER_DIR: pluginFixture.userDir }, homeDir: pluginHome, pluginInventoryLifetime: "session" });
+    const pluginPort = await createProductionPluginLifecyclePort(pluginProject, { env: { PICC_CLAUDE_USER_DIR: pluginFixture.userDir }, homeDir: pluginHome }); expect(pluginPort.ok).toBe(true); write(path.join(pluginFixture.userDir, "plugins", "installed_plugins.json"), "{ malformed");
+    if (pluginPort.ok) { const result = await pluginPort.value.plugins.plan({ kind: "install", qualifiedIdentity: "target@official", flags: { yes: false, declarationOnly: false, scope: "user" } }); expect(result).toMatchObject({ ok: false, code: "imported-ownership-uncertain" }); }
+
+    const marketFixture = inventoryFixture(); const marketHome = path.dirname(marketFixture.project);
+    const marketProject = loadClaudeProject({ cwd: marketFixture.project, env: { PICC_CLAUDE_USER_DIR: marketFixture.userDir }, homeDir: marketHome, pluginInventoryLifetime: "session" });
+    const marketPort = await createProductionPluginLifecyclePort(marketProject, { env: { PICC_CLAUDE_USER_DIR: marketFixture.userDir }, homeDir: marketHome }); expect(marketPort.ok).toBe(true); write(path.join(marketFixture.userDir, "plugins", "known_marketplaces.json"), "{ malformed");
+    if (marketPort.ok) { const result = await marketPort.value.marketplaces.plan({ kind: "marketplace-add", name: "new-market", sourceKind: "local-directory", sourceValue: marketFixture.project, flags: { yes: false, declarationOnly: false, scope: "user" } }); expect(result).toMatchObject({ ok: false, code: "marketplace-ownership-uncertain" }); }
+  });
+
+  it("refuses marketplace mutations when registration ownership evidence is malformed, unreadable, or omitted", async () => {
+    for (const fixture of ["malformed", "unreadable", "overflow", "saturated"] as const) {
+      const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const registrationFile = path.join(userDir, "plugins", "known_marketplaces.json");
+      if (fixture === "malformed") write(registrationFile, "{ malformed");
+      else if (fixture === "overflow") write(registrationFile, JSON.stringify(Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`market-${index}`, { source: { source: "github", repo: `owner/repo-${index}` } }]))));
+      else write(registrationFile, JSON.stringify(Object.fromEntries(Array.from({ length: 160 }, (_, index) => [`market-${index}`, { source: { source: "github" } }]))));
+      const open = fs.openSync; if (fixture === "unreadable") fs.openSync = ((target: fs.PathLike, ...rest: unknown[]) => path.resolve(String(target)) === path.resolve(registrationFile) ? (() => { throw new Error("denied"); })() : open(target, ...(rest as [fs.OpenMode, fs.Mode?]))) as typeof fs.openSync;
+      let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("uncertain marketplace ownership reached composition"); }) as never };
+      try {
+        for (const args of [["marketplace", "list"], ["marketplace", "details", "missing-market"]]) { const result = await runPluginInProcess(project, args, { env: options.env, homeDir }); const text = `${result.stdout.join("\n")}\n${result.stderr.join("\n")}`; expect(result.code).toBe(1); expect(text).toContain("Marketplace registration or catalog-selection evidence is incomplete"); expect(text).not.toContain("No marketplaces are registered"); expect(text).not.toContain("PiCC marketplace not found"); if (args[1] === "details") expect(text).toContain("inconclusive"); }
+        for (const args of [["marketplace", "add", "official", "--source", "local-directory", project, "--yes"], ["marketplace", "refresh", "official", "--yes"], ["marketplace", "remove", "official", "--preserve-installed", "yes", "--yes"], ["install", "target@official", "--yes"], ["update", "target@official", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("marketplace-ownership-uncertain"); expect(result.stderr.join("\n")).toContain("Marketplace registration or catalog-selection evidence is incomplete"); expect(result.stderr.join("\n")).toContain("picc plugin marketplace list/details"); }
+      } finally { fs.openSync = open; }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+    }
+  });
+
+  it("blocks marketplace-dependent mutations on unreadable, malformed, or bounded settings authority before composition", async () => {
+    for (const fixture of ["malformed", "unreadable", "omitted"] as const) {
+      const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const settingsFile = path.join(project, ".claude", "settings.json");
+      if (fixture === "malformed") write(settingsFile, "{ malformed");
+      else if (fixture === "unreadable") write(settingsFile, JSON.stringify({ extraKnownMarketplaces: {} }));
+      else write(settingsFile, JSON.stringify({ extraKnownMarketplaces: Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`market-${index}`, { source: { source: "github", repo: `owner/repo-${index}` } }])) }));
+      const read = fs.readFileSync; if (fixture === "unreadable") fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => typeof target !== "number" && path.resolve(String(target)) === path.resolve(settingsFile) ? (() => { throw new Error("denied"); })() : read(target, ...(rest as []))) as typeof fs.readFileSync;
+      let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; return { ok: false as const, code: "counted", message: "composition reached" }; }) as never };
+      try {
+        for (const args of [["marketplace", "list"], ["marketplace", "details", "new-market"]]) { const result = await runPluginInProcess(project, args, { env: options.env, homeDir }); const text = `${result.stdout.join("\n")}\n${result.stderr.join("\n")}`; expect(result.code).toBe(1); expect(text).toContain("Marketplace registration or catalog-selection evidence is incomplete"); expect(text).not.toContain("No marketplaces are registered"); expect(text).not.toContain("PiCC marketplace not found"); if (args[1] === "details") expect(text).toContain("inconclusive"); }
+        for (const args of [["marketplace", "add", "new-market", "--source", "local-directory", project, "--yes"], ["marketplace", "refresh", "new-market", "--yes"], ["marketplace", "remove", "new-market", "--preserve-installed", "yes", "--yes"], ["install", "target@new-market", "--yes"], ["update", "target@new-market", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("Marketplace registration or catalog-selection evidence is incomplete"); expect(result.stderr.join("\n")).toContain("picc plugin marketplace list/details"); if (fixture !== "omitted") expect(result.stderr.join("\n")).toContain("settings authority"); }
+        const malformedSelector = await runPluginInProcess(project, ["marketplace", "refresh", "new-market", "--selector", "eA", "--yes"], options); expect(malformedSelector.code).toBe(2); expect(malformedSelector.stderr.join("\n")).toContain("invalid-selector");
+      } finally { fs.readFileSync = read; }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+    }
+  });
+
+  it("does not promote ordinary malformed or oversized catalog content to marketplace authority uncertainty", async () => {
+    for (const fixture of ["malformed", "oversized"] as const) {
+      const { project, userDir } = inventoryFixture(); const root = path.join(project, "catalog"); write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "directory", path: root } } })); write(path.join(project, ".claude", "settings.json"), JSON.stringify({ cleanupPeriodDays: "invalid" }));
+      const plugins = fixture === "malformed" ? Array.from({ length: 160 }, () => 42) : Array.from({ length: 1025 }, (_, index) => ({ name: `plugin-${index}`, source: `./plugin-${index}` })); write(path.join(root, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Fixture" }, plugins }));
+      let compositions = 0; const services = (() => { compositions++; return { ok: false as const, code: "counted", message: "composition reached" }; }) as never;
+      for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"]]) { const result = await runPluginInProcess(project, args, { env: { PICC_CLAUDE_USER_DIR: userDir }, services }); expect(result.stderr.join("\n")).toContain("composition reached"); expect(result.stderr.join("\n")).not.toContain("marketplace-ownership-uncertain"); }
+      expect(compositions).toBe(2); expect(fs.existsSync(path.join(path.dirname(project), ".picc"))).toBe(false);
+    }
+  });
+
+  it("applies marketplace uncertainty only to marketplace-dependent plugin operations", async () => {
+    const { project, userDir } = inventoryFixture(); write(path.join(project, ".claude", "settings.json"), "{ malformed"); let compositions = 0; const services = (() => { compositions++; return { ok: false as const, code: "counted", message: "composition reached" }; }) as never; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, services };
+    for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.stderr.join("\n")).toContain("marketplace-ownership-uncertain"); }
+    for (const args of [["enable", "target@official", "--yes"], ["disable", "target@official", "--yes"], ["uninstall", "target@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.stderr.join("\n")).toContain("composition reached"); expect(result.stderr.join("\n")).not.toContain("marketplace-ownership-uncertain"); }
+    expect(compositions).toBe(3);
+  });
+
+  it("gives truthful installed-state guidance for unsupported and unreadable authority", async () => {
+    for (const fixture of ["unsupported", "unreadable"] as const) {
+      const { project, userDir } = inventoryFixture(); const installedFile = path.join(userDir, "plugins", "installed_plugins.json"); write(installedFile, JSON.stringify({ version: 99, plugins: {} })); const open = fs.openSync; if (fixture === "unreadable") fs.openSync = ((target: fs.PathLike, ...rest: unknown[]) => path.resolve(String(target)) === path.resolve(installedFile) ? (() => { throw new Error("denied"); })() : open(target, ...(rest as [fs.OpenMode, fs.Mode?]))) as typeof fs.openSync;
+      let compositions = 0;
+      try { for (const args of [["install", "target@official", "--yes"], ["update", "target@official", "--yes"], ["enable", "target@official", "--yes"], ["disable", "target@official", "--yes"], ["uninstall", "target@official", "--remove-declaration", "no", "--remove-data", "no", "--yes"]]) { const result = await runPluginInProcess(project, args, { env: { PICC_CLAUDE_USER_DIR: userDir }, services: (() => { compositions++; throw new Error("composition reached"); }) as never }); const text = result.stderr.join("\n"); expect(text).toContain(fixture === "unsupported" ? "update PiCC or report the unsupported installed-plugin-state format" : "check permissions and access"); expect(text).toContain("passive picc plugin list or interactive /doctor"); expect(text).not.toContain("repair"); } } finally { fs.openSync = open; }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(path.dirname(project), ".picc"))).toBe(false);
+    }
+  });
+
+  it("uses seed-specific read-only marketplace guidance", async () => {
+    const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const seed = path.join(homeDir, "seed"); const sourceRoot = path.join(seed, "official"); write(path.join(seed, "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "directory", path: sourceRoot } } })); write(path.join(sourceRoot, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Seed" }, plugins: [] }));
+    let compositions = 0; const result = await runPluginInProcess(project, ["marketplace", "add", "official", "--source", "local-directory", sourceRoot, "--yes"], { env: { PICC_CLAUDE_USER_DIR: userDir, CLAUDE_CODE_PLUGIN_SEED_DIR: seed }, homeDir, services: (() => { compositions++; throw new Error("seed reached composition"); }) as never });
+    expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain("seed-readonly"); expect(result.stderr.join("\n")).toContain("manage it at its configured source"); expect(result.stderr.join("\n")).not.toContain("use Claude Code"); expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+  });
+
+  it("keeps copied foreign selectors passive and refuses every imported or managed target mutation before composition", async () => {
+    const pluginActions = (identity: string): string[][] => [["install", identity, "--yes"], ["enable", identity, "--yes"], ["disable", identity, "--yes"], ["update", identity, "--yes"], ["uninstall", identity, "--remove-declaration", "no", "--remove-data", "no", "--yes"]];
+    for (const scope of ["user", "managed"] as const) {
+      const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const pluginRoot = path.join(userDir, "plugins", "cache", scope, "foreign", "1.0.0");
+      write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "foreign@official": [{ scope, installPath: pluginRoot, version: "1.0.0" }] } }));
+      write(path.join(pluginRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "foreign", version: "1.0.0" })); write(path.join(project, ".claude", "settings.json"), "{ malformed");
+      let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("foreign target reached composition"); }) as never };
+      const listed = await runPluginInProcess(project, ["details", "foreign@official"], options); const selector = /selector=([A-Za-z0-9_-]+)/u.exec(listed.stdout.join("\n"))?.[1]; expect(selector).toBeDefined();
+      const copied = await runPluginInProcess(project, ["details", selector!], options); expect(copied.code).toBe(0); expect(copied.stdout.join("\n")).toContain(`owner=${scope === "managed" ? "managed" : "claude-imported-readonly"}`);
+      for (const args of pluginActions("foreign@official")) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(scope === "managed" ? "managed-readonly" : "imported-readonly"); expect(result.stderr.join("\n")).toContain("No acquisition, trust approval, staging, executable publication, settings mutation, or desired-state mutation was attempted"); }
+      const selectedActions = [["enable", "foreign@official", "--selector", selector!, "--yes"], ["disable", "foreign@official", "--selector", selector!, "--yes"], ["update", "foreign@official", "--selector", selector!, "--yes"], ["uninstall", "foreign@official", "--selector", selector!, "--remove-declaration", "no", "--remove-data", "no", "--yes"]];
+      for (const args of selectedActions) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(scope === "managed" ? "managed-readonly" : "imported-readonly"); expect(result.stderr.join("\n")).not.toContain("invalid-selector"); }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+    }
+    for (const managed of [false, true]) {
+      const { project, userDir } = inventoryFixture(); const homeDir = path.dirname(project); const marketplaceRoot = path.join(project, "foreign-marketplace"); write(path.join(marketplaceRoot, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Foreign" }, plugins: [] }));
+      if (!managed) write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "directory", path: marketplaceRoot } } })); write(path.join(project, ".claude", "settings.json"), "{ malformed");
+      const managedFile = path.join(homeDir, "managed-settings.json"); if (managed) write(managedFile, JSON.stringify({ extraKnownMarketplaces: { official: { source: { source: "directory", path: marketplaceRoot } } } }));
+      const stat = fs.statSync; const read = fs.readFileSync; if (managed) { fs.statSync = ((target: fs.PathLike, ...rest: unknown[]) => String(target).endsWith("managed-settings.json") && String(target) !== managedFile ? stat(managedFile, ...(rest as [])) : stat(target, ...(rest as []))) as typeof fs.statSync; fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => typeof target !== "number" && String(target).endsWith("managed-settings.json") && String(target) !== managedFile ? read(managedFile, ...(rest as [])) : read(target, ...(rest as []))) as typeof fs.readFileSync; }
+      let compositions = 0; const options = { env: { PICC_CLAUDE_USER_DIR: userDir }, homeDir, services: (() => { compositions++; throw new Error("foreign marketplace reached composition"); }) as never };
+      try { for (const args of [["marketplace", "add", "official", "--source", "local-directory", marketplaceRoot, "--yes"], ["marketplace", "refresh", "official", "--yes"], ["marketplace", "remove", "official", "--preserve-installed", "yes", "--yes"]]) { const result = await runPluginInProcess(project, args, options); expect(result.code).toBe(1); expect(result.stderr.join("\n")).toContain(managed ? "managed-readonly" : "imported-readonly"); } } finally { fs.statSync = stat; fs.readFileSync = read; }
+      expect(compositions).toBe(0); expect(fs.existsSync(path.join(homeDir, ".picc"))).toBe(false);
+    }
+  });
+
+  it("rejects a production preview after another composition changes its observed authority", async () => {
+    const value = localLifecycleFixture(); const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: true }; let competingCode: number | undefined;
+    const stale = await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace], { ...options, confirm: async () => { competingCode = (await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace, "--yes"], { ...options, stdinIsTTY: false })).code; return true; } });
+    expect(competingCode).toBe(0); expect(stale.code).toBe(1); expect(stale.stderr.join("\n")).toContain("stale-observation"); const details = await runPluginInProcess(value.project, ["marketplace", "details", "official"], { ...options, stdinIsTTY: false }); expect(details.code).toBe(0);
+  });
+
+  it("commits a retained local marketplace and plugin through fresh production composition", async () => {
+    const value = localLifecycleFixture(); const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: false };
+    const added = await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace, "--yes"], options); const addedText = added.stdout.join("\n");
+    expect(added.code, added.stderr.join("\n")).toBe(0); expect(addedText).toContain("Marketplace state changed"); expect(addedText).toContain("Source authority: kind=local-directory; local-name=marketplace; display-anchor=opaque-sha256:");
+    for (const axis of ["Operation/action/target", "Selected marketplace scope/selector", "Source authority", "Immutable snapshot", "Catalog declarations", "Dependencies/dependents", "Settings/declaration", "Destructive choice", "Participants", "Expected state changes"]) expect(addedText).toContain(axis);
+    const marketplaceSelector = /Selected marketplace scope\/selector: user; ([A-Za-z0-9_-]+)/u.exec(addedText)?.[1]; expect(marketplaceSelector).toBeDefined();
+
+    const ambient = path.join(value.project, "ambient"); write(path.join(ambient, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Contradiction" }, plugins: [{ name: "tool", source: { source: "npm", package: "ambient-tool", registry: "https://registry.npmjs.org", version: "99.0.0" } }] }));
+    write(path.join(value.project, ".claude", "settings.json"), JSON.stringify({ extraKnownMarketplaces: { official: { source: { source: "directory", path: "./ambient" } } } }));
+    const installed = await runPluginInProcess(value.project, ["install", "tool@official", "--yes"], options); const installedText = installed.stdout.join("\n");
+    expect(installed.code, installed.stderr.join("\n")).toBe(0); expect(installedText).toContain("requested=relative; durable=marketplace-relative"); expect(installedText).toContain("Immutable revision: marketplace-"); expect(fs.existsSync(value.runtimeCanary)).toBe(false);
+    for (const axis of ["Operation/action/target", "Target scope/record selector", "Selected marketplace selector", "Immutable catalog", "Source authority", "Immutable revision", "Digests", "Executable content", "Dependencies", "Trust", "Default/enablement", "Settings/declaration", "Destructive choices", "Participants", "Expected state changes"]) expect(installedText).toContain(axis);
+
+    write(path.join(value.marketplace, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Contradiction" }, plugins: [{ name: "tool", source: { source: "npm", package: "ambient-tool", registry: "https://registry.npmjs.org", version: "99.0.0" } }] }));
+    write(path.join(value.marketplace, "plugins", "tool", ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "99.0.0" }));
+    const installedDetails = await runPluginInProcess(value.project, ["details", "tool@official"], options); const installedDetailsText = installedDetails.stdout.join("\n");
+    expect(installedDetails.code, installedDetails.stderr.join("\n")).toBe(0); expect(installedDetailsText).toContain("Plugin: tool@official"); expect(installedDetailsText).toContain("version=1.0.0");
+    const pluginSelector = /selector=([A-Za-z0-9_-]+)/u.exec(installedDetailsText)?.[1]; expect(pluginSelector).toBeDefined();
+    const foreignSameNameRoot = path.join(value.userDir, "plugins", "cache", "managed", "tool", "9.0.0"); write(path.join(foreignSameNameRoot, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "9.0.0" })); write(path.join(value.userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "tool@official": [{ scope: "managed", installPath: foreignSameNameRoot, version: "9.0.0" }] } }));
+    const exactOwnedDisable = await runPluginInProcess(value.project, ["disable", "tool@official", "--selector", pluginSelector!, "--yes"], options); const exactOwnedDisableError = exactOwnedDisable.stderr.join("\n"); expect(exactOwnedDisable.code).toBe(1); expect(exactOwnedDisableError).toContain("unsafe-identity-wide-setting"); expect(exactOwnedDisableError).not.toContain("managed-readonly"); fs.rmSync(path.join(value.userDir, "plugins", "installed_plugins.json"));
+    fs.rmSync(path.join(value.project, ".claude", "settings.json"));
+
+    write(path.join(value.marketplace, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [{ name: "bare", source: "./plugins/bare", version: "2.0.0", defaultEnabled: false }, { name: "tool", source: "./plugins/tool", defaultEnabled: false }] }));
+    write(path.join(value.marketplace, "plugins", "tool", ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "2.0.0", skills: "./skills", commands: "./commands", hooks: "./hooks/hooks.json", mcpServers: "./.mcp.json" }));
+    const refreshed = await runPluginInProcess(value.project, ["marketplace", "refresh", "official", "--selector", marketplaceSelector!, "--yes"], options); const refreshedText = refreshed.stdout.join("\n");
+    expect(refreshed.code, refreshed.stderr.join("\n")).toBe(0); expect(refreshedText).toContain(`Selected marketplace scope/selector: user; ${marketplaceSelector}`);
+    const updated = await runPluginInProcess(value.project, ["update", "tool@official", "--selector", pluginSelector!, "--marketplace-selector", marketplaceSelector!, "--yes"], options); const updatedText = updated.stdout.join("\n");
+    expect(updated.code, updated.stderr.join("\n")).toBe(0); expect(updatedText).toContain(`Target scope/record selector: user; ${pluginSelector}`); expect(updatedText).toContain(`Selected marketplace selector: ${marketplaceSelector}`); expect(updatedText).toContain("Immutable revision: marketplace-"); expect(updatedText).toContain("use /reload-plugins in the interactive TUI or start a new PiCC session"); expect(updatedText).not.toMatch(/\/reload(?!-plugins)/u);
+    write(path.join(value.marketplace, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Contradiction" }, plugins: [{ name: "tool", source: "./plugins/tool", version: "98.0.0" }] })); write(path.join(value.marketplace, "plugins", "tool", ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tool", version: "99.0.0" }));
+    const updatedDetails = await runPluginInProcess(value.project, ["details", "tool@official"], options); const updatedDetailsText = updatedDetails.stdout.join("\n");
+    expect(updatedDetails.code, updatedDetails.stderr.join("\n")).toBe(0); expect(updatedDetailsText).toContain("version=2.0.0"); expect(updatedDetailsText).toContain("Enablement: enabled=yes; scope=user;"); expect(JSON.parse(fs.readFileSync(path.join(value.userDir, "settings.json"), "utf8"))).toMatchObject({ enabledPlugins: { "tool@official": true } }); expect(fs.existsSync(value.runtimeCanary)).toBe(false);
+
+    const identities = projectIdentities(value.project); const locations = createLifecycleLocations({ homeDir: value.homeDir, profilePath: value.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } }); if (!locations.ok) throw new Error(locations.error.message); const established = await establishOwnedStateStore(locations.value, value.homeDir); if (!established.ok) throw new Error(established.message);
+    const registrationFiles: string[] = []; const visit = (directory: string): void => { for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const target = path.join(directory, entry.name); if (entry.isDirectory()) visit(target); else if (entry.name.endsWith(".json") && fs.readFileSync(target, "utf8").includes('"schema":"marketplace-registration"')) registrationFiles.push(target); } }; visit(established.value.recordsRoot); expect(registrationFiles).toHaveLength(1);
+    const envelope = JSON.parse(fs.readFileSync(registrationFiles[0]!, "utf8")) as { payload: OwnedMarketplaceRecord }; const checkoutFamilyKey = locations.value.checkoutFamilyKey; if (checkoutFamilyKey === undefined) throw new Error("missing checkout identity"); const projectRecord: OwnedMarketplaceRecord = { ...envelope.payload, scope: "project", checkoutFamilyKey, projectKey: checkoutFamilyKey }; const codec = createOwnedMarketplaceCodec(locations.value.profileKey); const encodedRecord = createRecordEnvelope(codec, "picc-owned", ownedMarketplaceScopeKey(projectRecord), projectRecord); if (!encodedRecord.ok) throw new Error(encodedRecord.message); const partition = ownedRecordPartition(established.value, "picc-owned", ownedMarketplaceScopeKey(projectRecord)); if (!partition.ok) throw new Error(partition.message); fs.mkdirSync(partition.value, { recursive: true }); fs.writeFileSync(path.join(partition.value, path.basename(registrationFiles[0]!)), encodedRecord.value.bytes);
+    write(path.join(value.project, ".claude", "settings.json"), JSON.stringify({ extraKnownMarketplaces: { official: { source: { source: "directory", path: "./marketplace" } } } }));
+    const ambiguousUpdate = await runPluginInProcess(value.project, ["update", "tool@official", "--selector", pluginSelector!, "--yes"], options); const ambiguousError = ambiguousUpdate.stderr.join("\n");
+    expect(ambiguousUpdate.code).toBe(1); expect(ambiguousError).toContain("catalog-selection-required"); expect(ambiguousError).toContain("run picc plugin marketplace details official"); expect(ambiguousError).toContain("--selector identifies the predecessor installed plugin record, while --marketplace-selector identifies the current registration");
+    const scopedUpdate = await runPluginInProcess(value.project, ["update", "tool@official", "--selector", pluginSelector!, "--marketplace-selector", marketplaceSelector!, "--yes"], options); expect(scopedUpdate.code, scopedUpdate.stderr.join("\n")).toBe(0);
+    fs.rmSync(path.join(partition.value, path.basename(registrationFiles[0]!))); fs.rmSync(path.join(value.project, ".claude", "settings.json"));
+
+    const removedUserMarketplace = await runPluginInProcess(value.project, ["marketplace", "remove", "official", "--selector", marketplaceSelector!, "--preserve-installed", "yes", "--yes"], options); const removedText = removedUserMarketplace.stdout.join("\n");
+    expect(removedUserMarketplace.code, removedUserMarketplace.stderr.join("\n")).toBe(0); expect(removedText).toContain(`Selected marketplace scope/selector: user; ${marketplaceSelector}`); expect(removedText).toContain("Dependencies/dependents: 1 installed dependents"); expect(removedText).toContain("- tool@official"); expect(removedText).toContain("Destructive choice: preserve-installations=true"); expect(removedText).toContain("Preserves installations, enablement declarations, code, data, generations, and immutable snapshots");
+  });
+
+  it("preserves exact owned authority for fresh project/local local-source marketplace commands", async () => {
+    for (const scope of ["project", "local"] as const) {
+      for (const sourceKind of ["local-directory", "local-catalog-file"] as const) {
+        const value = localLifecycleFixture(); const linked = path.join(value.homeDir, `linked-${scope}-${sourceKind}`); const admin = path.join(value.project, ".git", "worktrees", path.basename(linked));
+        fs.mkdirSync(linked, { recursive: true }); write(path.join(linked, ".git"), `gitdir: ${admin}\n`); write(path.join(admin, "gitdir"), `${path.join(linked, ".git")}\n`); write(path.join(admin, "commondir"), "../..\n");
+        const catalogFile = path.join(value.project, "standalone-catalog.json"); write(catalogFile, JSON.stringify({ name: "official", owner: { name: "Example" }, plugins: [] }));
+        const sourceValue = sourceKind === "local-directory" ? value.marketplace : catalogFile; const commandSourceValue = scope === "project" && sourceKind === "local-directory" ? `${path.dirname(sourceValue)}${path.sep}${path.sep}${path.basename(sourceValue)}${path.sep}${path.sep}` : sourceValue; const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: false };
+        const added = await runPluginInProcess(linked, ["marketplace", "add", "official", "--source", sourceKind, commandSourceValue, "--scope", scope, "--yes"], options); const addedText = added.stdout.join("\n");
+        expect(added.code, added.stderr.join("\n")).toBe(0); expect(addedText).toContain(`Selected marketplace scope/selector: ${scope};`); expect(addedText).toContain(`local-name=${path.basename(sourceValue)}`); expect(addedText).not.toContain(value.project);
+        const selector = /Selected marketplace scope\/selector: (?:project|local); ([A-Za-z0-9_-]+)/u.exec(addedText)?.[1]; expect(selector).toBeDefined();
+        const settingsFile = scope === "project" ? path.join(linked, ".claude", "settings.json") : path.join(value.project, ".claude", "settings.local.json"); const settingsText = fs.readFileSync(settingsFile, "utf8"); expect(settingsText).toContain("./"); expect(settingsText).not.toContain(value.project);
+        const fresh = loadClaudeProject({ cwd: linked, env: options.env, homeDir: value.homeDir, pluginInventoryLifetime: "command" }); const port = await createProductionPluginLifecyclePort(fresh, { cwd: linked, ...options }); expect(port.ok).toBe(true);
+        if (port.ok) expect(port.value.marketplaces.details("official", selector)).toMatchObject({ ok: true, value: { owner: "picc-owned", registration: { source: { path: commandSourceValue }, scope } } });
+        if (scope === "project" && sourceKind === "local-directory") { const falsePreview = await runPluginInProcess(linked, ["install", "bare@official"], { ...options, stdinIsTTY: true, confirm: async () => false }); const falseText = falsePreview.stdout.join("\n"); expect(falsePreview.code).toBe(2); expect(falseText).toContain("requested=false; requested-authority-achieved=true; effective-after=present; value=false; scope=user; source=settings.json; declaration-only=false"); }
+        const action = sourceKind === "local-directory" ? ["marketplace", "refresh", "official", "--selector", selector!, "--yes"] : ["marketplace", "remove", "official", "--selector", selector!, "--preserve-installed", "yes", "--yes"];
+        const mutated = await runPluginInProcess(linked, action, options); expect(mutated.code, mutated.stderr.join("\n")).toBe(0);
+        if (scope === "project" && sourceKind === "local-directory") {
+          const identities = projectIdentities(linked); const locations = createLifecycleLocations({ homeDir: value.homeDir, profilePath: value.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } }); if (!locations.ok) throw new Error(locations.error.message); const store = await establishOwnedStateStore(locations.value, value.homeDir); if (!store.ok) throw new Error(store.message);
+          const durableBytes = (): ReadonlyMap<string, string> => { const files = new Map<string, string>(); const visit = (directory: string): void => { for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const target = path.join(directory, entry.name); if (entry.isDirectory()) visit(target); else files.set(path.relative(store.value.profileRoot, target), createHash("sha256").update(fs.readFileSync(target)).digest("hex")); } }; visit(store.value.profileRoot); return files; };
+          const beforeInvalidMutation = durableBytes(); const invalidSettings = JSON.parse(fs.readFileSync(settingsFile, "utf8")) as { extraKnownMarketplaces: { official: { source: { path: string } } } }; invalidSettings.extraKnownMarketplaces.official.source.path = sourceValue; fs.writeFileSync(settingsFile, `${JSON.stringify(invalidSettings, null, 2)}\n`);
+          const invalidProject = loadClaudeProject({ cwd: linked, env: options.env, homeDir: value.homeDir, pluginInventoryLifetime: "command" }); const invalidPort = await createProductionPluginLifecyclePort(invalidProject, { cwd: linked, ...options }); expect(invalidPort.ok).toBe(true);
+          if (invalidPort.ok) { const inert = invalidPort.value.marketplaces.details("official"); expect(inert).toMatchObject({ ok: true, value: { owner: "claude-imported", trusted: false } }); if (inert.ok) expect(inert.value.registration).toBeUndefined(); }
+          const refused = await runPluginInProcess(linked, ["marketplace", "refresh", "official", "--selector", selector!, "--yes"], options); expect(refused.code).toBe(1); expect(refused.stderr.join("\n")).toMatch(/not-found|imported-readonly/u); expect(durableBytes()).toEqual(beforeInvalidMutation);
+        }
+      }
+    }
+  });
+
+  it("preserves ambient managed-policy precedence in production settings planning", async () => {
+    const value = localLifecycleFixture(); const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: false };
+    expect((await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace, "--yes"], options)).code).toBe(0);
+    const managed = path.join(value.homeDir, "managed-settings.json"); const defaultManagedPaths = new Set([path.resolve("/etc/claude-code/managed-settings.json"), path.resolve("C:\\Program Files\\ClaudeCode\\managed-settings.json")]); write(managed, JSON.stringify({ enabledPlugins: { "tool@official": false } }));
+    const redirectedManaged = (target: fs.PathLike): string | undefined => { const resolved = path.resolve(String(target)); return defaultManagedPaths.has(resolved) ? resolved : undefined; };
+    const isDefaultManaged = (target: fs.PathLike): boolean => redirectedManaged(target) !== undefined;
+    const stat = fs.statSync; const readFile = fs.readFileSync; const lstat = fs.lstatSync; const open = fs.openSync; const realpathNative = fs.realpathSync.native;
+    fs.statSync = ((target: fs.PathLike, ...rest: unknown[]) => isDefaultManaged(target) ? stat(managed, ...(rest as [])) : stat(target, ...(rest as []))) as typeof fs.statSync;
+    fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => typeof target !== "number" && isDefaultManaged(target) ? readFile(managed, ...(rest as [])) : readFile(target, ...(rest as []))) as typeof fs.readFileSync;
+    fs.lstatSync = ((target: fs.PathLike, ...rest: unknown[]) => isDefaultManaged(target) ? lstat(managed, ...(rest as [])) : lstat(target, ...(rest as []))) as typeof fs.lstatSync;
+    fs.openSync = ((target: fs.PathLike, ...rest: unknown[]) => isDefaultManaged(target) ? open(managed, ...(rest as [fs.OpenMode, fs.Mode?])) : open(target, ...(rest as [fs.OpenMode, fs.Mode?]))) as typeof fs.openSync;
+    fs.realpathSync.native = ((target: fs.PathLike, ...rest: unknown[]) => redirectedManaged(target) ?? realpathNative(target, ...(rest as []))) as typeof fs.realpathSync.native;
+    let installed;
+    try { installed = await runPluginInProcess(value.project, ["install", "tool@official", "--declaration-only"], { ...options, stdinIsTTY: true, confirm: async () => false }); } finally { fs.statSync = stat; fs.readFileSync = readFile; fs.lstatSync = lstat; fs.openSync = open; fs.realpathSync.native = realpathNative; }
+    const preview = installed.stdout.join("\n"); expect(installed.code, installed.stderr.join("\n")).toBe(2); expect(installed.stderr.join("\n")).toContain("cancelled"); expect(preview).toContain("Default/enablement: enabled=false; source=existing-effective"); expect(preview).toContain("requested=false; requested-authority-achieved=false; effective-after=present; value=false; scope=managed; source=managed-settings.json; declaration-only=true");
+  });
+
+  it("reports and rolls back an interrupted production lifecycle operation through its retained production port", async () => {
+    const value = localLifecycleFixture(); const options = { env: { PICC_CLAUDE_USER_DIR: value.userDir }, homeDir: value.homeDir, stdinIsTTY: false };
+    expect((await runPluginInProcess(value.project, ["marketplace", "add", "official", "--source", "local-directory", value.marketplace, "--yes"], options)).code).toBe(0);
+
+    const promises = fs.promises as unknown as { rename: typeof fs.promises.rename }; const originalRename = promises.rename; let interrupted = false;
+    promises.rename = (async (sourcePath, destinationPath) => {
+      if (interrupted) throw Object.assign(new Error("interrupted lifecycle proof"), { code: "EIO" });
+      const result = await originalRename(sourcePath, destinationPath);
+      const source = String(sourcePath); const destination = String(destinationPath);
+      if (source.includes(".tmp-") && !destination.includes(`${path.sep}staging${path.sep}`) && destination.includes(`${path.sep}.picc${path.sep}`)) interrupted = true;
+      return result;
+    }) as typeof fs.promises.rename;
+    let failedCode = -1; const pendingOutput: string[] = []; let retainedPort: Awaited<ReturnType<typeof createProductionPluginLifecyclePort>> | undefined;
+    try { failedCode = await runPluginInventoryCli(["install", "tool@official", "--yes"], { log: (message) => pendingOutput.push(message), error: () => { throw new Error("pending progress renderer failed"); } }, { cwd: value.project, platform: "linux", ...options, services: async (project) => { retainedPort = await createProductionPluginLifecyclePort(project, options); return retainedPort; } }); } finally { promises.rename = originalRename; }
+    expect(interrupted).toBe(true); expect(failedCode).toBe(1); expect(pendingOutput.at(-1)).toContain("Lifecycle result output failed");
+    const operationId = /Operation ID: (plugin_[A-Za-z0-9_-]+)/u.exec(pendingOutput.join("\n"))?.[1]; expect(operationId).toBeDefined();
+
+    const listed = await runPluginInProcess(value.project, ["recover"], options); expect(listed.stdout.join("\n")).toContain(`Operation ID: ${operationId}; status=pending`);
+    expect(retainedPort?.ok).toBe(true); if (retainedPort?.ok) { const recovered = await retainedPort.value.recovery.recover(operationId!, "rollback"); expect(recovered).toMatchObject({ ok: true, value: { outcome: "rolled-back" } }); const terminalLookup = await retainedPort.value.lookup(operationId!); expect(terminalLookup).toMatchObject({ ok: true, value: { state: "terminal", receipt: { outcome: "rolled-back" } } }); }
+    const terminal = await runPluginInProcess(value.project, ["recover", operationId!], options); expect(terminal.stdout.join("\n")).toContain("Outcome: rolled-back");
+  });
+
+  it("lists pending recovery read-only without selecting an action", async () => {
+    const { project, userDir } = inventoryFixture(); let previewed = 0; let recovered = 0;
+    const services = () => ({ ok: true as const, value: { marketplaces: { listStatus: () => ({ rows: [], omitted: 0, uncertain: false }), details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), prepare: () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, plugins: { list: () => [], details: () => ({ ok: false as const, code: "unused", message: "unused" }), plan: async () => ({ ok: false as const, code: "unused", message: "unused" }), execute: async () => ({ ok: false as const, code: "unused", message: "unused" }), discardPreview: async () => ({ ok: true as const, value: undefined }) }, recovery: { list: () => [{ operationId: "plugin_pending", status: "pending" }], preview: async () => { previewed++; return { ok: false as const, code: "unused", message: "unused" }; }, recover: async () => { recovered++; return { ok: false as const, code: "unused", message: "unused" }; } } } });
+    const result = await runPluginInProcess(project, ["recover"], { env: { PICC_CLAUDE_USER_DIR: userDir }, services: services as never });
+    expect(result).toEqual({ code: 0, stdout: ["Operation ID: plugin_pending; status=pending", "Pending lifecycle operations: total=1; omitted=0. Run picc plugin recover <exact-operation-id> to inspect one exact operation."], stderr: [] }); expect({ previewed, recovered }).toEqual({ previewed: 0, recovered: 0 });
+  });
+
+  it("uses source-specific path-free profile errors and preserves resolver precedence", async () => {
     const { project, userDir } = inventoryFixture();
     write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "picc@market": true } }));
     const configProfile = path.join(temp("picc-config-profile-"), "profile");
@@ -772,19 +1153,19 @@ process.exit(23);
     const defaultHome = temp("picc-default-home-");
     write(path.join(defaultHome, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "default@market": true } }));
 
-    const precedence = runPluginInProcess(project, ["list"], {
+    const precedence = await runPluginInProcess(project, ["list"], {
       env: { PICC_CLAUDE_USER_DIR: userDir, CLAUDE_CONFIG_DIR: configProfile },
       homeDir: defaultHome,
     });
     expect(precedence.stdout.join("\n")).toContain("Plugin: picc@market");
     expect(precedence.stdout.join("\n")).not.toContain("Plugin: config@market");
 
-    const configured = runPluginInProcess(project, ["list"], {
+    const configured = await runPluginInProcess(project, ["list"], {
       env: { CLAUDE_CONFIG_DIR: configProfile }, homeDir: defaultHome,
     });
     expect(configured.stdout.join("\n")).toContain("Plugin: config@market");
 
-    const defaulted = runPluginInProcess(project, ["list"], { env: {}, homeDir: defaultHome });
+    const defaulted = await runPluginInProcess(project, ["list"], { env: {}, homeDir: defaultHome });
     expect(defaulted.stdout.join("\n")).toContain("Plugin: default@market");
 
     const unreadablePicc = path.join(temp("picc-profile-file-"), "private-picc");
@@ -809,7 +1190,7 @@ process.exit(23);
       ],
     ] as const;
     for (const [options, message] of cases) {
-      const result = runPluginInProcess(project, ["list"], options);
+      const result = await runPluginInProcess(project, ["list"], options);
       expect(result).toEqual({ code: 1, stdout: [], stderr: [message] });
       expect(message).not.toContain(unreadablePicc);
       expect(message).not.toContain(unreadableConfig);
@@ -817,33 +1198,33 @@ process.exit(23);
     }
   });
 
-  it("reports malformed and unsupported inventory state generically", () => {
+  it("reports malformed and unsupported inventory state generically", async () => {
     const { project, userDir } = inventoryFixture();
     const options = { env: { PICC_CLAUDE_USER_DIR: userDir } };
 
-    const healthyWindows = runPluginInProcess(project, ["list"], { ...options, platform: "win32" });
+    const healthyWindows = await runPluginInProcess(project, ["list"], { ...options, platform: "win32" });
     expect(healthyWindows).toMatchObject({ code: 0, stderr: [] });
 
     write(path.join(userDir, "plugins", "installed_plugins.json"), "{ malformed");
     write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
-    const malformed = runPluginInProcess(project, ["list"], options);
+    const malformed = await runPluginInProcess(project, ["list"], options);
     expect(malformed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state")] });
 
     write(path.join(userDir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 999, plugins: {} }));
     fs.rmSync(path.join(userDir, "plugins", "known_marketplaces.json"));
-    const unsupported = runPluginInProcess(project, ["list"], options);
+    const unsupported = await runPluginInProcess(project, ["list"], options);
     expect(unsupported).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state", "format")] });
     expect(unsupported.stderr.join("\n")).not.toMatch(/repair the malformed|999/iu);
 
     write(path.join(userDir, "plugins", "known_marketplaces.json"), "{ malformed");
-    const mixed = runPluginInProcess(project, ["list"], options);
+    const mixed = await runPluginInProcess(project, ["list"], options);
     expect(mixed).toMatchObject({ code: 0, stderr: [inventoryIncompleteWarning("installed plugin state, marketplace state", "format repair")] });
     expect(mixed.stderr.join("\n")).not.toContain("999");
   });
 
-  it("classifies an unavailable cwd separately from profile failures", () => {
+  it("classifies an unavailable cwd separately from profile failures", async () => {
     const missing = path.join(temp("picc-missing-cwd-"), "removed");
-    const result = runPluginInProcess(missing, ["list"], { env: {} });
+    const result = await runPluginInProcess(missing, ["list"], { env: {} });
     expect(result).toEqual({
       code: 1,
       stdout: [],
@@ -891,7 +1272,7 @@ Object.defineProperty(process, "platform", { value: "win32" });
 process.chdir(${JSON.stringify(project)});
 process.env.PICC_CLAUDE_USER_DIR = ${JSON.stringify(userDir)};
 const messages = { stdout: [], stderr: [] };
-const code = loaded.runPluginInventoryCli(["list"], { log: value => messages.stdout.push(value), error: value => messages.stderr.push(value) });
+const code = await loaded.runPluginInventoryCli(["list"], { log: value => messages.stdout.push(value), error: value => messages.stderr.push(value) });
 console.log(JSON.stringify({ code, messages }));
 `;
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
@@ -1037,12 +1418,13 @@ require("node:module").syncBuiltinESMExports();
     }
   });
 
-  it("lists both read-only commands in help without changing help routing", () => {
+  it("routes top-level help to the standalone lifecycle grammar without a JSON promise", () => {
     const result = spawnSync(process.execPath, [launcherSource, "--help"], { encoding: "utf8" });
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("picc plugin list");
-    expect(result.stdout).toContain("picc plugin details <plugin@marketplace>");
+    expect(result.stdout).toContain("picc plugin <command>");
+    expect(result.stdout).toContain("Local marketplace/plugin lifecycle and offline recovery");
+    expect(result.stdout).toContain("picc plugin --help");
     expect(result.stdout).not.toMatch(/JSON|live.refresh/iu);
   });
 });

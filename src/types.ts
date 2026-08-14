@@ -112,6 +112,10 @@ export type PluginSharedStateCause =
   | "blocklist-unreadable"
   | "blocklist-malformed";
 
+export type PluginManifestDefaultEnabledEvidence =
+  | { presence: "explicit"; value: boolean; sourcePath: string }
+  | { presence: "absent"; sourcePath: string };
+
 export interface PluginResolutionOutcome {
   pluginId: string;
   status: PluginResolutionStatus;
@@ -119,6 +123,7 @@ export interface PluginResolutionOutcome {
   installation?: NormalizedPluginInstallation;
   context?: PluginRuntimeContext;
   sources?: PluginComponentSource[];
+  manifestDefaultEnabled?: PluginManifestDefaultEnabledEvidence;
   diagnostics: Diagnostic[];
 }
 
@@ -151,7 +156,8 @@ export type PluginMarketplaceCatalogSource =
   | { kind: "github"; repo: string; ref?: string; sha?: string }
   | { kind: "url"; url: string; ref?: string; sha?: string }
   | { kind: "git-subdir"; url: string; path: string; ref?: string; sha?: string }
-  | { kind: "npm"; package: string; version?: string; registry?: string };
+  | { kind: "npm"; package: string; version?: string; registry?: string }
+  | { kind: "archive"; url: string; sha256?: string };
 
 export interface PluginMarketplaceFieldProvenance {
   field: string;
@@ -1017,7 +1023,7 @@ export interface CapabilityEntry {
 export interface ClaudeProject {
   /** Repo root (or cwd when not in a repo). */
   root: string;
-  /** Launch cwd. */
+  /** Effective cwd used for this project assembly. */
   cwd: string;
   userDir: string; // ~/.claude
   settings: ClaudeSettings;

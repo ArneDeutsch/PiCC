@@ -35,6 +35,7 @@ Coverage map (each canary string is asserted by tests):
 | Unknown settings keys | `futureUnknownSetting`, `outputStyle` | compat report |
 | MCP pending-approval gate (unapproved project server) | `.mcp.json` (`example-server`) | compat report + pending notice |
 | Installed-plugin source copied into a hermetic cache/state layout | `.claude-plugin/` → test-created installed root | `FS-PLUGIN-SKILL-BODY` |
+| Helper-created lifecycle marketplace, plugin trees, and declarations in a copied fixture | e2e helper | `FS-LIFECYCLE-GENERATION-*` |
 | Notebook read/edit workflow | `analysis.ipynb`, `test/e2e-notebook.test.ts` | real and fallback cell IDs |
 
 `future-agent` declares one shared reference and one inline stdio server in the documented list

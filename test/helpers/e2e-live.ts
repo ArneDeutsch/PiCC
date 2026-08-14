@@ -79,6 +79,8 @@ export function readJsonLines(text: string): JsonLineObject[] {
 
 export interface RunResult {
   code: number | null;
+  pid: number;
+  forcedTermination: "watchdog" | "harness-stop" | null;
   stdout: string;
   stderr: string;
   requests: CapturedRequest[];
@@ -108,11 +110,16 @@ export interface RunPiOptions {
   piSettings?: Record<string, unknown>;
   /** CLI mode arguments replacing print `-p <prompt>` (RPC/JSON contract tests). */
   modeArgs?: string[];
+  /** Run Pi's real interactive mode through a pipe-backed terminal capability shim. */
+  interactiveTerminal?: boolean;
+  /** Isolate lifecycle journeys from ambient network credentials and Node preloads. */
+  lifecycleIsolation?: boolean;
   /** Required for source-fallback and installed-launcher selection; forbidden for compiled selection. */
   launcherPath?: string;
 }
 
 export interface StartedPi {
+  pid: number;
   requests: CapturedRequest[];
   waitForRequest(
     predicate?: (request: CapturedRequest) => boolean,
@@ -124,6 +131,8 @@ export interface StartedPi {
     timeoutMs?: number,
     count?: number,
   ): Promise<Record<string, unknown>>;
+  waitForText(text: string, timeoutMs?: number, count?: number): Promise<void>;
+  capturedText(): string;
   sendInput(line: string): void;
   closeInput(): void;
   completion: Promise<RunResult>;
@@ -135,6 +144,7 @@ export type E2ERuntime = "compiled" | "source-fallback" | "installed-launcher";
 export interface E2ELive {
   startPi: (opts: RunPiOptions) => Promise<StartedPi>;
   runPi: (opts: RunPiOptions) => Promise<RunResult>;
+  launchedProcessCount: () => number;
   cleanup: () => Promise<void>;
 }
 
@@ -214,6 +224,7 @@ export function createE2ELive({
   const retainedTempDirs = new Set<string>();
   const retainedFixtures = new Set<string>();
   const active = new Set<StartedPi>();
+  let launchedProcesses = 0;
 
   function makeAgentDir(
     mockUrl: string,
@@ -304,9 +315,12 @@ export function createE2ELive({
       opts.piSettings,
     );
     const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
-    tempDirs.push(emptyUserDir);
+    const isolatedHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-home-"));
+    tempDirs.push(emptyUserDir, isolatedHomeDir);
     let child: ChildProcess | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let processClosed = false;
+    let forcedTermination: RunResult["forcedTermination"] = null;
     let stdout = "";
     let stderr = "";
     let closed: Promise<number | null> | undefined;
@@ -345,9 +359,10 @@ export function createE2ELive({
       return finalization;
     };
     let stopOperation: Promise<void> | undefined;
-    const stop = (): Promise<void> => {
+    const stopFor = (reason: Exclude<RunResult["forcedTermination"], null>): Promise<void> => {
       stopOperation ??= (async () => {
-        if (!child || !closed) return;
+        if (!child || !closed || processClosed) return;
+        forcedTermination ??= reason;
         try {
           await stopProcessTree(child, closed);
         } catch (error) {
@@ -357,12 +372,58 @@ export function createE2ELive({
       })();
       return stopOperation;
     };
+    const stop = (): Promise<void> => stopFor("harness-stop");
     try {
       if (runtime === "compiled" && opts.launcherPath !== undefined) {
         throw new Error("The compiled E2E runtime selects the verified wrapper directly; launcherPath is forbidden");
       }
       if (runtime !== "compiled" && opts.launcherPath === undefined) {
         throw new Error(`${runtime} E2E runtime requires launcherPath`);
+      }
+      if (opts.interactiveTerminal && opts.modeArgs !== undefined) {
+        throw new Error("interactiveTerminal selects Pi interactive mode and cannot be combined with modeArgs");
+      }
+      const terminalShim = path.join(agentDir, "interactive-terminal.cjs");
+      if (opts.interactiveTerminal) {
+        fs.writeFileSync(terminalShim, [
+          'const path=require("node:path");',
+          `const direct=process.argv[1]!==undefined&&path.resolve(process.argv[1])===${JSON.stringify(path.resolve(CLI_PATH))};`,
+          'const launcherChild=process.env.PICC_LAUNCHER_PID!==undefined&&process.env.PICC_E2E_PI_PID===undefined;',
+          'if(direct||launcherChild){',
+          'Object.defineProperty(process.stdin,"isTTY",{value:true});',
+          'Object.defineProperty(process.stdout,"isTTY",{value:true});',
+          'Object.defineProperty(process.stderr,"isTTY",{value:true});',
+          'process.stdin.setRawMode=()=>process.stdin;',
+          'process.stdout.columns=120; process.stdout.rows=200;',
+          'process.env.PICC_E2E_PI_PID=String(process.pid);',
+          '}',
+        ].join("\n"));
+      }
+      const inheritedEnv = { ...process.env };
+      if (opts.lifecycleIsolation) {
+        for (const name of Object.keys(inheritedEnv)) {
+          if (/^(?:ALL|HTTP|HTTPS|NO)_PROXY$/iu.test(name)
+            || /^(?:AWS|AZURE|GOOGLE|GITHUB|GH|NPM|NODE_AUTH|OPENAI|ANTHROPIC|CLAUDE).*?(?:KEY|TOKEN|SECRET|PASSWORD|PROFILE|CONFIG)?$/iu.test(name)) {
+            delete inheritedEnv[name];
+          }
+        }
+        delete inheritedEnv.NODE_OPTIONS;
+      }
+      const childEnv: NodeJS.ProcessEnv = {
+        ...inheritedEnv,
+        HOME: isolatedHomeDir,
+        USERPROFILE: isolatedHomeDir,
+        PI_CODING_AGENT_DIR: agentDir,
+        PI_OFFLINE: "1",
+        PI_SKIP_VERSION_CHECK: "1",
+        PICC_CLAUDE_USER_DIR: emptyUserDir,
+        NO_COLOR: "1",
+        ...opts.extraEnv,
+      };
+      if (opts.lifecycleIsolation) delete childEnv.NODE_OPTIONS;
+      if (opts.interactiveTerminal) {
+        childEnv.NODE_OPTIONS = `--require ${JSON.stringify(terminalShim)}`;
+        childEnv.TERM = "xterm-256color";
       }
       child = spawn(
         process.execPath,
@@ -371,24 +432,19 @@ export function createE2ELive({
             ? [CLI_PATH, "-e", COMPILED_EXTENSION_PATH]
             : [opts.launcherPath!]),
           ...(opts.persistSession ? [] : ["--no-session"]),
-          ...(opts.modeArgs ?? ["-p", opts.prompt]),
+          ...(opts.interactiveTerminal ? ["--mode", "interactive"] : opts.modeArgs ?? ["-p", opts.prompt]),
         ],
         {
           cwd: fixture,
-          env: {
-            ...process.env,
-            PI_CODING_AGENT_DIR: agentDir,
-            PI_OFFLINE: "1",
-            PI_SKIP_VERSION_CHECK: "1",
-            PICC_CLAUDE_USER_DIR: emptyUserDir,
-            NO_COLOR: "1",
-            ...opts.extraEnv,
-          },
-          stdio: [opts.modeArgs?.includes("rpc") ? "pipe" : "ignore", "pipe", "pipe"],
+          env: childEnv,
+          stdio: [opts.interactiveTerminal || opts.modeArgs?.includes("rpc") ? "pipe" : "ignore", "pipe", "pipe"],
           windowsHide: true,
           detached: process.platform !== "win32",
         },
       );
+      launchedProcesses += 1;
+      const childPid = child.pid;
+      if (childPid === undefined) throw new Error("Pi child started without a PID");
       let outputRemainder = "";
       child.stdout!.on("data", (d: Buffer) => {
         const text = d.toString();
@@ -412,20 +468,24 @@ export function createE2ELive({
       child.stderr!.on("data", (d: Buffer) => (stderr += d.toString()));
       closed = new Promise<number | null>((resolve, reject) => {
         child!.once("error", reject);
-        child!.once("close", resolve);
+        child!.once("close", (code) => {
+          processClosed = true;
+          resolve(code);
+        });
       });
       killTimer = setTimeout(() => {
-        void stop().catch(() => undefined);
+        void stopFor("watchdog").catch(() => undefined);
       }, processWatchdogMs);
       const completion = (async (): Promise<RunResult> => {
         try {
           const code = await closed;
-          return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
+          return { code, pid: childPid, forcedTermination, stdout, stderr, requests: mock.requests, fixture, agentDir };
         } finally {
           await finalizeRun(false);
         }
       })();
       started = {
+        pid: childPid,
         requests: mock.requests,
         waitForRequest: (predicate, count, timeoutMs) => mock.waitForRequest(predicate, count, timeoutMs),
         waitForOutput: (predicate, timeoutMs = 10_000, count = 1) => {
@@ -442,7 +502,15 @@ export function createE2ELive({
             outputWaiters.add(waiter);
           });
         },
-        sendInput: (line) => child?.stdin?.write(`${line}\n`),
+        waitForText: async (text, timeoutMs = 10_000, count = 1) => {
+          const deadline = Date.now() + timeoutMs;
+          while ([...`${stdout}\n${stderr}`.matchAll(new RegExp(text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu"))].length < count) {
+            if (Date.now() >= deadline) throw new Error(`Timed out waiting for text ${JSON.stringify(text)}; captured ${stdout.length + stderr.length} bytes`);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        },
+        capturedText: () => `${stdout}\n${stderr}`,
+        sendInput: (line) => child?.stdin?.write(opts.interactiveTerminal ? `${line}\r` : `${line}\n`),
         closeInput: () => child?.stdin?.end(),
         completion,
         stop,
@@ -486,7 +554,7 @@ export function createE2ELive({
     }
   }
 
-  return { startPi, runPi, cleanup };
+  return { startPi, runPi, launchedProcessCount: () => launchedProcesses, cleanup };
 }
 
 /** All message content of a request as one searchable string. */

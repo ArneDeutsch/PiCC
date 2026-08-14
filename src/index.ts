@@ -122,7 +122,7 @@ import {
   type CompatReport,
 } from "./registry/compat-report.js";
 import { loadSkillBodyResult, substituteToolRules, substituteVariables } from "./claude/skills.js";
-import { resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
+import { pluginRuntimeDataAuthorization, prepareAuthorizedPluginDataLocation, resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
 import { createAgentMcpScope, type AgentMcpScope } from "./runtime/agent-mcp.js";
@@ -151,6 +151,8 @@ import {
   sanitizePluginInventoryDisplayText,
 } from "./runtime/plugin-inventory-text.js";
 import { openPluginInventory } from "./runtime/plugin-inventory-focus.js";
+import { createProductionPluginLifecyclePort, type PluginLifecyclePort } from "./plugin-inventory-cli.js";
+import { mergeCapturedLoadedWithEffectiveDesired, type PluginInventoryActionName } from "./runtime/plugin-inventory-model.js";
 import {
   capturePiccLaunchContext,
   piccUpdateGuidance,
@@ -163,6 +165,86 @@ import {
   sanitizedSubprocessEnv,
 } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
+import {
+  RELOAD_ACTIVATION_UNCONFIRMED,
+  reserveReloadAttempt,
+  armedReloadAttemptNonce,
+  clearReloadHandoff,
+  consumeReloadAttempt,
+  readReloadHandoff,
+  recordReloadHandoffOutcome,
+  resolveReloadAttempt,
+  sameReloadBinding,
+  writeReloadHandoff,
+} from "./plugin-lifecycle/reload-handoff.js";
+
+type ActiveReplacementShutdown = () => void | Promise<void>;
+interface ReplacementCwdHandoff {
+  readonly nonce: string;
+  readonly baseCwd: string;
+  readonly ownerProjectRoot: string;
+  readonly worktreeCwd?: string;
+}
+interface ActiveReplacementShutdownRegistry {
+  eligibleNonce?: string;
+  cwdHandoff?: ReplacementCwdHandoff;
+  pending?: { nonce: string; shutdown: ActiveReplacementShutdown };
+}
+const ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL = Symbol.for("@arnedeutsch/picc.active-replacement-shutdown.v3");
+
+function activeReplacementShutdownRegistry(): ActiveReplacementShutdownRegistry {
+  const host = globalThis as typeof globalThis & Record<symbol, unknown>;
+  const existing = host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL];
+  if (typeof existing === "object" && existing !== null) return existing as ActiveReplacementShutdownRegistry;
+  const created: ActiveReplacementShutdownRegistry = Object.seal({ eligibleNonce: undefined, cwdHandoff: undefined, pending: undefined });
+  host[ACTIVE_REPLACEMENT_SHUTDOWN_SYMBOL] = created;
+  return created;
+}
+
+function beginActiveReplacementShutdown(nonce: string, cwdState: CwdState, ownerProjectRoot: string): void {
+  const registry = activeReplacementShutdownRegistry();
+  registry.eligibleNonce = nonce;
+  const worktreeCwd = cwdState.getWorktree();
+  registry.cwdHandoff = {
+    nonce,
+    baseCwd: cwdState.getBase(),
+    ownerProjectRoot,
+    ...(worktreeCwd === undefined ? {} : { worktreeCwd }),
+  };
+  registry.pending = undefined;
+}
+
+function activeReplacementCwdHandoff(nonce: string): ReplacementCwdHandoff | undefined {
+  const registry = activeReplacementShutdownRegistry();
+  return registry.eligibleNonce === nonce && registry.cwdHandoff?.nonce === nonce
+    ? registry.cwdHandoff
+    : undefined;
+}
+
+function storeActiveReplacementShutdown(nonce: string, shutdown: ActiveReplacementShutdown): boolean {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce || registry.pending !== undefined) return false;
+  registry.pending = { nonce, shutdown };
+  return true;
+}
+
+function consumeActiveReplacementShutdown(nonce: string): ActiveReplacementShutdown | undefined {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce) return undefined;
+  const pending = registry.pending?.nonce === nonce ? registry.pending.shutdown : undefined;
+  registry.eligibleNonce = undefined;
+  registry.cwdHandoff = undefined;
+  registry.pending = undefined;
+  return pending;
+}
+
+function clearActiveReplacementShutdown(nonce: string): void {
+  const registry = activeReplacementShutdownRegistry();
+  if (registry.eligibleNonce !== nonce) return;
+  registry.eligibleNonce = undefined;
+  registry.cwdHandoff = undefined;
+  registry.pending = undefined;
+}
 
 /**
  * PiCC — the Pi extension entry.
@@ -384,6 +466,8 @@ export interface PiccTestSeam {
     | "serverStates"
     | "shutdown"
   >;
+  /** TEST-ONLY lifecycle composition override for focused plugin UI wiring. */
+  pluginLifecycle?: (project: LoadedProject) => Promise<{ readonly ok: true; readonly value: PluginLifecyclePort } | { readonly ok: false; readonly code: string; readonly message: string }>;
   /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
   mcpControl?: {
     whenSettled?: () => Promise<void>;
@@ -396,6 +480,8 @@ export interface PiccTestSeam {
   managedMcpDiscovery?: ManagedMcpDiscoveryOptions;
   /** TEST-ONLY managed artifact directories passed directly to project loading. */
   managedArtifactDirs?: string[];
+  /** TEST-ONLY replacement at the project-assembly boundary. */
+  loadProject?: typeof loadClaudeProject;
   /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
   loadBuiltinSdk?: () => Promise<any>;
   /** TEST-ONLY in-process replacement at the actual main-session presentation-routing boundary. */
@@ -549,8 +635,8 @@ export async function writeFdFully(
 }
 
 const PLUGIN_CONTROL_NAMES = new Set(["plugin", "plugins", "reload-plugins"]);
-const PLUGIN_REFRESH_ACTION = "run the canonical /reload in the interactive TUI or exit and relaunch PiCC";
-const PLUGIN_RECONCILE_RECOVERY = `Reconcile or reinstall the plugin through Claude Code, then ${PLUGIN_REFRESH_ACTION}`;
+const PLUGIN_REFRESH_ACTION = "run /reload-plugins in the interactive TUI or start a new PiCC session";
+const PLUGIN_RECONCILE_RECOVERY = `Inspect exact ownership with /plugin details <qualified identity>, then use the applicable focused action or picc plugin --help for exact PiCC-owned changes, or repair imported state through Claude Code; afterward, ${PLUGIN_REFRESH_ACTION}`;
 
 function pluginDataFailureRecovery(code: string): string {
   return code === "unreadable-path" || code === "wrong-kind"
@@ -574,11 +660,14 @@ export function preparePluginDataDir(opts: {
     return { ok: false, code: "project-context-mismatch" };
   }
   try {
+    const authorized = pluginRuntimeDataAuthorization(context);
+    if (authorized !== undefined) {
+      const prepared = prepareAuthorizedPluginDataLocation(authorized);
+      return prepared.ok ? { ok: true } : { ok: false, code: prepared.code };
+    }
     const location = resolvePluginDataLocation(opts.userDir, context.pluginId);
     if (!location.ok) return { ok: false, code: location.code };
-    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) {
-      return { ok: false, code: "qualified-projection-mismatch" };
-    }
+    if (path.resolve(location.value.lexicalPath) !== path.resolve(context.dataDir)) return { ok: false, code: "qualified-projection-mismatch" };
     fs.mkdirSync(location.value.lexicalPath, { recursive: true });
     const current = revalidatePluginDataLocation(location.value);
     return current.ok ? { ok: true } : { ok: false, code: current.code };
@@ -772,35 +861,106 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     startupSuppressionCleared = true;
     clearPiStartupSuppression();
   };
-  // Admission cleanup cannot depend on the later optional SDK import. Register
-  // it synchronously even when built-in replacement setup degrades or stalls.
-  pi.on("user_bash", () => {
-    clearStartupSuppression();
-  });
-
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
 
+  const armedReloadNonce = armedReloadAttemptNonce();
+  const replacementCwdHandoff = armedReloadNonce === undefined ? undefined : activeReplacementCwdHandoff(armedReloadNonce);
+  const projectLoadOptions: Parameters<typeof loadClaudeProject>[0] = {
+    cwd: replacementCwdHandoff?.worktreeCwd ?? replacementCwdHandoff?.baseCwd ?? process.cwd(),
+    ...(testSeam?.managedSettingsPaths
+      ? { managedSettingsPaths: testSeam.managedSettingsPaths }
+      : {}),
+    ...(testSeam?.managedMcpDiscovery
+      ? { managedMcpDiscovery: testSeam.managedMcpDiscovery }
+      : {}),
+    ...(testSeam?.managedArtifactDirs
+      ? { managedArtifactDirs: testSeam.managedArtifactDirs }
+      : {}),
+  };
+  const loadProject = testSeam?.loadProject ?? loadClaudeProject;
+  const rejectArmedReplacement = (resolveAttempt = true): void => {
+    if (armedReloadNonce === undefined) return;
+    let handled = false;
+    pi.on("session_start", (event: { reason?: string }, ctx: { shutdown?: () => void | Promise<void> }) => {
+      if (handled || event.reason !== "reload") return;
+      handled = true;
+      const shutdown = ctx?.shutdown;
+      if (typeof shutdown === "function") {
+        storeActiveReplacementShutdown(armedReloadNonce, () => shutdown.call(ctx));
+      }
+    });
+    if (resolveAttempt) resolveReloadAttempt(armedReloadNonce, "rejected");
+  };
   let project: LoadedProject;
   try {
-    project = loadClaudeProject({
-      cwd: process.cwd(),
-      ...(testSeam?.managedSettingsPaths
-        ? { managedSettingsPaths: testSeam.managedSettingsPaths }
-        : {}),
-      ...(testSeam?.managedMcpDiscovery
-        ? { managedMcpDiscovery: testSeam.managedMcpDiscovery }
-        : {}),
-      ...(testSeam?.managedArtifactDirs
-        ? { managedArtifactDirs: testSeam.managedArtifactDirs }
-        : {}),
-    });
+    project = loadProject(projectLoadOptions);
   } catch (err) {
-    // Completeness floor: a broken project must never crash the harness.
+    // Malformed Claude-compatible project state must degrade to diagnostics, not crash the harness.
     console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
+    // Leave assembly failure unresolved so the outgoing reload owner records operational failure.
+    rejectArmedReplacement(false);
     return;
   }
+  let reloadAcceptanceNonce: string | undefined;
+  if (project.reloadCandidate.status === "ready") {
+    const observed = readReloadHandoff(project.reloadCandidate.handoffPath);
+    if (armedReloadNonce !== undefined) {
+      const record = observed.ok ? observed.value : undefined;
+      const recaptured = project.reloadCandidate.recapture();
+      const exact = record?.outcome === "pending" && record.nonce === armedReloadNonce
+        && sameReloadBinding(record.binding, project.reloadCandidate.binding)
+        && recaptured.ok && sameReloadBinding(recaptured.value, project.reloadCandidate.binding);
+      if (!exact) {
+        if (record?.outcome === "pending") {
+          recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, record, "input-mismatch");
+        }
+        rejectArmedReplacement();
+        return;
+      }
+      const cleared = clearReloadHandoff(project.reloadCandidate.handoffPath);
+      if (!cleared.ok) {
+        recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, record, "input-mismatch");
+        rejectArmedReplacement();
+        return;
+      }
+      reloadAcceptanceNonce = armedReloadNonce;
+    } else if (observed.ok && observed.value?.outcome === "pending") {
+      recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, observed.value, "restart-superseded");
+    }
+  } else if (armedReloadNonce !== undefined) {
+    if (project.reloadCandidate.handoffPath !== undefined) {
+      const observed = readReloadHandoff(project.reloadCandidate.handoffPath);
+      if (observed.ok && observed.value?.outcome === "pending" && observed.value.nonce === armedReloadNonce) {
+        recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, observed.value, "input-mismatch");
+      }
+    }
+    rejectArmedReplacement();
+    return;
+  } else if (project.reloadCandidate.handoffPath !== undefined) {
+    const observed = readReloadHandoff(project.reloadCandidate.handoffPath);
+    if (observed.ok && observed.value?.outcome === "pending") {
+      recordReloadHandoffOutcome(project.reloadCandidate.handoffPath, observed.value, "restart-superseded");
+    }
+  }
+
+  // Exact authorization precedes publication. Operational acceptance belongs to
+  // Pi's earliest replacement-start event, not extension-factory entry.
+  pi.on("session_start", (event: { reason?: string }) => {
+    if (event.reason === "reload" && reloadAcceptanceNonce !== undefined) {
+      clearActiveReplacementShutdown(reloadAcceptanceNonce);
+      resolveReloadAttempt(reloadAcceptanceNonce, "accepted");
+      reloadAcceptanceNonce = undefined;
+    }
+  });
+
+  // Register cleanup after reload authorization but synchronously before optional SDK setup,
+  // so SDK degradation or stalling cannot prevent user-bash cleanup.
+  pi.on("user_bash", () => {
+    clearStartupSuppression();
+  });
+
   const config = loadPiCCConfig(project.root);
   // Config-validation findings (malformed file, out-of-range compaction knob reverted
   // to its default) surface once at startup — never silently swallowed. Same pattern as
@@ -822,7 +982,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     codexProviderRegistries.add(pi);
     registerCodexAbortGuard(pi);
   }
-  const cwdState = new CwdState(project.cwd);
+  const cwdState = new CwdState(replacementCwdHandoff?.baseCwd ?? project.cwd);
+  if (replacementCwdHandoff?.worktreeCwd !== undefined) cwdState.enterWorktree(replacementCwdHandoff.worktreeCwd);
+  const ownerProjectRoot = replacementCwdHandoff?.ownerProjectRoot ?? project.root;
+  const loadEffectiveProject = (): LoadedProject => loadProject({
+    ...projectLoadOptions,
+    cwd: cwdState.get(),
+    userDir: project.userDir,
+  });
   let activeMainNotebookState = new NotebookSessionState();
   const installMainNotebookState = (branch: unknown): void => {
     let installed!: NotebookSessionState;
@@ -1112,7 +1279,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
   const retentionCleanupAllowed = project.settings.retentionCleanupAllowed === true;
   const worktrees = new WorktreeManager({
-    projectRoot: project.root,
+    projectRoot: ownerProjectRoot,
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
     retentionCleanupAllowed,
@@ -5235,7 +5402,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const CONTROL_ERROR_RESPONSE =
     "PiCC could not produce that control-command report. No action occurred; try again or run /doctor.";
   const PLUGIN_RELOAD_GUIDANCE =
-    "/reload-plugins did no reload and made no changes. Manage installation and enablement in Claude Code, then run the canonical /reload in the interactive TUI to reload the whole extension, including installed plugin state, or exit and relaunch PiCC. /doctor reports currently available compatibility and retained plugin-runtime failure findings; /new does not reload plugin state.";
+    "/reload-plugins did not reload or mutate this process. Lifecycle changes may be made with standalone PiCC plugin commands, but adoption requires /reload-plugins in the live interactive session or a new PiCC session. /new does not reload plugin state.";
+  const PLUGIN_RELOAD_REJECTED =
+    "Plugin reload preflight was rejected. No reload started and the current captured runtime remains usable. Use picc plugin --help to inspect or repair current lifecycle state, then retry /reload-plugins.";
+  const PLUGIN_RELOAD_ASSEMBLY_FAILED =
+    "PiCC could not assemble plugin authority from the active checkout. Captured loaded runtime is unchanged and no reload started. Repair that checkout or leave it with ExitWorktree, then retry /reload-plugins. For standalone inspection, run picc plugin --help from the active checkout.";
+  const PLUGIN_RELOAD_INPUTS_CHANGED =
+    "Plugin reload inputs changed or could not be verified during validation. No reload started and the current captured runtime remains usable. Retry /reload-plugins after local lifecycle writes have finished.";
+  const PLUGIN_RELOAD_HANDOFF_WRITE_FAILED =
+    "Plugin reload handoff could not be stored. No reload started and the current captured runtime remains usable. Check local PiCC lifecycle storage permissions and free space, then retry /reload-plugins.";
+  const PLUGIN_RELOAD_ACTIVE =
+    "Another plugin reload attempt is already underway. This invocation made no changes and did not start another reload.";
+
+  function pluginReloadRejection(reason: string): string {
+    const bounded = sanitizeLine(reason, 160);
+    const safeReason = bounded.length > 0 && !/[\\/]|(?:^|\s)[A-Za-z]:/u.test(bounded)
+      ? ` Rejection reason: ${bounded}.`
+      : "";
+    return `${PLUGIN_RELOAD_REJECTED}${safeReason}`;
+  }
 
   const controlCommands = new Map<string, ControlCommandEntry>([
     ["doctor", {
@@ -5259,7 +5444,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       render: async () => renderUsageReport(),
     }],
     ["plugin", {
-      description: "PiCC: inspect the read-only plugin inventory",
+      description: "PiCC: inspect and explicitly manage the local plugin lifecycle",
       render: async (args, ctx) => renderPluginControl(args, ctx),
     }],
     ["plugins", {
@@ -5269,7 +5454,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : pluginReadOnlyUsage(ctx),
     }],
     ["reload-plugins", {
-      description: "PiCC: non-mutating plugin reload guidance",
+      description: "PiCC: validate and reload the complete local plugin runtime",
       render: async () => PLUGIN_RELOAD_GUIDANCE,
     }],
     ["mcp", {
@@ -5360,29 +5545,53 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return overlay === undefined ? output : `${output}\n\n${overlay}`;
   }
 
-  function pluginReadOnlyUsage(_ctx: any): string {
-    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. Manage plugin installation and enablement in Claude Code. After managing plugins, run the canonical /reload in the interactive TUI or exit and relaunch PiCC.`;
+  function pluginReadOnlyUsage(ctx: any): string {
+    const adoption = ctx?.mode === "tui" ? "After a committed plugin change, use /reload-plugins in this live interactive session or start a new PiCC session." : "Headless mode cannot reload plugins. If an interactive PiCC session is already running, use /reload-plugins there; otherwise start a new PiCC session.";
+    return `${PLUGIN_INVENTORY_SLASH_USAGE} No changes were made. In the interactive TUI, /plugin install|enable|disable|update|uninstall, /plugin marketplace add|refresh|remove, and /plugin recover enter the focused workflow; values and destructive choices are collected there. Headless modes are guidance-only; from the active checkout run picc plugin --help for standalone commands. ${adoption}`;
+  }
+
+  function requestedPluginAction(args: string): PluginInventoryActionName | undefined {
+    const tokens = args.trim().toLowerCase().split(/[ \t]+/u);
+    if (tokens[0] === "marketplace" && ["add", "refresh", "remove"].includes(tokens[1] ?? "")) return `marketplace-${tokens[1]}` as PluginInventoryActionName;
+    if (["install", "enable", "disable", "update", "uninstall", "recover"].includes(tokens[0] ?? "")) return tokens[0] as PluginInventoryActionName;
+    return undefined;
   }
 
   async function renderPluginControl(args: string, ctx: any): Promise<string | undefined> {
-    if (/^[ \t]*$/.test(args)) {
-      if (ctx?.mode !== "tui") return withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory));
+    const requestedAction = requestedPluginAction(args);
+    if (ctx?.mode !== "tui") return pluginReadOnlyUsage(ctx);
+    let effectiveDesired: LoadedProject;
+    try {
+      effectiveDesired = loadEffectiveProject();
+    } catch {
+      return "PiCC could not assemble plugin authority from the active checkout. Captured loaded runtime is unchanged; no lifecycle execution started. Repair that checkout or leave it with ExitWorktree, then re-open /plugin. For standalone inspection, run picc plugin --help from the active checkout.";
+    }
+    const mergedInventory = mergeCapturedLoadedWithEffectiveDesired(project.pluginInventory, effectiveDesired.pluginInventory);
+    if (/^[ \t]*$/.test(args) || requestedAction !== undefined) {
       const overlay = pluginRuntimeOverlay();
       if (overlay !== undefined) {
         try { ctx.ui?.notify?.(overlay, "warning"); } catch { /* overlay is additive */ }
       }
-      const opened = await openPluginInventory(project.pluginInventory, ctx);
+      const lifecycleFactory = async () => {
+        try {
+          const effectiveProject = loadEffectiveProject();
+          return await (testSeam?.pluginLifecycle?.(effectiveProject) ?? createProductionPluginLifecyclePort(effectiveProject, { cwd: effectiveProject.cwd, env: process.env, platform: process.platform }));
+        } catch {
+          return { ok: false as const, code: "active-checkout-assembly-failed", message: "Active-checkout plugin authority is unavailable" };
+        }
+      };
+      const opened = await openPluginInventory(project.pluginInventory, ctx, { durableDesired: effectiveDesired.pluginInventory, lifecycleFactory, ...(requestedAction === undefined ? {} : { initialAction: requestedAction }) });
       if (opened.opened) return undefined;
       const warning = opened.reason === "unavailable"
-        ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only list instead."
-        : "Interactive plugin inventory could not open; showing the bounded read-only list instead.";
+        ? "Interactive plugin inventory is unavailable in this TUI; showing the bounded read-only active-checkout projection instead."
+        : "Interactive plugin inventory could not open; showing the bounded read-only active-checkout projection instead.";
       try { ctx.ui?.notify?.(warning, "warning"); } catch { /* text fallback remains authoritative */ }
-      return `${warning}\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(project.pluginInventory))}`;
+      return `${warning} Re-open /plugin, or from the active checkout run picc plugin --help for standalone lifecycle commands.\n\n${withPluginRuntimeOverlay(renderPluginInventoryList(mergedInventory))}`;
     }
     const parsed = parsePluginInventorySlash(`/plugin ${args}`);
     return parsed.kind === "usage"
       ? pluginReadOnlyUsage(ctx)
-      : withPluginRuntimeOverlay(renderPluginInventoryOperation(project.pluginInventory, parsed.operation));
+      : withPluginRuntimeOverlay(renderPluginInventoryOperation(mergedInventory, parsed.operation));
   }
 
   async function appendControlOutput(name: string, output: string, ctx: any): Promise<void> {
@@ -5416,10 +5625,76 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   }
 
+  async function handlePluginReload(ctx: any): Promise<void> {
+    if (ctx?.mode !== "tui") {
+      await appendControlOutput("reload-plugins", PLUGIN_RELOAD_GUIDANCE, ctx);
+      return;
+    }
+    let candidate: LoadedProject;
+    try {
+      candidate = loadEffectiveProject();
+    } catch {
+      await appendControlOutput("reload-plugins", PLUGIN_RELOAD_ASSEMBLY_FAILED, ctx);
+      return;
+    }
+    if (candidate.reloadCandidate.status !== "ready") {
+      await appendControlOutput("reload-plugins", pluginReloadRejection(candidate.reloadCandidate.reason), ctx);
+      return;
+    }
+    let confirmation: LoadedProject | undefined;
+    try { confirmation = loadEffectiveProject(); } catch { confirmation = undefined; }
+    const exact = confirmation?.reloadCandidate.status === "ready" ? confirmation.reloadCandidate.recapture() : undefined;
+    if (confirmation?.reloadCandidate.status !== "ready"
+      || !sameReloadBinding(confirmation.reloadCandidate.binding, candidate.reloadCandidate.binding)
+      || !exact?.ok || !sameReloadBinding(exact.value, candidate.reloadCandidate.binding)) {
+      await appendControlOutput("reload-plugins", PLUGIN_RELOAD_INPUTS_CHANGED, ctx);
+      return;
+    }
+    const handoffPath = candidate.reloadCandidate.handoffPath;
+    const reserved = reserveReloadAttempt();
+    if (!reserved.ok) {
+      await appendControlOutput("reload-plugins", PLUGIN_RELOAD_ACTIVE, ctx);
+      return;
+    }
+    const nonce = reserved.value;
+    beginActiveReplacementShutdown(nonce, cwdState, ownerProjectRoot);
+    const written = writeReloadHandoff(handoffPath, candidate.reloadCandidate.binding, nonce);
+    if (!written.ok) {
+      consumeReloadAttempt(nonce);
+      clearActiveReplacementShutdown(nonce);
+      await appendControlOutput("reload-plugins", PLUGIN_RELOAD_HANDOFF_WRITE_FAILED, ctx);
+      return;
+    }
+    const handoffRecord = written.value;
+    try { await ctx.reload(); } catch { /* Pi may throw instead of returning its operational failure. */ }
+    const outcome = consumeReloadAttempt(nonce);
+    if (outcome === "accepted") {
+      clearActiveReplacementShutdown(nonce);
+      return;
+    }
+    if (outcome === "rejected") {
+      const shutdown = consumeActiveReplacementShutdown(nonce);
+      if (shutdown !== undefined) {
+        setTimeout(() => {
+          try { void Promise.resolve(shutdown()).catch(() => undefined); }
+          catch { /* Activation failure remains authoritative. */ }
+        }, 0);
+      }
+    } else {
+      clearActiveReplacementShutdown(nonce);
+      recordReloadHandoffOutcome(handoffPath, handoffRecord, "operational-failure");
+    }
+    throw new Error(RELOAD_ACTIVATION_UNCONFIRMED);
+  }
+
   async function handleControlCommand(name: string, args: string, ctx: any): Promise<void> {
     clearStartupSuppression();
     const command = controlCommands.get(name);
     if (!command) return;
+    if (name === "reload-plugins") {
+      await handlePluginReload(ctx);
+      return;
+    }
     try {
       const output = await command.render(args, ctx);
       if (output !== undefined) await appendControlOutput(name, output, ctx);

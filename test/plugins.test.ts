@@ -541,7 +541,7 @@ describe("resolveInstalledPlugins — component declarations", () => {
     write(path.join(installation.installPath, "commands", "go.md"), "go");
     write(path.join(installation.installPath, "agents", "worker.md"), "---\ndescription: worker\n---\nprompt");
     const plugin = resolve({ installations: [installation] }).plugins[0]!;
-    expect(plugin.manifestProjection).toEqual({ keywords: [], components: [], omissions: { keywords: 0, components: 0, diagnostics: 0 } });
+    expect(plugin.manifestProjection).toEqual({ keywords: [], dependencyDeclaration: "absent", defaultEnabled: { presence: "absent", sourcePath: path.join(installation.installPath, ".claude-plugin", "plugin.json") }, components: [], omissions: { keywords: 0, components: 0, diagnostics: 0 } });
     expect(plugin.skillSources[0]!.source.kind).toBe("file");
     expect(plugin.commandSources).toHaveLength(1);
     expect(plugin.agentSources).toHaveLength(1);

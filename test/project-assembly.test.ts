@@ -1,5 +1,10 @@
-import { spawnSync } from "node:child_process";
+import childProcess, { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
+import { syncBuiltinESMExports } from "node:module";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +23,22 @@ import {
   REINJECT_PER_SKILL_MAX_CHARS,
 } from "../src/runtime/skill-activation.js";
 import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
+import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
+import { loadSettings } from "../src/discovery/settings.js";
+import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection, issueOwnedDataRetirementProducerEvidence, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, reconstructOwnedDataRetirementProducerEvidence, revalidateCompleteOwnedProfileReference, type ExecutableAdmissionGeneration, type MarketplaceSnapshotTrustTarget, type OwnedMarketplaceSnapshotRecord, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
+import { canonicalJsonBytes, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { acquireLifecycleLocks, releaseLifecycleLocks } from "../src/plugin-lifecycle/locks.js";
+import { createOwnedDataRetirementParticipant, createTransactionCodecRegistry, executeTransaction, prepareTransaction, type OrdinaryTransactionParticipant, type TransactionParticipant, type TransactionProducerCodec } from "../src/plugin-lifecycle/transaction.js";
+import { previewRecovery, recoverTransaction } from "../src/plugin-lifecycle/recovery.js";
+import { planPluginSettingsWrite } from "../src/plugin-lifecycle/settings-plan.js";
+import { preparePluginSettingsWrite } from "../src/plugin-lifecycle/settings-writer.js";
+import { projectPluginManifest } from "../src/claude/plugin-metadata.js";
+import { createOwnedDataRetirementAuthorizer, ownedPluginDataDeletionEligible } from "../src/claude/plugin-paths.js";
+import { PORTABLE_TREE_LIMITS } from "../src/plugin-lifecycle/tree-validator.js";
+import { pluginMutableRecordKey } from "../src/plugin-lifecycle/plugin-service.js";
+import { deriveExecutableMarketplaceCatalogProjection } from "../src/util/plugin-marketplace-descriptor.js";
+import { captureImportedExecutableTrees, captureReloadCandidateBinding, clearReloadHandoff, readReloadHandoff, sameImportedExecutableTrees, sameReloadBinding, writeReloadHandoff } from "../src/plugin-lifecycle/reload-handoff.js";
 
 /**
  * Assembly-level coverage for loadClaudeProject: settings,
@@ -59,13 +80,25 @@ afterEach(() => {
   }
 });
 
-function write(filePath: string, content: string): void {
+function write(filePath: string, content: string | Uint8Array): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, content, "utf8");
+  fs.writeFileSync(filePath, content);
 }
 
 function writeSkill(dir: string, name: string, description: string): void {
   write(path.join(dir, name, "SKILL.md"), `---\ndescription: ${description}\n---\nbody of ${name}`);
+}
+
+function artifactEntriesFromDirectory(root: string): ArtifactDigestEntry[] {
+  const entries: ArtifactDigestEntry[] = [];
+  const walk = (directory: string, relative: string): void => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name); const childRelative = relative === "" ? name : `${relative}/${name}`; const stat = fs.statSync(file);
+      if (stat.isDirectory()) { entries.push({ path: childRelative, kind: "directory" }); walk(file, childRelative); }
+      else entries.push({ path: childRelative, kind: "file", executable: process.platform !== "win32" && (stat.mode & 0o111) !== 0, data: fs.readFileSync(file) });
+    }
+  };
+  walk(root, ""); return entries;
 }
 
 /** Base fixture: a git repo root and a hermetic user dir. */
@@ -78,10 +111,53 @@ function makeBase(): { base: string; repo: string; userDir: string } {
   return { base, repo, userDir };
 }
 
+function installOwnedPlugin(base: string, repo: string, userDir: string, checkoutFamilyPath = repo, homeDir = path.dirname(userDir), defaults: { manifest?: boolean; marketplace?: boolean; dependencies?: unknown; catalogDependencies?: unknown; name?: string; hooks?: boolean; skillBytes?: Uint8Array; catalogPadding?: string; catalogMetadataPluginRoot?: unknown; snapshotOnly?: boolean; catalogOnlyName?: string } = { manifest: true }): { root: string; dataRoot: string; installationRecordPath: string; marketplaceRecordPath: string; snapshotRecordPath: string; generationPath: string; member: Record<string, unknown>; treeDigest: string; rootDigest: string; executableDigest: string } {
+  const locationsResult = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: repo, checkoutFamilyPath } });
+  if (!locationsResult.ok) throw new Error("locations"); const locations = locationsResult.value;
+  const pluginName = defaults.name ?? "owned"; const pluginId = `${pluginName}@official` as `${string}@${string}`;
+  const manifest = JSON.stringify({ name: pluginName, version: "1.0.0", ...(defaults.manifest === undefined ? {} : { defaultEnabled: defaults.manifest }), ...(defaults.dependencies === undefined ? {} : { dependencies: defaults.dependencies }), ...(defaults.hooks ? { hooks: "./hooks/hooks.json" } : {}) });
+  const skill = defaults.skillBytes ?? Buffer.from(`---\ndescription: ${pluginName} skill\n---\n${pluginName} body`); const hook = JSON.stringify({ PreToolUse: [{ hooks: [] }] });
+  const catalog = JSON.stringify({ name: "official", owner: { name: "PiCC test" }, plugins: [{ name: pluginName, source: `./${pluginName}`, ...(defaults.marketplace === undefined ? {} : { defaultEnabled: defaults.marketplace }), ...(defaults.catalogDependencies === undefined ? {} : { dependencies: defaults.catalogDependencies }) }, ...(defaults.catalogOnlyName === undefined ? [] : [{ name: defaults.catalogOnlyName, source: `./${defaults.catalogOnlyName}` }])], ...(defaults.catalogPadding === undefined ? {} : { padding: defaults.catalogPadding }), ...(defaults.catalogMetadataPluginRoot === undefined ? {} : { metadata: { pluginRoot: defaults.catalogMetadataPluginRoot } }) });
+  const entries: ArtifactDigestEntry[] = [
+    { path: ".claude-plugin", kind: "directory" }, { path: ".claude-plugin/marketplace.json", kind: "file", data: Buffer.from(catalog) },
+    { path: pluginName, kind: "directory" }, { path: `${pluginName}/.claude-plugin`, kind: "directory" }, { path: `${pluginName}/.claude-plugin/plugin.json`, kind: "file", data: Buffer.from(manifest) },
+    { path: `${pluginName}/skills`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill`, kind: "directory" }, { path: `${pluginName}/skills/${pluginName}-skill/SKILL.md`, kind: "file", data: skill },
+    ...(defaults.hooks ? [{ path: `${pluginName}/hooks`, kind: "directory" as const }, { path: `${pluginName}/hooks/hooks.json`, kind: "file" as const, data: Buffer.from(hook) }] : []),
+    ...(defaults.catalogOnlyName === undefined ? [] : [{ path: defaults.catalogOnlyName, kind: "directory" as const }, { path: `${defaults.catalogOnlyName}/.claude-plugin`, kind: "directory" as const }, { path: `${defaults.catalogOnlyName}/.claude-plugin/plugin.json`, kind: "file" as const, data: Buffer.from(JSON.stringify({ name: defaults.catalogOnlyName, version: "1.0.0" })) }]),
+  ];
+  const treeDigest = digestArtifactEntries(entries); const artifactRoot = path.join(locations.profileRoot, "artifacts", "sha256", treeDigest.slice(7)); const root = path.join(artifactRoot, pluginName); const rootDigest = digestArtifactEntries(entries, pluginName);
+  write(path.join(artifactRoot, ".claude-plugin", "marketplace.json"), catalog); write(path.join(root, ".claude-plugin", "plugin.json"), manifest); write(path.join(root, "skills", `${pluginName}-skill`, "SKILL.md"), skill); if (defaults.hooks) write(path.join(root, "hooks", "hooks.json"), hook); if (defaults.catalogOnlyName !== undefined) write(path.join(artifactRoot, defaults.catalogOnlyName, ".claude-plugin", "plugin.json"), JSON.stringify({ name: defaults.catalogOnlyName, version: "1.0.0" }));
+  const manifestProjection = projectPluginManifest(JSON.parse(manifest) as Record<string, unknown>, path.join(root, ".claude-plugin", "plugin.json")).projection;
+  const executable = executableDigestForProjection(manifestProjection);
+  if (!executable.ok) throw new Error("executable");
+  const store: OwnedStateStore = { root: locations.profileRoot, profileRoot: locations.profileRoot, profileKey: locations.profileKey, artifactsRoot: path.join(locations.profileRoot, "artifacts", "sha256"), recordsRoot: path.join(locations.profileRoot, "records"), stagingRoot: path.join(locations.profileRoot, "staging"), generationsRoot: path.join(locations.profileRoot, "generations"), journalsRoot: path.join(locations.profileRoot, "journals"), receiptsRoot: path.join(locations.profileRoot, "receipts"), locksRoot: path.join(locations.profileRoot, "locks"), quarantineRoot: path.join(locations.profileRoot, "quarantine"), dataRoot: locations.dataRoot };
+  const catalogDigest = sha256(Buffer.from(catalog)); const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${treeDigest}`).digest("base64url")}` as const;
+  const source = { kind: "local-directory", path: path.resolve(base, "catalog") } as const;
+  const marketplaceCodec = createOwnedMarketplaceCodec(locations.profileKey);
+  const marketplace = { ownership: "picc-owned", name: "official", profileKey: locations.profileKey, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey!, projectKey: locations.checkoutFamilyKey!, source, selectedSnapshotId: snapshotId } as const;
+  const marketplaceScopeKey = ownedMarketplaceScopeKey(marketplace); const marketplaceEnvelope = createRecordEnvelope(marketplaceCodec, "picc-owned", marketplaceScopeKey, marketplace); if (!marketplaceEnvelope.ok) throw new Error("marketplace envelope");
+  const marketplacePartition = ownedRecordPartition(store, "picc-owned", marketplaceScopeKey); if (!marketplacePartition.ok) throw new Error("partition"); const marketplaceRecordPath = path.join(marketplacePartition.value, "record.json"); write(marketplaceRecordPath, Buffer.from(marketplaceEnvelope.value.bytes).toString("utf8"));
+  const snapshotCodec = createOwnedMarketplaceSnapshotCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot });
+  const executableCatalog = deriveExecutableMarketplaceCatalogProjection(Buffer.from(catalog), source.kind); if (executableCatalog === undefined) throw new Error("catalog projection");
+  const snapshotTarget: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source, catalogDigest, executableCatalog, artifactDigest: treeDigest, treeDigest, rootDigest: treeDigest, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot, installRoot: artifactRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: treeDigest } };
+  const snapshotTrust = createMarketplaceSnapshotTrustGrant(snapshotTarget); if (!snapshotTrust.ok) throw new Error(snapshotTrust.message); const snapshot = { ownership: "picc-owned", profileKey: locations.profileKey, ...snapshotTarget, trust: snapshotTrust.value } as const;
+  const snapshotScopeKey = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(snapshotCodec, "picc-owned", snapshotScopeKey, snapshot); if (!snapshotEnvelope.ok) throw new Error("snapshot envelope");
+  const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScopeKey); if (!snapshotPartition.ok) throw new Error("partition"); const snapshotRecordPath = path.join(snapshotPartition.value, "record.json"); write(snapshotRecordPath, Buffer.from(snapshotEnvelope.value.bytes).toString("utf8"));
+  const installationCodec = createOwnedPluginInstallationCodec({ profileKey: locations.profileKey, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: { [snapshotId]: [snapshot] } });
+  const catalogDeclaration = executableCatalog.declarations.find((item) => item.pluginId === pluginId); const catalogDependencies = catalogDeclaration?.dependencies ?? []; const catalogDependencyDeclaration = catalogDeclaration?.dependencyDeclaration ?? "absent";
+  const manifestDependencies = (manifestProjection.dependencies ?? []).map((dependency, itemIndex) => ({ ...dependency, itemIndex })); const mergedDependencies = [...catalogDependencies, ...manifestDependencies.filter((manifestDependency) => !catalogDependencies.some((catalogDependency) => catalogDependency.name === manifestDependency.name && catalogDependency.marketplace === manifestDependency.marketplace))].map((dependency, itemIndex) => ({ ...dependency, itemIndex })); const dependencyDeclaration = catalogDependencyDeclaration === "absent" && manifestProjection.dependencyDeclaration === "absent" ? "absent" as const : "complete" as const;
+  const installation = { ownership: "picc-owned", pluginId, scope: "project", profileKey: locations.profileKey, checkoutFamilyKey: locations.checkoutFamilyKey!, projectKey: locations.checkoutFamilyKey!, version: "1.0.0", source: { kind: "marketplace-relative", marketplaceName: "official", path: pluginName, marketplaceSnapshotId: snapshotId, catalogDigest }, artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: pluginName, usedSingleWrapper: false }, installRoot: root, dataIdentity: { profileKey: locations.profileKey, identity: pluginId }, executableGenerationId: "admission-current", trust: { target: pluginId, artifactDigest: treeDigest, treeDigest, rootDigest, executableDigest: executable.value, selectedRoot: { requested: "relative-subtree", path: pluginName, usedSingleWrapper: false }, allowedCrossMarketplaceDependencies: [], dependencies: mergedDependencies, dependencyDeclaration, catalogDependencies, catalogDependencyDeclaration, resolvedVersionAuthority: { kind: "manifest-version", version: "1.0.0" } }, allowedCrossMarketplaceDependencies: [], dependencies: mergedDependencies, dependencyDeclaration, catalogDependencies, catalogDependencyDeclaration, resolvedVersionAuthority: { kind: "manifest-version", version: "1.0.0" }, ...(defaults.marketplace === undefined ? {} : { marketplaceDefaultEnabled: defaults.marketplace }) } as const;
+  const installationScopeKey = `project-${locations.checkoutFamilyKey}`; let installationRecordPath = path.join(store.recordsRoot, "absent-installation.json"); let member: Record<string, unknown> = {};
+  if (!defaults.snapshotOnly) { const installEnvelope = createRecordEnvelope(installationCodec, "picc-owned", installationScopeKey, installation); if (!installEnvelope.ok) throw new Error("install envelope"); const installPartition = ownedRecordPartition(store, "picc-owned", installationScopeKey); if (!installPartition.ok) throw new Error("partition"); installationRecordPath = path.join(installPartition.value, `${pluginName}.json`); write(installationRecordPath, Buffer.from(installEnvelope.value.bytes).toString("utf8")); member = { pluginId, scope: "project", checkoutFamilyKey: locations.checkoutFamilyKey, projectKey: locations.checkoutFamilyKey, recordDigest: installEnvelope.value.envelope.payloadDigest }; }
+  const generation = canonicalJsonBytes({ ownership: "picc-owned", profileKey: locations.profileKey, generationId: "admission-current", members: defaults.snapshotOnly ? [] : [member] }); if (!generation.ok) throw new Error("generation"); const generationPath = path.join(store.generationsRoot, "current.json"); write(generationPath, Buffer.from(generation.value).toString("utf8"));
+  return { root, dataRoot: locations.dataRoot, installationRecordPath, marketplaceRecordPath, snapshotRecordPath, generationPath, member, treeDigest, rootDigest, executableDigest: executable.value };
+}
+
 function load(cwd: string, userDir: string) {
   return loadClaudeProject({
     cwd,
     userDir,
+    homeDir: path.dirname(userDir),
     managedSettingsPaths: [],
     managedArtifactDirs: [],
   });
@@ -175,6 +251,16 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(project.pluginInventory.find("beta@official")).toMatchObject({ outcome: { status: "disabled" } });
     expect(project.pluginInventory.find("beta@official")!.selectedInstallation).toBeUndefined();
     expect(Object.isFrozen(project.pluginInventory)).toBe(true);
+    expect(project.reloadCandidate.status).toBe("ready");
+    if (project.reloadCandidate.status !== "ready") throw new Error(project.reloadCandidate.reason);
+    expect(project.reloadCandidate.binding.importedExecutableTrees).toEqual([
+      expect.objectContaining({ kind: "tree", status: "present", digest: expect.stringMatching(/^sha256:/u) }),
+    ]);
+    fs.appendFileSync(path.join(alphaRoot, "skills", "alpha-skill", "SKILL.md"), "\nmutated");
+    const changed = project.reloadCandidate.recapture();
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.message);
+    expect(sameReloadBinding(changed.value, project.reloadCandidate.binding)).toBe(false);
   });
 
   it("uses one injected environment for marketplace discovery, installed selection, and metadata authorization", () => {
@@ -258,6 +344,26 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     } finally {
       open.mockRestore();
     }
+  });
+
+  it("renders lifecycle recovery evidence distinctly from ordinary doctor diagnostics", () => {
+    const { repo, userDir } = makeBase();
+    const project = load(repo, userDir);
+    const report = buildCompatReport(project);
+    const inventory = report.pluginInventory!;
+    const doctor = renderDoctorReport(project, {
+      ...report,
+      pluginInventory: {
+        ...inventory,
+        diagnostics: Object.freeze([
+          Object.freeze({ global: true, severity: "warning" as const, category: "lifecycle" as const, message: "Lifecycle pending: refresh", operationId: "orphan-operation", semanticStep: "refresh; 2 committed steps", recoveryCategory: "complete-or-rollback" as const, nextCommand: "picc plugin recover orphan-operation" }),
+          Object.freeze({ global: true, severity: "warning" as const, category: "diagnostic" as const, message: "ordinary diagnostic", nextCommand: "/plugin details alpha@official" }),
+        ]),
+      },
+    });
+    expect(doctor).toContain("Lifecycle evidence — owner: global; operation id: orphan-operation; semantic step: refresh; 2 committed steps; recovery category: complete-or-rollback; target: not attributed; observational recovery command: picc plugin recover orphan-operation");
+    expect(doctor).toContain("Diagnostic — global: ordinary diagnostic. Next: /plugin details alpha@official.");
+    expect(doctor).not.toContain("Lifecycle evidence — owner: global; operation id: not available; semantic step: not available; recovery category: not available; target: not attributed; observational recovery command: /plugin details alpha@official");
   });
 
   it("builds capability evidence only after plugin agent and hook validation", () => {
@@ -358,18 +464,60 @@ describe("loadClaudeProject — imported installed-state enablement", () => {
     expect(item.installations[0]?.projectLocation).toEqual({ kind: "main-checkout", display: "<main-checkout>" });
   });
 
-  it("keeps a locally cataloged plugin observational when no installed record exists", () => {
-    const { repo, userDir } = makeBase();
-    write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "owner/catalog" } } }));
-    write(path.join(userDir, "plugins", "marketplaces", "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Owner" }, plugins: [{ name: "catalog-only", source: { source: "github", repo: "owner/plugin" }, agents: "./agents" }] }));
-    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "catalog-only@official": true } }));
+  it("keeps a project-declared remote plugin passive without acquisition or lifecycle authority", () => {
+    const { repo, userDir } = makeBase(); const lifecycleRoot = path.join(path.dirname(userDir), ".picc");
+    write(path.join(userDir, "plugins", "known_marketplaces.json"), JSON.stringify({ official: { source: { source: "github", repo: "unavailable-owner/unavailable-catalog" } } }));
+    write(path.join(userDir, "plugins", "marketplaces", "official", ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "official", owner: { name: "Owner" }, plugins: [{ name: "catalog-only", source: { source: "github", repo: "unavailable-owner/unavailable-plugin", ref: "hostile-content-must-stay-unresolved" }, commands: "./commands", agents: "./agents", hooks: "./hooks/hooks.json" }] }));
+    write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "catalog-only@official": true } }));
+    expect(fs.existsSync(lifecycleRoot)).toBe(false);
+    const processTraps = [
+      vi.spyOn(childProcess, "spawn").mockImplementation((() => { throw new Error("passive load attempted spawn"); }) as typeof childProcess.spawn),
+      vi.spyOn(childProcess, "spawnSync").mockImplementation((() => { throw new Error("passive load attempted spawnSync"); }) as typeof childProcess.spawnSync),
+      vi.spyOn(childProcess, "exec").mockImplementation((() => { throw new Error("passive load attempted exec"); }) as unknown as typeof childProcess.exec),
+      vi.spyOn(childProcess, "execSync").mockImplementation((() => { throw new Error("passive load attempted execSync"); }) as typeof childProcess.execSync),
+      vi.spyOn(childProcess, "execFile").mockImplementation((() => { throw new Error("passive load attempted execFile"); }) as unknown as typeof childProcess.execFile),
+      vi.spyOn(childProcess, "execFileSync").mockImplementation((() => { throw new Error("passive load attempted execFileSync"); }) as typeof childProcess.execFileSync),
+      vi.spyOn(childProcess, "fork").mockImplementation((() => { throw new Error("passive load attempted fork"); }) as typeof childProcess.fork),
+    ];
+    const networkTraps = [
+      vi.spyOn(http, "request").mockImplementation((() => { throw new Error("passive load attempted HTTP request"); }) as typeof http.request),
+      vi.spyOn(http, "get").mockImplementation((() => { throw new Error("passive load attempted HTTP get"); }) as typeof http.get),
+      vi.spyOn(https, "request").mockImplementation((() => { throw new Error("passive load attempted HTTPS request"); }) as typeof https.request),
+      vi.spyOn(https, "get").mockImplementation((() => { throw new Error("passive load attempted HTTPS get"); }) as typeof https.get),
+      vi.spyOn(net, "connect").mockImplementation((() => { throw new Error("passive load attempted network connect"); }) as typeof net.connect),
+      vi.spyOn(net, "createConnection").mockImplementation((() => { throw new Error("passive load attempted network connection"); }) as typeof net.createConnection),
+    ];
+    const originalFetch = globalThis.fetch; const fetchTrap = vi.fn(() => Promise.reject(new Error("passive load attempted fetch"))); globalThis.fetch = fetchTrap;
+    try {
+      syncBuiltinESMExports();
+      expect(() => spawn("")).toThrow("passive load attempted spawn");
+      for (const trap of processTraps) trap.mockClear();
 
-    const project = load(repo, userDir);
-
-    expect(project.plugins).toEqual([]);
-    expect(project.pluginContexts.size).toBe(0);
-    expect(project.pluginInventory.find("catalog-only@official")).toMatchObject({ catalogPresence: true, outcome: { status: "enabled-but-uninstalled" } });
-    expect(project.pluginInventory.find("catalog-only@official")!.components).toContainEqual(expect.objectContaining({ kind: "agents", origin: "catalog" }));
+      const project = load(repo, userDir);
+      for (const trap of [...processTraps, ...networkTraps]) expect(trap).not.toHaveBeenCalled(); expect(fetchTrap).not.toHaveBeenCalled();
+      expect(project.plugins).toEqual([]);
+      expect(project.pluginContexts.size).toBe(0);
+      expect(project.skills.some((value) => value.source.pluginId === "catalog-only@official")).toBe(false);
+      expect(project.agents.some((value) => value.source.pluginId === "catalog-only@official")).toBe(false);
+      expect(JSON.stringify(project.mergedHooks)).not.toContain("catalog-only@official");
+      expect(project.pluginInventory.find("catalog-only@official")).toMatchObject({ catalogPresence: true, outcome: { status: "enabled-but-uninstalled" } });
+      expect(project.pluginInventory.find("catalog-only@official")!.components).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "commands", origin: "catalog" }),
+        expect.objectContaining({ kind: "agents", origin: "catalog" }),
+        expect.objectContaining({ kind: "hooks", origin: "catalog" }),
+      ]));
+      expect(project.pluginAdmissions).toEqual([]);
+      expect(project.ownedMarketplaces).toEqual([]);
+      expect(project.ownedProfileReference).toBeUndefined();
+      expect(project.executableGenerationObservation).toEqual({ status: "absent" });
+      expect(project.lifecycleObservation).toEqual({ records: [], receipts: [], pending: [] });
+      expect(fs.existsSync(path.join(userDir, "plugins", "installed_plugins.json"))).toBe(false);
+      expect(fs.existsSync(lifecycleRoot)).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const trap of [...processTraps, ...networkTraps]) trap.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 
   it("loads no installed content when enabledPlugins is absent", () => {
@@ -567,7 +715,7 @@ describe("loadClaudeProject — installed hook provenance", () => {
     const nativeRealpath = fs.realpathSync.native.bind(fs.realpathSync);
     let hookLookups = 0;
     const spy = vi.spyOn(fs.realpathSync, "native").mockImplementation((value) => {
-      if (path.normalize(String(value)) === path.normalize(hookPath) && ++hookLookups === 2) {
+      if (path.normalize(String(value)) === path.normalize(hookPath) && ++hookLookups === 4) {
         const error = new Error("private close-to-use path");
         Object.assign(error, { code: "EACCES" });
         throw error;
@@ -1040,5 +1188,655 @@ describe("buildSystemPromptSuffix — Active skills budgeting", () => {
     // Sanity: the section obeys the combined cap (plus headers/note slack).
     const start = suffix.indexOf("## Active skills");
     expect(suffix.length - start).toBeLessThanOrEqual(REINJECT_COMBINED_MAX_CHARS + 2000);
+  });
+});
+
+describe("loadClaudeProject — PiCC-owned admission composition", () => {
+  it("loads one committed owned generation and observes lifecycle state without mutation", () => {
+    const { base, repo, userDir } = makeBase();
+    const owned = installOwnedPlugin(base, repo, userDir);
+    const lifecycleRoot = path.join(path.dirname(userDir), ".picc", "plugins", "v1");
+    const snapshot = (): string => {
+      const entries: string[] = []; const walk = (directory: string): void => { for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, entry.name); if (entry.isDirectory()) walk(file); else entries.push(`${path.relative(lifecycleRoot, file)}:${fs.readFileSync(file).toString("base64")}`); } }; walk(lifecycleRoot); return entries.sort().join("\n");
+    };
+    const before = snapshot();
+    const project = load(repo, userDir);
+    expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", selectedSnapshotId: expect.stringMatching(/^marketplace-/u) })]);
+    expect(project.pluginAdmissions).toEqual(expect.arrayContaining([expect.objectContaining({ ownership: "picc-owned", pluginId: "owned@official", installPath: owned.root })]));
+    expect(project.plugins).toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: "owned@official", ownership: "picc-owned" })]));
+    expect(findByName(project.skills, "owned:owned-skill")).toBeDefined();
+    expect(project.pluginContexts.get("owned@official")?.dataDir).toContain(owned.dataRoot);
+    expect(project.lifecycleObservation.records.filter((item) => item.status === "admitted")).toHaveLength(3);
+    const authority = project.pluginAdmissions.find((value) => value.ownership === "picc-owned" && value.pluginId === "owned@official"); if (authority?.ownership !== "picc-owned") throw new Error("owned authority");
+    expect(project.pluginInventory.loadedGenerationId).toBe("admission-current");
+    expect(project.pluginInventory.find("owned@official")?.lifecycle).toMatchObject({ ownership: "picc-owned", mutableRecordKey: pluginMutableRecordKey(authority.authority.record), selectedScope: "project", loaded: true, dependency: { state: "satisfied" } });
+    expect(project.pluginInventory.find("owned@official")?.lifecycle?.candidates).toEqual([expect.objectContaining({ mutableRecordKey: pluginMutableRecordKey(authority.authority.record), selected: true })]);
+    expect(project.pluginInventory.marketplaces.find((value) => value.name === "official")).toMatchObject({ ownership: "picc-owned", candidates: [expect.objectContaining({ mutableRecordKey: ownedMarketplaceScopeKey(project.ownedMarketplaces[0]!), trusted: true })], availableActions: ["inspect"], readOnlyReason: expect.stringContaining("No exact selected") });
+    expect(snapshot()).toBe(before);
+  });
+
+  it("exposes catalog-only install eligibility only through the exact selected owned marketplace", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogOnlyName: "catalog-only" });
+    const source = path.join(repo, "catalog"); fs.cpSync(path.dirname(owned.root), source, { recursive: true }); write(path.join(repo, ".claude", "settings.json"), JSON.stringify({ extraKnownMarketplaces: { official: { source: { source: "directory", path: "./catalog" } } } }));
+    const project = load(repo, userDir); const catalogOnly = project.pluginInventory.find("catalog-only@official");
+    expect(catalogOnly).toMatchObject({ catalogPresence: true, lifecycle: { ownership: "unknown", marketplaceOwnership: "picc-owned", installed: false, availableActions: ["install"] } });
+    expect(project.pluginInventory.marketplaces.find((value) => value.name === "official")).toMatchObject({ ownership: "picc-owned", availableActions: ["inspect", "refresh", "remove"] });
+  });
+
+  it.each([
+    ["missing", (catalog: string) => fs.rmSync(catalog)],
+    ["mutated", (catalog: string) => fs.appendFileSync(catalog, " ")],
+    ["aliased", (catalog: string) => { const target = path.join(path.dirname(path.dirname(path.dirname(catalog))), "external-catalog.json"); fs.renameSync(catalog, target); fs.linkSync(target, catalog); }],
+  ] as const)("rejects %s retained marketplace catalog evidence", (_label, mutateCatalog) => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const catalog = path.join(path.dirname(owned.root), ".claude-plugin", "marketplace.json"); mutateCatalog(catalog);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" })]));
+  });
+
+  it("rejects an initially authored catalog above the catalog-read bound while within tree bounds", () => {
+    const { base, repo, userDir } = makeBase(); const padding = "x".repeat(1024 * 1024 + 1); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogPadding: padding, snapshotOnly: true });
+    const catalogPath = path.join(path.dirname(owned.root), ".claude-plugin", "marketplace.json"); const catalogBytes = fs.statSync(catalogPath).size;
+    expect(catalogBytes).toBeGreaterThan(1024 * 1024); expect(catalogBytes).toBeLessThan(PORTABLE_TREE_LIMITS.maximumFileBytes); expect(catalogBytes).toBeLessThan(PORTABLE_TREE_LIMITS.maximumTotalBytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" })]));
+  });
+
+  it("keeps basic materialized snapshot observation when no valid relative declaration is authorized", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { catalogMetadataPluginRoot: "../invalid", snapshotOnly: true }); const project = load(repo, userDir);
+    expect(project.ownedMarketplaces).toHaveLength(1); expect(project.plugins).toEqual([]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
+  });
+
+  it("projects only the active same-name checkout family while retaining the foreign record passively", () => {
+    const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); if (registration?.producer === undefined) throw new Error("registration");
+    const payload = registration.producer.payload as Record<string, unknown>; const foreignKey = `checkout-${"f".repeat(43)}`; const foreign = { ...payload, checkoutFamilyKey: foreignKey, projectKey: foreignKey };
+    const profileKey = payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const scopeKey = ownedMarketplaceScopeKey(foreign as never); const envelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", scopeKey, foreign as never); if (!envelope.ok) throw new Error(envelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); const foreignPath = path.join(partition.value, "record.json"); write(foreignPath, envelope.value.bytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", checkoutFamilyKey: payload.checkoutFamilyKey })]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: foreignPath, status: "admitted", producer: expect.objectContaining({ payload: expect.objectContaining({ checkoutFamilyKey: foreignKey }) }) })]));
+  });
+
+  it("fresh-loads a stable registration refresh while retaining both snapshots and executable generation", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); const oldSnapshot = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (registration?.producer === undefined || oldSnapshot?.producer === undefined) throw new Error("owned records");
+    const oldArtifactRoot = path.dirname(owned.root); const candidate = path.join(base, "refreshed-artifact"); fs.cpSync(oldArtifactRoot, candidate, { recursive: true }); const refreshedCatalog = Buffer.from(JSON.stringify({ name: "official", owner: { name: "PiCC refreshed" }, plugins: [{ name: "owned", source: "./owned" }] })); fs.writeFileSync(path.join(candidate, ".claude-plugin", "marketplace.json"), refreshedCatalog);
+    const refreshedTree = digestArtifactEntries(artifactEntriesFromDirectory(candidate)); const profileRoot = path.dirname(path.dirname(path.dirname(path.dirname(oldSnapshot.path)))); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const refreshedRoot = path.join(artifactsRoot, refreshedTree.slice(7)); fs.renameSync(candidate, refreshedRoot);
+    const catalogDigest = sha256(refreshedCatalog); const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${refreshedTree}`).digest("base64url")}` as const;
+    const refreshedExecutableCatalog = deriveExecutableMarketplaceCatalogProjection(refreshedCatalog, "local-directory"); if (refreshedExecutableCatalog === undefined) throw new Error("catalog projection");
+    const oldPayload = oldSnapshot.producer.payload as Record<string, unknown>; const target: MarketplaceSnapshotTrustTarget = { authorityKind: "materialized", marketplaceName: "official", snapshotId, source: oldPayload.source as Extract<MarketplaceSnapshotTrustTarget, { authorityKind: "materialized" }>["source"], catalogDigest, executableCatalog: refreshedExecutableCatalog, artifactDigest: refreshedTree, treeDigest: refreshedTree, rootDigest: refreshedTree, selectedRoot: { requested: "tree-root", path: "", usedSingleWrapper: false }, artifactRoot: refreshedRoot, installRoot: refreshedRoot, catalogRelativePath: ".claude-plugin/marketplace.json", provenance: { adapter: "local-directory-snapshot", artifactDigest: refreshedTree } }; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message);
+    const profileKey = oldPayload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const; const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore; const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); write(path.join(snapshotPartition.value, "record.json"), snapshotEnvelope.value.bytes);
+    const refreshedRegistration = { ...(registration.producer.payload as Record<string, unknown>), selectedSnapshotId: snapshotId }; const stableScope = ownedMarketplaceScopeKey(refreshedRegistration as never); expect(stableScope).toBe(registration.producer.scopeKey); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", stableScope, refreshedRegistration as never); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); fs.writeFileSync(registration.path, registrationEnvelope.value.bytes);
+    const second = load(repo, userDir); expect(second.ownedMarketplaces).toEqual([expect.objectContaining({ selectedSnapshotId: snapshotId })]); expect(second.lifecycleObservation.records.filter((item) => item.producer?.schema === "marketplace-catalog-snapshot" && item.status === "admitted")).toHaveLength(2); expect(second.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(second.executableGenerationObservation).toMatchObject({ status: "valid", generation: { generationId: "admission-current" } });
+  });
+
+  it("executes and freshly reconstructs an authentic operation-bound owned data retirement", async () => {
+    const setup = async (operationId: string) => {
+      const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const survivorOwned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { manifest: true, name: "survivor" });
+      const currentGeneration = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as ExecutableAdmissionGeneration; const predecessorGeneration = { ...currentGeneration, members: [owned.member, survivorOwned.member] } as unknown as ExecutableAdmissionGeneration; const predecessorGenerationBytes = canonicalJsonBytes(predecessorGeneration); if (!predecessorGenerationBytes.ok) throw new Error(predecessorGenerationBytes.message); fs.writeFileSync(owned.generationPath, predecessorGenerationBytes.value);
+      const loaded = load(repo, userDir);
+      if (loaded.ownedProfileReference === undefined) throw new Error("complete reference"); const selected = loaded.ownedProfileReference.installations.find((item) => item.record.pluginId === "owned@official"); const survivor = loaded.ownedProfileReference.installations.find((item) => item.record.pluginId === "survivor@official"); if (selected === undefined || survivor === undefined) throw new Error("selected installation set");
+      expect(ownedPluginDataDeletionEligible("owned@official", loaded.ownedProfileReference)).toBe(false);
+      if (process.platform !== "win32") { const chmodDirectories = (root: string): void => { fs.chmodSync(root, 0o700); for (const entry of fs.readdirSync(root, { withFileTypes: true })) if (entry.isDirectory()) chmodDirectories(path.join(root, entry.name)); }; chmodDirectories(path.join(path.dirname(userDir), ".picc")); }
+      const locations = createLifecycleLocations({ homeDir: path.dirname(userDir), profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: repo, checkoutFamilyPath: repo } }); if (!locations.ok) throw new Error("locations"); const established = await establishOwnedStateStore(locations.value, path.dirname(userDir)); if (!established.ok) throw new Error(established.message); const store = established.value;
+      const predecessor = loaded.ownedProfileReference.generation; const successorId = `admission-${operationId}`; const snapshots = loaded.lifecycleObservation.records.filter((item) => item.status === "admitted" && item.producer?.schema === "marketplace-catalog-snapshot").map((item) => item.producer!.payload as OwnedMarketplaceSnapshotRecord); const snapshotMap: Record<string, OwnedMarketplaceSnapshotRecord[]> = {}; for (const snapshot of snapshots) (snapshotMap[snapshot.snapshotId] ??= []).push(snapshot);
+      const installationCodec = createOwnedPluginInstallationCodec({ profileKey: store.profileKey as never, artifactsRoot: store.artifactsRoot, marketplaceSnapshots: snapshotMap }); const reboundSurvivor = { ...survivor.record, executableGenerationId: successorId }; const reboundEnvelope = createRecordEnvelope(installationCodec, "picc-owned", `project-${survivor.record.projectKey}`, reboundSurvivor); if (!reboundEnvelope.ok) throw new Error(reboundEnvelope.message);
+      const survivorMember = predecessor.members.find((member) => member.pluginId === "survivor@official"); if (survivorMember === undefined) throw new Error("survivor member"); const successor = { ...predecessor, generationId: successorId, members: [{ ...survivorMember, recordDigest: reboundEnvelope.value.envelope.payloadDigest }] } satisfies ExecutableAdmissionGeneration;
+      const issued = issueOwnedDataRetirementProducerEvidence({ store, predecessor: loaded.ownedProfileReference, selectedInstallation: selected, successorGeneration: successor }); if (!issued.ok) throw new Error(issued.message);
+      expect(issueOwnedDataRetirementProducerEvidence({ store, predecessor: loaded.ownedProfileReference, selectedInstallation: selected, successorGeneration: { ...successor, generationId: predecessor.generationId } })).toMatchObject({ ok: false });
+      expect(issueOwnedDataRetirementProducerEvidence({ store, predecessor: { ...loaded.ownedProfileReference, generation: { ...predecessor, generationId: "admission-decoy" } }, selectedInstallation: selected, successorGeneration: successor })).toMatchObject({ ok: false });
+      const recordBytes = fs.readFileSync(owned.installationRecordPath); const survivorBytes = fs.readFileSync(survivorOwned.installationRecordPath); const recordEnvelope = JSON.parse(recordBytes.toString()) as { scopeKey: string }; const survivorRecordEnvelope = JSON.parse(survivorBytes.toString()) as { scopeKey: string }; const stage = (name: string, bytes: Uint8Array): string => { const target = path.join(store.stagingRoot, name); fs.writeFileSync(target, bytes); return target; };
+      const recordStage = stage(`${operationId}-record.stage`, recordBytes); const recordBackup = stage(`${operationId}-record.backup`, recordBytes);
+      const deletion: OrdinaryTransactionParticipant = { kind: "plugin-installation-delete", effect: "delete", key: "installation", ownerKey: "picc-owned", scopeKey: recordEnvelope.scopeKey, targetPath: owned.installationRecordPath, targetClass: "owned", precondition: { state: "present", digest: sha256(recordBytes) }, stagedPath: recordStage, stagedDigest: sha256(recordBytes), rollback: { kind: "restore-backup", path: recordBackup, digest: sha256(recordBytes) }, producerEvidence: { role: "selected-installation-delete" } };
+      const settingsBytes = Buffer.from("{\"enabledPlugins\":{}}"); const settingsStage = stage(`${operationId}-settings.stage`, settingsBytes); const settingsTarget = path.join(repo, ".picc-retirement-settings.json"); const settingsPrefix: OrdinaryTransactionParticipant = { kind: "plugin-settings", key: "settings-prefix", ownerKey: "plugin-settings", scopeKey: "project-settings", targetPath: settingsTarget, targetClass: "external", precondition: { state: "absent" }, stagedPath: settingsStage, stagedDigest: sha256(settingsBytes), rollback: { kind: "delete-new-target" }, producerEvidence: { role: "authorized-settings-prefix" } };
+      const caseVariedProfileRoot = process.platform === "win32" ? store.profileRoot.replace(/[A-Za-z]/g, (value) => value === value.toLowerCase() ? value.toUpperCase() : value.toLowerCase()) : store.profileRoot;
+      const insideSettingsTarget = path.join(caseVariedProfileRoot, "inside-profile-settings.json"); const insideSettingsPrefix: OrdinaryTransactionParticipant = { ...settingsPrefix, key: "inside-profile-settings-prefix", targetPath: insideSettingsTarget };
+      const survivorStage = stage(`${operationId}-survivor.stage`, reboundEnvelope.value.bytes); const survivorBackup = stage(`${operationId}-survivor.backup`, survivorBytes); const replacement: OrdinaryTransactionParticipant = { kind: "plugin-installation-replace", key: "survivor-rebind", ownerKey: "picc-owned", scopeKey: survivorRecordEnvelope.scopeKey, targetPath: survivorOwned.installationRecordPath, targetClass: "owned", precondition: { state: "present", digest: sha256(survivorBytes) }, stagedPath: survivorStage, stagedDigest: sha256(reboundEnvelope.value.bytes), rollback: { kind: "restore-backup", path: survivorBackup, digest: sha256(survivorBytes) }, producerEvidence: { role: "survivor-generation-rebind", predecessorEnvelopeBase64: survivorBytes.toString("base64"), successorEnvelopeBase64: Buffer.from(reboundEnvelope.value.bytes).toString("base64") } };
+      const dataPath = path.join(store.dataRoot, `plugin-${createHash("sha256").update("owned@official").digest("base64url")}`); fs.mkdirSync(dataPath); fs.writeFileSync(path.join(dataPath, "state"), "persistent");
+      const retirement = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 3, key: "data", qualifiedIdentity: "owned@official", producerEvidence: issued.value }); if (!retirement.ok) throw new Error(retirement.message);
+      const successorBytes = canonicalJsonBytes(successor); if (!successorBytes.ok) throw new Error(successorBytes.message); const successorStage = stage(`${operationId}-successor.stage`, successorBytes.value); const predecessorBytes = fs.readFileSync(owned.generationPath); const predecessorBackup = stage(`${operationId}-generation.backup`, predecessorBytes);
+      const generation: OrdinaryTransactionParticipant = { kind: "executable-generation", key: "generation", ownerKey: "picc-owned", scopeKey: "generation", targetPath: path.join(store.generationsRoot, "current.json"), targetClass: "generation", precondition: { state: "present", digest: sha256(predecessorBytes) }, stagedPath: successorStage, stagedDigest: sha256(successorBytes.value), rollback: { kind: "restore-backup", path: predecessorBackup, digest: sha256(predecessorBytes) }, producerEvidence: { generation: successor }, generationId: successor.generationId };
+      const participants: readonly TransactionParticipant[] = [settingsPrefix, deletion, replacement, retirement.value, generation]; expect(reconstructOwnedDataRetirementProducerEvidence(store, issued.value, { targetPath: deletion.targetPath, targetDigest: deletion.precondition.state === "present" ? deletion.precondition.digest : sha256(Buffer.alloc(0)), backupPath: recordBackup, backupDigest: sha256(recordBytes), scopeKey: deletion.scopeKey })).toMatchObject({ ok: true }); const productionAuthorizer = createOwnedDataRetirementAuthorizer({ store, qualifiedIdentity: "owned@official" }); let capturedContext: Parameters<typeof productionAuthorizer>[0] | undefined; let retirementAuthorizationCalls = 0; const makeCodec = (): TransactionProducerCodec => ({ schema: `test.production-retirement-${operationId}`, version: 1, decodeSummary: (value) => typeof value === "object" && value !== null && (value as { operationId?: unknown }).operationId === operationId ? { ok: true, value } : { ok: false, code: "summary", message: "invalid" }, validatePlan: (plan) => plan.length === 5 ? { ok: true, value: undefined } : { ok: false, code: "plan", message: "invalid" }, authorizeExternal: (context) => context.participant.kind === "plugin-settings" && (context.participant.targetPath === settingsTarget || context.participant.targetPath === insideSettingsTarget) ? { ok: true, value: undefined } : { ok: false, code: "settings", message: "wrong settings" }, requiredLocks: () => ({ ok: true, value: [{ kind: "profile", key: store.profileKey }] }), authorizeOwnedDelete: (context) => context.participant.targetPath === owned.installationRecordPath ? { ok: true, value: undefined } : { ok: false, code: "delete", message: "wrong delete" }, authorizeOwnedDataRetirement: async (context) => { retirementAuthorizationCalls += 1; capturedContext = context; return productionAuthorizer(context); } });
+      const productionInvalidDelete: OrdinaryTransactionParticipant = { ...deletion, key: "survivor-delete", scopeKey: survivorRecordEnvelope.scopeKey, targetPath: survivorOwned.installationRecordPath, precondition: { state: "present", digest: sha256(survivorBytes) }, stagedPath: survivorBackup, stagedDigest: sha256(survivorBytes), rollback: { kind: "restore-backup", path: survivorBackup, digest: sha256(survivorBytes) } }; expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [productionInvalidDelete, deletion, settingsPrefix, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const wrongSuccessorPayload = { ...successor, generationId: `admission-${operationId}-wrong` }; const wrongSuccessorBytes = canonicalJsonBytes(wrongSuccessorPayload); if (!wrongSuccessorBytes.ok) throw new Error(wrongSuccessorBytes.message); const wrongSuccessorPath = stage(`${operationId}-wrong-successor.stage`, wrongSuccessorBytes.value); const wrongSuccessor = { ...generation, generationId: wrongSuccessorPayload.generationId, stagedPath: wrongSuccessorPath, stagedDigest: sha256(wrongSuccessorBytes.value), producerEvidence: { generation: wrongSuccessorPayload } }; expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, replacement, retirement.value, wrongSuccessor] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const decoyPath = path.join(store.generationsRoot, "decoy.json"); fs.writeFileSync(decoyPath, predecessorBytes); const decoyGeneration = { ...generation, targetPath: decoyPath }; expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, replacement, retirement.value, decoyGeneration] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, { ...replacement, kind: "ordinary-record" }, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [replacement, deletion, settingsPrefix, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const earlyRetirement = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 2, key: "data", qualifiedIdentity: "owned@official", producerEvidence: issued.value }); if (!earlyRetirement.ok) throw new Error(earlyRetirement.message); expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, earlyRetirement.value, replacement, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const alteredSuccessorEnvelope = Buffer.from((replacement.producerEvidence as { successorEnvelopeBase64: string }).successorEnvelopeBase64, "base64"); const alteredRaw = JSON.parse(alteredSuccessorEnvelope.toString()) as { payload: Record<string, unknown> }; alteredRaw.payload = { ...alteredRaw.payload, version: "2.0.0" }; const alteredPayload = canonicalJsonBytes(alteredRaw.payload); if (!alteredPayload.ok) throw new Error(alteredPayload.message); (alteredRaw as unknown as { payloadDigest: string }).payloadDigest = sha256(alteredPayload.value); const alteredEnvelope = canonicalJsonBytes(alteredRaw); if (!alteredEnvelope.ok) throw new Error(alteredEnvelope.message); const alteredPath = stage(`${operationId}-altered-survivor.stage`, alteredEnvelope.value); const alteredReplacement = { ...replacement, stagedPath: alteredPath, stagedDigest: sha256(alteredEnvelope.value), producerEvidence: { ...(replacement.producerEvidence as object), successorEnvelopeBase64: Buffer.from(alteredEnvelope.value).toString("base64") } }; expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, alteredReplacement, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const duplicateMember = { ...predecessor.members[0]!, scope: "local" as const }; const duplicateEvidence = { ...issued.value, predecessorGeneration: { ...predecessor, members: [...predecessor.members, duplicateMember] } }; const duplicateRetirement = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 3, key: "data", qualifiedIdentity: "owned@official", producerEvidence: duplicateEvidence }); if (!duplicateRetirement.ok) throw new Error(duplicateRetirement.message); expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, replacement, duplicateRetirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const mismatchedPredecessorEvidence = { ...issued.value, predecessorGeneration: { ...predecessor, generationId: `admission-${operationId}-mismatched-predecessor` } }; const mismatchedPredecessorRetirement = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 3, key: "data", qualifiedIdentity: "owned@official", producerEvidence: mismatchedPredecessorEvidence }); if (!mismatchedPredecessorRetirement.ok) throw new Error(mismatchedPredecessorRetirement.message); expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, replacement, mismatchedPredecessorRetirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const sameGenerationEvidence = { ...issued.value, successorGeneration: { ...successor, generationId: predecessor.generationId } }; const sameGenerationRetirement = await createOwnedDataRetirementParticipant({ store, operationId, participantIndex: 3, key: "data", qualifiedIdentity: "owned@official", producerEvidence: sameGenerationEvidence }); if (!sameGenerationRetirement.ok) throw new Error(sameGenerationRetirement.message); expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [settingsPrefix, deletion, replacement, sameGenerationRetirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" });
+      const extraEnvelopePath = path.join(path.dirname(survivorOwned.installationRecordPath), "extra-authentic.json"); const extraEnvelopeWrite: OrdinaryTransactionParticipant = { ...replacement, kind: "plugin-installation-envelope-write", key: "extra-installation-write", targetPath: extraEnvelopePath, precondition: { state: "absent" }, rollback: { kind: "delete-new-target" } }; const beforeExtra = fs.readFileSync(survivorOwned.installationRecordPath); expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [extraEnvelopeWrite, deletion, replacement, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" }); expect(fs.existsSync(extraEnvelopePath)).toBe(false); expect(fs.readFileSync(survivorOwned.installationRecordPath)).toEqual(beforeExtra); expect(load(repo, userDir).ownedProfileReference?.installations.map((item) => item.record.pluginId).sort()).toEqual(["owned@official", "survivor@official"]);
+      const authorizationCallsBeforeInsideTarget = retirementAuthorizationCalls; expect(await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants: [insideSettingsPrefix, deletion, replacement, retirement.value, generation] })).toMatchObject({ ok: false, code: "invalid-producer-data" }); expect(retirementAuthorizationCalls).toBeGreaterThan(authorizationCallsBeforeInsideTarget);
+      const prepared = await prepareTransaction({ store, codec: makeCodec(), operationId, confirmationSummary: { operationId }, participants }); if (!prepared.ok) throw new Error(`${prepared.code}: ${prepared.message}`);
+      if (capturedContext === undefined) throw new Error("production context not captured"); expect(await productionAuthorizer({ ...capturedContext })).toMatchObject({ ok: false });
+      const wrongIdentityAuthorizer = createOwnedDataRetirementAuthorizer({ store, qualifiedIdentity: "survivor@official" }); expect(await wrongIdentityAuthorizer(capturedContext)).toMatchObject({ ok: false });
+      const foreignLocations = createLifecycleLocations({ homeDir: path.dirname(userDir), profilePath: path.join(path.dirname(userDir), ".claude-foreign"), platform: process.platform === "win32" ? "win32" : "posix" }); if (!foreignLocations.ok) throw new Error("foreign locations"); const foreignStore = await establishOwnedStateStore(foreignLocations.value, path.dirname(userDir)); if (!foreignStore.ok) throw new Error(foreignStore.message); expect(await createOwnedDataRetirementAuthorizer({ store: foreignStore.value, qualifiedIdentity: "owned@official" })(capturedContext)).toMatchObject({ ok: false });
+      const lease = await acquireLifecycleLocks({ store, operationId, identities: prepared.value.requiredLocks }); if (!lease.ok) throw new Error(lease.message);
+      const registry = () => { const value = createTransactionCodecRegistry([makeCodec()]); if (!value.ok) throw new Error(value.message); return value.value; };
+      const recover = async (action: "complete" | "rollback") => { const preview = await previewRecovery({ store, operationId, registry: registry() }); if (!preview.ok) throw new Error(preview.message); return recoverTransaction({ store, operationId, action, confirmedProducerSchema: preview.value.producerSchema, confirmedProducerVersion: preview.value.producerVersion, confirmedPlanDigest: preview.value.planDigest, confirmedConfirmationDigest: preview.value.confirmationDigest, registry: registry(), lease: lease.value }); };
+      return { store, owned, survivorOwned, repo, userDir, prepared: prepared.value, lease: lease.value, registry, recover, retirement: retirement.value, predecessor, successor };
+    };
+    const normal = await setup("normal"); expect(await executeTransaction(normal.store, normal.prepared, { lease: normal.lease })).toMatchObject({ state: "committed", receipt: { completed: 5, outcome: "committed" } });
+    expect(JSON.parse(fs.readFileSync(normal.owned.generationPath, "utf8"))).toEqual(normal.successor); expect(fs.existsSync(normal.owned.installationRecordPath)).toBe(false);
+    for (const file of fs.readdirSync(normal.store.stagingRoot)) fs.rmSync(path.join(normal.store.stagingRoot, file), { recursive: true, force: true });
+    expect(load(normal.repo, normal.userDir).ownedProfileReference?.installations.map((item) => item.record.pluginId)).toEqual(["survivor@official"]);
+    const recoveryCases = [[0, "after-replacement", "complete"], [0, "after-replacement", "rollback"], [1, "after-forward-deletion", "complete"], [1, "after-forward-deletion", "rollback"], [2, "after-replacement", "complete"], [2, "after-replacement", "rollback"], [3, "after-data-retirement-rename", "complete"], [3, "after-data-retirement-rename", "rollback"], [4, "after-replacement", "rollback"]] as const;
+    for (const [faultIndex, selectedPhase, action] of recoveryCases) {
+      const selected = await setup(`${faultIndex}-${action}`); let fired = false; const outcome = await executeTransaction(selected.store, selected.prepared, { lease: selected.lease, faults: { hit(phase, index) { if (!fired && index === faultIndex && phase === selectedPhase) { fired = true; throw new Error("fault"); } } } });
+      expect(outcome).toMatchObject({ state: "pending-recovery", completed: faultIndex + 1 }); const recovered = await selected.recover(action); expect(recovered).toMatchObject({ ok: true, value: { outcome: action === "complete" ? "committed" : "rolled-back" } });
+      expect(JSON.parse(fs.readFileSync(selected.owned.generationPath, "utf8"))).toEqual(action === "complete" ? selected.successor : selected.predecessor); expect(fs.existsSync(selected.owned.installationRecordPath)).toBe(action === "rollback");
+      for (const file of fs.readdirSync(selected.store.stagingRoot)) fs.rmSync(path.join(selected.store.stagingRoot, file), { recursive: true, force: true });
+      const fresh = load(selected.repo, selected.userDir); expect(fresh.ownedProfileReference?.installations.map((item) => item.record.pluginId).sort()).toEqual(action === "complete" ? ["survivor@official"] : ["owned@official", "survivor@official"]);
+      expect(await previewRecovery({ store: selected.store, operationId: selected.prepared.operationId, registry: selected.registry() })).toMatchObject({ ok: true, value: { terminalOutcome: action === "complete" ? "committed" : "rolled-back" } });
+      await releaseLifecycleLocks(selected.lease);
+    }
+    const ambiguous = await setup("ambiguous-selected-path"); let interrupted = false; expect(await executeTransaction(ambiguous.store, ambiguous.prepared, { lease: ambiguous.lease, faults: { hit(phase, index) { if (!interrupted && phase === "after-forward-deletion" && index === 1) { interrupted = true; throw new Error("after-delete"); } } } })).toMatchObject({ state: "pending-recovery", completed: 2 });
+    fs.writeFileSync(ambiguous.owned.installationRecordPath, "recreated-foreign-bytes"); const completion = await recoverTransaction({ store: ambiguous.store, operationId: ambiguous.prepared.operationId, action: "complete", confirmedProducerSchema: ambiguous.prepared.producerSchema, confirmedProducerVersion: ambiguous.prepared.producerVersion, confirmedPlanDigest: ambiguous.prepared.planDigest, confirmedConfirmationDigest: ambiguous.prepared.confirmationDigest, registry: ambiguous.registry(), lease: ambiguous.lease }); expect(completion).toMatchObject({ ok: false }); expect(fs.readFileSync(path.join(ambiguous.store.dataRoot, `plugin-${createHash("sha256").update("owned@official").digest("base64url")}`, "state"), "utf8")).toBe("persistent"); expect(JSON.parse(fs.readFileSync(ambiguous.owned.generationPath, "utf8"))).toEqual(ambiguous.predecessor); expect(await previewRecovery({ store: ambiguous.store, operationId: ambiguous.prepared.operationId, registry: ambiguous.registry() })).toMatchObject({ ok: false }); expect(fs.existsSync(path.join(ambiguous.store.receiptsRoot, `${ambiguous.prepared.operationId}.json`))).toBe(false); await releaseLifecycleLocks(ambiguous.lease);
+    expect(await previewRecovery({ store: normal.store, operationId: normal.prepared.operationId, registry: normal.registry() })).toMatchObject({ ok: true, value: { terminalOutcome: "committed" } }); await releaseLifecycleLocks(normal.lease);
+
+    const multi = makeBase(); const multiOwned = installOwnedPlugin(multi.base, multi.repo, multi.userDir); const firstMulti = load(multi.repo, multi.userDir); const projectInstallation = firstMulti.lifecycleObservation.records.find((item) => item.producer?.schema === "plugin-installation"); if (projectInstallation?.producer === undefined) throw new Error("project installation");
+    const multiProfileKey = (projectInstallation.producer.payload as OwnedPluginInstallationRecord).profileKey; const multiProfileRoot = path.dirname(path.dirname(path.dirname(path.dirname(projectInstallation.path)))); const multiStoreShape = { root: multiProfileRoot, profileRoot: multiProfileRoot, profileKey: multiProfileKey, recordsRoot: path.join(multiProfileRoot, "records"), artifactsRoot: path.join(multiProfileRoot, "artifacts", "sha256"), stagingRoot: path.join(multiProfileRoot, "staging"), generationsRoot: path.join(multiProfileRoot, "generations"), journalsRoot: path.join(multiProfileRoot, "journals"), receiptsRoot: path.join(multiProfileRoot, "receipts"), locksRoot: path.join(multiProfileRoot, "locks"), quarantineRoot: path.join(multiProfileRoot, "quarantine"), dataRoot: path.join(multiProfileRoot, "data") } satisfies OwnedStateStore;
+    const multiSnapshots = firstMulti.lifecycleObservation.records.filter((item) => item.status === "admitted" && item.producer?.schema === "marketplace-catalog-snapshot").map((item) => item.producer!.payload as OwnedMarketplaceSnapshotRecord); const multiSnapshotMap: Record<string, OwnedMarketplaceSnapshotRecord[]> = {}; for (const snapshot of multiSnapshots) (multiSnapshotMap[snapshot.snapshotId] ??= []).push(snapshot); const multiCodec = createOwnedPluginInstallationCodec({ profileKey: multiProfileKey, artifactsRoot: multiStoreShape.artifactsRoot, marketplaceSnapshots: multiSnapshotMap });
+    const localInstallation = { ...(projectInstallation.producer.payload as OwnedPluginInstallationRecord), scope: "local" as const }; const localScopeKey = `local-${localInstallation.projectKey}`; const localEnvelope = createRecordEnvelope(multiCodec, "picc-owned", localScopeKey, localInstallation); if (!localEnvelope.ok) throw new Error(localEnvelope.message); const localPartition = ownedRecordPartition(multiStoreShape, "picc-owned", localScopeKey); if (!localPartition.ok) throw new Error(localPartition.message); const localRecordPath = path.join(localPartition.value, "owned-local.json"); write(localRecordPath, localEnvelope.value.bytes);
+    const originalGeneration = JSON.parse(fs.readFileSync(multiOwned.generationPath, "utf8")) as ExecutableAdmissionGeneration; const localMember = { ...originalGeneration.members[0]!, scope: "local" as const, recordDigest: localEnvelope.value.envelope.payloadDigest }; const completeMultiGeneration = { ...originalGeneration, members: [...originalGeneration.members, localMember] }; const completeMultiBytes = canonicalJsonBytes(completeMultiGeneration); if (!completeMultiBytes.ok) throw new Error(completeMultiBytes.message); fs.writeFileSync(multiOwned.generationPath, completeMultiBytes.value);
+    const loadedMulti = load(multi.repo, multi.userDir); if (loadedMulti.ownedProfileReference === undefined) throw new Error("complete multi-scope predecessor"); expect(loadedMulti.ownedProfileReference.installations.filter((item) => item.record.pluginId === "owned@official")).toHaveLength(2); if (process.platform !== "win32") { const chmodDirectories = (root: string): void => { fs.chmodSync(root, 0o700); for (const entry of fs.readdirSync(root, { withFileTypes: true })) if (entry.isDirectory()) chmodDirectories(path.join(root, entry.name)); }; chmodDirectories(path.join(path.dirname(multi.userDir), ".picc")); }
+    const multiLocations = createLifecycleLocations({ homeDir: path.dirname(multi.userDir), profilePath: multi.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: multi.repo, checkoutFamilyPath: multi.repo } }); if (!multiLocations.ok) throw new Error("multi locations"); const establishedMulti = await establishOwnedStateStore(multiLocations.value, path.dirname(multi.userDir)); if (!establishedMulti.ok) throw new Error(establishedMulti.message); const selectedMulti = loadedMulti.ownedProfileReference.installations[0]!; const multiSuccessor = { ...completeMultiGeneration, generationId: "admission-multi-successor", members: [localMember] }; const multiDataPath = path.join(establishedMulti.value.dataRoot, `plugin-${createHash("sha256").update("owned@official").digest("base64url")}`); fs.mkdirSync(multiDataPath); fs.writeFileSync(path.join(multiDataPath, "state"), "shared");
+    expect(issueOwnedDataRetirementProducerEvidence({ store: establishedMulti.value, predecessor: loadedMulti.ownedProfileReference, selectedInstallation: selectedMulti, successorGeneration: multiSuccessor })).toMatchObject({ ok: false, code: "retirement-authority" }); expect(fs.readFileSync(path.join(multiDataPath, "state"), "utf8")).toBe("shared"); expect(fs.existsSync(localRecordPath)).toBe(true);
+  }, 60_000);
+
+  it.each([
+    ["missing member record", (owned: ReturnType<typeof installOwnedPlugin>) => fs.rmSync(owned.installationRecordPath), "membership-invalid"],
+    ["partial generation marker", (owned: ReturnType<typeof installOwnedPlugin>) => { const marker = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as Record<string, unknown>; const encoded = canonicalJsonBytes({ ...marker, members: [] }); if (!encoded.ok) throw new Error("marker"); fs.writeFileSync(owned.generationPath, encoded.value); }, "membership-invalid"],
+    ["absent generation marker", (owned: ReturnType<typeof installOwnedPlugin>) => fs.rmSync(owned.generationPath), "absent"],
+    ["malformed generation marker", (owned: ReturnType<typeof installOwnedPlugin>) => fs.writeFileSync(owned.generationPath, "{not-json"), "malformed"],
+    ["noncanonical generation marker", (owned: ReturnType<typeof installOwnedPlugin>) => fs.appendFileSync(owned.generationPath, "\n"), "noncanonical"],
+    ["unreadable generation marker", (owned: ReturnType<typeof installOwnedPlugin>) => { fs.rmSync(owned.generationPath); fs.mkdirSync(owned.generationPath); }, "unreadable"],
+    ["invalid generation parent root", (owned: ReturnType<typeof installOwnedPlugin>) => { fs.rmSync(path.dirname(owned.generationPath), { recursive: true }); fs.writeFileSync(path.dirname(owned.generationPath), "not-a-directory"); }, "unreadable"],
+    ["extra generation record", (owned: ReturnType<typeof installOwnedPlugin>) => fs.copyFileSync(owned.installationRecordPath, path.join(path.dirname(owned.installationRecordPath), "extra.json")), "membership-invalid"],
+  ] as const)("keeps the entire owned generation inert for %s", (_label, mutate, expectedObservation) => {
+    const { base, repo, userDir } = makeBase();
+    const owned = installOwnedPlugin(base, repo, userDir);
+    mutate(owned);
+    const project = load(repo, userDir);
+    expect(project.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]);
+    expect(project.plugins.some((plugin) => plugin.ownership === "picc-owned")).toBe(false);
+    expect(project.pluginContexts.has("owned@official")).toBe(false);
+    expect(project.executableGenerationObservation.status).toBe(expectedObservation);
+  });
+
+  it.each([
+    ["marketplace default", { manifest: true, marketplace: false }, undefined, false],
+    ["manifest default", { manifest: false }, undefined, false],
+    ["implicit default", {}, undefined, true],
+    ["explicit enabled setting", { manifest: false, marketplace: false }, true, true],
+    ["explicit disabled setting", { manifest: true }, false, false],
+  ] as const)("applies %s enablement precedence on fresh assembly", (_label, defaults, explicit, expectedLoaded) => {
+    const { base, repo, userDir } = makeBase();
+    installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), defaults);
+    if (explicit !== undefined) write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "owned@official": explicit } }));
+    const project = load(repo, userDir);
+    expect(project.plugins.some((plugin) => plugin.pluginId === "owned@official")).toBe(expectedLoaded);
+  });
+
+  it("does not let a higher-scope record independently change retained marketplace default authority", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { manifest: false }); const first = load(repo, userDir);
+    const installationObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "plugin-installation"); const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot");
+    if (installationObservation?.producer === undefined || snapshotObservation?.producer === undefined) throw new Error("owned observations");
+    const installation = installationObservation.producer.payload as Record<string, unknown>; const snapshot = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = installation.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey;
+    const installationCodec = createOwnedPluginInstallationCodec({ profileKey, artifactsRoot: path.dirname(path.dirname(owned.root)), marketplaceSnapshots: { [String(snapshot.snapshotId)]: [snapshot as never] } });
+    const higher = { ...installation, scope: "local" }; const higherEnvelope = createRecordEnvelope(installationCodec, "picc-owned", `local-${String(installation.checkoutFamilyKey)}`, higher as never); if (!higherEnvelope.ok) throw new Error(higherEnvelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(installationObservation.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", `local-${String(installation.checkoutFamilyKey)}`); if (!partition.ok) throw new Error(partition.message); write(path.join(partition.value, "higher.json"), Buffer.from(higherEnvelope.value.bytes).toString("utf8"));
+    const marker = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [owned.member, { ...owned.member, scope: "local", recordDigest: higherEnvelope.value.envelope.payloadDigest }] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(owned.generationPath, bytes.value);
+    expect(load(repo, userDir).plugins.map((plugin) => plugin.pluginId)).toEqual([]);
+  });
+
+  it("projects a disabled dependency as the enabled dependent's activation blocker", () => {
+    const { base, repo, userDir } = makeBase(); const required = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "required" }); const dependent = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "dependent", dependencies: ["required"] });
+    const marker = JSON.parse(fs.readFileSync(dependent.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [required.member, dependent.member] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(dependent.generationPath, bytes.value);
+    write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "required@official": false, "dependent@official": true } }));
+    const project = load(repo, userDir);
+    expect(project.pluginResolutionOutcomes.find((value) => value.pluginId === "required@official")).toMatchObject({ status: "disabled" });
+    expect(project.pluginInventory.find("required@official")?.lifecycle?.dependency).toMatchObject({ state: "not-evaluated" });
+    expect(project.pluginInventory.find("dependent@official")?.lifecycle?.dependency).toMatchObject({ state: "blocked", reason: "Dependency assembly decision: disabled" });
+  });
+
+  it.each([
+    ["missing", undefined, "*"],
+    ["disabled", false, "*"],
+    ["incompatible", true, "^2.0.0"],
+  ] as const)("keeps a plugin inert when its dependency exists only in retained catalog authority and is %s", (_label, requiredEnabled, version) => {
+    const { base, repo, userDir } = makeBase(); let required: ReturnType<typeof installOwnedPlugin> | undefined; if (requiredEnabled !== undefined) required = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "required" }); const dependent = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "dependent", catalogDependencies: [{ name: "required", version }] }); if (required !== undefined) { const marker = JSON.parse(fs.readFileSync(dependent.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [required.member, dependent.member] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(dependent.generationPath, bytes.value); } write(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "dependent@official": true, ...(requiredEnabled === undefined ? {} : { "required@official": requiredEnabled }) } })); const project = load(repo, userDir); expect(project.plugins.some((plugin) => plugin.pluginId === "dependent@official")).toBe(false); expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "dependent@official")).toMatchObject({ status: "rejected" });
+  });
+
+  it.each([
+    ["missing", ["missing"]],
+    ["invalid", ["bad name"]],
+  ])("removes a dependency-%s owned plugin from outcomes and runtime authority", (_label, dependencies) => {
+    const { base, repo, userDir } = makeBase();
+    installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { manifest: true, dependencies });
+    const project = load(repo, userDir);
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.has("owned@official")).toBe(false);
+    expect(project.pluginResolutionOutcomes.filter((outcome) => outcome.pluginId === "owned@official")).toEqual([expect.objectContaining({ status: "rejected" })]);
+  });
+
+  it("uses the canonical checkout family while authorizing the active linked worktree", () => {
+    const base = makeTmp(); const main = path.join(base, "main"); const worktree = path.join(base, "linked"); const userDir = path.join(base, "home", ".claude");
+    fs.mkdirSync(main, { recursive: true }); fs.mkdirSync(userDir, { recursive: true });
+    for (const args of [["init"], ["config", "user.email", "test@example.com"], ["config", "user.name", "Test"]]) expect(spawnSync("git", args, { cwd: main }).status).toBe(0);
+    write(path.join(main, "seed.txt"), "seed"); expect(spawnSync("git", ["add", "."], { cwd: main }).status).toBe(0); expect(spawnSync("git", ["commit", "-m", "seed"], { cwd: main }).status).toBe(0);
+    expect(spawnSync("git", ["worktree", "add", "-b", "linked", worktree], { cwd: main }).status).toBe(0);
+    installOwnedPlugin(base, worktree, userDir, fs.realpathSync.native(main));
+    const project = load(worktree, userDir);
+    expect(project.plugins.map((plugin) => plugin.pluginId)).toContain("owned@official");
+    expect(project.pluginAdmissions).toEqual(expect.arrayContaining([expect.objectContaining({ ownership: "picc-owned", projectPath: fs.realpathSync.native(worktree) })]));
+  });
+
+  it("writes and assembles settings from the active linked worktree rather than its main checkout", async () => {
+    const base = makeTmp(); const main = path.join(base, "main"); const worktree = path.join(base, "linked"); const homeDir = path.join(base, "home"); const userDir = path.join(homeDir, ".claude");
+    fs.mkdirSync(main, { recursive: true }); fs.mkdirSync(userDir, { recursive: true });
+    for (const args of [["init"], ["config", "user.email", "test@example.com"], ["config", "user.name", "Test"]]) expect(spawnSync("git", args, { cwd: main }).status).toBe(0);
+    write(path.join(main, "seed.txt"), "seed"); expect(spawnSync("git", ["add", "."], { cwd: main }).status).toBe(0); expect(spawnSync("git", ["commit", "-m", "seed"], { cwd: main }).status).toBe(0);
+    expect(spawnSync("git", ["worktree", "add", "-b", "settings-linked", worktree], { cwd: main }).status).toBe(0); fs.mkdirSync(path.join(worktree, ".claude")); fs.mkdirSync(path.join(main, ".claude")); fs.mkdirSync(path.join(worktree, "nested"));
+    const active = fs.realpathSync.native(worktree); const family = fs.realpathSync.native(main); const locations = createLifecycleLocations({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family } }); if (!locations.ok) throw new Error("locations");
+    const plan = await planPluginSettingsWrite({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family }, projectRoot: active, cwd: path.join(active, "nested"), managedPaths: [], scope: "project", mutation: { kind: "enabled-plugin", key: "linked@official", value: false } }); if (!plan.ok) throw new Error(plan.message);
+    expect(process.platform === "win32" ? plan.value.targetPath.toLowerCase() : plan.value.targetPath).toBe(process.platform === "win32" ? path.join(active, ".claude", "settings.json").toLowerCase() : path.join(active, ".claude", "settings.json")); const store = await establishOwnedStateStore(locations.value, homeDir); if (!store.ok) throw new Error(store.message);
+    const prepared = await preparePluginSettingsWrite({ store: store.value, operationId: "linked_settings", profilePath: userDir, plan: plan.value }); if (!prepared.ok) throw new Error(prepared.message);
+    const lease = await acquireLifecycleLocks({ store: store.value, operationId: "linked_settings", identities: prepared.value.transaction.requiredLocks }); if (!lease.ok) throw new Error(lease.message);
+    try { expect((await executeTransaction(store.value, prepared.value.transaction, { lease: lease.value })).state).toBe("committed"); } finally { await releaseLifecycleLocks(lease.value); }
+    expect(fs.existsSync(path.join(main, ".claude", "settings.json"))).toBe(false);
+    const assembled = load(active, userDir).settings.effectivePluginEnablement?.["linked@official"]; expect(assembled).toMatchObject({ enabled: false, scope: "project" });
+    expect(process.platform === "win32" ? assembled?.source.toLowerCase() : assembled?.source).toBe(process.platform === "win32" ? plan.value.targetPath.toLowerCase() : plan.value.targetPath);
+    fs.writeFileSync(path.join(worktree, ".claude", "settings.local.json"), JSON.stringify({ enabledPlugins: { "shared@official": false, "legacy@official": true } }));
+    fs.writeFileSync(path.join(worktree, "nested", ".claude-settings-canary"), "untouched");
+    fs.writeFileSync(path.join(main, ".claude", "settings.local.json"), JSON.stringify({ enabledPlugins: { "shared@official": true } }));
+    const legacyBytes = fs.readFileSync(path.join(worktree, ".claude", "settings.local.json"));
+    const localPlan = await planPluginSettingsWrite({ homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family }, projectRoot: active, cwd: path.join(active, "nested"), managedPaths: [], scope: "local", mutation: { kind: "enabled-plugin", key: "main-write@official", value: true } }); if (!localPlan.ok) throw new Error(localPlan.message);
+    expect(process.platform === "win32" ? localPlan.value.targetPath.toLowerCase() : localPlan.value.targetPath).toBe(process.platform === "win32" ? path.join(main, ".claude", "settings.local.json").toLowerCase() : path.join(main, ".claude", "settings.local.json"));
+    const localPrepared = await preparePluginSettingsWrite({ store: store.value, operationId: "linked_local_settings", profilePath: userDir, plan: localPlan.value }); if (!localPrepared.ok) throw new Error(localPrepared.message); const localLease = await acquireLifecycleLocks({ store: store.value, operationId: "linked_local_settings", identities: localPrepared.value.transaction.requiredLocks }); if (!localLease.ok) throw new Error(localLease.message);
+    try { expect((await executeTransaction(store.value, localPrepared.value.transaction, { lease: localLease.value })).state).toBe("committed"); } finally { await releaseLifecycleLocks(localLease.value); }
+    expect(fs.readFileSync(path.join(worktree, ".claude", "settings.local.json"))).toEqual(legacyBytes); expect(fs.readFileSync(path.join(main, ".claude", "settings.local.json"), "utf8")).toContain('"main-write@official": true');
+    const linkedSettings = loadSettings({ cwd: path.join(active, "nested"), projectRoot: active, userDir, managedPaths: [] });
+    expect(linkedSettings.effectivePluginEnablement?.["shared@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(main, ".claude", "settings.local.json") });
+    expect(linkedSettings.effectivePluginEnablement?.["legacy@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(worktree, ".claude", "settings.local.json") });
+    expect(linkedSettings.effectivePluginEnablement?.["main-write@official"]).toMatchObject({ enabled: true, scope: "local", source: path.join(main, ".claude", "settings.local.json") });
+    expect(load(active, userDir).settings.effectivePluginEnablement?.["main-write@official"]).toMatchObject({ enabled: true, scope: "local" });
+    expect(fs.readFileSync(path.join(worktree, "nested", ".claude-settings-canary"), "utf8")).toBe("untouched");
+  });
+
+  it("stores lifecycle state under the configured home independently of a custom Claude profile", () => {
+    const { base, repo } = makeBase(); const userDir = path.join(base, "profiles", "custom-claude"); const homeDir = path.join(base, "actual-home"); fs.mkdirSync(userDir, { recursive: true });
+    installOwnedPlugin(base, repo, userDir, repo, homeDir);
+    const project = loadClaudeProject({ cwd: repo, userDir, homeDir, managedSettingsPaths: [], managedArtifactDirs: [] });
+    expect(project.plugins.map((plugin) => plugin.pluginId)).toContain("owned@official");
+    const lifecycleRoot = fs.realpathSync.native(path.join(homeDir, ".picc"));
+    expect(project.lifecycleObservation.records.every((record) => { const relative = path.relative(lifecycleRoot, record.path); return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`); })).toBe(true);
+  });
+
+  it("keeps executable membership unchanged when registration selection lacks retained snapshot authority", () => {
+    const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir);
+    const first = load(repo, userDir);
+    const marketplaceRecord = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration");
+    if (marketplaceRecord?.producer === undefined) throw new Error("marketplace record");
+    const payload = marketplaceRecord.producer.payload as Record<string, unknown>;
+    const refreshed = { ...payload, selectedSnapshotId: "marketplace-refreshed" }; const scopeKey = ownedMarketplaceScopeKey(refreshed as never);
+    const encoded = createRecordEnvelope(createOwnedMarketplaceCodec(payload["profileKey"] as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey), "picc-owned", scopeKey, refreshed as never); if (!encoded.ok) throw new Error("refresh");
+    const recordsRoot = path.dirname(path.dirname(path.dirname(marketplaceRecord.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey: payload["profileKey"] as string, recordsRoot, artifactsRoot: "", stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore; const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); fs.rmSync(marketplaceRecord.path); write(path.join(partition.value, "refreshed.json"), Buffer.from(encoded.value.bytes).toString("utf8"));
+    const second = load(repo, userDir);
+    expect(second.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual(first.plugins.map((plugin) => [plugin.pluginId, plugin.version]));
+    expect(second.pluginAdmissions.filter((item) => item.ownership === "picc-owned").map((item) => item.executableGenerationId)).toEqual(["admission-current"]);
+  });
+
+  it("retains immutable snapshot and executable authority after mutable marketplace removal", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); fs.rmSync(owned.marketplaceRecordPath);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([]); expect(project.plugins.map((plugin) => plugin.pluginId)).toContain("owned@official");
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
+  });
+
+  it("treats a fresh profile with no lifecycle roots as clean absence", () => {
+    const { repo, userDir } = makeBase(); const project = load(repo, userDir);
+    expect(project.lifecycleObservation).toEqual({ records: [], receipts: [], pending: [] });
+    expect(project.executableGenerationObservation).toEqual({ status: "absent" });
+  });
+
+  it.each([
+    ["generation id", (marker: Record<string, unknown>) => ({ ...marker, generationId: "admission-other" }), "membership-invalid"],
+    ["record digest", (marker: Record<string, unknown>) => ({ ...marker, members: [{ ...((marker.members as Record<string, unknown>[])[0]!), recordDigest: `sha256:${"0".repeat(64)}` }] }), "membership-invalid"],
+    ["qualified identity", (marker: Record<string, unknown>) => ({ ...marker, members: [{ ...((marker.members as Record<string, unknown>[])[0]!), pluginId: "other@official" }] }), "membership-invalid"],
+    ["scope", (marker: Record<string, unknown>) => ({ ...marker, members: [{ ...((marker.members as Record<string, unknown>[])[0]!), scope: "local" }] }), "membership-invalid"],
+    ["checkout family", (marker: Record<string, unknown>) => ({ ...marker, members: [{ ...((marker.members as Record<string, unknown>[])[0]!), checkoutFamilyKey: `checkout-${"d".repeat(43)}`, projectKey: `checkout-${"d".repeat(43)}` }] }), "membership-invalid"],
+    ["project key", (marker: Record<string, unknown>) => ({ ...marker, members: [{ ...((marker.members as Record<string, unknown>[])[0]!), projectKey: `checkout-${"d".repeat(43)}` }] }), "malformed"],
+  ] as const)("keeps generation inert after a %s member mutation and retains structurally valid evidence", (_label, mutation, expected) => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const marker = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as Record<string, unknown>;
+    const bytes = canonicalJsonBytes(mutation(marker)); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(owned.generationPath, bytes.value);
+    const project = load(repo, userDir); expect(project.plugins).toEqual([]); expect(project.executableGenerationObservation.status).toBe(expected);
+    if (expected === "membership-invalid") expect(project.executableGenerationObservation).toHaveProperty("generation.members.0");
+  });
+
+  it("rejects missing and conflicting selected snapshot authority while retaining bounded conflict diagnosis", () => {
+    const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const snapshotRecord = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (snapshotRecord?.producer === undefined) throw new Error("snapshot");
+    const originalBytes = fs.readFileSync(snapshotRecord.path); fs.rmSync(snapshotRecord.path); const missing = load(repo, userDir);
+    expect(missing.ownedMarketplaces).toEqual([]); expect(missing.plugins).toEqual([]);
+    fs.writeFileSync(snapshotRecord.path, originalBytes); const payload = snapshotRecord.producer.payload as Record<string, unknown>;
+    const profileKey = payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotRecord.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...originalTarget } = payload; const originalArtifactRoot = String(originalTarget.artifactRoot); const alternateRoot = `${originalArtifactRoot}${path.sep}child${path.sep}..`; const conflictingTarget = { ...originalTarget, artifactRoot: alternateRoot, installRoot: alternateRoot } as MarketplaceSnapshotTrustTarget; const conflictingTrust = createMarketplaceSnapshotTrustGrant(conflictingTarget); if (!conflictingTrust.ok) throw new Error(conflictingTrust.message); const conflicting = { ownership: "picc-owned", profileKey, ...conflictingTarget, trust: conflictingTrust.value }; const scopeKey = ownedMarketplaceSnapshotScopeKey(conflicting); const codec = createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot: store.artifactsRoot }); const envelope = createRecordEnvelope(codec, "picc-owned", scopeKey, conflicting as never); if (!envelope.ok) throw new Error(envelope.message);
+    const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message);
+    write(path.join(partition.value, "conflict.json"), Buffer.from(envelope.value.bytes).toString("utf8"));
+    const conflict = load(repo, userDir); expect(conflict.ownedMarketplaces).toEqual([]); expect(conflict.plugins).toEqual([]);
+    expect(conflict.lifecycleObservation.records.filter((item) => item.code === "snapshot-authority-conflict")).toHaveLength(2);
+  });
+
+  it("keeps content-identical same-name snapshot authorities from different sources independent", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (snapshotObservation?.producer === undefined) throw new Error("snapshot");
+    const original = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = original.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotObservation.path))); const profileRoot = path.dirname(recordsRoot); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const source = { kind: "local-directory", path: path.resolve(base, "independent-catalog") } as const; const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...targetFields } = original; const target = { ...targetFields, source } as MarketplaceSnapshotTrustTarget; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+    const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message); const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); write(path.join(snapshotPartition.value, "record.json"), snapshotEnvelope.value.bytes);
+    const registration = { ownership: "picc-owned", name: "official", profileKey, scope: "user", source, selectedSnapshotId: target.snapshotId } as const; const registrationScope = ownedMarketplaceScopeKey(registration); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", registrationScope, registration); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); const registrationPartition = ownedRecordPartition(store, "picc-owned", registrationScope); if (!registrationPartition.ok) throw new Error(registrationPartition.message); write(path.join(registrationPartition.value, "record.json"), registrationEnvelope.value.bytes);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ scope: "project", source: original.source }), expect.objectContaining({ scope: "user", source })]); expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]);
+    expect(project.lifecycleObservation.records.filter((item) => item.producer?.schema === "marketplace-catalog-snapshot" && item.status === "admitted")).toHaveLength(2);
+  });
+
+  it("admits 128 agreeing same-content authorities and fails their installation bucket closed at 129", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const snapshotObservation = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (snapshotObservation?.producer === undefined) throw new Error("snapshot");
+    const original = snapshotObservation.producer.payload as Record<string, unknown>; const profileKey = original.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(snapshotObservation.path))); const profileRoot = path.dirname(recordsRoot); const artifactsRoot = path.join(profileRoot, "artifacts", "sha256"); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot, stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const { ownership: _ownership, profileKey: _profileKey, trust: _trust, ...targetFields } = original;
+    const addAuthority = (index: number): void => {
+      const source = { kind: "local-directory", path: path.resolve(base, `same-content-authority-${index}`) } as const;
+      const target = { ...targetFields, source } as MarketplaceSnapshotTrustTarget; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+      const scopeKey = ownedMarketplaceSnapshotScopeKey(snapshot); const envelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot }), "picc-owned", scopeKey, snapshot); if (!envelope.ok) throw new Error(envelope.message); const partition = ownedRecordPartition(store, "picc-owned", scopeKey); if (!partition.ok) throw new Error(partition.message); write(path.join(partition.value, "record.json"), envelope.value.bytes);
+    };
+    for (let index = 1; index < 128; index++) addAuthority(index);
+    const atLimit = load(repo, userDir); expect(atLimit.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(atLimit.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toHaveLength(1);
+    addAuthority(128);
+    const overflow = load(repo, userDir); expect(overflow.plugins).toEqual([]); expect(overflow.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]); expect(overflow.executableGenerationObservation).toMatchObject({ status: "membership-invalid", code: "generation-incomplete" });
+    expect(overflow.lifecycleObservation.records).toContainEqual(expect.objectContaining({ status: "inert", code: "invalid-payload" }));
+  });
+
+  it("diagnoses valid envelopes placed under other valid authority partitions without suppressing controls", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir); const first = load(repo, userDir);
+    const registration = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-registration"); const snapshot = first.lifecycleObservation.records.find((item) => item.producer?.schema === "marketplace-catalog-snapshot"); if (registration?.producer === undefined || snapshot?.producer === undefined) throw new Error("records");
+    const profileKey = (registration.producer.payload as Record<string, unknown>).profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(registration.path))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const registrationPayload = registration.producer.payload as Record<string, unknown>; const userAuthority = { ...registrationPayload, scope: "user" } as Record<string, unknown>; delete userAuthority.checkoutFamilyKey; delete userAuthority.projectKey; const wrongRegistrationPartition = ownedRecordPartition(store, "picc-owned", ownedMarketplaceScopeKey(userAuthority as never)); if (!wrongRegistrationPartition.ok) throw new Error(wrongRegistrationPartition.message); const wrongRegistrationPath = path.join(wrongRegistrationPartition.value, "misplaced.json"); write(wrongRegistrationPath, fs.readFileSync(registration.path));
+    const snapshotPayload = snapshot.producer.payload as Record<string, unknown>; const otherSource = { kind: "local-directory", path: path.resolve(base, "other-authority") } as const; const wrongSnapshotKey = ownedMarketplaceSnapshotScopeKey({ ...snapshotPayload, source: otherSource } as never); const wrongSnapshotPartition = ownedRecordPartition(store, "picc-owned", wrongSnapshotKey); if (!wrongSnapshotPartition.ok) throw new Error(wrongSnapshotPartition.message); const wrongSnapshotPath = path.join(wrongSnapshotPartition.value, "misplaced.json"); write(wrongSnapshotPath, fs.readFileSync(snapshot.path));
+    const project = load(repo, userDir); expect(project.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]); expect(project.ownedMarketplaces).toHaveLength(1);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([expect.objectContaining({ path: wrongRegistrationPath, status: "inert", code: "record-containment" }), expect.objectContaining({ path: wrongSnapshotPath, status: "inert", code: "record-containment" }), expect.objectContaining({ path: owned.marketplaceRecordPath, status: "admitted" }), expect.objectContaining({ path: owned.snapshotRecordPath, status: "admitted" })]));
+  });
+
+  it("rejects aliased records/artifacts and bounds an oversized passive generation read", () => {
+    const recordFixture = makeBase(); const recordOwned = installOwnedPlugin(recordFixture.base, recordFixture.repo, recordFixture.userDir);
+    const recordTarget = `${recordOwned.installationRecordPath}.target`; fs.renameSync(recordOwned.installationRecordPath, recordTarget); fs.linkSync(recordTarget, recordOwned.installationRecordPath);
+    expect(load(recordFixture.repo, recordFixture.userDir).plugins).toEqual([]);
+    const artifactFixture = makeBase(); const artifactOwned = installOwnedPlugin(artifactFixture.base, artifactFixture.repo, artifactFixture.userDir); const manifest = path.join(artifactOwned.root, ".claude-plugin", "plugin.json"); const manifestTarget = `${manifest}.target`; fs.renameSync(manifest, manifestTarget); fs.linkSync(manifestTarget, manifest);
+    expect(load(artifactFixture.repo, artifactFixture.userDir).plugins).toEqual([]);
+    const oversizedFixture = makeBase(); const oversized = installOwnedPlugin(oversizedFixture.base, oversizedFixture.repo, oversizedFixture.userDir); fs.truncateSync(oversized.generationPath, 1024 * 1024 + 1);
+    expect(load(oversizedFixture.repo, oversizedFixture.userDir).executableGenerationObservation.status).toBe("unreadable");
+  });
+
+  it("keeps a generation inert when an unreadable sibling creates uncertainty in its exact installation partition", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir);
+    const oversizedPath = path.join(path.dirname(owned.installationRecordPath), "oversized.json"); fs.writeFileSync(oversizedPath, ""); fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
+    const project = load(repo, userDir);
+    expect(project.executableGenerationObservation).toMatchObject({ status: "membership-invalid", generation: { members: [owned.member] } });
+    expect(project.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]);
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.has("owned@official")).toBe(false);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: expect.stringContaining("oversized.json"), status: "inert", code: "unreadable-record" }),
+      expect.objectContaining({ path: owned.installationRecordPath, status: "inert", code: "generation-incomplete" }),
+    ]));
+  });
+
+  it("suppresses only a snapshot partition whose sibling record is unreadable", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir);
+    const original = JSON.parse(fs.readFileSync(owned.snapshotRecordPath, "utf8")) as { payload: Record<string, unknown> }; const profileKey = original.payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey; const recordsRoot = path.dirname(path.dirname(path.dirname(owned.snapshotRecordPath))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const source = { kind: "https-catalog", url: "https://catalog.example.org/community.json" } as const; const catalogDigest = `sha256:${"7".repeat(64)}` as const; const snapshotId = `marketplace-${createHash("sha256").update(`${catalogDigest}\0${source.url}`).digest("base64url")}` as const; const target: MarketplaceSnapshotTrustTarget = { authorityKind: "catalog-only", marketplaceName: "community", snapshotId, source, catalogDigest, executableCatalog: { marketplaceName: "community", allowedCrossMarketplaceDependencies: [], declarations: [] }, provenance: { adapter: "public-https-catalog", canonicalUrl: source.url } }; const trust = createMarketplaceSnapshotTrustGrant(target); if (!trust.ok) throw new Error(trust.message); const snapshot = { ownership: "picc-owned", profileKey, ...target, trust: trust.value } as const;
+    const snapshotScope = ownedMarketplaceSnapshotScopeKey(snapshot); const snapshotEnvelope = createRecordEnvelope(createOwnedMarketplaceSnapshotCodec({ profileKey, artifactsRoot: store.artifactsRoot }), "picc-owned", snapshotScope, snapshot); if (!snapshotEnvelope.ok) throw new Error(snapshotEnvelope.message); const snapshotPartition = ownedRecordPartition(store, "picc-owned", snapshotScope); if (!snapshotPartition.ok) throw new Error(snapshotPartition.message); const survivingSnapshotPath = path.join(snapshotPartition.value, "record.json"); write(survivingSnapshotPath, snapshotEnvelope.value.bytes);
+    const registration = { ownership: "picc-owned", name: "community", profileKey, scope: "user", source, selectedSnapshotId: snapshotId } as const; const registrationScope = ownedMarketplaceScopeKey(registration); const registrationEnvelope = createRecordEnvelope(createOwnedMarketplaceCodec(profileKey), "picc-owned", registrationScope, registration); if (!registrationEnvelope.ok) throw new Error(registrationEnvelope.message); const registrationPartition = ownedRecordPartition(store, "picc-owned", registrationScope); if (!registrationPartition.ok) throw new Error(registrationPartition.message); write(path.join(registrationPartition.value, "record.json"), registrationEnvelope.value.bytes);
+    const oversizedPath = path.join(path.dirname(owned.snapshotRecordPath), "oversized.json"); fs.writeFileSync(oversizedPath, ""); fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
+    const project = load(repo, userDir);
+    expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "community", scope: "user" })]);
+    expect(project.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]);
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.has("owned@official")).toBe(false);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: expect.stringContaining("oversized.json"), status: "inert", code: "unreadable-record" }),
+      expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "authority-uncertain" }),
+      expect.objectContaining({ path: owned.marketplaceRecordPath, status: "admitted" }),
+      expect.objectContaining({ path: survivingSnapshotPath, status: "admitted" }),
+    ]));
+  });
+
+  it("contains registration uncertainty to one exact scoped marketplace partition", () => {
+    const { base, repo, userDir } = makeBase(); const owned = installOwnedPlugin(base, repo, userDir);
+    const projectEnvelope = JSON.parse(fs.readFileSync(owned.marketplaceRecordPath, "utf8")) as { payload: Record<string, unknown> }; const profileKey = projectEnvelope.payload.profileKey as import("../src/plugin-lifecycle/types.js").LifecycleProfileKey;
+    const userRegistration: Record<string, unknown> = { ...projectEnvelope.payload, scope: "user" }; delete userRegistration.checkoutFamilyKey; delete userRegistration.projectKey;
+    const userScopeKey = ownedMarketplaceScopeKey(userRegistration as never); const codec = createOwnedMarketplaceCodec(profileKey); const userEnvelope = createRecordEnvelope(codec, "picc-owned", userScopeKey, userRegistration as never); if (!userEnvelope.ok) throw new Error(userEnvelope.message);
+    const recordsRoot = path.dirname(path.dirname(path.dirname(owned.marketplaceRecordPath))); const profileRoot = path.dirname(recordsRoot); const store = { root: profileRoot, profileRoot, profileKey, recordsRoot, artifactsRoot: path.join(profileRoot, "artifacts", "sha256"), stagingRoot: "", generationsRoot: "", journalsRoot: "", receiptsRoot: "", locksRoot: "", quarantineRoot: "", dataRoot: path.join(profileRoot, "data") } satisfies OwnedStateStore;
+    const userPartition = ownedRecordPartition(store, "picc-owned", userScopeKey); if (!userPartition.ok) throw new Error(userPartition.message); write(path.join(userPartition.value, "record.json"), Buffer.from(userEnvelope.value.bytes).toString("utf8"));
+    const oversizedPath = path.join(path.dirname(owned.marketplaceRecordPath), "oversized.json"); fs.writeFileSync(oversizedPath, ""); fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
+    const project = load(repo, userDir); expect(project.ownedMarketplaces).toEqual([expect.objectContaining({ name: "official", scope: "user" })]);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: owned.marketplaceRecordPath, status: "inert", code: "authority-uncertain" }),
+      expect.objectContaining({ path: path.join(userPartition.value, "record.json"), status: "admitted" }),
+    ]));
+  });
+
+  it("keeps an owned artifact inert when one file exceeds the portable per-file limit", () => {
+    const { base, repo, userDir } = makeBase();
+    const skillBytes = Buffer.alloc(PORTABLE_TREE_LIMITS.maximumFileBytes + 1, 0x61);
+    const owned = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { skillBytes });
+    const envelope = JSON.parse(fs.readFileSync(owned.installationRecordPath, "utf8")) as { payload: Record<string, unknown>; payloadDigest: string };
+    const trust = envelope.payload.trust as Record<string, unknown>;
+    const generation = JSON.parse(fs.readFileSync(owned.generationPath, "utf8")) as { members: Record<string, unknown>[] };
+    const skillPath = path.join(owned.root, "skills", "owned-skill", "SKILL.md");
+    const manifestPath = path.join(owned.root, ".claude-plugin", "plugin.json");
+    expect(fs.statSync(skillPath).size).toBe(PORTABLE_TREE_LIMITS.maximumFileBytes + 1);
+    expect(fs.statSync(skillPath).size + fs.statSync(manifestPath).size).toBeLessThan(PORTABLE_TREE_LIMITS.maximumTotalBytes);
+    expect(envelope.payload).toMatchObject({ installRoot: owned.root, selectedRoot: { path: "owned" }, artifactDigest: owned.treeDigest, treeDigest: owned.treeDigest, rootDigest: owned.rootDigest, executableDigest: owned.executableDigest });
+    expect(trust).toMatchObject({ selectedRoot: envelope.payload.selectedRoot, artifactDigest: owned.treeDigest, treeDigest: owned.treeDigest, rootDigest: owned.rootDigest, executableDigest: owned.executableDigest });
+    expect(path.basename(owned.root)).toBe((envelope.payload.selectedRoot as { path: string }).path);
+    expect(path.basename(path.dirname(owned.root))).toBe(owned.treeDigest.slice(7));
+    expect(envelope.payloadDigest).toBe(owned.member.recordDigest);
+    expect(generation.members).toEqual([owned.member]);
+    const project = load(repo, userDir);
+    expect(project.executableGenerationObservation).toMatchObject({ status: "membership-invalid", generation: { members: [owned.member] } });
+    expect(project.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toEqual([]);
+    expect(project.plugins).toEqual([]);
+    expect(project.pluginContexts.has("owned@official")).toBe(false);
+    expect(project.lifecycleObservation.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: owned.snapshotRecordPath, status: "inert", code: "artifact-mismatch" }),
+      expect.objectContaining({ path: owned.installationRecordPath, status: "inert" }),
+    ]));
+  });
+
+  it("removes an owned dependent after its required owned plugin has a terminal hook read rejection", () => {
+    const { base, repo, userDir } = makeBase(); const required = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "required", hooks: true }); const dependent = installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { name: "dependent", dependencies: ["required"] });
+    const marker = JSON.parse(fs.readFileSync(dependent.generationPath, "utf8")) as Record<string, unknown>; const bytes = canonicalJsonBytes({ ...marker, members: [required.member, dependent.member] }); if (!bytes.ok) throw new Error(bytes.message); fs.writeFileSync(dependent.generationPath, bytes.value);
+    const hookPath = path.join(required.root, "hooks", "hooks.json"); const original = fs.readFileSync; const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: unknown, ...args: unknown[]) => path.normalize(String(candidate)) === path.normalize(hookPath) ? (() => { throw Object.assign(new Error("deterministic hook rejection"), { code: "EACCES" }); })() : (original as (...values: unknown[]) => unknown)(candidate, ...args)) as typeof fs.readFileSync);
+    try { const project = load(repo, userDir); expect(project.plugins).toEqual([]); for (const pluginId of ["required@official", "dependent@official"]) expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === pluginId)).toMatchObject({ status: "rejected" }); expect(project.pluginResolutionOutcomes.find((item) => item.pluginId === "dependent@official")?.diagnostics.map((item) => item.message).join("\n")).toContain("final dependency admission"); expect(project.pluginInventory.find("required@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); expect(project.pluginInventory.find("dependent@official")?.lifecycle?.dependency).toMatchObject({ state: "indeterminate", reason: expect.stringContaining("indeterminate") }); }
+    finally { spy.mockRestore(); }
+  });
+
+  it("rejects an imported manifest mutation between root discovery and authoritative resolution", () => {
+    const { repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "alpha@official": true } }));
+    const originalRead = fs.readFileSync;
+    let manifestReads = 0;
+    const read = vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: unknown, ...args: unknown[]) => {
+      if (path.normalize(String(candidate)) === path.normalize(manifestPath)) {
+        manifestReads += 1;
+        if (manifestReads === 3) fs.writeFileSync(manifestPath, JSON.stringify({ name: "beta" }));
+      }
+      return (originalRead as (...values: unknown[]) => unknown)(candidate, ...args);
+    }) as typeof fs.readFileSync);
+    try {
+      const project = load(repo, userDir);
+      expect(manifestReads).toBeGreaterThanOrEqual(4);
+      expect(project.plugins).toEqual([expect.objectContaining({ pluginId: "alpha@official", name: "beta" })]);
+      expect(project.skills.some((skill) => skill.name === "beta:alpha-skill")).toBe(true);
+      expect(project.pluginResolutionOutcomes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ pluginId: "alpha@official", status: "loaded" }),
+      ]));
+      expect(project.reloadCandidate).toMatchObject({
+        status: "invalid",
+        reason: "imported plugin inputs changed or could not be verified during component assembly",
+      });
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it("constructs initial binding from verified post-bracket imported fingerprints without rescanning", () => {
+    const { base, repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    const captured = captureImportedExecutableTrees([pluginRoot]);
+    if (!captured.ok) throw new Error(captured.message);
+    const skillPath = path.join(pluginRoot, "skills", "alpha-skill", "SKILL.md");
+    fs.appendFileSync(skillPath, "\nchanged after post-capture");
+    const profileRoot = path.join(base, "profile");
+    const binding = captureReloadCandidateBinding({
+      cwd: repo,
+      projectRoot: repo,
+      userDir,
+      profileRoot,
+      profileKey: "profile-test",
+      generationPath: path.join(profileRoot, "generations", "current.json"),
+      expectedGeneration: { status: "absent" },
+      effectivePluginEnablement: sha256(Buffer.from("enablement")),
+      importedExecutableRoots: [pluginRoot],
+      initialImportedExecutableTrees: captured.value,
+      managedSettingsPaths: [],
+    });
+    if (!binding.ok) throw new Error(binding.message);
+    expect(sameImportedExecutableTrees(binding.value.binding.importedExecutableTrees, captured.value)).toBe(true);
+    const recaptured = binding.value.recapture();
+    expect(recaptured.ok).toBe(true);
+    if (!recaptured.ok) throw new Error(recaptured.message);
+    expect(sameImportedExecutableTrees(recaptured.value.importedExecutableTrees, captured.value)).toBe(false);
+    expect(captureReloadCandidateBinding({
+      cwd: repo,
+      projectRoot: repo,
+      userDir,
+      profileRoot,
+      profileKey: "profile-test",
+      generationPath: path.join(profileRoot, "generations", "current.json"),
+      effectivePluginEnablement: sha256(Buffer.from("enablement")),
+      importedExecutableRoots: [path.join(base, "other-root")],
+      initialImportedExecutableTrees: captured.value,
+      managedSettingsPaths: [],
+    })).toMatchObject({ ok: false, code: "imported-root-mismatch" });
+  });
+
+  it("binds reload handoff to exact committed generation and authentic settings inputs", () => {
+    const { base, repo, userDir } = makeBase();
+    installOwnedPlugin(base, repo, userDir, repo, path.dirname(userDir), { hooks: true });
+    const project = load(repo, userDir);
+    expect(project.reloadCandidate.status).toBe("ready");
+    if (project.reloadCandidate.status !== "ready") throw new Error(project.reloadCandidate.reason);
+    expect(project.reloadCandidate.binding.executableGeneration).toMatchObject({ status: "present", digest: expect.stringMatching(/^sha256:/u) });
+    expect(project.reloadCandidate.binding.settings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "file", status: "absent" }),
+    ]));
+    expect(project.skills.some((skill) => skill.name === "owned:owned-skill")).toBe(true);
+    expect(project.pluginContexts.has("owned@official")).toBe(true);
+    expect(project.pluginInventory.find("owned@official")?.outcome?.status).toBe("loaded");
+    expect(Object.keys(project.mergedHooks)).toContain("PreToolUse");
+
+    const written = writeReloadHandoff(project.reloadCandidate.handoffPath, project.reloadCandidate.binding, "assembly-test-nonce", 1_000);
+    expect(written.ok).toBe(true);
+    const observed = readReloadHandoff(project.reloadCandidate.handoffPath, 1_001);
+    expect(observed.ok && observed.value?.outcome).toBe("pending");
+    expect(observed.ok && observed.value !== undefined && sameReloadBinding(observed.value.binding, project.reloadCandidate.binding)).toBe(true);
+
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "owned@official": false } }));
+    const changed = project.reloadCandidate.recapture();
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.message);
+    expect(sameReloadBinding(changed.value, project.reloadCandidate.binding)).toBe(false);
+    expect(clearReloadHandoff(project.reloadCandidate.handoffPath).ok).toBe(true);
+  });
+
+  it("rejects an imported executable tree containing an external hardlink where the platform permits links", () => {
+    const { base, repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "linked");
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ enabledPlugins: { "linked@official": true } }));
+    const skillPath = path.join(pluginRoot, "skills", "linked-skill", "SKILL.md");
+    const external = path.join(base, "external-plugin-bytes.md");
+    fs.writeFileSync(external, fs.readFileSync(skillPath));
+    fs.rmSync(skillPath);
+    try {
+      fs.linkSync(external, skillPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (["EACCES", "EPERM", "ENOTSUP", "EXDEV"].includes(String(code))) return;
+      throw error;
+    }
+    const project = load(repo, userDir);
+    expect(fs.statSync(skillPath, { bigint: true }).nlink).toBeGreaterThan(1n);
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "imported plugin inputs changed or could not be verified during component assembly",
+    });
+  });
+
+  it("does not call an unreadable authentic settings authority a ready reload candidate", () => {
+    const { repo, userDir } = makeBase();
+    fs.mkdirSync(path.join(userDir, "settings.json"), { recursive: true });
+    const project = load(repo, userDir);
+    expect(project.settings.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "Settings file unreadable; skipped" }),
+    ]));
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "reload input fingerprint is unreadable or exceeds its bound",
+    });
+  });
+
+  it("does not call an overflowed authentic settings authority a ready reload candidate", () => {
+    const { repo, userDir } = makeBase();
+    fs.writeFileSync(path.join(userDir, "settings.json"), Buffer.alloc(4 * 1024 * 1024 + 1, 0x20));
+    const project = load(repo, userDir);
+    expect(project.reloadCandidate).toMatchObject({
+      status: "invalid",
+      reason: "reload input fingerprint is unreadable or exceeds its bound",
+    });
+  });
+
+  it("rejects a mutated candidate without changing the previously assembled runtime", () => {
+    const { base, repo, userDir } = makeBase();
+    const owned = installOwnedPlugin(base, repo, userDir);
+    const active = load(repo, userDir);
+    const activeSkillNames = active.skills.map((skill) => skill.name);
+    fs.appendFileSync(path.join(owned.root, "skills", "owned-skill", "SKILL.md"), "\nMUTATED");
+
+    const candidate = load(repo, userDir);
+    expect(candidate.reloadCandidate).toMatchObject({ status: "invalid" });
+    expect(candidate.executableGenerationObservation.status).toBe("membership-invalid");
+    expect(active.skills.map((skill) => skill.name)).toEqual(activeSkillNames);
+    expect(active.plugins.map((plugin) => plugin.pluginId)).toEqual(["owned@official"]);
+  });
+
+  it("keeps retained snapshot authority executable when current registration is removed", () => {
+    const { base, repo, userDir } = makeBase(); installOwnedPlugin(base, repo, userDir);
+    const first = load(repo, userDir);
+    const marketplaceRecord = first.lifecycleObservation.records.find((item) => {
+      if (item.status !== "admitted") return false;
+      return (JSON.parse(fs.readFileSync(item.path, "utf8")) as { schema: string }).schema === "marketplace-registration";
+    });
+    if (marketplaceRecord === undefined) throw new Error("marketplace record");
+    fs.rmSync(marketplaceRecord.path);
+    const second = load(repo, userDir);
+    expect(second.ownedMarketplaces).toEqual([]);
+    expect(first.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual([["owned@official", "1.0.0"]]);
+    expect(second.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual([["owned@official", "1.0.0"]]);
+    expect(second.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toHaveLength(1);
   });
 });

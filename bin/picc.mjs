@@ -2,18 +2,17 @@
 
 const HELP = `Usage: picc [Pi options]
        picc update [--check|--help]
-       picc plugin list
-       picc plugin details <plugin@marketplace>
+       picc plugin <command>
 
 PiCC options:
   -h, --help       Show this help
   -v, --version    Show PiCC and embedded Pi versions
   update           Update or repair PiCC
-  plugin list      List the locally captured plugin inventory (read-only)
-  plugin details   Show one qualified plugin identity (read-only)`;
+  plugin           Local marketplace/plugin lifecycle and offline recovery
+                   Run picc plugin --help for the strict command grammar`;
 const USAGE_ERROR = "PiCC: invalid arguments. Run `picc --help` for usage.";
 const UPDATER_UNAVAILABLE = "PiCC: updater unavailable in this build. Reinstall PiCC or update from its source checkout.";
-const PLUGIN_INVENTORY_UNAVAILABLE = "PiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.";
+const PLUGIN_INVENTORY_UNAVAILABLE = "PiCC plugin lifecycle is unavailable in this build. Update or reinstall PiCC.";
 const INITIALIZATION_FAILED = "PiCC: launcher initialization failed. Reinstall PiCC from a package or source checkout.";
 const SPAWN_FAILED = "PiCC: could not start the embedded Pi runtime. Run `picc update` or reinstall PiCC.";
 

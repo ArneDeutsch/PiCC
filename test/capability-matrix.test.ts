@@ -65,4 +65,25 @@ describe("renderCapabilityMatrix", () => {
     expect(row("feature.managed-policy-windows-registry")).toMatch(/⚠ \| not-supported[\s\S]*`feature.managed-policy`[\s\S]*HKLM and HKCU are neither queried nor probed[\s\S]*silently ignored/);
     expect(row("setting.strictPluginOnlyCustomization.mcp")).toContain("manual/CLI/runtime source delivery are themselves unsupported rather than governed");
   });
+
+  it("projects local plugin lifecycle and excluded policy truth into distinct rows", () => {
+    const rendered = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const row = (id: string): string => {
+      const value = rendered.split("\n").find((line) => line.startsWith(`| \`${id}\``));
+      expect(value, id).toBeDefined();
+      return value!;
+    };
+
+    expect(row("feature.plugin-marketplace")).toMatch(/partial[\s\S]*anonymous public HTTPS Git[\s\S]*Private\/SSH/);
+    expect(row("feature.plugin-source-acquisition")).toMatch(/partial[\s\S]*retained materialized local or Git-backed marketplace trees[\s\S]*standalone public HTTPS catalog descriptors cannot confer relative content authority[\s\S]*public npm[\s\S]*without lifecycle scripts[\s\S]*public HTTPS ZIP/);
+    expect(row("feature.plugin-dependencies")).toMatch(/PiCC-owned lifecycle activation[\s\S]*Imported dependency metadata remains observational/);
+    expect(row("setting.enabledPlugins")).toMatch(/Declaration-only consent permits writing[\s\S]*never overrides a higher-precedence effective declaration/);
+    expect(row("feature.plugin-lifecycle-automation")).toMatch(/not-supported[\s\S]*stable headless JSON[\s\S]*enterprise distribution/);
+    expect(row("feature.plugins-command-plugins")).toMatch(/partial[\s\S]*observational session snapshot[\s\S]*no lifecycle mutation/);
+    expect(row("feature.plugins-command-reload")).toMatch(/partial[\s\S]*ctx\.reload\(\)[\s\S]*authoritative new-session guidance/);
+    expect(row("setting.allowManagedHooksOnly")).toMatch(/⚠ \| not-supported[\s\S]*PiCC-owned or imported plugins/);
+    expect(row("setting.strictKnownMarketplaces")).toMatch(/⚠ \| partial[\s\S]*does not enforce/);
+    expect(row("setting.blockedMarketplaces")).toMatch(/⚠ \| partial[\s\S]*does not enforce/);
+    expect(row("setting.disableSideloadFlags")).toMatch(/not-supported[\s\S]*neither disables nor authorizes PiCC's explicit/);
+  });
 });
