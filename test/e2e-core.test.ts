@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -163,26 +164,15 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   }
 
   it(
-    "intercepts a plugin-management command in real Pi text-print mode without provider egress",
-    async () => {
-      const result = await runPi({ script: [], prompt: "/plugin install ignored" });
-      expect(result.requests).toHaveLength(0);
-      expect(result.stdout).toContain("Usage: /plugin list | /plugin details <plugin@marketplace>");
-      expect(result.stdout).toContain("run `picc plugin --help` in a terminal for standalone commands");
-      expect(result.stdout).toContain("No changes were made");
-      expect(result.stdout).not.toContain("install ignored");
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "drives the actual interactive plugin reload command through retention, adoption, terminal failure, and relaunch",
+    "drives the actual interactive plugin lifecycle through secrecy, retention, adoption, terminal failure, and relaunch",
     async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-real-plugin-lifecycle-"));
       let lifecycle: PluginLifecycleFixture | undefined;
       let durableMarketplaceSelector = "";
       let repairedSettings = Buffer.alloc(0);
-      const canary = "PICC_CREDENTIAL_CANARY_T16";
+      const canary = "PICC_CREDENTIAL_CANARY_T24";
+      const credentialSource = `https://user:${canary}@example.test/repo.git`;
+      const gitTrace = path.join(root, "git-process-trace.json");
       const preloadCanary = path.join(root, "ambient-preload-canary");
       const preloadScript = path.join(root, "ambient-preload-canary.cjs");
       fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
@@ -224,6 +214,24 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const command = "/lifecycle-base:generation";
       const launchesBefore = launchedProcessCount();
       let originalPid = 0;
+      const snapshotTree = (scanRoot: string) => {
+        const snapshot: string[] = [];
+        const visit = (directory: string) => {
+          for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+            const filename = path.join(directory, entry.name);
+            const relative = path.relative(scanRoot, filename).replace(/\\/gu, "/");
+            const metadata = fs.lstatSync(filename);
+            if (metadata.isSymbolicLink()) snapshot.push(`link:${relative}`);
+            else if (metadata.isDirectory()) { snapshot.push(`dir:${relative}`); visit(filename); }
+            else if (metadata.isFile()) {
+              const bytes = fs.readFileSync(filename);
+              snapshot.push(`file:${relative}:${bytes.byteLength}:${createHash("sha256").update(bytes).digest("hex")}`);
+            }
+          }
+        };
+        if (fs.existsSync(scanRoot)) visit(scanRoot);
+        return snapshot;
+      };
       const assertTreeSecretFree = (scanRoot: string) => {
         let regularFiles = 0;
         const visit = (directory: string) => {
@@ -253,6 +261,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             PICC_CLAUDE_USER_DIR: path.join(root, "claude-profile"),
             HOME: path.join(root, "home"),
             USERPROFILE: path.join(root, "home"),
+            GIT_TRACE2_EVENT: gitTrace,
             NODE_OPTIONS: `--require ${JSON.stringify(preloadScript)}`,
           },
           script: [
@@ -288,7 +297,48 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           await live.waitForText("PiCC session", 30_000);
           expect(live.requests).toHaveLength(requestCountBeforeDiagnosis);
           expect(live.capturedText()).not.toContain("picc plugin recover");
-          live.sendInput(`/reload-plugins ${canary}`);
+
+          const lifecycleBeforeCredential = snapshotTree(locations.value.root);
+          const settingsBeforeCredential = fs.readFileSync(settingsPath);
+          const gitTraceBeforeCredential = fs.existsSync(gitTrace) ? fs.readFileSync(gitTrace) : Buffer.alloc(0);
+          const requestsBeforeCredential = live.requests.length;
+          const standaloneBeforeCredential = standaloneLaunches;
+          const childrenBeforeCredential = launchedProcessCount();
+          live.sendInput("/plugin marketplace add");
+          await live.waitForText("marketplace-add", 30_000);
+          const marketplaceNameHint = "lowercase marketplace name";
+          const marketplaceNameHintCount = live.capturedText().split(marketplaceNameHint).length - 1;
+          live.sendInput("");
+          await live.waitForText(marketplaceNameHint, 30_000, marketplaceNameHintCount + 1);
+          for (const [value, nextField] of [
+            ["credential-witness", "local-directory | local-catalog-file | github | https-git | https-catalog"],
+            ["https-git", "source is hidden after entry"],
+            [credentialSource, "optional branch, tag, or commit"],
+            ["", "marketplace-add · scope"],
+            ["user", "marketplace-add · declaration only"],
+          ] as const) {
+            live.sendInput(value);
+            await live.waitForText(nextField, 30_000);
+          }
+          live.sendInput("no");
+          await live.waitForText("source refusal", 30_000);
+          expect(live.requests).toHaveLength(requestsBeforeCredential);
+          expect(standaloneLaunches).toBe(standaloneBeforeCredential);
+          expect(launchedProcessCount()).toBe(childrenBeforeCredential);
+          expect(fs.readFileSync(settingsPath)).toEqual(settingsBeforeCredential);
+          expect(snapshotTree(locations.value.root)).toEqual(lifecycleBeforeCredential);
+          expect(fs.existsSync(gitTrace) ? fs.readFileSync(gitTrace) : Buffer.alloc(0)).toEqual(gitTraceBeforeCredential);
+          expect(live.capturedText()).not.toContain(canary);
+          const inventoryHint = "A opens eligible lifecycle actions.";
+          const inventoryHintCount = live.capturedText().split(inventoryHint).length - 1;
+          live.sendInput("");
+          await live.waitForText(inventoryHint, 30_000, inventoryHintCount + 1);
+          const editorPath = lifecycle!.project;
+          const editorRenderCount = live.capturedText().split(editorPath).length - 1;
+          live.sendInput("\u0003");
+          await live.waitForText(editorPath, 30_000, editorRenderCount + 1);
+
+          live.sendInput("/reload-plugins");
           await live.waitForText("Plugin reload preflight was rejected", 30_000);
           const repaired = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { enabledPlugins: Record<string, boolean> };
           delete repaired.enabledPlugins["missing@full-surface-local"];
