@@ -31,8 +31,9 @@ export const PLUGIN_INVENTORY_ARGV_USAGE = `Usage: picc plugin <command>
   details <plugin@marketplace|selector>
   install <plugin@marketplace> [--marketplace-selector <marketplace-record>] [--scope <user|project|local>] [--declaration-only] [--yes]
   enable|disable <plugin@marketplace> [--selector <plugin-record>] [--declaration-only] [--yes]
-  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--declaration-only] [--yes]
-  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration <yes|no> --remove-data <yes|no> [--declaration-only] [--yes]
+  update <plugin@marketplace> [--selector <plugin-record>] [--marketplace-selector <marketplace-record>] [--yes]
+  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration yes --remove-data <yes|no> [--declaration-only] [--yes]
+  uninstall <plugin@marketplace> [--selector <record>] --remove-declaration no --remove-data <yes|no> [--yes]
   recover [operation-id] [--complete|--rollback] [--yes]
 Output is bounded human-readable text; no stable JSON schema is provided.`;
 
@@ -173,9 +174,9 @@ function parseArgvTokens(tokens: readonly string[]): PluginInventoryOperationPar
   }
   if (["install", "enable", "disable", "update", "uninstall"].includes(tokens[0] ?? "") && validQualifiedIdentity(tokens[1] ?? "")) {
     const action = tokens[0] as "install" | "enable" | "disable" | "update" | "uninstall";
-    const allowed = new Set(["--declaration-only", "--yes", ...(action === "install" || action === "update" ? ["--marketplace-selector"] : []), ...(action === "enable" || action === "disable" || action === "update" || action === "uninstall" ? ["--selector"] : []), ...(action === "install" ? ["--scope"] : []), ...(action === "uninstall" ? ["--remove-declaration", "--remove-data"] : [])]);
+    const allowed = new Set(["--yes", ...(action === "update" ? [] : ["--declaration-only"]), ...(action === "install" || action === "update" ? ["--marketplace-selector"] : []), ...(action === "enable" || action === "disable" || action === "update" || action === "uninstall" ? ["--selector"] : []), ...(action === "install" ? ["--scope"] : []), ...(action === "uninstall" ? ["--remove-declaration", "--remove-data"] : [])]);
     const flags = parseFlags(tokens.slice(2), allowed);
-    if (flags !== undefined && (action !== "uninstall" || flags.removeDeclaration !== undefined && flags.removeData !== undefined)) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: action, qualifiedIdentity: tokens[1]!, flags }) });
+    if (flags !== undefined && (action !== "uninstall" || flags.removeDeclaration !== undefined && flags.removeData !== undefined && (!flags.declarationOnly || flags.removeDeclaration === true))) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: action, qualifiedIdentity: tokens[1]!, flags }) });
   }
   if (tokens[0] === "recover") {
     if (tokens.length === 1) return Object.freeze({ kind: "operation", operation: Object.freeze({ kind: "recover-list" }) });

@@ -779,14 +779,17 @@ process.exit(23);
     expect(later.stdout.join("\n")).toContain("Plugin: later@market");
     expect(later.stdout.join("\n")).not.toContain("Plugin: same@market-a");
 
-    for (const args of [[], ["LIST"], ["details"], ["details", "bare"], ["list", "extra"], ["details", "later@market", "extra"]]) {
-      const result = await runPluginInProcess(project, args, { env });
+    let compositions = 0;
+    const invalidServices = (() => { compositions++; throw new Error("invalid grammar reached lifecycle composition"); }) as never;
+    for (const args of [[], ["LIST"], ["details"], ["details", "bare"], ["list", "extra"], ["details", "later@market", "extra"], ["update", "later@market", "--declaration-only"], ["uninstall", "later@market", "--remove-declaration", "no", "--remove-data", "no", "--declaration-only"]]) {
+      const result = await runPluginInProcess(project, args, { env, services: invalidServices });
       expect(result).toEqual({
         code: 2,
         stdout: [],
         stderr: [PLUGIN_INVENTORY_ARGV_USAGE],
       });
     }
+    expect(compositions).toBe(0);
 
     const unknown = await runPluginInProcess(project, ["details", "missing@market"], { env });
     expect(unknown).toEqual({
