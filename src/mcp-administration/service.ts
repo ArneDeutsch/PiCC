@@ -1,4 +1,4 @@
-import type { ResolvedMcpConfig } from "../types.js";
+import type { EnabledRemoteMcpServer, EnabledStdioMcpServer, ResolvedMcpConfig } from "../types.js";
 import { createMcpAdministrationInventory } from "./inventory.js";
 import type {
   McpAdministrationDeclaration,
@@ -78,6 +78,13 @@ export interface McpAdministrationFreshState {
   readonly liveStates?: readonly McpAdministrationLiveState[];
 }
 
+const MCP_RUNTIME_ADMISSION_BRAND: unique symbol = Symbol("picc.mcp-runtime-admission");
+
+/** Opaque, non-serializable authority minted only from one exact fresh service assembly. */
+export interface McpAdministrationRuntimeAdmission {
+  readonly [MCP_RUNTIME_ADMISSION_BRAND]: true;
+}
+
 export interface McpAdministrationActivationAdmissionBinding {
   readonly admittedName: string;
   readonly admittedSource: McpAdministrationDeclaration["source"];
@@ -90,11 +97,25 @@ export interface McpAdministrationActivationAdmissionBinding {
   readonly admittedCheckoutFamilyKey: string;
 }
 
+export interface McpAdministrationRuntimeAdmissionContents {
+  readonly server: EnabledStdioMcpServer | EnabledRemoteMcpServer;
+  readonly binding: McpAdministrationActivationAdmissionBinding;
+}
+
+const runtimeAdmissions = new WeakMap<object, McpAdministrationRuntimeAdmissionContents>();
+
+/** Runtime-side authenticity check; arbitrary objects and copied envelopes fail closed. */
+export function openMcpAdministrationRuntimeAdmission(
+  admission: McpAdministrationRuntimeAdmission,
+): McpAdministrationRuntimeAdmissionContents | undefined {
+  return typeof admission === "object" && admission !== null ? runtimeAdmissions.get(admission) : undefined;
+}
+
 export interface McpAdministrationLiveRequest {
   readonly action: McpAdministrationLiveAction;
   readonly before: McpAdministrationInventory;
   readonly after: McpAdministrationInventory;
-  readonly activationAdmissionBinding?: McpAdministrationActivationAdmissionBinding;
+  readonly runtimeAdmission?: McpAdministrationRuntimeAdmission;
 }
 
 export interface McpAdministrationLiveResult {
@@ -266,6 +287,8 @@ function postcommitEligibility(
 ): McpAdministrationEligibility {
   if (action.kind === "reset-project-choices") return eligible();
   if (action.kind === "remove") return exactScope(after, action.name, action.scope) === undefined ? eligible() : denied("stale-state");
+  if (action.kind !== "add" && (beforeState.reviewIdentity.profileKey !== afterState.reviewIdentity.profileKey ||
+    beforeState.reviewIdentity.checkoutFamilyKey !== afterState.reviewIdentity.checkoutFamilyKey)) return denied("stale-state");
   const afterServer = winner(after, action.name, "agentOwner" in action ? action.agentOwner : undefined);
   if (action.kind === "add") {
     const finalDeclaration = exactAddedDeclaration(afterState, action); const evidence = durable.state === "not-requested" ? undefined : mcpPersistenceDeclarationEvidence(durable);
@@ -292,27 +315,39 @@ function liveAction(action: McpAdministrationAction): McpAdministrationLiveActio
   return Object.freeze({ kind: action.kind, name: action.name, ...(action.agentOwner === undefined ? {} : { agentOwner: Object.freeze({ ...action.agentOwner }) }) });
 }
 
-function activationAdmissionBinding(action: McpAdministrationAction, state: McpAdministrationFreshState, addBinding?: McpDeclarationDefinitionBinding): McpAdministrationActivationAdmissionBinding | undefined {
+function runtimeAdmission(action: McpAdministrationAction, state: McpAdministrationFreshState, addBinding?: McpDeclarationDefinitionBinding): McpAdministrationRuntimeAdmission | undefined {
   if (action.kind !== "add" && action.kind !== "approve" && action.kind !== "enable" && action.kind !== "reconnect") return undefined;
-  const declaration = privateDeclaration(state, action.name, "agentOwner" in action ? action.agentOwner : undefined);
-  if (!validPrivateDefinition(declaration) || declaration.policy !== "allowed" || declaration.status !== "enabled" ||
+  const owner = "agentOwner" in action ? action.agentOwner : undefined;
+  const declaration = privateDeclaration(state, action.name, owner);
+  if (owner !== undefined || !validPrivateDefinition(declaration) || declaration.agentOwner !== undefined ||
+    declaration.policy !== "allowed" || declaration.status !== "enabled" || declaration.precedence !== "winner" ||
+    declaration.review === "pending" || declaration.review === "rejected-exact" || declaration.review === "rejected-compatibility" ||
     (action.kind === "add" && (addBinding === undefined || declaration.source !== SOURCE_FOR_SCOPE[action.scope] || declaration.definitionVersion !== addBinding.definitionVersion || declaration.definitionDigest !== addBinding.definitionDigest))) return undefined;
-  return Object.freeze({
+  const matches = state.mcp.servers.filter((server): server is EnabledStdioMcpServer | EnabledRemoteMcpServer =>
+    server.name === declaration.name && server.source === declaration.source && server.status === "enabled");
+  if (matches.length !== 1) return undefined;
+  const binding = Object.freeze({
     admittedName: declaration.name,
     admittedSource: declaration.source,
-    ...(declaration.agentOwner === undefined ? {} : { admittedAgentOwner: Object.freeze({ ...declaration.agentOwner }) }),
     admittedDefinitionVersion: declaration.definitionVersion,
     admittedDefinitionDigest: declaration.definitionDigest,
-    admittedPolicy: "allowed",
-    admittedStatus: "enabled",
+    admittedPolicy: "allowed" as const,
+    admittedStatus: "enabled" as const,
     admittedProfileKey: state.reviewIdentity.profileKey,
     admittedCheckoutFamilyKey: state.reviewIdentity.checkoutFamilyKey,
   });
+  const envelope = Object.freeze(Object.defineProperty({}, MCP_RUNTIME_ADMISSION_BRAND, { value: true })) as McpAdministrationRuntimeAdmission;
+  runtimeAdmissions.set(envelope, Object.freeze({ server: matches[0]!, binding }));
+  return envelope;
 }
 
 function liveRequest(action: McpAdministrationAction, before: McpAdministrationInventory, after: McpAdministrationInventory, afterState: McpAdministrationFreshState, addBinding?: McpDeclarationDefinitionBinding): McpAdministrationLiveRequest {
-  const binding = activationAdmissionBinding(action, afterState, addBinding);
-  return Object.freeze({ action: liveAction(action), before, after, ...(binding === undefined ? {} : { activationAdmissionBinding: binding }) });
+  const admission = runtimeAdmission(action, afterState, addBinding);
+  return Object.freeze({ action: liveAction(action), before, after, ...(admission === undefined ? {} : { runtimeAdmission: admission }) });
+}
+
+function requiresRuntimeAdmission(action: McpAdministrationAction): boolean {
+  return action.kind === "add" || action.kind === "approve" || action.kind === "enable" || action.kind === "reconnect";
 }
 
 export function createMcpAdministrationService(dependencies: McpAdministrationServiceDependencies) {
@@ -375,9 +410,11 @@ export function createMcpAdministrationService(dependencies: McpAdministrationSe
       if (durable.cleanup === "pending") return Object.freeze({ inventory: after, eligibility: denied("cleanup-pending"), recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       const finalEligibility = postcommitEligibility(action, beforeState, afterState, before, after, addBinding, durable);
       if (!finalEligibility.eligible) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
-      if (durable.effect === "unchanged" || dependencies.live === undefined || action.kind === "authenticate" || action.kind === "add" && activationAdmissionBinding(action, afterState, addBinding) === undefined) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+      if (durable.effect === "unchanged" || dependencies.live === undefined || action.kind === "authenticate") return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+      const request = liveRequest(action, before, after, afterState, addBinding);
+      if (requiresRuntimeAdmission(action) && request.runtimeAdmission === undefined) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       try {
-        const live = await dependencies.live.apply(liveRequest(action, before, after, afterState, addBinding));
+        const live = await dependencies.live.apply(request);
         return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: live.runtime, exposure: live.exposure });
       } catch {
         return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: Object.freeze({ state: "failed" as const, reasonCode: "live-port-failure" }), exposure: NOT_REQUESTED });
@@ -386,8 +423,10 @@ export function createMcpAdministrationService(dependencies: McpAdministrationSe
     const afterState = await dependencies.assemble(); const after = inventoryOf(afterState);
     const finalEligibility = postcommitEligibility(action, beforeState, afterState, before, after, addBinding);
     if (!finalEligibility.eligible || dependencies.live === undefined || action.kind === "authenticate") return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+    const request = liveRequest(action, before, after, afterState);
+    if (requiresRuntimeAdmission(action) && request.runtimeAdmission === undefined) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
     try {
-      const live = await dependencies.live.apply(liveRequest(action, before, after, afterState));
+      const live = await dependencies.live.apply(request);
       return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: live.runtime, exposure: live.exposure });
     } catch {
       return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: Object.freeze({ state: "failed" as const, reasonCode: "live-port-failure" }), exposure: NOT_REQUESTED });

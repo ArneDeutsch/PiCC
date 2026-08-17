@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ResolvedMcpConfig } from "../src/types.js";
 import type { McpAdministrationDeclaration, McpAdministrationLiveState } from "../src/mcp-administration/model.js";
-import { createMcpAdministrationService, type McpAdministrationFreshState, type McpAdministrationLiveRequest, type McpAdministrationLiveResult } from "../src/mcp-administration/service.js";
+import { createMcpAdministrationService, openMcpAdministrationRuntimeAdmission, type McpAdministrationFreshState, type McpAdministrationLiveRequest, type McpAdministrationLiveResult } from "../src/mcp-administration/service.js";
 import { bindMcpDeclarationDefinition, type McpPersistenceResult } from "../src/mcp-administration/persistence.js";
 
 const committed = (effect: "changed" | "unchanged" = "changed"): McpPersistenceResult => ({ state: "committed", effect, cleanup: "complete", retrySafe: effect === "unchanged" });
 const rolledBack: McpPersistenceResult = { state: "rolled-back", operationId: "op", effect: "unchanged", cleanup: "complete", retrySafe: true };
 const pending: McpPersistenceResult = { state: "pending-recovery", operationId: "op", effect: "uncertain", cleanup: "pending", retrySafe: false, reasonCode: "pending-recovery" };
+const CONTROL_DIGEST_B_FOR_SERVICE = `mcp-review-v1:${"b".repeat(64)}`;
 
 function declaration(overrides: Partial<McpAdministrationDeclaration> & Pick<McpAdministrationDeclaration, "name" | "source">): McpAdministrationDeclaration {
   const { name, source, ...rest } = overrides;
@@ -46,10 +47,22 @@ function admissionBinding(server: McpAdministrationDeclaration) {
 }
 
 function fresh(declarations: readonly McpAdministrationDeclaration[], liveStates: readonly McpAdministrationLiveState[] = []): McpAdministrationFreshState {
+  const servers: ResolvedMcpConfig["servers"] = [];
+  for (const item of declarations) {
+    if (item.precedence !== "winner" || item.status !== "enabled" || item.agentOwner !== undefined || item.source === "subagent-inline") continue;
+    if (item.summary.transport === "http" || item.summary.transport === "sse") servers.push({
+      name: item.name, source: item.source, status: "enabled", transport: item.summary.transport,
+      configuredType: item.summary.transport, url: "https://example.test/mcp", headers: {}, diagnostics: [],
+    });
+    else servers.push({
+      name: item.name, source: item.source, status: "enabled", transport: "stdio",
+      command: "node", args: [], env: {}, rawCommand: "node", diagnostics: [],
+    });
+  }
   return {
     reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
     mcp: {
-      servers: [], diagnostics: [], policyPosture: "absent",
+      servers, diagnostics: [], policyPosture: "absent",
       administration: { version: 1, policyPosture: "absent", observations: [], declarations, omittedDeclarationCount: 0 },
     } as ResolvedMcpConfig,
     liveStates,
@@ -301,11 +314,16 @@ describe("MCP administration orchestration", () => {
         const action = { kind, name: source, ...(owner === undefined ? {} : { agentOwner: owner }) } as const;
         const result = await h.service.execute(action);
         expect(result.eligibility, `${source} ${kind}`).toEqual({ eligible: true, reasonCode: "eligible" });
-        expect(result).toMatchObject({ recovery: { state: "not-requested" }, durable: { state: "committed", effect: "changed", cleanup: "complete" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+        const liveExpected = !(kind === "approve" && owner !== undefined);
+        expect(result).toMatchObject({ recovery: { state: "not-requested" }, durable: { state: "committed", effect: "changed", cleanup: "complete" }, runtime: { state: liveExpected ? "succeeded" : "not-requested" }, exposure: { state: liveExpected ? "succeeded" : "not-requested" } });
         expect(h.mutate).toHaveBeenCalledWith({ kind: "set-review", record: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test", source, serverName: source, ...(owner === undefined ? {} : { agentOwner: owner }), definitionVersion: 1, definitionDigest: beforeServer.definitionDigest, decision: kind === "approve" ? "approved" : "rejected" } });
+        if (!liveExpected) {
+          expect(h.apply).not.toHaveBeenCalled();
+          continue;
+        }
         const request = h.apply.mock.calls[0]![0];
         expect(request.action).toEqual(action);
-        expect(request.activationAdmissionBinding).toEqual(kind === "approve" ? admissionBinding(afterServer) : undefined);
+        expect(request.runtimeAdmission === undefined ? undefined : openMcpAdministrationRuntimeAdmission(request.runtimeAdmission)?.binding).toEqual(kind === "approve" ? admissionBinding(afterServer) : undefined);
       }
     }
   });
@@ -330,7 +348,7 @@ describe("MCP administration orchestration", () => {
         expect(h.mutate).toHaveBeenCalledWith({ kind: "set-runtime-disabled", name: source, disabled: kind === "disable" });
         const request = h.apply.mock.calls[0]![0];
         expect(request.action).toEqual(action);
-        expect(request.activationAdmissionBinding).toEqual(kind === "enable" ? admissionBinding(afterServer) : undefined);
+        expect(request.runtimeAdmission === undefined ? undefined : openMcpAdministrationRuntimeAdmission(request.runtimeAdmission)?.binding).toEqual(kind === "enable" ? admissionBinding(afterServer) : undefined);
       }
     }
   });
@@ -350,7 +368,7 @@ describe("MCP administration orchestration", () => {
     const result = await h.service.execute({ kind: "reset-project-choices" });
     expect(h.mutate).toHaveBeenCalledWith({ kind: "reset-review" });
     expect(h.apply.mock.calls[0]![0].action).toEqual({ kind: "reset-project-choices" });
-    expect(h.apply.mock.calls[0]![0].activationAdmissionBinding).toBeUndefined();
+    expect(h.apply.mock.calls[0]![0].runtimeAdmission).toBeUndefined();
     expect(h.apply).toHaveBeenCalledWith(expect.objectContaining({ after: expect.objectContaining({ servers: [expect.objectContaining({ status: "pending-approval" })] }) }));
     expect(result).toMatchObject({ durable: { state: "committed", effect: "changed" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
   });
@@ -394,7 +412,8 @@ describe("MCP administration orchestration", () => {
     const result = await h.service.execute({ kind: "reconnect", name: "remote" });
     expect(h.mutate).not.toHaveBeenCalled();
     expect(h.assemble).toHaveBeenCalledTimes(2);
-    expect(h.apply.mock.calls[0]![0]).toMatchObject({ action: { kind: "reconnect", name: "remote" }, activationAdmissionBinding: admissionBinding(server) });
+    expect(h.apply.mock.calls[0]![0]).toMatchObject({ action: { kind: "reconnect", name: "remote" }, runtimeAdmission: expect.any(Object) });
+    expect(openMcpAdministrationRuntimeAdmission(h.apply.mock.calls[0]![0].runtimeAdmission!)?.binding).toEqual(admissionBinding(server));
     expect(result).toMatchObject({ durable: { state: "not-requested" }, runtime: { state: "succeeded" } });
   });
 
@@ -428,6 +447,53 @@ describe("MCP administration orchestration", () => {
     const agent = declaration({ name: "target", source: "subagent-inline", agentOwner: owner, review: "approved-exact" });
     const deniedAgent = harness([fresh([agent], [{ name: "target", agentOwner: owner, state: "failed" }])]);
     await expect(deniedAgent.service.execute({ kind: "reconnect", name: "target", agentOwner: owner })).resolves.toMatchObject({ eligibility: { reasonCode: "unsupported-source" } });
+  });
+
+  it("mints only an authentic exact fresh-state runtime envelope", async () => {
+    const base = declaration({ name: "target", source: "native-user" });
+    const live = [{ name: "target", state: "failed" as const }];
+    const exact = fresh([base], live);
+    const exactHarness = harness([exact, exact]);
+    await exactHarness.service.execute({ kind: "reconnect", name: "target" });
+    const request = exactHarness.apply.mock.calls[0]![0];
+    expect(request.runtimeAdmission).toEqual({});
+    expect(JSON.stringify(request.runtimeAdmission)).toBe("{}");
+    expect(openMcpAdministrationRuntimeAdmission(request.runtimeAdmission!)?.server).toBe(exact.mcp.servers[0]);
+    expect(openMcpAdministrationRuntimeAdmission({} as never)).toBeUndefined();
+    expect(openMcpAdministrationRuntimeAdmission({ ...request.runtimeAdmission } as never)).toBeUndefined();
+
+    const rows: Array<[string, (state: McpAdministrationFreshState) => void]> = [
+      ["resolved source", (state) => { state.mcp.servers[0] = { ...state.mcp.servers[0]!, source: "native-local" } as never; }],
+      ["resolved status", (state) => { state.mcp.servers[0] = { name: "target", source: "native-user", status: "disabled", inactiveReason: "native-runtime-disabled", diagnostics: [] }; }],
+      ["policy", (state) => { (state.mcp.administration!.declarations[0] as { policy: string }).policy = "policy-denied"; }],
+      ["status", (state) => { (state.mcp.administration!.declarations[0] as { status: string }).status = "disabled"; }],
+      ["review", (state) => { (state.mcp.administration!.declarations[0] as { review: string }).review = "pending"; }],
+      ["owner", (state) => { (state.mcp.administration!.declarations[0] as { agentOwner?: unknown }).agentOwner = { name: "worker", scope: "project" }; }],
+      ["version", (state) => { (state.mcp.administration!.declarations[0] as { definitionVersion?: number }).definitionVersion = 2; }],
+      ["digest", (state) => { (state.mcp.administration!.declarations[0] as { definitionDigest?: string }).definitionDigest = CONTROL_DIGEST_B_FOR_SERVICE; }],
+      ["profile", (state) => { (state.reviewIdentity as { profileKey: string }).profileKey = "other-profile"; }],
+      ["family", (state) => { (state.reviewIdentity as { checkoutFamilyKey: string }).checkoutFamilyKey = "other-family"; }],
+    ];
+    for (const [label, mutateFinal] of rows) {
+      const before = fresh([base], live);
+      const after = structuredClone(before);
+      mutateFinal(after);
+      const candidate = harness([before, after]);
+      await candidate.service.execute({ kind: "reconnect", name: "target" });
+      expect(candidate.apply, label).not.toHaveBeenCalled();
+    }
+
+    for (const [label, resolvedServers] of [
+      ["absent exact resolver entry", []],
+      ["duplicate exact resolver entries", [exact.mcp.servers[0]!, exact.mcp.servers[0]!]],
+    ] as const) {
+      const before = fresh([base], live);
+      const after = fresh([base], live);
+      after.mcp.servers = [...resolvedServers];
+      const candidate = harness([before, after]);
+      await candidate.service.execute({ kind: "reconnect", name: "target" });
+      expect(candidate.apply, label).not.toHaveBeenCalled();
+    }
   });
 
   it("keeps one stdio and one remote reconnect success", async () => {
@@ -543,9 +609,14 @@ describe("MCP administration orchestration", () => {
 
   it("passes only a secret-free action descriptor after exact durable postconditions", async () => {
     const added = boundDeclaration("added", "native-user", { command: "secret-command", env: { TOKEN: "secret-canary-value" } }, { authority: { kind: "mutable", scope: "user" } });
-    const h = harness([fresh([]), fresh([added])]);
+    const after = fresh([added]);
+    after.mcp.servers[0] = { ...after.mcp.servers[0]!, command: "secret-command", rawCommand: "secret-command", env: { TOKEN: "secret-canary-value" } } as never;
+    const h = harness([fresh([]), after]);
     await h.service.execute({ kind: "add", scope: "user", name: "added", definition: { command: "secret-command", env: { TOKEN: "secret-canary-value" } } });
-    expect(h.apply).toHaveBeenCalledWith(expect.objectContaining({ action: { kind: "add", scope: "user", name: "added" }, activationAdmissionBinding: admissionBinding(added) }));
+    expect(h.apply).toHaveBeenCalledWith(expect.objectContaining({ action: { kind: "add", scope: "user", name: "added" }, runtimeAdmission: expect.any(Object) }));
+    const opened = openMcpAdministrationRuntimeAdmission(h.apply.mock.calls[0]![0].runtimeAdmission!);
+    expect(opened?.binding).toEqual(admissionBinding(added));
+    expect(opened?.server).toBe(after.mcp.servers[0]);
     const serializedLiveRequest = JSON.stringify(h.apply.mock.calls);
     expect(serializedLiveRequest).not.toContain("secret-command");
     expect(serializedLiveRequest).not.toContain("TOKEN");

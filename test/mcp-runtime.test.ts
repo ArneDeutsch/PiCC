@@ -9,6 +9,9 @@ import {
   resolveMcpToolTimeoutMs,
   type McpRuntimeDeps,
 } from "../src/runtime/mcp.js";
+import type { McpRuntimeAdmission } from "../src/runtime/mcp-control.js";
+import { createMcpAdministrationService } from "../src/mcp-administration/service.js";
+import type { McpAdministrationDeclaration } from "../src/mcp-administration/model.js";
 import { renderMcpStatusReport } from "../src/registry/compat-report.js";
 import type { EnabledStdioMcpServer, ResolvedAgentMcpConfig, ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
 import { deferred, waitUntil } from "./helpers/async.js";
@@ -137,6 +140,80 @@ async function waitForDeath(pid: number, what: string): Promise<void> {
   });
 }
 
+const CONTROL_DIGEST_A = `mcp-review-v1:${"a".repeat(64)}`;
+const CONTROL_DIGEST_B = `mcp-review-v1:${"b".repeat(64)}`;
+const CONTROL_DIGEST_C = `mcp-review-v1:${"c".repeat(64)}`;
+const CONTROL_DIGEST_D = `mcp-review-v1:${"d".repeat(64)}`;
+const CONTROL_DIGEST_E = `mcp-review-v1:${"e".repeat(64)}`;
+
+async function controlAdmission(
+  name: string,
+  digest = CONTROL_DIGEST_A,
+  over: Partial<EnabledStdioMcpServer> = {},
+): Promise<McpRuntimeAdmission> {
+  const server = makeServer({ name, ...over });
+  const declaration: McpAdministrationDeclaration = {
+    name,
+    source: server.source,
+    authority: { kind: "mutable", scope: "project" },
+    precedence: "winner",
+    definitionVersion: 1,
+    definitionDigest: digest,
+    summary: { transport: "stdio", commandBasename: "node", argumentCount: server.args.length, environmentKeyCount: Object.keys(server.env).length, headerKeyCount: 0, timeoutConfigured: false },
+    policy: "allowed",
+    review: "approved-exact",
+    status: "enabled",
+  };
+  let admission: McpRuntimeAdmission | undefined;
+  const state = {
+    reviewIdentity: { profileKey: "profile", checkoutFamilyKey: "family" },
+    mcp: {
+      servers: [server], diagnostics: [],
+      administration: { version: 1 as const, policyPosture: "absent" as const, observations: [], declarations: [declaration], omittedDeclarationCount: 0 },
+    },
+    liveStates: [{ name, state: "failed" as const }],
+  };
+  const service = createMcpAdministrationService({
+    inspectPending: async () => ({ pending: false, status: "clear" as const }),
+    recover: async () => ({ state: "rolled-back", operationId: "none", effect: "unchanged", cleanup: "complete", retrySafe: true }),
+    mutate: async () => ({ state: "committed", effect: "unchanged", cleanup: "complete", retrySafe: true }),
+    assemble: () => state,
+    live: { apply: async (request) => {
+      admission = request.runtimeAdmission;
+      return { runtime: { state: "succeeded" }, exposure: { state: "succeeded" } };
+    } },
+  });
+  await service.execute({ kind: "reconnect", name });
+  if (!admission) throw new Error("test admission was not minted");
+  return admission;
+}
+
+async function remoteControlAdmission(name: string, digest = CONTROL_DIGEST_A): Promise<McpRuntimeAdmission> {
+  const server = makeRemoteServer({ name });
+  const declaration: McpAdministrationDeclaration = {
+    name, source: server.source, authority: { kind: "mutable", scope: "project" }, precedence: "winner",
+    definitionVersion: 1, definitionDigest: digest,
+    summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 1, timeoutConfigured: false },
+    policy: "allowed", review: "approved-exact", status: "enabled",
+  };
+  let admission: McpRuntimeAdmission | undefined;
+  const state = {
+    reviewIdentity: { profileKey: "profile", checkoutFamilyKey: "family" },
+    mcp: { servers: [server], diagnostics: [], administration: { version: 1 as const, policyPosture: "absent" as const, observations: [], declarations: [declaration], omittedDeclarationCount: 0 } },
+    liveStates: [{ name, state: "failed" as const }],
+  };
+  const service = createMcpAdministrationService({
+    inspectPending: async () => ({ pending: false, status: "clear" as const }),
+    recover: async () => ({ state: "rolled-back", operationId: "none", effect: "unchanged", cleanup: "complete", retrySafe: true }),
+    mutate: async () => ({ state: "committed", effect: "unchanged", cleanup: "complete", retrySafe: true }),
+    assemble: () => state,
+    live: { apply: async (request) => { admission = request.runtimeAdmission; return { runtime: { state: "succeeded" }, exposure: { state: "succeeded" } }; } },
+  });
+  await service.execute({ kind: "reconnect", name });
+  if (!admission) throw new Error("test remote admission was not minted");
+  return admission;
+}
+
 function fakeToolSdk(options: {
   forwardedTimeouts: number[];
   callError?: unknown;
@@ -168,6 +245,684 @@ function fakeToolSdk(options: {
     StdioClientTransport: FakeTransport,
   } as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>;
 }
+
+// ---------------------------------------------------------------------------
+// Generation-safe live control
+// ---------------------------------------------------------------------------
+
+describe("McpRuntime live control", () => {
+  it("reconciles fresh authority, coalesces duplicate starts, retires routes before cleanup, and reuses an immutable catalog", async () => {
+    const closeGate = deferred<void>();
+    let clients = 0;
+    let lists = 0;
+    let notificationHandlers = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      constructor() { clients += 1; }
+      async connect(): Promise<void> {}
+      setNotificationHandler(): void { notificationHandlers += 1; }
+      getServerCapabilities() { return { tools: { listChanged: true }, prompts: { listChanged: true }, resources: { listChanged: true } }; }
+      async listTools() { lists += 1; return { tools: [{ name: "controlled", description: "first", inputSchema: { type: "object" } }] }; }
+      async listPrompts() { lists += 1; return { prompts: [{ name: "prompt", description: "first", arguments: [] }] }; }
+      async listResources() { lists += 1; return { resources: [{ uri: "file:///one", name: "resource" }] }; }
+      async callTool() { return { content: [] }; }
+      async close(): Promise<void> { await closeGate.promise; }
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      const admission = await controlAdmission("live", CONTROL_DIGEST_A, {
+        command: "EXPANDED_COMMAND_CANARY",
+        args: ["ARG_CANARY"],
+        env: { TOKEN: "ENV_CANARY" },
+        rawCommand: "RAW_COMMAND_CANARY",
+      });
+      const separatelyMintedAdmission = await controlAdmission("live", CONTROL_DIGEST_A, {
+        command: "EXPANDED_COMMAND_CANARY",
+        args: ["ARG_CANARY"],
+        env: { TOKEN: "ENV_CANARY" },
+        rawCommand: "RAW_COMMAND_CANARY",
+      });
+      const [first, duplicate] = await Promise.all([
+        runtime.reconcileServer(admission),
+        runtime.reconcileServer(separatelyMintedAdmission),
+      ]);
+      expect(first).toMatchObject({ state: "succeeded", cleanup: "not-required" });
+      expect(first.deltas).toEqual([expect.objectContaining({
+        serverName: "live", definitionFingerprint: CONTROL_DIGEST_A, generation: 1, kind: "publish",
+        tools: [expect.objectContaining({ wireDefinitionFingerprint: expect.stringMatching(/^mcp-wire-v1:[a-f0-9]{64}$/u) })],
+        prompts: [expect.objectContaining({ wireDefinitionFingerprint: expect.stringMatching(/^mcp-wire-v1:[a-f0-9]{64}$/u) })],
+        resourceServer: expect.objectContaining({ wireDefinitionFingerprint: expect.stringMatching(/^mcp-wire-v1:[a-f0-9]{64}$/u) }),
+      })]);
+      expect(duplicate).toBe(first);
+      expect({ clients, lists, notificationHandlers }).toEqual({ clients: 1, lists: 3, notificationHandlers: 0 });
+      await expect(runtime.reconcileServer(await controlAdmission("live"))).resolves.toEqual({
+        state: "succeeded", reason: "already-current", cleanup: "not-required", deltas: [],
+      });
+      expect({ clients, lists }).toEqual({ clients: 1, lists: 3 });
+      for (const canary of ["EXPANDED_COMMAND_CANARY", "ARG_CANARY", "ENV_CANARY", "RAW_COMMAND_CANARY"]) {
+        expect(JSON.stringify(first)).not.toContain(canary);
+      }
+
+      const disabling = runtime.disableServer("live");
+      expect(runtime.tools()).toEqual([]);
+      await expect(runtime.callTool("live", "controlled", {})).rejects.toThrow(/route was retired/);
+      closeGate.resolve();
+      const disabled = await disabling;
+      expect(disabled).toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+      expect(disabled.deltas).toEqual([expect.objectContaining({ kind: "retire", generation: 2 })]);
+      await expect(runtime.disableServer("live")).resolves.toEqual({
+        state: "succeeded", reason: "already-inactive", cleanup: "not-required", deltas: [],
+      });
+
+      const enabled = await runtime.reconcileServer(admission);
+      expect(enabled).toMatchObject({ state: "succeeded" });
+      expect(enabled.deltas).toEqual([expect.objectContaining({ kind: "publish", generation: 3 })]);
+      expect({ clients, lists, notificationHandlers }).toEqual({ clients: 2, lists: 3, notificationHandlers: 0 });
+    } finally {
+      closeGate.resolve();
+      await runtime.shutdown();
+    }
+  });
+
+  it("keeps wire fingerprints independent from admission and from sibling wire definitions", async () => {
+    let clients = 0;
+    let lists = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { tools: {}, prompts: {}, resources: {} }; }
+      async listTools() {
+        lists += 1;
+        const changed = this.id === 2;
+        return { tools: [{ name: "tool", description: changed ? "changed-tool" : "baseline-tool", inputSchema: { type: "object", const: changed ? "changed" : "baseline" } }] };
+      }
+      async listPrompts() {
+        lists += 1;
+        const changed = this.id === 3;
+        return { prompts: [{ name: "prompt", description: changed ? "changed-prompt" : "baseline-prompt", arguments: [{ name: "arg", required: changed }] }] };
+      }
+      async listResources() {
+        lists += 1;
+        return { resources: [{ uri: this.id === 4 ? "opaque:changed" : "opaque:baseline", name: "resource" }] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const fingerprints = async (digest: string): Promise<readonly string[]> => {
+      const result = await runtime.reconcileServer(await controlAdmission("fingerprints", digest));
+      const publish = result.deltas.at(-1)!;
+      return [
+        publish.tools[0]!.wireDefinitionFingerprint,
+        publish.prompts[0]!.wireDefinitionFingerprint,
+        publish.resourceServer!.wireDefinitionFingerprint,
+      ];
+    };
+    try {
+      const baseline = await fingerprints(CONTROL_DIGEST_A);
+      expect(new Set(baseline).size).toBe(3);
+
+      const changedAdmissionOnly = await fingerprints(CONTROL_DIGEST_B);
+      expect(changedAdmissionOnly).toEqual(baseline);
+
+      const toolOnly = await fingerprints(CONTROL_DIGEST_C);
+      expect(toolOnly.map((value, index) => value === baseline[index])).toEqual([false, true, true]);
+
+      const promptOnly = await fingerprints(CONTROL_DIGEST_D);
+      expect(promptOnly.map((value, index) => value === baseline[index])).toEqual([true, false, true]);
+
+      const resourceOnly = await fingerprints(CONTROL_DIGEST_E);
+      expect(resourceOnly.map((value, index) => value === baseline[index])).toEqual([true, true, false]);
+      expect({ clients, lists }).toEqual({ clients: 5, lists: 15 });
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("rejects forged or copied admissions before constructing any SDK client", async () => {
+    let sdkLoads = 0;
+    let clients = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient { constructor() { clients += 1; } }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => { sdkLoads += 1; return { Client: FakeClient, StdioClientTransport: FakeTransport } as never; },
+    }));
+    const authentic = await controlAdmission("opaque");
+    await expect(runtime.reconcileServer({} as McpRuntimeAdmission)).resolves.toMatchObject({ reason: "definition-unavailable" });
+    await expect(runtime.reconcileServer({ ...authentic } as McpRuntimeAdmission)).resolves.toMatchObject({ reason: "definition-unavailable" });
+    expect({ sdkLoads, clients }).toEqual({ sdkLoads: 0, clients: 0 });
+    await runtime.shutdown();
+  });
+
+  it("discovers the first catalog after initial failure, refreshes changed definitions, and isolates siblings", async () => {
+    let clients = 0;
+    const lists: string[] = [];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() {
+        lists.push(`client-${this.id}`);
+        if (this.id === 0) throw Object.assign(new Error("hidden"), { code: "EACCES" });
+        return { tools: [{ name: this.id === 1 ? "recovered" : "changed" }] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      const failed = await runtime.reconcileServer(await controlAdmission("one"));
+      expect(failed).toMatchObject({ state: "failed", reason: "connection-failed" });
+      const sibling = await runtime.reconcileServer(await controlAdmission("two"));
+      expect(sibling).toMatchObject({ state: "succeeded" });
+      expect(runtime.tools().map((tool) => [tool.serverName, tool.toolName])).toEqual([["two", "recovered"]]);
+
+      const recovered = await runtime.reconnectServer(await controlAdmission("one"));
+      expect(recovered).toMatchObject({ state: "succeeded" });
+      expect(recovered.deltas.at(-1)).toMatchObject({ kind: "publish", definitionFingerprint: CONTROL_DIGEST_A });
+      expect(runtime.tools().map((tool) => tool.serverName).sort()).toEqual(["one", "two"]);
+
+      const changed = await runtime.reconcileServer(await controlAdmission("one", CONTROL_DIGEST_B));
+      expect(changed).toMatchObject({ state: "succeeded" });
+      expect(changed.deltas).toEqual([
+        expect.objectContaining({ kind: "retire", definitionFingerprint: CONTROL_DIGEST_A }),
+        expect.objectContaining({ kind: "publish", definitionFingerprint: CONTROL_DIGEST_B }),
+      ]);
+      expect(lists).toHaveLength(4);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("keeps reconnect fingerprint and health refusals generation-neutral", async () => {
+    let clients = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> { if (this.id === 0 || this.id === 2) throw new Error("refused"); }
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() { return { tools: [{ name: "healthy" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      const admission = await controlAdmission("neutral");
+      await expect(runtime.reconcileServer(admission)).resolves.toMatchObject({ state: "failed", reason: "connection-failed" });
+      await expect(runtime.reconnectServer(await controlAdmission("neutral", CONTROL_DIGEST_B))).resolves.toEqual({
+        state: "failed", reason: "generation-stale", cleanup: "not-required", deltas: [],
+      });
+      const recovered = await runtime.reconnectServer(await controlAdmission("neutral"));
+      expect(recovered.deltas.at(-1)).toMatchObject({ kind: "publish", generation: 1 });
+      await expect(runtime.reconnectServer(await controlAdmission("neutral"))).resolves.toEqual({
+        state: "failed", reason: "not-failed", cleanup: "not-required", deltas: [],
+      });
+      await runtime.disableServer("neutral");
+      const failed = await runtime.reconcileServer(await controlAdmission("neutral"));
+      expect(failed).toMatchObject({ state: "failed", reason: "connection-failed" });
+      expect(failed.deltas.some((delta) => delta.kind === "publish")).toBe(false);
+      expect(runtime.tools()).toEqual([]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("publishes no catalog when a manual reconnect connection fails", async () => {
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> { throw new Error("refused"); }
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() { return { tools: [{ name: "must-not-publish" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.reconcileServer(await controlAdmission("manual-failure"));
+      const failed = await runtime.reconnectServer(await controlAdmission("manual-failure"));
+      expect(failed).toMatchObject({ state: "failed", reason: "connection-failed" });
+      expect(failed.deltas.some((delta) => delta.kind === "publish")).toBe(false);
+      expect(runtime.tools()).toEqual([]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("preserves automatic remote recovery after a generation-neutral not-failed reconnect refusal", async () => {
+    let clients = 0;
+    let disconnect: ((event: { kind: "abrupt-stream-failure" }) => void) | undefined;
+    class FakeTransport {
+      onDisconnect(next: (event: { kind: "abrupt-stream-failure" }) => void): () => void { disconnect = next; return () => { disconnect = undefined; }; }
+      async abort(): Promise<void> {}
+    }
+    class FakeClient {
+      constructor() { clients += 1; }
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() { return { tools: [{ name: "remote" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadRemoteClient: async () => FakeClient as never,
+      createRemoteTransport: async () => new FakeTransport() as never,
+      delay: async () => {},
+    }));
+    try {
+      await runtime.reconcileServer(await remoteControlAdmission("auto-after-refusal"));
+      await expect(runtime.reconnectServer(await remoteControlAdmission("auto-after-refusal"))).resolves.toMatchObject({
+        state: "failed", reason: "not-failed", deltas: [],
+      });
+      disconnect?.({ kind: "abrupt-stream-failure" });
+      await waitUntil({ description: "remote route to auto-recover after reconnect refusal", predicate: () => clients >= 2 && runtime.serverStates()[0]?.state === "connected" });
+      expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["remote"]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("rejects stale admission, blocks re-enable after uncertain cleanup, and makes shutdown win", async () => {
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      async listTools() { return { tools: [{ name: "tool" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      raceCleanup: async () => false,
+    }));
+    const valid = await controlAdmission("uncertain");
+    try {
+      expect(await runtime.reconcileServer({} as McpRuntimeAdmission)).toMatchObject({ state: "failed", reason: "definition-unavailable", deltas: [] });
+      await runtime.reconcileServer(valid);
+      const disabled = await runtime.disableServer("uncertain");
+      expect(disabled).toMatchObject({ state: "failed", reason: "cleanup-unconfirmed", cleanup: "unconfirmed" });
+      expect(disabled.deltas).toEqual([expect.objectContaining({ kind: "retire" })]);
+      expect(await runtime.reconcileServer(valid)).toMatchObject({
+        state: "failed", reason: "cleanup-unconfirmed", cleanup: "unconfirmed",
+      });
+
+      const late = await controlAdmission("late");
+      const shutdown = runtime.shutdown();
+      expect(await runtime.reconcileServer(late)).toMatchObject({ state: "failed", reason: "shutting-down" });
+      await shutdown;
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("disable overtakes entered stdio and remote connects without a test release", async () => {
+    for (const transportKind of ["stdio", "remote"] as const) {
+      const entered = deferred<void>();
+      const blocked = deferred<void>();
+      let closes = 0;
+      class FakeTransport {
+        readonly pid = undefined;
+        readonly stderr = undefined;
+        async abort(): Promise<void> { closes += 1; blocked.reject(new Error("aborted")); }
+        onDisconnect(): void {}
+      }
+      class FakeClient {
+        async connect(): Promise<void> { entered.resolve(); await blocked.promise; }
+        async close(): Promise<void> { closes += 1; blocked.reject(new Error("closed")); }
+      }
+      const runtime = McpRuntime.start(makeConfig(), makeDeps(transportKind === "stdio" ? {
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      } : {
+        loadRemoteClient: async () => FakeClient as never,
+        createRemoteTransport: async () => new FakeTransport() as never,
+      }));
+      const admission = transportKind === "stdio" ? await controlAdmission("entered") : await remoteControlAdmission("entered");
+      const starting = runtime.reconcileServer(admission);
+      await entered.promise;
+      const disabled = runtime.disableServer("entered");
+      await expect(starting).resolves.toMatchObject({ state: "failed", reason: "generation-stale" });
+      await expect(disabled).resolves.toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+      expect(closes).toBeGreaterThan(0);
+      await runtime.shutdown();
+    }
+  });
+
+  it("lets a newest equivalent reconcile advance past an entered reconcile and intervening disable", async () => {
+    for (const transportKind of ["stdio", "remote"] as const) {
+      const entered = deferred<void>();
+      const blocked = deferred<void>();
+      let clients = 0;
+      class FakeTransport {
+        readonly pid = undefined;
+        readonly stderr = undefined;
+        async abort(): Promise<void> { blocked.reject(new Error("aborted")); }
+        onDisconnect(): void {}
+      }
+      class FakeClient {
+        private readonly id = clients++;
+        async connect(): Promise<void> {
+          if (this.id === 0) {
+            entered.resolve();
+            await blocked.promise;
+          }
+        }
+        getServerCapabilities() { return {}; }
+        async close(): Promise<void> { if (this.id === 0) blocked.reject(new Error("closed")); }
+      }
+      const runtime = McpRuntime.start(makeConfig(), makeDeps(transportKind === "stdio" ? {
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      } : {
+        loadRemoteClient: async () => FakeClient as never,
+        createRemoteTransport: async () => new FakeTransport() as never,
+      }));
+      const admission = transportKind === "stdio"
+        ? await controlAdmission("latest-equivalent")
+        : await remoteControlAdmission("latest-equivalent");
+      const first = runtime.reconcileServer(admission);
+      await entered.promise;
+      const disabling = runtime.disableServer("latest-equivalent");
+      const latest = runtime.reconcileServer(transportKind === "stdio"
+        ? await controlAdmission("latest-equivalent")
+        : await remoteControlAdmission("latest-equivalent"));
+      expect(latest).not.toBe(first);
+      await expect(first).resolves.toMatchObject({ state: "failed", reason: "generation-stale" });
+      await expect(disabling).resolves.toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+      await expect(latest).resolves.toMatchObject({ state: "succeeded" });
+      expect(runtime.serverStates()).toEqual([expect.objectContaining({ name: "latest-equivalent", state: "connected" })]);
+      expect(clients).toBe(2);
+      await runtime.shutdown();
+    }
+  });
+
+  it("makes the newest A win after an entered A then B then A", async () => {
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    let clients = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> {
+        if (this.id === 0) {
+          entered.resolve();
+          await blocked.promise;
+        }
+      }
+      getServerCapabilities() { return {}; }
+      async close(): Promise<void> { if (this.id === 0) blocked.reject(new Error("closed")); }
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const firstA = runtime.reconcileServer(await controlAdmission("aba", CONTROL_DIGEST_A));
+    await entered.promise;
+    const middleB = runtime.reconcileServer(await controlAdmission("aba", CONTROL_DIGEST_B));
+    const latestA = runtime.reconcileServer(await controlAdmission("aba", CONTROL_DIGEST_A));
+    expect(latestA).not.toBe(firstA);
+    await expect(firstA).resolves.toEqual({
+      state: "failed", reason: "generation-stale", cleanup: "not-required", deltas: [],
+    });
+    await expect(middleB).resolves.toEqual({
+      state: "failed", reason: "generation-stale", cleanup: "confirmed", deltas: [],
+    });
+    const latestResult = await latestA;
+    expect(latestResult).toEqual({
+      state: "succeeded",
+      cleanup: "confirmed",
+      deltas: [expect.objectContaining({
+        kind: "publish", definitionFingerprint: CONTROL_DIGEST_A, generation: 1,
+      })],
+    });
+    expect(clients).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it("disable overtakes entered stdio and remote manual reconnects without a test release", async () => {
+    for (const transportKind of ["stdio", "remote"] as const) {
+      const entered = deferred<void>();
+      const blocked = deferred<void>();
+      let clients = 0;
+      const initialFailures = 1;
+      class FakeTransport {
+        readonly pid = undefined;
+        readonly stderr = undefined;
+        async abort(): Promise<void> {}
+        onDisconnect(): void {}
+      }
+      class FakeClient {
+        private readonly id = clients++;
+        async connect(): Promise<void> {
+          if (this.id < initialFailures) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+          entered.resolve();
+          await blocked.promise;
+        }
+        async close(): Promise<void> { if (this.id >= initialFailures) blocked.reject(new Error("closed")); }
+      }
+      const runtime = McpRuntime.start(makeConfig(), makeDeps(transportKind === "stdio" ? {
+        loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      } : {
+        loadRemoteClient: async () => FakeClient as never,
+        createRemoteTransport: async () => new FakeTransport() as never,
+        delay: async () => {},
+      }));
+      const admission = transportKind === "stdio" ? await controlAdmission("entered-reconnect") : await remoteControlAdmission("entered-reconnect");
+      await expect(runtime.reconcileServer(admission)).resolves.toMatchObject({ state: "failed", reason: "connection-failed" });
+      const reconnecting = runtime.reconnectServer(transportKind === "stdio"
+        ? await controlAdmission("entered-reconnect")
+        : await remoteControlAdmission("entered-reconnect"));
+      const duplicate = runtime.reconnectServer(transportKind === "stdio"
+        ? await controlAdmission("entered-reconnect")
+        : await remoteControlAdmission("entered-reconnect"));
+      expect(duplicate).toBe(reconnecting);
+      await entered.promise;
+      const disabled = runtime.disableServer("entered-reconnect");
+      await expect(reconnecting).resolves.toMatchObject({ state: "failed", reason: "generation-stale" });
+      await expect(disabled).resolves.toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+      await runtime.shutdown();
+    }
+  });
+
+  it("retries unconfirmed cleanup before admitting exactly one replacement", async () => {
+    let clients = 0;
+    let cleanupChecks = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      constructor() { clients += 1; }
+      async connect(): Promise<void> {}
+      async listTools() { return { tools: [{ name: "tool" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      raceCleanup: async (completion) => { cleanupChecks += 1; await completion; return cleanupChecks > 1; },
+    }));
+    const admission = await controlAdmission("retry-cleanup");
+    await runtime.reconcileServer(admission);
+    await expect(runtime.disableServer("retry-cleanup")).resolves.toMatchObject({ state: "failed", cleanup: "unconfirmed" });
+    const [replacement, duplicate] = await Promise.all([runtime.reconcileServer(admission), runtime.reconcileServer(admission)]);
+    expect(replacement).toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+    expect(duplicate).toBe(replacement);
+    expect(clients).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it("retries cleanup on repeated disable and reports confirmed cleanup exactly", async () => {
+    let cleanupChecks = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      raceCleanup: async (completion) => { cleanupChecks += 1; await completion; return cleanupChecks > 1; },
+    }));
+    await runtime.reconcileServer(await controlAdmission("repeat-confirmed"));
+    await expect(runtime.disableServer("repeat-confirmed")).resolves.toMatchObject({
+      state: "failed", reason: "cleanup-unconfirmed", cleanup: "unconfirmed",
+    });
+    await expect(runtime.disableServer("repeat-confirmed")).resolves.toEqual({
+      state: "succeeded", reason: "already-inactive", cleanup: "confirmed", deltas: [],
+    });
+    expect(cleanupChecks).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it("retries cleanup on repeated disable and reports continuing uncertainty exactly", async () => {
+    let cleanupChecks = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+      raceCleanup: async () => { cleanupChecks += 1; return false; },
+    }));
+    await runtime.reconcileServer(await controlAdmission("repeat-unconfirmed"));
+    await runtime.disableServer("repeat-unconfirmed");
+    await expect(runtime.disableServer("repeat-unconfirmed")).resolves.toEqual({
+      state: "failed", reason: "cleanup-unconfirmed", cleanup: "unconfirmed", deltas: [],
+    });
+    expect(cleanupChecks).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it("treats only the still-latest disable as duplicate and fences an intervening enable", async () => {
+    const cleanupGate = deferred<void>();
+    let clients = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      constructor() { clients += 1; }
+      async connect(): Promise<void> {}
+      async close(): Promise<void> { await cleanupGate.promise; }
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const admission = await controlAdmission("latest-disable");
+    await runtime.reconcileServer(admission);
+    const firstDisable = runtime.disableServer("latest-disable");
+    const enabling = runtime.reconcileServer(await controlAdmission("latest-disable"));
+    const latestDisable = runtime.disableServer("latest-disable");
+    expect(latestDisable).not.toBe(firstDisable);
+    cleanupGate.resolve();
+    await expect(firstDisable).resolves.toMatchObject({ state: "succeeded", cleanup: "confirmed" });
+    await expect(enabling).resolves.toMatchObject({ state: "failed", reason: "generation-stale" });
+    await expect(latestDisable).resolves.toMatchObject({ state: "succeeded", reason: "already-inactive" });
+    expect(clients).toBe(1);
+    await runtime.shutdown();
+  });
+
+  it("shutdown overtakes an entered stdio reconcile without a test release", async () => {
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> { entered.resolve(); await blocked.promise; }
+      async close(): Promise<void> { blocked.reject(new Error("shutdown")); }
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const starting = runtime.reconcileServer(await controlAdmission("shutdown-entered"));
+    await entered.promise;
+    const shutdown = runtime.shutdown();
+    await expect(starting).resolves.toMatchObject({ state: "failed", reason: "shutting-down" });
+    await shutdown;
+    expect(runtime.tools()).toEqual([]);
+  });
+
+  it("keeps a late old-definition completion from replacing the entered new generation", async () => {
+    const oldEntered = deferred<void>();
+    const oldCompletion = deferred<void>();
+    let clients = 0;
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> {
+        if (this.id === 0) { oldEntered.resolve(); await oldCompletion.promise; }
+      }
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() { return { tools: [{ name: this.id === 0 ? "old" : "new" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    const oldStart = runtime.reconcileServer(await controlAdmission("replacement", CONTROL_DIGEST_A));
+    await oldEntered.promise;
+    const replacement = runtime.reconcileServer(await controlAdmission("replacement", CONTROL_DIGEST_B));
+    await expect(oldStart).resolves.toMatchObject({ state: "failed", reason: "generation-stale" });
+    await expect(replacement).resolves.toMatchObject({ state: "succeeded" });
+    oldCompletion.resolve();
+    await Promise.resolve();
+    expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["new"]);
+    expect(runtime.serverStates()).toEqual([expect.objectContaining({ name: "replacement", state: "connected" })]);
+    await runtime.shutdown();
+  });
+
+  it("keeps a cached remote catalog hidden when replacement activation fails", async () => {
+    let clients = 0;
+    class FakeTransport {
+      onerror?: (error: Error) => void;
+      onDisconnect(): void {}
+      async abort(): Promise<void> {}
+    }
+    class FakeClient {
+      private readonly id = clients++;
+      async connect(): Promise<void> {
+        if (this.id > 0) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      }
+      getServerCapabilities() { return { tools: {} }; }
+      async listTools() { return { tools: [{ name: "cached" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadRemoteClient: async () => FakeClient as never,
+      createRemoteTransport: async () => new FakeTransport() as never,
+      delay: async () => {},
+    }));
+    const admission = await remoteControlAdmission("cached-remote");
+    const first = await runtime.reconcileServer(admission);
+    expect(first.deltas).toEqual([expect.objectContaining({ kind: "publish" })]);
+    expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["cached"]);
+    await runtime.disableServer("cached-remote");
+    const failed = await runtime.reconcileServer(admission);
+    expect(failed).toMatchObject({ state: "failed", reason: "connection-failed" });
+    expect(failed.deltas.some((delta) => delta.kind === "publish")).toBe(false);
+    expect(runtime.tools()).toEqual([]);
+    await runtime.shutdown();
+  });
+
+  it("invalidates a late connecting generation when disable races startup", async () => {
+    const connectGate = deferred<void>();
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> { await connectGate.promise; }
+      async listTools() { return { tools: [{ name: "late" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      const starting = runtime.reconcileServer(await controlAdmission("race"));
+      await waitUntil({ description: "live server to enter connecting", predicate: () => runtime.serverStates().some((state) => state.name === "race") });
+      const stopping = runtime.disableServer("race");
+      connectGate.resolve();
+      expect(await starting).toMatchObject({ state: "failed", reason: "generation-stale" });
+      expect(await stopping).toMatchObject({ state: "succeeded" });
+      expect(runtime.tools()).toEqual([]);
+    } finally {
+      connectGate.resolve();
+      await runtime.shutdown();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Timeout policy
