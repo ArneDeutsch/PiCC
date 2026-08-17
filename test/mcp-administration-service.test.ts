@@ -83,21 +83,26 @@ function expectedInventory(declarations: readonly McpAdministrationDeclaration[]
   } as const;
 }
 
-function harness(states: McpAdministrationFreshState[], options: { pending?: boolean; recovery?: McpPersistenceResult; mutation?: McpPersistenceResult; live?: McpAdministrationLiveResult } = {}) {
-  let index = 0; let pendingNow = options.pending ?? false;
+function harness(states: McpAdministrationFreshState[], options: { pending?: boolean; pendingSequence?: readonly boolean[]; recovery?: McpPersistenceResult; mutation?: McpPersistenceResult; live?: McpAdministrationLiveResult } = {}) {
+  let index = 0; let pendingIndex = 0; let pendingNow = options.pending ?? false;
   const calls: string[] = [];
   const mutate = vi.fn(async () => { calls.push("mutate"); return options.mutation ?? committed(); });
   const recover = vi.fn(async () => { calls.push("recover"); const result = options.recovery ?? rolledBack; if (result.state === "rolled-back" && result.cleanup === "complete" || result.state === "committed" && result.effect === "unchanged" && result.cleanup === "complete") pendingNow = false; return result; });
   const assemble = vi.fn(() => { calls.push("assemble"); return states[Math.min(index++, states.length - 1)]!; });
   const apply = vi.fn(async (_request: McpAdministrationLiveRequest) => { calls.push("live"); return options.live ?? { runtime: { state: "succeeded" as const }, exposure: { state: "succeeded" as const } }; });
+  const inspectPending = vi.fn(async () => {
+    const sequenced = options.pendingSequence?.[Math.min(pendingIndex++, options.pendingSequence.length - 1)];
+    const current = sequenced ?? pendingNow;
+    return { pending: current, status: current ? "pending" as const : "clear" as const };
+  });
   const service = createMcpAdministrationService({
-    inspectPending: async () => ({ pending: pendingNow, status: pendingNow ? "pending" as const : "clear" as const }),
+    inspectPending,
     recover,
     mutate,
     assemble,
     live: { apply },
   });
-  return { service, calls, mutate, recover, assemble, apply };
+  return { service, calls, mutate, recover, assemble, apply, inspectPending };
 }
 
 describe("MCP administration eligibility", () => {
@@ -666,5 +671,169 @@ describe("MCP administration orchestration", () => {
   it("projects bounded recovery guidance without managed authority", async () => {
     const h = harness([fresh([])], { pending: true });
     await expect(h.service.inventory()).resolves.toEqual(expect.objectContaining({ policyPosture: "fail-closed", observations: ["administration-recovery-pending"], remediation: "administration-recovery-pending", servers: [] }));
+  });
+});
+
+describe("MCP interactive confirmation authority", () => {
+  const selector = (item: McpAdministrationDeclaration) => ({
+    name: item.name, source: item.source, authority: item.authority, precedence: item.precedence,
+    ...(item.agentOwner === undefined ? {} : { agentOwner: item.agentOwner }),
+  });
+
+  it.each(["approve", "reject"] as const)("prepares and confirms exact project %s", async (kind) => {
+    const before = declaration({ name: "project", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, review: "pending", status: "pending-approval" });
+    const after = { ...before, review: kind === "approve" ? "approved-exact" as const : "rejected-exact" as const, status: kind === "approve" ? "enabled" as const : "disabled" as const };
+    const h = harness([fresh([before]), fresh([before]), fresh([after])]);
+    const prepared = await h.service.interactivePrepare(selector(before), kind);
+    expect(prepared).toMatchObject({ eligibility: { eligible: true }, authority: {} });
+    expect(JSON.stringify(prepared.authority)).toBe("{}");
+    const result = await h.service.confirmedExecute(prepared.authority!);
+    expect(result).toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed", effect: "changed" } });
+    expect(h.mutate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["disable", "enable"] as const)("prepares and confirms exact native %s", async (kind) => {
+    const enabled = declaration({ name: "native", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const disabled = { ...enabled, status: "disabled" as const, inactiveReason: "native-runtime-disabled" as const };
+    const before = kind === "disable" ? enabled : disabled; const after = kind === "disable" ? disabled : enabled;
+    const h = harness([fresh([before]), fresh([before]), fresh([after])]);
+    const prepared = await h.service.interactivePrepare(selector(before), kind);
+    await expect(h.service.confirmedExecute(prepared.authority!)).resolves.toMatchObject({ durable: { state: "committed" } });
+    expect(h.mutate).toHaveBeenCalledWith({ kind: "set-runtime-disabled", name: "native", disabled: kind === "disable" });
+  });
+
+  it("prepares and confirms reconnect while authentication remains authority-free", async () => {
+    const item = declaration({ name: "remote", source: "native-user", summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false } });
+    const live = [{ name: "remote", state: "failed" as const }];
+    const h = harness([fresh([item], live), fresh([item], live), fresh([item], live)]);
+    const auth = await h.service.interactivePrepare(selector(item), "authenticate");
+    expect(auth).toMatchObject({ eligibility: { reasonCode: "authentication-deferred" } }); expect(auth.authority).toBeUndefined();
+    const prepared = await h.service.interactivePrepare(selector(item), "reconnect");
+    await expect(h.service.confirmedExecute(prepared.authority!)).resolves.toMatchObject({ runtime: { state: "succeeded" } });
+    expect(h.mutate).not.toHaveBeenCalled(); expect(h.apply).toHaveBeenCalledOnce();
+  });
+
+  it("denies missing, shadowed, and mismatched full selectors without authority", async () => {
+    const winner = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const shadow = declaration({ name: "same", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, precedence: "shadowed", status: "shadowed", review: "pending" });
+    const h = harness([fresh([winner, shadow]), fresh([winner, shadow]), fresh([winner, shadow])]);
+    for (const [candidate, action, reason] of [
+      [selector(shadow), "approve", "stale-state"],
+      [{ ...selector(winner), source: "native-local" }, "disable", "stale-state"],
+      [{ ...selector(winner), name: "missing" }, "disable", "server-not-found"],
+    ] as const) {
+      const result = await h.service.interactivePrepare(candidate, action);
+      expect(result.eligibility.reasonCode).toBe(reason); expect(result.authority).toBeUndefined();
+    }
+  });
+
+  it("requires an exact authority and owner selector and refuses ambiguous duplicate winners", async () => {
+    const base = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    for (const candidate of [
+      { ...selector(base), authority: { kind: "mutable" as const, scope: "local" as const } },
+      { ...selector(base), agentOwner: { name: "worker", scope: "project" as const } },
+    ]) {
+      const h = harness([fresh([base])]);
+      const prepared = await h.service.interactivePrepare(candidate, "disable");
+      expect(prepared).toMatchObject({ eligibility: { reasonCode: "stale-state" } }); expect(prepared.authority).toBeUndefined();
+    }
+    const duplicate = { ...base, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const } };
+    const h = harness([fresh([base, duplicate])]);
+    const prepared = await h.service.interactivePrepare(selector(base), "disable");
+    expect(prepared).toMatchObject({ eligibility: { reasonCode: "stale-state" } }); expect(prepared.authority).toBeUndefined();
+    expect(h.mutate).not.toHaveBeenCalled(); expect(h.apply).not.toHaveBeenCalled();
+  });
+
+  it("keeps direct execution's existing first-winner behavior separate from interactive authority", async () => {
+    const first = declaration({ name: "native", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const duplicate = { ...first, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const } };
+    const disabled = { ...first, status: "disabled" as const, inactiveReason: "native-runtime-disabled" as const };
+    const h = harness([fresh([first, duplicate]), fresh([disabled, duplicate])]);
+    await expect(h.service.execute({ kind: "disable", name: "native" })).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" }, runtime: { state: "succeeded" } });
+    expect(h.mutate).toHaveBeenCalledOnce(); expect(h.apply).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when a duplicate winner emerges before mutation or after commit", async () => {
+    const base = declaration({ name: "native", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const duplicate = { ...base, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const } };
+    const before = harness([fresh([base]), fresh([base, duplicate])]);
+    const preparedBefore = await before.service.interactivePrepare(selector(base), "disable");
+    await expect(before.service.confirmedExecute(preparedBefore.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" }, durable: { state: "not-requested" }, runtime: { state: "not-requested" } });
+    expect(before.mutate).not.toHaveBeenCalled(); expect(before.apply).not.toHaveBeenCalled();
+
+    const disabled = { ...base, status: "disabled" as const, inactiveReason: "native-runtime-disabled" as const };
+    const after = harness([fresh([base]), fresh([base]), fresh([disabled, duplicate])]);
+    const preparedAfter = await after.service.interactivePrepare(selector(base), "disable");
+    await expect(after.service.confirmedExecute(preparedAfter.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" }, durable: { state: "committed" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+    expect(after.mutate).toHaveBeenCalledOnce(); expect(after.apply).not.toHaveBeenCalled();
+  });
+
+  it("never recovers during confirmation and blocks pending work at both pre-mutation boundaries", async () => {
+    const base = declaration({ name: "native", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    for (const sequence of [[false, true], [false, false, true]] as const) {
+      const h = harness([fresh([base]), fresh([base])], { pendingSequence: sequence });
+      const prepared = await h.service.interactivePrepare(selector(base), "disable");
+      const result = await h.service.confirmedExecute(prepared.authority!);
+      expect(result).toEqual({ inventory: expect.objectContaining({ remediation: "administration-recovery-pending", servers: [] }), eligibility: { eligible: false, reasonCode: "recovery-pending" }, recovery: { state: "not-requested" }, durable: { state: "not-requested" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+      expect(h.recover).not.toHaveBeenCalled(); expect(h.mutate).not.toHaveBeenCalled(); expect(h.apply).not.toHaveBeenCalled();
+    }
+  });
+
+  it("returns complete truthful current inventory for invalid and replayed authority", async () => {
+    const base = declaration({ name: "truth", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const h = harness([fresh([base]), fresh([base]), fresh([base])]);
+    const prepared = await h.service.interactivePrepare(selector(base), "disable");
+    const expected = {
+      inventory: expectedInventory([base]), eligibility: { eligible: false, reasonCode: "stale-state" },
+      recovery: { state: "not-requested" }, durable: { state: "not-requested" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" },
+    };
+    await expect(h.service.confirmedExecute({} as never)).resolves.toEqual(expected);
+    const first = await h.service.confirmedExecute(prepared.authority!);
+    expect(first.durable.state).toBe("committed");
+    await expect(h.service.confirmedExecute(prepared.authority!)).resolves.toEqual(expected);
+  });
+
+  it("fails closed for definition replacement, copied/serialized/forged/cross-service/replayed and concurrent confirmation", async () => {
+    const a = declaration({ name: "project", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, review: "pending", status: "pending-approval" });
+    const b = { ...a, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE };
+    const stale = harness([fresh([a]), fresh([b])]);
+    const stalePrepared = await stale.service.interactivePrepare(selector(a), "approve");
+    await expect(stale.service.confirmedExecute(stalePrepared.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" }, durable: { state: "not-requested" } });
+    expect(stale.mutate).not.toHaveBeenCalled(); expect(stale.apply).not.toHaveBeenCalled();
+
+    const forgery = harness([fresh([a]), fresh([a]), fresh([a]), fresh([a])]);
+    const forgedPreparation = await forgery.service.interactivePrepare(selector(a), "approve");
+    const other = harness([fresh([a])]);
+    for (const forged of [{}, { ...forgedPreparation.authority }, JSON.parse(JSON.stringify(forgedPreparation.authority))] as const) {
+      await expect(forgery.service.confirmedExecute(forged as never)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" } });
+    }
+    await expect(other.service.confirmedExecute(forgedPreparation.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" } });
+    const exact = harness([fresh([a]), fresh([a]), fresh([{ ...a, review: "approved-exact", status: "enabled" }])]);
+    const prepared = await exact.service.interactivePrepare(selector(a), "approve");
+    const [first, second] = await Promise.all([exact.service.confirmedExecute(prepared.authority!), exact.service.confirmedExecute(prepared.authority!)]);
+    expect([first, second].filter((value) => value.durable.state === "committed")).toHaveLength(1);
+    expect(exact.mutate).toHaveBeenCalledOnce();
+    await expect(exact.service.confirmedExecute(prepared.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" } });
+  });
+
+  it("invalidates every bound public/private state field before mutation", async () => {
+    const base = declaration({ name: "native", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const changes: Array<[string, (state: McpAdministrationFreshState) => void]> = [
+      ["source", (state) => { (state.mcp.administration!.declarations[0] as { source: string }).source = "native-local"; }],
+      ["authority", (state) => { (state.mcp.administration!.declarations[0] as { authority: unknown }).authority = { kind: "mutable", scope: "local" }; }],
+      ["precedence", (state) => { (state.mcp.administration!.declarations[0] as { precedence: string }).precedence = "shadowed"; }],
+      ["owner", (state) => { (state.mcp.administration!.declarations[0] as { agentOwner?: unknown }).agentOwner = { name: "worker", scope: "project" }; }],
+      ["profile", (state) => { (state.reviewIdentity as { profileKey: string }).profileKey = "changed"; }],
+      ["family", (state) => { (state.reviewIdentity as { checkoutFamilyKey: string }).checkoutFamilyKey = "changed"; }],
+      ["policy", (state) => { (state.mcp.administration!.declarations[0] as { policy: string }).policy = "policy-denied"; }],
+      ["review", (state) => { (state.mcp.administration!.declarations[0] as { review: string }).review = "pending"; }],
+      ["status", (state) => { (state.mcp.administration!.declarations[0] as { status: string }).status = "disabled"; }],
+    ];
+    for (const [label, change] of changes) {
+      const before = fresh([base]); const after = structuredClone(before); change(after);
+      const h = harness([before, after]); const prepared = await h.service.interactivePrepare(selector(base), "disable");
+      await expect(h.service.confirmedExecute(prepared.authority!), label).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" } });
+      expect(h.mutate, label).not.toHaveBeenCalled(); expect(h.apply, label).not.toHaveBeenCalled();
+    }
   });
 });
