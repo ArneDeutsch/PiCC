@@ -828,17 +828,38 @@ describe("tool surface registration", () => {
     expect(out).toMatch(/Model-invocable only|User-only/);
   });
 
-  it("/agents lists subagents with tools and read-only markers", async () => {
+  it("/agents reports enabled and settings-disabled dispatch truth while retaining the policy catalog", async () => {
     pi.entries.length = 0;
     await pi.commands.get("agents").handler("", pi.ctx());
     const out = pi.entries
       .filter((e) => e.customType === "picc-control")
       .map((e) => String(e.data?.output ?? ""))
       .join("\n");
-    expect(out).toContain("subagent(s) available");
+    expect(out).toContain("policy-permitted subagent(s) available");
+    expect(out).toContain("dispatch with the Agent tool");
     expect(out).toContain("reviewer");
     expect(out).toMatch(/reviewer[^\n]*read-only/);
     expect(out).toContain("tools:");
+
+    const disabled = fakePi();
+    picc(disabled.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, settings: { ...loaded.settings, subagentsEnabled: false } };
+      },
+      onInitializationSettled: disabled.captureInitialization,
+    });
+    await disabled.waitForInitialization();
+    await disabled.commands.get("agents").handler("", disabled.ctx());
+    const disabledOut = String(disabled.entries.at(-1)?.data?.output ?? "");
+    expect(disabledOut).toContain("policy-permitted subagent catalog entries");
+    expect(disabledOut).toContain("dispatch is disabled by settings");
+    expect(disabledOut).toContain("reviewer");
+    expect(disabledOut).not.toContain("available");
+    expect(disabledOut).not.toContain("dispatch with the Agent tool");
+    expect(disabled.tools.has("Agent")).toBe(false);
   });
 
   it("user-invocable skills are NOT registered as extension commands (they expand via input)", () => {
@@ -1430,8 +1451,10 @@ describe("session lifecycle hooks", () => {
   });
 
   it("handles headless /doctor immediately with findings and active-model vision state", async () => {
+    const externalModel = { provider: "openai", id: "gpt-text", input: ["text"] };
+    await pi.fire("model_select", { model: externalModel });
     await pi.fire("session_start", { reason: "startup" }, pi.printCtx({
-      model: { provider: "openai", id: "gpt-text", input: ["text"] },
+      model: externalModel,
     }));
     pi.entries.length = 0;
     pi.messages.length = 0;
@@ -3111,6 +3134,7 @@ describe("plugin reload handoff wiring", () => {
             stale = true;
             await replacement.fire("session_start", { reason: "reload" }, replacement.tuiCtx({
               shutdown: async () => { replacementShutdowns += 1; },
+              sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
             }));
           };
           return Reflect.get(target, property, receiver);
@@ -3129,7 +3153,9 @@ describe("plugin reload handoff wiring", () => {
       expect(skill.content[0].text).toContain(path.join(userDir, "plugins", "cache"));
       const command = await replacement.tools.get("SlashCommand").execute("reload-command", { command: "/reload-fixture:reload-command witness" });
       expect(command.content[0].text).toContain("RELOAD-COMMAND witness");
-      const prompt = String((await replacement.fire("before_agent_start", { systemPrompt: "RELOAD-BASE" })).systemPrompt);
+      const prompt = String((await replacement.fire("before_agent_start", { systemPrompt: "RELOAD-BASE" }, replacement.tuiCtx({
+        sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
+      }))).systemPrompt);
       expect(prompt).toContain("reload-fixture:reload-agent");
       expect(prompt).toContain("Reload agent witness");
       replacement.entries.length = 0;
@@ -3472,6 +3498,1917 @@ describe("plugin reload handoff wiring", () => {
   });
 });
 
+describe("selected main-session lifecycle composition", () => {
+  const outcomeForTest = () => ({ block: false, askDowngraded: false, diagnostics: [] });
+  it("installs CLI-selected identity, durable initialPrompt, and restrictive tools before the first turn", async () => {
+    const selectedPi = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const registeredFlags: string[] = [];
+    const originalSend = selectedPi.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(selectedPi.api, {
+      registerFlag: (name: string) => { registeredFlags.push(name); },
+      getFlag: (name: string) => name === "agent" ? "selected-main" : undefined,
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") {
+          branch.push({ type: "custom_message", ...message });
+        }
+      },
+    });
+    picc(selectedPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, settings: { ...loaded.settings, agent: "reviewer" } };
+      },
+      onInitializationSettled: selectedPi.captureInitialization,
+    });
+    expect(registeredFlags).toEqual(["agent"]);
+    await selectedPi.waitForInitialization();
+    await selectedPi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    const sessionManager = {
+      getBranch: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      getEntries: () => branch,
+    };
+    const ctx = selectedPi.printCtx({ sessionManager });
+    await selectedPi.fire("session_start", { reason: "startup" }, ctx);
+
+    const prompt = String((await selectedPi.fire("before_agent_start", { systemPrompt: "ORDINARY-BASE" }, ctx))?.systemPrompt);
+    expect(prompt).toContain("FS-SELECTED-MAIN-BODY");
+    expect(prompt).toContain("FS-SKILL-ARGS-BODY");
+    expect(prompt).not.toContain("## Working with the user");
+    expect(prompt).not.toContain("ORDINARY-BASE");
+    expect(selectedPi.activeTools.has("write")).toBe(false);
+    expect(selectedPi.activeTools.has("read")).toBe(true);
+    expect(branch.filter((entry) => entry.customType === "picc-selected-main-agent")).toHaveLength(1);
+    expect(branch.filter((entry) => entry.customType === "picc-selected-main-agent-initial-prompt")).toHaveLength(1);
+    const deliveredInitial = selectedPi.messages.find((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt");
+    expect(deliveredInitial?.options).toEqual({ triggerTurn: false });
+    expect(deliveredInitial?.message.content).toBe("FS-SELECTED-MAIN-INITIAL: inspect the selected identity before the ordinary request.");
+    expect(deliveredInitial?.message.details).toEqual({ version: 1, selectedName: "selected-main" });
+
+    await selectedPi.tools.get("Skill").execute("selected-live-skill", {
+      name: "repo-info",
+      arguments: "",
+    });
+    const nextTurn = String((await selectedPi.fire("before_agent_start", { systemPrompt: "COMPACTED" }, ctx))?.systemPrompt);
+    expect(nextTurn).toContain("FS-SKILL-SHELL-BODY");
+    await selectedPi.fire("session_compact", {
+      reason: "threshold",
+      compactionEntry: { summary: "selected summary" },
+    }, ctx);
+    const postCompact = String((await selectedPi.fire("before_agent_start", { systemPrompt: "RECONSTRUCTED" }, ctx))?.systemPrompt);
+    expect(postCompact).toContain("FS-SELECTED-MAIN-BODY");
+    expect(postCompact).toContain("FS-SKILL-SHELL-BODY");
+  });
+
+  it("delivers initialPrompt once for A to B to A on one branch and again on another branch", async () => {
+    const transitionPi = fakePi();
+    let selectedName = "selected-main";
+    let branch: Record<string, unknown>[] = [];
+    const originalSend = transitionPi.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(transitionPi.api, {
+      getFlag: (name: string) => name === "agent" ? selectedName : undefined,
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") {
+          branch.push({ type: "custom_message", ...message });
+        }
+      },
+    });
+    picc(transitionPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "reviewer"
+            ? { ...agent, initialPrompt: "FS-REVIEWER-SELECTED-INITIAL" }
+            : agent),
+        };
+      },
+      onInitializationSettled: transitionPi.captureInitialization,
+    });
+    await transitionPi.waitForInitialization();
+    await transitionPi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = transitionPi.printCtx({ sessionManager: manager, thinkingLevel: "medium" });
+    await transitionPi.fire("session_start", { reason: "startup" }, ctx);
+    await transitionPi.tools.get("Skill").execute("selected-a-skill", {
+      name: "repo-info",
+      arguments: "",
+    });
+    expect(String((await transitionPi.fire("before_agent_start", { systemPrompt: "A" }, ctx))?.systemPrompt))
+      .toContain("FS-SKILL-SHELL-BODY");
+    selectedName = "reviewer";
+    await transitionPi.fire("session_start", { reason: "new" }, ctx);
+    const reviewerPrompt = String((await transitionPi.fire("before_agent_start", { systemPrompt: "B" }, ctx))?.systemPrompt);
+    expect(reviewerPrompt).not.toContain("FS-SKILL-SHELL-BODY");
+    selectedName = "selected-main";
+    await transitionPi.fire("session_start", { reason: "new" }, ctx);
+    const delivered = branch.filter((entry) => entry.customType === "picc-selected-main-agent-initial-prompt");
+    expect(delivered.filter((entry) => (entry.details as { selectedName?: string })?.selectedName === "selected-main")).toHaveLength(1);
+    expect(delivered.filter((entry) => (entry.details as { selectedName?: string })?.selectedName === "reviewer")).toHaveLength(1);
+    expect(String((await transitionPi.fire("before_agent_start", { systemPrompt: "ordinary" }, ctx))?.systemPrompt))
+      .toContain("FS-SELECTED-MAIN-BODY");
+
+    branch = [];
+    await transitionPi.fire("session_start", { reason: "fork" }, ctx);
+    expect(branch.filter((entry) => entry.customType === "picc-selected-main-agent-initial-prompt")).toHaveLength(1);
+  });
+
+  it("installs ordinary and persisted-recovery outcomes without stale selected capabilities", async () => {
+    const cases = [
+      { name: "none", branch: [] as Record<string, unknown>[], fallback: false },
+      {
+        name: "missing-persisted",
+        branch: [{ type: "custom", customType: "picc-selected-main-agent", data: { version: 1, requestedName: "removed-agent" } }],
+        fallback: true,
+      },
+      {
+        name: "persisted-uncertain",
+        branch: [{ type: "custom", customType: "picc-selected-main-agent", data: { version: 1, requestedName: ["malformed"] } }],
+        fallback: true,
+      },
+    ] as const;
+    for (const transition of cases) {
+      const transitionPi = fakePi();
+      picc(transitionPi.api as never, {
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+        onInitializationSettled: transitionPi.captureInitialization,
+      });
+      await transitionPi.waitForInitialization();
+      await transitionPi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+      const branch: Record<string, unknown>[] = [...transition.branch];
+      const manager = {
+        getBranch: () => branch,
+        getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      };
+      const ctx = transitionPi.printCtx({ sessionManager: manager });
+      await transitionPi.fire("session_start", { reason: "startup" }, ctx);
+      const prompt = String((await transitionPi.fire("before_agent_start", { systemPrompt: "ORDINARY-BASE" }, ctx))?.systemPrompt);
+      if (transition.fallback) {
+        expect(prompt, transition.name).toContain("no-tools recovery identity");
+        expect(prompt, transition.name).toContain("stale identity and its capabilities are inactive");
+        expect(prompt, transition.name).toContain("Currently loaded custom-agent candidates");
+        expect(prompt, transition.name).toContain("Do not resume the affected branch");
+        expect(prompt, transition.name).toContain("picc --agent <name>");
+        expect(prompt, transition.name).toContain("omit/remove the selector");
+        if (transition.name === "missing-persisted") {
+          expect(prompt).toContain('definition "removed-agent" no longer exists');
+        } else {
+          expect(prompt).toContain("selection evidence could not be read safely");
+        }
+        expect(prompt).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
+        expect(transitionPi.activeTools.size, transition.name).toBe(0);
+        await expect(transitionPi.fire("before_provider_request", {}, ctx), transition.name).resolves.toBeUndefined();
+        await transitionPi.commands.get("doctor").handler("", ctx);
+        const doctor = String(transitionPi.entries.at(-1)?.data?.output);
+        expect(doctor).toContain("Selected main session recovery");
+        expect(doctor).toContain("Do not resume the affected branch");
+        expect(doctor).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
+      } else {
+        expect(prompt).toContain("ORDINARY-BASE");
+        expect(prompt).toContain("## Working with the user");
+        expect(transitionPi.activeTools.size).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("keeps safe fallback closed when active-tool reconciliation fails", async () => {
+    const owner = fakePi();
+    Object.assign(owner.api, {
+      getActiveTools: () => { throw new Error("RAW_FALLBACK_RECONCILE_CANARY"); },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    await owner.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    const branch = [{
+      type: "custom",
+      customType: "picc-selected-main-agent",
+      data: { version: 1, requestedName: "removed-agent" },
+    }];
+    const ctx = owner.tuiCtx({
+      sessionManager: { getBranch: () => branch, getEntries: () => branch },
+    });
+
+    await owner.fire("session_start", { reason: "resume" }, ctx);
+
+    const errors = owner.notifications.filter((notice) => notice.severity === "error")
+      .map((notice) => notice.text).join("\n");
+    const warnings = owner.notifications.filter((notice) => notice.severity === "warning")
+      .map((notice) => notice.text).join("\n");
+    expect(errors).toContain("tool publication could not be confirmed");
+    expect(warnings).not.toContain("PiCC installed a no-tools recovery identity");
+    expect(`${errors}\n${warnings}`).not.toContain("RAW_FALLBACK_RECONCILE_CANARY");
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+  });
+
+  it("treats an absent branch API as persisted uncertainty rather than no-record", async () => {
+    const uncertainPi = fakePi();
+    picc(uncertainPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: uncertainPi.captureInitialization,
+    });
+    await uncertainPi.waitForInitialization();
+    const ctx = uncertainPi.printCtx({ sessionManager: {} });
+    await uncertainPi.fire("session_start", { reason: "startup" }, ctx);
+    const prompt = String((await uncertainPi.fire("before_agent_start", { systemPrompt: "ORDINARY" }, ctx))?.systemPrompt);
+    expect(prompt).toContain("Persisted branch selection evidence could not be read safely");
+    expect(prompt).toContain("no-tools recovery identity");
+    expect(prompt).toContain("Do not resume the affected branch");
+    expect(prompt).not.toContain("ORDINARY");
+    expect(prompt).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
+    expect(uncertainPi.activeTools.size).toBe(0);
+    await uncertainPi.commands.get("doctor").handler("", ctx);
+    expect(String(uncertainPi.entries.at(-1)?.data?.output)).toContain("Persisted branch selection evidence could not be read safely");
+  });
+
+  it("blocks every input and provider boundary for a missing fresh CLI selection", async () => {
+    const selectedPi = fakePi();
+    Object.assign(selectedPi.api, {
+      registerFlag: () => undefined,
+      getFlag: () => "missing-selected-main",
+    });
+    picc(selectedPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: selectedPi.captureInitialization,
+    });
+    await selectedPi.waitForInitialization();
+    const branch: unknown[] = [];
+    const ctx = selectedPi.tuiCtx({
+      sessionManager: { getBranch: () => branch, appendCustomEntry: () => undefined, getEntries: () => branch },
+    });
+    const priorExitCode = process.exitCode;
+    try {
+      await selectedPi.fire("session_start", { reason: "startup" }, ctx);
+      for (const text of ["must not reach provider", "/doctor", "/mcp"]) {
+        expect(await selectedPi.fire("input", { source: "interactive", text }, ctx))
+          .toEqual({ action: "handled" });
+      }
+      await expect(selectedPi.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+      expect(selectedPi.messages.some((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt")).toBe(false);
+      const recovery = selectedPi.notifications.filter((notice) => notice.severity === "error")
+        .map((notice) => notice.text).join("\n");
+      expect(recovery).toContain("No loaded custom-agent definition matches the requested identity");
+      expect(recovery).toContain("Provider admission is blocked and no request was made");
+      expect(recovery).toContain("Currently loaded custom-agent candidates");
+      expect(recovery).toContain("picc --agent <name>");
+      expect(recovery).toContain("omit/remove the selector");
+      expect(recovery).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)|run \/(?:doctor|mcp)/iu);
+      await selectedPi.commands.get("doctor").handler("", ctx);
+      const doctor = String(selectedPi.entries.at(-1)?.data?.output);
+      expect(doctor).toContain("No loaded custom-agent definition matches the requested identity");
+      expect(doctor).toContain("Provider admission is blocked and no request was made");
+      expect(doctor).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
+    } finally {
+      process.exitCode = priorExitCode;
+    }
+  });
+
+  it("preserves ordinary startup fault handling but denies the paired selected transition fault", async () => {
+    for (const selected of [false, true]) {
+      const owner = fakePi();
+      Object.assign(owner.api, { getFlag: () => selected ? "selected-main" : undefined });
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [], onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      const branch: unknown[] = [];
+      const ctx = owner.tuiCtx({
+        sessionManager: {
+          getBranch: () => branch,
+          getEntries: () => branch,
+          appendCustomEntry: () => undefined,
+        },
+      });
+      Object.defineProperty(ctx, "model", { configurable: true, get: () => { throw new Error("paired model fault"); } });
+      await owner.fire("session_start", { reason: "startup" }, ctx);
+      if (selected) {
+        expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx))
+          .toEqual({ action: "handled" });
+        await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+      } else {
+        const prompt = String((await owner.fire("before_agent_start", { systemPrompt: "ORDINARY" }, owner.tuiCtx()))?.systemPrompt);
+        expect(prompt).toContain("ORDINARY");
+        await expect(owner.fire("before_provider_request", {}, owner.tuiCtx())).resolves.toBeUndefined();
+      }
+    }
+  });
+
+  it("keeps the working model when a selected explicit model is refused", async () => {
+    const selectedPi = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const workingModel = { provider: "openai", id: "gpt-working" };
+    const requestedModel = { provider: "openai", id: "gpt-selected" };
+    Object.assign(selectedPi.api, {
+      getFlag: () => "selected-main",
+      setModel: async (model: unknown) => {
+        selectedPi.modelSets.push(model);
+        return model !== requestedModel;
+      },
+    });
+    picc(selectedPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "selected-main"
+            ? { ...agent, model: "openai/gpt-selected", initialPrompt: undefined }
+            : agent),
+        };
+      },
+      onInitializationSettled: selectedPi.captureInitialization,
+    });
+    await selectedPi.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = selectedPi.tuiCtx({
+      sessionManager: manager,
+      model: workingModel,
+      modelRegistry: { find: (provider: string, id: string) =>
+        provider === requestedModel.provider && id === requestedModel.id ? requestedModel : undefined },
+    });
+    await selectedPi.fire("session_start", { reason: "startup" }, ctx);
+    expect(selectedPi.modelSets).toContain(requestedModel);
+    expect(selectedPi.notifications.some((notice) =>
+      notice.text.includes("selected-main") && notice.text.includes("working model"))).toBe(true);
+    await expect(selectedPi.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+    await selectedPi.commands.get("doctor").handler("", ctx);
+    expect(String(selectedPi.entries.at(-1)?.data?.output)).toContain("model override was unavailable or refused");
+  });
+
+  it("restores the host baseline and revokes selected authority when a replacement is freshly missing", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName = "selected-main";
+    const baselineModel = { provider: "openai", id: "gpt-baseline" };
+    const selectedModel = { provider: "openai", id: "gpt-selected" };
+    const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => selectedName,
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") {
+          branch.push({ type: "custom_message", ...message });
+        }
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "selected-main"
+            ? { ...agent, model: "openai/gpt-selected" }
+            : agent),
+        };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({
+      sessionManager: manager,
+      model: baselineModel,
+      thinkingLevel: "high",
+      modelRegistry: { find: (provider: string, id: string) =>
+        provider === selectedModel.provider && id === selectedModel.id ? selectedModel : undefined },
+    });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(owner.modelSets.at(-1)).toBe(selectedModel);
+
+    selectedName = "freshly-missing";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    expect(owner.modelSets.at(-1)).toBe(baselineModel);
+    expect(owner.thinkingLevels.at(-1)).toBe("high");
+    expect(owner.activeTools.size).toBe(0);
+    expect(String((await owner.fire("before_agent_start", { systemPrompt: "STALE" }, ctx))?.systemPrompt))
+      .not.toContain("FS-SELECTED-MAIN-BODY");
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx))
+      .toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    const errors = owner.notifications.filter((notice) => notice.severity === "error").map((notice) => notice.text);
+    expect(errors.at(-1)).toContain("freshly-missing");
+    expect(errors.at(-1)).not.toMatch(/Selected agent .*Selected agent/u);
+  });
+
+  it.each(["throw", "mutate-then-throw"] as const)(
+    "revokes the outgoing scope, restores baseline, and never publishes a successor when selection append %s",
+    async (fault) => {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = [];
+      let selectedName = "selected-main";
+      let failAppend = false;
+      const baselineModel = { provider: "openai", id: "gpt-baseline" };
+      const selectedModel = { provider: "openai", id: "gpt-selected" };
+      const mcpReplacements: Array<unknown> = [];
+      const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+      Object.assign(owner.api, {
+        getFlag: () => selectedName,
+        sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+          originalSend(message, options);
+          if (message.customType === "picc-selected-main-agent-initial-prompt") {
+            branch.push({ type: "custom_message", ...message });
+          }
+        },
+      });
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return {
+            ...loaded,
+            agents: loaded.agents.map((agent) => agent.name === "selected-main"
+              ? { ...agent, model: "openai/gpt-selected" }
+              : agent),
+          };
+        },
+        onWired: ({ selectedMainMcp }) => {
+          const realReplace = selectedMainMcp.replace.bind(selectedMainMcp);
+          (selectedMainMcp as { replace: typeof selectedMainMcp.replace }).replace = async (next) => {
+            mcpReplacements.push(next);
+            return realReplace(next);
+          };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      const manager = {
+        getBranch: () => branch,
+        getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => {
+          if (failAppend) {
+            if (fault === "mutate-then-throw") branch.push({ type: "custom", customType, data });
+            throw new Error("append fault canary");
+          }
+          branch.push({ type: "custom", customType, data });
+        },
+      };
+      const ctx = owner.tuiCtx({
+        sessionManager: manager,
+        model: baselineModel,
+        modelRegistry: { find: (provider: string, id: string) =>
+          provider === selectedModel.provider && id === selectedModel.id ? selectedModel : undefined },
+      });
+      await owner.fire("session_start", { reason: "startup" }, ctx);
+      expect(owner.modelSets.at(-1)).toBe(selectedModel);
+
+      selectedName = "reviewer";
+      failAppend = true;
+      await owner.fire("session_start", { reason: "new" }, ctx);
+      expect(mcpReplacements.at(-1)).toBeUndefined();
+      expect(owner.modelSets.at(-1)).toBe(baselineModel);
+      expect(owner.activeTools.size).toBe(0);
+      expect(String((await owner.fire("before_agent_start", { systemPrompt: "STALE" }, ctx))?.systemPrompt))
+        .not.toMatch(/FS-SELECTED-MAIN-BODY|Reply with EXACTLY this locked YAML/u);
+      expect(owner.messages.some((entry) =>
+        entry.message.customType === "picc-selected-main-agent-initial-prompt" &&
+        (entry.message.details as { selectedName?: string } | undefined)?.selectedName === "reviewer")).toBe(false);
+      await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+      const error = owner.notifications.filter((notice) => notice.severity === "error").at(-1)?.text ?? "";
+      expect(error).toContain("reviewer");
+      expect(error).toContain("could not be persisted");
+      expect(error).not.toContain("append fault canary");
+    },
+  );
+
+  it("resolves settings, persisted, and CLI selectors independently from the winning definition", async () => {
+    const cases = [
+      { name: "settings", cli: undefined, persisted: undefined, setting: "selected-main", expected: "FS-SELECTED-MAIN-BODY", source: "settings" },
+      { name: "persisted beats setting", cli: undefined, persisted: "reviewer", setting: "selected-main", expected: "locked YAML", source: "persisted" },
+      { name: "CLI beats persisted and setting", cli: "selected-main", persisted: "reviewer", setting: "reviewer", expected: "WINNING-ASSEMBLED-BODY", source: "cli" },
+    ] as const;
+    for (const scenario of cases) {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = scenario.persisted === undefined ? [] : [{
+        type: "custom", customType: "picc-selected-main-agent",
+        data: { version: 1, requestedName: scenario.persisted },
+      }];
+      Object.assign(owner.api, { getFlag: () => scenario.cli });
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          const winner = loaded.agents.find((agent) => agent.name === "selected-main")!;
+          const pluginId = "safe-selected@fixture";
+          const assembledWinner = {
+            ...winner,
+            body: scenario.cli === "selected-main" ? "WINNING-ASSEMBLED-BODY" : winner.body,
+            initialPrompt: undefined,
+            source: scenario.cli === "selected-main" ? { ...winner.source, pluginId } : winner.source,
+          };
+          return {
+            ...loaded,
+            settings: { ...loaded.settings, agent: scenario.setting },
+            agents: [assembledWinner, ...loaded.agents.filter((agent) => agent.name !== "selected-main")],
+            pluginContexts: scenario.cli === "selected-main"
+              ? new Map([[pluginId, { pluginId, pluginName: "safe-selected", root: dir, dataDir: path.join(dir, ".safe-data"), projectDir: dir }]])
+              : loaded.pluginContexts,
+          };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      const manager = {
+        getBranch: () => branch, getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      };
+      const ctx = owner.tuiCtx({ sessionManager: manager });
+      await owner.fire("session_start", { reason: "startup" }, ctx);
+      const prompt = String((await owner.fire("before_agent_start", { systemPrompt: "ORDINARY" }, ctx))?.systemPrompt);
+      expect(prompt, scenario.name).toContain(scenario.expected);
+      const healthy = owner.notifications.filter((notice) => notice.text.includes("Selected main-session identity"));
+      expect(healthy, scenario.name).toHaveLength(1);
+      expect(healthy[0]!.text).toContain(`from ${scenario.source}`);
+      expect(healthy[0]!.text).toContain("winning definition: project");
+      if (scenario.cli === "selected-main") expect(healthy[0]!.text).toContain("plugin safe-selected@fixture");
+      expect(healthy[0]!.text).not.toContain(path.join(dir, ".claude", "agents"));
+    }
+  });
+
+  it("reconstructs selected context through compaction and reload without stale resident skills", async () => {
+    const owner = fakePi();
+    let selectedName = "selected-main";
+    const branch: Record<string, unknown>[] = [];
+    const agentMemoryDir = path.join(dir, ".claude", "agent-memory", "selected-main");
+    const configFile = path.join(dir, ".claude", ".picc", "config.json");
+    fs.mkdirSync(agentMemoryDir, { recursive: true });
+    fs.writeFileSync(path.join(agentMemoryDir, "MEMORY.md"), "SELECTED-AGENT-MEMORY-CANARY\n");
+    fs.writeFileSync(configFile, JSON.stringify({ steering: { "gpt-context*": "SELECTED-STEERING-CANARY" } }));
+    const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => selectedName,
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") branch.push({ type: "custom_message", ...message });
+      },
+    });
+    try {
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return { ...loaded, autoMemory: { dir: "SAFE-AUTO-MEMORY-DIR", content: "AUTO-MEMORY-CANARY" } };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+    } finally {
+      fs.rmSync(configFile, { force: true });
+    }
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, model: { provider: "openai", id: "gpt-context" }, thinkingLevel: "medium" });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    const assertSelectedContext = async (label: string) => {
+      const prompt = String((await owner.fire("before_agent_start", { systemPrompt: `ORDINARY-${label}` }, ctx))?.systemPrompt);
+      for (const canary of [
+        "FS-SELECTED-MAIN-BODY", "Claude Code compatibility conventions (PiCC)",
+        "FS-ROOT-CLAUDE-MD", "FS-IMPORT-HOP-1", "FS-IMPORT-HOP-2", "FS-RULE-UNCONDITIONAL",
+        "FS-SKILL-ARGS-BODY", "SELECTED-AGENT-MEMORY-CANARY", "AUTO-MEMORY-CANARY",
+        "SELECTED-STEERING-CANARY", "## Scratchpad directory", "reviewer",
+      ]) expect(prompt, `${label}: ${canary}`).toContain(canary);
+      expect(prompt).not.toContain(`ORDINARY-${label}`);
+      expect(prompt).not.toContain("## Working with the user");
+      expect(prompt).not.toMatch(/- (?:planner|general-purpose|isolated-worker)(?:\s|:|\()/u);
+      return prompt;
+    };
+    await assertSelectedContext("initial");
+    await owner.tools.get("Skill").execute("resident-a", { name: "repo-info", arguments: "" });
+    await owner.fire("session_compact", { reason: "threshold", compactionEntry: { summary: "summary" } }, ctx);
+    expect(await assertSelectedContext("compact")).toContain("FS-SKILL-SHELL-BODY");
+
+    selectedName = "reviewer";
+    await owner.fire("session_start", { reason: "reload" }, ctx);
+    const reloaded = String((await owner.fire("before_agent_start", { systemPrompt: "ORDINARY-RELOAD" }, ctx))?.systemPrompt);
+    expect(reloaded).toContain("locked YAML");
+    expect(reloaded).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY|ORDINARY-RELOAD/u);
+    expect(owner.messages.filter((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt")).toHaveLength(1);
+    fs.rmSync(agentMemoryDir, { recursive: true, force: true });
+  });
+
+  it("reconstructs a persisted selection in a fresh extension instance on genuine reload without replaying initialPrompt", async () => {
+    const branch: Record<string, unknown>[] = [];
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const first = fakePi();
+    const firstSend = first.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(first.api, {
+      getFlag: () => "selected-main",
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        firstSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") branch.push({ type: "custom_message", ...message });
+      },
+    });
+    picc(first.api as never, { managedSettingsPaths: [], managedArtifactDirs: [], onInitializationSettled: first.captureInitialization });
+    await first.waitForInitialization();
+    await first.fire("session_start", { reason: "startup" }, first.tuiCtx({ sessionManager: manager }));
+    expect(branch.some((entry) => entry.customType === "picc-selected-main-agent")).toBe(true);
+    expect(branch.filter((entry) => entry.customType === "picc-selected-main-agent-initial-prompt")).toHaveLength(1);
+
+    const replacement = fakePi();
+    Object.assign(replacement.api, { getFlag: () => undefined });
+    picc(replacement.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+          ...agent, body: "FRESH-RELOAD-SELECTED-BODY", tools: ["Read", "Agent(reviewer)"],
+        } : agent) };
+      },
+      onInitializationSettled: replacement.captureInitialization,
+    });
+    await replacement.waitForInitialization();
+    const ctx = replacement.tuiCtx({ sessionManager: manager });
+    await replacement.fire("session_start", { reason: "reload" }, ctx);
+    const prompt = String((await replacement.fire("before_agent_start", { systemPrompt: "ORDINARY-RELOAD" }, ctx))?.systemPrompt);
+    expect(prompt).toContain("FRESH-RELOAD-SELECTED-BODY");
+    expect(prompt).toContain("FS-ROOT-CLAUDE-MD");
+    expect(prompt).not.toContain("ORDINARY-RELOAD");
+    expect(replacement.activeTools.has("read")).toBe(true);
+    expect(replacement.activeTools.has("write")).toBe(false);
+    await replacement.commands.get("agents").handler("", ctx);
+    const catalog = String(replacement.entries.at(-1)?.data?.output);
+    expect(catalog).toContain("reviewer");
+    expect(catalog).not.toContain("general-purpose");
+    expect(replacement.messages.some((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt")).toBe(false);
+    expect(branch.filter((entry) => entry.customType === "picc-selected-main-agent-initial-prompt")).toHaveLength(1);
+    await expect(replacement.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    { name: "malformed restriction provenance", mutate: (agent: any, loaded: any) => ({ ...loaded, agents: [{ ...agent, toolRestrictionValidation: { tools: "invalid", disallowedTools: "valid" } }, ...loaded.agents.filter((value: any) => value.name !== agent.name)] }) },
+    { name: "plugin context unavailable", mutate: (agent: any, loaded: any) => ({ ...loaded, agents: [{ ...agent, source: { ...agent.source, pluginId: "missing@plugin" } }, ...loaded.agents.filter((value: any) => value.name !== agent.name)] }) },
+    { name: "plugin substitution failure", mutate: (agent: any, loaded: any) => {
+      const pluginId = "broken@plugin";
+      const context = { pluginId, pluginName: "broken", root: dir, dataDir: path.join(dir, ".data"), projectDir: dir };
+      return { ...loaded, pluginContexts: new Map([[pluginId, context]]), agents: [{ ...agent, body: 42, source: { ...agent.source, pluginId } }, ...loaded.agents.filter((value: any) => value.name !== agent.name)] };
+    } },
+    { name: "plugin data directory failure", mutate: (agent: any, loaded: any) => {
+      const pluginId = "broken@plugin";
+      const context = { pluginId, pluginName: "broken", root: dir, dataDir: path.join(dir, "wrong-data-dir"), projectDir: dir };
+      return { ...loaded, pluginContexts: new Map([[pluginId, context]]), agents: [{ ...agent, body: "${CLAUDE_PLUGIN_DATA}", source: { ...agent.source, pluginId } }, ...loaded.agents.filter((value: any) => value.name !== agent.name)] };
+    } },
+    { name: "prompt assembly failure", mutate: (agent: any, loaded: any) => ({ ...loaded, claudeMd: [{ ...loaded.claudeMd[0], content: 42 }], agents: [{ ...agent, initialPrompt: "MUST-NOT-SEND" }, ...loaded.agents.filter((value: any) => value.name !== agent.name)] }) },
+  ])("fails $name closed before selected startup side effects", async ({ mutate }) => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const sideEffects = { model: 0, hookFactory: 0, hookRun: 0, mcpFactory: 0, mcpPublication: 0, promptSend: 0 };
+    const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      setModel: async () => { sideEffects.model += 1; return true; },
+      setThinkingLevel: () => { sideEffects.model += 1; return true; },
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        if (message.customType === "picc-selected-main-agent-initial-prompt") sideEffects.promptSend += 1;
+        originalSend(message, options);
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      selectedMainHookRunnerFactory: () => {
+        sideEffects.hookFactory += 1;
+        return { hasHooks: () => true, fire: async () => { sideEffects.hookRun += 1; return outcomeForTest(); } };
+      },
+      selectedMainMcpScopeFactory: async () => {
+        sideEffects.mcpFactory += 1;
+        throw new Error("MCP_FACTORY_MUST_NOT_RUN");
+      },
+      selectedMainMcpInventoryHostFault: () => { sideEffects.mcpPublication += 1; },
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return mutate(loaded.agents.find((agent) => agent.name === "selected-main")!, loaded) as ReturnType<typeof loadClaudeProject>;
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    expect(String((await owner.fire("before_agent_start", { systemPrompt: "ORDINARY" }, ctx))?.systemPrompt)).not.toContain("FS-SELECTED-MAIN-BODY");
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    expect(owner.notifications.some((notice) => notice.text.includes("Selected main-session identity"))).toBe(false);
+    expect(owner.messages.some((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt")).toBe(false);
+    expect(sideEffects).toEqual({ model: 0, hookFactory: 0, hookRun: 0, mcpFactory: 0, mcpPublication: 0, promptSend: 0 });
+  });
+
+  it.each(["send-throw", "missing-same-branch-proof"] as const)(
+    "fails initialPrompt %s closed without a provider turn",
+    async (fault) => {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = [];
+      const hookEvents: string[] = [];
+      const runtimeCalls: string[] = [];
+      const baselineModel = { provider: "openai", id: "gpt-prompt-fault-baseline" };
+      const selectedModel = { provider: "openai", id: "gpt-prompt-fault-selected" };
+      const transitionOrder: string[] = [];
+      let mcpFactories = 0;
+      const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+      Object.assign(owner.api, {
+        getFlag: () => "selected-main",
+        setModel: async (model: unknown) => {
+          owner.modelSets.push(model);
+          transitionOrder.push(model === baselineModel ? "model:baseline" : "model:selected");
+          return true;
+        },
+        setThinkingLevel: (level: string) => {
+          owner.thinkingLevels.push(level);
+          transitionOrder.push(`effort:${level}`);
+          return true;
+        },
+        sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+          if (message.customType === "picc-selected-main-agent-initial-prompt") {
+            if (fault === "send-throw") throw new Error("RAW_SEND_SECRET");
+            originalSend(message, options);
+            return;
+          }
+          originalSend(message, options);
+        },
+      });
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        selectedMainHookRunnerFactory: () => ({
+          hasHooks: () => true,
+          fire: async (eventName: string) => { hookEvents.push(eventName); return outcomeForTest(); },
+        }),
+        selectedMainMcpScopeFactory: async () => {
+          mcpFactories += 1;
+          return {
+            whenSettled: async () => {},
+            tools: () => [{ serverName: "prompt-proof", toolName: "run", description: "run", inputSchema: { type: "object" } }],
+            resourceServers: () => [{ serverName: "prompt-proof", resources: [{ serverName: "prompt-proof", uri: "prompt-proof:item", name: "item" }] }],
+            serverStates: () => [{ name: "prompt-proof", transport: "stdio" as const, state: "connected" as const }],
+            callTool: async () => { runtimeCalls.push("tool"); return { content: [] }; },
+            readResource: async () => { runtimeCalls.push("resource"); return { contents: [] }; },
+            diagnostics: () => [], setupOutcomes: () => [],
+            knownToolNames: () => ["mcp__prompt-proof__run"], borrowedServerNames: () => [],
+            shutdown: async () => ({ confirmed: ["prompt-proof"], unconfirmed: [], diagnostics: [] }),
+            retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+          };
+        },
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+            ...agent,
+            tools: [...(agent.tools ?? []), "mcp__prompt-proof__run", "ListMcpResourcesTool", "ReadMcpResourceTool"],
+            hooks: { SessionStart: [] },
+            model: "openai/gpt-prompt-fault-selected",
+            effort: "high",
+          } : agent) };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      const manager = {
+        getBranch: () => branch, getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      };
+      const ctx = owner.tuiCtx({
+        sessionManager: manager,
+        isProjectTrusted: () => true,
+        model: baselineModel,
+        thinkingLevel: "medium",
+        modelRegistry: {
+          find: (provider: string, id: string) =>
+            provider === selectedModel.provider && id === selectedModel.id ? selectedModel : undefined,
+        },
+      });
+      const ui = ctx.ui as {
+        notify: (text: string, severity?: "info" | "warning" | "error") => void;
+      };
+      const notify = ui.notify;
+      ui.notify = (text, severity) => {
+        if (severity === "error") transitionOrder.push("denial");
+        notify(text, severity);
+      };
+      await owner.fire("session_start", { reason: "startup" }, ctx);
+      expect(owner.modelSets).toContain(selectedModel);
+      expect(owner.thinkingLevels).toContain("high");
+      expect(owner.modelSets.at(-1)).toBe(baselineModel);
+      expect(owner.thinkingLevels.at(-1)).toBe("medium");
+      expect(transitionOrder.indexOf("model:selected")).toBeLessThan(transitionOrder.lastIndexOf("model:baseline"));
+      expect(transitionOrder.lastIndexOf("model:baseline")).toBeLessThan(transitionOrder.indexOf("denial"));
+      expect(transitionOrder.indexOf("effort:high")).toBeLessThan(transitionOrder.lastIndexOf("effort:medium"));
+      expect(transitionOrder.lastIndexOf("effort:medium")).toBeLessThan(transitionOrder.indexOf("denial"));
+      expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+      await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+      expect(owner.notifications.some((notice) => notice.text.includes("Selected main-session identity"))).toBe(false);
+      expect(owner.notifications.map((notice) => notice.text).join("\n")).not.toContain("RAW_SEND_SECRET");
+      expect(owner.messages.every((entry) => entry.options?.triggerTurn !== true)).toBe(true);
+      expect(mcpFactories).toBe(1);
+      expect(owner.tools.has("mcp__prompt-proof__run")).toBe(true);
+      expect(owner.tools.has("ReadMcpResourceTool")).toBe(true);
+      expect(owner.activeTools.has("mcp__prompt-proof__run")).toBe(false);
+      expect(owner.activeTools.has("ReadMcpResourceTool")).toBe(false);
+      expect(hookEvents).toEqual(["SessionEnd"]);
+      await expect(owner.tools.get("mcp__prompt-proof__run").execute("stale", {})).rejects.toThrow(/not active/u);
+      await expect(owner.tools.get("ReadMcpResourceTool").execute("stale-resource", {
+        server: "prompt-proof", uri: "prompt-proof:item",
+      })).rejects.toThrow(/not active/u);
+      expect(runtimeCalls).toEqual([]);
+    },
+  );
+
+  it("fails the whole selected registration transaction closed when tool reconciliation is not confirmed", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const counters = { activeSets: 0, model: 0, hookFactory: 0, hookStart: 0, mcpFactory: 0, prompt: 0 };
+    const realSetActive = owner.api.setActiveTools as (names: string[]) => void;
+    const realSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      setActiveTools: (names: string[]) => {
+        counters.activeSets += 1;
+        if (counters.activeSets === 1) throw new Error("RAW_RECONCILE_CANARY");
+        realSetActive(names);
+      },
+      setModel: async () => { counters.model += 1; return true; },
+      setThinkingLevel: () => { counters.model += 1; return true; },
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        if (message.customType === "picc-selected-main-agent-initial-prompt") counters.prompt += 1;
+        realSend(message, options);
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      selectedMainHookRunnerFactory: () => {
+        counters.hookFactory += 1;
+        return { hasHooks: () => true, fire: async (eventName: string) => {
+          if (eventName === "SessionStart") counters.hookStart += 1;
+          return outcomeForTest();
+        } };
+      },
+      selectedMainMcpScopeFactory: async () => {
+        counters.mcpFactory += 1;
+        throw new Error("MCP_MUST_NOT_START");
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(counters.activeSets).toBeGreaterThanOrEqual(2);
+    expect({ ...counters, activeSets: 0 }).toEqual({ activeSets: 0, model: 0, hookFactory: 0, hookStart: 0, mcpFactory: 0, prompt: 0 });
+    expect(owner.activeTools.size).toBe(0);
+    expect(owner.notifications.some((notice) => notice.text.includes("Selected main-session identity"))).toBe(false);
+    expect(owner.notifications.map((notice) => notice.text).join("\n")).not.toContain("RAW_RECONCILE_CANARY");
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+  });
+
+  it("awaits the post-registration reconciliation fault through cleanup and denial before release", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const hookEvents: string[] = [];
+    const runtimeCalls: string[] = [];
+    const counters = { model: 0, hookFactory: 0, mcpFactory: 0, mcpPublication: 0, prompt: 0 };
+    let selectedMcpPublished = false;
+    let reconcileFaulted = false;
+    const realGetActive = owner.api.getActiveTools as () => string[];
+    const realRegister = owner.api.registerTool as (tool: { name: string }) => void;
+    const realSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      getActiveTools: () => {
+        if (selectedMcpPublished && !reconcileFaulted) {
+          reconcileFaulted = true;
+          throw new Error("RAW_FINAL_RECONCILE_CANARY");
+        }
+        return realGetActive();
+      },
+      registerTool: (tool: { name: string }) => {
+        realRegister(tool);
+        if (tool.name === "mcp__final-reconcile__run") {
+          selectedMcpPublished = true;
+          counters.mcpPublication += 1;
+        }
+      },
+      setModel: async (model: unknown) => { counters.model += 1; owner.modelSets.push(model); return true; },
+      setThinkingLevel: (level: string) => { counters.model += 1; owner.thinkingLevels.push(level); return true; },
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        if (message.customType === "picc-selected-main-agent-initial-prompt") counters.prompt += 1;
+        realSend(message, options);
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      selectedMainHookRunnerFactory: () => {
+        counters.hookFactory += 1;
+        return { hasHooks: () => true, fire: async (eventName: string) => {
+          hookEvents.push(eventName);
+          return outcomeForTest();
+        } };
+      },
+      selectedMainMcpScopeFactory: async () => {
+        counters.mcpFactory += 1;
+        return {
+          whenSettled: async () => {},
+          tools: () => [{ serverName: "final-reconcile", toolName: "run", description: "run", inputSchema: { type: "object" } }],
+          resourceServers: () => [], serverStates: () => [{ name: "final-reconcile", transport: "stdio" as const, state: "connected" as const }],
+          callTool: async () => { runtimeCalls.push("run"); return { content: [] }; },
+          readResource: async () => ({ contents: [] }), diagnostics: () => [], setupOutcomes: () => [],
+          knownToolNames: () => ["mcp__final-reconcile__run"], borrowedServerNames: () => [],
+          shutdown: async () => ({ confirmed: [], unconfirmed: ["final-reconcile"], diagnostics: [] }),
+          retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: ["final-reconcile"], diagnostics: [] }),
+        };
+      },
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+          ...agent, tools: [...(agent.tools ?? []), "mcp__final-reconcile__run"], hooks: { SessionStart: [] },
+        } : agent) };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const baselineModel = { provider: "openai", id: "gpt-baseline" };
+    const ctx = owner.tuiCtx({ sessionManager: manager, model: baselineModel, thinkingLevel: "medium", isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(reconcileFaulted).toBe(true);
+    expect(counters.hookFactory).toBe(1);
+    expect(counters.mcpFactory).toBe(1);
+    expect(counters.mcpPublication).toBe(1);
+    expect(counters.model).toBeGreaterThan(0);
+    expect(counters.prompt).toBe(0);
+    expect(hookEvents).toEqual(["SessionEnd"]);
+    expect(owner.modelSets.at(-1)).toBe(baselineModel);
+    expect(owner.thinkingLevels.at(-1)).toBe("medium");
+    expect(owner.activeTools.size).toBe(0);
+    expect(owner.notifications.some((notice) => notice.text.includes("Selected main-session identity"))).toBe(false);
+    expect(owner.notifications.map((notice) => notice.text).join("\n")).not.toContain("RAW_FINAL_RECONCILE_CANARY");
+    expect(owner.notifications.at(-1)?.text).toContain("cleanup remains unconfirmed");
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    await owner.commands.get("doctor").handler("", ctx);
+    const doctor = String(owner.entries.at(-1)?.data?.output);
+    expect(doctor).toContain("tool publication could not be confirmed");
+    expect(doctor).toContain("cleanup remains unconfirmed");
+    expect(doctor).not.toContain("RAW_FINAL_RECONCILE_CANARY");
+    await expect(owner.tools.get("mcp__final-reconcile__run").execute("stale", {})).rejects.toThrow(/not active/u);
+    expect(runtimeCalls).toEqual([]);
+  });
+
+  it.each([
+    { name: "explicit model and effort", model: "openai/gpt-selected", effort: "high", behavior: "success" },
+    { name: "unavailable model", model: "openai/missing", effort: "high", behavior: "missing" },
+    { name: "Claude alias", model: "sonnet", effort: "high", behavior: "alias" },
+    { name: "inherit model", model: "inherit", effort: "high", behavior: "inherit" },
+    { name: "selected setModel throw", model: "openai/gpt-selected", effort: "high", behavior: "throw" },
+    { name: "effort false", model: "inherit", effort: "high", behavior: "effort-false" },
+  ] as const)("composes model/effort outcome: $name", async (scenario) => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const baseline = { provider: "openai", id: "gpt-baseline" };
+    const selected = { provider: "openai", id: "gpt-selected" };
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      setModel: async (model: unknown) => {
+        owner.modelSets.push(model);
+        if (scenario.behavior === "throw" && model === selected) throw new Error("RAW_MODEL_SECRET");
+        return true;
+      },
+      setThinkingLevel: (level: string) => {
+        owner.thinkingLevels.push(level);
+        return scenario.behavior === "effort-false" && level === "high" ? false : true;
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? { ...agent, model: scenario.model, effort: scenario.effort, initialPrompt: undefined } : agent) };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+    const ctx = owner.tuiCtx({
+      sessionManager: manager, model: baseline, thinkingLevel: "medium",
+      modelRegistry: { find: (provider: string, id: string) => provider === "openai" && id === "gpt-selected" ? selected : undefined },
+    });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+    const visible = owner.notifications.map((notice) => notice.text).join("\n");
+    if (scenario.behavior === "success") expect(owner.modelSets).toContain(selected);
+    if (scenario.behavior === "missing" || scenario.behavior === "throw") expect(visible).toContain("working model");
+    if (scenario.behavior === "alias") expect(visible).toContain("Claude model alias");
+    if (scenario.behavior === "inherit") expect(visible).not.toMatch(/Claude model alias|working model/u);
+    if (scenario.behavior === "effort-false") expect(visible).toContain("working effort");
+    expect(visible).not.toMatch(/RAW_MODEL_SECRET|openai\/gpt-selected|effort: high/u);
+    await owner.commands.get("doctor").handler("", ctx);
+    const doctor = String(owner.entries.at(-1)?.data?.output);
+    if (["missing", "throw"].includes(scenario.behavior)) expect(doctor).toContain("model override was unavailable or refused");
+    if (scenario.behavior === "alias") expect(doctor).toContain("Claude alias");
+    if (scenario.behavior === "effort-false") expect(doctor).toContain("effort override was unsupported or refused");
+  });
+
+  it("applies host baseline, PiCC config, then selected model and effort in order", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const baseline = { provider: "openai", id: "gpt-baseline" };
+    const configured = { provider: "openai", id: "gpt-config" };
+    const selected = { provider: "openai", id: "gpt-selected" };
+    const configFile = path.join(dir, ".claude", ".picc", "config.json");
+    fs.writeFileSync(configFile, JSON.stringify({ model: "openai/gpt-config", effort: "low" }));
+    Object.assign(owner.api, { getFlag: () => "selected-main" });
+    try {
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? { ...agent, model: "openai/gpt-selected", effort: "high", initialPrompt: undefined } : agent) };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+    } finally {
+      fs.rmSync(configFile, { force: true });
+    }
+    await owner.waitForInitialization();
+    const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+    const ctx = owner.tuiCtx({
+      sessionManager: manager, model: baseline, thinkingLevel: "medium",
+      modelRegistry: { find: (_provider: string, id: string) => id === "gpt-config" ? configured : id === "gpt-selected" ? selected : undefined },
+    });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(owner.modelSets.slice(-3)).toEqual([baseline, configured, selected]);
+    expect(owner.thinkingLevels.slice(-3)).toEqual(["medium", "low", "high"]);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+  });
+
+  it("keeps a genuine external baseline across Pi-owned model clamp events and restores it on fallback", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName: string | undefined = "selected-main";
+    const initial = { provider: "openai", id: "gpt-initial" };
+    const selected = { provider: "openai", id: "gpt-selected" };
+    const external = { provider: "openai", id: "gpt-external" };
+    Object.assign(owner.api, {
+      getFlag: () => selectedName,
+      setModel: async (model: unknown) => {
+        owner.modelSets.push(model);
+        await owner.fire("thinking_level_select", { level: "low" });
+        return true;
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? { ...agent, model: "openai/gpt-selected", effort: "high", initialPrompt: undefined } : agent) };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+    const ctx = owner.tuiCtx({ sessionManager: manager, model: initial, thinkingLevel: "medium", modelRegistry: { find: (_provider: string, id: string) => id === "gpt-selected" ? selected : external } });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    await owner.fire("model_select", { model: external }, ctx);
+    await owner.fire("thinking_level_select", { level: "max" }, ctx);
+    selectedName = undefined;
+    branch.length = 0;
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    expect(owner.modelSets.at(-1)).toBe(external);
+    expect(owner.thinkingLevels.at(-1)).toBe("max");
+    const ordinary = String((await owner.fire("before_agent_start", { systemPrompt: "ORDINARY-RESTORED" }, ctx))?.systemPrompt);
+    expect(ordinary).toContain("ORDINARY-RESTORED");
+    expect(ordinary).toContain("## Working with the user");
+    expect(ordinary).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY/u);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+
+    selectedName = "selected-main";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    selectedName = undefined;
+    branch.splice(0, branch.length, { type: "custom", customType: "picc-selected-main-agent", data: { version: 1, requestedName: "removed" } });
+    await owner.fire("session_start", { reason: "resume" }, ctx);
+    expect(owner.modelSets.at(-1)).toBe(external);
+    expect(owner.thinkingLevels.at(-1)).toBe("max");
+    expect(owner.activeTools.size).toBe(0);
+    const missingFallback = String((await owner.fire("before_agent_start", { systemPrompt: "STALE-MISSING" }, ctx))?.systemPrompt);
+    expect(missingFallback).toContain("no longer exists");
+    expect(missingFallback).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY|Available subagents|STALE-MISSING/u);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+
+    selectedName = "selected-main";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    selectedName = undefined;
+    branch.splice(0, branch.length, { type: "custom", customType: "picc-selected-main-agent", data: { version: 1, requestedName: ["malformed"] } });
+    await owner.fire("session_start", { reason: "resume" }, ctx);
+    expect(owner.modelSets.at(-1)).toBe(external);
+    expect(owner.thinkingLevels.at(-1)).toBe("max");
+    expect(owner.activeTools.size).toBe(0);
+    const uncertainFallback = String((await owner.fire("before_agent_start", { systemPrompt: "STALE-UNCERTAIN" }, ctx))?.systemPrompt);
+    expect(uncertainFallback).toContain("selection evidence could not be read safely");
+    expect(uncertainFallback).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY|Available subagents|STALE-UNCERTAIN/u);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    { dimension: "model", transition: "ordinary" },
+    { dimension: "model", transition: "fallback" },
+    { dimension: "model", transition: "denial" },
+    { dimension: "effort", transition: "ordinary" },
+    { dimension: "effort", transition: "fallback" },
+    { dimension: "effort", transition: "denial" },
+  ] as const)("does not recapture an outgoing selected $dimension override as an absent baseline on $transition", async ({ dimension, transition }) => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName: string | undefined = "selected-main";
+    const selectedModel = { provider: "openai", id: "gpt-selected-absent-baseline" };
+    Object.assign(owner.api, { getFlag: () => selectedName });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+          ...agent,
+          model: dimension === "model" ? "openai/gpt-selected-absent-baseline" : "inherit",
+          effort: dimension === "effort" ? "high" : undefined,
+          initialPrompt: undefined,
+        } : agent) };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({
+      sessionManager: manager,
+      model: undefined,
+      thinkingLevel: undefined,
+      modelRegistry: { find: (_provider: string, id: string) => id === selectedModel.id ? selectedModel : undefined },
+    });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+    if (dimension === "model") expect(owner.modelSets).toEqual([selectedModel]);
+    else expect(owner.thinkingLevels).toEqual(["high"]);
+
+    selectedName = transition === "denial" ? "missing-fresh-after-absent" : undefined;
+    branch.length = 0;
+    if (transition === "fallback") {
+      branch.push({ type: "custom", customType: "picc-selected-main-agent", data: { version: 1, requestedName: "removed-after-absent" } });
+    }
+    await owner.fire("session_start", { reason: transition === "fallback" ? "resume" : "new" }, ctx);
+    if (dimension === "model") expect(owner.modelSets).toEqual([selectedModel]);
+    else expect(owner.thinkingLevels).toEqual(["high"]);
+    expect(owner.activeTools.size).toBe(0);
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    const visible = owner.notifications.filter((notice) => notice.severity === "error").map((notice) => notice.text).join("\n");
+    expect(visible).toMatch(/baseline|model state|effort/iu);
+    expect(visible).not.toContain("gpt-selected-absent-baseline");
+  });
+
+  it.each([
+    { name: "configured model false", fault: "config-false" },
+    { name: "configured model throw", fault: "config-throw" },
+    { name: "baseline restore false", fault: "baseline-false" },
+    { name: "baseline restore throw", fault: "baseline-throw" },
+  ] as const)("fails $name closed and retains model-state diagnostics", async ({ fault }) => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName: string | undefined = "selected-main";
+    let replacement = false;
+    const baseline = { provider: "openai", id: "gpt-baseline" };
+    const configured = { provider: "openai", id: "gpt-config" };
+    const configFile = path.join(dir, ".claude", ".picc", "config.json");
+    if (fault.startsWith("config")) fs.writeFileSync(configFile, JSON.stringify({ model: "openai/gpt-config" }));
+    Object.assign(owner.api, {
+      getFlag: () => selectedName,
+      setModel: async (model: unknown) => {
+        owner.modelSets.push(model);
+        const fail = fault.startsWith("config") ? model === configured : replacement && model === baseline;
+        if (fail && fault.endsWith("throw")) throw new Error("RAW_RESTORE_SECRET");
+        return !fail;
+      },
+    });
+    try {
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? { ...agent, model: "inherit", effort: undefined, initialPrompt: undefined } : agent) };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+    } finally {
+      fs.rmSync(configFile, { force: true });
+    }
+    await owner.waitForInitialization();
+    const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+    const ctx = owner.tuiCtx({ sessionManager: manager, model: baseline, modelRegistry: { find: (_provider: string, id: string) => id === "gpt-config" ? configured : undefined } });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    if (fault.startsWith("baseline")) {
+      replacement = true;
+      selectedName = undefined;
+      branch.length = 0;
+      await owner.fire("session_start", { reason: "new" }, ctx);
+    }
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    const visible = owner.notifications.map((notice) => notice.text).join("\n");
+    expect(visible).toContain("model");
+    expect(visible).not.toMatch(/RAW_RESTORE_SECRET|openai\/gpt-config/u);
+    await owner.commands.get("doctor").handler("", ctx);
+    expect(String(owner.entries.at(-1)?.data?.output)).toMatch(/admission|model|baseline/iu);
+  });
+
+  it("emits one bounded healthy notice after model and SessionStart in TUI and only stderr in print", async () => {
+    for (const mode of ["tui", "print"] as const) {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = [];
+      const ordering: string[] = [];
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      Object.assign(owner.api, { getFlag: () => "selected-main", setThinkingLevel: (level: string) => { ordering.push(`model:${level}`); owner.thinkingLevels.push(level); return true; } });
+      try {
+        picc(owner.api as never, {
+          managedSettingsPaths: [], managedArtifactDirs: [],
+          baseHookRunner: { hasHooks: () => true, fire: async (eventName: string) => { if (eventName === "SessionStart") ordering.push("SessionStart"); return outcomeForTest(); } },
+          loadProject: (options) => {
+            const loaded = loadClaudeProject(options);
+            return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? { ...agent, initialPrompt: undefined } : agent) };
+          },
+          onInitializationSettled: owner.captureInitialization,
+        });
+        await owner.waitForInitialization();
+        const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+        const ctx = mode === "tui" ? owner.tuiCtx({ sessionManager: manager }) : owner.printCtx({ sessionManager: manager });
+        await owner.fire("session_start", { reason: "startup" }, ctx);
+        const output = mode === "tui" ? owner.notifications.map((notice) => notice.text) : stderr.mock.calls.map((call) => String(call[0]));
+        const healthy = output.filter((text) => text.includes("Selected main-session identity"));
+        expect(healthy).toHaveLength(1);
+        expect(ordering.indexOf("model:medium")).toBeLessThan(ordering.indexOf("SessionStart"));
+        expect(healthy[0]).toContain("selected-main");
+        expect(healthy[0]).toContain("from cli");
+        expect(healthy[0]).toContain("winning definition: project");
+        expect(healthy[0]).toContain("Selected instructions are active");
+        expect(healthy[0]).toContain("required PiCC compatibility and project context remain");
+        expect(healthy[0]).toContain("Run /doctor for compatibility differences");
+        expect(healthy[0]).not.toMatch(/partial fidelity|base-prompt|FS-SELECTED|initialPrompt|permissionMode|\.claude[\\/]agents|---/u);
+        expect(stdout).not.toHaveBeenCalled();
+      } finally {
+        stderr.mockRestore();
+        stdout.mockRestore();
+      }
+    }
+  });
+
+  it.each(([
+    ["permissionMode", "permissionMode", "plan"],
+    ["maxTurns", "maxTurns", 3],
+    ["background", "background", true],
+    ["isolation", "isolation", "worktree"],
+    ["color", "color", "red"],
+    ["model degradation", "model", "openai/not-installed"],
+    ["Claude model alias", "model", "sonnet"],
+    ["refused selected effort", "effort", "high"],
+    ["untrusted selected hook", "trust", true],
+    ["MCP admission", "mcp", true],
+  ] as const).flatMap(([name, field, value], index) => [
+    { name, field, value, mode: "tui" as const },
+    ...(index === 0 ? [{ name, field, value, mode: "print" as const }] : []),
+  ]))(
+    "routes bounded $name diagnostics through $mode and retains the doctor finding",
+    async ({ name, field, value, mode }) => {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = [];
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      Object.assign(owner.api, {
+        getFlag: () => "selected-main",
+        setThinkingLevel: (level: string) => {
+          owner.thinkingLevels.push(level);
+          return !(field === "effort" && level === "high");
+        },
+      });
+      try {
+        picc(owner.api as never, {
+          managedSettingsPaths: [], managedArtifactDirs: [],
+          selectedMainMcpScopeFactory: field === "mcp" ? async () => ({
+            whenSettled: async () => {}, tools: () => [], resourceServers: () => [], serverStates: () => [],
+            callTool: async () => ({ content: [] }), readResource: async () => ({ contents: [] }), diagnostics: () => [],
+            setupOutcomes: () => [{ serverName: "redacted-mcp", kind: "missing-reference" as const }],
+            knownToolNames: () => [], borrowedServerNames: () => [],
+            shutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+            retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+          }) : undefined,
+          loadProject: (options) => {
+            const loaded = loadClaudeProject(options);
+            return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+              ...agent,
+              permissionMode: undefined, maxTurns: undefined, background: undefined,
+              isolation: undefined, color: undefined, model: "inherit", effort: undefined,
+              hooks: { SessionStart: [{ hooks: [{ type: "command", command: "RAW_HOOK_CANARY", raw: {} }] }] },
+              initialPrompt: undefined,
+              ...(field === "mcp" ? { agentMcp: { scope: "project", items: [], diagnostics: [], diagnosticOwnership: [] } }
+                : field === "trust" ? {}
+                  : { [field]: value }),
+            } : agent) };
+          },
+          onInitializationSettled: owner.captureInitialization,
+        });
+        await owner.waitForInitialization();
+        const manager = {
+          getBranch: () => branch, getEntries: () => branch,
+          appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+        };
+        const ctx = mode === "tui"
+          ? owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => false })
+          : owner.printCtx({ sessionManager: manager, isProjectTrusted: () => false });
+        await owner.fire("session_start", { reason: "startup" }, ctx);
+        const channel = mode === "tui"
+          ? owner.notifications.filter((notice) => field === "mcp" ? notice.severity === "error" : notice.severity === "warning").map((notice) => notice.text)
+          : stderr.mock.calls.map((call) => String(call[0]));
+        const diagnostic = channel.find((text) => field === "mcp"
+          ? /MCP setup|MCP publication|MCP configuration/u.test(text)
+          : field === "trust" ? text.includes("project/local hooks")
+            : name === "Claude model alias" ? text.includes("Claude model alias")
+              : name === "refused selected effort" ? text.includes("working effort")
+                : text.includes(String(name === "model degradation" ? "working model" : field))) ?? "";
+        expect(diagnostic, `${mode}:${name}`).toContain("selected-main");
+        expect(diagnostic.length, `${mode}:${name}`).toBeLessThanOrEqual(1_500);
+        expect(diagnostic, `${mode}:${name}`).toMatch(/does not apply|working model|working effort|working-model mapping|no selected project hook command ran|no provider request/iu);
+        expect(diagnostic, `${mode}:${name}`).toMatch(/required|continue|choose|start|trust the project/iu);
+        if (mode === "tui") {
+          expect(stderr.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(diagnostic);
+        } else {
+          expect(owner.notifications.map((notice) => notice.text)).not.toContain(diagnostic);
+        }
+        expect(stdout).not.toHaveBeenCalled();
+        await owner.commands.get("doctor").handler("", ctx);
+        const doctor = String(owner.entries.at(-1)?.data?.output);
+        const doctorFinding = name === "Claude model alias" ? "model uses a Claude alias"
+          : name === "refused selected effort" ? "effort override was unsupported or refused"
+            : field === "trust" ? "project/local selected hooks were skipped"
+              : field === "model" ? "model override"
+                : field === "mcp" ? "MCP" : String(field);
+        expect(doctor, `${mode}:${name}`).toContain(doctorFinding);
+        const selectedDoctorStart = doctor.indexOf("\n\nSelected main session");
+        const visible = `${diagnostic}\n${selectedDoctorStart < 0 ? "" : doctor.slice(selectedDoctorStart)}`;
+        for (const canary of [dir, "FS-SELECTED-MAIN-BODY", "---", "RAW_HOOK_CANARY", "redacted-mcp", "sonnet", "effort: high"]) {
+          expect(visible, `${mode}:${name}:${canary}`).not.toContain(canary);
+        }
+      } finally {
+        stderr.mockRestore();
+        stdout.mockRestore();
+      }
+    },
+  );
+
+  it("composes trusted selected hooks with base/scoped overlays and enforces tool, Agent catalog, rewrite, late, and stale guards", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName = "selected-main";
+    const events: string[] = [];
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    const outcome = (updatedInput?: Record<string, unknown>) => ({
+      block: false, askDowngraded: false, diagnostics: [],
+      ...(updatedInput === undefined ? {} : { updatedInput }),
+    });
+    const baseRunner = {
+      hasHooks: () => true,
+      fire: async (eventName: string) => {
+        events.push(`base:${eventName}`);
+        return outcome();
+      },
+    };
+    const selectedRunner = {
+      hasHooks: () => true,
+      fire: async (eventName: string) => {
+        events.push(`selected:${eventName}`);
+        return eventName === "PreToolUse" ? outcome({ path: "secrets/rewrite.txt" }) : outcome();
+      },
+    };
+    const scopedRunner = {
+      hasHooks: () => true,
+      fire: async (eventName: string) => {
+        events.push(`scoped:${eventName}`);
+        return outcome();
+      },
+    };
+    const handle = fakeSdk({ replies: ["SELECTED-REVIEWER-RAN"] });
+    Object.assign(owner.api, { getFlag: () => selectedName });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      baseHookRunner: baseRunner,
+      selectedMainHookRunnerFactory: () => selectedRunner,
+      sdk: handle.sdk,
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+            ...agent,
+            tools: ["Read", "Agent(reviewer)"],
+            hooks: { SessionStart: [] },
+            initialPrompt: undefined,
+          } : agent),
+        };
+      },
+      onWired: (value) => { internals = value; },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    internals.inputHooks.addScoped("selected-main", scopedRunner as never);
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true, thinkingLevel: "medium" });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(events).toEqual(["base:SessionStart", "selected:SessionStart", "scoped:SessionStart"]);
+
+    events.length = 0;
+    expect((await owner.fire("tool_call", {
+      toolName: "write", toolCallId: "ordinary-denied", input: { path: "safe.txt", content: "x" },
+    }, ctx))?.block).toBe(true);
+    expect(events).toEqual([]);
+    expect((await owner.fire("tool_call", {
+      toolName: "Agent", toolCallId: "wrong-agent", input: { subagent_type: "general-purpose", prompt: "no" },
+    }, ctx))?.block).toBe(true);
+    expect((await owner.fire("tool_call", {
+      toolName: "Agent", toolCallId: "reviewer-agent", input: { subagent_type: "reviewer", prompt: "review" },
+    }, ctx))?.block).not.toBe(true);
+    expect(events).toEqual(["base:PreToolUse", "selected:PreToolUse", "scoped:PreToolUse"]);
+    events.length = 0;
+    expect((await owner.fire("tool_call", {
+      toolName: "read", toolCallId: "rewritten-read", input: { path: "src/index.ts" },
+    }, ctx))?.block).toBe(true);
+    expect(events).toEqual(["base:PreToolUse", "selected:PreToolUse", "scoped:PreToolUse"]);
+
+    await owner.commands.get("agents").handler("", ctx);
+    const catalog = String(owner.entries.at(-1)?.data?.output);
+    expect(catalog).toContain("policy-permitted subagent(s) available");
+    expect(catalog).toContain("dispatch with the Agent tool");
+    expect(catalog).toContain("reviewer");
+    expect(catalog).not.toContain("general-purpose");
+    const dispatched = await owner.tools.get("Agent").execute("selected-reviewer", {
+      subagent_type: "reviewer", prompt: "review", run_in_background: false,
+    });
+    expect(dispatched.content[0].text).toContain("SELECTED-REVIEWER-RAN");
+
+    (owner.api.registerTool as (tool: Record<string, unknown>) => void)({
+      name: "WebSearch", label: "late", description: "late", parameters: { type: "object" },
+      execute: async () => ({ content: [{ type: "text", text: "LATE-RAN" }] }),
+    });
+    expect(owner.activeTools.has("WebSearch")).toBe(true);
+    await owner.fire("before_agent_start", { systemPrompt: "selected" }, ctx);
+    expect(owner.activeTools.has("WebSearch")).toBe(false);
+    expect((await owner.fire("tool_call", {
+      toolName: "WebSearch", toolCallId: "late-denied", input: { query: "x" },
+    }, ctx))?.block).toBe(true);
+
+    selectedName = "reviewer";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    expect(events.filter((event) => event === "selected:SessionEnd")).toHaveLength(1);
+    expect(events.filter((event) => event === "base:SessionEnd")).toHaveLength(1);
+    expect(events.filter((event) => event === "scoped:SessionEnd")).toHaveLength(1);
+    expect(events.filter((event) => event === "scoped:SessionStart")).toHaveLength(1);
+
+    selectedName = "missing-after-selected";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    expect(events.filter((event) => event === "selected:SessionEnd")).toHaveLength(2);
+    expect(events.filter((event) => event === "base:SessionEnd")).toHaveLength(2);
+    expect(events.filter((event) => event === "scoped:SessionEnd")).toHaveLength(2);
+    expect((await owner.fire("tool_call", {
+      toolName: "read", toolCallId: "stale-read", input: { path: "src/index.ts" },
+    }, ctx))?.block).toBe(true);
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+  });
+
+  it.each(["stop", "throw", "publication"] as const)(
+    "fails selected hook %s closed with redacted diagnostics and zero provider admission",
+    async (fault) => {
+      const owner = fakePi();
+      const branch: Record<string, unknown>[] = [];
+      const rawSecret = "RAW_SELECTED_HOOK_SECRET";
+      Object.assign(owner.api, { getFlag: () => "selected-main" });
+      picc(owner.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        baseHookRunner: { hasHooks: () => false, fire: async () => outcomeForTest() },
+        selectedMainHookRunnerFactory: () => ({
+          hasHooks: () => true,
+          fire: async (eventName: string) => {
+            if (eventName !== "SessionStart") return outcomeForTest();
+            if (fault === "throw") throw new Error(rawSecret);
+            return { ...outcomeForTest(), stop: true, stopReason: rawSecret };
+          },
+        }),
+        selectedMainHookHostFault: (installing) => {
+          if (fault === "publication" && installing) throw new Error(rawSecret);
+        },
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options);
+          return {
+            ...loaded,
+            agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+              ...agent, hooks: { SessionStart: [] }, initialPrompt: undefined,
+            } : agent),
+          };
+        },
+        onInitializationSettled: owner.captureInitialization,
+      });
+      await owner.waitForInitialization();
+      const manager = {
+        getBranch: () => branch,
+        getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      };
+      const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true });
+      await owner.fire("session_start", { reason: "startup" }, ctx);
+      expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx))
+        .toEqual({ action: "handled" });
+      await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+      const visible = owner.notifications.map((notice) => notice.text).join("\n");
+      expect(visible).toContain("selected-main");
+      expect(visible).not.toContain(rawSecret);
+      expect(visible).not.toContain("is active from");
+    },
+  );
+
+  it.each([
+    "missing-reference", "inline-startup", "scope-inspection", "inventory-publication",
+    "cleanup-unconfirmed", "partial-tool-registration", "partial-resource-registration",
+  ] as const)("fails selected MCP %s composition closed before provider work", async (fault) => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const runtimeCalls: string[] = [];
+    const originalRegister = owner.api.registerTool as (tool: { name?: string }) => void;
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      registerTool: (tool: { name?: string }) => {
+        if ((fault === "partial-tool-registration" && tool.name === "mcp__fault__two") ||
+            (fault === "partial-resource-registration" && tool.name === "ReadMcpResourceTool")) {
+          throw new Error("RAW_MCP_REGISTRATION_SECRET");
+        }
+        originalRegister(tool);
+      },
+    });
+    const cleanupUnconfirmed = fault === "cleanup-unconfirmed";
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      baseHookRunner: { hasHooks: () => false, fire: async () => outcomeForTest() },
+      selectedMainHookRunnerFactory: cleanupUnconfirmed ? () => ({
+        hasHooks: () => false, fire: async () => outcomeForTest(),
+      }) : undefined,
+      selectedMainHookHostFault: cleanupUnconfirmed && ((installing) => {
+        if (installing) throw new Error("RAW_HOOK_PUBLICATION_SECRET");
+      }) || undefined,
+      selectedMainMcpInventoryHostFault: fault === "inventory-publication" ? (publishing) => {
+        if (publishing) throw new Error("RAW_INVENTORY_SECRET");
+      } : undefined,
+      selectedMainMcpScopeFactory: async () => ({
+        whenSettled: async () => {},
+        tools: () => [
+          { serverName: "fault", toolName: "one", description: "one", inputSchema: { type: "object" } },
+          { serverName: "fault", toolName: "two", description: "two", inputSchema: { type: "object" } },
+        ],
+        resourceServers: () => fault === "partial-resource-registration" ? [{
+          serverName: "fault", resources: [{ serverName: "fault", uri: "fault:item", name: "item" }],
+        }] : [],
+        serverStates: () => [{ name: "fault", transport: "stdio" as const, state: "connected" as const }],
+        callTool: async (server: string, tool: string) => {
+          runtimeCalls.push(`${server}:${tool}`);
+          return { content: [] };
+        },
+        readResource: async (server: string, uri: string) => {
+          runtimeCalls.push(`${server}:${uri}`);
+          return { contents: [] };
+        },
+        diagnostics: () => [],
+        setupOutcomes: () => {
+          if (fault === "scope-inspection") throw new Error("RAW_SCOPE_SECRET");
+          if (fault === "missing-reference") return [{ serverName: "missing", kind: "missing-reference" as const }];
+          if (fault === "inline-startup") return [{ serverName: "inline", kind: "inline-startup-failed" as const }];
+          return [];
+        },
+        knownToolNames: () => ["mcp__fault__one", "mcp__fault__two"],
+        borrowedServerNames: () => [],
+        shutdown: async () => cleanupUnconfirmed
+          ? { confirmed: [], unconfirmed: ["fault"], diagnostics: ["RAW_CLEANUP_SECRET"] }
+          : { confirmed: ["fault"], unconfirmed: [], diagnostics: [] },
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: ["fault"], diagnostics: [] }),
+      }),
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+            ...agent,
+            tools: [
+              "mcp__fault__one", "mcp__fault__two", "ListMcpResourcesTool", "ReadMcpResourceTool",
+            ],
+            hooks: cleanupUnconfirmed ? { SessionStart: [] } : undefined,
+            initialPrompt: undefined,
+          } : agent),
+        };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx))
+      .toEqual({ action: "handled" });
+    expect(String((await owner.fire("before_agent_start", { systemPrompt: "ordinary" }, ctx))?.systemPrompt))
+      .not.toContain("FS-SELECTED-MAIN-BODY");
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
+    const visible = owner.notifications.map((notice) => notice.text).join("\n");
+    expect(visible).toContain("selected-main");
+    expect(visible).not.toMatch(/RAW_(?:MCP|HOOK|INVENTORY|SCOPE|CLEANUP)/u);
+    expect(visible).not.toContain("is active from");
+    const staleProxy = owner.tools.get("mcp__fault__one");
+    if (staleProxy) await expect(staleProxy.execute("stale", {})).rejects.toThrow();
+    expect(owner.activeTools.has("ReadMcpResourceTool")).toBe(false);
+    expect(runtimeCalls).toEqual([]);
+  });
+
+  it("composes the selected MCP universe, diagnostics, collision ownership, and stale-call revocation", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    let selectedName: string | undefined = "selected-main";
+    const globalCalls: string[] = [];
+    const selectedCalls: string[] = [];
+    let scopeGeneration = 0;
+    const globalTools = [
+      { serverName: "global-a", toolName: "ping", description: "A", inputSchema: { type: "object" } },
+      { serverName: "global-b", toolName: "ping", description: "B", inputSchema: { type: "object" } },
+      { serverName: "collision", toolName: "ping", description: "global wins", inputSchema: { type: "object" } },
+    ];
+    const globalStates = [
+      { name: "global-a", transport: "stdio" as const, state: "connected" as const },
+      { name: "global-b", transport: "stdio" as const, state: "failed" as const },
+      { name: "collision", transport: "stdio" as const, state: "connected" as const },
+    ];
+    const inlineStates = Array.from({ length: 35 }, (_, index) => ({
+      name: index === 0 ? "c-inline" : `inline-${String(index).padStart(2, "0")}`,
+      transport: "stdio" as const,
+      state: "connected" as const,
+    }));
+    const selectedTools = [
+      globalTools[0]!,
+      globalTools[2]!,
+      { serverName: "c-inline", toolName: "run", description: "C", inputSchema: { type: "object" } },
+    ];
+    const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => selectedName,
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") branch.push({ type: "custom_message", ...message });
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      mcpRuntime: {
+        whenSettled: async () => {},
+        tools: () => globalTools,
+        prompts: () => [],
+        resourceServers: () => [],
+        callTool: async (server: string, tool: string) => {
+          globalCalls.push(`${server}:${tool}`);
+          return { content: [{ type: "text", text: `global:${server}` }] };
+        },
+        getPrompt: async () => ({ messages: [] }),
+        readResource: async () => ({ contents: [] }),
+        diagnostics: () => [],
+        serverStates: () => globalStates,
+        shutdown: async () => {},
+      },
+      selectedMainMcpScopeFactory: async () => {
+        const generation = ++scopeGeneration;
+        return {
+        whenSettled: async () => {},
+        tools: () => selectedTools,
+        resourceServers: () => [{
+          serverName: "c-inline",
+          resources: [{ serverName: "c-inline", uri: "c-inline:item", name: "item" }],
+        }],
+        serverStates: () => [...globalStates.filter((state) => state.name !== "global-b"), ...inlineStates],
+        callTool: async (server: string, tool: string) => {
+          selectedCalls.push(`${generation}:${server}:${tool}`);
+          if (server === "collision") return {
+            content: [{ type: "text", text: "global-collision-route" }],
+          };
+          return { content: [{ type: "text", text: `selected:${server}` }] };
+        },
+        readResource: async (server: string, uri: string) => {
+          selectedCalls.push(`${generation}:${server}:${uri}`);
+          return { contents: [{ uri, text: "inline-resource" }] };
+        },
+        diagnostics: () => [],
+        setupOutcomes: () => [],
+        knownToolNames: () => selectedTools.map((tool) => `mcp__${tool.serverName}__${tool.toolName}`),
+        borrowedServerNames: () => ["global-a", "collision"],
+        shutdown: async () => ({ confirmed: ["c-inline"], unconfirmed: [], diagnostics: [] }),
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      };
+      },
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          settings: {
+            ...loaded.settings,
+            permissions: {
+              ...loaded.settings.permissions,
+              deny: [...loaded.settings.permissions.deny, "mcp__global-b__ping"],
+            },
+          },
+          agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
+            ...agent,
+            tools: [
+              "Read", "Agent(reviewer)",
+              "mcp__global-a__ping", "mcp__collision__ping", "mcp__c-inline__run",
+              "ListMcpResourcesTool", "ReadMcpResourceTool",
+            ],
+            agentMcp: {
+              scope: "project" as const,
+              items: [
+                { kind: "reference" as const, name: "global-a" },
+                { kind: "inline" as const, name: "c-inline", entry: { name: "c-inline", command: "unused", args: [], env: {}, skipped: false } },
+              ],
+              diagnostics: [], diagnosticOwnership: [],
+            },
+            initialPrompt: undefined,
+          } : agent),
+        };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true, thinkingLevel: "medium" });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+
+    (owner.api.registerTool as (tool: Record<string, unknown>) => void)({
+      name: "mcp__global-b__ping", label: "late denied B", description: "late denied B",
+      parameters: { type: "object" }, execute: async () => ({ content: [{ type: "text", text: "B-RAN" }] }),
+    });
+    expect(owner.activeTools.has("mcp__global-b__ping")).toBe(true);
+    await owner.fire("before_agent_start", { systemPrompt: "selected" }, ctx);
+    expect(owner.activeTools.has("mcp__global-a__ping")).toBe(true);
+    expect(owner.activeTools.has("mcp__global-b__ping")).toBe(false);
+    expect(owner.activeTools.has("mcp__c-inline__run")).toBe(true);
+    expect((await owner.fire("tool_call", {
+      toolName: "mcp__global-b__ping", toolCallId: "blocked-b", input: {},
+    }, ctx))?.block).toBe(true);
+    expect((await owner.fire("tool_call", {
+      toolName: "mcp__c-inline__run", toolCallId: "c-inline", input: {},
+    }, ctx))?.block).not.toBe(true);
+    expect((await owner.tools.get("mcp__c-inline__run").execute("c-inline", {})).content[0].text)
+      .toContain("selected:c-inline");
+    expect((await owner.tools.get("ReadMcpResourceTool").execute("resource", {
+      server: "c-inline", uri: "c-inline:item",
+    })).content[0].text).toContain("inline-resource");
+    expect((await owner.tools.get("mcp__collision__ping").execute("collision", {})).content[0].text)
+      .toContain("global-collision-route");
+
+    await owner.commands.get("mcp").handler("", ctx);
+    const mcpReport = String(owner.entries.at(-1)?.data?.output);
+    expect(mcpReport).toContain('"global-a"');
+    expect(mcpReport).toContain("borrowed global under selected authority");
+    expect(mcpReport).toContain('"c-inline"');
+    expect(mcpReport).toContain("selected-owned inline");
+    expect(mcpReport).toContain('"global-b"');
+    expect(mcpReport).toContain("not callable under selected authority");
+    expect(mcpReport).toContain("selected MCP server row(s) omitted");
+    expect(mcpReport).toContain("no expanded selected-inventory view exists");
+    expect(mcpReport).not.toContain("No active selected MCP routes");
+    const collisionRow = mcpReport.split("\n").find((line) => line.includes('"collision"')) ?? "";
+    expect(collisionRow).toContain("connected");
+    expect(collisionRow).toContain("borrowed global");
+    await owner.commands.get("doctor").handler("", ctx);
+    expect(String(owner.entries.at(-1)?.data?.output)).toContain("Global MCP servers excluded from selected authority");
+
+    const staleInline = owner.tools.get("mcp__c-inline__run");
+    const staleResource = owner.tools.get("ReadMcpResourceTool");
+    selectedName = "reviewer";
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    await expect(staleInline.execute("stale", {})).rejects.toThrow(/not active/u);
+    await expect(staleResource.execute("stale-resource", {
+      server: "c-inline", uri: "c-inline:item",
+    })).rejects.toThrow(/not active/u);
+    expect(selectedCalls).toEqual([
+      "1:c-inline:run", "1:c-inline:c-inline:item", "1:collision:ping",
+    ]);
+
+    selectedName = undefined;
+    branch.length = 0;
+    await owner.fire("session_start", { reason: "new" }, ctx);
+    expect(globalCalls).toEqual([]);
+    expect(owner.activeTools.has("mcp__global-a__ping")).toBe(true);
+    expect(owner.activeTools.has("mcp__global-b__ping")).toBe(false);
+    expect((await owner.fire("tool_call", {
+      toolName: "mcp__global-b__ping", toolCallId: "ordinary-denied-b", input: {},
+    }, ctx))?.block).toBe(true);
+  });
+
+  it("keeps a project-selected identity active while skipping hooks without positive trust", async () => {
+    const selectedPi = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const originalSend = selectedPi.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(selectedPi.api, {
+      getFlag: () => "selected-main",
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") {
+          branch.push({ type: "custom_message", ...message });
+        }
+      },
+    });
+    picc(selectedPi.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: loaded.agents.map((agent) => agent.name === "selected-main"
+            ? {
+                ...agent,
+                hooks: {
+                  SessionStart: [{ hooks: [{ type: "command", command: "definitely-not-a-real-selected-hook-command", raw: {} }] }],
+                },
+              }
+            : agent),
+        };
+      },
+      onInitializationSettled: selectedPi.captureInitialization,
+    });
+    await selectedPi.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = selectedPi.tuiCtx({ sessionManager: manager, isProjectTrusted: () => false });
+    await selectedPi.fire("session_start", { reason: "startup" }, ctx);
+    const prompt = String((await selectedPi.fire("before_agent_start", { systemPrompt: "ordinary" }, ctx))?.systemPrompt);
+    expect(prompt, JSON.stringify(selectedPi.notifications)).toContain("FS-SELECTED-MAIN-BODY");
+    expect(selectedPi.abortCalls).toBe(0);
+    expect(selectedPi.notifications.some((notice) =>
+      notice.text.includes("project/local hooks were skipped") && notice.text.includes("selected-main"))).toBe(true);
+    await selectedPi.commands.get("doctor").handler("", ctx);
+    expect(String(selectedPi.entries.at(-1)?.data?.output)).toContain("project/local selected hooks were skipped");
+  });
+});
+
 describe("degradation floor", () => {
   it("unknown hook event, degraded handler types, future settings keys — nothing crashed at load", () => {
     // The extension registered tools/commands despite FuturisticUnknownEvent,
@@ -3482,7 +5419,9 @@ describe("degradation floor", () => {
   });
 
   it("future-agent loads the exact supported inert MCP topology without obsolete deferred wording", async () => {
-    const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
+    const ordinaryCtx = pi.ctx({ sessionManager: { getBranch: () => [], getSessionFile: () => undefined } });
+    await pi.fire("session_start", { reason: "new" }, ordinaryCtx);
+    const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }, ordinaryCtx)).systemPrompt as string;
     expect(prompt).toContain("future-agent:");
 
     const loaded = loadAgents([{ dir: path.join(dir, ".claude", "agents"), scope: "project" }]);
@@ -3529,6 +5468,7 @@ describe("universal tool/worktree stops through production wiring", () => {
     const p = fakePi();
     let high = true;
     const context = p.tuiCtx({
+      sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => high
         ? ({ tokens: 950, contextWindow: 1000, percent: 95 })

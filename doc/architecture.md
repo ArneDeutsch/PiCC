@@ -135,8 +135,8 @@ authoritative native state or standalone managed MCP fails MCP closed, while abs
 applicable lower inputs.
 
 Every current MCP source crosses this admission seam before post-admission materialization. Agent-inline
-admission uses the same immutable policy and approval snapshot, then materializes only inside its named
-dispatch; it never widens ordinary MCP sources or the parent inventory. Future plugin or explicit
+admission uses the same immutable policy and approval snapshot, then materializes only for its selected
+main session or named dispatch; it never widens ordinary MCP sources. Future plugin or explicit
 runtime/CLI adapters must cross the same seam before their sources can be claimed as supported.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
@@ -299,7 +299,9 @@ where to start reading, not the extent of its cluster.
 
 - **Context assembly** (`context-assembly.ts`) — assembles the instruction set into the system-prompt
   suffix. Rebuilt every turn, the suffix is never compacted away: **this is the primary
-  compaction-preservation mechanism**. Resident skill bodies are restored most-recent-first within
+  compaction-preservation mechanism**. An ordinary main session appends that suffix to Pi's prompt;
+  a selected main agent instead rebuilds the complete custom-agent prompt every turn from its frozen
+  session definition and PiCC context. Resident skill bodies are restored most-recent-first within
   PiCC's heuristic character budget, which approximates rather than reproduces Claude Code's
   token-counted policy. Its interaction-posture block is main-session-only — a dispatched subagent
   returns a report, and has no user to converse with.
@@ -353,6 +355,14 @@ where to start reading, not the extent of its cluster.
   the panel tree and its parent's transcript. Normal-path results still replace pending calls in the
   same tool row, and subagent output does not stream into chat.
 
+- **Selected main-session state** (`selected-main-agent-selection.ts`,
+  `selected-main-agent-runtime.ts`, `selected-main-agent-scopes.ts`) — resolves CLI, persisted-branch,
+  and settings selectors into one immutable identity/policy snapshot. The snapshot owns prompt,
+  tool/catalog restrictions, supported model/effort, hooks, MCP, and one-time initial-prompt state
+  through session replacement. Missing fresh selections deny provider admission; uncertain or missing
+  persisted selections install a no-tools recovery identity. Selected hook/MCP replacement is a
+  serialized ownership transition, not a mutation of the shared agent registry.
+
 - **Session state** (`cwd-state.ts`, `worktrees.ts`) — `CwdState` is **the single mutable source of
   truth for the effective cwd**; every tool resolves through it at execute time (see *The cwd swap is
   load-bearing*). `WorktreeManager` resolves a base ref to a concrete SHA **before** creating the
@@ -380,16 +390,17 @@ where to start reading, not the extent of its cluster.
   The enablement gate is enforced by construction: no enabled server means no MCP context; no
   published prompt means no prompt metadata; and no advertised resource capability in the settled
   initial snapshots means no resource-tool schemas. Owned resources close with the session.
-  `agent-mcp.ts` composes immutable named-dispatch catalogs and routing from borrowed eligible session
+  `agent-mcp.ts` composes immutable named-agent catalogs and routing from borrowed eligible session
   servers plus one owned agent-inline runtime; a published session route quietly wins any same-name
-  inline admission result. Dispatch starts the scope after initial worktree admission and before tool
-  gating or the first provider request. It retains the scope through scoped stop hooks and checkpoint
-  recovery, then awaits shutdown before worktree release and terminal settlement. A successful later
+  inline admission result. Selected main sessions retain that scope for the session and project its
+  owned inventory into selected-authority `/mcp` and `/doctor` output. Dispatch starts its scope after
+  initial worktree admission and before tool gating or the first provider request, retains it through
+  scoped stop hooks and checkpoint recovery, then awaits shutdown before worktree release and terminal settlement. A successful later
   EnterWorktree queries live published owned-stdio routes at that boundary before adding pin guidance.
   After main custody is confirmed, session shutdown fences and joins active generations before its one
   retained persistence/quarantine scan, joins linked and other background tasks, cleans checkpoint-paused
   children, shuts down scoped MCP and then the global runtime, and only then fires SessionEnd. Unconfirmed
-  main or child custody stops before scoped or global MCP shutdown and before SessionEnd. Agent-inline capabilities never
+  main or child custody stops before scoped or global MCP shutdown and before SessionEnd. Dispatch-owned agent-inline capabilities never
   enter the parent inventory or a sibling/nested agent. Nested agents with omitted or clean-empty
   declarations still inherit eligible published main-session routes; parent-inline routes do not
   propagate. Claude documents the agent declaration's list/reference/inline shape and
@@ -536,15 +547,23 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    [“Core-tool readiness” in `pi-integration.md`](pi-integration.md#37-core-tool-readiness) for the
    exact lifecycle and retry mechanics.
 
-2. **`session_start`.** Captures the model registry and active model, applies the configured
+2. **`session_start`.** Reads Pi's registered `--agent` flag and the selected branch's custom entries,
+   then resolves CLI > persisted branch > merged `agent` setting independently of definition order:
+   managed, then nearest project, then user, then lower-precedence plugin definitions. Claude's
+   CLI-defined `--agents` definitions are unsupported and absent. It freezes and persists the admitted
+   selected identity before installing prompt/tool/catalog, model/effort, hook, and MCP ownership;
+   missing fresh selection denies provider admission, while missing or uncertain persisted evidence
+   installs a no-tools recovery identity.
+   It then captures the model registry and active model, applies the configured
    model/effort, attempts to self-heal `core.hooksPath` when `.githooks/` and a resolved Git executable are
    available (otherwise skips it), and fires the `SessionStart` hook. Steering text is derived from
    the active model here and **re-derived on `model_select`**,
    so a mid-session model switch re-steers — steering follows the model, it is not a startup
    snapshot.
 
-3. **`before_agent_start` (every turn).** Appends the system-prompt suffix, re-asserting the full
-   instruction set and the scratchpad section each turn.
+3. **`before_agent_start` (every turn).** Re-asserts the full instruction set and scratchpad each
+   turn. Ordinary sessions append the suffix; selected sessions replace the turn prompt with the
+   frozen selected-agent body plus supported PiCC context and restrictions.
 
 4. **`input`.** Checkpoint replay/disposition and extension-sourced input handling run first. For
    admitted non-extension user input, intercept PiCC control commands and handle the fallback for Pi

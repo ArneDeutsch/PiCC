@@ -414,12 +414,19 @@ export interface AgentMcpDeclaration {
   readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
 }
 
+export interface AgentToolRestrictionValidation {
+  readonly tools: "absent" | "valid" | "invalid";
+  readonly disallowedTools: "absent" | "valid" | "invalid";
+}
+
 export interface ClaudeAgent {
   name: string;
   description: string;
   /** Tool allowlist (Claude tool names, or "*" semantics when undefined = all tools). */
   tools?: string[];
   disallowedTools?: string[];
+  /** Bounded, value-free evidence retained before permissive list coercion. */
+  toolRestrictionValidation?: AgentToolRestrictionValidation;
   model?: string;
   effort?: string;
   permissionMode?: string;
@@ -636,6 +643,7 @@ export interface ClaudeSettings {
   hooks: HookConfig;
   env: Record<string, string>;
   model?: string;
+  agent?: string;
   includeCoAuthoredBy?: boolean;
   attribution?: Record<string, unknown>;
   disableAllHooks: boolean;

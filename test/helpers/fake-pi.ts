@@ -409,7 +409,7 @@ export function fakePi(): FakePi {
           self.abortCalls += 1;
         },
         hasPendingMessages: () => false,
-        sessionManager: { getEntries: () => [] },
+        sessionManager: { getEntries: () => [], getBranch: () => [] },
         ...overrides,
       };
     },

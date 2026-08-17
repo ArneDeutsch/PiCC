@@ -84,9 +84,10 @@ The full, always-current compatibility matrix is in
 
 ## Control surface
 
-Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives an explicit
-project compatibility report; `/mcp` shows bounded read-only MCP server status; `/usage` reports a
-per-subagent token/cost breakdown; `/quota` reports provider quota headers; `alt+a` opens the
+Inside a session: `/skills` lists loaded skills; `/agents` lists the subagent catalog permitted by
+the current agent policy; `/doctor` gives an explicit project compatibility report; `/mcp` shows
+bounded read-only MCP server status; `/usage` reports a per-subagent token/cost breakdown; `/quota` reports provider quota
+headers; `alt+a` opens the
 subagent status panel.
 Eligible user-invocable skills whose names do not conflict with built-ins appear in the `/`
 autocomplete menu. Model and per-model steering are

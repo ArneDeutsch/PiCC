@@ -3,6 +3,7 @@ import { matchesRule, parseRule, READ_DENY_EDIT_TOOLS } from "../engine/permissi
 import type { HookRunnerLike } from "../engine/hook-runner.js";
 import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js";
 import { clipOversizedToolResult } from "./tool-clip.js";
+import type { SelectedMainAgentToolDecision } from "./selected-main-agent-runtime.js";
 
 /**
  * The enforcement guard: an inline Pi extension shared by the main session and every
@@ -34,6 +35,8 @@ export interface GuardDeps {
   clipMaxTokens?: number;
   /** Captures generation-bound checkpoint stop authority before hook execution. */
   captureUniversalStop?: () => () => boolean;
+  /** Installed main-session capability policy; omitted for ordinary and subagent sessions. */
+  selectedSessionPolicy?: (call: ReturnType<typeof toClaudeCall>) => SelectedMainAgentToolDecision;
 }
 
 // Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
@@ -118,6 +121,18 @@ export function createGuardExtension(deps: GuardDeps) {
     return `PiCC: blocked by ${kind} ${rule ?? ""}`.trim();
   };
 
+  const evaluateSelectedSession = (
+    call: ReturnType<typeof toClaudeCall>,
+  ): { reason: string } | undefined => {
+    if (deps.selectedSessionPolicy === undefined) return undefined;
+    try {
+      const decision = deps.selectedSessionPolicy(call);
+      return decision.allowed ? undefined : { reason: "PiCC: blocked by selected main-session capability policy" };
+    } catch {
+      return { reason: "PiCC: blocked by selected main-session capability policy" };
+    }
+  };
+
   const evaluateDeny = (call: ReturnType<typeof toClaudeCall>): { reason: string } | undefined => {
     const decision = deps.engine.evaluate(call);
     if (decision.decision === "deny") {
@@ -143,6 +158,8 @@ export function createGuardExtension(deps: GuardDeps) {
 
       const denied = evaluateDeny(call);
       if (denied) return { block: true, reason: denied.reason };
+      const selectedDenied = evaluateSelectedSession(call);
+      if (selectedDenied) return { block: true, reason: selectedDenied.reason };
 
       const stopRun = deps.captureUniversalStop?.();
       const outcome = await deps.hooks.fire(
@@ -181,6 +198,13 @@ export function createGuardExtension(deps: GuardDeps) {
           return {
             block: true,
             reason: `${deniedAfterUpdate.reason} (after PreToolUse updatedInput)`,
+          };
+        }
+        const selectedDeniedAfterUpdate = evaluateSelectedSession(updatedCall);
+        if (selectedDeniedAfterUpdate) {
+          return {
+            block: true,
+            reason: `${selectedDeniedAfterUpdate.reason} (after PreToolUse updatedInput)`,
           };
         }
       }

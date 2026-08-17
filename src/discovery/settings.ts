@@ -802,6 +802,22 @@ function applySettingsFile(
         if (s !== undefined) out.model = expandEnvVars(s);
         break;
       }
+      case "agent": {
+        const s = expectString(value, "agent", source, out.diagnostics);
+        if (s !== undefined) {
+          const name = s.trim();
+          if (name.length === 0) {
+            out.diagnostics.push({
+              severity: "warning",
+              message: 'Setting "agent" must not be blank; ignored',
+              source,
+            });
+          } else {
+            out.agent = name;
+          }
+        }
+        break;
+      }
       case "includeCoAuthoredBy": {
         const b = expectBool(value, "includeCoAuthoredBy", source, out.diagnostics);
         if (b !== undefined) out.includeCoAuthoredBy = b;

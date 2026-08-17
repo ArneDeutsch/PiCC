@@ -5708,7 +5708,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     pi.messages.length = 0;
     let enteredOperations = 0;
     const ctx = pi.printCtx({
-      sessionManager: { getSessionFile: () => path.join(dir, "persisted-session.jsonl") },
+      sessionManager: {
+        getSessionFile: () => path.join(dir, "persisted-session.jsonl"),
+        getBranch: () => [],
+      },
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
@@ -6087,7 +6090,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       mode,
       hasUI: mode === "rpc",
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-      sessionManager: { getEntries: () => [] },
+      sessionManager: { getEntries: () => [], getBranch: () => [] },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => queueMicrotask(() => options.onError(new Error("private failure"))),
     });
