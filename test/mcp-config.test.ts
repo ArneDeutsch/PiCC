@@ -9,8 +9,9 @@ import {
   type McpJsonResult,
 } from "../src/claude/mcp-config.js";
 import { AGENT_MCP_LIMITS, normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
-import { resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
+import { MCP_ADMINISTRATION_TRACE_LIMITS, resolveMcpConfig, type GitTrackedProbe } from "../src/discovery/mcp.js";
 import { MCP_POLICY_LIMITS } from "../src/engine/mcp-policy.js";
+import { createMcpReviewDefinitionDigest } from "../src/mcp-administration/review-definition.js";
 import type { RemoteMcpWorkHooks } from "../src/claude/mcp-remote-config.js";
 import { loadClaudeProject } from "../src/project.js";
 import type { ClaudeMcpStateResult } from "../src/claude/claude-mcp-state.js";
@@ -25,6 +26,7 @@ import type {
   ResolvedMcpServer,
   Scope,
 } from "../src/types.js";
+import type { McpReviewSnapshot } from "../src/mcp-administration/model.js";
 
 const tempDirs: string[] = [];
 
@@ -105,6 +107,7 @@ function resolve(opts: {
   restrictiveMaterialOmitted?: boolean;
   managedMcp?: ManagedMcpResult;
   remoteWorkHooks?: RemoteMcpWorkHooks;
+  reviewSnapshot?: McpReviewSnapshot;
   captureAgentMcpAdmission?: (context: AgentMcpAdmissionContext) => void;
 }): ResolvedMcpConfig {
   return resolveMcpConfig({
@@ -119,6 +122,7 @@ function resolve(opts: {
     env: opts.env ?? ({} as NodeJS.ProcessEnv),
     isGitTracked: opts.probe ?? (() => false),
     ...(opts.remoteWorkHooks === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooks }),
+    ...(opts.reviewSnapshot === undefined ? {} : { reviewSnapshot: opts.reviewSnapshot }),
     ...(opts.captureAgentMcpAdmission === undefined ? {} : { captureAgentMcpAdmission: opts.captureAgentMcpAdmission }),
   });
 }
@@ -440,12 +444,12 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "srv")?.status).toBe("pending-approval");
   });
 
-  it("enables .mcp.json servers via enableAllProjectMcpServers from local scope", () => {
+  it("does not let checkout-local blanket approval authorize .mcp.json servers", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [entry("local", local, { enableAllProjectMcpServers: true })],
     });
-    expect(server(cfg, "srv")?.status).toBe("enabled");
+    expect(server(cfg, "srv")?.status).toBe("pending-approval");
   });
 
   it("enables only the servers named in enabledMcpjsonServers (others stay pending)", () => {
@@ -466,12 +470,9 @@ describe("resolveMcpConfig — enablement gate", () => {
     });
     expect(server(cfg, "srv")?.status).toBe("pending-approval");
     const diag = cfg.diagnostics.find((d) => d.includes("ignored"));
-    expect(diag).toContain("Independently review server definitions");
-    expect(diag).toContain("only explicitly trusted server names");
-    expect(diag).toContain("~/.claude/settings.json, or the configured user directory");
-    expect(diag).toContain("clean untracked .claude/settings.local.json");
-    expect(diag).toContain("never copy project-supplied mcpServers, approval keys, or blanket approval");
-    expect(diag).not.toContain("move them");
+    expect(diag).toContain("project bytes cannot authorize project MCP definitions");
+    expect(diag).toContain("user or managed settings compatibility grants");
+    expect(diag).toContain("private exact-definition review state");
   });
 
   it("honors disabledMcpjsonServers from EVERY scope, winning over all approvals", () => {
@@ -515,12 +516,12 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "my.server")?.status).toBe("disabled");
   });
 
-  it("matches enable-list entries through the name sanitizer too", () => {
+  it("does not honor a checkout-local enable-list even when its sanitized name matches", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ "my.server": { command: "x" } }),
       entries: [entry("local", local, { enabledMcpjsonServers: ["my_server"] })],
     });
-    expect(server(cfg, "my.server")?.status).toBe("enabled");
+    expect(server(cfg, "my.server")?.status).toBe("pending-approval");
   });
 
   it("sanitizes each UTF-16 code unit while preserving underscore and hyphen", () => {
@@ -574,14 +575,14 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "p-srv")?.source).toBe("settings-project");
   });
 
-  it("enables a project-settings-origin server via local-scope enabledMcpjsonServers", () => {
+  it("keeps a project-settings-origin server pending under local-scope enabledMcpjsonServers", () => {
     const cfg = resolve({
       entries: [
         entry("project", project, { servers: { "p-srv": { command: "p" } } }),
         entry("local", local, { enabledMcpjsonServers: ["p-srv"] }),
       ],
     });
-    expect(server(cfg, "p-srv")?.status).toBe("enabled");
+    expect(server(cfg, "p-srv")?.status).toBe("pending-approval");
     expect(server(cfg, "p-srv")?.source).toBe("settings-project");
   });
 
@@ -595,11 +596,11 @@ describe("resolveMcpConfig — enablement gate", () => {
     });
     expect(server(cfg, "a")?.status).toBe("enabled");
     expect(server(cfg, "b")?.status).toBe("enabled");
-    expect(server(cfg, "c")?.status).toBe("enabled");
+    expect(server(cfg, "c")?.status).toBe("pending-approval");
   });
 
   it("resolves enableAllProjectMcpServers nearest-wins among honored scopes", () => {
-    // Entries arrive in ascending precedence order; local overrides user…
+    // Checkout-local values cannot override the trusted user grant.
     const offWins = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [
@@ -607,9 +608,9 @@ describe("resolveMcpConfig — enablement gate", () => {
         entry("local", local, { enableAllProjectMcpServers: false }),
       ],
     });
-    expect(server(offWins, "srv")?.status).toBe("pending-approval");
+    expect(server(offWins, "srv")?.status).toBe("enabled");
 
-    // …and managed (highest, applied last) overrides local.
+    // Managed values remain trusted and override lower authority.
     const onWins = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [
@@ -654,12 +655,9 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     });
     expect(server(cfg, "srv")?.status).toBe("pending-approval");
     const approvalDiag = cfg.diagnostics.find((d) => d.includes("MCP approvals"));
-    expect(approvalDiag).toContain("cannot work while the file is tracked by git");
-    expect(approvalDiag).toContain("only explicitly trusted server names");
-    expect(approvalDiag).toContain("~/.claude/settings.json, or the configured user directory");
-    expect(approvalDiag).toContain("from scratch only after a reviewed repository change");
-    expect(approvalDiag).toContain("do not reuse project-supplied MCP content");
-    expect(approvalDiag).not.toContain("git rm --cached");
+    expect(approvalDiag).toContain("project bytes cannot authorize project MCP definitions");
+    expect(approvalDiag).toContain("tracked local file");
+    expect(approvalDiag).toContain("private exact-definition review state");
   });
 
   it("suppresses the demotion diagnostic when the tracked local file only disables servers", () => {
@@ -674,7 +672,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(cfg.diagnostics.some((d) => d.includes("tracked by git"))).toBe(false);
   });
 
-  it("fails open (untracked) when the injected probe THROWS", () => {
+  it("does not authorize from local approval when the injected probe throws", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [entry("local", local, { enableAllProjectMcpServers: true })],
@@ -682,7 +680,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
         throw new Error("hostile probe");
       },
     });
-    expect(server(cfg, "srv")?.status).toBe("enabled");
+    expect(server(cfg, "srv")?.status).toBe("pending-approval");
   });
 
   it("demotes a TRACKED local mcpServers block to pending instead of default-enabled", () => {
@@ -699,7 +697,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(demotion).not.toContain("approvals ignored, servers pending");
   });
 
-  it("fails OPEN on probe failure (undefined): treated as untracked/user-authored", () => {
+  it("keeps project approval pending on indeterminate provenance while retaining local declaration behavior", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [
@@ -710,7 +708,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
       ],
       probe: () => undefined,
     });
-    expect(server(cfg, "srv")?.status).toBe("enabled");
+    expect(server(cfg, "srv")?.status).toBe("pending-approval");
     expect(server(cfg, "l-srv")?.status).toBe("enabled");
   });
 
@@ -788,7 +786,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(project.mcp.diagnostics.some((d) => d.includes("tracked by git"))).toBe(true);
   });
 
-  it.skipIf(!gitAvailable)("default probe: an UNTRACKED settings.local.json in a real repo self-approves", () => {
+  it.skipIf(!gitAvailable)("default probe: an untracked settings.local.json cannot self-approve", () => {
     const root = makeTmp();
     spawnSync("git", ["init", "-q"], { cwd: root, stdio: "ignore" });
     writeJson(path.join(root, ".mcp.json"), { mcpServers: { srv: { command: "x" } } });
@@ -802,8 +800,8 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
       managedSettingsPaths: [],
       managedArtifactDirs: [],
     });
-    expect(server(project.mcp, "srv")?.status).toBe("enabled");
-    expect(project.mcp.diagnostics.some((d) => d.includes("tracked by git"))).toBe(false);
+    expect(server(project.mcp, "srv")?.status).toBe("pending-approval");
+    expect(project.mcp.diagnostics.some((d) => d.includes("project bytes cannot authorize"))).toBe(true);
   });
 });
 
@@ -891,6 +889,257 @@ describe("resolveMcpConfig — source precedence", () => {
     expect(server(cfg, "constructor")?.source).toBe("project-mcpjson");
     expect(server(cfg, "toString")?.command).toBe("local-ts");
     expect(cfg.servers).toHaveLength(2);
+  });
+});
+
+describe("MCP administration definition review", () => {
+  const snapshotFor = (
+    digest: string,
+    decision: "approved" | "rejected",
+    source: "project-mcpjson" | "subagent-inline" = "project-mcpjson",
+    agentOwner?: { name: string; scope: "project" },
+  ): McpReviewSnapshot => Object.freeze({
+    version: 1,
+    profileKey: "profile-a",
+    checkoutFamilyKey: "family-a",
+    records: Object.freeze([Object.freeze({
+      profileKey: "profile-a",
+      checkoutFamilyKey: "family-a",
+      source,
+      serverName: "srv",
+      ...(agentOwner === undefined ? {} : { agentOwner }),
+      definitionVersion: 1,
+      definitionDigest: digest,
+      decision,
+    })]),
+  });
+
+  it("canonicalizes semantic map/remote aliases and invalidates every execution-bearing field", () => {
+    const stdio = (value: Record<string, unknown>) => normalizeMcpServerBlock({ srv: value }, "vector")[0]!;
+    const base = createMcpReviewDefinitionDigest(stdio({
+      command: "node", args: ["", "serve"], env: { Z: "last", A: "first" }, timeout: 2000,
+    }));
+    expect(createMcpReviewDefinitionDigest(stdio({
+      env: { A: "first", Z: "last" }, timeout: 2000, args: ["", "serve"], command: "node",
+    }))).toBe(base);
+    for (const changed of [
+      { command: "node2", args: ["", "serve"], env: { Z: "last", A: "first" }, timeout: 2000 },
+      { command: "node", args: ["serve", ""], env: { Z: "last", A: "first" }, timeout: 2000 },
+      { command: "node", args: ["", "serve"], env: { Z: "changed", A: "first" }, timeout: 2000 },
+      { command: "node", args: ["", "serve"], env: { Z: "last", A: "first" }, timeout: 3000 },
+    ]) expect(createMcpReviewDefinitionDigest(stdio(changed))).not.toBe(base);
+
+    const remote = (value: Record<string, unknown>) => createMcpReviewDefinitionDigest(stdio(value));
+    const remoteBase = remote({ type: "http", url: "HTTPS://EXAMPLE.test:443/mcp", headers: { Z: "2", A: "1" }, timeout: 2000 });
+    expect(remote({ type: "streamable-http", url: "https://example.test/mcp", headers: { A: "1", Z: "2" }, timeout: 2000 })).toBe(remoteBase);
+    expect(remote({ type: "http", url: "https://example.test/other", headers: { A: "1", Z: "2" }, timeout: 2000 })).not.toBe(remoteBase);
+    expect(remote({ type: "http", url: "https://example.test/mcp", headers: { A: "changed", Z: "2" }, timeout: 2000 })).not.toBe(remoteBase);
+    expect(remote({ type: "sse", url: "https://example.test/mcp", headers: { A: "1", Z: "2" }, timeout: 2000 })).not.toBe(remoteBase);
+    expect(remote({ type: "http", url: "https://example.test/mcp", headers: { A: "1", Z: "2" }, timeout: 3000 })).not.toBe(remoteBase);
+    const remoteTrace = resolve({ mcpJson: mcpJsonOf({ srv: { type: "http", url: "https://user:pass@example.test/mcp?q=secret#fragment", headers: { A: "1", Z: "2" } } }) }).administration!;
+    expect(remoteTrace.declarations[0]?.summary).toMatchObject({ remoteOrigin: "https://example.test", headerKeyCount: 2 });
+    expect(JSON.stringify(remoteTrace)).not.toMatch(/user:pass|q=secret|fragment|"A":"1"/u);
+  });
+
+  it("binds exact decisions to profile, family, source, name, and current definition", () => {
+    const initial = resolve({ mcpJson: mcpJsonOf({ srv: { command: "node", args: [""] } }) });
+    const digest = initial.administration!.declarations[0]!.definitionDigest!;
+    const approved = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "node", args: [""] } }),
+      reviewSnapshot: snapshotFor(digest, "approved"),
+    });
+    expect(server(approved, "srv")?.status).toBe("enabled");
+    expect(approved.administration?.declarations[0]?.review).toBe("approved-exact");
+    expect(server(resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "node", args: ["changed"] } }),
+      reviewSnapshot: snapshotFor(digest, "approved"),
+    }), "srv")?.status).toBe("pending-approval");
+    const rejected = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "node", args: [""] } }),
+      entries: [entry("user", "/user", { enableAllProjectMcpServers: true })],
+      reviewSnapshot: snapshotFor(digest, "rejected"),
+    });
+    expect(server(rejected, "srv")).toMatchObject({ status: "disabled", inactiveReason: "mcpjson-rejected" });
+    expect(rejected.administration?.declarations[0]?.review).toBe("rejected-exact");
+
+    const baseRecord = snapshotFor(digest, "approved").records[0]!;
+    for (const changed of [
+      { snapshot: { profileKey: "profile-b" }, record: {} },
+      { snapshot: { checkoutFamilyKey: "family-b" }, record: {} },
+      { snapshot: {}, record: { source: "settings-project" as const } },
+      { snapshot: {}, record: { serverName: "other" } },
+    ]) {
+      const mismatched = {
+        ...snapshotFor(digest, "approved"),
+        ...changed.snapshot,
+        records: [{ ...baseRecord, ...changed.record }],
+      } as McpReviewSnapshot;
+      expect(server(resolve({
+        mcpJson: mcpJsonOf({ srv: { command: "node", args: [""] } }),
+        reviewSnapshot: mismatched,
+      }), "srv")?.status).toBe("pending-approval");
+    }
+  });
+
+  it("makes exact rejection deterministic and stronger than compatibility approval", () => {
+    const initial = resolve({ mcpJson: mcpJsonOf({ srv: { command: "node" } }) });
+    const digest = initial.administration!.declarations[0]!.definitionDigest!;
+    const approved = snapshotFor(digest, "approved").records[0]!;
+    const rejected = { ...approved, decision: "rejected" as const };
+    for (const records of [[approved, rejected], [rejected, approved]]) {
+      const cfg = resolve({
+        mcpJson: mcpJsonOf({ srv: { command: "node" } }),
+        entries: [entry("user", "/user", { enableAllProjectMcpServers: true })],
+        reviewSnapshot: { ...snapshotFor(digest, "approved"), records },
+      });
+      expect(server(cfg, "srv")?.status).toBe("disabled");
+      expect(cfg.administration?.declarations[0]?.review).toBe("rejected-exact");
+    }
+    const compatibilityRejected = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "node" } }),
+      entries: [entry("user", "/user", { disabledMcpjsonServers: ["srv"] })],
+      reviewSnapshot: snapshotFor(digest, "rejected"),
+    });
+    expect(compatibilityRejected.administration?.declarations[0]?.review).toBe("rejected-compatibility");
+  });
+
+  it("fails malformed or accessor-bearing review snapshots closed without reading accessors", () => {
+    let getterCalls = 0;
+    const hostileRecord = Object.defineProperty({}, "decision", {
+      enumerable: true,
+      get() { getterCalls++; return "approved"; },
+    });
+    for (const reviewSnapshot of [
+      { version: 2, profileKey: "profile-a", checkoutFamilyKey: "family-a", records: [] },
+      { version: 1, profileKey: "profile-a", checkoutFamilyKey: "family-a", records: [hostileRecord] },
+      { version: 1, profileKey: "profile-a", checkoutFamilyKey: "family-a", records: Array.from({ length: 513 }, () => ({})) },
+    ]) {
+      let admission: AgentMcpAdmissionContext | undefined;
+      const cfg = resolve({
+        mcpJson: mcpJsonOf({ srv: { command: "node" } }),
+        reviewSnapshot: reviewSnapshot as unknown as McpReviewSnapshot,
+        captureAgentMcpAdmission: (context) => { admission = context; },
+      });
+      expect(server(cfg, "srv")?.status).toBe("pending-approval");
+      expect(cfg.administration?.observations).toContain("review-snapshot-unavailable-or-invalid");
+      const owned = admission!.resolveOwned!(
+        normalizeAgentMcpDeclaration([{ srv: { command: "node" } }], "project"),
+        { name: "agent", scope: "project" },
+      );
+      expect(owned.servers[0]?.status).toBe("pending-approval");
+      expect(owned.administration?.observations).toContain("review-snapshot-unavailable-or-invalid");
+    }
+    expect(getterCalls).toBe(0);
+  });
+
+  it("bounds the resolver trace winner-first and reports exact omissions", () => {
+    const projectServers = Object.fromEntries(Array.from({ length: MCP_ADMINISTRATION_TRACE_LIMITS.declarations + 8 }, (_, index) => [
+      `server-${index}`,
+      { command: `project-${index}` },
+    ]));
+    const shadowServers = Object.fromEntries(Array.from({ length: 4 }, (_, index) => [
+      `server-${index}`,
+      { command: `user-${index}` },
+    ]));
+    const cfg = resolve({
+      entries: [
+        entry("user", "/user", { servers: shadowServers }),
+        entry("project", "/project", { servers: projectServers }),
+        entry("user", "/approval", { enableAllProjectMcpServers: true }),
+      ],
+    });
+    const trace = cfg.administration!;
+    expect(cfg.servers).toHaveLength(MCP_ADMINISTRATION_TRACE_LIMITS.declarations + 8);
+    expect(trace.declarations).toHaveLength(MCP_ADMINISTRATION_TRACE_LIMITS.declarations);
+    expect(trace.declarations.every((item) => item.precedence === "winner")).toBe(true);
+    expect(trace.declarations.slice(0, 3).map((item) => item.name)).toEqual(["server-0", "server-1", "server-2"]);
+    expect(trace.omittedDeclarationCount).toBe(12);
+    expect(trace.observations).toContain("administration-declarations-omitted");
+  });
+
+  it("records every acquired collision once with the resolver's exact winner", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "/project/bin/project-secret" } }),
+      entries: [
+        entry("user", "/u", { servers: { srv: { command: "/user/bin/user-secret" } }, enabledMcpjsonServers: ["srv"] }),
+        entry("project", "/p", { servers: { srv: { command: "/project/bin/settings-secret" } } }),
+        entry("local", "/l", { servers: { srv: { command: "/local/bin/local-secret" } } }),
+      ],
+    });
+    const trace = cfg.administration!;
+    expect(trace.declarations).toHaveLength(4);
+    expect(trace.declarations.filter((item) => item.precedence === "winner")).toEqual([
+      expect.objectContaining({ source: "project-mcpjson", summary: expect.objectContaining({ commandBasename: "project-secret" }) }),
+    ]);
+    expect(trace.declarations.filter((item) => item.precedence === "shadowed")).toHaveLength(3);
+    expect(JSON.stringify(trace)).not.toMatch(/\/project\/bin|\/user\/bin|\/local\/bin/u);
+    expect(Object.isFrozen(trace.declarations)).toBe(true);
+    expect(Object.isFrozen(trace.declarations[0])).toBe(true);
+  });
+
+  it("orders retained winners before shadowed declarations and preserves acquisition order in both groups", () => {
+    const trace = resolve({
+      entries: [
+        entry("user", "/user", { servers: {
+          userOnly: { command: "user-only" },
+          sharedA: { command: "user-a" },
+          sharedB: { command: "user-b" },
+        } }),
+        entry("project", "/project", { servers: {
+          projectOnly: { command: "project-only" },
+          sharedA: { command: "project-a" },
+          sharedB: { command: "project-b" },
+        } }),
+      ],
+    }).administration!;
+    expect(trace.declarations.map((item) => [item.precedence, item.name, item.summary.commandBasename])).toEqual([
+      ["winner", "userOnly", "user-only"],
+      ["winner", "projectOnly", "project-only"],
+      ["winner", "sharedA", "project-a"],
+      ["winner", "sharedB", "project-b"],
+      ["shadowed", "sharedA", "user-a"],
+      ["shadowed", "sharedB", "user-b"],
+    ]);
+  });
+
+  it("projects authority and broad compatibility labels while policy denial stays strongest", () => {
+    const broadName = resolve({
+      mcpJson: mcpJsonOf({ named: { command: "node" } }),
+      entries: [entry("user", "/user", { enabledMcpjsonServers: ["named"] })],
+    });
+    expect(broadName.administration?.declarations[0]).toMatchObject({
+      authority: { kind: "mutable", scope: "project" },
+      review: "approved-broad-name",
+    });
+    const broadAll = resolve({
+      entries: [
+        entry("project", "/project", { servers: { all: { command: "node" } } }),
+        entry("user", "/user", { enableAllProjectMcpServers: true }),
+      ],
+    });
+    expect(broadAll.administration?.declarations[0]).toMatchObject({
+      authority: { kind: "read-only", sourceClass: "settings-project" },
+      review: "approved-broad-all",
+    });
+    const managedEntry = Object.freeze({
+      ...normalizeMcpServerBlock({ managed: { command: "managed" } }, "managed")[0]!,
+      source: "managed-mcp" as const,
+    });
+    expect(resolve({ managedMcp: { status: "loaded", servers: [managedEntry] } }).administration?.declarations[0]).toMatchObject({
+      source: "managed-mcp",
+      authority: { kind: "read-only", sourceClass: "managed-mcp" },
+    });
+    const denied = resolve({
+      mcpJson: mcpJsonOf({ named: { command: "node" } }),
+      entries: [entry("user", "/user", {
+        enabledMcpjsonServers: ["named"], disabledMcpjsonServers: ["named"],
+      })],
+      policy: [{ scope: "managed", sourcePath: "/policy", order: 0, valid: true, deniedMcpServers: [{ serverName: "named" }] }],
+    });
+    expect(server(denied, "named")).toMatchObject({ status: "blocked", inactiveReason: "policy-denied" });
+    expect(denied.administration?.declarations[0]).toMatchObject({
+      policy: "policy-denied", review: "rejected-compatibility",
+    });
   });
 });
 
@@ -1043,15 +1292,15 @@ describe("resolveMcpConfig — native Claude hierarchy and gates", () => {
     ]);
   });
 
-  it("makes native disabledMcpServers final for an unapproved authentic project winner", () => {
+  it("keeps an unapproved project winner pending before native runtime disablement", () => {
     const cfg = resolve({
       nativeState: nativeState({ disabled: ["blocked"] }),
       mcpJson: mcpJsonOf({ blocked: { command: "must-not-run" } }),
     });
     expect(server(cfg, "blocked")).toMatchObject({
-      status: "disabled",
+      status: "pending-approval",
       source: "project-mcpjson",
-      inactiveReason: "native-runtime-disabled",
+      inactiveReason: "mcpjson-unapproved",
     });
   });
 
@@ -1087,6 +1336,13 @@ describe("resolveMcpConfig — native Claude hierarchy and gates", () => {
       policyAuthority: "user-controlled",
       policyObservations: [],
       policyFailures: [],
+      administration: {
+        version: 1,
+        policyPosture: "fail-closed",
+        observations: [],
+        declarations: [],
+        omittedDeclarationCount: 0,
+      },
     });
   });
 
@@ -1722,6 +1978,95 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     ]);
   });
 
+  it("binds project-agent review to owner and definition before interpolation", () => {
+    const firstDeclaration = normalizeAgentMcpDeclaration([{ srv: { command: "node", args: ["first"] } }], "project");
+    let initialAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { initialAdmission = context; } });
+    const initial = initialAdmission!.resolveOwned!(firstDeclaration, { name: "first-agent", scope: "project" });
+    const digest = initial.administration!.declarations[0]!.definitionDigest!;
+    const review = Object.freeze({
+      version: 1 as const,
+      profileKey: "profile-a",
+      checkoutFamilyKey: "family-a",
+      records: Object.freeze([Object.freeze({
+        profileKey: "profile-a",
+        checkoutFamilyKey: "family-a",
+        source: "subagent-inline" as const,
+        serverName: "srv",
+        agentOwner: Object.freeze({ name: "first-agent", scope: "project" as const }),
+        definitionVersion: 1 as const,
+        definitionDigest: digest,
+        decision: "approved" as const,
+      })]),
+    });
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ reviewSnapshot: review, captureAgentMcpAdmission: (context) => { admission = context; } });
+    expect(admission!.resolveOwned!(firstDeclaration, { name: "first-agent", scope: "project" }).servers[0]?.status).toBe("enabled");
+    expect(admission!.resolveOwned!(firstDeclaration, { name: "second-agent", scope: "project" }).servers[0]?.status).toBe("pending-approval");
+    const changed = normalizeAgentMcpDeclaration([{ srv: { command: "node", args: ["changed"] } }], "project");
+    expect(admission!.resolveOwned!(changed, { name: "first-agent", scope: "project" }).servers[0]?.status).toBe("pending-approval");
+
+    const mismatchedOwnerReview: McpReviewSnapshot = {
+      ...review,
+      records: [{ ...review.records[0]!, agentOwner: { name: "first-agent", scope: "user" } }],
+    };
+    let mismatchedAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({ reviewSnapshot: mismatchedOwnerReview, captureAgentMcpAdmission: (context) => { mismatchedAdmission = context; } });
+    const mismatched = mismatchedAdmission!.resolveOwned!(firstDeclaration, { name: "first-agent", scope: "user" });
+    expect(mismatched.servers[0]?.status).toBe("pending-approval");
+    expect(mismatched.administration?.declarations[0]?.review).toBe("pending");
+  });
+
+  it("keeps a project-owned agent declaration pending when only user owner scope has exact review", () => {
+    const declaration = normalizeAgentMcpDeclaration([{ srv: { command: "node" } }], "project");
+    let initialAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { initialAdmission = context; } });
+    const digest = initialAdmission!.resolveOwned!(declaration, { name: "agent", scope: "project" })
+      .administration!.declarations[0]!.definitionDigest!;
+    const reviewSnapshot: McpReviewSnapshot = {
+      version: 1,
+      profileKey: "profile-a",
+      checkoutFamilyKey: "family-a",
+      records: [{
+        profileKey: "profile-a",
+        checkoutFamilyKey: "family-a",
+        source: "subagent-inline",
+        serverName: "srv",
+        agentOwner: { name: "agent", scope: "user" },
+        definitionVersion: 1,
+        definitionDigest: digest,
+        decision: "approved",
+      }],
+    };
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ reviewSnapshot, captureAgentMcpAdmission: (context) => { admission = context; } });
+    const result = admission!.resolveOwned!(declaration, { name: "agent", scope: "project" });
+    expect(result.servers[0]?.status).toBe("pending-approval");
+    expect(result.administration?.declarations[0]?.review).toBe("pending");
+  });
+
+  it("copies supplied review state once before later owned-agent resolution", () => {
+    const declaration = normalizeAgentMcpDeclaration([{ srv: { command: "node" } }], "project");
+    let initialAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { initialAdmission = context; } });
+    const digest = initialAdmission!.resolveOwned!(declaration, { name: "agent", scope: "project" })
+      .administration!.declarations[0]!.definitionDigest!;
+    const mutable = {
+      version: 1 as const,
+      profileKey: "profile-a",
+      checkoutFamilyKey: "family-a",
+      records: [{
+        profileKey: "profile-a", checkoutFamilyKey: "family-a", source: "subagent-inline" as const,
+        serverName: "srv", agentOwner: { name: "agent", scope: "project" as const },
+        definitionVersion: 1 as const, definitionDigest: digest, decision: "approved" as const,
+      }],
+    };
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({ reviewSnapshot: mutable, captureAgentMcpAdmission: (context) => { admission = context; } });
+    mutable.records[0]!.decision = "rejected" as "approved";
+    expect(admission!.resolveOwned!(declaration, { name: "agent", scope: "project" }).servers[0]?.status).toBe("enabled");
+  });
+
   it("admits the legal fallback-spelling name without conflating it with invalid names", () => {
     const result = resolveAgent({}, [{ "invalid-agent-server": { command: "node" } }]);
     expect(result.servers).toEqual([
@@ -1788,22 +2133,19 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     expect(work).toEqual({ materialize: 0, inspect: 0, validate: 0 });
   });
 
-  it.each([
-    [true, "pending-approval"],
-    [false, "enabled"],
-  ] as const)("treats local approval as %s-tracked provenance", (tracked, status) => {
+  it.each([true, false] as const)("never authorizes a project agent from local approval (tracked=%s)", (tracked) => {
     const result = resolveAgent({
       entries: [entry("local", "/repo/.claude/settings.local.json", { enabledMcpjsonServers: ["candidate"] })],
       probe: () => tracked,
     }, [{ candidate: { command: "candidate-command" } }], "project");
-    expect(result.servers[0]).toMatchObject({ name: "candidate", status });
+    expect(result.servers[0]).toMatchObject({ name: "candidate", status: "pending-approval" });
   });
 
   it.each([
     [
-      "local false overrides user true",
+      "local false cannot override user true",
       [entry("user", "/home/settings.json", { enableAllProjectMcpServers: true }), entry("local", "/repo/settings.local.json", { enableAllProjectMcpServers: false })],
-      "pending-approval",
+      "enabled",
     ],
     [
       "managed false overrides local true",
@@ -2199,6 +2541,7 @@ describe("loadClaudeProject — mcp assembly", () => {
     expect([nativeCalls, projectCalls]).toEqual([0, 0]);
     expect(project.mcp.policyPosture).toBe(posture);
     expect(project.mcp.policyOrdinarySourcesSuppressed).toBe(true);
+    expect(project.mcp.administration?.observations).toContain("ordinary-sources-suppressed-by-managed-mcp");
     expect(project.mcp.servers.map((item) => item.name)).toEqual(names);
     expect(project.mcp.diagnostics).toEqual([]);
     if (names.length > 0) expect(project.mcp.servers[0]).toMatchObject({ status: "enabled", source: "managed-mcp" });
@@ -2383,6 +2726,13 @@ describe("loadClaudeProject — mcp assembly", () => {
       policyAuthority: "user-controlled",
       policyObservations: [],
       policyFailures: [],
+      administration: {
+        version: 1,
+        policyPosture: "absent",
+        observations: [],
+        declarations: [],
+        omittedDeclarationCount: 0,
+      },
     });
   });
 
@@ -2397,13 +2747,14 @@ describe("loadClaudeProject — mcp assembly", () => {
     writeJson(path.join(root, ".claude", "settings.json"), {
       env: { [variable]: "settings.example" },
     });
-    writeJson(path.join(root, ".claude", "settings.local.json"), {
+    const userDir = path.join(root, "user-home", ".claude");
+    writeJson(path.join(userDir, "settings.json"), {
       enabledMcpjsonServers: ["remote"],
     });
     try {
       const project = loadClaudeProject({
         cwd: root,
-        userDir: path.join(root, "no-such-home", ".claude"),
+        userDir,
         managedSettingsPaths: [],
         managedArtifactDirs: [],
       });
@@ -2418,7 +2769,7 @@ describe("loadClaudeProject — mcp assembly", () => {
     }
   });
 
-  it("resolves .mcp.json + settings.local.json approval end to end", () => {
+  it("keeps .mcp.json pending under settings.local.json approval end to end", () => {
     const root = makeTmp();
     writeJson(path.join(root, ".mcp.json"), {
       mcpServers: { github: { command: "gh-mcp", args: ["serve"] } },
@@ -2427,13 +2778,11 @@ describe("loadClaudeProject — mcp assembly", () => {
       enabledMcpjsonServers: ["github"],
     });
 
-    // Temp dir: either not a repo (probe fails open) or the file is untracked —
-    // both count as user-authored, so the approval holds.
     const project = loadFrom(root);
     const github = server(project.mcp, "github");
-    expect(github?.status).toBe("enabled");
+    expect(github?.status).toBe("pending-approval");
     expect(github?.source).toBe("project-mcpjson");
-    expect(github?.args).toEqual(["serve"]);
+    expect(github).not.toHaveProperty("args");
   });
 
   it("surfaces a malformed .mcp.json as a config-level diagnostic, never a crash", () => {

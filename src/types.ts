@@ -906,6 +906,8 @@ export interface ResolvedMcpConfig {
   policyFailures?: readonly Readonly<McpPolicySourceFailure>[];
   /** True only when discovery established that ordinary sources were suppressed. */
   policyOrdinarySourcesSuppressed?: boolean;
+  /** Resolver-owned, immutable declaration/review projection. */
+  administration?: import("./mcp-administration/model.js").McpAdministrationTrace;
 }
 
 interface ResolvedAgentMcpServerCommon {
@@ -950,11 +952,17 @@ export interface ResolvedAgentMcpConfig {
   readonly servers: readonly ResolvedAgentMcpServer[];
   readonly diagnostics: readonly string[];
   readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
+  /** Present when the caller supplies the owning agent identity. */
+  readonly administration?: import("./mcp-administration/model.js").McpAdministrationTrace;
 }
 
 /** Project-captured authority for resolving one declaration into unstarted configuration. */
 export interface AgentMcpAdmissionContext {
   readonly resolve: (declaration: AgentMcpDeclaration) => ResolvedAgentMcpConfig;
+  readonly resolveOwned?: (
+    declaration: AgentMcpDeclaration,
+    owner: import("./mcp-administration/model.js").McpAgentOwner,
+  ) => ResolvedAgentMcpConfig;
 }
 
 // ---------------------------------------------------------------------------
