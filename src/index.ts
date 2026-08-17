@@ -166,6 +166,29 @@ import {
 } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 import {
+  SELECTED_MAIN_AGENT_ENTRY,
+  SELECTED_MAIN_AGENT_INITIAL_PROMPT,
+  observeSelectedMainAgentBranch,
+  resolveSelectedMainAgentSelection,
+  selectedMainAgentInitialPromptDelivered,
+} from "./runtime/selected-main-agent-selection.js";
+import {
+  SelectedMainAgentActiveToolReconciler,
+  SelectedMainAgentToolPolicy,
+  createSelectedMainAgentRuntimeSnapshot,
+  type SelectedMainAgentRuntimeSnapshot,
+} from "./runtime/selected-main-agent-runtime.js";
+import {
+  SELECTED_MAIN_HOOK_SLOT,
+  SELECTED_MAIN_MCP_INVENTORY_SLOT,
+  SelectedMainHookSlotController,
+  SelectedMainMcpScopeController,
+  type SelectedMainHookRunner,
+  type SelectedMainMcpAdapter,
+  type SelectedMainMcpInventorySource,
+  type SelectedMainMcpTransitionOutcome,
+} from "./runtime/selected-main-agent-scopes.js";
+import {
   RELOAD_ACTIVATION_UNCONFIRMED,
   reserveReloadAttempt,
   armedReloadAttemptNonce,
@@ -260,10 +283,22 @@ function clearActiveReplacementShutdown(nonce: string): void {
 class HookMultiplexer {
   private readonly executionOverlay = new AsyncLocalStorage<ReadonlyMap<string, HookRunner>>();
   private readonly extras = new Map<string, HookRunner>();
+  private selectedMain: SelectedMainHookRunner | undefined;
 
-  constructor(private readonly base: HookRunner) {}
+  constructor(private readonly base: SelectedMainHookRunner, private readonly selectedHostFault?: (installing: boolean) => void) {}
+  replaceSelectedMainHook(
+    slot: typeof SELECTED_MAIN_HOOK_SLOT,
+    runner: SelectedMainHookRunner | undefined,
+  ): void {
+    if (slot !== SELECTED_MAIN_HOOK_SLOT) throw new Error("Invalid selected-main hook slot");
+    this.selectedHostFault?.(runner !== undefined);
+    this.selectedMain = runner;
+  }
   addScoped(identity: string, runner: HookRunner): void {
     if (!this.extras.has(identity)) this.extras.set(identity, runner);
+  }
+  removeScoped(identities: Iterable<string>): void {
+    for (const identity of identities) this.extras.delete(identity);
   }
   async withScoped<T>(
     runners: ReadonlyMap<string, HookRunner>,
@@ -272,8 +307,9 @@ class HookMultiplexer {
     const inherited = this.executionOverlay.getStore() ?? new Map<string, HookRunner>();
     return this.executionOverlay.run(new Map([...inherited, ...runners]), operation);
   }
-  private delegates(): HookRunner[] {
-    const delegates = [this.base];
+  private delegates(): SelectedMainHookRunner[] {
+    const delegates: SelectedMainHookRunner[] = [this.base];
+    if (this.selectedMain !== undefined) delegates.push(this.selectedMain);
     const identities = new Set<string>();
     for (const [identity, runner] of [
       ...this.extras,
@@ -291,6 +327,20 @@ class HookMultiplexer {
   }
   private readonly reportedDiagnostics = new Set<string>();
   private askDowngradeReported = false;
+
+  async fireSessionHook(
+    eventName: "SessionEnd",
+    payload: Partial<HookPayload>,
+  ) {
+    if (this.selectedMain === undefined) throw new Error("Selected SessionEnd delegate is unavailable");
+    const outcome = await this.fire(eventName, payload);
+    return Object.freeze({
+      outcome,
+      selectedDelivered: true as const,
+      baseDelivered: true as const,
+      committed: true as const,
+    });
+  }
 
   async fire(
     eventName: string,
@@ -438,8 +488,13 @@ export interface PiccTestSeam {
     mainCheckpointGate: MainSessionCheckpointGate;
     /** Observe shutdown ordering at the production MCP ownership boundary. */
     mcpRuntime: Pick<McpRuntime, "shutdown">;
-    /** TEST-ONLY access to the actual input hook multiplexer for boundary spies. */
-    inputHooks: { fire: (...args: any[]) => Promise<any> };
+    /** Observe selected-scope fencing and replacement at the production ownership boundary. */
+    selectedMainMcp: Pick<SelectedMainMcpScopeController, "replace" | "shutdownBeforeGlobal">;
+    /** TEST-ONLY access to the actual input hook multiplexer for boundary spies/overlay composition. */
+    inputHooks: {
+      fire: (...args: any[]) => Promise<any>;
+      addScoped: (identity: string, runner: HookRunner) => void;
+    };
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -452,6 +507,14 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+  /** TEST-ONLY in-memory base hook runner; production constructs HookRunner from the loaded project. */
+  baseHookRunner?: SelectedMainHookRunner;
+  /** TEST-ONLY selected runner factory and host mutation fault; production constructs/publishes normally. */
+  selectedMainHookRunnerFactory?: (definition: ClaudeAgent) => SelectedMainHookRunner | undefined;
+  selectedMainHookHostFault?: (installing: boolean) => void;
+  /** TEST-ONLY replacement/faults for selected-main scope construction and inventory publication. */
+  selectedMainMcpScopeFactory?: typeof createAgentMcpScope;
+  selectedMainMcpInventoryHostFault?: (publishing: boolean) => void;
   /** TEST-ONLY replacement for the session-global MCP runtime; never used by production wiring. */
   mcpRuntime?: Pick<
     McpRuntime,
@@ -835,6 +898,8 @@ export function formatAgentMcpSetupWarning(
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
+  // Pi applies extension flag values only after synchronous registration and before session_start.
+  pi.registerFlag?.("agent", { type: "string", description: "Run the main session as a Claude-format custom agent" });
   const routeMainSessionTool = testSeam?.renderMainSessionTool ?? renderMainSessionTool;
   const surfaceTypedForkTuiDiagnostics = createBoundedTuiDiagnosticSurface();
   // Capture once before project loading can spawn or inspect anything. PICC_* is
@@ -1254,7 +1319,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       ? prepared
       : fail(`persistent data directory validation or creation failed (${prepared.code}). ${pluginDataFailureRecovery(prepared.code)}`);
   };
-  const baseHooks = new HookRunner({
+  const baseHooks = testSeam?.baseHookRunner ?? new HookRunner({
     config: project.mergedHooks,
     projectDir: project.root,
     sessionId,
@@ -1265,7 +1330,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     onRuntimeFinding: retainRuntimeFinding,
     transcriptPath,
   });
-  const hooks = new HookMultiplexer(baseHooks);
+  const hooks = new HookMultiplexer(baseHooks, testSeam?.selectedMainHookHostFault);
+  const selectedMainHooks = new SelectedMainHookSlotController(hooks);
   const permissionEngine = new PermissionEngine(project.settings.permissions, {
     cwd: project.cwd,
     // Path rules anchor to the settings' project root, immune to cwd drift
@@ -1314,7 +1380,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const orphanReaping = worktrees.reapOrphans().catch(emptyWorktreeFailure);
   void orphanReaping;
   testSeam?.onRetentionJobsSettled?.(joinScheduledRetentionJobs);
-  const state = newSessionContextState(project.claudeMd);
+  let state = newSessionContextState(project.claudeMd);
   // Completeness floor: a report failure must never abort extension init.
   try {
     compat = buildCompatReport(project);
@@ -1330,7 +1396,43 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   let currentModelRef = "";
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
+  let hostBaselineModel: unknown;
+  let hostBaselineModelInitialized = false;
+  let hostBaselineEffort: string | undefined;
+  let hostBaselineEffortInitialized = false;
+  let ownsModelTransition = 0;
+  let ownsEffortTransition = 0;
+  let selectedModelOverrideWasActive = false;
+  let selectedEffortOverrideWasActive = false;
+  let selectedOverrideWasActive = false;
   let steeringText: string | undefined;
+  const setPiccModel = async (model: unknown): Promise<boolean> => {
+    // Pi may emit both selectors while changing model families; neither event may recapture a
+    // PiCC-owned transition as host baseline.
+    ownsModelTransition += 1;
+    ownsEffortTransition += 1;
+    try {
+      return await pi.setModel(model as never) !== false;
+    } finally {
+      ownsEffortTransition -= 1;
+      ownsModelTransition -= 1;
+    }
+  };
+  const setPiccEffort = (level: string): boolean => {
+    ownsEffortTransition += 1;
+    try {
+      return (pi.setThinkingLevel(level as never) as unknown) !== false;
+    } finally {
+      ownsEffortTransition -= 1;
+    }
+  };
+  const commitCurrentModel = (model: any): void => {
+    currentModel = model;
+    if (typeof model?.provider === "string" && typeof model?.id === "string") {
+      currentModelRef = `${model.provider}/${model.id}`;
+      steeringText = steeringForModel(config, currentModelRef);
+    }
+  };
   let stopHookIterations = 0;
   let checkpointContext: any;
   let checkpointSessionEpoch: object = {};
@@ -1516,8 +1618,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const pluginContextFor = (source: ClaudeSkill["source"]): PluginRuntimeContext | undefined =>
     source.pluginId ? pluginRuntimeContextForSource({ pluginId: source.pluginId }, pluginContexts) : undefined;
 
-  const mainActivation = newSkillActivationState(state.activeSkills);
-  const activeSkillDenyRules = mainActivation.denyRules;
+  let mainActivation = newSkillActivationState(state.activeSkills);
+  const resetMainSessionContext = (): void => {
+    hooks.removeScoped(mainActivation.scopedHookSkills);
+    state = newSessionContextState(project.claudeMd);
+    mainActivation = newSkillActivationState(state.activeSkills);
+  };
   interface MainActivationStage {
     residentSkills: string[];
     renderHashes: Set<string>;
@@ -1876,6 +1982,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     agent: ClaudeAgent,
     depth = 0,
     diagnosticSink?: (diagnostic: Diagnostic) => void,
+    mainPolicy?: SelectedMainAgentToolPolicy,
+    contextState = newSessionContextState(agent.skipProjectContext === true ? [] : project.claudeMd),
   ): string {
     const sections: string[] = [agent.body.trim()];
     // Preloaded skills (agent `skills:`): body + variables, no args/shell (sync path).
@@ -1942,7 +2050,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         debug(`agent ${agent.name}: unknown memory scope "${String(agent.memory)}"; no memory loaded`);
       }
     }
-    const granted = permissionEngine.gateTools(agent.tools, agent.disallowedTools, allKnownToolNames());
+    const granted = mainPolicy === undefined
+      ? permissionEngine.gateTools(agent.tools, agent.disallowedTools, allKnownToolNames())
+      : [...mainPolicy.activeToolNames(allKnownToolNames())];
     // The catalog must mirror tool provisioning: at max depth the nested Agent tool
     // is not provided, so advertising subagents would only produce unknown-tool calls.
     const nestedDispatchAvailable =
@@ -1964,9 +2074,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // skipProjectContext trims all project-level context.
       autoMemory: skipProject ? undefined : project.autoMemory,
       skills: project.skills,
-      agents: nestedDispatchAvailable ? agentsWithBuiltins() : [],
+      agents: nestedDispatchAvailable
+        ? (mainPolicy === undefined
+            ? agentsWithBuiltins()
+            : agentsWithBuiltins().filter((candidate) =>
+                mainPolicy.catalogSubagentTypes().includes(candidate.name)))
+        : [],
       settings: project.settings,
-      state: newSessionContextState(skipProject ? [] : project.claudeMd),
+      // Main selected sessions retain the long-lived session state so activated skills and
+      // nested context survive turn rebuilding and compaction. Dispatched agents use the
+      // fresh default above, preserving their isolated-context contract.
+      state: contextState,
       steeringText: agentModelRef ? steeringForModel(config, agentModelRef) : steeringText,
       // Subagents receive the same scratchpad guidance as the main session — a
       // subagent that writes a temp file via the Bash tool and then Reads it (or
@@ -1992,12 +2110,48 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     env: process.env,
     settingsEnv: project.settings.env,
   });
+  let selectedMainMcpInventory: SelectedMainMcpInventorySource | undefined;
+  const selectedMainMcp = new SelectedMainMcpScopeController({
+    replaceSelectedMainMcpInventory(slot, source) {
+      if (slot !== SELECTED_MAIN_MCP_INVENTORY_SLOT) throw new Error("Invalid selected-main MCP inventory slot");
+      testSeam?.selectedMainMcpInventoryHostFault?.(source !== undefined);
+      selectedMainMcpInventory = source;
+    },
+  }, testSeam?.selectedMainMcpScopeFactory);
+  let selectedMainSnapshot: SelectedMainAgentRuntimeSnapshot | undefined;
+  let selectedMainPolicy: SelectedMainAgentToolPolicy | undefined;
+  let selectedMainDefinition: ClaudeAgent | undefined;
+  let selectedMainHookPublished = false;
+  let selectedMainAdmissionFailure: string | undefined;
+  let selectedMainMcpAdapter: SelectedMainMcpAdapter | undefined;
+  let selectedMainMcpAllowedNames: ReadonlySet<string> = new Set();
+  let selectedMainAliasWarning = false;
+  let selectedMainTrustWarning = false;
+  let selectedMainModelUnavailableWarning = false;
+  let selectedMainEffortWarning = false;
+  const registeredSelectedMainMcpNames = new Set<string>();
+  let selectedMainToolReconciler: SelectedMainAgentActiveToolReconciler | undefined;
+  const activeSelectedMainToolReconciler = (): SelectedMainAgentActiveToolReconciler =>
+    selectedMainToolReconciler ??= new SelectedMainAgentActiveToolReconciler(pi);
+  const observableMcpServerStates = () => mcpRuntime.serverStates();
+  const registeredMainToolNames = (): string[] => {
+    const tools = pi.getAllTools().map((tool: { name?: unknown }) => tool.name)
+      .filter((name: unknown): name is string => typeof name === "string");
+    if (selectedMainSnapshot?.kind !== "selected") {
+      return tools.filter((name: string) => !registeredSelectedMainMcpNames.has(name));
+    }
+    return tools.filter((name: string) =>
+      !name.startsWith("mcp__") && name !== ListMcpResourcesTool && name !== ReadMcpResourceTool
+        ? true
+        : selectedMainMcpAllowedNames.has(name));
+  };
 
   function allKnownToolNames(scope?: AgentMcpScope): string[] {
     const scopedMcpNames = scope
       ? [...scope.knownToolNames()]
       : [
           ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
+          ...(selectedMainMcpInventory?.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`) ?? []),
           ...(mcpRuntime.resourceServers().length > 0
             ? [ListMcpResourcesTool, ReadMcpResourceTool]
             : []),
@@ -2959,6 +3113,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentPanelFocus,
       mainCheckpointGate,
       mcpRuntime,
+      selectedMainMcp,
       inputHooks: hooks,
     });
   } catch (err) {
@@ -3467,10 +3622,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     getCwd,
     contextForTouchedFile: injectForFile,
     // Active skills' disallowed-tools: enforced while the skill is resident.
-    extraDenyRules: () => [...activeSkillDenyRules.values()].flat(),
+    extraDenyRules: () => [...mainActivation.denyRules.values()].flat(),
     // Backstop: clip a single oversized tool result before it enters context.
     clipMaxTokens: config.compaction.clipMaxTokens,
     captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop(),
+    selectedSessionPolicy: (call) => {
+      const decision = selectedMainPolicy?.evaluateCall(call) ??
+        (selectedMainAdmissionFailure === undefined ? { allowed: true as const } : {
+          allowed: false as const,
+          reason: "selected-session-tool-denied" as const,
+        });
+      if (!decision.allowed) return decision;
+      if ((registeredSelectedMainMcpNames.has(call.tool) || selectedMainSnapshot?.kind === "selected") &&
+          (call.tool.startsWith("mcp__") || call.tool === ListMcpResourcesTool || call.tool === ReadMcpResourceTool) &&
+          !selectedMainMcpAllowedNames.has(call.tool)) {
+        return { allowed: false as const, reason: "selected-session-tool-denied" as const };
+      }
+      return decision;
+    },
   })(pi);
 
   // ---------------------------------------------------------------------------
@@ -3482,6 +3651,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC: ${message}`),
   );
   pi.on("before_agent_start", async (event: any, ctx: any) => {
+    if (selectedMainAdmissionFailure !== undefined) {
+      try { ctx?.abort?.(); } catch { /* admission remains closed */ }
+      return { systemPrompt: selectedMainSnapshot?.kind === "admission-denied"
+        ? selectedMainSnapshot.recoveryText
+        : "PiCC selected-main admission is closed. Start a fresh PiCC process and session after correcting the reported problem." };
+    }
     deliverSettlementNotices();
     // First-turn MCP settle barrier: Pi awaits this handler before snapshotting
     // the run's tools, so waiting for the complete initial sequence and its
@@ -3516,6 +3691,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
       }
     }
+    if (selectedMainSnapshot?.kind === "selected" && mcpExposureFailure !== undefined) {
+      const requestedName = selectedMainSnapshot.requestedName;
+      await clearSelectedMainSession(ctx, requestedName).catch(() => false);
+      await restoreHostBaselineForDeniedTransition(selectedOverrideWasActive);
+      denySelectedAdmission(requestedName,
+        "MCP publication could not be confirmed; no input or provider request is admitted. Repair MCP startup from the project configuration, exit PiCC, then start a fresh process and session.", ctx);
+      try { ctx?.abort?.(); } catch { /* admission remains closed */ }
+      return { systemPrompt: "PiCC selected-main admission is closed. Start a fresh PiCC process and session." };
+    }
+    if (!await reconcileSelectedTools(ctx)) {
+      try { ctx?.abort?.(); } catch { /* admission remains closed */ }
+      return { systemPrompt: "PiCC selected-main tool admission is closed. Start a fresh PiCC process and session." };
+    }
     // One-time MCP failure warning: every enabled server has settled behind the
     // barrier above, so the FIRST turn after settle is the one honest moment to
     // report startup failures. Checked exactly once per session — a "failed"
@@ -3549,6 +3737,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
     }
     try {
+      if (selectedMainSnapshot?.kind === "selected" && selectedMainDefinition && selectedMainPolicy) {
+        return { systemPrompt: buildSubagentSystemPrompt(selectedMainDefinition, 0, undefined, selectedMainPolicy, state) };
+      }
+      if (selectedMainSnapshot?.kind === "safe-fallback") {
+        const fallbackContext = buildSystemPromptSuffix({
+          claudeMd: project.claudeMd,
+          rules: project.rules,
+          skills: project.skills,
+          agents: [],
+          settings: project.settings,
+          state,
+          steeringText,
+          scratchDir,
+          windowsTempNote: shellNamespaceDiffersFromNative(),
+          autoMemory: project.autoMemory,
+          onDiagnostic: reportListingDegradation,
+        });
+        return { systemPrompt: `${selectedMainSnapshot.recoveryPrompt}\n\n${fallbackContext}` };
+      }
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
         rules: project.rules,
@@ -3570,9 +3777,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         onDiagnostic: reportListingDegradation,
       });
       return { systemPrompt: `${event.systemPrompt}\n\n${suffix}` };
-    } catch (err) {
-      console.error(`PiCC prompt assembly failed: ${(err as Error).message}`);
-      return undefined;
+    } catch {
+      if (selectedMainSnapshot?.kind !== "selected") {
+        console.error("PiCC prompt assembly failed");
+        return undefined;
+      }
+      const requestedName = selectedMainSnapshot.requestedName;
+      await clearSelectedMainSession(ctx, requestedName).catch(() => false);
+      await restoreHostBaselineForDeniedTransition(selectedOverrideWasActive);
+      denySelectedAdmission(requestedName,
+        "Prompt assembly failed; no input or provider request is admitted. Repair the selected definition or runtime context, exit PiCC, then start a fresh process and session.", ctx);
+      try { ctx?.abort?.(); } catch { /* admission remains closed */ }
+      return { systemPrompt: "PiCC selected-main admission is closed. Start a fresh PiCC process and session." };
     }
   });
 
@@ -3697,6 +3913,513 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return result;
   });
 
+  const selectedMainNotice = (ctx: any, text: string, severity: "info" | "warning" | "error"): void => {
+    try {
+      if (ctx?.mode === "tui") ctx.ui?.notify?.(text, severity);
+      else console.error(`PiCC: ${text}`);
+    } catch {
+      try { console.error(`PiCC: ${text}`); } catch { /* admission state is already installed */ }
+    }
+  };
+  const selectedDefinitionProvenance = (definition: ClaudeAgent): string => {
+    const scope = definition.source.scope;
+    return definition.source.pluginId
+      ? `${scope} plugin ${sanitizeLine(definition.source.pluginId, 128)}`
+      : scope;
+  };
+  const denySelectedAdmission = (requestedName: string | undefined, reason: string, ctx: any): void => {
+    const identity = requestedName === undefined
+      ? "unknown (selection authority unavailable)"
+      : JSON.stringify(sanitizeLine(requestedName, 128));
+    const boundedReason = `Selected agent ${identity}: ${sanitizeDisplayText(reason, 1_200, true)}`;
+    selectedMainAdmissionFailure = boundedReason;
+    selectedMainSnapshot = createSelectedMainAgentRuntimeSnapshot({
+      kind: "missing-fresh",
+      source: "settings",
+      ...(requestedName === undefined ? {} : { requestedName }),
+    });
+    selectedMainPolicy = selectedMainSnapshot === undefined
+      ? undefined
+      : new SelectedMainAgentToolPolicy(selectedMainSnapshot, permissionEngine, []);
+    const reconciler = activeSelectedMainToolReconciler();
+    reconciler.setPolicy(selectedMainPolicy);
+    reconciler.reconcile(registeredMainToolNames());
+    if (ctx?.mode !== "tui") process.exitCode = 1;
+    selectedMainNotice(ctx, boundedReason, "error");
+  };
+  const reconcileSelectedTools = async (
+    ctx: any,
+    candidate?: {
+      readonly snapshot: Extract<SelectedMainAgentRuntimeSnapshot, { kind: "selected" }>;
+      readonly policy: SelectedMainAgentToolPolicy;
+    },
+  ): Promise<boolean> => {
+    try {
+      const reconciler = activeSelectedMainToolReconciler();
+      reconciler.setPolicy(candidate?.policy ?? selectedMainPolicy);
+      const result = reconciler.reconcile(registeredMainToolNames());
+      if (result.ok) return true;
+    } catch { /* checked failure below */ }
+    const requestedName = candidate?.snapshot.requestedName ??
+      (selectedMainSnapshot?.kind === "selected" ? selectedMainSnapshot.requestedName : undefined);
+    const cleanupConfirmed = await clearSelectedMainSession(ctx, requestedName).catch(() => false);
+    const baselineRestored = await restoreHostBaselineForDeniedTransition(selectedOverrideWasActive);
+    const retainedState = [
+      cleanupConfirmed ? undefined : "Outgoing selected hook/MCP cleanup remains unconfirmed; no successor can be admitted in this process.",
+      baselineRestored ? undefined : "The host model/effort baseline could not be restored, so the current model state remains uncertain.",
+    ].filter((part): part is string => part !== undefined).join(" ");
+    denySelectedAdmission(
+      requestedName,
+      "Selected main-session tool publication could not be confirmed; no provider request is admitted. Correct the runtime/tool registration problem, then start a fresh PiCC process and session." +
+        (retainedState ? ` ${retainedState}` : ""),
+      ctx,
+    );
+    return false;
+  };
+  const createSelectedHookRunner = (definition: ClaudeAgent): SelectedMainHookRunner | undefined => {
+    if (testSeam?.selectedMainHookRunnerFactory) return testSeam.selectedMainHookRunnerFactory(definition);
+    if (!definition.hooks || Object.keys(definition.hooks).length === 0) return undefined;
+    const parsed = parseHookConfig(definition.hooks, definition.source.path,
+      definition.source.pluginId ? { pluginId: definition.source.pluginId } : undefined);
+    return new HookRunner({
+      config: parsed.config,
+      projectDir: project.root,
+      sessionId,
+      env: project.settings.env,
+      disableAllHooks: project.settings.disableAllHooks,
+      pluginContexts,
+      ensurePluginDataDir,
+      onRuntimeFinding: retainRuntimeFinding,
+      transcriptPath,
+    });
+  };
+  const selectedMcpTransitionConfirmed = (
+    outcome: SelectedMainMcpTransitionOutcome,
+    installed: boolean,
+  ): boolean => outcome.installed === installed && outcome.cleanup.unconfirmed.length === 0 &&
+    !outcome.diagnostics.some((entry) => entry.reason !== "setup-diagnostic");
+  const restoreGlobalMcpDefinitions = (): boolean => {
+    if (selectedMainMcpAdapter === undefined) return true;
+    try {
+      const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(mcpRuntime)];
+      if (mcpRuntime.resourceServers().length > 0) {
+        definitions.push(...buildMcpResourceTools(mcpRuntime, {
+          clipMaxTokens: config.compaction.clipMaxTokens,
+        }));
+      }
+      const admitted = new Set(
+        permissionEngine.gateTools(undefined, undefined, definitions.map((tool) => tool.name)),
+      );
+      for (const definition of definitions) {
+        if (admitted.has(definition.name)) {
+          pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definition, {
+            fallbackCallDisplayName: definition.label,
+          }) as unknown as Record<string, unknown>));
+          registeredSelectedMainMcpNames.delete(definition.name);
+        } else {
+          // A retained selected proxy with this name must remain excluded after selected→ordinary;
+          // initial publication applied the same global permission gate and never authorized it.
+          registeredSelectedMainMcpNames.add(definition.name);
+        }
+      }
+      selectedMainMcpAdapter = undefined;
+      selectedMainMcpAllowedNames = new Set();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const clearSelectedMainSession = async (ctx: any, requestedName?: string): Promise<boolean> => {
+    let mcpConfirmed = false;
+    let hooksConfirmed = false;
+    try {
+      mcpConfirmed = selectedMcpTransitionConfirmed(await selectedMainMcp.replace(undefined), false);
+    } catch { /* checked below */ }
+    try {
+      const outcome = await selectedMainHooks.replace(undefined, { cwd: cwdState.get(), reason: "other" });
+      hooksConfirmed = outcome.committed && outcome.cleared;
+    } catch { /* checked below */ }
+    selectedMainHookPublished = false;
+    const confirmed = mcpConfirmed && hooksConfirmed && restoreGlobalMcpDefinitions();
+    if (!confirmed) {
+      denySelectedAdmission(requestedName,
+        "Selected main-session cleanup or SessionEnd delivery could not be confirmed. No successor, input, or provider request is admitted; exit PiCC and start a fresh process and session.", ctx);
+    }
+    return confirmed;
+  };
+  const restoreHostBaselineForDeniedTransition = async (outgoingSelectedOwned: boolean): Promise<boolean> => {
+    const modelNeedsRestore = outgoingSelectedOwned || selectedModelOverrideWasActive;
+    const effortNeedsRestore = outgoingSelectedOwned || selectedEffortOverrideWasActive;
+    let confirmed = true;
+    try {
+      if (modelNeedsRestore) {
+        if (hostBaselineModel === undefined) {
+          if (selectedModelOverrideWasActive) confirmed = false;
+        } else if (await setPiccModel(hostBaselineModel)) {
+          commitCurrentModel(hostBaselineModel);
+          selectedModelOverrideWasActive = false;
+        } else {
+          confirmed = false;
+        }
+      }
+      if (effortNeedsRestore) {
+        if (hostBaselineEffort === undefined) {
+          if (selectedEffortOverrideWasActive) confirmed = false;
+        } else if (setPiccEffort(hostBaselineEffort)) {
+          selectedEffortOverrideWasActive = false;
+        } else {
+          confirmed = false;
+        }
+      }
+      return confirmed;
+    } catch {
+      return false;
+    }
+  };
+  const applyMainModelAndEffort = async (
+    activeSelectedSnapshot: Extract<SelectedMainAgentRuntimeSnapshot, { kind: "selected" }> | undefined,
+    outgoingSelectedOwned: boolean,
+    event: any,
+    ctx: any,
+  ): Promise<void> => {
+    const selectedIsActive = activeSelectedSnapshot !== undefined;
+    let baselineConfirmed = true;
+    if (selectedIsActive || outgoingSelectedOwned || selectedModelOverrideWasActive) {
+      if (hostBaselineModel === undefined) {
+        // A selected→selected transition may intentionally inherit/replace the current override.
+        // Leaving selected authority requires a real host value to restore.
+        if (selectedModelOverrideWasActive && !selectedIsActive) baselineConfirmed = false;
+      } else if (await setPiccModel(hostBaselineModel)) {
+        commitCurrentModel(hostBaselineModel);
+        selectedModelOverrideWasActive = false;
+      } else {
+        baselineConfirmed = false;
+      }
+    }
+    if (selectedIsActive || outgoingSelectedOwned || selectedEffortOverrideWasActive) {
+      if (hostBaselineEffort === undefined) {
+        if (selectedEffortOverrideWasActive && !selectedIsActive) baselineConfirmed = false;
+      } else if (setPiccEffort(hostBaselineEffort)) {
+        selectedEffortOverrideWasActive = false;
+      } else {
+        baselineConfirmed = false;
+      }
+    }
+    if (!baselineConfirmed) throw new Error("host model or effort baseline restore was not confirmed");
+    if (config.model && (event.reason === "startup" || selectedIsActive || outgoingSelectedOwned)) {
+      const model = resolveModelSpec(config.model);
+      if (model && await setPiccModel(model)) commitCurrentModel(model);
+      else if (model && (selectedIsActive || outgoingSelectedOwned)) throw new Error("configured model was refused");
+    }
+    if (config.effort) {
+      const level = mapEffort(config, config.effort);
+      if (level && !setPiccEffort(level) && (selectedIsActive || outgoingSelectedOwned)) {
+        throw new Error("configured effort was refused");
+      }
+    }
+    if (activeSelectedSnapshot?.model) {
+      const identity = JSON.stringify(activeSelectedSnapshot.diagnostic.agentIdentity);
+      const alias = activeSelectedSnapshot.model.toLowerCase();
+      if (CLAUDE_MODEL_ALIASES.has(alias) && alias !== "inherit") {
+        selectedMainAliasWarning = true;
+        selectedMainNotice(ctx, `Selected agent ${identity} uses a Claude model alias; PiCC kept the working-model mapping rather than claiming an exact family. Use an explicit installed model when exact selection matters, then start a fresh session.`, "warning");
+      } else if (alias !== "inherit") {
+        const selectedModel = resolveModelSpec(activeSelectedSnapshot.model);
+        let applied = false;
+        if (selectedModel !== undefined) {
+          try { applied = await setPiccModel(selectedModel); } catch { applied = false; }
+        }
+        if (!applied) {
+          selectedMainModelUnavailableWarning = true;
+          selectedMainNotice(ctx, `Selected agent ${identity} requests a model that is unavailable, unauthenticated, or was refused. PiCC kept the working model; choose an installed authenticated model, then start a fresh session.`, "warning");
+        } else {
+          commitCurrentModel(selectedModel);
+          selectedModelOverrideWasActive = true;
+        }
+      }
+    }
+    if (activeSelectedSnapshot?.effort) {
+      const identity = JSON.stringify(activeSelectedSnapshot.diagnostic.agentIdentity);
+      const selectedEffort = mapEffort(config, activeSelectedSnapshot.effort);
+      let applied = false;
+      if (selectedEffort) {
+        try { applied = setPiccEffort(selectedEffort); } catch { applied = false; }
+      }
+      if (!applied) {
+        selectedMainEffortWarning = true;
+        selectedMainNotice(ctx, `Selected agent ${identity} requests an unsupported or refused effort. PiCC kept the working effort; correct the definition, then start a fresh session.`, "warning");
+      } else {
+        selectedEffortOverrideWasActive = true;
+      }
+    }
+  };
+  const installSelectedMainSession = async (
+    branch: unknown,
+    ctx: any,
+    event: any,
+    outgoingSelectedOwned: boolean,
+  ): Promise<void> => {
+    // Fail closed while the replacement transaction validates persistence, cleanup, and publication.
+    selectedMainAdmissionFailure = "Selected main-session transition is still being checked.";
+    selectedMainAliasWarning = false;
+    selectedMainTrustWarning = false;
+    selectedMainModelUnavailableWarning = false;
+    selectedMainEffortWarning = false;
+    selectedMainDefinition = undefined;
+    selectedMainHookPublished = false;
+    const observation = observeSelectedMainAgentBranch(branch);
+    let cliName: string | undefined;
+    try {
+      const value = pi.getFlag?.("agent");
+      if (typeof value === "string") cliName = value;
+    } catch {
+      cliName = undefined;
+    }
+    const resolution = resolveSelectedMainAgentSelection({
+      cliName,
+      settingName: project.settings.agent,
+      branchObservation: observation,
+      agents: project.agents,
+    });
+    let snapshot = createSelectedMainAgentRuntimeSnapshot(resolution);
+    const denyTransition = async (
+      requestedName: string | undefined,
+      reason: string,
+      cleanup: boolean,
+    ): Promise<void> => {
+      const cleanupConfirmed = !cleanup || await clearSelectedMainSession(ctx, requestedName).catch(() => false);
+      const baselineRestored = await restoreHostBaselineForDeniedTransition(outgoingSelectedOwned);
+      const retainedState = [
+        cleanupConfirmed ? undefined : "Outgoing selected hook/MCP cleanup remains unconfirmed; no successor can be admitted in this process.",
+        baselineRestored ? undefined : "The host model/effort baseline could not be restored, so the current model state remains uncertain.",
+      ].filter((part): part is string => part !== undefined).join(" ");
+      denySelectedAdmission(requestedName, `${reason}${retainedState ? ` ${retainedState}` : ""}`, ctx);
+    };
+
+    if (resolution.kind === "selected" && snapshot?.kind === "selected" && snapshot.appendSelectionEntry) {
+      try {
+        if (typeof sessionManagerRef?.appendCustomEntry !== "function") throw new Error("selection transcript append is unavailable");
+        sessionManagerRef.appendCustomEntry(SELECTED_MAIN_AGENT_ENTRY, {
+          version: 1,
+          requestedName: snapshot.requestedName,
+        });
+      } catch {
+        await denyTransition(snapshot.requestedName,
+          "The requested selection could not be persisted; no provider request was admitted. Repair session storage, then start a fresh PiCC process and session.",
+          outgoingSelectedOwned || selectedMainMcpAdapter !== undefined || selectedMainHookPublished);
+        return;
+      }
+    }
+
+    const selectedTransitionOwnsCleanup = outgoingSelectedOwned || snapshot !== undefined ||
+      selectedMainMcpAdapter !== undefined || selectedMainHookPublished;
+    if (selectedTransitionOwnsCleanup && !await clearSelectedMainSession(ctx, snapshot?.requestedName)) return;
+
+    if (snapshot === undefined) {
+      selectedMainSnapshot = undefined;
+      selectedMainPolicy = undefined;
+      selectedMainAdmissionFailure = undefined;
+      await reconcileSelectedTools(ctx);
+      return;
+    }
+    if (snapshot.kind !== "selected") {
+      selectedMainSnapshot = snapshot;
+      selectedMainPolicy = new SelectedMainAgentToolPolicy(snapshot, permissionEngine, []);
+      if (snapshot.kind === "admission-denied") {
+        const baselineRestored = await restoreHostBaselineForDeniedTransition(outgoingSelectedOwned);
+        denySelectedAdmission(snapshot.requestedName,
+          `The requested identity was not admitted (${snapshot.diagnostic.reason}); no provider request was made. ${snapshot.recoveryText}` +
+          (baselineRestored ? "" : " The host model/effort baseline could not be restored, so the current model state remains uncertain."), ctx);
+      } else {
+        selectedMainAdmissionFailure = undefined;
+        await reconcileSelectedTools(ctx);
+        selectedMainNotice(ctx,
+          `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} could not be safely restored (${snapshot.diagnostic.reason}). PiCC installed a no-tools recovery identity with no stale capabilities. Select an available agent and start a fresh session.`,
+          "warning");
+      }
+      return;
+    }
+
+    if (resolution.kind !== "selected") {
+      await denyTransition(snapshot.requestedName,
+        "The selected definition became unavailable during admission; start a fresh PiCC process and session.", false);
+      return;
+    }
+    let definition = resolution.agent;
+    let policy: SelectedMainAgentToolPolicy;
+    try {
+      // The raw snapshot above validates restrictions before persistence. Plugin preparation then
+      // produces the one effective definition frozen consistently into prompt/policy/hooks/MCP.
+      definition = preparePluginAgentOwner(definition);
+      const prepared = createSelectedMainAgentRuntimeSnapshot({ ...resolution, agent: definition });
+      if (prepared?.kind !== "selected") throw new Error("prepared selected definition was not admitted");
+      snapshot = prepared;
+      // Prompt, hooks, and MCP consume the same prepared/frozen projection as policy; no later
+      // registry mutation may produce a split selected identity.
+      definition = Object.freeze({
+        ...definition,
+        body: snapshot.body,
+        tools: snapshot.tools === undefined ? undefined : [...snapshot.tools],
+        disallowedTools: snapshot.disallowedTools === undefined ? undefined : [...snapshot.disallowedTools],
+        model: snapshot.model,
+        effort: snapshot.effort,
+        permissionMode: snapshot.permissionMode,
+        skills: snapshot.skills === undefined ? undefined : [...snapshot.skills],
+        memory: snapshot.memory,
+        hooks: snapshot.hooks as ClaudeAgent["hooks"],
+        agentMcp: snapshot.agentMcp as ClaudeAgent["agentMcp"],
+        initialPrompt: snapshot.initialPrompt,
+        metadata: snapshot.metadata,
+        source: snapshot.source,
+      }) as ClaudeAgent;
+      policy = new SelectedMainAgentToolPolicy(snapshot, permissionEngine, agentsWithBuiltins().map((agent) => agent.name));
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "Plugin context or capability preparation failed; no provider request was admitted. Repair the plugin/runtime definition, then start a fresh PiCC process and session.", false);
+      return;
+    }
+    // Prompt construction is part of admission, not a first-turn best effort. Validate the frozen
+    // identity before model changes, selected hooks/MCP, or initialPrompt can produce side effects.
+    try {
+      buildSubagentSystemPrompt(definition, 0, undefined, policy, state);
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "Selected prompt assembly failed; no provider request was admitted. Repair the selected definition or project context, then start a fresh PiCC process and session.", false);
+      return;
+    }
+    // Narrow the existing host universe before any selected model, hook, MCP, or prompt side effect.
+    // A second checked reconciliation below admits the newly published selected MCP definitions.
+    if (!await reconcileSelectedTools(ctx, { snapshot, policy })) return;
+    let selectedHooksTrusted = true;
+    if ((definition.source.scope === "project" || definition.source.scope === "local") && definition.hooks) {
+      try {
+        selectedHooksTrusted = typeof ctx?.isProjectTrusted === "function" &&
+          await Promise.resolve(ctx.isProjectTrusted()) === true;
+      } catch {
+        selectedHooksTrusted = false;
+      }
+      if (!selectedHooksTrusted) {
+        selectedMainTrustWarning = true;
+        selectedMainNotice(ctx,
+          `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} remains active, but its project/local hooks were skipped because project trust was not positively confirmed. No selected project hook command ran; trust the project explicitly, then start a fresh PiCC process and session.`,
+          "warning");
+      }
+    }
+    try {
+      await applyMainModelAndEffort(snapshot, outgoingSelectedOwned, event, ctx);
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "Model configuration could not be restored or applied safely. No input or provider request is admitted; repair model configuration, exit PiCC, then start a fresh process and session.", false);
+      return;
+    }
+    if (snapshot.permissionMode !== undefined) {
+      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares permissionMode, which PiCC cannot apply to main sessions. Deny and tool restrictions remain enforced, but the requested permission posture is not active; correct the definition, then start a fresh session.`, "warning");
+    }
+    const unsupportedFieldNames: Record<string, string> = {
+      "max-turns-unsupported-for-main": "maxTurns",
+      "background-unsupported-for-main": "background",
+      "isolation-unsupported-for-main": "isolation",
+      "color-unsupported-for-main": "color",
+    };
+    for (const reason of snapshot.unsupported) {
+      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares ${unsupportedFieldNames[reason] ?? "an unsupported field"}, which has no main-session behavior. Remove the field or use a dispatched subagent, then start a fresh session.`, "warning");
+    }
+    let mcpOutcome: SelectedMainMcpTransitionOutcome;
+    try {
+      mcpOutcome = await selectedMainMcp.replace({
+        agentIdentity: snapshot.resolvedName,
+        sessionRuntime: mcpRuntime,
+        declaration: snapshot.agentMcp,
+        admissionContext: project.agentMcpAdmission,
+        inlineDeps: {
+          projectRoot: project.root,
+          spawnCwd: cwdState.get(),
+          sessionId: `${sessionId}:selected-main`,
+          env: process.env,
+          settingsEnv: project.settings.env,
+        },
+      });
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "MCP setup failed unexpectedly; no provider request was admitted. Correct MCP configuration or policy, then start a fresh PiCC process and session.", true);
+      return;
+    }
+    if (!selectedMcpTransitionConfirmed(mcpOutcome, true)) {
+      await denyTransition(snapshot.requestedName,
+        "MCP setup, publication, or cleanup was not confirmed; no provider request was admitted. Correct MCP configuration or policy, then start a fresh PiCC process and session.", true);
+      return;
+    }
+    if (mcpOutcome.diagnostics.some((entry) => entry.reason === "setup-diagnostic")) {
+      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} MCP setup reported a redacted nonblocking diagnostic. Run /mcp and /doctor, correct the declaration if a capability is absent, then relaunch PiCC.`, "warning");
+    }
+    let selectedHookRunner: SelectedMainHookRunner | undefined;
+    try {
+      selectedHookRunner = selectedHooksTrusted ? createSelectedHookRunner(definition) : undefined;
+      const hookOutcome = await selectedMainHooks.replace(selectedHookRunner, {
+        cwd: cwdState.get(), reason: "other",
+      });
+      if (!hookOutcome.committed || hookOutcome.installed !== (selectedHookRunner !== undefined)) {
+        throw new Error("selected hook publication was not confirmed");
+      }
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "Hook preparation or publication was not confirmed; no provider request was admitted. Correct the hook definition, then start a fresh PiCC process and session.", true);
+      return;
+    }
+
+    const adapter = selectedMainMcp.adapter();
+    const allowedMcpNames = new Set(adapter.tools().map((tool) => `mcp__${tool.serverName}__${tool.toolName}`));
+    if (adapter.resourceServers().length > 0) {
+      allowedMcpNames.add(ListMcpResourcesTool);
+      allowedMcpNames.add(ReadMcpResourceTool);
+    }
+    const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(adapter)];
+    if (adapter.resourceServers().length > 0) {
+      definitions.push(...buildMcpResourceTools(adapter, {
+        clipMaxTokens: config.compaction.clipMaxTokens,
+      }));
+    }
+    try {
+      for (const definitionTool of definitions) {
+        pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definitionTool, {
+          fallbackCallDisplayName: definitionTool.label,
+        }) as unknown as Record<string, unknown>));
+        registeredSelectedMainMcpNames.add(definitionTool.name);
+      }
+    } catch {
+      await denyTransition(snapshot.requestedName,
+        "MCP tool or resource publication failed; no provider request was admitted. Start a fresh PiCC process and session.", true);
+      return;
+    }
+    selectedMainSnapshot = snapshot;
+    selectedMainDefinition = definition;
+    selectedMainHookPublished = selectedHookRunner !== undefined;
+    selectedMainPolicy = policy;
+    selectedMainMcpAdapter = adapter;
+    selectedMainMcpAllowedNames = allowedMcpNames;
+    if (!await reconcileSelectedTools(ctx)) return;
+
+    if (snapshot.initialPrompt && !selectedMainAgentInitialPromptDelivered(branch, snapshot.requestedName)) {
+      try {
+        pi.sendMessage({
+          customType: SELECTED_MAIN_AGENT_INITIAL_PROMPT,
+          content: snapshot.initialPrompt,
+          display: true,
+          details: { version: 1, selectedName: snapshot.requestedName },
+        }, { triggerTurn: false });
+        const verifiedBranch = sessionManagerRef?.getBranch?.();
+        if (!selectedMainAgentInitialPromptDelivered(verifiedBranch, snapshot.requestedName)) {
+          throw new Error("same-branch prompt proof is absent");
+        }
+      } catch {
+        await denyTransition(snapshot.requestedName,
+          "The initialPrompt could not be delivered and proved on this branch; no provider request was admitted. Retry in a fresh PiCC process and session.", true);
+        return;
+      }
+    }
+    selectedMainAdmissionFailure = undefined;
+  };
+
   pi.on("session_start", async (event: any, ctx: any) => {
     const startController = mainCheckpointGate.currentController();
     if (startController.isProcessTerminal()) {
@@ -3716,10 +4439,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     let branch: unknown;
     try {
-      branch = ctx.sessionManager?.getBranch?.();
+      // Only a successfully obtained actual empty branch is no-record. Missing/degraded branch
+      // authority is persisted-uncertain and must never broaden into settings or ordinary mode.
+      branch = typeof ctx.sessionManager?.getBranch === "function"
+        ? ctx.sessionManager.getBranch()
+        : undefined;
     } catch {
       branch = undefined;
     }
+    const branchSelectionAuthority = observeSelectedMainAgentBranch(branch).kind !== "no-record";
+    let cliSelectionAuthority = false;
+    try { cliSelectionAuthority = typeof pi.getFlag?.("agent") === "string"; } catch { /* unresolved here */ }
     installMainNotebookState(branch);
     // Every start refreshes and replaces the heartbeat; only an actual startup may schedule transcript reaping.
     sessionRetentionStarted(ctx, event.reason);
@@ -3740,8 +4470,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     activeCompactionOperation = undefined;
     printedResumeToken = undefined;
     stopHookIterations = 0;
+    const outgoingSelectedRequestedNameAtStart = selectedMainSnapshot?.kind === "selected"
+      ? selectedMainSnapshot.requestedName
+      : undefined;
+    const outgoingSelectedOwnedAtStart = selectedOverrideWasActive || selectedMainSnapshot !== undefined;
+    const selectedAuthorityAtStart = outgoingSelectedOwnedAtStart || cliSelectionAuthority ||
+      project.settings.agent !== undefined || branchSelectionAuthority;
+    resetMainSessionContext();
     try {
       modelRegistryRef = ctx.modelRegistry;
+      if (!hostBaselineModelInitialized) {
+        hostBaselineModel = ctx.model;
+        hostBaselineModelInitialized = true;
+      }
+      if (!hostBaselineEffortInitialized) {
+        hostBaselineEffort = typeof ctx.thinkingLevel === "string" ? ctx.thinkingLevel : undefined;
+        hostBaselineEffortInitialized = true;
+      }
+      if (ctx.model) commitCurrentModel(ctx.model);
+      await installSelectedMainSession(branch, ctx, event, outgoingSelectedOwnedAtStart);
       // Status panel: interactive TUI ONLY. The gate is `ctx.mode === "tui"`
       // specifically, NOT `hasUI` — RPC mode also implements setWidget (and
       // reports hasUI: true), so a hasUI gate would install the panel into an
@@ -3753,19 +4500,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // so print/RPC sessions never emit it (and never consume its gate).
         panelHintUi = ctx.ui;
       }
-      if (ctx.model) {
-        currentModel = ctx.model;
-        currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;
-        steeringText = steeringForModel(config, currentModelRef);
+      const activeSelectedSnapshot = selectedMainSnapshot?.kind === "selected" && selectedMainAdmissionFailure === undefined
+        ? selectedMainSnapshot
+        : undefined;
+      const selectedIsActive = activeSelectedSnapshot !== undefined;
+      if (!selectedIsActive && selectedMainAdmissionFailure === undefined) {
+        try {
+          await applyMainModelAndEffort(undefined, outgoingSelectedOwnedAtStart, event, ctx);
+        } catch {
+          denySelectedAdmission(outgoingSelectedRequestedNameAtStart,
+            "The host model/effort baseline or configured model could not be restored safely. No input or provider request is admitted; repair model configuration, exit PiCC, then start a fresh process and session.", ctx);
+        }
       }
-      if (config.model && event.reason === "startup") {
-        const m = resolveModelSpec(config.model);
-        if (m) await pi.setModel(m);
+      if (selectedMainAdmissionFailure !== undefined) {
+        selectedOverrideWasActive = outgoingSelectedOwnedAtStart;
+        try { ctx.abort?.(); } catch { /* admission remains closed */ }
+        return;
       }
-      if (config.effort) {
-        const level = mapEffort(config, config.effort);
-        if (level) pi.setThinkingLevel(level);
-      }
+      selectedOverrideWasActive = selectedIsActive;
       // A project shipping .githooks expects them live. Worktrees inherit this
       // repository-local setting from the shared Git configuration.
       if (fs.existsSync(path.join(project.root, ".githooks"))) {
@@ -3811,12 +4563,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (checkpointSessionEpoch !== sessionStartEpoch ||
           mainCheckpointGate.currentController() !== sessionStartController) return;
       if (outcome.stop) {
-        const reason = outcome.stopReason ?? "SessionStart hook requested stop";
-        try {
-          if (ctx.hasUI) ctx.ui?.notify?.(reason, "warning");
-          else console.error(`PiCC: ${reason}`);
-          ctx.abort?.();
-        } catch { /* stop authority remains final */ }
+        if (activeSelectedSnapshot) {
+          await clearSelectedMainSession(ctx, activeSelectedSnapshot.requestedName).catch(() => false);
+          await restoreHostBaselineForDeniedTransition(true);
+          denySelectedAdmission(activeSelectedSnapshot.requestedName,
+            "A SessionStart hook stopped startup. No input or provider request is admitted; inspect the hook privately, repair it, exit PiCC, then start a fresh process and session.", ctx);
+        } else {
+          const reason = outcome.stopReason ?? "SessionStart hook requested stop";
+          try {
+            if (ctx.hasUI) ctx.ui?.notify?.(reason, "warning");
+            else console.error(`PiCC: ${reason}`);
+            ctx.abort?.();
+          } catch { /* stop authority remains final */ }
+        }
         stopRun();
         return;
       }
@@ -3838,8 +4597,28 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           else console.error(`PiCC: ${mcpStartupNotice}`);
         }
       }
-    } catch (err) {
-      console.error(`PiCC session_start failed: ${(err as Error).message}`);
+      if (selectedMainSnapshot?.kind === "selected" && selectedMainAdmissionFailure === undefined && selectedMainDefinition) {
+        selectedMainNotice(ctx,
+          `Selected main-session identity ${JSON.stringify(selectedMainSnapshot.diagnostic.agentIdentity)} is active from ${selectedMainSnapshot.selectorSource}; winning definition: ${selectedDefinitionProvenance(selectedMainDefinition)}. Main-session base-prompt replacement is PiCC-defined partial fidelity.`,
+          "info");
+      }
+    } catch {
+      const selectedOwnsFailure = selectedAuthorityAtStart || selectedMainSnapshot !== undefined ||
+        selectedMainAdmissionFailure !== undefined;
+      if (selectedOwnsFailure) {
+        const requestedName = selectedMainSnapshot?.kind === "selected" || selectedMainSnapshot?.kind === "admission-denied"
+          ? selectedMainSnapshot.requestedName
+          : undefined;
+        await clearSelectedMainSession(ctx, requestedName).catch(() => false);
+        await restoreHostBaselineForDeniedTransition(outgoingSelectedOwnedAtStart);
+        denySelectedAdmission(
+          requestedName,
+          "Startup failed unexpectedly. No input or provider request is admitted. Repair the reported runtime problem, exit PiCC, then start a fresh process and session.",
+          ctx,
+        );
+      } else {
+        console.error("PiCC session startup configuration failed; continuing with the host session state.");
+      }
     }
   });
 
@@ -3891,6 +4670,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("before_provider_request", async (_event: any, ctx: any) => {
+    if (selectedMainAdmissionFailure !== undefined) {
+      try { ctx?.abort?.(); } catch { /* admission remains closed */ }
+      throw new Error("PiCC selected-main admission is closed");
+    }
     await mainCheckpointGate.beforeProviderRequest(ctx);
   });
 
@@ -4032,13 +4815,37 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         })
         .map((id) => backgroundTasks.stopAndWait(id)));
       await subagentRuntime.shutdownCheckpointPaused();
+      // Subagent MCP joins before global shutdown because in-flight child calls still need their
+      // borrowed servers. Selected-main cleanup then precedes global MCP for the same ownership
+      // reason. SessionEnd follows both; its reason is the Claude hook matcher's subject.
       await subagentRuntime.shutdownMcpScopes();
-      // MCP servers die with the session — after the subagent joins above
-      // (an in-flight subagent MCP call must not lose its server mid-call),
-      // before SessionEnd fires. Never throws; grace-bounded per server.
-      await mcpRuntime.shutdown();
-      // `reason` is the matcher subject for SessionEnd (Claude wire contract).
-      await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
+      const selectedShutdown = await selectedMainMcp.shutdownBeforeGlobal(() => mcpRuntime.shutdown());
+      const selectedCleanupFailure = selectedShutdown.selected.cleanup.unconfirmed.length > 0 ||
+          selectedShutdown.selected.diagnostics.some((entry) =>
+            entry.reason === "cleanup-failed" || entry.reason === "cleanup-unconfirmed" ||
+            entry.reason === "inventory-publication-failed")
+        ? new Error("Selected main MCP shutdown cleanup was unconfirmed")
+        : undefined;
+      const sessionEndPayload = { cwd: cwdState.get(), reason: event?.reason ?? "other" };
+      let sessionEndFailure: Error | undefined;
+      try {
+        if (selectedMainHookPublished) {
+          const delivery = await selectedMainHooks.replace(undefined, sessionEndPayload);
+          if (!delivery.committed) throw new Error("Selected main SessionEnd delivery was uncertain");
+        } else {
+          await hooks.fire("SessionEnd", sessionEndPayload);
+        }
+      } catch (error) {
+        sessionEndFailure = error instanceof Error
+          ? error
+          : new Error("Selected main SessionEnd delivery was uncertain");
+      } finally {
+        selectedMainHookPublished = false;
+      }
+      // SessionEnd delivery owns a separate exactly-once slot. Preserve MCP custody failure, but
+      // surface it only after both selected and base hooks had their terminal opportunity.
+      if (selectedCleanupFailure) throw selectedCleanupFailure;
+      if (sessionEndFailure) throw sessionEndFailure;
     } catch (error) {
       if (error instanceof UnconfirmedHostDeadlineError) {
         if (!error.message.includes("fresh PiCC process")) {
@@ -4048,7 +4855,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       } else if (error instanceof Error &&
           (error.message.startsWith("Main checkpoint shutdown custody could not be confirmed") ||
            error.message.startsWith("Unconfirmed child shutdown disposition") ||
-           error.message.startsWith("Confirmed child cleanup release"))) {
+           error.message.startsWith("Confirmed child cleanup release") ||
+           error.message.startsWith("Selected main MCP shutdown cleanup") ||
+           error.message.startsWith("Selected main SessionEnd delivery"))) {
         custodyFailure = error;
       }
       // Other shutdown integrations retain the existing never-crash floor.
@@ -4118,6 +4927,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // Extension continuations are internal. Every other admitted input is a
       // user boundary and clears the retained Pi startup flag before processing.
       if (event.source !== "extension") clearStartupSuppression();
+      if (selectedMainAdmissionFailure !== undefined) {
+        selectedMainNotice(ctx, selectedMainAdmissionFailure, "error");
+        return { action: "handled" };
+      }
       if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
       const stopCapability = stopContinuationAdmission.getStore();
       if (stopCapability) {
@@ -4259,7 +5072,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           // activation controls; awaited hook/skill work has no commit authority.
           mainCheckpointGate.acceptedLogicalRun();
           if (stagedActivation) commitMainActivation(stagedActivation);
-          else activeSkillDenyRules.clear();
+          else mainActivation.denyRules.clear();
         }
         const shadow = mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
         // Quarantine is the live lifecycle decision; shadow capture success only
@@ -5160,11 +5973,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("model_select", (event: any) => {
     try {
+      if (ownsModelTransition === 0) {
+        hostBaselineModel = event.model;
+        hostBaselineModelInitialized = true;
+        selectedModelOverrideWasActive = false;
+      }
       currentModel = event.model;
       currentModelRef = `${event.model.provider}/${event.model.id}`;
       steeringText = steeringForModel(config, currentModelRef);
     } catch {
       /* floor */
+    }
+  });
+
+  pi.on("thinking_level_select", (event: any) => {
+    if (ownsEffortTransition === 0 && typeof event?.level === "string") {
+      hostBaselineEffort = event.level;
+      hostBaselineEffortInitialized = true;
+      selectedEffortOverrideWasActive = false;
     }
   });
 
@@ -5245,14 +6071,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   function renderAgentsList(): string {
-    // Same catalog the model sees: project/user/plugin agents plus the
-    // non-overridden built-ins (general-purpose/Explore/Plan).
-    const agents = agentsWithBuiltins();
-    if (!agents.length) return "No subagents are available.";
-    const lines = [
-      `PiCC — ${agents.length} subagent(s) available (dispatch with the Agent tool):`,
-      "",
-    ];
+    // Keep policy catalog inspection independent from session-level dispatch enablement.
+    const catalogTypes = selectedMainSnapshot?.kind === "selected" && selectedMainPolicy
+      ? new Set(selectedMainPolicy.catalogSubagentTypes())
+      : undefined;
+    const agents = agentsWithBuiltins().filter((agent) => catalogTypes?.has(agent.name) ?? true);
+    if (!agents.length) {
+      return project.settings.subagentsEnabled
+        ? "No policy-permitted subagents are available."
+        : "No policy-permitted subagent catalog entries; dispatch is disabled by settings.";
+    }
+    const header = project.settings.subagentsEnabled
+      ? `PiCC — ${agents.length} policy-permitted subagent(s) available (dispatch with the Agent tool):`
+      : `PiCC — ${agents.length} policy-permitted subagent catalog entries (dispatch is disabled by settings):`;
+    const lines = [header, ""];
     for (const a of agents) {
       const gated = permissionEngine.gateTools(a.tools, a.disallowedTools, allKnownToolNames());
       const readOnly = a.tools && !["Write", "Edit", "Bash"].some((t) => gated.includes(t));
@@ -5422,10 +6254,62 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return `${PLUGIN_RELOAD_REJECTED}${safeReason}`;
   }
 
+  const selectedMainMcpStatus = (): { rows: string[]; omitted: number; excludedGlobals: string[] } => {
+    const adapter = selectedMainMcpAdapter;
+    if (!adapter) return { rows: [], omitted: 0, excludedGlobals: [] };
+    const inlineStates = selectedMainMcpInventory?.serverStates() ?? [];
+    const inlineNames = new Set(inlineStates.map((state) => state.name));
+    const globalStates = mcpRuntime.serverStates();
+    const globalByName = new Map(globalStates.map((state) => [state.name, state]));
+    const activeNames = new Set<string>();
+    for (const tool of adapter.tools()) activeNames.add(tool.serverName);
+    for (const resource of adapter.resourceServers()) activeNames.add(resource.serverName);
+    for (const state of adapter.serverStates()) activeNames.add(state.name);
+    for (const state of inlineStates) activeNames.add(state.name);
+    const allRows = [...activeNames].sort().map((name) => {
+      const inline = inlineNames.has(name);
+      const state = inlineStates.find((entry) => entry.name === name) ?? globalByName.get(name);
+      const ownership = inline ? "selected-owned inline" : "borrowed global under selected authority";
+      return `- ${JSON.stringify(sanitizeLine(name, 128))}: ${state?.state ?? "published"} [owner: ${ownership}]`;
+    });
+    const excludedGlobals = globalStates.map((state) => state.name)
+      .filter((name) => !activeNames.has(name))
+      .map((name) => sanitizeLine(name, 128));
+    return { rows: allRows.slice(0, 32), omitted: Math.max(0, allRows.length - 32), excludedGlobals };
+  };
+  const selectedMainDoctorDetails = (): string => {
+    const snapshot = selectedMainSnapshot;
+    if (selectedMainAdmissionFailure !== undefined) {
+      return `\n\nSelected main session admission:\n- ${sanitizeDisplayText(selectedMainAdmissionFailure, 1_200, true)}`;
+    }
+    if (snapshot?.kind !== "selected") return "";
+    const humanFields: Record<string, string> = {
+      "max-turns-unsupported-for-main": "maxTurns",
+      "background-unsupported-for-main": "background",
+      "isolation-unsupported-for-main": "isolation",
+      "color-unsupported-for-main": "color",
+    };
+    const findings = [
+      ...snapshot.unsupported.map((reason) => `${humanFields[reason] ?? "unsupported field"}: no main-session behavior is applied; remove the field or use a dispatched subagent, then start a fresh session.`),
+      ...(snapshot.permissionMode === undefined ? [] : ["permissionMode is degraded: PiCC remains default-permissive while deny/tool restrictions are enforced; review the definition and start a fresh session."]),
+      ...(selectedMainAliasWarning ? ["model uses a Claude alias: PiCC retained the working-model mapping; use an explicit installed model when exact selection matters."] : []),
+      ...(selectedMainModelUnavailableWarning ? ["model override was unavailable or refused: the working model was retained; choose an installed authenticated model and start a fresh session."] : []),
+      ...(selectedMainEffortWarning ? ["effort override was unsupported or refused: the working effort was retained; correct the definition and start a fresh session."] : []),
+      ...(selectedMainTrustWarning ? ["project/local selected hooks were skipped because project trust was not positively confirmed; trust the project explicitly and start a fresh PiCC process and session."] : []),
+    ];
+    const mcpStatus = selectedMainMcpStatus();
+    findings.push(mcpStatus.rows.length > 0
+      ? `Selected MCP authority:\n${mcpStatus.rows.join("\n")}${mcpStatus.omitted > 0 ? `\n- ${mcpStatus.omitted} selected MCP server row(s) omitted; no expanded selected-inventory view exists.` : ""}`
+      : "Selected MCP authority has no active server routes; this is expected when the selected definition declares none and no admitted globals are borrowed.");
+    if (mcpStatus.excludedGlobals.length > 0) {
+      findings.push(`Global MCP servers excluded from selected authority: ${mcpStatus.excludedGlobals.slice(0, 32).map((name) => JSON.stringify(name)).join(", ")}${mcpStatus.excludedGlobals.length > 32 ? `, and ${mcpStatus.excludedGlobals.length - 32} more` : ""}.`);
+    }
+    return `\n\nSelected main session (${JSON.stringify(snapshot.diagnostic.agentIdentity)}):\n${findings.map((finding) => `- ${finding}`).join("\n")}`;
+  };
   const controlCommands = new Map<string, ControlCommandEntry>([
     ["doctor", {
       description: "PiCC: project-specific compatibility report",
-      render: async () => renderDoctorReport(project, compat, currentModel, config.compaction, mcpRuntime.serverStates()),
+      render: async () => `${renderDoctorReport(project, compat, currentModel, config.compaction, observableMcpServerStates())}${selectedMainDoctorDetails()}`,
     }],
     ["quota", {
       description: "PiCC: subscription/rate-limit info from the last provider response",
@@ -5436,7 +6320,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       render: async () => renderSkillsList(),
     }],
     ["agents", {
-      description: "PiCC: list the subagents available for dispatch",
+      description: "PiCC: list the subagent catalog permitted by the current agent policy; session-level subagent support may still disable dispatch",
       render: async () => renderAgentsList(),
     }],
     ["usage", {
@@ -5465,7 +6349,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           await (testSeam?.mcpControl?.whenSettled ?? (() => mcpRuntime.whenSettled()))();
         }
         const render = testSeam?.mcpControl?.render ?? renderMcpStatusReport;
-        return render(project.mcp, mcpRuntime.serverStates());
+        const globalReport = render(project.mcp, observableMcpServerStates());
+        if (selectedMainSnapshot?.kind !== "selected") return globalReport;
+        const status = selectedMainMcpStatus();
+        const selectedRows = status.rows.length > 0
+          ? status.rows.join("\n")
+          : "- No active selected MCP routes; no selected inventory is being hidden.";
+        const omissions = status.omitted > 0
+          ? `\n- ${status.omitted} selected MCP server row(s) omitted; no expanded selected-inventory view exists.`
+          : "";
+        const excluded = status.excludedGlobals.length > 0
+          ? `\nExcluded global servers (not callable under selected authority): ${status.excludedGlobals.slice(0, 32).map((name) => JSON.stringify(name)).join(", ")}${status.excludedGlobals.length > 32 ? `, and ${status.excludedGlobals.length - 32} more` : ""}.`
+          : "";
+        return `${globalReport}\nSelected main-session MCP authority:\n${selectedRows}${omissions}${excluded}`;
       },
     }],
   ]);

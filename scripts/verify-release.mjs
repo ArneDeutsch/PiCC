@@ -42,6 +42,7 @@ export const RELEASE_STATIC_FILES = Object.freeze([
   "examples/full-surface/.claude/agents/planner.md",
   "examples/full-surface/.claude/agents/researcher.md",
   "examples/full-surface/.claude/agents/reviewer.md",
+  "examples/full-surface/.claude/agents/selected-main.md",
   "examples/full-surface/.claude/commands/bg-research.md",
   "examples/full-surface/.claude/commands/ship.md",
   "examples/full-surface/.claude/rules/general.md",

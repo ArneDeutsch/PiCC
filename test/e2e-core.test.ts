@@ -1432,6 +1432,64 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     TEST_TIMEOUT_MS,
   );
 
+  it("persists and re-resolves a selected main identity across a real two-process print resume", async () => {
+    const launchesBefore = launchedProcessCount();
+    const created = await runPi({
+      fixture: "full-surface",
+      persistSession: true,
+      agent: "selected-main",
+      prompt: "ordinary selected request",
+      script: [{ text: "selected first complete" }],
+    });
+    expect(created.code, created.stderr).toBe(0);
+    expect(created.requests).toHaveLength(1);
+    expect(systemText(created.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY");
+    expect(systemText(created.requests[0]!)).not.toContain("## Working with the user");
+    expect(userText(created.requests[0]!)).toMatch(/FS-SELECTED-MAIN-INITIAL[\s\S]*ordinary selected request/u);
+    expect(toolNames(created.requests[0]!)).toContain("read");
+    expect(toolNames(created.requests[0]!)).not.toContain("write");
+    const [sessionFile] = findSessionFiles(created.agentDir);
+    expect(sessionFile).toBeTruthy();
+
+    const resumed = await runPi({
+      fixtureDir: created.fixture,
+      agentDir: created.agentDir,
+      sessionPath: sessionFile,
+      persistSession: true,
+      prompt: "resumed selected request",
+      setup: (fixtureDir) => {
+        const definition = path.join(fixtureDir, ".claude", "agents", "selected-main.md");
+        fs.writeFileSync(definition, fs.readFileSync(definition, "utf8")
+          .replace("FS-SELECTED-MAIN-BODY", "FS-SELECTED-MAIN-BODY-RERESOLVED")
+          .replace("  - Read\n", "  - Write\n"));
+      },
+      script: [{ text: "selected resumed complete" }],
+    });
+    expect(resumed.code).toBe(0);
+    expect(resumed.requests).toHaveLength(1);
+    expect(systemText(resumed.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY-RERESOLVED");
+    expect(toolNames(resumed.requests[0]!)).toContain("write");
+    expect(toolNames(resumed.requests[0]!)).not.toContain("read");
+    const resumedUsers = userText(resumed.requests[0]!);
+    expect(resumedUsers.match(/FS-SELECTED-MAIN-INITIAL/gu)).toHaveLength(1);
+    expect(resumedUsers.indexOf("FS-SELECTED-MAIN-INITIAL")).toBeLessThan(resumedUsers.indexOf("resumed selected request"));
+    expect(launchedProcessCount() - launchesBefore).toBe(2);
+  }, TEST_TIMEOUT_MS);
+
+  it("rejects a missing fresh selected identity before any real provider request", async () => {
+    const launchesBefore = launchedProcessCount();
+    const result = await runPi({
+      fixture: "full-surface",
+      agent: "missing-selected-main",
+      prompt: "must not reach provider",
+      script: [],
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.requests).toHaveLength(0);
+    expect(result.stderr).toContain("missing-selected-main");
+    expect(launchedProcessCount() - launchesBefore).toBe(1);
+  }, TEST_TIMEOUT_MS);
+
   // --- Slash-skill expansion end-to-end via the input event ---
   it(
     "expands a /deploy slash skill into the user turn with positional args (full-surface)",

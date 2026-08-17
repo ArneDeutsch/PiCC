@@ -1139,7 +1139,58 @@ describe("pi 0.83.0 API contract", () => {
     }
   });
 
-  it("extension sendMessage is fire-and-forget and reports an asynchronous rejection", async () => {
+  it("extension no-trigger sendMessage synchronously updates live context and same-branch persistence", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-selected-main-message-contract-"));
+    let extensionApi: any;
+    let session: any;
+    try {
+      const sdk: any = await import("@earendil-works/pi-coding-agent");
+      const ai: any = await import("@earendil-works/pi-ai");
+      const manager = sdk.SessionManager.create(cwd, join(cwd, "sessions"), { id: "selected-main-contract" });
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        sessionManager: manager,
+        streamSimple: () => completedContractMessage(ai, "flush complete"),
+        extensionFactory: (api) => { extensionApi = api; },
+      }));
+      const details = { version: 1, selectedName: "contract-selected" };
+      expect(extensionApi.sendMessage({
+        customType: "picc-selected-main-agent-initial-prompt",
+        content: "contract initial user turn",
+        display: true,
+        details,
+      }, { triggerTurn: false })).toBeUndefined();
+
+      expect(session.messages.at(-1)).toMatchObject({
+        role: "custom",
+        customType: "picc-selected-main-agent-initial-prompt",
+        content: "contract initial user turn",
+        details,
+      });
+      expect(manager.getBranch().at(-1)).toMatchObject({
+        type: "custom_message",
+        customType: "picc-selected-main-agent-initial-prompt",
+        content: "contract initial user turn",
+        details,
+      });
+      const file = manager.getSessionFile();
+      expect(file).toBeTruthy();
+      await session.prompt("ordinary turn that flushes the persisted session");
+      const reopened = sdk.SessionManager.open(file, join(cwd, "sessions"), cwd);
+      expect(reopened.getBranch()
+        .find((entry: any) => entry.customType === "picc-selected-main-agent-initial-prompt"))
+        .toMatchObject({ customType: "picc-selected-main-agent-initial-prompt", content: "contract initial user turn", details });
+      const fork = sdk.SessionManager.forkFrom(file, cwd, join(cwd, "sessions"), { id: "selected-main-fork-contract" });
+      expect(fork.getBranch().find((entry: any) =>
+        entry.customType === "picc-selected-main-agent-initial-prompt"))
+        .toMatchObject({ type: "custom_message", content: "contract initial user turn", details });
+    } finally {
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("extension no-trigger sendMessage is fire-and-forget and reports an asynchronous rejection", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "picc-send-message-contract-"));
     const ai: any = await import("@earendil-works/pi-ai");
     let extensionApi: any;
@@ -1157,7 +1208,7 @@ describe("pi 0.83.0 API contract", () => {
 
       expect(extensionApi.sendMessage(
         { customType: "contract-fire-and-forget", content: "payload", display: false },
-        { triggerTurn: true },
+        { triggerTurn: false },
       )).toBeUndefined();
       await waitUntil({
         predicate: () => emitted.mock.calls.length === 1,
@@ -1769,6 +1820,29 @@ describe("pi 0.83.0 API contract", () => {
     );
     expect(typeof captured.registerShortcut).toBe("function");
     expect(ext.shortcuts.get("alt+a")?.description).toBe("probe");
+  });
+
+  it("registered string extension flags expose values applied through the runtime flag map", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    const loader: any = await import(`${mainUrl.slice(0, distIdx)}/dist/core/extensions/loader.js`);
+    const runtime = loader.createExtensionRuntime
+      ? loader.createExtensionRuntime()
+      : sdk.createExtensionRuntime();
+    let captured: any;
+    const ext = await loader.loadExtensionFromFactory(
+      (pi: any) => {
+        captured = pi;
+        pi.registerFlag("agent", { type: "string" });
+      },
+      process.cwd(),
+      sdk.createEventBus(),
+      runtime,
+    );
+    expect(ext.flags.get("agent")).toMatchObject({ name: "agent", type: "string" });
+    runtime.flagValues.set("agent", "contract-selected");
+    expect(captured.getFlag("agent")).toBe("contract-selected");
   });
 
   it("registerMessageRenderer exists on the real ExtensionAPI and sendMessage threads a details param", async () => {
