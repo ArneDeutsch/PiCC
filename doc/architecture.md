@@ -548,10 +548,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    exact lifecycle and retry mechanics.
 
 2. **`session_start`.** Reads Pi's registered `--agent` flag and the selected branch's custom entries,
-   then resolves CLI > persisted branch > merged `agent` setting independently of named-definition
-   nearest-wins precedence. It freezes and persists the admitted selected identity before installing
-   prompt/tool/catalog, model/effort, hook, and MCP ownership; missing fresh selection denies provider
-   admission, while missing or uncertain persisted evidence installs a no-tools recovery identity.
+   then resolves CLI > persisted branch > merged `agent` setting independently of definition order:
+   managed, then nearest project, then user, then lower-precedence plugin definitions. Claude's
+   CLI-defined `--agents` definitions are unsupported and absent. It freezes and persists the admitted
+   selected identity before installing prompt/tool/catalog, model/effort, hook, and MCP ownership;
+   missing fresh selection denies provider admission, while missing or uncertain persisted evidence
+   installs a no-tools recovery identity.
    It then captures the model registry and active model, applies the configured
    model/effort, attempts to self-heal `core.hooksPath` when `.githooks/` and a resolved Git executable are
    available (otherwise skips it), and fires the `SessionStart` hook. Steering text is derived from

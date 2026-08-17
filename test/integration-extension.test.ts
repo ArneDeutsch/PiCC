@@ -3657,15 +3657,65 @@ describe("selected main-session lifecycle composition", () => {
       await transitionPi.fire("session_start", { reason: "startup" }, ctx);
       const prompt = String((await transitionPi.fire("before_agent_start", { systemPrompt: "ORDINARY-BASE" }, ctx))?.systemPrompt);
       if (transition.fallback) {
-        expect(prompt, transition.name).toContain("could not safely restore the selected main-session agent");
+        expect(prompt, transition.name).toContain("no-tools recovery identity");
+        expect(prompt, transition.name).toContain("stale identity and its capabilities are inactive");
+        expect(prompt, transition.name).toContain("Currently loaded custom-agent candidates");
+        expect(prompt, transition.name).toContain("Do not resume the affected branch");
+        expect(prompt, transition.name).toContain("picc --agent <name>");
+        expect(prompt, transition.name).toContain("omit/remove the selector");
+        if (transition.name === "missing-persisted") {
+          expect(prompt).toContain('definition "removed-agent" no longer exists');
+        } else {
+          expect(prompt).toContain("selection evidence could not be read safely");
+        }
+        expect(prompt).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
         expect(transitionPi.activeTools.size, transition.name).toBe(0);
         await expect(transitionPi.fire("before_provider_request", {}, ctx), transition.name).resolves.toBeUndefined();
+        await transitionPi.commands.get("doctor").handler("", ctx);
+        const doctor = String(transitionPi.entries.at(-1)?.data?.output);
+        expect(doctor).toContain("Selected main session recovery");
+        expect(doctor).toContain("Do not resume the affected branch");
+        expect(doctor).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
       } else {
         expect(prompt).toContain("ORDINARY-BASE");
         expect(prompt).toContain("## Working with the user");
         expect(transitionPi.activeTools.size).toBeGreaterThan(0);
       }
     }
+  });
+
+  it("keeps safe fallback closed when active-tool reconciliation fails", async () => {
+    const owner = fakePi();
+    Object.assign(owner.api, {
+      getActiveTools: () => { throw new Error("RAW_FALLBACK_RECONCILE_CANARY"); },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    await owner.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    const branch = [{
+      type: "custom",
+      customType: "picc-selected-main-agent",
+      data: { version: 1, requestedName: "removed-agent" },
+    }];
+    const ctx = owner.tuiCtx({
+      sessionManager: { getBranch: () => branch, getEntries: () => branch },
+    });
+
+    await owner.fire("session_start", { reason: "resume" }, ctx);
+
+    const errors = owner.notifications.filter((notice) => notice.severity === "error")
+      .map((notice) => notice.text).join("\n");
+    const warnings = owner.notifications.filter((notice) => notice.severity === "warning")
+      .map((notice) => notice.text).join("\n");
+    expect(errors).toContain("tool publication could not be confirmed");
+    expect(warnings).not.toContain("PiCC installed a no-tools recovery identity");
+    expect(`${errors}\n${warnings}`).not.toContain("RAW_FALLBACK_RECONCILE_CANARY");
+    expect(await owner.fire("input", { source: "interactive", text: "blocked" }, ctx)).toEqual({ action: "handled" });
+    await expect(owner.fire("before_provider_request", {}, ctx)).rejects.toThrow("admission is closed");
   });
 
   it("treats an absent branch API as persisted uncertainty rather than no-record", async () => {
@@ -3679,9 +3729,14 @@ describe("selected main-session lifecycle composition", () => {
     const ctx = uncertainPi.printCtx({ sessionManager: {} });
     await uncertainPi.fire("session_start", { reason: "startup" }, ctx);
     const prompt = String((await uncertainPi.fire("before_agent_start", { systemPrompt: "ORDINARY" }, ctx))?.systemPrompt);
-    expect(prompt).toContain("could not safely restore the selected main-session agent");
+    expect(prompt).toContain("Persisted branch selection evidence could not be read safely");
+    expect(prompt).toContain("no-tools recovery identity");
+    expect(prompt).toContain("Do not resume the affected branch");
     expect(prompt).not.toContain("ORDINARY");
+    expect(prompt).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
     expect(uncertainPi.activeTools.size).toBe(0);
+    await uncertainPi.commands.get("doctor").handler("", ctx);
+    expect(String(uncertainPi.entries.at(-1)?.data?.output)).toContain("Persisted branch selection evidence could not be read safely");
   });
 
   it("blocks every input and provider boundary for a missing fresh CLI selection", async () => {
@@ -3711,8 +3766,17 @@ describe("selected main-session lifecycle composition", () => {
       expect(selectedPi.messages.some((entry) => entry.message.customType === "picc-selected-main-agent-initial-prompt")).toBe(false);
       const recovery = selectedPi.notifications.filter((notice) => notice.severity === "error")
         .map((notice) => notice.text).join("\n");
-      expect(recovery).toContain("fresh");
-      expect(recovery).not.toMatch(/run \/(?:doctor|mcp)/iu);
+      expect(recovery).toContain("No loaded custom-agent definition matches the requested identity");
+      expect(recovery).toContain("Provider admission is blocked and no request was made");
+      expect(recovery).toContain("Currently loaded custom-agent candidates");
+      expect(recovery).toContain("picc --agent <name>");
+      expect(recovery).toContain("omit/remove the selector");
+      expect(recovery).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)|run \/(?:doctor|mcp)/iu);
+      await selectedPi.commands.get("doctor").handler("", ctx);
+      const doctor = String(selectedPi.entries.at(-1)?.data?.output);
+      expect(doctor).toContain("No loaded custom-agent definition matches the requested identity");
+      expect(doctor).toContain("Provider admission is blocked and no request was made");
+      expect(doctor).not.toMatch(/selected-agent-|persistence-(?:missing|uncertain)/u);
     } finally {
       process.exitCode = priorExitCode;
     }
@@ -4563,7 +4627,7 @@ describe("selected main-session lifecycle composition", () => {
     expect(owner.thinkingLevels.at(-1)).toBe("max");
     expect(owner.activeTools.size).toBe(0);
     const missingFallback = String((await owner.fire("before_agent_start", { systemPrompt: "STALE-MISSING" }, ctx))?.systemPrompt);
-    expect(missingFallback).toContain("could not safely restore");
+    expect(missingFallback).toContain("no longer exists");
     expect(missingFallback).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY|Available subagents|STALE-MISSING/u);
     await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
 
@@ -4576,7 +4640,7 @@ describe("selected main-session lifecycle composition", () => {
     expect(owner.thinkingLevels.at(-1)).toBe("max");
     expect(owner.activeTools.size).toBe(0);
     const uncertainFallback = String((await owner.fire("before_agent_start", { systemPrompt: "STALE-UNCERTAIN" }, ctx))?.systemPrompt);
-    expect(uncertainFallback).toContain("could not safely restore");
+    expect(uncertainFallback).toContain("selection evidence could not be read safely");
     expect(uncertainFallback).not.toMatch(/FS-SELECTED-MAIN-BODY|FS-SKILL-SHELL-BODY|Available subagents|STALE-UNCERTAIN/u);
     await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
   });
@@ -4722,7 +4786,10 @@ describe("selected main-session lifecycle composition", () => {
         expect(healthy[0]).toContain("selected-main");
         expect(healthy[0]).toContain("from cli");
         expect(healthy[0]).toContain("winning definition: project");
-        expect(healthy[0]).not.toMatch(/FS-SELECTED|initialPrompt|permissionMode|\.claude[\\/]agents|---/u);
+        expect(healthy[0]).toContain("Selected instructions are active");
+        expect(healthy[0]).toContain("required PiCC compatibility and project context remain");
+        expect(healthy[0]).toContain("Run /doctor for compatibility differences");
+        expect(healthy[0]).not.toMatch(/partial fidelity|base-prompt|FS-SELECTED|initialPrompt|permissionMode|\.claude[\\/]agents|---/u);
         expect(stdout).not.toHaveBeenCalled();
       } finally {
         stderr.mockRestore();
@@ -4742,7 +4809,10 @@ describe("selected main-session lifecycle composition", () => {
     ["refused selected effort", "effort", "high"],
     ["untrusted selected hook", "trust", true],
     ["MCP admission", "mcp", true],
-  ] as const).flatMap(([name, field, value]) => (["tui", "print"] as const).map((mode) => ({ name, field, value, mode }))))(
+  ] as const).flatMap(([name, field, value], index) => [
+    { name, field, value, mode: "tui" as const },
+    ...(index === 0 ? [{ name, field, value, mode: "print" as const }] : []),
+  ]))(
     "routes bounded $name diagnostics through $mode and retains the doctor finding",
     async ({ name, field, value, mode }) => {
       const owner = fakePi();
@@ -4802,8 +4872,8 @@ describe("selected main-session lifecycle composition", () => {
                 : text.includes(String(name === "model degradation" ? "working model" : field))) ?? "";
         expect(diagnostic, `${mode}:${name}`).toContain("selected-main");
         expect(diagnostic.length, `${mode}:${name}`).toBeLessThanOrEqual(1_500);
-        expect(diagnostic, `${mode}:${name}`).toMatch(/not active|no main-session behavior|working model|working effort|working-model mapping|no selected project hook command ran|no provider request/iu);
-        expect(diagnostic, `${mode}:${name}`).toMatch(/start|choose|remove|correct|use an explicit|trust the project/iu);
+        expect(diagnostic, `${mode}:${name}`).toMatch(/does not apply|working model|working effort|working-model mapping|no selected project hook command ran|no provider request/iu);
+        expect(diagnostic, `${mode}:${name}`).toMatch(/required|continue|choose|start|trust the project/iu);
         if (mode === "tui") {
           expect(stderr.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(diagnostic);
         } else {

@@ -1459,9 +1459,15 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       prompt: "resumed selected request",
       setup: (fixtureDir) => {
         const definition = path.join(fixtureDir, ".claude", "agents", "selected-main.md");
-        fs.writeFileSync(definition, fs.readFileSync(definition, "utf8")
-          .replace("FS-SELECTED-MAIN-BODY", "FS-SELECTED-MAIN-BODY-RERESOLVED")
-          .replace("  - Read\n", "  - Write\n"));
+        const original = fs.readFileSync(definition, "utf8");
+        const bodyMutated = original.replace("FS-SELECTED-MAIN-BODY", "FS-SELECTED-MAIN-BODY-RERESOLVED");
+        const restrictionMutated = bodyMutated.replace(/^([ \t]*-[ \t]+)Read(?=\r?$)/mu, "$1Write");
+        expect(bodyMutated).not.toBe(original);
+        expect(restrictionMutated).not.toBe(bodyMutated);
+        expect(restrictionMutated).toContain("FS-SELECTED-MAIN-BODY-RERESOLVED");
+        expect(restrictionMutated).toMatch(/^\s*-\s+Write\r?$/mu);
+        expect(restrictionMutated).not.toMatch(/^\s*-\s+Read\r?$/mu);
+        fs.writeFileSync(definition, restrictionMutated);
       },
       script: [{ text: "selected resumed complete" }],
     });

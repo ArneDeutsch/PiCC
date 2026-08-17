@@ -47,7 +47,7 @@ export interface SelectedMainHookRunner {
   ): Promise<HookOutcome>;
 }
 
-/** Host operations are the t04 composition seam into the complete session HookMultiplexer. */
+/** Host operations are the composition-root seam into the complete session HookMultiplexer. */
 export interface SelectedMainSessionEndDelivery {
   readonly outcome: HookOutcome;
   /** Explicit host evidence that the selected delegate ran exactly once. */

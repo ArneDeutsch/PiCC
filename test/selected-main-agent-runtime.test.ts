@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { PermissionEngine } from "../src/engine/permissions.js";
 import {
   SELECTED_MAIN_AGENT_ADMISSION_RECOVERY,
-  SELECTED_MAIN_AGENT_SAFE_RECOVERY_PROMPT,
   SelectedMainAgentActiveToolReconciler,
   SelectedMainAgentToolPolicy,
   createSelectedMainAgentRuntimeSnapshot,
@@ -163,7 +162,6 @@ describe("selected main-agent runtime snapshots", () => {
       const snapshot = createSelectedMainAgentRuntimeSnapshot(resolution);
       expect(snapshot).toMatchObject({
         kind: "safe-fallback",
-        recoveryPrompt: SELECTED_MAIN_AGENT_SAFE_RECOVERY_PROMPT,
         tools: [],
         subagentTypes: [],
       });

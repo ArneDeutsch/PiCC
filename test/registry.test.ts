@@ -1052,7 +1052,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it("pins the finite selected-main agent frontmatter audit", () => {
     const expected = new Map<string, { tier: SupportTier; residuals: RegExp[] }>([
-      ["name", { tier: "partial", residuals: [/nearest-wins precedence is independent of selector precedence/] }],
+      ["name", { tier: "partial", residuals: [
+        /managed, then nearest project, then user, then lower-precedence plugin agents/,
+        /CLI-defined --agents definitions are unsupported and do not participate/,
+        /independently of selector precedence/,
+      ] }],
       ["description", { tier: "partial", residuals: [/selected main agent.*explicitly/] }],
       ["tools", { tier: "partial", residuals: [/get\/set limits|observable active-tool intent/] }],
       ["disallowedTools", { tier: "partial", residuals: [/selected-main.*observable get\/set limits/] }],
@@ -1069,9 +1073,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /commands and skills are processed/,
         /value is prepended when the user also provides a prompt/,
         /PiCC dispatch.*PiCC-defined and unverified/,
-        /separate durable no-trigger user-role message/,
-        /proves it on the selected branch before provider admission/,
-        /does not replay it on resume/,
+        /separate no-trigger user-role message/,
+        /proves it synchronously on the live selected branch before provider admission/,
+        /new persisted session becomes reopenable from disk only when Pi persists it/,
+        /after the first assistant response/,
+        /resume does not replay initialPrompt/,
       ] }],
       ["metadata", { tier: "partial", residuals: [
         /absent from Claude's documented supported agent-frontmatter table/,
@@ -1126,7 +1132,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(id), id).toMatchObject({ tier: "partial", safetyRelevant: true });
     }
     const setting = lookupCapability("setting.agent")?.note;
-    expect(setting).toMatch(/CLI > persisted branch > merged setting/);
+    for (const predicate of [
+      /CLI > persisted branch > merged setting selector precedence/,
+      /managed, then nearest project, then user, then lower-precedence plugin definitions/,
+      /CLI-defined --agents definitions are unsupported and absent/,
+      /independent of definition order/,
+    ]) expect(setting).toMatch(predicate);
 
     const feature = lookupCapability("feature.selected-main-agent")?.note;
     for (const predicate of [
@@ -1135,8 +1146,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       /applies tool\/catalog restrictions/,
       /Fresh missing or invalid selection blocks provider work/,
       /missing or uncertain persisted evidence installs a prominent no-tools recovery identity/,
-      /survives compaction and resume by branch re-resolution/,
-      /optional once-only durable initial user message/,
+      /CLI-defined --agents definitions are unsupported and do not participate/,
+      /Selection and initialPrompt are proved synchronously on the live branch before provider admission/,
+      /new persisted session becomes reopenable from disk only after Pi persists it/,
+      /after the first assistant response/,
+      /initialPrompt is not replayed and selection is re-resolved on resume/,
+      /optional once-only initial user message/,
       /selected-main skill preload\/retention and memory application are PiCC-defined and unverified/,
     ]) expect(feature).toMatch(predicate);
   });
@@ -1152,12 +1167,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       /command line, then the identity persisted on the current session branch, then the resolved setting/,
       /agent-definition precedence: managed, then nearest project, then user/,
       /lower-precedence plugin agents/,
+      /CLI-defined `--agents` definitions are unsupported and do not participate/,
+      /proved synchronously before provider admission/,
+      /not reopenable from disk until Pi persists it, currently after the first assistant response/,
+      /resume does not replay `initialPrompt` and re-resolves the selected name/,
       /missing fresh CLI\/setting selection stops before provider work/,
       /do\s+not resume the affected branch/,
       /start a new non-resumed session with an available/,
       /`picc --agent <name>`, or omit\/remove the selection to use the ordinary identity/,
       /\[capability matrix\]\(supported-features\.md\)/,
     ]) expect(guide).toMatch(predicate);
+  });
+
+  it("distinguishes dispatched memory support from selected-main injection", () => {
+    const note = lookupCapability("feature.agent-memory")?.note;
+    expect(note).toMatch(/Documented dispatched-subagent project\/user\/local memory scopes load into child context/);
+    expect(note).toMatch(/selected-main prompt is PiCC-defined and unverified/);
+    expect(note).toMatch(/only on an explicit user request to remember/);
+    expect(note).not.toContain("full parity");
   });
 
   it.each<DisclosureContract>([

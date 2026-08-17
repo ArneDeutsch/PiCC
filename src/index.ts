@@ -3754,7 +3754,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           autoMemory: project.autoMemory,
           onDiagnostic: reportListingDegradation,
         });
-        return { systemPrompt: `${selectedMainSnapshot.recoveryPrompt}\n\n${fallbackContext}` };
+        return { systemPrompt: `${selectedFallbackRecovery(selectedMainSnapshot.requestedName)}\n\n${fallbackContext}` };
       }
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -3926,6 +3926,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return definition.source.pluginId
       ? `${scope} plugin ${sanitizeLine(definition.source.pluginId, 128)}`
       : scope;
+  };
+  const selectedAgentCandidates = (): string => {
+    const names = [...new Set(project.agents.map((agent) => sanitizeLine(agent.name, 128)).filter(Boolean))]
+      .sort().slice(0, 12);
+    if (names.length === 0) {
+      return "No custom-agent definitions are currently loaded; add or repair one in a supported agent source, or omit/remove the selector to use the ordinary identity.";
+    }
+    const omitted = Math.max(0, new Set(project.agents.map((agent) => agent.name)).size - names.length);
+    return `Currently loaded custom-agent candidates: ${names.map((name) => JSON.stringify(name)).join(", ")}${omitted > 0 ? `, and ${omitted} more` : ""}.`;
+  };
+  const selectedFallbackRecovery = (requestedName?: string): string => {
+    const cause = requestedName === undefined
+      ? "Persisted branch selection evidence could not be read safely."
+      : `The persisted selected-agent definition ${JSON.stringify(sanitizeLine(requestedName, 128))} no longer exists.`;
+    return `${cause} PiCC installed a no-tools recovery identity; the stale identity and its capabilities are inactive. ${selectedAgentCandidates()} Do not resume the affected branch. Exit PiCC and start a new non-resumed session with picc --agent <name>, or omit/remove the selector to use the ordinary identity.`;
   };
   const denySelectedAdmission = (requestedName: string | undefined, reason: string, ctx: any): void => {
     const identity = requestedName === undefined
@@ -4122,7 +4137,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const alias = activeSelectedSnapshot.model.toLowerCase();
       if (CLAUDE_MODEL_ALIASES.has(alias) && alias !== "inherit") {
         selectedMainAliasWarning = true;
-        selectedMainNotice(ctx, `Selected agent ${identity} uses a Claude model alias; PiCC kept the working-model mapping rather than claiming an exact family. Use an explicit installed model when exact selection matters, then start a fresh session.`, "warning");
+        selectedMainNotice(ctx, `Selected agent ${identity} uses a Claude model alias; PiCC kept the working-model mapping rather than claiming an exact family. If exact model behavior is required, choose a supported installed model; otherwise you may continue with the working mapping.`, "warning");
       } else if (alias !== "inherit") {
         const selectedModel = resolveModelSpec(activeSelectedSnapshot.model);
         let applied = false;
@@ -4131,7 +4146,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
         if (!applied) {
           selectedMainModelUnavailableWarning = true;
-          selectedMainNotice(ctx, `Selected agent ${identity} requests a model that is unavailable, unauthenticated, or was refused. PiCC kept the working model; choose an installed authenticated model, then start a fresh session.`, "warning");
+          selectedMainNotice(ctx, `Selected agent ${identity} requests a model that is unavailable, unauthenticated, or was refused. PiCC kept the working model. If the requested model is required, choose a supported installed and authenticated model; otherwise you may continue.`, "warning");
         } else {
           commitCurrentModel(selectedModel);
           selectedModelOverrideWasActive = true;
@@ -4147,7 +4162,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       if (!applied) {
         selectedMainEffortWarning = true;
-        selectedMainNotice(ctx, `Selected agent ${identity} requests an unsupported or refused effort. PiCC kept the working effort; correct the definition, then start a fresh session.`, "warning");
+        selectedMainNotice(ctx, `Selected agent ${identity} requests an unsupported or refused effort. PiCC kept the working effort. If exact effort behavior is required, choose a supported effort; otherwise you may continue.`, "warning");
       } else {
         selectedEffortOverrideWasActive = true;
       }
@@ -4227,15 +4242,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       selectedMainPolicy = new SelectedMainAgentToolPolicy(snapshot, permissionEngine, []);
       if (snapshot.kind === "admission-denied") {
         const baselineRestored = await restoreHostBaselineForDeniedTransition(outgoingSelectedOwned);
+        const missingFresh = snapshot.diagnostic.reason === "selected-agent-missing-fresh";
         denySelectedAdmission(snapshot.requestedName,
-          `The requested identity was not admitted (${snapshot.diagnostic.reason}); no provider request was made. ${snapshot.recoveryText}` +
+          (missingFresh
+            ? `No loaded custom-agent definition matches the requested identity. Provider admission is blocked and no request was made. ${selectedAgentCandidates()} Start a fresh non-resumed session with picc --agent <name> after loading a matching definition, or omit/remove the selector to use the ordinary identity.`
+            : `The requested identity was not admitted because its capability restrictions could not be established safely; no provider request was made. ${snapshot.recoveryText}`) +
           (baselineRestored ? "" : " The host model/effort baseline could not be restored, so the current model state remains uncertain."), ctx);
       } else {
         selectedMainAdmissionFailure = undefined;
-        await reconcileSelectedTools(ctx);
-        selectedMainNotice(ctx,
-          `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} could not be safely restored (${snapshot.diagnostic.reason}). PiCC installed a no-tools recovery identity with no stale capabilities. Select an available agent and start a fresh session.`,
-          "warning");
+        if (!await reconcileSelectedTools(ctx)) return;
+        selectedMainNotice(ctx, selectedFallbackRecovery(snapshot.requestedName), "warning");
       }
       return;
     }
@@ -4313,7 +4329,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     if (snapshot.permissionMode !== undefined) {
-      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares permissionMode, which PiCC cannot apply to main sessions. Deny and tool restrictions remain enforced, but the requested permission posture is not active; correct the definition, then start a fresh session.`, "warning");
+      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares permissionMode, which PiCC does not apply to main sessions. PiCC remains default-permissive while deny and tool restrictions stay enforced. If that exact permission posture is required, do not select this definition as the PiCC main identity; otherwise you may continue.`, "warning");
     }
     const unsupportedFieldNames: Record<string, string> = {
       "max-turns-unsupported-for-main": "maxTurns",
@@ -4322,7 +4338,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "color-unsupported-for-main": "color",
     };
     for (const reason of snapshot.unsupported) {
-      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares ${unsupportedFieldNames[reason] ?? "an unsupported field"}, which has no main-session behavior. Remove the field or use a dispatched subagent, then start a fresh session.`, "warning");
+      selectedMainNotice(ctx, `Selected agent ${JSON.stringify(snapshot.diagnostic.agentIdentity)} declares ${unsupportedFieldNames[reason] ?? "an unsupported field"}, which PiCC does not apply to the main session. If that field's exact behavior is required, do not select this definition as the PiCC main identity; otherwise you may continue.`, "warning");
     }
     let mcpOutcome: SelectedMainMcpTransitionOutcome;
     try {
@@ -4599,7 +4615,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       if (selectedMainSnapshot?.kind === "selected" && selectedMainAdmissionFailure === undefined && selectedMainDefinition) {
         selectedMainNotice(ctx,
-          `Selected main-session identity ${JSON.stringify(selectedMainSnapshot.diagnostic.agentIdentity)} is active from ${selectedMainSnapshot.selectorSource}; winning definition: ${selectedDefinitionProvenance(selectedMainDefinition)}. Main-session base-prompt replacement is PiCC-defined partial fidelity.`,
+          `Selected main-session identity ${JSON.stringify(selectedMainSnapshot.diagnostic.agentIdentity)} is active from ${selectedMainSnapshot.selectorSource}; winning definition: ${selectedDefinitionProvenance(selectedMainDefinition)}. Selected instructions are active; required PiCC compatibility and project context remain. Run /doctor for compatibility differences.`,
           "info");
       }
     } catch {
@@ -6282,6 +6298,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (selectedMainAdmissionFailure !== undefined) {
       return `\n\nSelected main session admission:\n- ${sanitizeDisplayText(selectedMainAdmissionFailure, 1_200, true)}`;
     }
+    if (snapshot?.kind === "safe-fallback") {
+      return `\n\nSelected main session recovery:\n- ${selectedFallbackRecovery(snapshot.requestedName)}`;
+    }
     if (snapshot?.kind !== "selected") return "";
     const humanFields: Record<string, string> = {
       "max-turns-unsupported-for-main": "maxTurns",
@@ -6290,11 +6309,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "color-unsupported-for-main": "color",
     };
     const findings = [
-      ...snapshot.unsupported.map((reason) => `${humanFields[reason] ?? "unsupported field"}: no main-session behavior is applied; remove the field or use a dispatched subagent, then start a fresh session.`),
-      ...(snapshot.permissionMode === undefined ? [] : ["permissionMode is degraded: PiCC remains default-permissive while deny/tool restrictions are enforced; review the definition and start a fresh session."]),
-      ...(selectedMainAliasWarning ? ["model uses a Claude alias: PiCC retained the working-model mapping; use an explicit installed model when exact selection matters."] : []),
-      ...(selectedMainModelUnavailableWarning ? ["model override was unavailable or refused: the working model was retained; choose an installed authenticated model and start a fresh session."] : []),
-      ...(selectedMainEffortWarning ? ["effort override was unsupported or refused: the working effort was retained; correct the definition and start a fresh session."] : []),
+      ...snapshot.unsupported.map((reason) => `${humanFields[reason] ?? "unsupported field"}: PiCC applies no main-session behavior for this field. If its exact behavior is required, do not select this definition as the PiCC main identity; otherwise you may continue.`),
+      ...(snapshot.permissionMode === undefined ? [] : ["permissionMode is degraded: PiCC remains default-permissive while deny/tool restrictions are enforced. If that exact permission posture is required, do not select this definition as the PiCC main identity; otherwise you may continue."]),
+      ...(selectedMainAliasWarning ? ["model uses a Claude alias: PiCC retained the working-model mapping. If exact model behavior is required, choose a supported installed model; otherwise you may continue."] : []),
+      ...(selectedMainModelUnavailableWarning ? ["model override was unavailable or refused: the working model was retained. If the requested model is required, choose a supported installed and authenticated model; otherwise you may continue."] : []),
+      ...(selectedMainEffortWarning ? ["effort override was unsupported or refused: the working effort was retained. If exact effort behavior is required, choose a supported effort; otherwise you may continue."] : []),
       ...(selectedMainTrustWarning ? ["project/local selected hooks were skipped because project trust was not positively confirmed; trust the project explicitly and start a fresh PiCC process and session."] : []),
     ];
     const mcpStatus = selectedMainMcpStatus();

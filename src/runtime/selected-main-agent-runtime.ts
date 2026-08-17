@@ -11,8 +11,6 @@ import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { toClaudeToolName } from "./tool-map.js";
 import type { SelectedMainAgentResolution } from "./selected-main-agent-selection.js";
 
-export const SELECTED_MAIN_AGENT_SAFE_RECOVERY_PROMPT =
-  "PiCC could not safely restore the selected main-session agent. Continue only to help the user select an available agent and start a fresh session; do not use tools or claim the previous identity.";
 export const SELECTED_MAIN_AGENT_ADMISSION_RECOVERY =
   "Correct the selected agent definition or selector, then start a fresh PiCC session.";
 
@@ -64,7 +62,6 @@ export interface SelectedMainAgentSelectedSnapshot extends SelectedDefinitionSna
 export interface SelectedMainAgentSafeFallbackSnapshot {
   readonly kind: "safe-fallback";
   readonly requestedName?: string;
-  readonly recoveryPrompt: string;
   readonly tools: readonly [];
   readonly subagentTypes: readonly [];
   readonly diagnostic: SelectedMainAgentDiagnostic;
@@ -180,7 +177,6 @@ export function createSelectedMainAgentRuntimeSnapshot(
     return Object.freeze({
       kind: "safe-fallback",
       ...(requestedName === undefined ? {} : { requestedName }),
-      recoveryPrompt: SELECTED_MAIN_AGENT_SAFE_RECOVERY_PROMPT,
       tools: EMPTY,
       subagentTypes: EMPTY,
       diagnostic: fixedDiagnostic(

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1139,7 +1139,7 @@ describe("pi 0.83.0 API contract", () => {
     }
   });
 
-  it("extension no-trigger sendMessage synchronously updates live context and same-branch persistence", async () => {
+  it("extension no-trigger sendMessage proves the live branch before Pi makes the session reopenable", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "picc-selected-main-message-contract-"));
     let extensionApi: any;
     let session: any;
@@ -1175,7 +1175,13 @@ describe("pi 0.83.0 API contract", () => {
       });
       const file = manager.getSessionFile();
       expect(file).toBeTruthy();
+      expect(existsSync(file)).toBe(false);
+      const preResponseOpen = sdk.SessionManager.open(file, join(cwd, "sessions"), cwd);
+      expect(preResponseOpen.getBranch()).toEqual([]);
+      expect(existsSync(file)).toBe(false);
+
       await session.prompt("ordinary turn that flushes the persisted session");
+      expect(existsSync(file)).toBe(true);
       const reopened = sdk.SessionManager.open(file, join(cwd, "sessions"), cwd);
       expect(reopened.getBranch()
         .find((entry: any) => entry.customType === "picc-selected-main-agent-initial-prompt"))

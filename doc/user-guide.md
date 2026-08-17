@@ -206,16 +206,20 @@ picc
 
 Run `picc --agent <name>`, or set `"agent": "<name>"` in Claude settings. Selection precedence is
 command line, then the identity persisted on the current session branch, then the resolved setting.
-This is separate from existing agent-definition precedence: managed, then nearest project, then user,
-then lower-precedence plugin agents, with the first same-named definition winning. The startup notice
-names both the selector source and winning definition; `/doctor`, `/agents`, and `/mcp` show the
+This is separate from PiCC's agent-definition precedence: managed, then nearest project, then user,
+then lower-precedence plugin agents, with the first same-named definition winning. Claude's separate
+CLI-defined `--agents` definitions are unsupported and do not participate. The startup notice names
+both the selector source and winning definition; `/doctor`, `/agents`, and `/mcp` show the
 effective restrictions and selected MCP authority.
 
 A selected definition replaces the ordinary main identity for every turn and applies its tool and
 subagent restrictions, model/effort choices, supported hooks and MCP servers, skills, memory, and
-prompt context. Unlike Claude's auto-submitted, command/skill-processed composition, PiCC stores an
-`initialPrompt` once as a separate durable user-role message without triggering a turn; resume does
-not replay it. Session resume re-resolves the persisted name against the current definitions. A
+prompt context. Unlike Claude's auto-submitted, command/skill-processed composition, PiCC records an
+`initialPrompt` once as a separate no-trigger user-role message on the live selected branch. Selection
+and that message are proved synchronously before provider admission, but a new persisted session is
+not reopenable from disk until Pi persists it, currently after the first assistant response. Once
+persisted, resume does not replay `initialPrompt` and re-resolves the selected name against the current
+definitions. A
 missing fresh CLI/setting selection stops before provider work. For a no-tools recovery identity, do
 not resume the affected branch: exit PiCC and start a new non-resumed session with an available
 `picc --agent <name>`, or omit/remove the selection to use the ordinary identity. The generated
@@ -574,7 +578,7 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | Command | What it does |
 |---|---|
 | `/skills` | Categorize loaded skills by typed-slash availability; unsupported-name and reserved-shadowing rows separately state whether direct `Skill` invocation remains allowed |
-| `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
+| `/agents` | List the custom and built-in subagent catalog permitted by the current agent policy, with tools, read-only marker, model, and worktree-isolation; the output identifies when session settings disable dispatch |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and settle advertised tool, prompt, and resource catalogs or time out. See [MCP server settings](#6-security--permission-posture) |
 | `/plugin`, `/plugin list`, `/plugin details name@marketplace` | Observational inventory plus focused interactive lifecycle actions; see [Installed plugins](#installed-plugins) |
