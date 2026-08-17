@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CLAUDE_MCP_STATE_LIMITS,
   loadClaudeMcpState,
+  selectNativeProjectRecord,
   type ClaudeMcpStateLoaded,
   type LoadClaudeMcpStateOptions,
 } from "../src/claude/claude-mcp-state.js";
@@ -103,6 +104,18 @@ describe("loadClaudeMcpState snapshot handling", () => {
     write({});
     expect(load({ fileSystem: { close: (fd) => { fs.closeSync(fd); throw new Error("injected"); } } }))
       .toEqual({ kind: "unusable", diagnostics: ["Native Claude state could not be read"] });
+  });
+});
+
+describe("selectNativeProjectRecord writer seam", () => {
+  it("returns one authentic noncanonical equivalent key but rejects multiple aliases for mutation", () => {
+    const alias = path.join(root, "alias");
+    const rootState = { projects: { [alias]: { mcpServers: { local: { command: "run" } } } } };
+    const inputs = { root: rootState, projectRoot: project, identifyProject: () => [localKey()], canonicalizeProject: () => ({ kind: "canonical" as const, path: localKey() }) };
+    expect(selectNativeProjectRecord(inputs)).toEqual({ ok: true, value: { familyIdentity: localKey(), selectedKey: alias, selectedRecord: rootState.projects[alias], matchingKeys: [alias] } });
+    const duplicate = { projects: { [alias]: rootState.projects[alias], [localKey()]: { mcpServers: { local: { command: "run" } } } } };
+    expect(selectNativeProjectRecord({ ...inputs, root: duplicate, rejectMultipleMatches: true })).toEqual({ ok: false, diagnostic: "Native Claude project state has ambiguous matching records" });
+    expect(selectNativeProjectRecord({ ...inputs, root: duplicate })).toMatchObject({ ok: true, value: { selectedKey: localKey(), matchingKeys: [alias, localKey()] } });
   });
 });
 
