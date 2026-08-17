@@ -82,12 +82,16 @@ export interface McpAdministrationDeclaration {
 export type McpAdministrationObservation =
   | "ordinary-sources-suppressed-by-managed-mcp"
   | "review-snapshot-unavailable-or-invalid"
+  | "administration-recovery-pending"
   | "administration-declarations-omitted";
+
+export type McpAdministrationRemediation = "administration-recovery-pending";
 
 export interface McpAdministrationTrace {
   readonly version: 1;
   readonly policyPosture: McpPolicyPosture;
   readonly observations: readonly McpAdministrationObservation[];
+  readonly remediation?: McpAdministrationRemediation;
   readonly declarations: readonly McpAdministrationDeclaration[];
   readonly omittedDeclarationCount: number;
 }
@@ -117,6 +121,7 @@ export interface McpAdministrationInventory {
   readonly version: 1;
   readonly policyPosture: McpPolicyPosture;
   readonly observations: readonly McpAdministrationObservation[];
+  readonly remediation?: McpAdministrationRemediation;
   readonly servers: readonly McpAdministrationInventoryItem[];
   readonly omittedDeclarationCount: number;
 }

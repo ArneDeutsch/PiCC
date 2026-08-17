@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants, promises as fs } from "node:fs";
+import fsSync, { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import type { OwnedStateStore, StoreResult } from "../plugin-lifecycle/state-store.js";
 import { MCP_REVIEW_LIMITS, validateAndCopyMcpReviewSnapshot } from "./review-definition.js";
@@ -25,6 +25,42 @@ export interface McpReviewStateCapture {
   readonly bytes?: Readonly<Uint8Array>;
 }
 
+function absentCapture(store: OwnedStateStore, checkoutFamilyKey: string): StoreResult<McpReviewStateCapture> {
+  return { ok: true, value: Object.freeze({ snapshot: Object.freeze({
+    version: 1, profileKey: store.profileKey, checkoutFamilyKey, records: Object.freeze([]),
+  }) }) };
+}
+
+function validOpenedFile(target: string, opened: BigIntStats, named: BigIntStats, realPath: string): boolean {
+  return opened.isFile() && opened.nlink === 1n && named.isFile() && !named.isSymbolicLink() && opened.dev === named.dev && opened.ino === named.ino &&
+    opened.size <= BigInt(MCP_REVIEW_STATE_MAX_BYTES) && samePath(path.resolve(realPath), path.resolve(target));
+}
+
+function validateCapture(inputs: {
+  readonly store: OwnedStateStore;
+  readonly checkoutFamilyKey: string;
+  readonly target: string;
+  readonly opened: BigIntStats;
+  readonly named: BigIntStats;
+  readonly after: BigIntStats;
+  readonly realPath: string;
+  readonly bytes: Uint8Array;
+}): StoreResult<McpReviewStateCapture> {
+  const { opened, named, after, bytes } = inputs;
+  if (!validOpenedFile(inputs.target, opened, named, inputs.realPath) || bytes.byteLength > MCP_REVIEW_STATE_MAX_BYTES || BigInt(bytes.byteLength) !== opened.size ||
+    after.dev !== opened.dev || after.ino !== opened.ino || after.nlink !== 1n || after.size !== opened.size || !after.isFile() || after.isSymbolicLink()) {
+    return fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
+  }
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const validated = validateAndCopyMcpReviewSnapshot(JSON.parse(decoded) as unknown);
+    if (validated.invalid || validated.snapshot === undefined || validated.snapshot.profileKey !== inputs.store.profileKey || validated.snapshot.checkoutFamilyKey !== inputs.checkoutFamilyKey) {
+      return fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
+    }
+    return { ok: true, value: Object.freeze({ snapshot: validated.snapshot, bytes: Buffer.from(bytes) }) };
+  } catch { return fail("invalid-review-state", "Private MCP review state is unavailable or invalid"); }
+}
+
 export async function readMcpReviewStateCapture(inputs: {
   readonly store: OwnedStateStore;
   readonly checkoutFamilyKey: string;
@@ -33,21 +69,32 @@ export async function readMcpReviewStateCapture(inputs: {
   try {
     const handle = await fs.open(target.value, constants.O_RDONLY | constants.O_NONBLOCK);
     try {
-      const opened = await handle.stat({ bigint: true }); const named = await fs.lstat(target.value, { bigint: true });
-      if (!opened.isFile() || opened.nlink !== 1n || !named.isFile() || named.isSymbolicLink() || opened.dev !== named.dev || opened.ino !== named.ino ||
-        opened.size > BigInt(MCP_REVIEW_STATE_MAX_BYTES) || !samePath(path.resolve(await fs.realpath(target.value)), path.resolve(target.value))) throw new Error("unsafe");
+      const opened = await handle.stat({ bigint: true }); const named = await fs.lstat(target.value, { bigint: true }); const realPath = await fs.realpath(target.value);
+      if (!validOpenedFile(target.value, opened, named, realPath)) return fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
       const bytes = await handle.readFile(); const after = await fs.lstat(target.value, { bigint: true });
-      if (bytes.byteLength > MCP_REVIEW_STATE_MAX_BYTES || after.dev !== opened.dev || after.ino !== opened.ino || !after.isFile() || after.isSymbolicLink()) throw new Error("changed");
-      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      const validated = validateAndCopyMcpReviewSnapshot(JSON.parse(decoded) as unknown);
-      if (validated.invalid || validated.snapshot === undefined || validated.snapshot.profileKey !== inputs.store.profileKey || validated.snapshot.checkoutFamilyKey !== inputs.checkoutFamilyKey) throw new Error("invalid");
-      return { ok: true, value: Object.freeze({ snapshot: validated.snapshot, bytes: Buffer.from(bytes) }) };
+      return validateCapture({ ...inputs, target: target.value, opened, named, after, realPath, bytes });
     } finally { await handle.close(); }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, value: Object.freeze({ snapshot: Object.freeze({
-      version: 1, profileKey: inputs.store.profileKey, checkoutFamilyKey: inputs.checkoutFamilyKey, records: Object.freeze([]),
-    }) }) };
-    return fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? absentCapture(inputs.store, inputs.checkoutFamilyKey) : fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
+  }
+}
+
+/** Synchronous, read-only startup capture with the same validation as the persistence reader. */
+export function readMcpReviewStateCaptureSync(inputs: {
+  readonly store: OwnedStateStore;
+  readonly checkoutFamilyKey: string;
+}): StoreResult<McpReviewStateCapture> {
+  const target = mcpReviewStatePath(inputs.store, inputs.checkoutFamilyKey); if (!target.ok) return target;
+  try {
+    const handle = fsSync.openSync(target.value, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const opened = fsSync.fstatSync(handle, { bigint: true }); const named = fsSync.lstatSync(target.value, { bigint: true }); const realPath = fsSync.realpathSync.native(target.value);
+      if (!validOpenedFile(target.value, opened, named, realPath)) return fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
+      const bytes = fsSync.readFileSync(handle); const after = fsSync.lstatSync(target.value, { bigint: true });
+      return validateCapture({ ...inputs, target: target.value, opened, named, after, realPath, bytes });
+    } finally { fsSync.closeSync(handle); }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? absentCapture(inputs.store, inputs.checkoutFamilyKey) : fail("invalid-review-state", "Private MCP review state is unavailable or invalid");
   }
 }
 

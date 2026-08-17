@@ -894,8 +894,8 @@ export interface ResolvedMcpConfig {
   servers: ResolvedMcpServer[];
   /** Config-level findings (malformed file, ignored project-scope approvals). */
   diagnostics: string[];
-  /** Authoritative native state was present but unusable, so all MCP is inactive. */
-  failClosed?: "native-state-unusable";
+  /** Explicit acquisition authority that made all MCP inactive. */
+  failClosed?: "native-state-unusable" | "administration-recovery-pending";
   /** Fixed provenance for safe fail-closed repair guidance; never a resolved path. */
   failClosedProfile?: ClaudeProfileSource;
   /** Optional for legacy/test literals; policy-aware resolver outputs always populate it. */

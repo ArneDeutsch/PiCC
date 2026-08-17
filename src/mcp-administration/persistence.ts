@@ -13,7 +13,7 @@ import {
 } from "../plugin-lifecycle/transaction.js";
 import { projectIdentities } from "../util/project-identity.js";
 import type { McpMutationScope, McpReviewRecord, McpReviewSnapshot } from "./model.js";
-import { validateAndCopyMcpReviewSnapshot } from "./review-definition.js";
+import { createMcpReviewDefinitionDigest, MCP_REVIEW_DEFINITION_VERSION, validateAndCopyMcpReviewSnapshot } from "./review-definition.js";
 import { MCP_REVIEW_STATE_MAX_BYTES, mcpReviewStatePath, readMcpReviewStateCapture, resetMcpReviewRecords, setMcpReviewRecord } from "./review-state.js";
 import { createMcpTransactionCodec, type McpCurrentAuthority, type McpFormatEvidence, type McpMutationIdentity, type McpParticipantEvidence, type McpTransactionSummary } from "./transaction-codec.js";
 
@@ -137,12 +137,26 @@ function safeJsonCopy(value: unknown): StoreResult<unknown> {
   try { inspect(value, 0); const copied = copy(value); const bytes = Buffer.from(JSON.stringify(copied), "utf8"); return bytes.byteLength <= MAX_JSON_BYTES ? { ok: true, value: copied } : fail("invalid-input", "MCP input is invalid"); }
   catch { return fail("invalid-input", "MCP input is invalid"); }
 }
-function validatedDefinition(name: string, input: Readonly<Record<string, unknown>>): StoreResult<Record<string, unknown>> {
+export interface McpDeclarationDefinitionBinding {
+  readonly definition: Readonly<Record<string, unknown>>;
+  readonly definitionVersion: typeof MCP_REVIEW_DEFINITION_VERSION;
+  readonly definitionDigest: string;
+}
+
+export function bindMcpDeclarationDefinition(name: string, input: Readonly<Record<string, unknown>>): StoreResult<McpDeclarationDefinitionBinding> {
+  if (!validName(name)) return fail("invalid-input", "MCP definition is invalid");
   const copied = safeJsonCopy(input); if (!copied.ok || !record(copied.value)) return fail("invalid-input", "MCP definition is invalid");
   const block = Object.create(null) as Record<string, unknown>; block[name] = copied.value;
   const entries = normalizeMcpServerBlock(block, "MCP administration"); const entry = entries[0];
   if (entries.length !== 1 || entry === undefined || entry.name !== name || entry.skipped || entry.notConfigured) return fail("invalid-input", "MCP definition is invalid");
-  return { ok: true, value: copied.value };
+  const definitionDigest = createMcpReviewDefinitionDigest(entry);
+  if (definitionDigest === undefined) return fail("invalid-input", "MCP definition is invalid");
+  return { ok: true, value: Object.freeze({ definition: copied.value, definitionVersion: MCP_REVIEW_DEFINITION_VERSION, definitionDigest }) };
+}
+
+export function validateMcpDeclarationInput(name: string, input: Readonly<Record<string, unknown>>): StoreResult<Record<string, unknown>> {
+  const binding = bindMcpDeclarationDefinition(name, input);
+  return binding.ok ? { ok: true, value: binding.value.definition as Record<string, unknown> } : binding;
 }
 function canonicalEqual(left: unknown, right: unknown): boolean {
   try { const a = canonicalJsonBytes(JSON.parse(JSON.stringify(left)) as unknown); const b = canonicalJsonBytes(JSON.parse(JSON.stringify(right)) as unknown); return a.ok && b.ok && Buffer.from(a.value).equals(Buffer.from(b.value)); }
@@ -229,7 +243,7 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
       const copied = validateAndCopyMcpReviewSnapshot({ version: 1, profileKey: context.store.profileKey, checkoutFamilyKey: context.checkoutFamilyKey, records: [bounded.value] });
       reviewRecord = copied.snapshot?.records[0]; if (copied.invalid || reviewRecord === undefined || !validName(reviewRecord.serverName)) return rejected("invalid-input");
     }
-    const preparedDefinition = mutation.kind === "set-declaration" ? validatedDefinition(mutation.name, mutation.definition) : undefined;
+    const preparedDefinition = mutation.kind === "set-declaration" ? bindMcpDeclarationDefinition(mutation.name, mutation.definition) : undefined;
     if (preparedDefinition !== undefined && !preparedDefinition.ok) return rejected("invalid-input");
 
     let target: string; let role: McpParticipantEvidence["role"]; let document: JsonDocument; let operation: McpTransactionSummary["operation"]; let scope: McpMutationScope | undefined; let nativeProjectKey: string | undefined; let beforeValue: unknown;
@@ -260,7 +274,7 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
       } else {
         if (Object.hasOwn(holder, "mcpServers") && !record(holder.mcpServers)) return rejected("invalid-state");
         if (mutation.kind === "set-declaration") {
-          const servers = Object.hasOwn(holder, "mcpServers") ? holder.mcpServers as Record<string, unknown> : (holder.mcpServers = {}); servers[mutation.name] = preparedDefinition!.value;
+          const servers = Object.hasOwn(holder, "mcpServers") ? holder.mcpServers as Record<string, unknown> : (holder.mcpServers = {}); servers[mutation.name] = preparedDefinition!.value.definition;
         } else if (Object.hasOwn(holder, "mcpServers")) delete (holder.mcpServers as Record<string, unknown>)[mutation.name];
       }
       if (scope === "local" && newLocalRecord && !canonicalEqual(holder, {})) {
@@ -270,7 +284,7 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
     }
     if (canonicalEqual(beforeValue, document.value)) return { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") };
     let mutationIdentity: McpMutationIdentity;
-    if (mutation.kind === "set-declaration") { const canonical = canonicalJsonBytes(JSON.parse(JSON.stringify(preparedDefinition!.value)) as unknown); if (!canonical.ok) return rejected("invalid-input"); mutationIdentity = { kind: "set-declaration", scope: mutation.scope, serverName: mutation.name, definitionDigest: sha256(canonical.value) }; }
+    if (mutation.kind === "set-declaration") { const canonical = canonicalJsonBytes(JSON.parse(JSON.stringify(preparedDefinition!.value.definition)) as unknown); if (!canonical.ok) return rejected("invalid-input"); mutationIdentity = { kind: "set-declaration", scope: mutation.scope, serverName: mutation.name, definitionDigest: sha256(canonical.value) }; }
     else if (mutation.kind === "remove-declaration") mutationIdentity = { kind: "remove-declaration", scope: mutation.scope, serverName: mutation.name };
     else if (mutation.kind === "set-runtime-disabled") mutationIdentity = { kind: "set-runtime-disabled", serverName: mutation.name, disabled: mutation.disabled };
     else if (mutation.kind === "set-review") mutationIdentity = { kind: "set-review", source: reviewRecord!.source, serverName: reviewRecord!.serverName, ...(reviewRecord!.agentOwner === undefined ? {} : { agentOwner: reviewRecord!.agentOwner }), definitionDigest: reviewRecord!.definitionDigest, decision: reviewRecord!.decision };

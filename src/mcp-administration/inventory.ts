@@ -69,6 +69,7 @@ export function createMcpAdministrationInventory(
     version: 1,
     policyPosture: trace.policyPosture,
     observations: Object.freeze(observations),
+    ...(trace.remediation === undefined ? {} : { remediation: trace.remediation }),
     servers: Object.freeze(servers),
     omittedDeclarationCount,
   });

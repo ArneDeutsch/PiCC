@@ -25,9 +25,12 @@ import {
 import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "../src/plugin-lifecycle/artifact-digest.js";
 import { loadSettings } from "../src/discovery/settings.js";
-import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { createLifecycleLocations, createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { createMarketplaceSnapshotTrustGrant, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, executableDigestForProjection, issueOwnedDataRetirementProducerEvidence, ownedMarketplaceScopeKey, ownedMarketplaceSnapshotScopeKey, reconstructOwnedDataRetirementProducerEvidence, revalidateCompleteOwnedProfileReference, type ExecutableAdmissionGeneration, type MarketplaceSnapshotTrustTarget, type OwnedMarketplaceSnapshotRecord, type OwnedPluginInstallationRecord } from "../src/plugin-lifecycle/admission.js";
 import { canonicalJsonBytes, createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition, sha256, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
+import { MCP_REVIEW_STATE_MAX_BYTES, mcpReviewStatePath } from "../src/mcp-administration/review-state.js";
+import { persistMcpMutation } from "../src/mcp-administration/persistence.js";
+import { projectIdentities } from "../src/util/project-identity.js";
 import { acquireLifecycleLocks, releaseLifecycleLocks } from "../src/plugin-lifecycle/locks.js";
 import { createOwnedDataRetirementParticipant, createTransactionCodecRegistry, executeTransaction, prepareTransaction, type OrdinaryTransactionParticipant, type TransactionParticipant, type TransactionProducerCodec } from "../src/plugin-lifecycle/transaction.js";
 import { previewRecovery, recoverTransaction } from "../src/plugin-lifecycle/recovery.js";
@@ -47,6 +50,21 @@ import { captureImportedExecutableTrees, captureReloadCandidateBinding, clearRel
  */
 
 const tempDirs: string[] = [];
+
+const fileSymlinkProbe = (() => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-file-link-probe-"));
+  try {
+    const target = path.join(parent, "target");
+    fs.writeFileSync(target, "probe");
+    fs.symlinkSync(target, path.join(parent, "link"), "file");
+    return true;
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+    throw error;
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+})();
 
 const directoryLinkProbe = (() => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc-assembly-dir-link-probe-"));
@@ -1838,5 +1856,165 @@ describe("loadClaudeProject — PiCC-owned admission composition", () => {
     expect(first.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual([["owned@official", "1.0.0"]]);
     expect(second.plugins.map((plugin) => [plugin.pluginId, plugin.version])).toEqual([["owned@official", "1.0.0"]]);
     expect(second.pluginAdmissions.filter((item) => item.ownership === "picc-owned")).toHaveLength(1);
+  });
+});
+
+describe("loadClaudeProject — MCP private startup authority", () => {
+  async function startupFixture() {
+    const fixture = makeBase();
+    const homeDir = path.dirname(fixture.userDir);
+    const identities = projectIdentities(fixture.repo);
+    const locations = createMcpLifecycleLocations({
+      homeDir,
+      profilePath: fixture.userDir,
+      platform: process.platform === "win32" ? "win32" : "posix",
+      project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! },
+    });
+    if (!locations.ok || locations.value.checkoutFamilyKey === undefined) throw new Error("MCP locations unavailable");
+    const established = await establishOwnedStateStore(locations.value, homeDir);
+    if (!established.ok) throw new Error(established.message);
+    const authorityFingerprint = `sha256:${"a".repeat(64)}`;
+    return {
+      ...fixture,
+      homeDir,
+      store: established.value,
+      checkoutFamilyKey: locations.value.checkoutFamilyKey,
+      context: {
+        store: established.value,
+        profilePath: fixture.userDir,
+        projectRoot: fixture.repo,
+        checkoutFamilyKey: locations.value.checkoutFamilyKey,
+        authorityFingerprint,
+        identifyProject: () => identities,
+        revalidateAuthority: () => ({ ok: true as const, value: { profileKey: established.value.profileKey, checkoutFamilyKey: locations.value.checkoutFamilyKey!, authorityFingerprint } }),
+      },
+    };
+  }
+
+  it("honors persisted exact approval and rejection on fresh synchronous assembly", async () => {
+    const f = await startupFixture();
+    write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { reviewed: { command: "run", args: ["safe"] } } }));
+    const initial = load(f.repo, f.userDir);
+    const candidate = initial.mcp.administration?.declarations.find((item) => item.name === "reviewed");
+    if (candidate?.definitionDigest === undefined) throw new Error("missing review digest");
+    const base = { profileKey: f.store.profileKey, checkoutFamilyKey: f.checkoutFamilyKey, source: "project-mcpjson" as const, serverName: "reviewed", definitionVersion: 1 as const, definitionDigest: candidate.definitionDigest };
+    expect(await persistMcpMutation(f.context, { kind: "set-review", record: { ...base, decision: "approved" } })).toMatchObject({ state: "committed" });
+    const approved = load(f.repo, f.userDir);
+    expect(approved.mcpStartupAuthority).toMatchObject({ reviewInvalid: false, recoveryPending: false, reviewSnapshot: { records: [{ decision: "approved" }] } });
+    expect(approved.mcp.servers.find((server) => server.name === "reviewed")).toMatchObject({ status: "enabled" });
+    expect(await persistMcpMutation(f.context, { kind: "set-review", record: { ...base, decision: "rejected" } })).toMatchObject({ state: "committed" });
+    expect(load(f.repo, f.userDir).mcp.servers.find((server) => server.name === "reviewed")).toMatchObject({ status: "disabled", inactiveReason: "mcpjson-rejected" });
+  });
+
+  it("treats malformed private review state as unavailable without granting exact approval", async () => {
+    const f = await startupFixture();
+    write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { reviewed: { command: "run" } } }));
+    const target = mcpReviewStatePath(f.store, f.checkoutFamilyKey);
+    if (!target.ok) throw new Error(target.message);
+    write(target.value, "{ malformed");
+    const project = load(f.repo, f.userDir);
+    expect(project.mcpStartupAuthority).toMatchObject({ reviewInvalid: true, recoveryPending: false });
+    expect(project.mcp.servers.find((server) => server.name === "reviewed")).toMatchObject({ status: "pending-approval" });
+    expect(project.mcp.administration?.observations).toContain("review-snapshot-unavailable-or-invalid");
+  });
+
+  it("blocks ordinary acquisition during a nonterminal journal and performs no startup recovery write", async () => {
+    const f = await startupFixture();
+    const pending = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "pending", definition: { command: "${EXPANSION_CANARY}" } }, {
+      faults: { hit(phase) { if (phase === "after-replacement") throw new Error("leave pending"); } },
+    });
+    expect(pending).toMatchObject({ state: "pending-recovery" });
+    if (pending.state !== "pending-recovery") throw new Error("pending journal expected");
+    const journalPath = path.join(f.store.journalsRoot, `${pending.operationId}.json`);
+    const before = fs.readFileSync(journalPath);
+    const loadNativeState = vi.fn(() => { throw new Error("ordinary acquisition must remain suppressed"); });
+    const loadProjectMcpJson = vi.fn(() => { throw new Error("ordinary acquisition must remain suppressed"); });
+    const project = loadClaudeProject({
+      cwd: f.repo,
+      userDir: f.userDir,
+      homeDir: f.homeDir,
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      mcpOrdinaryLoadersForTest: { loadNativeState, loadProjectMcpJson },
+    });
+    expect(project.mcpStartupAuthority).toMatchObject({ recoveryPending: true, pendingOperationId: pending.operationId });
+    expect(project.mcp).toMatchObject({ failClosed: "administration-recovery-pending", policyAuthority: "user-controlled", administration: { observations: ["administration-recovery-pending"], remediation: "administration-recovery-pending" } });
+    expect(project.mcp.policyOrdinarySourcesSuppressed).toBeUndefined();
+    expect(project.mcp.policyFailures).toEqual([]);
+    expect(JSON.stringify(project.mcp)).not.toContain("repair-administrator-policy");
+    expect(JSON.stringify(project.mcp)).not.toContain("ordinary-sources-suppressed-by-managed-mcp");
+    expect(project.mcp.servers).toEqual([]);
+    expect(loadNativeState).not.toHaveBeenCalled();
+    expect(loadProjectMcpJson).not.toHaveBeenCalled();
+    expect(fs.readFileSync(journalPath)).toEqual(before);
+  });
+
+  it("fails the passive review reader closed across malformed, encoded, bounded, identity, and file-alias cases", async () => {
+    type Case = { label: string; install(target: string, f: Awaited<ReturnType<typeof startupFixture>>): void };
+    const invalidSnapshot = (f: Awaited<ReturnType<typeof startupFixture>>, overrides: Record<string, unknown> = {}) => JSON.stringify({
+      version: 1, profileKey: f.store.profileKey, checkoutFamilyKey: f.checkoutFamilyKey, records: [], ...overrides,
+    });
+    const cases: Case[] = [
+      { label: "malformed JSON", install(target) { write(target, "{ malformed"); } },
+      { label: "invalid UTF-8", install(target) { fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, Buffer.from([0xc3, 0x28])); } },
+      { label: "oversized", install(target) { fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, Buffer.alloc(MCP_REVIEW_STATE_MAX_BYTES + 1, 0x20)); } },
+      { label: "non-regular", install(target) { fs.mkdirSync(target, { recursive: true }); } },
+      { label: "wrong profile", install(target, f) { write(target, invalidSnapshot(f, { profileKey: "profile-wrong" })); } },
+      { label: "wrong family", install(target, f) { write(target, invalidSnapshot(f, { checkoutFamilyKey: "checkout-wrong" })); } },
+      { label: "invalid schema", install(target, f) { write(target, invalidSnapshot(f, { version: 2 })); } },
+      { label: "hardlink", install(target, f) { const source = path.join(f.base, "review-hardlink-source"); write(source, invalidSnapshot(f)); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.linkSync(source, target); } },
+    ];
+    for (const row of cases) {
+      const f = await startupFixture();
+      write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { broad: { command: "broad" }, managedBroad: { command: "managed-broad" }, rejected: { command: "rejected" } } }));
+      write(path.join(f.userDir, "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["broad"], disabledMcpjsonServers: ["rejected"] }));
+      const managedSettings = path.join(f.base, "managed-settings.json");
+      write(managedSettings, JSON.stringify({ enabledMcpjsonServers: ["managedBroad"] }));
+      const target = mcpReviewStatePath(f.store, f.checkoutFamilyKey); if (!target.ok) throw new Error(target.message);
+      row.install(target.value, f);
+      const before = fs.statSync(target.value).mtimeMs;
+      const project = loadClaudeProject({ cwd: f.repo, userDir: f.userDir, homeDir: f.homeDir, managedSettingsPaths: [managedSettings], managedArtifactDirs: [] });
+      expect(project.mcpStartupAuthority.reviewInvalid, row.label).toBe(true);
+      expect(project.mcp.administration?.observations, row.label).toContain("review-snapshot-unavailable-or-invalid");
+      expect(project.mcp.administration?.declarations.some((item) => item.review === "approved-exact"), row.label).toBe(false);
+      expect(project.mcp.administration?.declarations.find((item) => item.name === "broad"), row.label).toMatchObject({ review: "approved-broad-name", status: "enabled" });
+      expect(project.mcp.administration?.declarations.find((item) => item.name === "managedBroad"), row.label).toMatchObject({ review: "approved-broad-name", status: "enabled" });
+      expect(project.mcp.administration?.declarations.find((item) => item.name === "rejected"), row.label).toMatchObject({ review: "rejected-compatibility", status: "disabled" });
+      expect(fs.statSync(target.value).mtimeMs, row.label).toBe(before);
+    }
+  });
+
+  it.skipIf(!fileSymlinkProbe)("fails the passive review reader closed for a symlink without changing its target", async () => {
+    const f = await startupFixture();
+    write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { broad: { command: "broad" }, managedBroad: { command: "managed-broad" }, rejected: { command: "rejected" } } }));
+    write(path.join(f.userDir, "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["broad"], disabledMcpjsonServers: ["rejected"] }));
+    const managedSettings = path.join(f.base, "managed-settings.json");
+    write(managedSettings, JSON.stringify({ enabledMcpjsonServers: ["managedBroad"] }));
+    const target = mcpReviewStatePath(f.store, f.checkoutFamilyKey); if (!target.ok) throw new Error(target.message);
+    const source = path.join(f.base, "review-symlink-source");
+    write(source, JSON.stringify({ version: 1, profileKey: f.store.profileKey, checkoutFamilyKey: f.checkoutFamilyKey, records: [] }));
+    fs.mkdirSync(path.dirname(target.value), { recursive: true });
+    fs.symlinkSync(source, target.value, "file");
+    const before = fs.readFileSync(source);
+    const project = loadClaudeProject({ cwd: f.repo, userDir: f.userDir, homeDir: f.homeDir, managedSettingsPaths: [managedSettings], managedArtifactDirs: [] });
+    expect(project.mcpStartupAuthority.reviewInvalid).toBe(true);
+    expect(project.mcp.administration?.observations).toContain("review-snapshot-unavailable-or-invalid");
+    expect(project.mcp.administration?.declarations.some((item) => item.review === "approved-exact")).toBe(false);
+    expect(project.mcp.administration?.declarations.find((item) => item.name === "broad")).toMatchObject({ review: "approved-broad-name", status: "enabled" });
+    expect(project.mcp.administration?.declarations.find((item) => item.name === "managedBroad")).toMatchObject({ review: "approved-broad-name", status: "enabled" });
+    expect(project.mcp.administration?.declarations.find((item) => item.name === "rejected")).toMatchObject({ review: "rejected-compatibility", status: "disabled" });
+    expect(fs.readFileSync(source)).toEqual(before);
+  });
+
+  it("treats an invalid journal as administration recovery pending without startup writes", async () => {
+    const f = await startupFixture();
+    write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { blocked: { command: "${EXPANSION_CANARY}" } } }));
+    const journal = path.join(f.store.journalsRoot, "invalid.json");
+    write(journal, "{ invalid"); const before = fs.readFileSync(journal);
+    const project = load(f.repo, f.userDir);
+    expect(project.mcp).toMatchObject({ failClosed: "administration-recovery-pending", administration: { observations: ["administration-recovery-pending"], remediation: "administration-recovery-pending" } });
+    expect(project.mcp.servers).toEqual([]);
+    expect(project.agentMcpAdmission).toBeUndefined();
+    expect(fs.readFileSync(journal)).toEqual(before);
   });
 });
