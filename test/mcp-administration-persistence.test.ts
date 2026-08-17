@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
 import { createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { establishOwnedStateStore, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
-import { persistMcpMutation } from "../src/mcp-administration/persistence.js";
+import { mcpPersistenceDeclarationEvidence, persistMcpMutation } from "../src/mcp-administration/persistence.js";
+import { createMcpAdministrationService } from "../src/mcp-administration/service.js";
+import type { ResolvedMcpConfig } from "../src/types.js";
 import { createMcpReviewDefinitionDigest, matchesMcpReviewRecord } from "../src/mcp-administration/review-definition.js";
 import { mcpReviewStatePath, readMcpReviewState } from "../src/mcp-administration/review-state.js";
 import type { McpReviewRecord } from "../src/mcp-administration/model.js";
@@ -52,7 +54,7 @@ describe("recoverable scoped MCP persistence", () => {
     expect(receipts).not.toContain("secret");
   });
 
-  it("performs add, replace, and remove for project, user, and local names without touching neighbors", async () => {
+  it("performs create-only add and remove for project, user, and local names without touching neighbors", async () => {
     const f = await fixture(); const family = fs.realpathSync.native(f.project); const projectFile = path.join(f.project, ".mcp.json"); const bom = Buffer.from([0xef, 0xbb, 0xbf]);
     fs.writeFileSync(projectFile, '{\r\n\t"mcpServers": {\r\n\t\t"neighbor": {"command":"project-keep"}\r\n\t}\r\n}\r\n');
     fs.writeFileSync(f.profile, Buffer.concat([bom, Buffer.from(`{\r\n\t"mcpServers": {\r\n\t\t"neighbor": {"command":"user-keep"}\r\n\t},\r\n\t"projects": {\r\n\t\t${JSON.stringify(family)}: {\r\n\t\t\t"mcpServers": {\r\n\t\t\t\t"neighbor": {"command":"local-keep"}\r\n\t\t\t},\r\n\t\t\t"compatibility": {"keep":true}\r\n\t\t}\r\n\t},\r\n\t"userCanary": true\r\n}\r\n`)]));
@@ -72,8 +74,34 @@ describe("recoverable scoped MCP persistence", () => {
     const assertCanaries = (same: Partial<Record<"project" | "user" | "local", string>>) => { const { project, native } = readScopes(); expect(project.mcpServers.neighbor).toEqual({ command: "project-keep" }); expect(native.mcpServers.neighbor).toEqual({ command: "user-keep" }); expect(native.projects[family]!.mcpServers.neighbor).toEqual({ command: "local-keep" }); expect(native.projects[family]!.compatibility).toEqual({ keep: true }); expect(native.userCanary).toBe(true); expect(project.mcpServers.same).toEqual(same.project === undefined ? undefined : { command: same.project }); expect(native.mcpServers.same).toEqual(same.user === undefined ? undefined : { command: same.user }); expect(native.projects[family]!.mcpServers.same).toEqual(same.local === undefined ? undefined : { command: same.local }); };
     const same: Partial<Record<"project" | "user" | "local", string>> = {};
     for (const scope of ["project", "user", "local"] as const) { expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope, name: "same", definition: { command: "one" } })).toMatchObject({ state: "committed", effect: "changed" }); same[scope] = "one"; assertCanaries(same); }
-    for (const scope of ["project", "user", "local"] as const) { expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope, name: "same", definition: { command: "two" } })).toMatchObject({ state: "committed", effect: "changed" }); same[scope] = "two"; assertCanaries(same); }
+    for (const scope of ["project", "user", "local"] as const) { const before = scope === "project" ? fs.readFileSync(path.join(f.project, ".mcp.json")) : fs.readFileSync(f.profile); expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope, name: "same", definition: { command: "two" } })).toMatchObject({ state: "rejected", effect: "unchanged", reasonCode: "already-exists" }); expect(scope === "project" ? fs.readFileSync(path.join(f.project, ".mcp.json")) : fs.readFileSync(f.profile)).toEqual(before); assertCanaries(same); }
     for (const scope of ["project", "user", "local"] as const) { expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope, name: "same" })).toMatchObject({ state: "committed", effect: "changed" }); delete same[scope]; assertCanaries(same); }
+  });
+
+  it("round-trips bounded non-control names with spaces and double underscores across declaration and review state", async () => {
+    const f = await fixture(); const name = "Claude compatible__server name";
+    for (const scope of ["project", "user", "local"] as const) { const result = await persistMcpMutation(f.context, { kind: "set-declaration", scope, name, definition: { command: "run" } }); expect(result).toMatchObject({ state: "committed", effect: "changed" }); expect(mcpPersistenceDeclarationEvidence(result)).toMatchObject({ scope, name, definitionVersion: 1 }); }
+    const review: McpReviewRecord = { profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey, source: "project-mcpjson", serverName: name, definitionVersion: 1, definitionDigest: `mcp-review-v1:${"e".repeat(64)}`, decision: "approved" };
+    expect(await persistMcpMutation(f.context, { kind: "set-review", record: review })).toMatchObject({ state: "committed" });
+    expect((JSON.parse(fs.readFileSync(path.join(f.project, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers).toHaveProperty(name);
+    const captured = await readMcpReviewState({ store: f.store, checkoutFamilyKey: f.context.checkoutFamilyKey }); expect(captured.ok && captured.value.records[0]?.serverName).toBe(name);
+    for (const scope of ["project", "user", "local"] as const) expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope, name })).toMatchObject({ state: "committed", effect: "changed" });
+    for (const scope of ["project", "user", "local"] as const) {
+      expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope, name: "__proto__", definition: { command: "run" } }), `${scope} add`).toMatchObject({ state: "committed", effect: "changed" });
+      const root = JSON.parse(fs.readFileSync(scope === "project" ? path.join(f.project, ".mcp.json") : f.profile, "utf8")) as Record<string, unknown>;
+      const servers = scope === "project" ? (root.mcpServers as Record<string, unknown>) : scope === "user" ? (root.mcpServers as Record<string, unknown>) : ((root.projects as Record<string, Record<string, unknown>>)[fs.realpathSync.native(f.project)]!.mcpServers as Record<string, unknown>);
+      expect(Object.hasOwn(servers, "__proto__")).toBe(true); expect(servers.__proto__).toEqual({ command: "run" });
+      expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope, name: "__proto__" }), `${scope} remove`).toMatchObject({ state: "committed", effect: "changed" });
+    }
+    for (const invalid of ["bad\u0000name", "x".repeat(129), "workspace", "claude-in-chrome", "computer-use", "Claude Preview", "Claude Browser"]) expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: invalid, definition: { command: "run" } })).toMatchObject({ state: "rejected", reasonCode: "invalid-input" });
+    fs.writeFileSync(path.join(f.project, ".mcp.json"), JSON.stringify({ mcpServers: { workspace: { command: "external" } } }));
+    expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope: "project", name: "workspace" })).toMatchObject({ state: "committed", effect: "changed" });
+  });
+
+  it("authenticates a broad-name durable add even when the loader retains it as skipped without a review digest", async () => {
+    const f = await fixture(); const name = "broad name__skipped"; const declaration = { name, source: "project-mcpjson" as const, authority: { kind: "mutable" as const, scope: "project" as const }, precedence: "winner" as const, summary: { transport: "stdio" as const, commandBasename: "run", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false }, policy: "allowed" as const, review: "pending" as const, status: "skipped" as const };
+    let assembly = 0; const service = createMcpAdministrationService({ inspectPending: async () => ({ pending: false, status: "clear" }), recover: async () => ({ state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete" }), mutate: (mutation) => persistMcpMutation(f.context, mutation), assemble: () => ({ reviewIdentity: { profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey }, mcp: { servers: [], diagnostics: [], administration: { version: 1, policyPosture: "absent", observations: [], declarations: assembly++ === 0 ? [] : [declaration], omittedDeclarationCount: 0 } } as ResolvedMcpConfig }) });
+    await expect(service.execute({ kind: "add", scope: "project", name, definition: { command: "run" } })).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" }, runtime: { state: "not-requested" } });
   });
 
   it("supports project and private review state without a native profile while native scopes fail unchanged", async () => {
@@ -99,14 +127,14 @@ describe("recoverable scoped MCP persistence", () => {
     const protoDefinition = JSON.parse('{"command":"run","__proto__":{"inert":true}}') as Record<string, unknown>; expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "proto", definition: protoDefinition })).toMatchObject({ state: "committed", effect: "changed" }); expect((JSON.parse(fs.readFileSync(path.join(f.project, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers.proto).toEqual(protoDefinition);
     expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "safe", definition: { command: "run" } })).toMatchObject({ state: "committed", effect: "changed" });
     const receipts = fs.readdirSync(f.store.receiptsRoot).length; const bytes = fs.readFileSync(path.join(f.project, ".mcp.json"));
-    const noOp = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "safe", definition: { command: "run" } }); expect(noOp).toMatchObject({ state: "committed", effect: "unchanged", reasonCode: "no-op" }); expect(noOp).not.toHaveProperty("operationId");
+    const noOp = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "safe", definition: { command: "run" } }); expect(noOp).toMatchObject({ state: "rejected", effect: "unchanged", reasonCode: "already-exists" }); expect(noOp).not.toHaveProperty("operationId");
     expect(fs.readdirSync(f.store.receiptsRoot)).toHaveLength(receipts); expect(fs.readFileSync(path.join(f.project, ".mcp.json"))).toEqual(bytes); expect(fs.readdirSync(f.store.stagingRoot)).toEqual([]);
     const nativeBefore = fs.readFileSync(f.profile); expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope: "local", name: "absent" })).toMatchObject({ state: "committed", effect: "unchanged", reasonCode: "no-op" }); expect(await persistMcpMutation(f.context, { kind: "set-runtime-disabled", name: "absent", disabled: false })).toMatchObject({ state: "committed", effect: "unchanged", reasonCode: "no-op" }); expect(fs.readFileSync(f.profile)).toEqual(nativeBefore);
   });
 
   it("preserves formatting and neighbors, enables by exact disabled-name removal, and resets the whole private family", async () => {
     const f = await fixture(); const projectFile = path.join(f.project, ".mcp.json"); fs.writeFileSync(projectFile, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{\r\n\t"future": true,\r\n\t"mcpServers": {\r\n\t\t"same": {"command":"old"},\r\n\t\t"neighbor": {"command":"keep"}\r\n\t}\r\n}\r\n')]));
-    expect((await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "same", definition: { command: "new" } })).state).toBe("committed"); const formatted = fs.readFileSync(projectFile); expect(formatted.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf])); expect(formatted.toString()).toContain("\r\n\t"); expect(formatted.toString()).toContain('"neighbor"'); expect(formatted.toString().endsWith("\r\n")).toBe(true);
+    expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "same", definition: { command: "new" } })).toMatchObject({ state: "rejected", reasonCode: "already-exists" }); const formatted = fs.readFileSync(projectFile); expect(formatted.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf])); expect(formatted.toString()).toContain("\r\n\t"); expect(formatted.toString()).toContain('"neighbor"'); expect(formatted.toString().endsWith("\r\n")).toBe(true);
     fs.writeFileSync(f.profile, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{\r\n\t"future": {"keep":true}\r\n}\r\n')]));
     const readFormattedNative = () => { const bytes = fs.readFileSync(f.profile); expect(bytes.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf])); const text = bytes.subarray(3).toString("utf8"); expect(text).toContain("\r\n\t"); expect(text.endsWith("\r\n")).toBe(true); return JSON.parse(text) as { future: unknown; projects: Record<string, { disabledMcpServers: string[]; enabledMcpServers?: unknown }> }; };
     expect((await persistMcpMutation(f.context, { kind: "set-runtime-disabled", name: "same", disabled: true })).state).toBe("committed"); let local = readFormattedNative().projects[fs.realpathSync.native(f.project)]!; expect(local.disabledMcpServers).toEqual(["same"]); expect(local).not.toHaveProperty("enabledMcpServers");
@@ -129,7 +157,7 @@ describe("recoverable scoped MCP persistence", () => {
   it("mutates user scope without selecting malformed projects and preserves that unrelated value", async () => {
     const f = await fixture(); const malformedProjects = ["opaque", { nested: true }]; fs.writeFileSync(f.profile, JSON.stringify({ projects: malformedProjects, mcpServers: { neighbor: { command: "keep" } }, canary: true }) + "\n");
     expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "user", name: "same", definition: { command: "one" } })).toMatchObject({ state: "committed", effect: "changed" });
-    expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "user", name: "same", definition: { command: "two" } })).toMatchObject({ state: "committed", effect: "changed" });
+    expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "user", name: "same", definition: { command: "two" } })).toMatchObject({ state: "rejected", effect: "unchanged", reasonCode: "already-exists" });
     expect(await persistMcpMutation(f.context, { kind: "remove-declaration", scope: "user", name: "same" })).toMatchObject({ state: "committed", effect: "changed" });
     const result = JSON.parse(fs.readFileSync(f.profile, "utf8")) as Record<string, unknown>; expect(result.projects).toEqual(malformedProjects); expect(result).toMatchObject({ mcpServers: { neighbor: { command: "keep" } }, canary: true });
   });
@@ -150,6 +178,12 @@ describe("recoverable scoped MCP persistence", () => {
     const changed = JSON.stringify({ version: 1, profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey, records: [] }) + "\n";
     const result = await persistMcpMutation(f.context, { kind: "set-review", record: { ...valid, decision: "rejected" } }, { faults: { hit(phase) { if (phase === "after-journal") fs.writeFileSync(reviewPath, changed); } } });
     expect(result).toMatchObject({ state: "failed-before-commit", effect: "unchanged", reasonCode: "stale" }); expect(fs.readFileSync(reviewPath, "utf8")).toBe(changed);
+  });
+
+  it("preserves a competing exact-scope declaration introduced after the create read", async () => {
+    const f = await fixture(); const target = path.join(f.project, ".mcp.json"); const competing = Buffer.from('{"mcpServers":{"raced":{"command":"competitor"}},"canary":true}\n');
+    const result = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "raced", definition: { command: "requested" } }, { faults: { hit(phase) { if (phase === "after-journal") fs.writeFileSync(target, competing); } } });
+    expect(result).toMatchObject({ state: "failed-before-commit", effect: "unchanged", reasonCode: "stale" }); expect(fs.readFileSync(target)).toEqual(competing);
   });
 
   it("rejects valid output expansion beyond the reader limit without transaction residue", async () => {
@@ -185,9 +219,10 @@ describe("recoverable scoped MCP persistence", () => {
       const oldEntry = normalizeMcpServerBlock({ shared: { command: "old" } }, "linked fixture")[0]!; const oldDigest = createMcpReviewDefinitionDigest(oldEntry)!;
       const identity = { profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey, source: "project-mcpjson" as const, serverName: "shared" }; const approved = { ...identity, definitionVersion: 1 as const, definitionDigest: oldDigest, decision: "approved" as const };
       expect((await persistMcpMutation(f.context, { kind: "set-review", record: approved })).state).toBe("committed"); const fromLinked = await readMcpReviewState({ store: linkedStore.value, checkoutFamilyKey: linkedContext.checkoutFamilyKey }); if (!fromLinked.ok) throw new Error(fromLinked.message); expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, oldDigest)).toBe(true);
+      expect((await persistMcpMutation(f.context, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed");
       expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "pending-main" } }, { faults: { hit(phase) { if (phase === "after-replacement") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery", effect: "uncertain" });
       expect(await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "blocked-linked", definition: { command: "must-not-apply" } })).toMatchObject({ state: "rolled-back", effect: "unchanged" }); expect(fs.readFileSync(path.join(main, ".mcp.json"), "utf8")).not.toContain("pending-main"); expect(fs.existsSync(path.join(linked, ".mcp.json"))).toBe(true);
-      expect((await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-main" } })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-linked" } })).state).toBe("committed");
+      expect((await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-main" } })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-linked" } })).state).toBe("committed");
       const mainChanged = createMcpReviewDefinitionDigest(normalizeMcpServerBlock((JSON.parse(fs.readFileSync(path.join(main, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers, "main changed")[0]!)!; const linkedChanged = createMcpReviewDefinitionDigest(normalizeMcpServerBlock((JSON.parse(fs.readFileSync(path.join(linked, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers, "linked changed")[0]!)!;
       expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, mainChanged)).toBe(false); expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, linkedChanged)).toBe(false);
     } finally { try { execFileSync("git", ["worktree", "remove", "--force", linked], { cwd: main, stdio: "pipe" }); } catch { fs.rmSync(linked, { recursive: true, force: true }); } }

@@ -8,13 +8,17 @@ const CONFIG_PATH = "tsconfig.runtime.json";
 const LOCK_PATH = "package-lock.json";
 const EXTENSION_ENTRY = "picc/index.js";
 const INVENTORY_ENTRY = "dist/plugin-inventory-cli.js";
+const MCP_ADMINISTRATION_ENTRY = "dist/mcp-administration-cli.js";
 const SOURCE_EXTENSION_ENTRY = "picc/index.ts";
 const SOURCE_INVENTORY_ENTRY = "src/plugin-inventory-cli.ts";
+const SOURCE_MCP_ADMINISTRATION_ENTRY = "src/mcp-administration-cli.ts";
 const REQUIRED_RUNTIME_FILES = [
   "dist/index.js",
   "dist/index.js.map",
   INVENTORY_ENTRY,
   `${INVENTORY_ENTRY}.map`,
+  MCP_ADMINISTRATION_ENTRY,
+  `${MCP_ADMINISTRATION_ENTRY}.map`,
 ];
 const HEX = /^[0-9a-f]{64}$/u;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -78,8 +82,8 @@ function validateManifest(value) {
   if (!exactKeys(value, ["schemaVersion", "package", "compiler", "sources", "sourceDigest", "files", "runtimeDigest", "entries"])) return false;
   if (value.schemaVersion !== 1 || !validPackage(value.package) || !validCompiler(value.compiler)) return false;
   if (!validRecords(value.sources) || !validRecords(value.files) || !HEX.test(value.sourceDigest) || !HEX.test(value.runtimeDigest)) return false;
-  if (!exactKeys(value.entries, ["extension", "pluginInventory"])) return false;
-  if (value.entries.extension !== EXTENSION_ENTRY || value.entries.pluginInventory !== INVENTORY_ENTRY) return false;
+  if (!exactKeys(value.entries, ["extension", "pluginInventory", "mcpAdministration"])) return false;
+  if (value.entries.extension !== EXTENSION_ENTRY || value.entries.pluginInventory !== INVENTORY_ENTRY || value.entries.mcpAdministration !== MCP_ADMINISTRATION_ENTRY) return false;
   if (!value.sources.every((record) => record.path.startsWith("src/") && record.path.endsWith(".ts"))) return false;
   const filePaths = new Set(value.files.map((record) => record.path));
   if (!filePaths.has(EXTENSION_ENTRY) || !REQUIRED_RUNTIME_FILES.every((required) => filePaths.has(required))) return false;
@@ -253,9 +257,9 @@ function isMissingError(error) {
  * @property {string} sourceDigest
  * @property {RuntimeFileRecord[]} files
  * @property {string} runtimeDigest
- * @property {{extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js"}} entries
+ * @property {{extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js"}} entries
  */
-/** @typedef {{extensionPath: string, pluginInventoryPath: string}} RuntimeEntries */
+/** @typedef {{extensionPath: string, pluginInventoryPath: string, mcpAdministrationPath: string}} RuntimeEntries */
 /** @typedef {{ok: true, manifest: RuntimeManifestV1, entries: RuntimeEntries} | {ok: false, category: "missing" | "source-stale" | "corrupt" | "version-mismatch", reason: string}} VerifyResult */
 
 /** @param {{packageRoot: string, checkSource?: boolean, distDirectory?: string}} options @returns {VerifyResult} */
@@ -344,7 +348,7 @@ export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDi
     if (JSON.stringify(currentPackage) !== JSON.stringify(manifest.package)) return failure("version-mismatch", "The installed PiCC runtime does not match the package identity.");
   }
 
-  return { ok: true, manifest, entries: { extensionPath: manifest.entries.extension, pluginInventoryPath: manifest.entries.pluginInventory } };
+  return { ok: true, manifest, entries: { extensionPath: manifest.entries.extension, pluginInventoryPath: manifest.entries.pluginInventory, mcpAdministrationPath: manifest.entries.mcpAdministration } };
 }
 
 /**
@@ -361,7 +365,7 @@ export function selectPiccRuntime({ packageRoot, installationKind }) {
     const message = verified.category === "missing"
       ? "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup."
       : "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.";
-    return { ok: true, mode: "source", entries: { extensionPath: SOURCE_EXTENSION_ENTRY, pluginInventoryPath: SOURCE_INVENTORY_ENTRY }, notice: { category: verified.category, message } };
+    return { ok: true, mode: "source", entries: { extensionPath: SOURCE_EXTENSION_ENTRY, pluginInventoryPath: SOURCE_INVENTORY_ENTRY, mcpAdministrationPath: SOURCE_MCP_ADMINISTRATION_ENTRY }, notice: { category: verified.category, message } };
   }
   const reason = installationKind === "installed"
     ? `The installed PiCC runtime is ${verified.category === "missing" ? "missing" : verified.category === "version-mismatch" ? "version-incoherent" : "damaged"}. Update or reinstall PiCC, then relaunch.`

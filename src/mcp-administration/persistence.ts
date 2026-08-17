@@ -6,7 +6,7 @@ import { normalizeMcpServerBlock } from "../claude/mcp-config.js";
 import { acquireLifecycleLocks, releaseLifecycleLocks, type LifecycleLockLease, type ProcessOwnershipProbe } from "../plugin-lifecycle/locks.js";
 import { createMcpLifecycleLocations } from "../plugin-lifecycle/locations.js";
 import { previewRecovery, recoverTransaction } from "../plugin-lifecycle/recovery.js";
-import { canonicalJsonBytes, sha256, type OwnedStateStore, type StoreResult } from "../plugin-lifecycle/state-store.js";
+import { sha256, type OwnedStateStore, type StoreResult } from "../plugin-lifecycle/state-store.js";
 import {
   createTransactionCodecRegistry, executeTransaction, isOwnedDataRetirementParticipant, listPendingJournals, prepareTransaction, readTransactionJournal,
   type OrdinaryTransactionParticipant, type TransactionFaultSeam, type TransactionOutcome, type TransactionParticipant,
@@ -15,7 +15,7 @@ import { projectIdentities } from "../util/project-identity.js";
 import type { McpMutationScope, McpReviewRecord, McpReviewSnapshot } from "./model.js";
 import { createMcpReviewDefinitionDigest, MCP_REVIEW_DEFINITION_VERSION, validateAndCopyMcpReviewSnapshot } from "./review-definition.js";
 import { MCP_REVIEW_STATE_MAX_BYTES, mcpReviewStatePath, readMcpReviewStateCapture, resetMcpReviewRecords, setMcpReviewRecord } from "./review-state.js";
-import { createMcpTransactionCodec, type McpCurrentAuthority, type McpFormatEvidence, type McpMutationIdentity, type McpParticipantEvidence, type McpTransactionSummary } from "./transaction-codec.js";
+import { canonicalMcpJsonBytes, createMcpTransactionCodec, type McpCurrentAuthority, type McpFormatEvidence, type McpMutationIdentity, type McpParticipantEvidence, type McpTransactionSummary } from "./transaction-codec.js";
 
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_INPUT_DEPTH = 10;
@@ -26,7 +26,8 @@ const retainedLeaseStores = new WeakMap<LifecycleLockLease, OwnedStateStore>();
 function retainedLeases(store: OwnedStateStore): Map<string, LifecycleLockLease> { const key = path.resolve(store.profileRoot); const existing = retainedMcpLeases.get(key); if (existing !== undefined) return existing; const created = new Map<string, LifecycleLockLease>(); retainedMcpLeases.set(key, created); return created; }
 export type McpPersistenceEffect = "changed" | "unchanged" | "uncertain";
 export type McpPersistenceCleanup = "complete" | "pending";
-export type McpPersistenceReasonCode = "no-op" | "invalid-authority" | "invalid-input" | "invalid-state" | "ambiguous-project-state" | "stale" | "busy" | "storage-failure" | "pending-recovery" | "cleanup-pending";
+export type McpPersistenceReasonCode = "no-op" | "already-exists" | "invalid-authority" | "invalid-input" | "invalid-state" | "ambiguous-project-state" | "stale" | "busy" | "storage-failure" | "pending-recovery" | "cleanup-pending";
+export interface McpPersistenceDeclarationEvidence { readonly scope: McpMutationScope; readonly name: string; readonly definitionVersion: 1; readonly definitionDigest: string }
 interface ResultBase { readonly retrySafe: boolean; readonly effect: McpPersistenceEffect; readonly cleanup: McpPersistenceCleanup; readonly reasonCode?: McpPersistenceReasonCode; readonly reason?: string }
 export type McpPersistenceResult =
   | (ResultBase & { readonly state: "committed"; readonly operationId?: string })
@@ -34,6 +35,9 @@ export type McpPersistenceResult =
   | (ResultBase & { readonly state: "failed-before-commit"; readonly operationId: string })
   | (ResultBase & { readonly state: "stale" | "busy" | "rejected" })
   | (ResultBase & { readonly state: "pending-recovery"; readonly operationId: string });
+
+const declarationEvidenceByResult = new WeakMap<object, McpPersistenceDeclarationEvidence>();
+export function mcpPersistenceDeclarationEvidence(result: McpPersistenceResult): McpPersistenceDeclarationEvidence | undefined { return declarationEvidenceByResult.get(result); }
 
 export type McpPersistenceMutation =
   | { readonly kind: "set-declaration"; readonly scope: McpMutationScope; readonly name: string; readonly definition: Readonly<Record<string, unknown>> }
@@ -57,10 +61,12 @@ export interface McpPersistenceContext {
 interface JsonDocument { readonly value: Record<string, unknown>; readonly bytes?: Buffer; readonly bom: boolean; readonly newline: "\n" | "\r\n"; readonly indent: string; readonly trailing: boolean }
 function fail(code: string, message: string): StoreResult<never> { return { ok: false, code, message }; }
 function record(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
-function validName(name: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) && !name.includes("__"); }
+const CLAUDE_BUILT_IN_SERVER_NAMES = new Set(["workspace", "claude-in-chrome", "computer-use", "Claude Preview", "Claude Browser"]);
+function validName(name: string): boolean { return name.length > 0 && name.length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/u.test(name); }
+function validAddName(name: string): boolean { return validName(name) && !CLAUDE_BUILT_IN_SERVER_NAMES.has(name); }
 function samePath(left: string, right: string): boolean { return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right; }
 function reason(code: McpPersistenceReasonCode): string {
-  return ({ "no-op": "The requested MCP state is already current", "invalid-authority": "MCP persistence authority is invalid or changed", "invalid-input": "The MCP mutation input is invalid", "invalid-state": "The target MCP state is malformed or unsafe", "ambiguous-project-state": "Consolidate or remove canonical-equivalent project entries in the selected .claude.json", stale: "The target MCP state changed concurrently", busy: "Another MCP administration operation holds the required lock", "storage-failure": "MCP persistence storage failed before a durable result", "pending-recovery": "MCP rollback remains pending and blocks new writes", "cleanup-pending": "The durable result is terminal but operation artifact cleanup remains pending" })[code];
+  return ({ "no-op": "The requested MCP state is already current", "already-exists": "An MCP declaration with that name already exists in the selected scope", "invalid-authority": "MCP persistence authority is invalid or changed", "invalid-input": "The MCP mutation input is invalid", "invalid-state": "The target MCP state is malformed or unsafe", "ambiguous-project-state": "Consolidate or remove canonical-equivalent project entries in the selected .claude.json", stale: "The target MCP state changed concurrently", busy: "Another MCP administration operation holds the required lock", "storage-failure": "MCP persistence storage failed before a durable result", "pending-recovery": "MCP rollback remains pending and blocks new writes", "cleanup-pending": "The durable result is terminal but operation artifact cleanup remains pending" })[code];
 }
 function rejected(code: McpPersistenceReasonCode): McpPersistenceResult { return { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: code, reason: reason(code) }; }
 
@@ -144,11 +150,11 @@ export interface McpDeclarationDefinitionBinding {
 }
 
 export function bindMcpDeclarationDefinition(name: string, input: Readonly<Record<string, unknown>>): StoreResult<McpDeclarationDefinitionBinding> {
-  if (!validName(name)) return fail("invalid-input", "MCP definition is invalid");
+  if (!validAddName(name)) return fail("invalid-input", "MCP definition is invalid");
   const copied = safeJsonCopy(input); if (!copied.ok || !record(copied.value)) return fail("invalid-input", "MCP definition is invalid");
-  const block = Object.create(null) as Record<string, unknown>; block[name] = copied.value;
+  const validationName = "picc-validation"; const block = Object.create(null) as Record<string, unknown>; block[validationName] = copied.value;
   const entries = normalizeMcpServerBlock(block, "MCP administration"); const entry = entries[0];
-  if (entries.length !== 1 || entry === undefined || entry.name !== name || entry.skipped || entry.notConfigured) return fail("invalid-input", "MCP definition is invalid");
+  if (entries.length !== 1 || entry === undefined || entry.name !== validationName || entry.skipped || entry.notConfigured) return fail("invalid-input", "MCP definition is invalid");
   const definitionDigest = createMcpReviewDefinitionDigest(entry);
   if (definitionDigest === undefined) return fail("invalid-input", "MCP definition is invalid");
   return { ok: true, value: Object.freeze({ definition: copied.value, definitionVersion: MCP_REVIEW_DEFINITION_VERSION, definitionDigest }) };
@@ -159,8 +165,7 @@ export function validateMcpDeclarationInput(name: string, input: Readonly<Record
   return binding.ok ? { ok: true, value: binding.value.definition as Record<string, unknown> } : binding;
 }
 function canonicalEqual(left: unknown, right: unknown): boolean {
-  try { const a = canonicalJsonBytes(JSON.parse(JSON.stringify(left)) as unknown); const b = canonicalJsonBytes(JSON.parse(JSON.stringify(right)) as unknown); return a.ok && b.ok && Buffer.from(a.value).equals(Buffer.from(b.value)); }
-  catch { return false; }
+  const a = canonicalMcpJsonBytes(left); const b = canonicalMcpJsonBytes(right); return a.ok && b.ok && a.value.equals(b.value);
 }
 function participantEvidence(context: McpPersistenceContext, role: McpParticipantEvidence["role"], targetPath: string, mutation: McpMutationIdentity, format: McpFormatEvidence, nativeProjectKey?: string): McpParticipantEvidence {
   return Object.freeze({ version: 1, role, targetPath: path.resolve(targetPath), profileKey: context.store.profileKey, checkoutFamilyKey: context.checkoutFamilyKey, authorityFingerprint: context.authorityFingerprint, mutation, format, ...(nativeProjectKey === undefined ? {} : { nativeProjectKey }) });
@@ -236,7 +241,7 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
       const recovered = await recoverPending(context, reviewPath.value, options.faults); if (recovered !== undefined) return recovered;
     }
     if (!reviewPath.ok || !/^sha256:[a-f0-9]{64}$/.test(context.authorityFingerprint) || !(await currentAuthority(context)).ok) return rejected("invalid-authority");
-    if ("name" in mutation && !validName(mutation.name)) return rejected("invalid-input");
+    if ("name" in mutation && (!validName(mutation.name) || mutation.kind === "set-declaration" && !validAddName(mutation.name))) return rejected("invalid-input");
     let reviewRecord: McpReviewRecord | undefined;
     if (mutation.kind === "set-review") {
       const bounded = safeJsonCopy(mutation.record); if (!bounded.ok) return rejected("invalid-input");
@@ -274,17 +279,21 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
       } else {
         if (Object.hasOwn(holder, "mcpServers") && !record(holder.mcpServers)) return rejected("invalid-state");
         if (mutation.kind === "set-declaration") {
-          const servers = Object.hasOwn(holder, "mcpServers") ? holder.mcpServers as Record<string, unknown> : (holder.mcpServers = {}); servers[mutation.name] = preparedDefinition!.value.definition;
+          const servers = Object.hasOwn(holder, "mcpServers") ? holder.mcpServers as Record<string, unknown> : (holder.mcpServers = {});
+          if (Object.hasOwn(servers, mutation.name)) return rejected("already-exists");
+          Object.defineProperty(servers, mutation.name, { value: preparedDefinition!.value.definition, enumerable: true, configurable: true, writable: true });
         } else if (Object.hasOwn(holder, "mcpServers")) delete (holder.mcpServers as Record<string, unknown>)[mutation.name];
       }
       if (scope === "local" && newLocalRecord && !canonicalEqual(holder, {})) {
-        const projects = Object.hasOwn(document.value, "projects") ? document.value.projects as Record<string, unknown> : (document.value.projects = {}); projects[nativeProjectKey!] = holder;
+        const projects = Object.hasOwn(document.value, "projects") ? document.value.projects as Record<string, unknown> : (document.value.projects = {});
+        Object.defineProperty(projects, nativeProjectKey!, { value: holder, enumerable: true, configurable: true, writable: true });
       }
       operation = mutation.kind === "set-runtime-disabled" ? "runtime-disable" : "declaration";
     }
-    if (canonicalEqual(beforeValue, document.value)) return { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") };
+    const declarationEvidence = mutation.kind === "set-declaration" ? { scope: mutation.scope, name: mutation.name, definitionVersion: preparedDefinition!.value.definitionVersion, definitionDigest: preparedDefinition!.value.definitionDigest } as const : undefined;
+    if (canonicalEqual(beforeValue, document.value)) { const result: McpPersistenceResult = { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") }; if (declarationEvidence !== undefined) declarationEvidenceByResult.set(result, declarationEvidence); return result; }
     let mutationIdentity: McpMutationIdentity;
-    if (mutation.kind === "set-declaration") { const canonical = canonicalJsonBytes(JSON.parse(JSON.stringify(preparedDefinition!.value.definition)) as unknown); if (!canonical.ok) return rejected("invalid-input"); mutationIdentity = { kind: "set-declaration", scope: mutation.scope, serverName: mutation.name, definitionDigest: sha256(canonical.value) }; }
+    if (mutation.kind === "set-declaration") { const canonical = canonicalMcpJsonBytes(preparedDefinition!.value.definition); if (!canonical.ok) return rejected("invalid-input"); mutationIdentity = { kind: "set-declaration", scope: mutation.scope, serverName: mutation.name, definitionDigest: sha256(canonical.value) }; }
     else if (mutation.kind === "remove-declaration") mutationIdentity = { kind: "remove-declaration", scope: mutation.scope, serverName: mutation.name };
     else if (mutation.kind === "set-runtime-disabled") mutationIdentity = { kind: "set-runtime-disabled", serverName: mutation.name, disabled: mutation.disabled };
     else if (mutation.kind === "set-review") mutationIdentity = { kind: "set-review", source: reviewRecord!.source, serverName: reviewRecord!.serverName, ...(reviewRecord!.agentOwner === undefined ? {} : { agentOwner: reviewRecord!.agentOwner }), definitionDigest: reviewRecord!.definitionDigest, decision: reviewRecord!.decision };
@@ -302,10 +311,22 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
     const lease = await acquireLifecycleLocks({ store: context.store, operationId, identities: locks.value, ...(context.processOwnershipProbe === undefined ? {} : { processProbe: context.processOwnershipProbe }) });
     if (!lease.ok) { const clean = await cleanupArtifacts(ownedArtifacts); return { state: lease.code === "lock-busy" ? "busy" : "rejected", retrySafe: true, effect: "unchanged", cleanup: clean ? "complete" : "pending", reasonCode: clean ? lease.code === "lock-busy" ? "busy" : "storage-failure" : "cleanup-pending", reason: reason(clean ? lease.code === "lock-busy" ? "busy" : "storage-failure" : "cleanup-pending") }; }
     const result = await mapOutcome(await executeTransaction(context.store, prepared.value, { lease: lease.value, ...(options.faults === undefined ? {} : { faults: options.faults }) }), ownedArtifacts);
+    if (result.state === "committed" && declarationEvidence !== undefined) declarationEvidenceByResult.set(result, declarationEvidence);
     if (result.state === "pending-recovery") { retainedLeases(context.store).set(operationId, lease.value); retainedLeaseStores.set(lease.value, context.store); return result; }
     const released = await releaseLifecycleLocks(lease.value).catch(() => ({ ok: false as const })); return cleanupPosture(result, released.ok);
   } catch {
     const clean = await cleanupArtifacts(ownedArtifacts); return { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: clean ? "complete" : "pending", reasonCode: clean ? "storage-failure" : "cleanup-pending", reason: reason(clean ? "storage-failure" : "cleanup-pending") };
+  }
+}
+
+export async function recoverMcpPendingOperation(context: McpPersistenceContext, options: { readonly faults?: TransactionFaultSeam } = {}): Promise<McpPersistenceResult> {
+  try {
+    const reviewPath = mcpReviewStatePath(context.store, context.checkoutFamilyKey);
+    if (!reviewPath.ok || !/^sha256:[a-f0-9]{64}$/.test(context.authorityFingerprint) || !(await currentAuthority(context)).ok) return rejected("invalid-authority");
+    const recovered = await recoverPending(context, reviewPath.value, options.faults);
+    return recovered ?? { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") };
+  } catch {
+    return rejected("storage-failure");
   }
 }
 

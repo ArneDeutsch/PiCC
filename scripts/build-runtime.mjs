@@ -116,7 +116,7 @@ export function buildRuntime({
       sourceDigest: before.sourceDigest,
       files,
       runtimeDigest,
-      entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js" },
+      entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
     };
     fileSystem.writeFileSync(path.join(stage, "picc-runtime.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
 

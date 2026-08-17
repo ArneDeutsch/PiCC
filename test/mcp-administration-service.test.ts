@@ -71,14 +71,14 @@ function expectedInventory(declarations: readonly McpAdministrationDeclaration[]
 }
 
 function harness(states: McpAdministrationFreshState[], options: { pending?: boolean; recovery?: McpPersistenceResult; mutation?: McpPersistenceResult; live?: McpAdministrationLiveResult } = {}) {
-  let index = 0;
+  let index = 0; let pendingNow = options.pending ?? false;
   const calls: string[] = [];
   const mutate = vi.fn(async () => { calls.push("mutate"); return options.mutation ?? committed(); });
-  const recover = vi.fn(async () => { calls.push("recover"); return options.recovery ?? rolledBack; });
+  const recover = vi.fn(async () => { calls.push("recover"); const result = options.recovery ?? rolledBack; if (result.state === "rolled-back" && result.cleanup === "complete" || result.state === "committed" && result.effect === "unchanged" && result.cleanup === "complete") pendingNow = false; return result; });
   const assemble = vi.fn(() => { calls.push("assemble"); return states[Math.min(index++, states.length - 1)]!; });
   const apply = vi.fn(async (_request: McpAdministrationLiveRequest) => { calls.push("live"); return options.live ?? { runtime: { state: "succeeded" as const }, exposure: { state: "succeeded" as const } }; });
   const service = createMcpAdministrationService({
-    inspectPending: async () => ({ pending: options.pending ?? false, status: options.pending ? "pending" : "clear" }),
+    inspectPending: async () => ({ pending: pendingNow, status: pendingNow ? "pending" as const : "clear" as const }),
     recover,
     mutate,
     assemble,
@@ -110,6 +110,18 @@ describe("MCP administration eligibility", () => {
     await expect(h.service.preview({ kind: "remove", scope: "project", name: "same" })).resolves.toMatchObject({ eligibility: { reasonCode: "scope-mismatch" } });
     await expect(h.service.preview({ kind: "remove", scope: "user", name: "same" })).resolves.toMatchObject({ eligibility: { eligible: true } });
     await expect(h.service.preview({ kind: "add", scope: "project", name: "same", definition: { command: "new" } })).resolves.toMatchObject({ eligibility: { eligible: true } });
+    await expect(h.service.preview({ kind: "add", scope: "user", name: "same", definition: { command: "new" } })).resolves.toMatchObject({ eligibility: { eligible: false, reasonCode: "already-exists" } });
+    const executed = await h.service.execute({ kind: "add", scope: "user", name: "same", definition: { command: "new" } });
+    expect(executed).toMatchObject({ eligibility: { eligible: false, reasonCode: "already-exists" }, durable: { state: "not-requested" } }); expect(h.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects Claude built-in names only for add while retaining externally acquired administration", async () => {
+    const names = ["workspace", "claude-in-chrome", "computer-use", "Claude Preview", "Claude Browser"];
+    for (const name of names) {
+      const external = declaration({ name, source: "native-user", authority: { kind: "mutable", scope: "user" } }); const h = harness([fresh([external])]);
+      await expect(h.service.preview({ kind: "add", scope: "project", name, definition: { command: "run" } }), name).resolves.toMatchObject({ eligibility: { eligible: false, reasonCode: "invalid-input" } });
+      await expect(h.service.preview({ kind: "remove", scope: "user", name }), name).resolves.toMatchObject({ eligibility: { eligible: true } });
+    }
   });
 
   it("table-drives every acquired source across review, toggle, reconnect, and authentication policy", async () => {
@@ -173,11 +185,19 @@ describe("MCP administration eligibility", () => {
     ] as const) await expect(h.service.preview(action)).resolves.toMatchObject({ eligibility: { eligible: false, reasonCode: action.kind === "reconnect" ? "unsupported-source" : "server-not-found" } });
   });
 
+  it("returns fixed duplicate eligibility and preserves state when create loses a persistence race", async () => {
+    const bytes = Buffer.from('{"mcpServers":{"neighbor":{"command":"keep"}}}\n'); const before = Buffer.from(bytes);
+    const raced: McpPersistenceResult = { state: "stale", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "stale" };
+    const h = harness([fresh([]), fresh([])], { mutation: raced });
+    await expect(h.service.execute({ kind: "add", scope: "project", name: "raced", definition: { command: "run" } })).resolves.toMatchObject({ eligibility: { eligible: false, reasonCode: "durable-mutation-failed" }, durable: { state: "stale", effect: "unchanged" } });
+    expect(bytes).toEqual(before); expect(h.apply).not.toHaveBeenCalled();
+  });
+
   it("validates add previews through the persistence-owned descriptor-safe validator", async () => {
     const getter = Object.create(null) as Record<string, unknown>;
     Object.defineProperty(getter, "command", { enumerable: true, get() { throw new Error("must stay inert"); } });
     for (const action of [
-      { kind: "add", scope: "user", name: "bad__name", definition: { command: "run" } },
+      { kind: "add", scope: "user", name: "bad\u0000name", definition: { command: "run" } },
       { kind: "add", scope: "user", name: "safe", definition: getter },
       { kind: "add", scope: "project", name: "safe", definition: { unknown: true } },
     ] as const) {
@@ -212,6 +232,17 @@ describe("MCP administration eligibility", () => {
 });
 
 describe("MCP administration orchestration", () => {
+  it("prepares fresh inventory through recovery only and recovers before mutation/live work", async () => {
+    const preparedServer = declaration({ name: "prepared", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const preparation = harness([fresh([preparedServer])], { pending: true });
+    await expect(preparation.service.prepareInventoryAfterRecovery()).resolves.toMatchObject({ eligibility: { eligible: true }, recovery: { state: "rolled-back" }, inventory: { servers: [expect.objectContaining({ name: "prepared" })] } });
+    expect(preparation.calls).toEqual(["recover", "assemble"]); expect(preparation.mutate).not.toHaveBeenCalled();
+
+    const stillPending = harness([fresh([])], { pending: true, recovery: pending });
+    await expect(stillPending.service.prepareInventoryAfterRecovery()).resolves.toMatchObject({ eligibility: { reasonCode: "recovery-pending" }, inventory: { servers: [] } }); expect(stillPending.assemble).not.toHaveBeenCalled();
+
+  });
+
   it("recovers before assembly, mutation, fresh assembly, and composite live work", async () => {
     const server = declaration({ name: "s", source: "native-local", authority: { kind: "mutable", scope: "local" } });
     const h = harness([fresh([server]), fresh([{ ...server, status: "disabled", inactiveReason: "native-runtime-disabled" }])], { pending: true });
@@ -410,7 +441,7 @@ describe("MCP administration orchestration", () => {
     }
   });
 
-  it("suppresses live work when durable add or review postconditions are stale or ineffective", async () => {
+  it("accepts exact durable pending add while suppressing live work for pending and stale postconditions", async () => {
     const additions = [
       boundDeclaration("added", "managed-mcp", { command: "secret-command", env: { TOKEN: "secret" } }),
       boundDeclaration("added", "project-mcpjson", { command: "secret-command", env: { TOKEN: "secret" } }, { authority: { kind: "mutable", scope: "project" }, review: "pending", status: "pending-approval" }),
@@ -420,7 +451,7 @@ describe("MCP administration orchestration", () => {
       const h = harness([fresh([]), fresh([finalServer!])]);
       await expect(h.service.execute({ kind: "add", scope: "project", name: "added", definition: { command: "secret-command", env: { TOKEN: "secret" } } })).resolves.toEqual({
         inventory: expectedInventory([finalServer!]),
-        eligibility: { eligible: false, reasonCode: index === 1 ? "not-effective" : "stale-state" },
+        eligibility: index === 1 ? { eligible: true, reasonCode: "eligible" } : { eligible: false, reasonCode: "stale-state" },
         recovery: { state: "not-requested" },
         durable: committed(),
         runtime: { state: "not-requested" },
@@ -450,6 +481,23 @@ describe("MCP administration orchestration", () => {
       exposure: { state: "not-requested" },
     });
     expect(ineffectiveApproval.apply).not.toHaveBeenCalled();
+  });
+
+  it("treats exact durable add presence as success across shadowed, pending, rejected, disabled, auth-needed, and disconnected states", async () => {
+    const definition = { command: "run" };
+    const rows = [
+      { label: "shadowed", scope: "project" as const, server: boundDeclaration("broad name__x", "project-mcpjson", definition, { authority: { kind: "mutable", scope: "project" }, precedence: "shadowed", status: "shadowed" }), live: [] },
+      { label: "pending", scope: "project" as const, server: boundDeclaration("broad name__x", "project-mcpjson", definition, { authority: { kind: "mutable", scope: "project" }, review: "pending", status: "pending-approval" }), live: [] },
+      { label: "rejected", scope: "project" as const, server: boundDeclaration("broad name__x", "project-mcpjson", definition, { authority: { kind: "mutable", scope: "project" }, review: "rejected-exact", status: "disabled" }), live: [] },
+      { label: "disabled", scope: "user" as const, server: boundDeclaration("broad name__x", "native-user", definition, { authority: { kind: "mutable", scope: "user" }, status: "disabled", inactiveReason: "native-runtime-disabled" }), live: [] },
+      { label: "auth-needed", scope: "user" as const, server: boundDeclaration("broad name__x", "native-user", definition, { authority: { kind: "mutable", scope: "user" } }), live: [{ name: "broad name__x", state: "failed" as const, diagnostic: "authentication" }] },
+      { label: "disconnected", scope: "user" as const, server: boundDeclaration("broad name__x", "native-user", definition, { authority: { kind: "mutable", scope: "user" } }), live: [{ name: "broad name__x", state: "failed" as const }] },
+    ];
+    for (const row of rows) {
+      const h = harness([fresh([]), fresh([row.server], row.live)]);
+      await expect(h.service.execute({ kind: "add", scope: row.scope, name: "broad name__x", definition }), row.label).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" } });
+      if (row.server.precedence === "winner" && row.server.status === "enabled") expect(h.apply, row.label).toHaveBeenCalledOnce(); else expect(h.apply, row.label).not.toHaveBeenCalled();
+    }
   });
 
   it("blocks stale and ineffective reject, disable, and enable final states with complete outcomes", async () => {

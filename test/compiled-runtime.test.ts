@@ -26,7 +26,7 @@ type RuntimeManifest = {
   sourceDigest: string;
   files: RecordEntry[];
   runtimeDigest: string;
-  entries: { extension: string; pluginInventory: string };
+  entries: { extension: string; pluginInventory: string; mcpAdministration: string };
 };
 
 function digest(value: unknown): string {
@@ -44,6 +44,7 @@ function writeFixture(): void {
   fs.mkdirSync(path.join(fixtureRoot, "src", "nested"), { recursive: true });
   fs.writeFileSync(path.join(fixtureRoot, "src", "index.ts"), 'export default function mappedWitness(): never { throw new Error("mapped witness"); }\n');
   fs.writeFileSync(path.join(fixtureRoot, "src", "plugin-inventory-cli.ts"), "export const inventory = true;\n");
+  fs.writeFileSync(path.join(fixtureRoot, "src", "mcp-administration-cli.ts"), "export const mcpAdministration = true;\n");
   fs.writeFileSync(path.join(fixtureRoot, "src", "nested", "café.ts"), "export const café = true;\n");
   fs.writeFileSync(path.join(fixtureRoot, "unrelated.txt"), "not a compiler input\n");
   fs.copyFileSync(path.join(repositoryRoot, "tsconfig.runtime.json"), path.join(fixtureRoot, "tsconfig.runtime.json"));
@@ -82,7 +83,7 @@ function expectVerified(checkSource = true): RuntimeManifest {
   expect(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource })).toStrictEqual({
     ok: true,
     manifest: expectedManifest,
-    entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js" },
+    entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
   });
   return expectedManifest;
 }
@@ -139,7 +140,7 @@ describe("compiled runtime identity", () => {
       .filter((entry) => fs.statSync(path.join(fixtureRoot, "dist", ...entry.split("/"))).isFile())
       .sort();
     expect(outputs).toStrictEqual([
-      "index.js", "index.js.map", "nested/café.js", "nested/café.js.map", "picc-runtime.json",
+      "index.js", "index.js.map", "mcp-administration-cli.js", "mcp-administration-cli.js.map", "nested/café.js", "nested/café.js.map", "picc-runtime.json",
       "plugin-inventory-cli.js", "plugin-inventory-cli.js.map",
     ]);
     expect(fs.readFileSync(path.join(fixtureRoot, "dist", "index.js"), "utf8")).toContain("function mappedWitness()");
@@ -153,10 +154,10 @@ describe("compiled runtime identity", () => {
       dependencyLockPath: "package-lock.json",
       dependencyLockSha256: hashFile(path.join(fixtureRoot, "package-lock.json")),
     };
-    const canonicalSources = ["src/index.ts", "src/nested/café.ts", "src/plugin-inventory-cli.ts"]
+    const canonicalSources = ["src/index.ts", "src/mcp-administration-cli.ts", "src/nested/café.ts", "src/plugin-inventory-cli.ts"]
       .map((recordPath) => ({ path: recordPath, sha256: hashFile(path.join(fixtureRoot, ...recordPath.split("/"))) }));
     const canonicalFiles = [
-      "dist/index.js", "dist/index.js.map", "dist/nested/café.js", "dist/nested/café.js.map",
+      "dist/index.js", "dist/index.js.map", "dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map", "dist/nested/café.js", "dist/nested/café.js.map",
       "dist/plugin-inventory-cli.js", "dist/plugin-inventory-cli.js.map", "picc/index.js",
     ].map((recordPath) => ({ path: recordPath, sha256: hashFile(path.join(fixtureRoot, ...recordPath.split("/"))) }));
     expect(first.package).toStrictEqual(canonicalPackage);
@@ -295,6 +296,7 @@ describe("compiled runtime identity", () => {
     for (const requiredPair of [
       ["dist/index.js", "dist/index.js.map"],
       ["dist/plugin-inventory-cli.js", "dist/plugin-inventory-cli.js.map"],
+      ["dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map"],
     ]) {
       const originalFiles = requiredPair.map((requiredPath) => {
         const physicalPath = path.join(fixtureRoot, ...requiredPath.split("/"));
@@ -311,6 +313,11 @@ describe("compiled runtime identity", () => {
         fs.writeFileSync(manifestPath, originalManifest);
       }
     }
+  });
+
+  it("rejects a self-consistent manifest whose MCP entry does not name the exact authorized output", () => {
+    rewriteManifest((value) => { value.entries.mcpAdministration = "dist/plugin-inventory-cli.js"; }, true);
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
   });
 
   it("rejects changed, missing, unexpected, mapless, orphan-map, and unsafe-map output", () => {
@@ -434,13 +441,13 @@ describe("compiled runtime identity", () => {
   it("returns installation-aware exact selector unions without forwarding verifier prose", () => {
     const expectedManifest = manifest();
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({
-      ok: true, mode: "compiled", entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js" },
+      ok: true, mode: "compiled", entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
       manifest: expectedManifest, notice: null,
     });
     const saved = path.join(fixtureRoot, "saved dist");
     fs.renameSync(path.join(fixtureRoot, "dist"), saved);
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" })).toStrictEqual({
-      ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts" },
+      ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts", mcpAdministrationPath: "src/mcp-administration-cli.ts" },
       notice: {
         category: "missing",
         message: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.",
@@ -455,7 +462,7 @@ describe("compiled runtime identity", () => {
 
     fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// stale\n");
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" })).toStrictEqual({
-      ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts" },
+      ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts", mcpAdministrationPath: "src/mcp-administration-cli.ts" },
       notice: {
         category: "source-stale",
         message: "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.",

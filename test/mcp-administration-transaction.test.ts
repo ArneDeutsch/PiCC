@@ -27,8 +27,10 @@ function reboundPlanDigest(value: { participants: Record<string, unknown>[]; req
 describe("MCP transaction taxonomy", () => {
   it("reports committed state and leaves no pending journal", async () => {
     const f = await setup(); try {
-      const result = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "user", name: "safe", definition: { command: "run" } });
-      expect(result).toMatchObject({ state: "committed", retrySafe: false });
+      for (const name of ["broad name__authenticated", "__proto__"]) {
+        const result = await persistMcpMutation(f.context, { kind: "set-declaration", scope: "user", name, definition: { command: "run" } });
+        expect(result, name).toMatchObject({ state: "committed", retrySafe: false }); const servers = (JSON.parse(fs.readFileSync(f.context.profilePath, "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers; expect(Object.hasOwn(servers, name)).toBe(true);
+      }
       expect(await inspectMcpPendingOperation(f.store)).toEqual({ pending: false, status: "clear" });
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   });

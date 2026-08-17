@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { canonicalJsonBytes, sha256, type OwnedStateStore, type StoreResult } from "../plugin-lifecycle/state-store.js";
+import { sha256, type OwnedStateStore, type StoreResult } from "../plugin-lifecycle/state-store.js";
 import type { LifecycleLockIdentity } from "../plugin-lifecycle/locks.js";
 import { isOwnedDataRetirementParticipant, type ExternalMutationContext, type OrdinaryTransactionParticipant, type TransactionParticipant, type TransactionProducerCodec } from "../plugin-lifecycle/transaction.js";
 import { validateAndCopyMcpReviewSnapshot } from "./review-definition.js";
@@ -51,7 +51,7 @@ function fail(code: string, message: string): StoreResult<never> { return { ok: 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function samePath(left: string, right: string): boolean { return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right; }
 function validScope(value: unknown): value is McpMutationScope { return value === "project" || value === "local" || value === "user"; }
-function validName(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes("__"); }
+function validName(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value); }
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { const actual = Object.keys(value).sort(); const expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
 function validDigest(value: unknown): value is string { return typeof value === "string" && /^(?:sha256|mcp-review-v1):[a-f0-9]{64}$/.test(value); }
 function mutationIdentity(value: unknown): McpMutationIdentity | undefined {
@@ -70,7 +70,19 @@ function formatEvidence(value: unknown): McpFormatEvidence | undefined {
   if (!isRecord(value) || !exactKeys(value, ["bom", "indent", "newline", "trailing"]) || typeof value.bom !== "boolean" || (value.newline !== "\n" && value.newline !== "\r\n") || typeof value.indent !== "string" || value.indent.length > 16 || typeof value.trailing !== "boolean") return undefined;
   return value as unknown as McpFormatEvidence;
 }
-function canonicallyEqual(left: unknown, right: unknown): boolean { const a = canonicalJsonBytes(left); const b = canonicalJsonBytes(right); return a.ok && b.ok && Buffer.from(a.value).equals(Buffer.from(b.value)); }
+export function canonicalMcpJsonBytes(value: unknown): StoreResult<Buffer> {
+  try {
+    const encode = (item: unknown): string => {
+      if (item === null || typeof item === "boolean" || typeof item === "string") return JSON.stringify(item);
+      if (typeof item === "number" && Number.isFinite(item)) return JSON.stringify(item);
+      if (Array.isArray(item)) return `[${item.map(encode).join(",")}]`;
+      if (!isRecord(item)) throw new Error("shape");
+      return `{${Object.keys(item).sort().map((key) => `${JSON.stringify(key)}:${encode(item[key])}`).join(",")}}`;
+    };
+    return { ok: true, value: Buffer.from(encode(value), "utf8") };
+  } catch { return fail("invalid-json", "MCP JSON is invalid"); }
+}
+function canonicallyEqual(left: unknown, right: unknown): boolean { const a = canonicalMcpJsonBytes(left); const b = canonicalMcpJsonBytes(right); return a.ok && b.ok && a.value.equals(b.value); }
 
 export function decodeMcpTransactionSummary(value: unknown, store: OwnedStateStore): StoreResult<McpTransactionSummary> {
   if (!isRecord(value) || value.version !== 1 || value.profileKey !== store.profileKey ||
@@ -143,8 +155,8 @@ async function validateSurgicalSuccessor(participant: OrdinaryTransactionPartici
         if (mutation.kind === "remove-declaration") delete expectedServers[mutation.serverName];
         else {
           const stagedServers = isRecord(stagedHolder.mcpServers) ? stagedHolder.mcpServers : undefined; const definition = stagedServers?.[mutation.serverName];
-          const canonical = canonicalJsonBytes(definition); if (!canonical.ok || sha256(canonical.value) !== mutation.definitionDigest) return fail("invalid-successor", "MCP declaration digest changed");
-          expectedServers[mutation.serverName] = definition;
+          const canonical = canonicalMcpJsonBytes(definition); if (!canonical.ok || sha256(canonical.value) !== mutation.definitionDigest) return fail("invalid-successor", "MCP declaration digest changed");
+          Object.defineProperty(expectedServers, mutation.serverName, { value: definition, enumerable: true, configurable: true, writable: true });
         }
       }
     }
