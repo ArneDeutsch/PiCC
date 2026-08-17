@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import { digestArtifactEntries, type ArtifactDigestEntry } from "./artifact-digest.js";
-import type { LifecycleLocations } from "./locations.js";
+import { OwnedStateStoreNamespace, type LifecycleLocations } from "./locations.js";
 import {
   bindPrivateStagingParentForTrustedCode,
   type MaterializedPluginTree,
@@ -116,7 +116,13 @@ export async function establishOwnedStateStore(
       || isWindowsNamespaceOrUnc(trustedHome) || isWindowsNamespaceOrUnc(locations.root)) throw new Error("invalid trusted home");
     const home = path.resolve(trustedHome);
     const root = path.resolve(locations.root);
-    const expectedRoot = path.join(home, ".picc", "plugins", "v1");
+    const namespaceDirectory = locations.storeNamespace === OwnedStateStoreNamespace.Plugins
+      ? "plugins"
+      : locations.storeNamespace === OwnedStateStoreNamespace.Mcp
+        ? "mcp"
+        : undefined;
+    if (namespaceDirectory === undefined) throw new Error("invalid store namespace");
+    const expectedRoot = path.join(home, ".picc", namespaceDirectory, "v1");
     const expectedProfileRoot = path.join(expectedRoot, "profiles", locations.profileKey);
     if (!/^profile-[A-Za-z0-9_-]+$/.test(locations.profileKey) || !equalPath(root, expectedRoot)
       || !equalPath(path.resolve(locations.profileRoot), expectedProfileRoot)

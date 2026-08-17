@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { createLifecycleLocations, OwnedStateStoreNamespace } from "../src/plugin-lifecycle/locations.js";
 import {
   canonicalJsonBytes, createProducerCodecRegistry, createRecordEnvelope, establishOwnedStateStore,
   issuePrivateStagingParent, ownedRecordPartition, publishMaterializedArtifact, readRecordEnvelope,
@@ -32,6 +32,12 @@ function artifactDestination(store: OwnedStateStore, digest: string): string { r
 describe("owned lifecycle state store", () => {
   it("puts every authoritative root beneath one profile and isolates equal operation names across profiles", async () => {
     const base = await home(); const first = await fixture(base, "one"); const second = await fixture(base, "two");
+    const pluginLocations = createLifecycleLocations({ homeDir: base, profilePath: path.join(base, "one"), platform: process.platform === "win32" ? "win32" : "posix" });
+    if (!pluginLocations.ok) throw new Error(pluginLocations.error.message);
+    expect(pluginLocations.value.storeNamespace).toBe(OwnedStateStoreNamespace.Plugins);
+    const expectedPluginProfile = path.join(base, ".picc", "plugins", "v1", "profiles", first.profileKey);
+    expect(process.platform === "win32" ? first.profileRoot.toLowerCase() : first.profileRoot)
+      .toBe(process.platform === "win32" ? expectedPluginProfile.toLowerCase() : expectedPluginProfile);
     for (const store of [first, second]) for (const candidate of [store.artifactsRoot, store.recordsRoot, store.stagingRoot, store.generationsRoot, store.journalsRoot, store.receiptsRoot, store.locksRoot, store.quarantineRoot, store.dataRoot!]) expect(path.relative(store.profileRoot, candidate)).not.toMatch(/^\.\./);
     expect(first.dataRoot).toBe(path.join(first.profileRoot, "data")); expect(second.dataRoot).toBe(path.join(second.profileRoot, "data"));
     expect(first.profileRoot).not.toBe(second.profileRoot);
