@@ -11,6 +11,7 @@
 
 import path from "node:path";
 import type {
+  AgentToolRestrictionValidation,
   ClaudeAgent,
   Diagnostic,
   HookConfig,
@@ -60,6 +61,223 @@ const KNOWN_HANDLER_TYPES: readonly string[] = [
 /** Tools whose presence makes an agent NOT read-only for catalog purposes. */
 const WRITE_CAPABLE_TOOLS = new Set(["write", "edit", "bash"]);
 const PLUGIN_AGENT_LOCAL_NAME = /^[a-z]+(?:-[a-z]+)*$/;
+
+export const AGENT_TOOL_RESTRICTION_LIMITS = Object.freeze({
+  items: 256,
+  itemChars: 4_096,
+  totalChars: 65_536,
+});
+
+type ToolRestrictionFieldState = "absent" | "valid" | "invalid";
+
+export interface NormalizedAgentToolRestrictions {
+  tools?: string[];
+  disallowedTools?: string[];
+  validation: AgentToolRestrictionValidation;
+}
+
+function ownDataValue(
+  value: unknown,
+  key: PropertyKey,
+): { state: "absent" } | { state: "invalid" } | { state: "present"; value: unknown } {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return { state: "invalid" };
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) return { state: "absent" };
+    if (!("value" in descriptor)) return { state: "invalid" };
+    return { state: "present", value: descriptor.value };
+  } catch {
+    return { state: "invalid" };
+  }
+}
+
+function safeArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype;
+  } catch {
+    return false;
+  }
+}
+
+function safeArrayLength(value: unknown[]): number | undefined {
+  const length = ownDataValue(value, "length");
+  return length.state === "present" && typeof length.value === "number"
+    && Number.isSafeInteger(length.value) && length.value >= 0
+    ? length.value
+    : undefined;
+}
+
+function safeStringList(value: unknown): string[] | undefined {
+  try {
+    return toStringList(value);
+  } catch {
+    return undefined;
+  }
+}
+
+interface LegacyRestrictionProjectionBudget {
+  visits: number;
+  projectedChars: number;
+}
+
+function consumeLegacyProjection(
+  budget: LegacyRestrictionProjectionBudget,
+  chars: number,
+): boolean {
+  budget.visits++;
+  budget.projectedChars += chars;
+  return budget.visits <= AGENT_TOOL_RESTRICTION_LIMITS.items
+    && budget.projectedChars <= AGENT_TOOL_RESTRICTION_LIMITS.totalChars;
+}
+
+function legacyRestrictionScalar(
+  value: unknown,
+  depth: number,
+  budget: LegacyRestrictionProjectionBudget,
+): string | undefined {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+    || value === null || value === undefined) {
+    const projected = String(value);
+    return consumeLegacyProjection(budget, projected.length) ? projected : undefined;
+  }
+  if (depth >= 4 || !consumeLegacyProjection(budget, 0)) return undefined;
+  if (safeArray(value)) {
+    const length = safeArrayLength(value);
+    if (length === undefined || length > AGENT_TOOL_RESTRICTION_LIMITS.items) return undefined;
+    const parts: string[] = [];
+    for (let index = 0; index < length; index++) {
+      const item = ownDataValue(value, index);
+      if (item.state !== "present") return undefined;
+      const projected = legacyRestrictionScalar(item.value, depth + 1, budget);
+      if (projected === undefined) return undefined;
+      parts.push(projected);
+    }
+    const separators = Math.max(0, parts.length - 1);
+    if (budget.projectedChars + separators > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return undefined;
+    budget.projectedChars += separators;
+    return parts.join(",");
+  }
+  try {
+    const projected = "[object Object]";
+    if (Object.getPrototypeOf(value) === Object.prototype
+      && budget.projectedChars + projected.length <= AGENT_TOOL_RESTRICTION_LIMITS.totalChars) {
+      budget.projectedChars += projected.length;
+      return projected;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function boundedLegacyStringList(value: string): string[] | undefined {
+  if (value.length > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return undefined;
+  const projected = safeStringList(value);
+  if (projected === undefined || projected.length > AGENT_TOOL_RESTRICTION_LIMITS.items) return undefined;
+  let totalChars = 0;
+  for (const item of projected) {
+    if (item.length > AGENT_TOOL_RESTRICTION_LIMITS.itemChars) return undefined;
+    totalChars += item.length;
+    if (totalChars > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return undefined;
+  }
+  return projected;
+}
+
+function legacyRestrictionList(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return boundedLegacyStringList(value);
+  const budget: LegacyRestrictionProjectionBudget = { visits: 0, projectedChars: 0 };
+  if (safeArray(value)) {
+    const length = safeArrayLength(value);
+    if (length === undefined || length > AGENT_TOOL_RESTRICTION_LIMITS.items) return undefined;
+    const out: string[] = [];
+    for (let index = 0; index < length; index++) {
+      const item = ownDataValue(value, index);
+      if (item.state !== "present") return undefined;
+      const projected = legacyRestrictionScalar(item.value, 0, budget);
+      if (projected === undefined || projected.length > AGENT_TOOL_RESTRICTION_LIMITS.itemChars) return undefined;
+      const trimmed = projected.trim();
+      if (trimmed.length > 0) out.push(trimmed);
+    }
+    return out;
+  }
+  const projected = legacyRestrictionScalar(value, 0, budget);
+  return projected === undefined ? undefined : [projected.trim()].filter(Boolean);
+}
+
+function validateToolRestrictionValue(value: unknown): ToolRestrictionFieldState {
+  if (value === undefined || value === null) return "absent";
+  if (typeof value === "string") {
+    if (value.length > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return "invalid";
+  } else if (typeof value !== "number" && typeof value !== "boolean") {
+    if (!safeArray(value)) return "invalid";
+    const length = safeArrayLength(value);
+    if (length === undefined || length > AGENT_TOOL_RESTRICTION_LIMITS.items) return "invalid";
+    let totalChars = 0;
+    for (let index = 0; index < length; index++) {
+      const item = ownDataValue(value, index);
+      if (item.state !== "present") return "invalid";
+      const scalar = item.value;
+      if (typeof scalar !== "string" && typeof scalar !== "number" && typeof scalar !== "boolean") {
+        return "invalid";
+      }
+      const chars = typeof scalar === "string" ? scalar.length : String(scalar).length;
+      if (chars > AGENT_TOOL_RESTRICTION_LIMITS.itemChars) return "invalid";
+      totalChars += chars;
+      if (totalChars > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return "invalid";
+    }
+  }
+
+  const normalized = safeStringList(value);
+  if (normalized === undefined || normalized.length > AGENT_TOOL_RESTRICTION_LIMITS.items) {
+    return "invalid";
+  }
+  let totalChars = 0;
+  for (const item of normalized) {
+    if (item.length > AGENT_TOOL_RESTRICTION_LIMITS.itemChars) return "invalid";
+    totalChars += item.length;
+    if (totalChars > AGENT_TOOL_RESTRICTION_LIMITS.totalChars) return "invalid";
+  }
+  return "valid";
+}
+
+function selectedField(
+  frontmatter: unknown,
+  primary: string,
+  alias: string,
+): { state: ToolRestrictionFieldState; value?: unknown } {
+  const preferred = ownDataValue(frontmatter, primary);
+  if (preferred.state === "invalid") return { state: "invalid" };
+  if (preferred.state === "present") {
+    const state = validateToolRestrictionValue(preferred.value);
+    return { state, value: preferred.value };
+  }
+  const fallback = ownDataValue(frontmatter, alias);
+  if (fallback.state === "invalid") return { state: "invalid" };
+  if (fallback.state === "present") {
+    const state = validateToolRestrictionValue(fallback.value);
+    return { state, value: fallback.value };
+  }
+  return { state: "absent" };
+}
+
+/** Validate capability-bearing fields before preserving their legacy normalized lists. */
+export function normalizeAgentToolRestrictions(frontmatter: unknown): NormalizedAgentToolRestrictions {
+  const tools = selectedField(frontmatter, "tools", "allowed-tools");
+  const disallowedTools = selectedField(frontmatter, "disallowedTools", "disallowed-tools");
+  return {
+    tools: tools.state === "invalid" ? legacyRestrictionList(tools.value) : safeStringList(tools.value),
+    disallowedTools: disallowedTools.state === "invalid"
+      ? legacyRestrictionList(disallowedTools.value)
+      : safeStringList(disallowedTools.value),
+    validation: Object.freeze({
+      tools: tools.state,
+      disallowedTools: disallowedTools.state,
+    }),
+  };
+}
 
 export interface LoadAgentsResult {
   agents: ClaudeAgent[];
@@ -321,10 +539,16 @@ function loadAgentFile(
   globalDiagnostics.push(...forbiddenDiagnostics);
 
   // tools / allowed-tools alias (tools wins when both present)
-  const tools = toStringList(fm["tools"] !== undefined ? fm["tools"] : fm["allowed-tools"]);
-  const disallowedTools = toStringList(
-    fm["disallowedTools"] !== undefined ? fm["disallowedTools"] : fm["disallowed-tools"],
-  );
+  const restrictions = normalizeAgentToolRestrictions(fm);
+  const { tools, disallowedTools } = restrictions;
+  for (const [field, state] of Object.entries(restrictions.validation)) {
+    if (state !== "invalid") continue;
+    agentDiagnostics.push({
+      severity: "warning",
+      message: `Agent ${field} restriction has a malformed, hostile, or oversized shape; selected main sessions will fail closed`,
+      source: filePath,
+    });
+  }
 
   // model: "inherit" is the Claude default and means "no override".
   let model = toOptionalString(fm["model"])?.trim();
@@ -388,6 +612,7 @@ function loadAgentFile(
     description,
     tools,
     disallowedTools,
+    toolRestrictionValidation: restrictions.validation,
     model,
     effort: toOptionalString(fm["effort"])?.trim() || undefined,
     ...(pluginProvided

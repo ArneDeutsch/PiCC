@@ -4,9 +4,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
 import {
+  AGENT_TOOL_RESTRICTION_LIMITS,
   builtinAgents,
   loadAgents,
   loadPluginAgents,
+  normalizeAgentToolRestrictions,
   renderAgentCatalog,
   resolveAgent,
   type PluginAgentLoaderSource,
@@ -139,6 +141,7 @@ describe("loadAgents", () => {
     expect(a.description).toBe("Reviews code for quality. Use proactively after changes.");
     expect(a.tools).toEqual(["Read", "Grep"]);
     expect(a.disallowedTools).toEqual(["WebFetch"]);
+    expect(a.toolRestrictionValidation).toEqual({ tools: "valid", disallowedTools: "valid" });
     expect(a.model).toBeUndefined(); // "inherit" => no override
     expect(a.permissionMode).toBe("acceptEdits");
     expect(a.maxTurns).toBe(12);
@@ -383,6 +386,114 @@ describe("loadAgents", () => {
     ]);
     expect(agents).toEqual([]);
     expect(diagnostics).toEqual([]);
+  });
+});
+
+describe("agent tool-restriction validation provenance", () => {
+  it("accepts bounded scalar and flat scalar-list forms before normalization", () => {
+    expect(normalizeAgentToolRestrictions({
+      tools: "Read, Grep",
+      disallowedTools: ["Write", 7, true],
+    })).toEqual({
+      tools: ["Read", "Grep"],
+      disallowedTools: ["Write", "7", "true"],
+      validation: { tools: "valid", disallowedTools: "valid" },
+    });
+    expect(normalizeAgentToolRestrictions({ "allowed-tools": "Glob" })).toEqual({
+      tools: ["Glob"],
+      disallowedTools: undefined,
+      validation: { tools: "valid", disallowedTools: "absent" },
+    });
+  });
+
+  it("pins exact and +1 item, per-item, and aggregate limits for both fields and aliases", () => {
+    const fieldCases = [
+      ["tools", "tools"],
+      ["allowed-tools", "tools"],
+      ["disallowedTools", "disallowedTools"],
+      ["disallowed-tools", "disallowedTools"],
+    ] as const;
+    const aggregateBoundary = Array.from(
+      { length: AGENT_TOOL_RESTRICTION_LIMITS.totalChars / AGENT_TOOL_RESTRICTION_LIMITS.itemChars },
+      () => "x".repeat(AGENT_TOOL_RESTRICTION_LIMITS.itemChars),
+    );
+    const boundaries = [
+      Array.from({ length: AGENT_TOOL_RESTRICTION_LIMITS.items }, () => "x"),
+      ["x".repeat(AGENT_TOOL_RESTRICTION_LIMITS.itemChars)],
+      aggregateBoundary,
+    ];
+    const overLimits = [
+      Array.from({ length: AGENT_TOOL_RESTRICTION_LIMITS.items + 1 }, () => "x"),
+      ["x".repeat(AGENT_TOOL_RESTRICTION_LIMITS.itemChars + 1)],
+      [...aggregateBoundary, "x"],
+    ];
+
+    for (const [inputField, validationField] of fieldCases) {
+      for (const value of boundaries) {
+        expect(normalizeAgentToolRestrictions({ [inputField]: value }).validation[validationField]).toBe("valid");
+      }
+      for (const value of overLimits) {
+        expect(normalizeAgentToolRestrictions({ [inputField]: value }).validation[validationField]).toBe("invalid");
+      }
+    }
+  });
+
+  it("marks object, nested, non-scalar, accessor, prototype-hostile, and oversized material invalid", () => {
+    const accessor = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessor, "tools", { get: () => { throw new Error("must not run"); } });
+    const hostileArray = ["Read"];
+    Object.setPrototypeOf(hostileArray, { poisoned: true });
+    const cases: unknown[] = [
+      { tools: { Read: true } },
+      { tools: [["Read"]] },
+      { tools: ["Read", { tool: "Write" }] },
+      accessor,
+      { tools: hostileArray },
+      { tools: new Proxy(["Read"], { get() { throw new Error("array access trap"); } }) },
+      { tools: "x".repeat(AGENT_TOOL_RESTRICTION_LIMITS.totalChars + 1) },
+      { tools: Array.from({ length: AGENT_TOOL_RESTRICTION_LIMITS.items + 1 }, () => "Read") },
+    ];
+    for (const value of cases) {
+      expect(normalizeAgentToolRestrictions(value).validation.tools).toBe("invalid");
+    }
+  });
+
+  it("omits malformed legacy projection when shared visit or projected-character budgets are exhausted", () => {
+    const shared = ["Read"];
+    const nestedShared = Array.from({ length: AGENT_TOOL_RESTRICTION_LIMITS.items }, () => shared);
+    const characterHeavyNested = Array.from(
+      { length: (AGENT_TOOL_RESTRICTION_LIMITS.totalChars / AGENT_TOOL_RESTRICTION_LIMITS.itemChars) + 1 },
+      () => "x".repeat(AGENT_TOOL_RESTRICTION_LIMITS.itemChars),
+    );
+    for (const tools of [nestedShared, [characterHeavyNested]]) {
+      const normalized = normalizeAgentToolRestrictions({ tools });
+      expect(normalized.validation.tools).toBe("invalid");
+      expect(normalized.tools).toBeUndefined();
+    }
+  });
+
+  it("retains invalid provenance and bounded diagnostics on parsed agent definitions", () => {
+    writeAgent("invalid-tools.md", [
+      "---",
+      "description: invalid restrictions",
+      "tools:",
+      "  Read: true",
+      "disallowedTools:",
+      "  - Write",
+      "  - [Bash]",
+      "---",
+      "body",
+    ].join("\n"));
+
+    const { agents } = load();
+    expect(agents[0]?.tools).toEqual(["[object Object]"]);
+    expect(agents[0]?.disallowedTools).toEqual(["Write", "Bash"]);
+    expect(agents[0]?.toolRestrictionValidation).toEqual({
+      tools: "invalid",
+      disallowedTools: "invalid",
+    });
+    expect(agents[0]?.diagnostics.filter((item) => item.message.includes("selected main sessions will fail closed")))
+      .toHaveLength(2);
   });
 });
 

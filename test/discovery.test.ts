@@ -258,6 +258,39 @@ describe("loadSettings — precedence & merging", () => {
     expect(settings.model).toBe("managed-model");
   });
 
+  it("resolves every effective agent scalar precedence step", () => {
+    const scopes = makeScopes();
+    const managedFile = scopes.absentManaged[0]!;
+    writeJson(path.join(scopes.userDir, "settings.json"), { agent: "user-agent" });
+    expect(load(scopes).agent).toBe("user-agent");
+
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { agent: "project-agent" });
+    expect(load(scopes).agent).toBe("project-agent");
+
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), { agent: "local-agent" });
+    expect(load(scopes).agent).toBe("local-agent");
+
+    writeJson(managedFile, { agent: "managed-agent" });
+    const managed = load(scopes, [managedFile]);
+    expect(managed.agent).toBe("managed-agent");
+    expect(managed.unknownKeys).not.toContainEqual(expect.objectContaining({ key: "agent" }));
+  });
+
+  it("diagnoses blank and malformed higher-scope agent values without erasing a valid selector", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), { agent: "user-agent" });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { agent: "   " });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), { agent: { hostile: true } });
+
+    const settings = load(scopes);
+    expect(settings.agent).toBe("user-agent");
+    expect(settings.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: 'Setting "agent" must not be blank; ignored' }),
+      expect.objectContaining({ message: 'Setting "agent" is not a string; ignored' }),
+    ]));
+    expect(settings.unknownKeys).not.toContainEqual(expect.objectContaining({ key: "agent" }));
+  });
+
   it("accumulates permission rules across scopes with dedup", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), {
