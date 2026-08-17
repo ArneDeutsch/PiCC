@@ -27,6 +27,8 @@ export interface McpResourceSource {
 
 export interface McpResourceToolOptions {
   readonly clipMaxTokens: number;
+  /** Dynamic main-session exposure re-reads the live catalog at each call. */
+  readonly catalogMode?: "snapshot" | "live";
 }
 
 type ResourceToolDetails = {
@@ -180,6 +182,7 @@ class BoundedOutput {
 function formatResourceList(
   servers: readonly SnapshotServer[],
   clipMaxTokens: number,
+  catalogMode: "snapshot" | "live",
   selected?: SnapshotServer,
 ): string {
   const out = new McpContentAccumulator(clipMaxTokens);
@@ -191,7 +194,9 @@ function formatResourceList(
       out.append(`  Discovery failed: ${safeUntrusted(server.discoveryError, ERROR_MAX_CHARS)}\n`);
     }
     if (server.resources.length === 0 && server.discoveryError === undefined) {
-      out.append("  No resources in the immutable initial catalog.\n");
+      out.append(catalogMode === "live"
+        ? "  No resources in the current live catalog.\n"
+        : "  No resources in the immutable initial catalog.\n");
     }
     for (let index = 0; index < server.resources.length; index += 1) {
       appendResourceListing(out, server.resources[index]!, index);
@@ -314,7 +319,11 @@ export function buildMcpResourceTools(
   source: McpResourceSource,
   options: McpResourceToolOptions,
 ): ToolDefinition<any, ResourceToolDetails>[] {
-  const servers = snapshotServers(source.resourceServers());
+  const initialServers = snapshotServers(source.resourceServers());
+  const catalogMode = options.catalogMode ?? "snapshot";
+  const serversAtCall = catalogMode === "live"
+    ? () => snapshotServers(source.resourceServers())
+    : () => initialServers;
 
   const listParameters = Type.Object({
     server: Type.Optional(Type.String({ description: "Exact MCP server name to list" })),
@@ -327,12 +336,15 @@ export function buildMcpResourceTools(
   const listTool: ToolDefinition<typeof listParameters, ResourceToolDetails> = {
     name: ListMcpResourcesTool,
     label: "List MCP resources",
-    description: "List immutable initial MCP resource catalogs, optionally for one exact server name.",
+    description: catalogMode === "live"
+      ? "List the current live MCP resource catalog, optionally for one exact server name."
+      : "List immutable initial MCP resource catalogs, optionally for one exact server name.",
     parameters: listParameters,
     async execute(_toolCallId, params) {
+      const servers = serversAtCall();
       const selected = params.server === undefined ? undefined : findServer(servers, params.server, "list");
       return {
-        content: [{ type: "text", text: formatResourceList(servers, options.clipMaxTokens, selected) }],
+        content: [{ type: "text", text: formatResourceList(servers, options.clipMaxTokens, catalogMode, selected) }],
         details: { operation: "list", ...(selected ? { server: selected.serverName } : {}) },
       };
     },
@@ -344,7 +356,7 @@ export function buildMcpResourceTools(
     description: "Read text or base64 content from one exact MCP server using an opaque URI.",
     parameters: readParameters,
     async execute(_toolCallId, params) {
-      findServer(servers, params.server, "read");
+      findServer(serversAtCall(), params.server, "read");
       let result: unknown;
       try {
         result = await source.readResource(params.server, params.uri);

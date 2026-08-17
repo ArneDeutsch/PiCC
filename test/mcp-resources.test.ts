@@ -38,7 +38,7 @@ function tools(value: McpResourceSource, clipMaxTokens = 1_000): [ToolDefinition
   return buildMcpResourceTools(value, { clipMaxTokens }) as [ToolDefinition, ToolDefinition];
 }
 
-async function execute(tool: ToolDefinition, params: Record<string, unknown>) {
+async function execute(tool: ToolDefinition<any, any>, params: Record<string, unknown>) {
   return tool.execute("call", params, undefined, undefined, {} as never);
 }
 
@@ -56,6 +56,24 @@ function expectedContentLabel(index: number, encoding: "text" | "base64"): strin
 const aggregateOmission = "[PiCC omitted remaining MCP resource contents]\n";
 
 describe("MCP resource tool definitions", () => {
+  it("uses the current live catalog for late list/read validation and delegates only after admission", async () => {
+    let servers: McpResourceServerInfo[] = [];
+    const readResource = vi.fn(async (_server: string, uri: string) => ({ contents: [{ uri, text: "late body" }] }));
+    const [list, read] = buildMcpResourceTools({
+      resourceServers: () => servers,
+      readResource,
+    }, { clipMaxTokens: 1_000, catalogMode: "live" });
+    expect(list!.description).toContain("current live MCP resource catalog");
+    await expect(execute(read!, { server: "late", uri: "memo://late" })).rejects.toThrow("was not found");
+    expect(readResource).not.toHaveBeenCalled();
+    servers = [server({ serverName: "late", resources: [] })];
+    const listed = textOf(await execute(list!, {}));
+    expect(listed).toContain("[MCP resource server \"late\"]");
+    expect(listed).toContain("No resources in the current live catalog");
+    expect(textOf(await execute(read!, { server: "late", uri: "memo://late" }))).toContain("late body");
+    expect(readResource).toHaveBeenCalledWith("late", "memo://late");
+  });
+
   it("exports exact names and strict fixed schemas without prompt metadata or custom renderers", () => {
     expect(ListMcpResourcesTool).toBe("ListMcpResourcesTool");
     expect(ReadMcpResourceTool).toBe("ReadMcpResourceTool");

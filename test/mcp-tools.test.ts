@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
-import { buildMcpProxyTools, normalizeMcpSchema, type McpToolSource } from "../src/runtime/mcp-tools.js";
+import { buildMcpProxyTool, buildMcpProxyTools, normalizeMcpSchema, type McpToolSource } from "../src/runtime/mcp-tools.js";
 import type { McpToolInfo } from "../src/runtime/mcp.js";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
@@ -50,6 +50,12 @@ function toolInfo(over: Partial<McpToolInfo> = {}): McpToolInfo {
 // ---------------------------------------------------------------------------
 
 describe("buildMcpProxyTools proxy construction", () => {
+  it("builds one exact late-exposure definition without widening to sibling catalog entries", () => {
+    const callTool = vi.fn(async () => ({ content: [] }));
+    const proxy = buildMcpProxyTool(toolInfo({ toolName: "late" }), { callTool });
+    expect(proxy?.name).toBe("mcp__srv__late");
+  });
+
   it("names proxies mcp__<server>__<tool> and carries the runtime's bounded description", () => {
     const [proxy] = buildMcpProxyTools(
       sourceFor([toolInfo({ serverName: "files", toolName: "list-dir", description: "lists a dir" })]),

@@ -34,6 +34,23 @@ export interface McpPromptCatalog {
   readonly diagnostics: readonly string[];
 }
 
+export class McpPromptCatalogStore {
+  private catalogValue: McpPromptCatalog;
+
+  constructor(private readonly reservedNames: () => ReadonlySet<string> | readonly string[]) {
+    this.catalogValue = buildMcpPromptCatalog([], this.reservedNames());
+  }
+
+  current(): McpPromptCatalog {
+    return this.catalogValue;
+  }
+
+  refresh(prompts: readonly McpPromptInfo[]): McpPromptCatalog {
+    this.catalogValue = buildMcpPromptCatalog(prompts, this.reservedNames());
+    return this.catalogValue;
+  }
+}
+
 interface McpPromptRoutingState {
   readonly byName: ReadonlyMap<string, McpPromptCommand>;
   readonly reservedNames: ReadonlySet<string>;
