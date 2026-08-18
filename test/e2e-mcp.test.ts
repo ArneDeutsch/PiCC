@@ -16,6 +16,10 @@ import {
 import { waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from "./helpers/mcp-process.js";
 import type { CapturedRequest } from "./helpers/mock-openai.js";
+import { bindMcpDeclarationDefinition } from "../src/mcp-administration/persistence.js";
+import { mcpReviewStatePath } from "../src/mcp-administration/review-state.js";
+import { createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { projectIdentities } from "../src/util/project-identity.js";
 
 /**
  * E2E — MCP stdio support: the two headline claims of the feature, proven on
@@ -165,12 +169,8 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
             fs.writeFileSync(
-              path.join(dir, ".mcp.json"),
-              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
-            );
-            fs.writeFileSync(
               path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
+              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
             );
           },
         });
@@ -183,6 +183,102 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
       }
     },
     TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "dynamically enables and disables an exact-approved provider tool in one compiled real-Pi session",
+    async () => {
+      let barrier: McpProcessFixture | undefined;
+      let projectDir = "";
+      let stateRoot: string | undefined;
+      let live: Awaited<ReturnType<typeof startPi>> | undefined;
+      const extraEnv: Record<string, string> = {};
+      try {
+        live = await startPi({
+          interactiveTerminal: true,
+          lifecycleIsolation: true,
+          persistSession: true,
+          prompt: "unused",
+          extraEnv,
+          script: [{ text: "FIRST-DONE" }, { text: "SECOND-DONE" }],
+          setup(dir) {
+            projectDir = dir;
+            barrier = createMcpProcessFixture(dir);
+            const definition = serverEntry(barrier);
+            fs.writeFileSync(path.join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { fixture: definition } }, null, 2));
+            const userDir = path.join(dir, ".e2e-claude-user");
+            const homeDir = path.join(dir, ".e2e-home");
+            fs.mkdirSync(userDir, { recursive: true });
+            fs.mkdirSync(homeDir, { recursive: true });
+            extraEnv.PICC_CLAUDE_USER_DIR = userDir;
+            extraEnv.HOME = homeDir;
+            extraEnv.USERPROFILE = homeDir;
+            fs.writeFileSync(path.join(userDir, ".claude.json"), JSON.stringify({
+              projects: { [fs.realpathSync.native(dir)]: { disabledMcpServers: ["fixture"] } },
+            }, null, 2));
+
+            const identities = projectIdentities(dir);
+            const locations = createMcpLifecycleLocations({
+              homeDir, profilePath: userDir, platform: process.platform === "win32" ? "win32" : "posix",
+              project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! },
+            });
+            if (!locations.ok || locations.value.checkoutFamilyKey === undefined) throw new Error("MCP state location unavailable");
+            stateRoot = locations.value.profileRoot;
+            for (const relative of ["artifacts/sha256", "records", "staging", "generations", "journals", "receipts", "locks", "quarantine", "data"]) {
+              fs.mkdirSync(path.join(stateRoot, relative), { recursive: true, mode: 0o700 });
+              if (process.platform !== "win32") fs.chmodSync(path.join(stateRoot, relative), 0o700);
+            }
+            const binding = bindMcpDeclarationDefinition("fixture", definition);
+            if (!binding.ok) throw new Error(binding.message);
+            const reviewPath = mcpReviewStatePath({ profileKey: locations.value.profileKey, recordsRoot: path.join(stateRoot, "records") } as never, locations.value.checkoutFamilyKey);
+            if (!reviewPath.ok) throw new Error(reviewPath.message);
+            fs.writeFileSync(reviewPath.value, JSON.stringify({
+              version: 1, profileKey: locations.value.profileKey, checkoutFamilyKey: locations.value.checkoutFamilyKey,
+              records: [{ profileKey: locations.value.profileKey, checkoutFamilyKey: locations.value.checkoutFamilyKey,
+                source: "project-mcpjson", serverName: "fixture", definitionVersion: 1,
+                definitionDigest: binding.value.definitionDigest, decision: "approved" }],
+            }));
+          },
+        });
+
+        expect(barrier!.publishedPids()).toEqual([]);
+        live.sendInput("/mcp enable");
+        await live.waitForText("Enable · eligible", 30_000);
+        live.sendInput("");
+        await live.waitForText("Confirm enable", 30_000);
+        live.sendInput("");
+        await live.waitForText("Runtime: succeeded", 30_000);
+        const firstEditorRender = live.capturedText().split(projectDir).length - 1;
+        live.sendInput("\u0003\u0003");
+        await live.waitForText(projectDir, 30_000, firstEditorRender + 1);
+        live.sendInput("first provider witness");
+        const added = await live.waitForRequest((request) => userText(request).includes("first provider witness"), 1, 30_000);
+        expect(toolNames(added)).toContain("mcp__fixture__echo");
+        await live.waitForText("FIRST-DONE", 30_000);
+
+        const detailCount = live.capturedText().split("Disable · eligible").length - 1;
+        const confirmationCount = live.capturedText().split("Confirm disable").length - 1;
+        const exposureCount = live.capturedText().split("Exposure: succeeded").length - 1;
+        live.sendInput("/mcp disable");
+        await live.waitForText("Disable · eligible", 30_000, detailCount + 1);
+        live.sendInput("");
+        await live.waitForText("Confirm disable", 30_000, confirmationCount + 1);
+        live.sendInput("");
+        await live.waitForText("Exposure: succeeded", 30_000, exposureCount + 1);
+        const secondEditorRender = live.capturedText().split(projectDir).length - 1;
+        live.sendInput("\u0003\u0003");
+        await live.waitForText(projectDir, 30_000, secondEditorRender + 1);
+        live.sendInput("second provider witness");
+        const removed = await live.waitForRequest((request) => userText(request).includes("second provider witness"), 1, 30_000);
+        expect(toolNames(removed)).not.toContain("mcp__fixture__echo");
+      } finally {
+        live?.closeInput();
+        await live?.stop();
+        await barrier?.cleanup();
+        if (stateRoot !== undefined) fs.rmSync(stateRoot, { recursive: true, force: true });
+      }
+    },
+    TEST_TIMEOUT_MS * 2,
   );
 
   it(
@@ -201,16 +297,10 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
             fs.writeFileSync(
-              path.join(dir, ".mcp.json"),
-              JSON.stringify({
-                mcpServers: {
-                  fixture: serverEntry(barrier, "gated-prompt-discovery"),
-                },
-              }, null, 2),
-            );
-            fs.writeFileSync(
               path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
+              JSON.stringify({ mcpServers: {
+                fixture: serverEntry(barrier, "gated-prompt-discovery"),
+              } }, null, 2),
             );
           },
         });
@@ -253,13 +343,17 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
   );
 
   it(
-    "keeps an inline MCP tool child-only across the real agent loop and closes its process tree",
+    "keeps an exact-approved inline MCP tool child-only, keeps an unreviewed sibling inert, and closes the owner process tree",
     async () => {
       let barrier: McpProcessFixture | undefined;
+      let stateRoot: string | undefined;
+      const extraEnv: Record<string, string> = {};
       try {
         const parent = (request: CapturedRequest) => request.sessionKind === "main";
         const inlineChild = (request: CapturedRequest) =>
           request.sessionKind === "child" && systemText(request).includes("INLINE-OWNER-SENTINEL");
+        const unreviewedChild = (request: CapturedRequest) =>
+          request.sessionKind === "child" && systemText(request).includes("UNREVIEWED-OWNER-SENTINEL");
         const unrelatedChild = (request: CapturedRequest) => {
           const matches = request.sessionKind === "child" && systemText(request).includes("UNRELATED-SENTINEL");
           if (matches && barrier?.exists("spawn-grandchild.pid") && barrier.exists("grandchild.pid")) {
@@ -269,11 +363,14 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           return matches;
         };
         const result = await runPi({
-          classifier: { childSystemMarkers: ["INLINE-OWNER-SENTINEL", "UNRELATED-SENTINEL"] },
+          extraEnv,
+          classifier: { childSystemMarkers: ["INLINE-OWNER-SENTINEL", "UNREVIEWED-OWNER-SENTINEL", "UNRELATED-SENTINEL"] },
           script: [
             { when: parent, toolCalls: [{ name: "Agent", args: { subagent_type: "inline-owner", prompt: "use your echo tool", run_in_background: false } }] },
             { when: inlineChild, toolCalls: [{ name: "mcp__inline__echo", args: { text: "INLINE-CHILD-ROUNDTRIP" } }] },
             { when: inlineChild, text: "INLINE-CHILD-DONE" },
+            { when: parent, toolCalls: [{ name: "Agent", args: { subagent_type: "unreviewed-owner", prompt: "report without MCP", run_in_background: false } }] },
+            { when: unreviewedChild, text: "UNREVIEWED-DONE" },
             { when: parent, toolCalls: [{ name: "Agent", args: { subagent_type: "unrelated", prompt: "report without MCP", run_in_background: false } }] },
             { when: unrelatedChild, text: "UNRELATED-DONE" },
             { when: parent, text: "PARENT-DONE" },
@@ -281,6 +378,11 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           prompt: "verify agent-scoped MCP isolation",
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
+            const userDir = path.join(dir, ".e2e-claude-user");
+            const homeDir = path.join(dir, ".e2e-home");
+            fs.mkdirSync(userDir, { recursive: true }); fs.mkdirSync(homeDir, { recursive: true });
+            extraEnv.PICC_CLAUDE_USER_DIR = userDir; extraEnv.HOME = homeDir; extraEnv.USERPROFILE = homeDir;
+            const approvedDefinition = { command: barrier.nodeCommand, args: [barrier.serverScript, "spawn-grandchild"], env: barrier.env };
             const agents = path.join(dir, ".claude", "agents");
             fs.mkdirSync(agents, { recursive: true });
             fs.writeFileSync(path.join(agents, "inline-owner.md"), [
@@ -290,37 +392,63 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
               "      env:", `        MCP_BARRIER_DIR: ${JSON.stringify(barrier.dir)}`,
               "---", "INLINE-OWNER-SENTINEL", "",
             ].join("\n"));
-            fs.writeFileSync(path.join(agents, "unrelated.md"), [
-              "---", "name: unrelated", "description: unrelated child", "---",
-              "UNRELATED-SENTINEL", "",
+            fs.writeFileSync(path.join(agents, "unreviewed-owner.md"), [
+              "---", "name: unreviewed-owner", "description: unreviewed inline MCP", "mcpServers:",
+              "  - unreviewed:", `      command: ${JSON.stringify(barrier.nodeCommand)}`,
+              `      args: [${JSON.stringify(barrier.serverScript)}, exit-early]`,
+              "      env:", `        MCP_BARRIER_DIR: ${JSON.stringify(barrier.dir)}`,
+              "---", "UNREVIEWED-OWNER-SENTINEL", "",
             ].join("\n"));
-            fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["inline"] }, null, 2));
+            fs.writeFileSync(path.join(agents, "unrelated.md"), [
+              "---", "name: unrelated", "description: unrelated child", "---", "UNRELATED-SENTINEL", "",
+            ].join("\n"));
+
+            const identities = projectIdentities(dir);
+            const locations = createMcpLifecycleLocations({ homeDir, profilePath: userDir,
+              platform: process.platform === "win32" ? "win32" : "posix",
+              project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } });
+            if (!locations.ok || locations.value.checkoutFamilyKey === undefined) throw new Error("MCP state location unavailable");
+            stateRoot = locations.value.profileRoot;
+            for (const relative of ["artifacts/sha256", "records", "staging", "generations", "journals", "receipts", "locks", "quarantine", "data"]) {
+              fs.mkdirSync(path.join(stateRoot, relative), { recursive: true, mode: 0o700 });
+              if (process.platform !== "win32") fs.chmodSync(path.join(stateRoot, relative), 0o700);
+            }
+            const binding = bindMcpDeclarationDefinition("inline", approvedDefinition);
+            if (!binding.ok) throw new Error(binding.message);
+            const reviewPath = mcpReviewStatePath({ profileKey: locations.value.profileKey, recordsRoot: path.join(stateRoot, "records") } as never, locations.value.checkoutFamilyKey);
+            if (!reviewPath.ok) throw new Error(reviewPath.message);
+            fs.writeFileSync(reviewPath.value, JSON.stringify({ version: 1, profileKey: locations.value.profileKey,
+              checkoutFamilyKey: locations.value.checkoutFamilyKey, records: [{ profileKey: locations.value.profileKey,
+                checkoutFamilyKey: locations.value.checkoutFamilyKey, source: "subagent-inline", serverName: "inline",
+                agentOwner: { name: "inline-owner", scope: "project" }, definitionVersion: 1,
+                definitionDigest: binding.value.definitionDigest, decision: "approved" }] }));
           },
         });
 
         expect(result.code, result.stderr).toBe(0);
         const parentRequests = result.requests.filter(parent);
         const inlineRequests = result.requests.filter(inlineChild);
+        const unreviewedRequests = result.requests.filter(unreviewedChild);
         const unrelatedRequests = result.requests.filter(unrelatedChild);
-        expect(parentRequests.length).toBeGreaterThanOrEqual(2);
+        expect(parentRequests.length).toBeGreaterThanOrEqual(3);
         expect(inlineRequests).toHaveLength(2);
+        expect(unreviewedRequests).toHaveLength(1);
         expect(unrelatedRequests).toHaveLength(1);
         for (const request of parentRequests) expect(toolNames(request)).not.toContain("mcp__inline__echo");
         expect(toolNames(inlineRequests[0]!)).toContain("mcp__inline__echo");
         expect(toolResultText(inlineRequests[1]!)).toContain("INLINE-CHILD-ROUNDTRIP");
+        expect(toolNames(unreviewedRequests[0]!)).not.toContain("mcp__unreviewed__echo");
         expect(toolNames(unrelatedRequests[0]!)).not.toContain("mcp__inline__echo");
+        expect(barrier!.exists("exit-early.pid"), "unreviewed inline server must never start").toBe(false);
         expect(barrier!.exists("spawn-grandchild.pid")).toBe(true);
         expect(barrier!.exists("grandchild.pid")).toBe(true);
         const pids = [barrier!.pidOf("spawn-grandchild.pid"), barrier!.pidOf("grandchild.pid")];
-        await waitUntil({
-          description: "agent-inline MCP process tree to die before Pi exits",
+        await waitUntil({ description: "agent-inline MCP process tree to die before Pi exits",
           predicate: () => pids.every((pid) => !processIsAlive(pid)),
-          describeObserved: () => `alive=${pids.filter(processIsAlive).join(",")}`,
-          timeoutMs: 10_000,
-        });
+          describeObserved: () => `alive=${pids.filter(processIsAlive).join(",")}`, timeoutMs: 10_000 });
       } finally {
         await barrier?.cleanup();
+        if (stateRoot !== undefined) fs.rmSync(stateRoot, { recursive: true, force: true });
       }
     },
     TEST_TIMEOUT_MS,
@@ -344,14 +472,10 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           extraEnv: { MCP_TIMEOUT: "30000" },
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
-            fs.writeFileSync(
-              path.join(dir, ".mcp.json"),
-              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
-            );
-            // setup runs after the fixture commit, so this untracked local scope may self-approve.
+            // setup runs after the fixture commit, so this untracked local declaration may self-approve.
             fs.writeFileSync(
               path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
+              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
             );
           },
         });

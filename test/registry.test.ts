@@ -2638,12 +2638,20 @@ describe("buildCompatReport", () => {
     const note = pending[0]!.capability.note;
     expect(note).toContain("name-based, not definition-bound");
     expect(note).toContain("re-review definitions after project MCP changes");
-    // The one-time notify line stays bounded: names + enabling key + /doctor
-    // pointer, never a JSON settings payload.
-    expect(report.mcpPendingNotice).toContain("alpha");
-    expect(report.mcpPendingNotice).toContain("enabledMcpjsonServers");
-    expect(report.mcpPendingNotice).not.toContain('"enabledMcpjsonServers":');
-    expect(report.mcpPendingNotice).toContain("/doctor");
+    // Startup discloses only the count and review route; /doctor retains the
+    // names and settings remediation without putting either in the notice.
+    const notice = report.mcpPendingNotice ?? "";
+    expect(notice).toBe("MCP: 2 server(s) need review — run /mcp manage.");
+    expect(notice).not.toContain("alpha");
+    expect(notice).not.toContain("beta");
+    expect(notice).not.toContain("enabledMcpjsonServers");
+    expect(notice).not.toContain("disabledMcpjsonServers");
+    expect(notice).not.toContain("settings");
+    expect(notice).not.toContain("/doctor");
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).toContain("alpha");
+    expect(doctor).toContain("beta");
+    expect(doctor).toContain("enabledMcpjsonServers");
   });
 
   it("surfaces an ENABLED server's diagnostics as findings — variable named, values never expanded", () => {
@@ -3312,19 +3320,18 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     }),
   });
 
-  it("is ONE short self-contained line — count, names, the enabling key, the /doctor pointer", () => {
+  it("is one bounded count-only line pointing to /mcp manage", () => {
     const notice = buildCompatReport(pendingProject).mcpPendingNotice;
     expect(notice).toBeDefined();
     const line = notice as string;
-    // A single toast line: the session-start notify emits it verbatim.
+    // The session-start toast emits this line verbatim and leaves details to /doctor.
     expect(line).not.toContain("\n");
-    expect(line).toContain("1 server(s) pending approval");
-    expect(line).toContain("example-server");
-    expect(line).toContain("enabledMcpjsonServers");
-    expect(line).not.toContain("settings.local.json");
-    expect(line).not.toContain("alias");
-    expect(line).toContain("disabledMcpjsonServers");
-    expect(line).toContain("/doctor for safe settings guidance");
+    expect(line).toBe("MCP: 1 server(s) need review — run /mcp manage.");
+    expect(line).not.toContain("example-server");
+    expect(line).not.toContain("enabledMcpjsonServers");
+    expect(line).not.toContain("disabledMcpjsonServers");
+    expect(line).not.toContain("settings");
+    expect(line).not.toContain("/doctor");
     expect(line.length).toBeLessThan(512);
 
     const trackedLocal = makeProject({
@@ -3334,6 +3341,8 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
       }),
     });
     const trackedNotice = buildCompatReport(trackedLocal).mcpPendingNotice ?? "";
+    expect(trackedNotice).toBe("MCP: 1 server(s) need review — run /mcp manage.");
+    expect(trackedNotice).not.toContain("tracked");
     expect(trackedNotice).not.toContain("settings.local.json");
     expect(trackedNotice).not.toContain("alias");
   });
@@ -3378,8 +3387,8 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     expect(buildCompatReport(enabledOnly).mcpPendingNotice).toBeUndefined();
   });
 
-  it("beyond 3 pending servers, keeps notice and /doctor guidance bounded", () => {
-    const names = Array.from({ length: 9 }, (_, i) => `srv-${String(i + 1).padStart(2, "0")}`);
+  it("keeps the count-only notice and separate /doctor guidance bounded at large counts", () => {
+    const names = Array.from({ length: 10_000 }, (_, i) => `srv-${String(i + 1).padStart(5, "0")}`);
     const project = makeProject({
       mcp: makeMcp({
         servers: names.map((name) => makeMcpServer({ name, status: "pending-approval" })),
@@ -3388,11 +3397,13 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     const report = buildCompatReport(project);
     const notice = report.mcpPendingNotice;
     expect(notice).toBeDefined();
-    expect(notice).toContain("9 server(s) pending approval");
-    expect(notice).toContain("and 6 more");
-    // Names after the third appear nowhere on the notify line.
-    expect(notice).not.toContain("srv-04");
-    expect(notice).not.toContain("srv-09");
+    expect(notice).toBe("MCP: 10000 server(s) need review — run /mcp manage.");
+    expect(notice).not.toContain("srv-00001");
+    expect(notice).not.toContain("srv-10000");
+    expect(notice).not.toContain("enabledMcpjsonServers");
+    expect(notice).not.toContain("disabledMcpjsonServers");
+    expect(notice).not.toContain("settings");
+    expect(notice).not.toContain("/doctor");
     expect(notice!.length).toBeLessThan(512);
     const pending = report.findings.find(
       (finding) => finding.capability.id === "feature.mcp-project-approval",

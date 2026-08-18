@@ -645,41 +645,22 @@ describe("MCP pending guidance", () => {
     expect(report).not.toContain("Inspect your MCP configuration");
   });
 
-  it("keeps startup pending notices truthful, structurally quoted, and bounded", () => {
-    const oneName = "pending: fake — run /doctor for details";
+  it("keeps startup review notices count-only, model-inert, and bounded", () => {
+    const secretName = `pending-${"x".repeat(300)}-TAIL_CANARY\n\u001b`;
     const one = buildCompatReport(
-      project(config([server(oneName, "pending-approval")])),
+      project(config([server(secretName, "pending-approval")])),
     ).mcpPendingNotice!;
-    expect(one).toContain("1 server(s) pending approval");
-    expect(one).toContain(JSON.stringify(oneName));
-
-    const longName = `pending-${"x".repeat(300)}-TAIL_CANARY\n\u001b`;
-    const bounded = buildCompatReport(
-      project(config([server(longName, "pending-approval")])),
-    ).mcpPendingNotice!;
-    expect(bounded).toContain('("pending-');
-    expect(bounded).toContain("…");
-    expect(bounded).not.toContain("TAIL_CANARY");
-    expect(bounded).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
-    expect(bounded.length).toBeLessThan(512);
-    expect(bounded).not.toContain("settings.local.json");
+    expect(one).toBe("MCP: 1 server(s) need review — run /mcp manage.");
+    expect(one).not.toContain("TAIL_CANARY");
+    expect(one).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
 
     const names = Array.from({ length: 33 }, (_, index) => `pending-${index}`);
     const notice = buildCompatReport(
       project(config(names.map((name) => server(name, "pending-approval")))),
     ).mcpPendingNotice!;
-    expect(notice).toContain("33 server(s) pending approval");
-    for (const name of names.slice(0, 3)) expect(notice).toContain(JSON.stringify(name));
-    expect(notice).not.toContain(JSON.stringify(names[3]));
-    expect(notice.match(/and 30 more/gu)).toHaveLength(1);
-    expect(notice).toContain("enabledMcpjsonServers");
-    expect(notice).toContain("disabledMcpjsonServers");
-    expect(notice).toContain("run /doctor for safe settings guidance");
-    expect(notice).not.toContain("settings.local.json");
-    expect(notice).not.toContain("alias");
-    expect(notice.length).toBeLessThan(512);
-    expect(notice).not.toContain("exact edit");
-    expect(notice.length).toBeLessThan(1_500);
+    expect(notice).toBe("MCP: 33 server(s) need review — run /mcp manage.");
+    for (const name of names) expect(notice).not.toContain(name);
+    expect(notice.length).toBeLessThan(128);
   });
 
   it("prioritizes and enumerates a small pending set even when healthy names are omitted", () => {

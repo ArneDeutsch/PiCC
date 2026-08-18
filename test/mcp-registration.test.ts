@@ -8,6 +8,8 @@ import picc, { type PiccTestSeam } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
+import { buildMcpPromptCatalog } from "../src/runtime/mcp-prompts.js";
+import type { McpAdministrationService } from "../src/mcp-administration/service.js";
 import { flattenProjectPath } from "../src/claude/memory.js";
 import { createNodeManagedMcpIo } from "../src/claude/managed-mcp.js";
 import {
@@ -1341,6 +1343,238 @@ describe("remote MCP stable main-session registration (fake runtime)", () => {
 // ---------------------------------------------------------------------------
 // Pi late-activation pin (real dist, in-process)
 // ---------------------------------------------------------------------------
+
+describe("MCP administration exposure composition", () => {
+  it("keeps same-name agent rejection and reset isolated from every admitted main capability", async () => {
+    const originalCwd = process.cwd();
+    const dir = makeTempDir("picc-mcp-agent-main-isolation-");
+    const pi = fakePi();
+    const digest = `mcp-review-v1:${"a".repeat(64)}`;
+    const owner = { name: "worker", scope: "project" as const };
+    let agentReview: "approved-exact" | "rejected-exact" | "pending" = "approved-exact";
+    let service: McpAdministrationService | undefined;
+    const runtimeCalls: string[] = [];
+    const runtime = {
+      whenSettled: async () => {},
+      tools: () => [{ serverName: "same", toolName: "echo", description: "main echo", inputSchema: { type: "object" } }],
+      prompts: () => [{ serverName: "same", promptName: "hello", description: "main prompt", arguments: [] }],
+      resourceServers: () => [{ serverName: "same", resources: [{ serverName: "same", uri: "same:item", name: "item" }] }],
+      diagnostics: () => [], serverStates: () => [{ name: "same", transport: "stdio", state: "connected" }], shutdown: async () => {},
+      callTool: async () => ({ content: [{ type: "text", text: "MAIN_TOOL" }] }),
+      getPrompt: async () => ({ messages: [{ role: "user", content: { type: "text", text: "MAIN_PROMPT" } }] }),
+      readResource: async () => ({ contents: [{ uri: "same:item", text: "MAIN_RESOURCE" }] }),
+      reconcileServer: async () => { runtimeCalls.push("reconcile"); return { state: "succeeded", deltas: [] }; },
+      reconnectServer: async () => { runtimeCalls.push("reconnect"); return { state: "succeeded", deltas: [] }; },
+      disableServer: async () => { runtimeCalls.push("disable"); return { state: "succeeded", deltas: [] }; },
+    };
+    const state = () => ({
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      liveStates: [{ name: "same", state: "connected" }],
+      mcp: {
+        servers: [{ name: "same", source: "native-user", status: "enabled", transport: "stdio", command: "node", rawCommand: "node", args: [], env: {}, diagnostics: [] }],
+        diagnostics: [], policyPosture: "absent",
+        administration: { version: 1, policyPosture: "absent", observations: [], declarations: [
+          { name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" }, precedence: "winner",
+            definitionVersion: 1, definitionDigest: digest, summary: { transport: "stdio", commandBasename: "node", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+            policy: "allowed", review: "not-required", status: "enabled" },
+          { name: "same", source: "subagent-inline", agentOwner: owner, authority: { kind: "read-only", sourceClass: "subagent-inline" }, precedence: "winner",
+            definitionVersion: 1, definitionDigest: digest, summary: { transport: "stdio", commandBasename: "node", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+            policy: "allowed", review: agentReview, status: agentReview === "approved-exact" ? "enabled" : agentReview === "rejected-exact" ? "disabled" : "pending-approval" },
+        ], omittedDeclarationCount: 0 },
+      },
+    });
+    try {
+      process.chdir(dir);
+      writeProjectFile(dir, "CLAUDE.md", "same-name isolation fixture\n");
+      picc(pi.api as never, {
+        mcpRuntime: runtime as never,
+        mcpAdministration: {
+          inspectPending: async () => ({ pending: false, status: "clear" }),
+          mutate: async (mutation) => {
+            if (mutation.kind === "set-review") agentReview = "rejected-exact";
+            else if (mutation.kind === "reset-review") agentReview = "pending";
+            return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false };
+          },
+          assemble: async () => state() as never,
+          captureService: (captured) => { service = captured; },
+        },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      const tool = pi.tools.get("mcp__same__echo");
+      const listResources = pi.tools.get("ListMcpResourcesTool");
+      const readResource = pi.tools.get("ReadMcpResourceTool");
+      expect(tool).toBeDefined(); expect(listResources).toBeDefined(); expect(readResource).toBeDefined();
+      const promptBefore = await pi.fire("input", { text: "/mcp__same__hello", source: "interactive" }, pi.tuiCtx());
+      expect(promptBefore.text).toContain("MAIN_PROMPT");
+      const activeBefore = [...pi.activeTools].sort();
+
+      await expect(service!.execute({ kind: "reject", name: "same", agentOwner: owner })).resolves.toMatchObject({
+        runtime: { state: "not-requested" }, exposure: { state: "not-requested" },
+      });
+      await expect(service!.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({
+        runtime: { state: "not-requested" }, exposure: { state: "not-requested" },
+      });
+
+      expect(runtimeCalls).toEqual([]);
+      expect(pi.tools.get("mcp__same__echo")).toBe(tool);
+      expect(pi.tools.get("ListMcpResourcesTool")).toBe(listResources);
+      expect(pi.tools.get("ReadMcpResourceTool")).toBe(readResource);
+      expect([...pi.activeTools].sort()).toEqual(activeBefore);
+      const promptAfter = await pi.fire("input", { text: "/mcp__same__hello", source: "interactive" }, pi.tuiCtx());
+      expect(promptAfter.text).toContain("MAIN_PROMPT");
+      await expect(tool.execute("call", { text: "x" })).resolves.toMatchObject({ content: [{ text: "MAIN_TOOL" }] });
+      await expect(readResource.execute("read", { server: "same", uri: "same:item" })).resolves.toMatchObject({ content: expect.any(Array) });
+    } finally {
+      process.chdir(originalCwd);
+      await shutdownExtension(pi);
+    }
+  });
+
+  it("consumes scoped replacement, multi-reset, partial outcome, and cleanup-uncertain transitions", async () => {
+    const originalCwd = process.cwd();
+    const dir = makeTempDir("picc-mcp-transition-consumer-");
+    const pi = fakePi();
+    let service: McpAdministrationService | undefined;
+    let useAfter = false;
+    let before: any; let after: any;
+    const events: string[] = [];
+    const declaration = (name: string, source: string, overrides: Record<string, unknown> = {}) => ({
+      name, source, authority: source === "native-local" ? { kind: "mutable", scope: "local" } : source === "native-user" ? { kind: "mutable", scope: "user" } : { kind: "mutable", scope: "project" },
+      precedence: "winner", definitionVersion: 1, definitionDigest: `mcp-review-v1:${name.charCodeAt(0).toString(16).padStart(2, "0").repeat(32)}`,
+      summary: { transport: "stdio", commandBasename: "node", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+      policy: "allowed", review: source.startsWith("project") || source === "settings-project" ? "approved-exact" : "not-required", status: "enabled", ...overrides,
+    });
+    const state = (items: any[]) => ({
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      mcp: { servers: items.filter((item) => item.precedence === "winner" && item.status === "enabled").map((item) => ({
+        name: item.name, source: item.source, status: "enabled", transport: "stdio", command: "node", rawCommand: "node", args: [], env: {}, diagnostics: [],
+      })), diagnostics: [], policyPosture: "absent", administration: { version: 1, policyPosture: "absent", observations: [], declarations: items, omittedDeclarationCount: 0 } },
+    });
+    const runtime = {
+      whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [], diagnostics: () => [], serverStates: () => [], shutdown: async () => {},
+      callTool: async () => ({ content: [] }), getPrompt: async () => ({ messages: [] }), readResource: async () => ({ contents: [] }),
+      disableServer: async (name: string) => {
+        events.push(`disable:${name}`);
+        const delta = { serverName: name, definitionFingerprint: `fingerprint:${name}`, generation: events.length, kind: "retire", tools: [], prompts: [] } as const;
+        return name === "cleanup" ? { state: "failed", reason: "cleanup-uncertain", cleanup: "unconfirmed", deltas: [delta] } : { state: "succeeded", deltas: [delta] };
+      },
+      reconcileServer: async (admission: any) => {
+        const name = admission && typeof admission === "object" ? "same" : "unknown";
+        events.push(`reconcile:${name}`);
+        return { state: "succeeded", deltas: [{ serverName: name, definitionFingerprint: `fingerprint:${name}`, generation: events.length, kind: "publish", tools: [], prompts: [] }] };
+      },
+      reconnectServer: async () => ({ state: "succeeded", deltas: [] }),
+    };
+    try {
+      process.chdir(dir); writeProjectFile(dir, "CLAUDE.md", "transition consumer fixture\n");
+      picc(pi.api as never, {
+        mcpRuntime: runtime as never,
+        mcpAdministration: {
+          inspectPending: async () => ({ pending: false, status: "clear" }),
+          mutate: async () => { useAfter = true; return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false }; },
+          assemble: async () => useAfter ? after : before,
+          captureService: (captured) => { service = captured; },
+          exposure: {
+            apply: async (delta) => {
+              events.push(`exposure:${delta.kind}:${delta.serverName}`);
+              return delta.serverName === "exposure-fail" ? { state: "failed", serverName: delta.serverName, generation: delta.generation, reason: "registration-failed" } as never
+                : { state: "applied", serverName: delta.serverName, generation: delta.generation, registered: [], refreshed: [], activated: [], deactivated: [], denied: [], collisions: [], failures: [], paletteRefreshAvailable: false } as never;
+            },
+            promptCatalog: () => ({ prompts: [], byCommand: new Map(), diagnostics: [] }) as never,
+          },
+        },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      const run = async (action: any, beforeItems: any[], afterItems: any[]) => {
+        before = state(beforeItems); after = state(afterItems); useAfter = false; events.length = 0;
+        return await service!.execute(action);
+      };
+
+      const high = declaration("same", "native-local");
+      const lowShadow = declaration("same", "native-user", { precedence: "shadowed", status: "shadowed" });
+      await expect(run({ kind: "remove", scope: "user", name: "same" }, [high, lowShadow], [high])).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+      expect(events).toEqual([]);
+
+      const lowWinner = { ...lowShadow, precedence: "winner", status: "enabled" };
+      await run({ kind: "remove", scope: "local", name: "same" }, [high, lowShadow], [lowWinner]);
+      expect(events).toEqual(["disable:same", "reconcile:same", "exposure:retire:same", "exposure:publish:same"]);
+
+      const first = declaration("first", "project-mcpjson");
+      const second = declaration("second", "settings-project");
+      await run({ kind: "reset-project-choices" }, [first, second], [
+        { ...first, review: "pending", status: "pending-approval" }, { ...second, review: "pending", status: "pending-approval" },
+      ]);
+      expect(events).toEqual(["disable:first", "disable:second", "exposure:retire:first", "exposure:retire:second"]);
+
+      const exposureFail = declaration("exposure-fail", "native-user");
+      await expect(run({ kind: "remove", scope: "user", name: "exposure-fail" }, [exposureFail], [])).resolves.toMatchObject({
+        runtime: { state: "succeeded" }, exposure: { state: "failed", reasonCode: "exposure-failed" },
+      });
+      expect(events).toContain("exposure:retire:exposure-fail");
+
+      const cleanup = declaration("cleanup", "native-user");
+      await expect(run({ kind: "remove", scope: "user", name: "cleanup" }, [cleanup], [])).resolves.toMatchObject({
+        runtime: { state: "failed", reasonCode: "runtime-failed" }, exposure: { state: "succeeded" },
+      });
+      expect(events).toEqual(["disable:cleanup", "exposure:retire:cleanup"]);
+    } finally {
+      process.chdir(originalCwd); await shutdownExtension(pi);
+    }
+  });
+
+  it("contains a bounded startup exposure rejection while retaining a valid sibling prompt", async () => {
+    const originalCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const dir = makeTempDir("picc-mcp-partial-exposure-");
+    const userDir = makeTempDir("picc-mcp-partial-user-");
+    writeProjectFile(dir, "CLAUDE.md", "partial exposure fixture\n");
+    writeProjectFile(dir, ".claude/settings.local.json", JSON.stringify({ mcpServers: {
+      broken: { command: process.execPath, args: ["broken.cjs"] },
+      sibling: { command: process.execPath, args: ["sibling.cjs"] },
+    } }));
+    const siblingPrompt = { serverName: "sibling", promptName: "hello", description: "Sibling prompt", arguments: [] };
+    const catalog = buildMcpPromptCatalog([siblingPrompt], []);
+    const applications: string[] = [];
+    const runtime = {
+      whenSettled: async () => {},
+      tools: () => [{ serverName: "broken", toolName: "bad", description: "broken", inputSchema: { type: "object" } }],
+      prompts: () => [siblingPrompt], resourceServers: () => [], diagnostics: () => [], serverStates: () => [], shutdown: async () => {},
+      callTool: async () => ({ content: [] }), readResource: async () => ({ contents: [] }),
+      getPrompt: async () => ({ messages: [{ role: "user", content: { type: "text", text: "SIBLING_PROMPT_OK" } }] }),
+    };
+    const pi = fakePi();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      process.chdir(dir); process.env.PICC_CLAUDE_USER_DIR = userDir;
+      picc(pi.api as never, {
+        mcpRuntime: runtime as never,
+        mcpAdministration: { exposure: {
+          apply: async (delta) => {
+            applications.push(delta.serverName);
+            if (delta.serverName === "broken") throw new Error("REJECTED_EXPOSURE_CANARY");
+            return { state: "applied", serverName: "sibling", generation: delta.generation, registered: [], refreshed: [], activated: [], deactivated: [], denied: [], collisions: [], failures: [], paletteRefreshAvailable: false } as never;
+          },
+          promptCatalog: () => catalog,
+        } },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      const outcome = await pi.fire("input", { text: "/mcp__sibling__hello", source: "interactive" }, pi.tuiCtx());
+      expect(applications.sort()).toEqual(["broken", "sibling"]);
+      expect(outcome).toMatchObject({ action: "transform" });
+      expect(outcome.text).toContain("SIBLING_PROMPT_OK");
+      expect(error.mock.calls.flat().join("\n")).toContain("exposure failed for \"broken\"");
+      expect(error.mock.calls.flat().join("\n")).not.toContain("MCP exposure failed:");
+    } finally {
+      error.mockRestore();
+      process.chdir(originalCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR; else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      await shutdownExtension(pi);
+    }
+  });
+});
 
 const piDistDir = path.join(
   originalCwd,

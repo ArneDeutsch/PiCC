@@ -1,8 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ResolvedMcpConfig } from "../src/types.js";
+import { createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { establishOwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
 import type { McpAdministrationDeclaration, McpAdministrationLiveState } from "../src/mcp-administration/model.js";
-import { createMcpAdministrationService, openMcpAdministrationRuntimeAdmission, type McpAdministrationFreshState, type McpAdministrationLiveRequest, type McpAdministrationLiveResult } from "../src/mcp-administration/service.js";
-import { bindMcpDeclarationDefinition, type McpPersistenceResult } from "../src/mcp-administration/persistence.js";
+import { createMcpAdministrationService, openMcpAdministrationRuntimeAdmission, openMcpAdministrationRuntimeTransition, type McpAdministrationFreshState, type McpAdministrationLiveRequest, type McpAdministrationLiveResult } from "../src/mcp-administration/service.js";
+import { bindMcpDeclarationDefinition, persistMcpMutation, type McpPersistenceResult } from "../src/mcp-administration/persistence.js";
 
 const committed = (effect: "changed" | "unchanged" = "changed"): McpPersistenceResult => ({ state: "committed", effect, cleanup: "complete", retrySafe: effect === "unchanged" });
 const rolledBack: McpPersistenceResult = { state: "rolled-back", operationId: "op", effect: "unchanged", cleanup: "complete", retrySafe: true };
@@ -319,7 +324,7 @@ describe("MCP administration orchestration", () => {
         const action = { kind, name: source, ...(owner === undefined ? {} : { agentOwner: owner }) } as const;
         const result = await h.service.execute(action);
         expect(result.eligibility, `${source} ${kind}`).toEqual({ eligible: true, reasonCode: "eligible" });
-        const liveExpected = !(kind === "approve" && owner !== undefined);
+        const liveExpected = kind === "approve" && owner === undefined;
         expect(result).toMatchObject({ recovery: { state: "not-requested" }, durable: { state: "committed", effect: "changed", cleanup: "complete" }, runtime: { state: liveExpected ? "succeeded" : "not-requested" }, exposure: { state: liveExpected ? "succeeded" : "not-requested" } });
         expect(h.mutate).toHaveBeenCalledWith({ kind: "set-review", record: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test", source, serverName: source, ...(owner === undefined ? {} : { agentOwner: owner }), definitionVersion: 1, definitionDigest: beforeServer.definitionDigest, decision: kind === "approve" ? "approved" : "rejected" } });
         if (!liveExpected) {
@@ -372,10 +377,67 @@ describe("MCP administration orchestration", () => {
     const h = harness([fresh([approved]), fresh([awaiting])]);
     const result = await h.service.execute({ kind: "reset-project-choices" });
     expect(h.mutate).toHaveBeenCalledWith({ kind: "reset-review" });
-    expect(h.apply.mock.calls[0]![0].action).toEqual({ kind: "reset-project-choices" });
-    expect(h.apply.mock.calls[0]![0].runtimeAdmission).toBeUndefined();
-    expect(h.apply).toHaveBeenCalledWith(expect.objectContaining({ after: expect.objectContaining({ servers: [expect.objectContaining({ status: "pending-approval" })] }) }));
+    const request = h.apply.mock.calls[0]![0];
+    expect(request.action).toEqual({ kind: "reset-project-choices" });
+    expect(request.runtimeAdmission).toBeUndefined();
+    expect(request.transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([{ kind: "retire", serverName: "project" }]);
     expect(result).toMatchObject({ durable: { state: "committed", effect: "changed" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+  });
+
+  it("derives only exact ownerless effective-winner transitions for shadow removal, reveal, reset, and agent review", async () => {
+    const high = declaration({ name: "same", source: "native-local", authority: { kind: "mutable", scope: "local" }, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE });
+    const lowShadow = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" }, precedence: "shadowed", status: "shadowed" });
+
+    const shadowRemoval = harness([fresh([high, lowShadow]), fresh([high])]);
+    await expect(shadowRemoval.service.execute({ kind: "remove", scope: "user", name: "same" })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+    expect(shadowRemoval.apply).not.toHaveBeenCalled();
+
+    const lowWinner = { ...lowShadow, precedence: "winner" as const, status: "enabled" as const };
+    const reveal = harness([fresh([high, lowShadow]), fresh([lowWinner])]);
+    await reveal.service.execute({ kind: "remove", scope: "local", name: "same" });
+    const revealed = reveal.apply.mock.calls[0]![0].transitions.map(openMcpAdministrationRuntimeTransition);
+    expect(revealed).toHaveLength(1);
+    expect(revealed[0]).toMatchObject({ kind: "replace", serverName: "same" });
+    if (revealed[0]?.kind !== "replace") throw new Error("replacement transition not minted");
+    expect(openMcpAdministrationRuntimeAdmission(revealed[0].admission)).toEqual({
+      server: expect.objectContaining({ name: "same", source: "native-user", status: "enabled" }),
+      binding: admissionBinding(lowWinner),
+    });
+
+    const first = declaration({ name: "first", source: "project-mcpjson", review: "approved-exact" });
+    const second = declaration({ name: "second", source: "settings-project", review: "approved-exact", definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE });
+    const unrelatedResetBefore = declaration({ name: "unrelated-reset", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const unrelatedResetAfter = declaration({ name: "unrelated-reset", source: "native-local", authority: { kind: "mutable", scope: "local" }, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE });
+    const reset = harness([fresh([first, second, unrelatedResetBefore]), fresh([
+      { ...first, review: "pending", status: "pending-approval" },
+      { ...second, review: "pending", status: "pending-approval" },
+      unrelatedResetAfter,
+    ])]);
+    await reset.service.execute({ kind: "reset-project-choices" });
+    expect(reset.apply.mock.calls[0]![0].transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([
+      { kind: "retire", serverName: "first" },
+      { kind: "retire", serverName: "second" },
+    ]);
+
+    const owner = { name: "worker", scope: "project" as const };
+    const main = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const agent = declaration({ name: "same", source: "subagent-inline", agentOwner: owner, review: "approved-exact" });
+    const agentReview = harness([fresh([main, agent]), fresh([main, { ...agent, review: "rejected-exact", status: "disabled" }])]);
+    await expect(agentReview.service.execute({ kind: "reject", name: "same", agentOwner: owner })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+    expect(agentReview.apply).not.toHaveBeenCalled();
+
+    const agentReset = harness([fresh([main, agent]), fresh([main, { ...agent, review: "pending", status: "pending-approval" }])]);
+    await expect(agentReset.service.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+    expect(agentReset.apply).not.toHaveBeenCalled();
+
+    const target = declaration({ name: "target", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const unrelatedBefore = declaration({ name: "unrelated", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const unrelatedAfter = declaration({ name: "unrelated", source: "native-local", authority: { kind: "mutable", scope: "local" }, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE });
+    const concurrent = harness([fresh([target, unrelatedBefore]), fresh([unrelatedAfter])]);
+    await concurrent.service.execute({ kind: "remove", scope: "user", name: "target" });
+    expect(concurrent.apply.mock.calls[0]![0].transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([
+      { kind: "retire", serverName: "target" },
+    ]);
   });
 
   it("persists an agent-inline review with its exact owner and current definition", async () => {
@@ -509,6 +571,57 @@ describe("MCP administration orchestration", () => {
       const live = [{ name: server.name, state: "failed" as const }];
       const h = harness([fresh([server], live), fresh([server], live)]);
       await expect(h.service.execute({ kind: "reconnect", name: server.name })).resolves.toMatchObject({ eligibility: { eligible: true }, runtime: { state: "succeeded" } });
+    }
+  });
+
+  it("keeps an authenticated add commit successful but live-inert after a concurrent exact-name replacement", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-service-evidence-"));
+    try {
+      const home = path.join(root, "home");
+      const project = path.join(root, "project");
+      const profile = path.join(home, ".claude.json");
+      fs.mkdirSync(home); fs.mkdirSync(project); fs.writeFileSync(profile, "{}\n");
+      const family = fs.realpathSync.native(project);
+      const locations = createMcpLifecycleLocations({ homeDir: home, profilePath: profile,
+        platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: family, checkoutFamilyPath: family } });
+      if (!locations.ok || locations.value.checkoutFamilyKey === undefined) throw new Error("MCP locations unavailable");
+      const established = await establishOwnedStateStore(locations.value, home);
+      if (!established.ok) throw new Error(established.message);
+      const authorityFingerprint = `sha256:${"e".repeat(64)}`;
+      const context: Parameters<typeof persistMcpMutation>[0] = {
+        store: established.value, profilePath: profile, projectRoot: project,
+        checkoutFamilyKey: locations.value.checkoutFamilyKey, authorityFingerprint,
+        identifyProject: () => [family],
+        revalidateAuthority: () => ({ ok: true, value: { profileKey: established.value.profileKey,
+          checkoutFamilyKey: locations.value.checkoutFamilyKey!, authorityFingerprint } }),
+      };
+      const replacement = boundDeclaration("raced", "project-mcpjson", { command: "replacement-b" }, {
+        authority: { kind: "mutable", scope: "project" }, review: "approved-exact", status: "enabled",
+      });
+      const apply = vi.fn(async () => ({ runtime: { state: "succeeded" as const }, exposure: { state: "succeeded" as const } }));
+      let assembly = 0;
+      const service = createMcpAdministrationService({
+        inspectPending: async () => ({ pending: false, status: "clear" }),
+        recover: async () => rolledBack,
+        mutate: async (mutation) => {
+          const committedResult = await persistMcpMutation(context, mutation);
+          fs.writeFileSync(path.join(project, ".mcp.json"), JSON.stringify({ mcpServers: { raced: { command: "replacement-b" } } }));
+          return committedResult;
+        },
+        assemble: () => assembly++ === 0 ? {
+          ...fresh([]), reviewIdentity: { profileKey: established.value.profileKey, checkoutFamilyKey: locations.value.checkoutFamilyKey! },
+        } : {
+          ...fresh([replacement]), reviewIdentity: { profileKey: established.value.profileKey, checkoutFamilyKey: locations.value.checkoutFamilyKey! },
+        },
+        live: { apply },
+      });
+      await expect(service.execute({ kind: "add", scope: "project", name: "raced", definition: { command: "original-a" } })).resolves.toMatchObject({
+        eligibility: { eligible: true }, durable: { state: "committed", effect: "changed" },
+        runtime: { state: "not-requested" }, exposure: { state: "not-requested" },
+      });
+      expect(apply).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -749,8 +862,8 @@ describe("MCP interactive confirmation authority", () => {
     const duplicate = { ...first, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const } };
     const disabled = { ...first, status: "disabled" as const, inactiveReason: "native-runtime-disabled" as const };
     const h = harness([fresh([first, duplicate]), fresh([disabled, duplicate])]);
-    await expect(h.service.execute({ kind: "disable", name: "native" })).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" }, runtime: { state: "succeeded" } });
-    expect(h.mutate).toHaveBeenCalledOnce(); expect(h.apply).toHaveBeenCalledOnce();
+    await expect(h.service.execute({ kind: "disable", name: "native" })).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" }, runtime: { state: "not-requested" } });
+    expect(h.mutate).toHaveBeenCalledOnce(); expect(h.apply).not.toHaveBeenCalled();
   });
 
   it("fails closed when a duplicate winner emerges before mutation or after commit", async () => {

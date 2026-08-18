@@ -778,7 +778,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
 
           let inlineConfig;
           try {
-            inlineConfig = project.agentMcpAdmission?.resolve(declaration);
+            inlineConfig = project.agentMcpAdmission?.resolveOwned?.(declaration, { name: agent.name, scope }) ??
+              project.agentMcpAdmission?.resolve(declaration);
           } catch {
             inlineConfig = undefined;
           }
@@ -1062,8 +1063,6 @@ const EMPTY_MCP: ResolvedMcpConfig = { servers: [], diagnostics: [] };
 /** Cap on server names quoted in one list — a hostile config must not flood a line. */
 const MCP_NAME_LIST_MAX = 8;
 const MCP_PENDING_COPY_NAME_MAX = 128;
-const MCP_NOTICE_NAME_LIST_MAX = 3;
-const MCP_NOTICE_NAME_MAX = 40;
 
 /** Bound on a per-server diagnostic quoted on the /doctor posture line. */
 const MCP_POSTURE_DIAG_MAX_CHARS = 240;
@@ -1201,19 +1200,9 @@ function mcpPendingEditDetail(pendingNames: string[]): string {
   );
 }
 
-/**
- * One bounded, terminal-safe line: count, capped structurally quoted names,
- * approval/decline keys, and the /doctor pointer. Startup is otherwise quiet,
- * so this deliberately does NOT carry the full settings edit — the bounded
- * human-facing reports provide the approval and decline guidance.
- */
+/** One bounded, terminal-safe, model-inert pointer into the review workflow. */
 function buildMcpPendingNotice(pendingNames: string[]): string {
-  return (
-    `MCP: ${pendingNames.length} server(s) pending approval (` +
-    `${mcpNameList(pendingNames, MCP_NOTICE_NAME_LIST_MAX, MCP_NOTICE_NAME_MAX)}) — ` +
-    `approve selected names with enabledMcpjsonServers or decline with disabledMcpjsonServers; ` +
-    `run /doctor for safe settings guidance.`
-  );
+  return `MCP: ${pendingNames.length} server(s) need review — run /mcp manage.`;
 }
 
 /**
