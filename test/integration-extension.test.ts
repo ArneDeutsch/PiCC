@@ -1423,7 +1423,7 @@ describe("session lifecycle hooks", () => {
     expect(doctor).toContain("disabledMcpjsonServers");
     expect(doctor).toContain("Main-session MCP status (agent declaration findings and remediation appear under Compatibility findings):");
     expect(doctor).toContain('project agent "future-agent" references MCP server "fixture-session"');
-    expect(doctor).toContain('inline MCP server "fixture-inline" is pending PiCC project approval');
+    expect(doctor).toContain('inline MCP server "fixture-inline" is pending PiCC project review');
     expect(doctor).toContain("Startup health and deterministic cleanup are dispatch-time only");
     expect(doctor).not.toContain("declares dispatch-local mcpServers");
     expect(doctor).not.toContain("MCP servers will not start");
@@ -3977,9 +3977,8 @@ describe("MCP timeout diagnostic delivery (zero-enabled project)", () => {
 describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
   // standing pending case), so the failed-connect path gets its own minimal
-  // project: an approved server whose command cannot spawn. The approval rides
-  // an UNTRACKED settings.local.json (no git repo → the tracked probe fails
-  // open), so the enablement gate itself is exercised for real.
+  // project: a user-approved server whose command cannot spawn. Each test uses
+  // a temporary selected profile so checkout-local settings cannot self-approve.
   function makeFailingMcpProject(): string {
     const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-"));
     fs.writeFileSync(
@@ -3989,20 +3988,24 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
       }),
       "utf8",
     );
-    fs.mkdirSync(path.join(mcpDir, ".claude"), { recursive: true });
-    fs.writeFileSync(
-      path.join(mcpDir, ".claude", "settings.local.json"),
-      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
-      "utf8",
-    );
     return mcpDir;
   }
 
-  function cleanupFailingMcpProject(mcpDir: string): void {
-    process.chdir(dir);
+  function makeFailingMcpUserDir(): string {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-user-"));
+    fs.writeFileSync(
+      path.join(userDir, "settings.json"),
+      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
+      "utf8",
+    );
+    return userDir;
+  }
+
+  function cleanupFailingMcpDirectory(tempDir: string | undefined): void {
+    if (tempDir === undefined) return;
     // Best-effort: Windows can EPERM a just-vacated cwd (handle release lag).
     try {
-      fs.rmSync(mcpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       /* leftover temp dir is harmless */
     }
@@ -4011,13 +4014,20 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   it(
     "a failed server reaches the /doctor posture line, fires the one-time warning notify, and drains diagnostics to stderr",
     async () => {
-      const mcpDir = makeFailingMcpProject();
-      process.chdir(mcpDir);
+      const previousCwd = process.cwd();
+      const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+      const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+      let mcpDir: string | undefined;
+      let userDir: string | undefined;
       // Installed BEFORE wiring: the settle-time diagnostics drain runs inside
       // the detached registration step, any time after connect settles.
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const p = fakePi();
       try {
+        mcpDir = makeFailingMcpProject();
+        userDir = makeFailingMcpUserDir();
+        process.chdir(mcpDir);
+        process.env.PICC_CLAUDE_USER_DIR = userDir;
         picc(p.api as never, { onInitializationSettled: p.captureInitialization });
         await p.waitForInitialization();
         // The first-turn barrier awaits MCP settle + registration, so after this
@@ -4048,8 +4058,15 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
         expect(doctor).not.toContain("picc-no-such-command-t05");
       } finally {
         errSpy.mockRestore();
-        await p.fire("session_shutdown", { reason: "other" });
-        cleanupFailingMcpProject(mcpDir);
+        try {
+          await p.fire("session_shutdown", { reason: "other" });
+        } finally {
+          process.chdir(previousCwd);
+          if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+          else delete process.env.PICC_CLAUDE_USER_DIR;
+          cleanupFailingMcpDirectory(mcpDir);
+          cleanupFailingMcpDirectory(userDir);
+        }
       }
     },
     60_000,
@@ -4058,11 +4075,18 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   it(
     "the one-time failure notice falls back to stderr when the ctx has no UI",
     async () => {
-      const mcpDir = makeFailingMcpProject();
-      process.chdir(mcpDir);
+      const previousCwd = process.cwd();
+      const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+      const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+      let mcpDir: string | undefined;
+      let userDir: string | undefined;
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const p = fakePi();
       try {
+        mcpDir = makeFailingMcpProject();
+        userDir = makeFailingMcpUserDir();
+        process.chdir(mcpDir);
+        process.env.PICC_CLAUDE_USER_DIR = userDir;
         picc(p.api as never, { onInitializationSettled: p.captureInitialization });
         await p.waitForInitialization();
         // printCtx models real Pi print mode: hasUI false → stderr fallback.
@@ -4074,8 +4098,15 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
         expect(errText).toContain("run /doctor for details");
       } finally {
         errSpy.mockRestore();
-        await p.fire("session_shutdown", { reason: "other" });
-        cleanupFailingMcpProject(mcpDir);
+        try {
+          await p.fire("session_shutdown", { reason: "other" });
+        } finally {
+          process.chdir(previousCwd);
+          if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+          else delete process.env.PICC_CLAUDE_USER_DIR;
+          cleanupFailingMcpDirectory(mcpDir);
+          cleanupFailingMcpDirectory(userDir);
+        }
       }
     },
     60_000,
