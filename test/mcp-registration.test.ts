@@ -1633,7 +1633,7 @@ describe("MCP administration exposure composition", () => {
     const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
     const homeVariable = process.platform === "win32" ? "USERPROFILE" : "HOME";
     const previousHome = process.env[homeVariable];
-    const base = makeTempDir("picc-mcp-linked-default-");
+    const base = fs.realpathSync.native(makeTempDir("picc-mcp-linked-default-"));
     const main = path.join(base, "main");
     const linked = path.join(base, "linked");
     const userDir = path.join(base, "profile");
