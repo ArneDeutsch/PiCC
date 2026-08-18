@@ -15,9 +15,10 @@ export function mcpReviewStatePath(store: OwnedStateStore, checkoutFamilyKey: st
   if (!/^checkout-[A-Za-z0-9_-]{1,256}$/.test(checkoutFamilyKey) || !/^profile-[A-Za-z0-9_-]{1,128}$/.test(store.profileKey)) {
     return fail("invalid-owner", "Review profile or checkout family identity is invalid");
   }
-  const owner = createHash("sha256").update(`${MCP_REVIEW_STATE_FILENAME}\0${store.profileKey}`, "utf8").digest("base64url");
-  const family = createHash("sha256").update(checkoutFamilyKey, "utf8").digest("base64url");
-  return { ok: true, value: path.join(store.recordsRoot, `${MCP_REVIEW_STATE_FILENAME}-${owner}-${family}.json`) };
+  const identity = createHash("sha256")
+    .update(`picc\0mcp-review-state\0v1\0${store.profileKey}\0${checkoutFamilyKey}\0`, "utf8")
+    .digest("base64url");
+  return { ok: true, value: path.join(store.recordsRoot, `${MCP_REVIEW_STATE_FILENAME}-${identity}.json`) };
 }
 
 export interface McpReviewStateCapture {

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,8 +18,11 @@ import { projectIdentities } from "../src/util/project-identity.js";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }); });
 
-async function fixture(projectOverride?: string): Promise<{ root: string; home: string; profile: string; project: string; store: OwnedStateStore; context: Parameters<typeof persistMcpMutation>[0] }> {
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-persistence-"))); roots.push(root);
+async function fixture(projectOverride?: string, minimumRootLength = 0): Promise<{ root: string; home: string; profile: string; project: string; store: OwnedStateStore; context: Parameters<typeof persistMcpMutation>[0] }> {
+  const temporaryRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-persistence-"))); roots.push(temporaryRoot);
+  const paddingLength = Math.max(0, minimumRootLength - temporaryRoot.length - 1);
+  const root = paddingLength === 0 ? temporaryRoot : path.join(temporaryRoot, "r".repeat(paddingLength));
+  if (root !== temporaryRoot) fs.mkdirSync(root);
   const home = path.join(root, "home"); const profile = path.join(home, ".claude.json"); const project = projectOverride ?? path.join(root, "project");
   fs.mkdirSync(home); fs.mkdirSync(project, { recursive: true }); fs.writeFileSync(profile, "{\n  \"future\": {\"keep\": true}\n}\n");
   const family = fs.realpathSync.native(project); const locations = createMcpLifecycleLocations({ homeDir: home, profilePath: profile,
@@ -152,6 +156,21 @@ describe("recoverable scoped MCP persistence", () => {
     expect(path.dirname(selected.value)).toBe(f.store.recordsRoot); const before = fs.readdirSync(f.store.recordsRoot);
     expect(await persistMcpMutation(f.context, { kind: "reset-review" })).toMatchObject({ state: "committed", effect: "unchanged", cleanup: "complete", retrySafe: true, reasonCode: "no-op" });
     expect(fs.readdirSync(f.store.recordsRoot)).toEqual(before); expect(fs.readdirSync(f.store.stagingRoot)).toEqual([]); expect(fs.readdirSync(f.store.receiptsRoot)).toEqual([]);
+  });
+
+  it("derives one compact separated review identity and writes beneath a long canonical root", async () => {
+    const f = await fixture(undefined, 100); const selected = mcpReviewStatePath(f.store, f.context.checkoutFamilyKey); if (!selected.ok) throw new Error(selected.message);
+    const expectedDigest = createHash("sha256").update(`picc\0mcp-review-state\0v1\0${f.store.profileKey}\0${f.context.checkoutFamilyKey}\0`, "utf8").digest("base64url");
+    expect(path.basename(selected.value)).toBe(`mcp-review-${expectedDigest}.json`);
+    expect(path.basename(selected.value)).toHaveLength("mcp-review-.json".length + 43);
+    const alternateProfile = f.store.profileKey === `profile-${"f".repeat(43)}` ? `profile-${"d".repeat(43)}` : `profile-${"f".repeat(43)}`; const alternateFamily = f.context.checkoutFamilyKey === `checkout-${"e".repeat(43)}` ? `checkout-${"d".repeat(43)}` : `checkout-${"e".repeat(43)}`;
+    const changedProfile = mcpReviewStatePath({ ...f.store, profileKey: alternateProfile }, f.context.checkoutFamilyKey); const changedFamily = mcpReviewStatePath(f.store, alternateFamily);
+    expect(changedProfile.ok && changedProfile.value).not.toBe(selected.value); expect(changedFamily.ok && changedFamily.value).not.toBe(selected.value);
+    const oldOwner = createHash("sha256").update(`mcp-review\0${f.store.profileKey}`, "utf8").digest("base64url"); const oldFamily = createHash("sha256").update(f.context.checkoutFamilyKey, "utf8").digest("base64url");
+    expect(path.join(f.store.recordsRoot, `mcp-review-${oldOwner}-${oldFamily}.json`).length).toBeGreaterThan(256); expect(selected.value.length).toBeLessThanOrEqual(256);
+    const record: McpReviewRecord = { profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey, source: "project-mcpjson", serverName: "long-root", definitionVersion: 1, definitionDigest: `mcp-review-v1:${"7".repeat(64)}`, decision: "approved" };
+    expect(await persistMcpMutation(f.context, { kind: "set-review", record })).toMatchObject({ state: "committed", effect: "changed" });
+    const captured = await readMcpReviewState({ store: f.store, checkoutFamilyKey: f.context.checkoutFamilyKey }); if (!captured.ok) throw new Error(captured.message); expect(captured.value.records).toEqual([record]);
   });
 
   it("mutates user scope without selecting malformed projects and preserves that unrelated value", async () => {
