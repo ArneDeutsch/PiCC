@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createProductionMcpCliServices, parseMcpAdministrationArgv, readMcpJsonInput, runMcpAdministrationCli, type McpCliServiceHandle } from "../src/mcp-administration-cli.js";
 import type { LoadedProject } from "../src/project.js";
 import type { McpAdministrationInventory } from "../src/mcp-administration/model.js";
+import { createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
+import { projectIdentities } from "../src/util/project-identity.js";
 
 const inventory: McpAdministrationInventory = {
   version: 1, policyPosture: "active-rules", observations: [], omittedDeclarationCount: 0,
@@ -68,7 +71,7 @@ describe("standalone MCP administration grammar", () => {
       get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
       add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable. --env/--header values may be exposed in argv and shell history; for credentials prefer add-json --json-file <path|->.",
       "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.",
-      remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration and refuses ambiguity.",
+      remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration only from a complete bounded inventory; pass --scope when declarations are omitted or ambiguous.",
       "reset-project-choices": "Usage: picc mcp reset-project-choices [--dry-run]\nResets PiCC-owned review choices across the active profile and checkout family; declarations and runtime-disable choices are preserved.",
     };
     const global = harness(); const globalVerb = harness(); expect(await global.run(["--help"])).toBe(0); expect(await globalVerb.run(["help"])).toBe(0); expect(global.stdout).toEqual([expectedGlobal]); expect(global.stderr).toEqual([]); expect(globalVerb.stdout).toEqual(global.stdout);
@@ -139,6 +142,15 @@ describe("standalone MCP administration semantics", () => {
     const recovered = harness({ preparation: { inventory, eligibility: { eligible: true, reasonCode: "eligible" }, recovery: { state: "rolled-back", effect: "unchanged", cleanup: "complete", reasonCode: "no-op" } } }); expect(await recovered.run(["remove", "pending"])).toBe(0);
     expect(recovered.stdout).toEqual(["Recovery: state=rolled-back; effect=unchanged; cleanup=complete; reason=no-op", "MCP result: action=remove; target=project pending\nEligibility: eligible", "Durable: state=committed; effect=changed; cleanup=complete"]); expect(recovered.stderr).toEqual([]);
     expect(recovered.calls).toEqual([["execute", { kind: "remove", scope: "project", name: "pending" }]]);
+
+    const omittedInventory = { ...inventory, omittedDeclarationCount: 2 };
+    for (const args of [["remove", "pending"], ["remove", "--dry-run", "pending"]]) {
+      const omitted = harness({ inventory: omittedInventory, preparation: { inventory: omittedInventory, eligibility: { eligible: true, reasonCode: "eligible" }, recovery: { state: "not-requested" } } });
+      expect(await omitted.run(args)).toBe(1); expect(omitted.calls).toEqual([]);
+      expect(omitted.stderr).toEqual(["PiCC MCP: unscoped remove requires a complete bounded inventory; declarations were omitted. Pass --scope local, project, or user."]);
+    }
+    const explicit = harness({ inventory: omittedInventory }); expect(await explicit.run(["remove", "--scope", "project", "pending"])).toBe(0);
+    expect(explicit.calls).toEqual([["execute", { kind: "remove", scope: "project", name: "pending" }]]);
   });
 
   it("uses exit 2 for syntax, 1 for operational/recovery failure, and never reflects secrets", async () => {
@@ -181,7 +193,7 @@ describe("standalone MCP JSON input boundaries", () => {
 
 function productionProject(root: string, home: string): LoadedProject {
   return {
-    root, userDir: path.join(home, ".claude"), mcpStartupAuthority: { reviewInvalid: false, recoveryPending: false },
+    root, userDir: path.join(home, ".claude"), settings: { env: { SETTINGS_ONLY: "settings-value", SHARED: "settings-value" } }, mcpStartupAuthority: { reviewInvalid: false, recoveryPending: false },
     mcp: { servers: [], diagnostics: [], policyPosture: "absent", administration: { version: 1, policyPosture: "absent", observations: [], omittedDeclarationCount: 0, declarations: [
       { name: "remote", source: "native-user", authority: { kind: "mutable", scope: "user" }, precedence: "winner", definitionVersion: 1, definitionDigest: `mcp-review-v1:${"a".repeat(64)}`, summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 1, timeoutConfigured: false }, policy: "allowed", review: "not-required", status: "enabled" },
     ] } },
@@ -203,8 +215,8 @@ describe("standalone MCP production composition", () => {
         const events: string[] = []; const initial = productionProject(project, home); const fresh = productionProject(project, home); const runtimeEnv = {}; let loads = 0; let admittedConfig: LoadedProject["mcp"] | undefined;
         const loadProject = () => { loads += 1; if (loads === 1) return initial; events.push("fresh-load"); return fresh; };
         const shutdown = vi.fn(async () => { events.push("shutdown"); if (failure === "shutdown") throw new Error("CANARY_SHUTDOWN_FAILURE"); });
-        const startRuntime = vi.fn((config: LoadedProject["mcp"]) => {
-          admittedConfig = config; events.push("start"); if (failure === "start") throw new Error("CANARY_START_FAILURE");
+        const startRuntime = vi.fn((config: LoadedProject["mcp"], runtimeOptions: { env: NodeJS.ProcessEnv; settingsEnv: Record<string, string> }) => {
+          admittedConfig = config; expect(runtimeOptions.env).toBe(runtimeEnv); expect(runtimeOptions.settingsEnv).toBe(fresh.settings.env); events.push("start"); if (failure === "start") throw new Error("CANARY_START_FAILURE");
           return { whenSettled: async () => { events.push("settle"); if (failure === "settle") throw new Error("CANARY_SETTLEMENT_FAILURE"); }, serverStates: () => { events.push("states"); if (failure === "states") throw new Error("CANARY_STATE_FAILURE"); return [{ name: "remote", transport: "http" as const, state: "failed" as const, statusSummary: "authentication", toolCount: 3, promptCount: 2, resourceCount: 1 }]; }, shutdown };
         });
         const handle = await createProductionMcpCliServices({ cwd: project, homeDir: home, env: runtimeEnv, health: true, loadProject, startRuntime });
@@ -232,6 +244,11 @@ describe("standalone MCP production composition", () => {
       expect(handle.ok).toBe(true); if (!handle.ok) return;
       const result = await handle.value.service.execute({ kind: "add", scope: "project", name: "added", definition: { command: "run" } });
       expect(result).toMatchObject({ inventory: { servers: [] }, eligibility: { eligible: true }, durable: { state: "committed", cleanup: "complete" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
+      const identities = projectIdentities(project); const locations = createMcpLifecycleLocations({ homeDir: home, profilePath: path.join(home, ".claude"), platform: process.platform === "win32" ? "win32" : "posix", project: { checkoutFamilyPath: identities[0]!, activeCheckoutPath: identities.at(-1)! } });
+      expect(locations.ok).toBe(true); if (!locations.ok || locations.value.checkoutFamilyKey === undefined) return;
+      const expectedFingerprint = `sha256:${createHash("sha256").update(`${locations.value.profileKey}\0${locations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
+      const retainedText = fs.readdirSync(home, { recursive: true, encoding: "utf8" }).map((entry) => { const candidate = path.join(home, entry); try { return fs.statSync(candidate).isFile() ? fs.readFileSync(candidate, "utf8") : ""; } catch { return ""; } }).join("\n");
+      expect(retainedText).toContain(expectedFingerprint);
       const stdout: string[] = []; const stderr: string[] = []; expect(await runMcpAdministrationCli(["add", "added", "--", "run"], { log: (line) => stdout.push(line), error: (line) => stderr.push(line) }, { services: async () => ({ ok: true, value: { service: { ...handle.value.service, execute: async () => result }, health: handle.value.health } }) })).toBe(0);
       expect(stdout).toEqual(["Declaration state: committed/not-visible; live activation=not-requested; health=not-probed"]); expect(stderr).toEqual([]); expect(startRuntime).not.toHaveBeenCalled();
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -266,13 +283,20 @@ describe("standalone MCP rendering and recovery", () => {
     }
   });
 
+  it("reports completed recovery before successful add state", async () => {
+    const result = { inventory, eligibility: { eligible: true, reasonCode: "eligible" }, recovery: { state: "rolled-back", effect: "unchanged", cleanup: "complete", reasonCode: "no-op" }, durable: persistence, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } };
+    const h = harness({ execute: result }); expect(await h.run(["add", "added", "--", "SECRET_COMMAND"])).toBe(0);
+    expect(h.stdout).toEqual(["Recovery: state=rolled-back; effect=unchanged; cleanup=complete; reason=no-op", "Declaration state: committed/not-visible; live activation=not-requested; health=not-probed"]);
+    expect(h.stdout.join("\n")).not.toContain("SECRET_COMMAND");
+  });
+
   it("renders exact fixed actionable remediation while retaining stable reason codes", async () => {
     const guidance: Record<string, string> = {
       "recovery-pending": "Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.",
       "invalid-authority": "Action: rerun from the intended project and selected Claude profile after any project/profile change.",
       "stale-state": "Action: reacquire current MCP state and retry the command.",
       busy: "Action: wait for the competing MCP administration operation to finish, then retry.",
-      "cleanup-pending": "Action: retry administration cleanup before making another MCP change.",
+      "cleanup-pending": "Action: retry the original direct administration command to continue cleanup before another MCP change.",
       "already-exists": "Action: choose a different server name or remove the exact-scope declaration before adding it again.",
       "server-not-found": "Action: list the bounded acquired inventory and retry with an exact visible server name.",
       "scope-mismatch": "Action: list the server's mutable scopes and retry with the matching --scope value.",
@@ -281,6 +305,50 @@ describe("standalone MCP rendering and recovery", () => {
       const result = { inventory, eligibility: { eligible: false, reasonCode }, recovery: { state: "not-requested" }, durable: { state: "not-requested" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } }; const h = harness({ execute: result });
       expect(await h.run(["reset-project-choices"])).toBe(1); expect(h.stdout).toEqual([`MCP result: action=reset-project-choices; target=project-family review choices\nEligibility: refused:${reasonCode}`, action]); expect(h.stderr).toEqual([]);
     }
+
+    const durableGuidance: Record<string, string> = {
+      "already-exists": guidance["already-exists"]!,
+      "invalid-authority": guidance["invalid-authority"]!,
+      "invalid-input": "Action: correct the bounded server name or definition and retry.",
+      "invalid-state": "Action: repair PiCC private MCP review state for the selected profile, then retry.",
+      "ambiguous-project-state": "Action: consolidate canonical-equivalent project entries in the selected native `.claude.json`, then retry.",
+      stale: "Action: reacquire current MCP state and retry the command.",
+      busy: guidance.busy!,
+      "storage-failure": "Action: verify writable storage and available space for both PiCC private transaction storage and PiCC private MCP review state for the selected profile, then retry.",
+      "pending-recovery": guidance["recovery-pending"]!,
+      "cleanup-pending": guidance["cleanup-pending"]!,
+    };
+    for (const [reasonCode, action] of Object.entries(durableGuidance)) {
+      const result = { inventory, eligibility: { eligible: false, reasonCode: "durable-mutation-failed" }, recovery: { state: "not-requested" }, durable: { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: reasonCode === "cleanup-pending" ? "pending" : "complete", reasonCode, reason: "SECRET_DURABLE_DETAIL" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } }; const h = harness({ execute: result });
+      expect(await h.run(["reset-project-choices"])).toBe(1); expect(h.stdout[1]).toBe(action); expect(h.stdout[2]).toContain(`reason=${reasonCode}`); expect(h.stdout.join("\n")).not.toContain("SECRET_DURABLE_DETAIL");
+    }
+
+    const artifactCases = [
+      { argv: ["add", "server", "--", "SECRET_COMMAND"], artifact: "the selected native `.claude.json`" },
+      { argv: ["remove", "--scope", "user", "server"], artifact: "the selected native `.claude.json`" },
+      { argv: ["remove", "--scope", "project", "server"], artifact: "the project `.mcp.json`" },
+    ];
+    for (const { argv, artifact } of artifactCases) {
+      for (const [reasonCode, expected] of [
+        ["invalid-state", `Action: repair ${artifact}, then retry.`],
+        ["storage-failure", `Action: verify writable storage and available space for both PiCC private transaction storage and ${artifact}, then retry.`],
+      ] as const) {
+        const result = { inventory, eligibility: { eligible: false, reasonCode: "durable-mutation-failed" }, recovery: { state: "not-requested" }, durable: { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode, reason: "SECRET_DURABLE_DETAIL" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } }; const h = harness({ execute: result });
+        expect(await h.run(argv)).toBe(1); expect(h.stdout[1]).toBe(expected); expect(h.stdout[2]).toContain(`reason=${reasonCode}`);
+        expect(h.stdout.join("\n")).not.toMatch(/SECRET_DURABLE_DETAIL|SECRET_COMMAND/u);
+      }
+    }
+  });
+
+  it("gives standalone action-aware remediation when durable rejection has no reason code", async () => {
+    const result = { inventory, eligibility: { eligible: false, reasonCode: "durable-mutation-failed" }, recovery: { state: "not-requested" }, durable: { state: "rejected", retrySafe: false, effect: "unknown", cleanup: "pending", reason: "SECRET_REASON_WITHOUT_CODE" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } };
+    const h = harness({ execute: result }); expect(await h.run(["add", "--scope", "project", "server", "--", "SECRET_COMMAND"])).toBe(1);
+    expect(h.stdout).toEqual([
+      "MCP result: action=add; target=project server\nEligibility: refused:durable-mutation-failed",
+      "Action: inspect the project `.mcp.json` and PiCC private transaction storage, verify writable storage and available space for both, then retry the original direct administration command.",
+      "Durable: state=rejected; effect=unknown; cleanup=pending",
+    ]);
+    expect(h.stdout.join("\n")).not.toMatch(/SECRET_REASON_WITHOUT_CODE|SECRET_COMMAND|safe durable reason below/u);
   });
 
   it("escapes broad names, keeps shadow counts unprobed, and gives deterministic review/auth guidance", async () => {

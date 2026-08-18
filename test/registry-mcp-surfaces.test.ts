@@ -110,6 +110,10 @@ describe("MCP prompt and resource capability registry", () => {
     const remote = note("feature.mcp-remote-transports");
     expect(remote).toContain("Initial connection");
     expect(remote).toContain("five reconnects");
+    expect(remote).toContain("Eligible failed main-session remote servers also expose PiCC-defined manual reconnect");
+    expect(remote).toContain("automatic reconnection remains remote-only");
+    expect(aggregate).toContain("eligible failed main-session stdio and supported remote servers expose PiCC-defined manual reconnect");
+    expect(aggregate).toContain("stdio children do not reconnect automatically");
     expect(remote).toContain("capability-list discovery");
     expect(remote).toContain("belong to feature.mcp");
     expect(remote).not.toContain("discovery retries only network/5xx");
@@ -173,7 +177,7 @@ describe("MCP administration capability registry", () => {
     ["feature.mcp-prompts", [/exact typed routing/i, /palette stubs remain startup-bounded/i, /not dynamically republished/i]],
     ["feature.mcp-resources", [/first gains an advertised resource capability/i, /changed-definition administration/i, /active exposure retires/i]],
     ["feature.mcp-remote-transports", [/manual reconnect/i, /static-header-only/i]],
-    ["feature.mcp-cli-management", [/bounded transient health discovery/i, /Dry-run.*without recovery or writes/i, /transaction\/recovery taxonomy/i, /Unscoped remove refuses ambiguity/i, /file\/stdin avoids argv exposure/i, /add-from-claude-desktop import command.*unavailable/i, /Byte-identical output.*unavailable/i]],
+    ["feature.mcp-cli-management", [/bounded transient health discovery/i, /Dry-run.*without recovery or writes/i, /transaction\/recovery taxonomy/i, /Unscoped remove refuses ambiguity and any inventory with omitted declarations/i, /explicit `--scope`/i, /file\/stdin avoids argv exposure/i, /add-from-claude-desktop import command.*unavailable/i, /Byte-identical output.*unavailable/i]],
     ["feature.mcp-control-status", [/bare \/mcp.*invokes no recovery/i, /TUI-only/i, /headless administration.*no-action/i]],
     ["feature.mcp-runtime-enabled", [/not-supported|never activates/i, /default-off/i]],
     ["feature.mcp-claude-json-scopes", [/project scope writes `\.mcp\.json`/i, /unrelated state is preserved/i]],

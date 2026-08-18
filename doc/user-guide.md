@@ -601,9 +601,10 @@ the current safe snapshot without recovery or writes, so it can refuse while the
 action would first recover. Project scope writes `.mcp.json`; local and user scope update the
 applicable native project and user records.
 Unscoped `list`/`get` show the bounded acquired inventory and effective winner; scoped reads are a
-PiCC extension. Unscoped remove succeeds only for one unambiguous mutable declaration. List/get may
-start only eligible winners in a transient bounded runtime to report connected, authentication-needed,
-or failed health and capability counts, then attempt bounded shutdown.
+PiCC extension. Unscoped remove succeeds only for one unambiguous mutable declaration when the
+bounded inventory omitted nothing; otherwise pass an explicit `--scope`. List/get may start only
+eligible winners in a transient bounded runtime to report connected, authentication-needed, or failed
+health and capability counts, then attempt bounded shutdown.
 
 For `add-json`, file, stdin, and inline input have a 1 MiB UTF-8 byte limit. Inline JSON and
 `--env`/`--header` values can expose credentials in argv and shell history; for credential-bearing
@@ -637,8 +638,10 @@ outcomes, while pending recovery or cleanup is not. One count-only startup notic
 sessions to `/mcp manage`; print/JSON/RPC modes do not recover or wait for review input.
 
 Disable retires the current route before cleanup; enable can reconnect an eligible stdio definition
-only after confirmed cleanup. Reconnect is available for a failed eligible remote main-session server.
-Same-definition reconnect or re-enable reuses its immutable catalog; a changed execution definition
+only after confirmed cleanup. PiCC-defined manual reconnect is available for eligible failed stdio and
+supported remote main-session servers. Stdio servers do not reconnect automatically; supported remote
+servers retain their bounded automatic reconnect policy. Same-definition reconnect or re-enable reuses
+its immutable catalog; a changed execution definition
 is rediscovered and refreshes main-session tools, prompts, and resources through the host. The fixed
 resource tools are first registered and activated when the live main-session catalog first gains a
 resource-capable definition, including through changed-definition administration. Host registration

@@ -37,7 +37,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
   add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable. --env/--header values may be exposed in argv and shell history; for credentials prefer add-json --json-file <path|->.",
   "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.",
-  remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration and refuses ambiguity.",
+  remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration only from a complete bounded inventory; pass --scope when declarations are omitted or ambiguous.",
   "reset-project-choices": "Usage: picc mcp reset-project-choices [--dry-run]\nResets PiCC-owned review choices across the active profile and checkout family; declarations and runtime-disable choices are preserved.",
 });
 const SYNTAX = "PiCC MCP: invalid arguments. Run `picc mcp --help` for usage.";
@@ -57,7 +57,7 @@ export interface McpAdministrationCliOptions {
   readonly services?: (health: boolean) => Promise<StoreResult<McpCliServiceHandle>> | StoreResult<McpCliServiceHandle>;
   readonly readJsonInput?: (source: string) => Promise<StoreResult<unknown>>;
   readonly loadProject?: typeof loadClaudeProject;
-  readonly startRuntime?: (config: LoadedProject["mcp"], options: { projectRoot: string; sessionId: string; env: NodeJS.ProcessEnv }) => TransientMcpRuntime;
+  readonly startRuntime?: (config: LoadedProject["mcp"], options: { projectRoot: string; sessionId: string; env: NodeJS.ProcessEnv; settingsEnv: Record<string, string> }) => TransientMcpRuntime;
 }
 
 type Operation =
@@ -238,14 +238,31 @@ function remediation(reasonCode: string, dryRun = false): string | undefined {
     "recovery-pending": dryRun
       ? "Action: dry-run cannot recover pending MCP administration state; open `/mcp manage` in an interactive TUI to attempt service-owned recovery, then retry the original dry-run."
       : "Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.",
+    "pending-recovery": "Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.",
     "invalid-authority": "Action: rerun from the intended project and selected Claude profile after any project/profile change.",
     "stale-state": "Action: reacquire current MCP state and retry the command.",
+    stale: "Action: reacquire current MCP state and retry the command.",
     busy: "Action: wait for the competing MCP administration operation to finish, then retry.",
-    "cleanup-pending": "Action: retry administration cleanup before making another MCP change.",
+    "cleanup-pending": "Action: retry the original direct administration command to continue cleanup before another MCP change.",
     "already-exists": "Action: choose a different server name or remove the exact-scope declaration before adding it again.",
     "server-not-found": "Action: list the bounded acquired inventory and retry with an exact visible server name.",
     "scope-mismatch": "Action: list the server's mutable scopes and retry with the matching --scope value.",
+    "invalid-input": "Action: correct the bounded server name or definition and retry.",
+    "durable-mutation-failed": "Action: correct the selected target artifact or PiCC private transaction storage, then retry the original direct administration command.",
   } as Readonly<Record<string, string>>)[reasonCode];
+}
+function targetArtifactClass(action: McpAdministrationAction): string {
+  if (action.kind === "reset-project-choices") return "PiCC private MCP review state for the selected profile";
+  return "scope" in action && action.scope === "project" ? "the project `.mcp.json`" : "the selected native `.claude.json`";
+}
+function durableRemediation(action: McpAdministrationAction, reasonCode: string | undefined): string | undefined {
+  const artifact = targetArtifactClass(action);
+  if (reasonCode === "invalid-state") return `Action: repair ${artifact}, then retry.`;
+  if (reasonCode === "ambiguous-project-state") return "Action: consolidate canonical-equivalent project entries in the selected native `.claude.json`, then retry.";
+  if (reasonCode === "storage-failure") return `Action: verify writable storage and available space for both PiCC private transaction storage and ${artifact}, then retry.`;
+  return reasonCode === undefined
+    ? `Action: inspect ${artifact} and PiCC private transaction storage, verify writable storage and available space for both, then retry the original direct administration command.`
+    : remediation(reasonCode);
 }
 function renderAddedState(action: Extract<McpAdministrationAction, { kind: "add" }>, inventory: McpAdministrationInventory): string {
   const row = inventory.servers.find((item) => item.name === action.name && item.authority.kind === "mutable" && item.authority.scope === action.scope && item.agentOwner === undefined);
@@ -290,6 +307,10 @@ export async function runMcpAdministrationCli(argv: readonly string[], output: M
         if (!resolution.eligibility.eligible) {
           const guidance = remediation(resolution.eligibility.reasonCode, removeDryRun); if (guidance !== undefined) output.log(guidance); return 1;
         }
+        if (resolution.inventory.omittedDeclarationCount > 0) {
+          output.error("PiCC MCP: unscoped remove requires a complete bounded inventory; declarations were omitted. Pass --scope local, project, or user.");
+          return 1;
+        }
         const matches = resolution.inventory.servers.filter((row) => row.name === removeName && row.authority.kind === "mutable" && row.agentOwner === undefined);
         if (matches.length === 0) { output.error("PiCC MCP: no mutable server with that exact name was found."); output.log(remediation("server-not-found")!); return 1; }
         if (matches.length !== 1) { output.error("PiCC MCP: that name is declared in multiple mutable scopes; pass --scope."); output.log(remediation("scope-mismatch")!); return 1; }
@@ -302,10 +323,11 @@ export async function runMcpAdministrationCli(argv: readonly string[], output: M
       output.log(resultPlan(parsed.action, preview, true)); const guidance = remediation(preview.eligibility.reasonCode, true); if (guidance !== undefined) output.log(guidance); return preview.eligibility.eligible ? 0 : 1;
     }
     const result = await handle.service.execute(parsed.action);
+    if (result.recovery.state !== "not-requested") output.log(renderRecovery(result.recovery));
     if (parsed.action.kind === "add" && result.eligibility.eligible && result.durable.state === "committed" && result.durable.cleanup === "complete") { output.log(renderAddedState(parsed.action, result.inventory)); return 0; }
     output.log(resultPlan(parsed.action, result, false));
-    const guidance = remediation(result.eligibility.reasonCode) ?? (result.durable.state === "not-requested" ? undefined : remediation(result.durable.reasonCode ?? "")); if (guidance !== undefined) output.log(guidance);
-    if (result.recovery.state !== "not-requested") output.log(renderRecovery(result.recovery));
+    const durableGuidance = result.durable.state === "not-requested" || result.durable.state === "committed" && result.durable.cleanup === "complete" ? undefined : durableRemediation(parsed.action, result.durable.reasonCode);
+    const guidance = durableGuidance ?? remediation(result.eligibility.reasonCode); if (guidance !== undefined) output.log(guidance);
     if (result.durable.state !== "not-requested") output.log(`Durable: state=${result.durable.state}; effect=${result.durable.effect}; cleanup=${result.durable.cleanup}${result.durable.reasonCode === undefined ? "" : `; reason=${result.durable.reasonCode}`}`);
     return operationalSuccess(result) ? 0 : 1;
   } catch { output.error("PiCC MCP: administration failed without exposing input details."); return 1; }
@@ -325,7 +347,7 @@ export async function createProductionMcpCliServices(options: McpAdministrationC
     const locations = createMcpLifecycleLocations({ homeDir: home, profilePath: initial.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: active, checkoutFamilyPath: family } });
     if (!locations.ok || locations.value.checkoutFamilyKey === undefined) return { ok: false, code: "authority-unavailable", message: "authority unavailable" };
     const capturedProfilePath = path.resolve(initial.userDir); const capturedProjectRoot = path.resolve(initial.root); const capturedFamilyKey = locations.value.checkoutFamilyKey;
-    const passive = passiveStore(locations); const authorityFingerprint = `sha256:${createHash("sha256").update(`${capturedProfilePath}\0${capturedProjectRoot}\0${capturedFamilyKey}`, "utf8").digest("hex")}`;
+    const passive = passiveStore(locations); const authorityFingerprint = `sha256:${createHash("sha256").update(`${passive.profileKey}\0${capturedFamilyKey}`, "utf8").digest("hex")}`;
     const revalidateAuthority = (): StoreResult<{ profileKey: string; checkoutFamilyKey: string; authorityFingerprint: string }> => {
       try {
         const freshProfile = resolveClaudeProfile({ env, homeDir: home }); const freshProject = loadProject({ cwd, env, homeDir: home, pluginInventoryLifetime: "command" });
@@ -333,7 +355,7 @@ export async function createProductionMcpCliServices(options: McpAdministrationC
         if (freshFamily === undefined || freshActive === undefined || path.resolve(freshProfile.userDir) !== capturedProfilePath || path.resolve(freshProject.userDir) !== capturedProfilePath || path.resolve(freshProject.root) !== capturedProjectRoot) return { ok: false, code: "changed-authority", message: "authority changed" };
         const freshLocations = createMcpLifecycleLocations({ homeDir: home, profilePath: freshProject.userDir, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: freshActive, checkoutFamilyPath: freshFamily } });
         if (!freshLocations.ok || freshLocations.value.profileKey !== passive.profileKey || freshLocations.value.checkoutFamilyKey !== capturedFamilyKey) return { ok: false, code: "changed-authority", message: "authority changed" };
-        const freshFingerprint = `sha256:${createHash("sha256").update(`${path.resolve(freshProject.userDir)}\0${path.resolve(freshProject.root)}\0${freshLocations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
+        const freshFingerprint = `sha256:${createHash("sha256").update(`${freshLocations.value.profileKey}\0${freshLocations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
         return freshFingerprint === authorityFingerprint ? { ok: true, value: { profileKey: passive.profileKey, checkoutFamilyKey: capturedFamilyKey, authorityFingerprint } } : { ok: false, code: "changed-authority", message: "authority changed" };
       } catch { return { ok: false, code: "changed-authority", message: "authority changed" }; }
     };
@@ -347,7 +369,7 @@ export async function createProductionMcpCliServices(options: McpAdministrationC
     const assemble = async () => {
       const project = loadProject({ cwd, env, homeDir: home, pluginInventoryLifetime: "command" }); let liveStates: readonly McpAdministrationLiveState[] | undefined;
       if (options.health) {
-        healthByName.clear(); const runtime = (options.startRuntime ?? ((config, runtimeOptions) => McpRuntime.start(config, runtimeOptions)))(project.mcp, { projectRoot: project.root, sessionId: `picc-mcp-cli-${randomUUID()}`, env });
+        healthByName.clear(); const runtime = (options.startRuntime ?? ((config, runtimeOptions) => McpRuntime.start(config, runtimeOptions)))(project.mcp, { projectRoot: project.root, sessionId: `picc-mcp-cli-${randomUUID()}`, env, settingsEnv: project.settings.env });
         try { await runtime.whenSettled(); const states = runtime.serverStates(); liveStates = states.map(liveState); for (const state of states) healthByName.set(state.name, { state: state.state === "connected" ? "connected" : state.statusSummary?.includes("authentication") ? "auth-needed" : "failed", tools: state.toolCount ?? 0, prompts: state.promptCount ?? 0, resources: state.resourceCount ?? 0 }); }
         finally { await runtime.shutdown(); }
       }
