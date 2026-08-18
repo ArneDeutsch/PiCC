@@ -101,6 +101,7 @@ export interface TransactionProducerCodec<T = unknown> {
   readonly requiredLocks: (summary: unknown, participants: readonly TransactionParticipant[]) => StoreResult<readonly LifecycleLockIdentity[]>;
   /** Required for external participants and reconstructed from this trusted registry during recovery. */
   readonly authorizeExternal?: (context: ExternalMutationContext) => StoreResult<void | ExternalAuthorization> | Promise<StoreResult<void | ExternalAuthorization>>;
+  readonly authorizeOwnedReplace?: (context: ExternalMutationContext) => StoreResult<void> | Promise<StoreResult<void>>;
   /** Required only for explicit PiCC-owned record deletion. */
   readonly authorizeOwnedDelete?: (context: ExternalMutationContext) => StoreResult<void> | Promise<StoreResult<void>>;
   /** Required only for the distinct exact last-reference owned-data retirement participant. */
@@ -128,8 +129,8 @@ export function createTransactionCodecRegistry(codecs: readonly TransactionProdu
     if (!validCodecIdentity(codec.schema, codec.version) || typeof codec.decodeSummary !== "function" || typeof codec.validatePlan !== "function" || typeof codec.requiredLocks !== "function") return fail("invalid-codec", "Trusted transaction codec identity or callbacks are invalid");
     const key = `${codec.schema}\0${codec.version}`; if (map.has(key)) return fail("invalid-codec", "Trusted transaction codec identity is duplicated");
     const decodeSummary = codec.decodeSummary.bind(codec); const validatePlan = codec.validatePlan.bind(codec);
-    const requiredLocks = codec.requiredLocks.bind(codec); const authorizeExternal = codec.authorizeExternal?.bind(codec); const authorizeOwnedDelete = codec.authorizeOwnedDelete?.bind(codec); const authorizeOwnedDataRetirement = codec.authorizeOwnedDataRetirement?.bind(codec);
-    map.set(key, Object.freeze({ schema: codec.schema, version: codec.version, decodeSummary, validatePlan, requiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }), ...(authorizeOwnedDataRetirement === undefined ? {} : { authorizeOwnedDataRetirement }) }));
+    const requiredLocks = codec.requiredLocks.bind(codec); const authorizeExternal = codec.authorizeExternal?.bind(codec); const authorizeOwnedReplace = codec.authorizeOwnedReplace?.bind(codec); const authorizeOwnedDelete = codec.authorizeOwnedDelete?.bind(codec); const authorizeOwnedDataRetirement = codec.authorizeOwnedDataRetirement?.bind(codec);
+    map.set(key, Object.freeze({ schema: codec.schema, version: codec.version, decodeSummary, validatePlan, requiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedReplace === undefined ? {} : { authorizeOwnedReplace }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }), ...(authorizeOwnedDataRetirement === undefined ? {} : { authorizeOwnedDataRetirement }) }));
   }
   return { ok: true, value: Object.freeze({ lookup: (schema: string, version: number) => map.get(`${schema}\0${version}`) }) };
 }
@@ -325,8 +326,8 @@ export async function prepareTransaction<T>(inputs: { readonly store: OwnedState
   if (!validCodecIdentity(inputs.codec.schema, inputs.codec.version) || typeof inputs.codec.decodeSummary !== "function" || typeof inputs.codec.validatePlan !== "function" || typeof inputs.codec.requiredLocks !== "function") return fail("invalid-codec", "Producer codec identity or callbacks are invalid at preparation");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(inputs.operationId)) return fail("invalid-operation", "Operation id is invalid");
   const decodeSummary = inputs.codec.decodeSummary.bind(inputs.codec); const validatePlan = inputs.codec.validatePlan.bind(inputs.codec);
-  const deriveRequiredLocks = inputs.codec.requiredLocks.bind(inputs.codec); const authorizeExternal = inputs.codec.authorizeExternal?.bind(inputs.codec); const authorizeOwnedDelete = inputs.codec.authorizeOwnedDelete?.bind(inputs.codec); const authorizeOwnedDataRetirement = inputs.codec.authorizeOwnedDataRetirement?.bind(inputs.codec);
-  const codecSnapshot: TransactionProducerCodec = Object.freeze({ schema: inputs.codec.schema, version: inputs.codec.version, decodeSummary, validatePlan, requiredLocks: deriveRequiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }), ...(authorizeOwnedDataRetirement === undefined ? {} : { authorizeOwnedDataRetirement }) });
+  const deriveRequiredLocks = inputs.codec.requiredLocks.bind(inputs.codec); const authorizeExternal = inputs.codec.authorizeExternal?.bind(inputs.codec); const authorizeOwnedReplace = inputs.codec.authorizeOwnedReplace?.bind(inputs.codec); const authorizeOwnedDelete = inputs.codec.authorizeOwnedDelete?.bind(inputs.codec); const authorizeOwnedDataRetirement = inputs.codec.authorizeOwnedDataRetirement?.bind(inputs.codec);
+  const codecSnapshot: TransactionProducerCodec = Object.freeze({ schema: inputs.codec.schema, version: inputs.codec.version, decodeSummary, validatePlan, requiredLocks: deriveRequiredLocks, ...(authorizeExternal === undefined ? {} : { authorizeExternal }), ...(authorizeOwnedReplace === undefined ? {} : { authorizeOwnedReplace }), ...(authorizeOwnedDelete === undefined ? {} : { authorizeOwnedDelete }), ...(authorizeOwnedDataRetirement === undefined ? {} : { authorizeOwnedDataRetirement }) });
   const summaryClone = canonicalClone(inputs.confirmationSummary); if (!summaryClone.ok) return summaryClone;
   if (!decodeSummary(summaryClone.value).ok) return fail("invalid-summary", "Producer confirmation summary is invalid");
   const summaryBytes = canonicalJsonBytes(summaryClone.value); if (!summaryBytes.ok) return summaryBytes;
@@ -337,6 +338,12 @@ export async function prepareTransaction<T>(inputs: { readonly store: OwnedState
   if (new Set(normalized.map((item) => item.key)).size !== normalized.length || new Set(normalized.map((item) => process.platform === "win32" ? participantTarget(item).toLowerCase() : participantTarget(item))).size !== normalized.length) return fail("invalid-plan", "Participant keys and canonical targets must be unique");
   const generation = validateGenerationRelationship(normalized); if (!generation.ok) return generation;
   if (normalized.some((item) => !isOwnedDataRetirement(item) && item.targetClass === "external") && authorizeExternal === undefined) return fail("unsafe-target", "External participants require a reconstructible trusted producer callback");
+  if (normalized.some((item) => !isOwnedDataRetirement(item) && item.targetClass === "owned" && participantEffect(item) === "replace") && authorizeOwnedReplace !== undefined) {
+    for (const participant of normalized) if (!isOwnedDataRetirement(participant) && participant.targetClass === "owned" && participantEffect(participant) === "replace") {
+      const authorized = await authorizeOwnedReplace({ operationId: inputs.operationId, participant, mutation: "revalidate" });
+      if (!authorized.ok) return fail("invalid-producer-data", "Producer rejected prepared owned-replace authority");
+    }
+  }
   if (normalized.some((item) => !isOwnedDataRetirement(item) && item.effect === "delete") && authorizeOwnedDelete === undefined) return fail("unsafe-target", "Owned deletion requires reconstructible trusted producer authority");
   if (normalized.some(isOwnedDataRetirement) && authorizeOwnedDataRetirement === undefined) return fail("unsafe-target", "Owned data retirement requires reconstructible trusted producer authority");
   if (!validatePlan(normalized).ok) return fail("invalid-plan", "Producer rejected the exact normalized plan");
@@ -425,6 +432,10 @@ export async function revalidatePersistedTransaction(store: OwnedStateStore, tra
     if (participant.targetClass === "external") {
       const authorized = await codec.authorizeExternal?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
       if (authorized === undefined || !authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted external authority");
+    }
+    if (participant.targetClass === "owned" && participantEffect(participant) === "replace" && codec.authorizeOwnedReplace !== undefined) {
+      const authorized = await codec.authorizeOwnedReplace({ operationId: transaction.operationId, participant, mutation: "revalidate" });
+      if (!authorized.ok) return fail("invalid-producer-data", "Producer rejected persisted owned-replace authority");
     }
     if (participant.effect === "delete") {
       const authorized = await codec.authorizeOwnedDelete?.({ operationId: transaction.operationId, participant, mutation: "revalidate" });
@@ -556,6 +567,9 @@ async function authorize(codec: TransactionProducerCodec, operationId: string, p
   if (participant.effect === "delete") {
     const result = await codec.authorizeOwnedDelete?.({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
     if (result === undefined || !result.ok) throw new Error("owned-delete-authority");
+  } else if (participant.targetClass === "owned" && codec.authorizeOwnedReplace !== undefined) {
+    const result = await codec.authorizeOwnedReplace({ operationId, participant, mutation, ...(temporary === undefined ? {} : { temporary }) });
+    if (!result.ok) throw new Error("owned-replace-authority");
   }
   return undefined;
 }
@@ -687,6 +701,23 @@ export async function inspectDeletionEvidence(store: OwnedStateStore, transactio
     if (status !== "absent") present = true;
   }
   return { ok: true, value: present };
+}
+
+export async function canRollbackZeroPrefix(store: OwnedStateStore, journal: TransactionJournal): Promise<StoreResult<boolean>> {
+  if (journal.completed !== 0 || journal.rolledBack !== 0 || journal.createdParents.some((created) => created !== null)) return { ok: true, value: false };
+  const deletionEvidence = await inspectDeletionEvidence(store, journal); if (!deletionEvidence.ok) return deletionEvidence;
+  if (deletionEvidence.value) return { ok: true, value: false };
+  try {
+    for (const participant of journal.participants) {
+      if (isOwnedDataRetirement(participant)) {
+        const status = await retirementStatus(store, participant);
+        if (status !== "source" && status !== "absent-noop") return { ok: true, value: false };
+      } else if (!await validateParticipantTarget(participant, participant.precondition.state === "present") || !await casMatches(participant)) {
+        return { ok: true, value: false };
+      }
+    }
+    return { ok: true, value: true };
+  } catch { return { ok: true, value: false }; }
 }
 async function mutationCommitted(store: OwnedStateStore, journal: PreparedTransaction, participant: TransactionParticipant, index: number): Promise<boolean> {
   if (isOwnedDataRetirement(participant)) return committedPostcondition(store, journal, participant, index);

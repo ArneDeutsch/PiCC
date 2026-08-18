@@ -32,21 +32,80 @@ import {
 } from "./claude/plugins.js";
 import { projectIdentities } from "./util/project-identity.js";
 import type { PluginResolutionOutcome } from "./types.js";
-import { createLifecycleLocations } from "./plugin-lifecycle/locations.js";
+import { createLifecycleLocations, createMcpLifecycleLocations } from "./plugin-lifecycle/locations.js";
 import { createExecutableAdmissionGenerationCodec, createOwnedMarketplaceCodec, createOwnedMarketplaceSnapshotCodec, createOwnedPluginInstallationCodec, observeExecutableGenerationFile, readOwnedAdmissionRecords, type AdmittedOwnedInstallation, type CompleteOwnedProfileReference, type GenerationMarkerObservation, type MarketplaceSnapshotAuthority, type OwnedMarketplaceRecord } from "./plugin-lifecycle/admission.js";
 import { canonicalJsonBytes, createProducerCodecRegistry, sha256, type OwnedStateStore, type StoreResult } from "./plugin-lifecycle/state-store.js";
 import { assembledEnablement, observeLifecycleEnvelope, ownedMarketplaceProjection, projectOwnedAndImportedInstallations, uniquelySelectedApplicableOwnedWinner, type InstallationProjection, type LifecycleObservationEnvelope } from "./plugin-lifecycle/projection.js";
 import { admitDependencyGraph } from "./plugin-lifecycle/dependency-admission.js";
 import { captureImportedExecutableTrees, captureReloadCandidateBinding, sameImportedExecutableTrees, type ReloadCandidateBinding } from "./plugin-lifecycle/reload-handoff.js";
+import { observePersistedTransactionsSync } from "./plugin-lifecycle/transaction.js";
+import { readMcpReviewStateCaptureSync } from "./mcp-administration/review-state.js";
+import type { McpReviewSnapshot } from "./mcp-administration/model.js";
 
 /**
  * Assemble the full Claude-artifact model of a project: settings with
  * precedence, skills, agents, rules, CLAUDE.md hierarchy, and installed-plugin
  * content folded into the same registries.
  */
+export interface McpStartupAuthority {
+  readonly profileKey?: string;
+  readonly checkoutFamilyKey?: string;
+  readonly reviewSnapshot?: McpReviewSnapshot;
+  readonly reviewInvalid: boolean;
+  readonly recoveryPending: boolean;
+  readonly pendingOperationId?: string;
+}
+
+function passiveMcpStore(locations: ReturnType<typeof createMcpLifecycleLocations> & { ok: true }): OwnedStateStore {
+  const root = locations.value.profileRoot;
+  return Object.freeze({
+    root,
+    profileRoot: root,
+    profileKey: locations.value.profileKey,
+    artifactsRoot: path.join(root, "artifacts", "sha256"),
+    recordsRoot: path.join(root, "records"),
+    stagingRoot: path.join(root, "staging"),
+    generationsRoot: path.join(root, "generations"),
+    journalsRoot: path.join(root, "journals"),
+    receiptsRoot: path.join(root, "receipts"),
+    locksRoot: path.join(root, "locks"),
+    quarantineRoot: path.join(root, "quarantine"),
+    dataRoot: locations.value.dataRoot,
+  });
+}
+
+export function loadMcpStartupAuthority(inputs: { homeDir: string; profilePath: string; projectRoot: string }): McpStartupAuthority {
+  const identities = projectIdentities(inputs.projectRoot);
+  const family = identities[0];
+  const active = identities.at(-1);
+  if (family === undefined || active === undefined) return Object.freeze({ reviewInvalid: false, recoveryPending: false });
+  const locations = createMcpLifecycleLocations({
+    homeDir: inputs.homeDir,
+    profilePath: inputs.profilePath,
+    platform: process.platform === "win32" ? "win32" : "posix",
+    project: { activeCheckoutPath: active, checkoutFamilyPath: family },
+  });
+  if (!locations.ok || locations.value.checkoutFamilyKey === undefined) return Object.freeze({ reviewInvalid: false, recoveryPending: false });
+  const store = passiveMcpStore(locations);
+  const observed = observePersistedTransactionsSync(store);
+  const pending = observed.journals.find((journal) => journal.status !== "terminal-residue");
+  const captured = readMcpReviewStateCaptureSync({ store, checkoutFamilyKey: locations.value.checkoutFamilyKey });
+  const reviewSnapshot = captured.ok ? captured.value.snapshot : undefined;
+  const reviewInvalid = !captured.ok;
+  return Object.freeze({
+    profileKey: store.profileKey,
+    checkoutFamilyKey: locations.value.checkoutFamilyKey,
+    ...(reviewSnapshot === undefined ? {} : { reviewSnapshot }),
+    reviewInvalid,
+    recoveryPending: pending !== undefined,
+    ...(pending === undefined ? {} : { pendingOperationId: pending.operationId }),
+  });
+}
+
 export interface LoadedProject extends ClaudeProject {
   /** Resolved MCP servers (always present here; empty config => `servers: []`). */
   mcp: ResolvedMcpConfig;
+  mcpStartupAuthority: McpStartupAuthority;
   /** Fully merged hook config: settings hooks + plugin hooks. */
   mergedHooks: HookConfig;
   plugins: InstalledPlugin[];
@@ -341,24 +400,46 @@ export function loadClaudeProject(opts: {
     loadProjectMcpJson: loadMcpJson,
   };
   let agentMcpAdmission: AgentMcpAdmissionContext | undefined;
-  const mcp = resolveMcpConfig({
-    projectRoot: root,
-    loadOrdinaryMcp: () => ({
-      nativeState: ordinaryLoaders.loadNativeState({
-        statePath: profile.nativeStatePath,
+  const mcpStartupAuthority = loadMcpStartupAuthority({ homeDir: lifecycleHome, profilePath: userDir, projectRoot: root });
+  const mcp: ResolvedMcpConfig = mcpStartupAuthority.recoveryPending
+    ? {
+        servers: [],
+        diagnostics: ["MCP administration recovery is pending; run an MCP administration action to complete rollback before startup"],
+        failClosed: "administration-recovery-pending",
+        policyPosture: "fail-closed",
+        policyAuthority: "user-controlled",
+        policyObservations: [],
+        policyFailures: [],
+        administration: {
+          version: 1,
+          policyPosture: "fail-closed",
+          observations: ["administration-recovery-pending"],
+          remediation: "administration-recovery-pending",
+          declarations: [],
+          omittedDeclarationCount: 0,
+        },
+      }
+    : resolveMcpConfig({
         projectRoot: root,
-      }),
-      mcpJson: ordinaryLoaders.loadProjectMcpJson(root),
-    }),
-    mcpSettings: settings.mcpSettings ?? [],
-    nativeStateProfile: profile.source,
-    mcpPolicySettings: settings.mcpPolicySettings,
-    mcpPolicySourceFailures: settings.mcpPolicySourceFailures,
-    mcpPolicyRestrictiveMaterialOmitted: settings.mcpPolicyRestrictiveMaterialOmitted,
-    managedMcp,
-    ...(opts.env === undefined ? {} : { env: opts.env }),
-    captureAgentMcpAdmission: (context) => { agentMcpAdmission = context; },
-  });
+        loadOrdinaryMcp: () => ({
+          nativeState: ordinaryLoaders.loadNativeState({
+            statePath: profile.nativeStatePath,
+            projectRoot: root,
+          }),
+          mcpJson: ordinaryLoaders.loadProjectMcpJson(root),
+        }),
+        mcpSettings: settings.mcpSettings ?? [],
+        nativeStateProfile: profile.source,
+        mcpPolicySettings: settings.mcpPolicySettings,
+        mcpPolicySourceFailures: settings.mcpPolicySourceFailures,
+        mcpPolicyRestrictiveMaterialOmitted: settings.mcpPolicyRestrictiveMaterialOmitted,
+        managedMcp,
+        ...(mcpStartupAuthority.reviewSnapshot !== undefined
+          ? { reviewSnapshot: mcpStartupAuthority.reviewSnapshot }
+          : mcpStartupAuthority.reviewInvalid ? { reviewSnapshot: {} as McpReviewSnapshot } : {}),
+        ...(opts.env === undefined ? {} : { env: opts.env }),
+        captureAgentMcpAdmission: (context) => { agentMcpAdmission = context; },
+      });
 
   const hookConfigs: HookConfig[] = [settings.hooks];
   for (const plugin of plugins) {
@@ -521,6 +602,7 @@ export function loadClaudeProject(opts: {
     rules: rulesResult.rules,
     claudeMd: claudeMdResult.files,
     mcp,
+    mcpStartupAuthority,
     ...(agentMcpAdmission === undefined ? {} : { agentMcpAdmission }),
     diagnostics,
     mergedHooks,

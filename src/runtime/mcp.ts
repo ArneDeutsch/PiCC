@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
+import { openMcpAdministrationRuntimeAdmission } from "../mcp-administration/service.js";
 import {
   killProcessTreeByPid,
   killProcessTreeByPidAndWait,
@@ -23,6 +25,11 @@ import {
 } from "./mcp-remote.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type {
+  McpCatalogDelta,
+  McpRuntimeAdmission,
+  McpRuntimeControlResult,
+} from "./mcp-control.js";
 
 /**
  * MCP transport and capability runtime manager.
@@ -291,6 +298,14 @@ interface ServerHandle {
   settled: boolean;
   /** Every remote close begun after references were detached, retained for owner confirmation. */
   remoteCloseCompletion?: Promise<boolean>;
+  definitionFingerprint?: string;
+  routeActive: boolean;
+  catalogPublished: boolean;
+  completionResolve?: () => void;
+  completionPromise: Promise<void>;
+  countsTowardInitialSettlement: boolean;
+  desiredGeneration?: number;
+  stopCompletion?: Promise<boolean>;
 }
 
 export class McpRuntime {
@@ -308,6 +323,17 @@ export class McpRuntime {
   private readonly cleanupRetries = new Map<string, () => Promise<boolean>>();
   private exitHookRegistered = false;
   private remoteClientCtorPromise?: Promise<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>;
+  private readonly controlQueues = new Map<string, Promise<McpRuntimeControlResult>>();
+  private readonly semanticControls = new Map<string, {
+    readonly generation: number;
+    readonly completion: Promise<McpRuntimeControlResult>;
+  }>();
+  private readonly activeDisables = new Map<string, { readonly generation: number; readonly completion: Promise<McpRuntimeControlResult> }>();
+  private readonly desiredGenerations = new Map<string, number>();
+  private readonly preemptiveDeltas = new Map<string, { readonly generation: number; readonly delta: McpCatalogDelta }>();
+  private readonly catalogByDefinition = new Map<string, DiscoverySnapshot>();
+  private readonly routeGenerations = new Map<string, number>();
+  private controlShutdown = false;
 
   /**
    * Last-resort sweep for a dying harness process: taskkill (a spawn) cannot
@@ -328,7 +354,10 @@ export class McpRuntime {
     }
   };
 
-  private constructor(config: { readonly servers: readonly RuntimeMcpServer[] }, deps: McpRuntimeDeps) {
+  private constructor(
+    config: { readonly servers: readonly RuntimeMcpServer[]; readonly administration?: ResolvedMcpConfig["administration"] },
+    deps: McpRuntimeDeps,
+  ) {
     this.deps = deps;
     this.processCleanup = resolveProcessCleanupDeps(deps);
     const timeoutResolution = resolveMcpTimeoutPolicyInternal(
@@ -339,19 +368,14 @@ export class McpRuntime {
     for (const rejected of timeoutResolution.rejected) {
       this.diags.push(timeoutRejectionDiagnostic(rejected));
     }
+    const definitions = new Map(config.servers.length === 0 ? [] : (config.administration
+      ? config.administration.declarations
+        .filter((item) => item.precedence === "winner" && item.definitionDigest !== undefined)
+        .map((item) => [item.name, item.definitionDigest!] as const)
+      : []));
     for (const server of config.servers) {
       if (server.status !== "enabled") continue;
-      this.handles.push({
-        server,
-        state: "connecting",
-        tools: Object.freeze([]),
-        prompts: Object.freeze([]),
-        resources: Object.freeze([]),
-        generation: 0,
-        stderrRing: "",
-        stopped: false,
-        settled: false,
-      });
+      this.handles.push(this.createHandle(server, definitions.get(server.name), true));
     }
     this.unsettledCount = this.handles.length;
     if (this.unsettledCount === 0) {
@@ -374,7 +398,7 @@ export class McpRuntime {
   }
 
   private static startConfig(
-    config: { readonly servers: readonly RuntimeMcpServer[] },
+    config: { readonly servers: readonly RuntimeMcpServer[]; readonly administration?: ResolvedMcpConfig["administration"] },
     deps: McpRuntimeDeps,
   ): McpRuntime {
     const runtime = new McpRuntime(config, deps);
@@ -472,6 +496,42 @@ export class McpRuntime {
       client.readResource({ uri }, { timeout }));
   }
 
+  /** Reconciles one freshly admitted resolver entry without allowing stale work to publish. */
+  reconcileServer(admission: McpRuntimeAdmission): Promise<McpRuntimeControlResult> {
+    return this.beginControl(admission, false);
+  }
+
+  /** Retries only the current failed definition under fresh admission authority. */
+  reconnectServer(admission: McpRuntimeAdmission): Promise<McpRuntimeControlResult> {
+    return this.beginControl(admission, true);
+  }
+
+  /** Retires the route synchronously and starts cleanup independently of queued reconcile work. */
+  disableServer(serverName: string): Promise<McpRuntimeControlResult> {
+    if (this.controlShutdown) return Promise.resolve(controlFailure("shutting-down"));
+    const duplicate = this.activeDisables.get(serverName);
+    if (duplicate !== undefined && duplicate.generation === this.desiredGenerations.get(serverName)) return duplicate.completion;
+    const desiredGeneration = this.advanceDesiredGeneration(serverName);
+    const current = this.handles.find((candidate) => candidate.server.name === serverName);
+    const delta = current ? this.retireHandle(current) : undefined;
+    const completion = (async (): Promise<McpRuntimeControlResult> => {
+      if (!current) return controlSuccess([], "not-required", "route-absent");
+      if (!delta && current.stopped && current.stopCompletion === undefined && !this.cleanupRetries.has(serverName)) {
+        return controlSuccess([], "not-required", "already-inactive");
+      }
+      const confirmed = await this.stopServer(current).catch(() => false);
+      return confirmed
+        ? controlSuccess(delta ? [delta] : [], "confirmed", delta ? undefined : "already-inactive")
+        : controlFailure("cleanup-unconfirmed", "unconfirmed", delta);
+    })();
+    const active = { generation: desiredGeneration, completion };
+    this.activeDisables.set(serverName, active);
+    void completion.finally(() => {
+      if (this.activeDisables.get(serverName) === active) this.activeDisables.delete(serverName);
+    });
+    return completion;
+  }
+
   /** Rejects with a descriptive Error on failure/timeout; result is the raw MCP call result. */
   async callTool(serverName: string, toolName: string, args: unknown): Promise<unknown> {
     const handle = this.requireHandle(serverName);
@@ -500,7 +560,7 @@ export class McpRuntime {
   }
 
   private catalogVisible(handle: ServerHandle): boolean {
-    return handle.server.transport !== "stdio" || handle.state === "connected";
+    return handle.routeActive && handle.catalogPublished && (handle.server.transport !== "stdio" || handle.state === "connected");
   }
 
   private requireHandle(serverName: string): ServerHandle {
@@ -519,6 +579,9 @@ export class McpRuntime {
     invoke: (client: Client, timeoutMs: number) => Promise<unknown>,
   ): Promise<unknown> {
     const serverName = handle.server.name;
+    if (!handle.routeActive) {
+      throw new Error(`MCP server "${serverName}" is unavailable because its route was retired`);
+    }
     if (handle.state === "reconnecting" || handle.state === "retrying") {
       throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
     }
@@ -578,12 +641,14 @@ export class McpRuntime {
 
   /** Idempotent; closes clients and kills process trees; grace-bounded, never throws. */
   shutdown(): Promise<void> {
+    this.fenceControlShutdown();
     this.shutdownPromise ??= this.shutdownAgent().then(() => undefined);
     return this.shutdownPromise;
   }
 
   /** Agent-owner cleanup with bounded, identity-only confirmation evidence. */
   shutdownAgent(): Promise<McpCleanupOutcome> {
+    this.fenceControlShutdown();
     this.agentShutdownPromise ??= this.doShutdown();
     return this.agentShutdownPromise;
   }
@@ -604,6 +669,218 @@ export class McpRuntime {
       settled.filter((entry) => entry.confirmed).map((entry) => entry.name),
       settled.filter((entry) => !entry.confirmed).map((entry) => entry.name),
     );
+  }
+
+  private createHandle(
+    server: EnabledMcpServer,
+    definitionFingerprint?: string,
+    countsTowardInitialSettlement = false,
+  ): ServerHandle {
+    let completionResolve: (() => void) | undefined;
+    const completionPromise = new Promise<void>((resolve) => { completionResolve = resolve; });
+    return {
+      server,
+      state: "connecting",
+      tools: Object.freeze([]),
+      prompts: Object.freeze([]),
+      resources: Object.freeze([]),
+      generation: 0,
+      stderrRing: "",
+      stopped: false,
+      settled: false,
+      routeActive: true,
+      catalogPublished: false,
+      completionPromise,
+      completionResolve,
+      countsTowardInitialSettlement,
+      ...(definitionFingerprint === undefined ? {} : { definitionFingerprint }),
+    };
+  }
+
+  private beginControl(admission: McpRuntimeAdmission, failedOnly: boolean): Promise<McpRuntimeControlResult> {
+    const opened = openMcpAdministrationRuntimeAdmission(admission);
+    if (opened === undefined) return Promise.resolve(controlFailure("definition-unavailable"));
+    const name = opened.server.name;
+    const fingerprint = opened.binding.admittedDefinitionDigest;
+    const actionKey = failedOnly ? "reconnect" : "reconcile";
+    const semanticKey = `${actionKey}\u0000${name}\u0000${fingerprint}`;
+    const duplicate = this.semanticControls.get(semanticKey);
+    if (duplicate !== undefined && duplicate.generation === this.desiredGenerations.get(name)) {
+      return duplicate.completion;
+    }
+
+    const current = this.handles.find((candidate) => candidate.server.name === name);
+    if (failedOnly) {
+      if (!current || current.definitionFingerprint !== fingerprint) {
+        return Promise.resolve(controlFailure("generation-stale"));
+      }
+      if (current.state !== "failed") return Promise.resolve(controlFailure("not-failed"));
+    } else if (current?.routeActive && current.definitionFingerprint === fingerprint &&
+      (current.state === "connecting" || current.state === "connected" || current.state === "retrying" || current.state === "reconnecting")) {
+      return Promise.resolve(controlSuccess([], "not-required", "already-current"));
+    }
+
+    const desiredGeneration = this.advanceDesiredGeneration(name);
+    const superseded = this.handles.find((candidate) => candidate.server.name === name && candidate.desiredGeneration !== undefined && candidate.desiredGeneration !== desiredGeneration);
+    if (superseded) {
+      const delta = this.retireHandle(superseded) ?? this.preemptiveDeltas.get(name)?.delta;
+      if (delta) this.preemptiveDeltas.set(name, { generation: desiredGeneration, delta });
+      void this.stopServer(superseded);
+    }
+    const prior = this.controlQueues.get(name);
+    const next = prior === undefined
+      ? this.reconcileCurrent(opened, failedOnly, desiredGeneration)
+      : prior.then(
+          () => this.reconcileCurrent(opened, failedOnly, desiredGeneration),
+          () => this.reconcileCurrent(opened, failedOnly, desiredGeneration),
+        );
+    this.controlQueues.set(name, next);
+    const semanticControl = { generation: desiredGeneration, completion: next };
+    this.semanticControls.set(semanticKey, semanticControl);
+    void next.finally(() => {
+      if (this.controlQueues.get(name) === next) this.controlQueues.delete(name);
+      if (this.semanticControls.get(semanticKey) === semanticControl) this.semanticControls.delete(semanticKey);
+    });
+    return next;
+  }
+
+  private advanceDesiredGeneration(serverName: string): number {
+    const next = (this.desiredGenerations.get(serverName) ?? 0) + 1;
+    this.desiredGenerations.set(serverName, next);
+    return next;
+  }
+
+  private desiredCurrent(serverName: string, generation: number): boolean {
+    return !this.controlShutdown && this.desiredGenerations.get(serverName) === generation;
+  }
+
+  private fenceControlShutdown(): void {
+    if (this.controlShutdown) return;
+    this.controlShutdown = true;
+    for (const handle of this.handles) {
+      this.advanceDesiredGeneration(handle.server.name);
+      void this.stopServer(handle);
+    }
+  }
+
+  private async reconcileCurrent(
+    admission: NonNullable<ReturnType<typeof openMcpAdministrationRuntimeAdmission>>,
+    failedOnly: boolean,
+    desiredGeneration: number,
+  ): Promise<McpRuntimeControlResult> {
+    if (!this.desiredCurrent(admission.server.name, desiredGeneration)) {
+      return controlFailure(this.controlShutdown ? "shutting-down" : "generation-stale");
+    }
+    const { server, binding } = admission;
+    const name = server.name;
+    const fingerprint = binding.admittedDefinitionDigest;
+    const current = this.handles.find((candidate) => candidate.server.name === name);
+    if (failedOnly && (!current || current.definitionFingerprint !== fingerprint)) {
+      return controlFailure("generation-stale");
+    }
+    if (failedOnly && current?.state !== "failed") return controlFailure("not-failed");
+    if (!failedOnly && current?.routeActive && current.definitionFingerprint === fingerprint &&
+      (current.state === "connecting" || current.state === "connected" || current.state === "retrying" || current.state === "reconnecting")) {
+      return controlSuccess([], "not-required", "already-current");
+    }
+
+    const preemptive = this.preemptiveDeltas.get(name);
+    if (preemptive?.generation === desiredGeneration) this.preemptiveDeltas.delete(name);
+    const deltas: McpCatalogDelta[] = preemptive?.generation === desiredGeneration ? [preemptive.delta] : [];
+    let cleanup: "not-required" | "confirmed" = "not-required";
+    if (current) {
+      const retired = this.retireHandle(current);
+      if (retired) deltas.push(retired);
+      const confirmed = await this.stopServer(current).catch(() => false);
+      if (!confirmed) return controlFailure("cleanup-unconfirmed", "unconfirmed", ...deltas);
+      cleanup = "confirmed";
+    }
+    if (!this.desiredCurrent(name, desiredGeneration)) {
+      return controlFailure(this.controlShutdown ? "shutting-down" : "generation-stale", cleanup, ...deltas);
+    }
+
+    const handle = this.createHandle(server, fingerprint);
+    handle.desiredGeneration = desiredGeneration;
+    const cached = this.catalogByDefinition.get(catalogIdentity(name, fingerprint));
+    if (cached) {
+      this.publishInitialCapabilities(handle, cached);
+      handle.catalogPublished = false;
+    }
+    const index = current ? this.handles.indexOf(current) : -1;
+    if (index >= 0) this.handles[index] = handle;
+    else this.handles.push(handle);
+    if (!this.desiredCurrent(name, desiredGeneration)) {
+      this.retireHandle(handle);
+      void this.stopServer(handle);
+      return controlFailure("generation-stale", cleanup, ...deltas);
+    }
+    void this.connectOne(handle, cached === undefined);
+    await handle.completionPromise;
+    if (!this.desiredCurrent(name, desiredGeneration) || this.handles.find((candidate) => candidate.server.name === name) !== handle || !handle.routeActive) {
+      return controlFailure(this.controlShutdown ? "shutting-down" : "generation-stale", cleanup, ...deltas);
+    }
+    if (handle.state !== "connected") {
+      this.retireHandle(handle);
+      return controlFailure("connection-failed", cleanup, ...deltas);
+    }
+    handle.catalogPublished = true;
+    const published = this.catalogDelta(handle, "publish");
+    if (published) deltas.push(published);
+    return controlSuccess(deltas, cleanup);
+  }
+
+  private async connectOne(handle: ServerHandle, discover: boolean): Promise<void> {
+    if (handle.server.transport === "stdio") {
+      try {
+        const sdk = this.deps.loadSdk
+          ? await this.deps.loadSdk()
+          : await Promise.all([
+              import("@modelcontextprotocol/sdk/client/index.js"),
+              import("@modelcontextprotocol/sdk/client/stdio.js"),
+            ]).then(([clientMod, stdioMod]) => ({ Client: clientMod.Client, StdioClientTransport: stdioMod.StdioClientTransport }));
+        await this.connectStdio(handle as ServerHandle & { server: EnabledStdioRuntimeServer }, sdk, discover);
+      } catch {
+        this.settleHandle(handle, "failed", undefined, "MCP support is unavailable because its SDK could not be loaded.");
+      }
+    } else {
+      await this.connectRemoteInitial(handle as ServerHandle & { server: EnabledRemoteRuntimeServer }, discover);
+    }
+  }
+
+  private retireHandle(handle: ServerHandle): McpCatalogDelta | undefined {
+    if (!handle.routeActive) return undefined;
+    handle.routeActive = false;
+    handle.generation += 1;
+    handle.remoteAbort?.abort();
+    return handle.catalogPublished ? this.catalogDelta(handle, "retire") : undefined;
+  }
+
+  private catalogDelta(handle: ServerHandle, kind: McpCatalogDelta["kind"]): McpCatalogDelta | undefined {
+    const definitionFingerprint = handle.definitionFingerprint;
+    if (definitionFingerprint === undefined) return undefined;
+    const generation = (this.routeGenerations.get(handle.server.name) ?? 0) + 1;
+    this.routeGenerations.set(handle.server.name, generation);
+    const tools = Object.freeze(handle.tools.map((info) => Object.freeze({
+      info,
+      wireDefinitionFingerprint: wireFingerprint([info.toolName, info.description, info.inputSchema]),
+    })));
+    const prompts = Object.freeze(handle.prompts.map((info) => Object.freeze({
+      info,
+      wireDefinitionFingerprint: wireFingerprint([info.promptName, info.description, info.arguments]),
+    })));
+    const resourceServer = handle.resourceServerInfo === undefined ? undefined : Object.freeze({
+      info: handle.resourceServerInfo,
+      wireDefinitionFingerprint: wireFingerprint(handle.resourceServerInfo.resources),
+    });
+    return Object.freeze({
+      serverName: handle.server.name,
+      definitionFingerprint,
+      generation,
+      kind,
+      tools,
+      prompts,
+      ...(resourceServer === undefined ? {} : { resourceServer }),
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -652,6 +929,7 @@ export class McpRuntime {
   private async connectStdio(
     handle: ServerHandle & { server: EnabledStdioRuntimeServer },
     sdk: McpSdk,
+    discover = true,
   ): Promise<void> {
     const server = handle.server;
     // connectAll yields at the SDK import(); a shutdown() in that window has
@@ -724,7 +1002,7 @@ export class McpRuntime {
       const connectPromise = (async () => {
         await client.connect(transport);
         initializationComplete = true;
-        const snapshot = await this.discoverInitialCapabilities(handle, client);
+        const snapshot = discover ? await this.discoverInitialCapabilities(handle, client) : undefined;
         if (localCloseObserved || localTransportErrorObserved) {
           throw Object.assign(new Error("transport lost during capability discovery"), {
             code: MCP_ERROR_CONNECTION_CLOSED,
@@ -732,11 +1010,12 @@ export class McpRuntime {
         }
         if (
           !handle.stopped &&
+          handle.routeActive &&
           !handle.settled &&
           handle.client === client &&
           handle.transport === transport
         ) {
-          this.publishInitialCapabilities(handle, snapshot);
+          if (snapshot) this.publishInitialCapabilities(handle, snapshot);
         }
       })();
       // The losing branch keeps running after a timeout; never let it become
@@ -824,11 +1103,12 @@ export class McpRuntime {
 
   private async connectRemoteInitial(
     handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
+    discover = true,
   ): Promise<void> {
     const epoch = ++handle.generation;
     const controller = new AbortController();
     handle.remoteAbort = controller;
-    const sequence = this.remoteInitialSequence(handle, epoch, controller.signal);
+    const sequence = this.remoteInitialSequence(handle, epoch, controller.signal, discover);
     sequence.catch(() => undefined);
     const outcome = await (this.deps.raceWithTimeout ?? raceWithTimeout)(sequence, this.connectTimeoutMs);
     if (handle.stopped || handle.generation !== epoch) return;
@@ -849,6 +1129,7 @@ export class McpRuntime {
     handle: ServerHandle & { server: EnabledRemoteRuntimeServer },
     epoch: number,
     signal: AbortSignal,
+    discover: boolean,
   ): Promise<void> {
     const delays = [1_000, 2_000, 4_000] as const;
     for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -857,7 +1138,7 @@ export class McpRuntime {
       handle.attempt = attempt;
       handle.attemptLimit = 4;
       try {
-        const connected = await this.openRemote(handle, epoch, signal, true);
+        const connected = await this.openRemote(handle, epoch, signal, discover);
         if (!this.remoteCurrent(handle, epoch, signal)) {
           await connected.transport.abort().catch(() => undefined);
           return;
@@ -1004,6 +1285,7 @@ export class McpRuntime {
   }
 
   private publishInitialCapabilities(handle: ServerHandle, snapshot: DiscoverySnapshot): void {
+    if (handle.desiredGeneration === undefined) handle.catalogPublished = true;
     handle.tools = snapshot.tools;
     handle.prompts = snapshot.prompts;
     handle.resources = snapshot.resources;
@@ -1023,6 +1305,9 @@ export class McpRuntime {
         })
       : undefined;
     this.diags.push(...snapshot.diagnostics);
+    if (handle.definitionFingerprint !== undefined) {
+      this.catalogByDefinition.set(catalogIdentity(handle.server.name, handle.definitionFingerprint), snapshot);
+    }
   }
 
   private async discoverInitialCapabilities(
@@ -1221,7 +1506,7 @@ export class McpRuntime {
   }
 
   private beginRecovery(handle: ServerHandle, _event: RemoteMcpDisconnect): void {
-    if (handle.server.transport === "stdio" || handle.stopped) return;
+    if (handle.server.transport === "stdio" || handle.stopped || !handle.routeActive || !this.handleDesiredCurrent(handle)) return;
     if (handle.state === "reconnecting" || handle.state === "failed") return;
     const epoch = ++handle.generation;
     handle.state = "reconnecting";
@@ -1321,8 +1606,12 @@ export class McpRuntime {
     this.diags.push(handle.diagnostic);
   }
 
+  private handleDesiredCurrent(handle: ServerHandle): boolean {
+    return handle.desiredGeneration === undefined || this.desiredGenerations.get(handle.server.name) === handle.desiredGeneration;
+  }
+
   private remoteCurrent(handle: ServerHandle, epoch: number, signal: AbortSignal): boolean {
-    return !handle.stopped && !signal.aborted && handle.generation === epoch;
+    return !handle.stopped && handle.routeActive && this.handleDesiredCurrent(handle) && !signal.aborted && handle.generation === epoch;
   }
 
   private async closeRemoteParts(
@@ -1435,8 +1724,24 @@ export class McpRuntime {
     );
   }
 
-  private async stopServer(handle: ServerHandle): Promise<boolean> {
-    if (handle.stopped) return !this.cleanupRetries.has(handle.server.name);
+  private stopServer(handle: ServerHandle): Promise<boolean> {
+    if (handle.stopCompletion) return handle.stopCompletion;
+    const completion = this.stopServerOnce(handle);
+    handle.stopCompletion = completion;
+    void completion.then(() => {
+      if (handle.stopCompletion === completion) handle.stopCompletion = undefined;
+    });
+    return completion;
+  }
+
+  private async stopServerOnce(handle: ServerHandle): Promise<boolean> {
+    if (handle.stopped) {
+      const retry = this.cleanupRetries.get(handle.server.name);
+      if (!retry) return true;
+      const confirmed = await retry().catch(() => false);
+      if (confirmed) this.cleanupRetries.delete(handle.server.name);
+      return confirmed;
+    }
     handle.stopped = true;
     handle.generation += 1;
     handle.remoteAbort?.abort();
@@ -1555,14 +1860,18 @@ export class McpRuntime {
     if (handle.settled) return;
     handle.settled = true;
     handle.state = state;
+    handle.completionResolve?.();
+    handle.completionResolve = undefined;
     if (diagnostic !== undefined) {
       const bounded = neutralizeControlChars(diagnostic);
       handle.diagnostic = bounded;
       this.diags.push(bounded);
     }
     if (statusSummary !== undefined) handle.statusSummary = statusSummary;
-    this.unsettledCount -= 1;
-    if (this.unsettledCount <= 0) this.settleResolve?.();
+    if (handle.countsTowardInitialSettlement) {
+      this.unsettledCount -= 1;
+      if (this.unsettledCount <= 0) this.settleResolve?.();
+    }
   }
 
   private stderrExcerpt(handle: ServerHandle): string {
@@ -1603,6 +1912,54 @@ export class McpRuntime {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function controlSuccess(
+  deltas: readonly McpCatalogDelta[],
+  cleanup: McpRuntimeControlResult["cleanup"] = "not-required",
+  reason?: McpRuntimeControlResult["reason"],
+): McpRuntimeControlResult {
+  return Object.freeze({
+    state: "succeeded",
+    ...(reason === undefined ? {} : { reason }),
+    cleanup,
+    deltas: Object.freeze([...deltas]),
+  });
+}
+
+function controlFailure(
+  reason: Exclude<McpRuntimeControlResult["reason"], undefined>,
+  cleanup: McpRuntimeControlResult["cleanup"] = "not-required",
+  ...deltas: Array<McpCatalogDelta | undefined>
+): McpRuntimeControlResult {
+  return Object.freeze({
+    state: "failed",
+    reason,
+    cleanup,
+    deltas: Object.freeze(deltas.filter((delta): delta is McpCatalogDelta => delta !== undefined)),
+  });
+}
+
+function catalogIdentity(serverName: string, definitionFingerprint: string): string {
+  return `${serverName}\u0000${definitionFingerprint}`;
+}
+
+function wireFingerprint(value: unknown): string {
+  const seen = new WeakSet<object>();
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(value, (_key, candidate: unknown) => {
+      if (typeof candidate === "bigint") return String(candidate);
+      if (typeof candidate !== "object" || candidate === null) return candidate;
+      if (seen.has(candidate)) return "[circular]";
+      seen.add(candidate);
+      if (Array.isArray(candidate)) return candidate;
+      return Object.fromEntries(Object.entries(candidate as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)));
+    }) ?? "undefined";
+  } catch {
+    encoded = "unrepresentable";
+  }
+  return `mcp-wire-v1:${createHash("sha256").update(encoded).digest("hex")}`;
+}
 
 function cleanupOutcome(
   confirmed: readonly string[],

@@ -126,18 +126,22 @@ canonical project identities, and `discovery/mcp.ts` otherwise resolves whole en
 → `.mcp.json` → native user → settings extension order. It compiles one immutable managed-settings
 policy and admits each raw effective winner before expansion, approval, native disablement, or
 runtime materialization. Project `.mcp.json` and project-origin extension servers stay pending until
-approved from a user-authored settings scope; native local/user definitions instead use native
-runtime disablement. A git-tracked `settings.local.json` is demoted to project scope so a cloned repo
-can never self-approve. The fixed bounded Git classification may precede final policy admission only
+an exact PiCC review or user/managed compatibility grant permits them; native local/user definitions
+instead use native runtime disablement. Resolver-owned administration trace and normalized execution
+digests reuse these same whole-entry winners. Checkout-local approval keys never authorize; a
+tracked `settings.local.json` is additionally demoted to project scope. The fixed bounded Git
+classification may precede final policy admission only
 where it can change same-name winner or approval selection; inadmissible contenders do not trigger it,
 and no further classification occurs after a blocked winner is known. Present-but-unusable
 authoritative native state or standalone managed MCP fails MCP closed, while absence preserves the
 applicable lower inputs.
 
 Every current MCP source crosses this admission seam before post-admission materialization. Agent-inline
-admission uses the same immutable policy and approval snapshot, then materializes only for its selected
-main session or named dispatch; it never widens ordinary MCP sources. Future plugin or explicit
-runtime/CLI adapters must cross the same seam before their sources can be claimed as supported.
+admission uses captured, preclassified policy/review authority, then materializes only inside its
+selected main-session or named-dispatch scope without later filesystem or Git acquisition; it never
+mutates ordinary resolution or widens ordinary MCP sources, the parent inventory, or sibling scopes.
+Future plugin or explicit runtime/CLI adapters must cross the same seam before their sources can be
+claimed as supported.
 
 **Managed policy** is discovered by `discovery/managed-policy.ts` and applied as ordered, attributed
 source contributions after ordinary settings. Plugin enablement is validated per qualified identity
@@ -247,6 +251,47 @@ until a successful `/reload-plugins` replacement or a new session.
 **Placement:** lifecycle source, storage, transaction, settings, trust, dependency, and recovery code.
 Project contribution selection and final runtime assembly remain in `src/project.ts` and the Claude
 component loaders.
+
+### `mcp-administration/` — resolver-bound review and recoverable mutation
+
+The resolver owns the bounded declaration trace, whole-entry winner identity, and versioned digest of
+normalized execution fields. `inventory.ts` removes private definition identity and secret-bearing
+fields before any CLI or UI projection. `review-state.ts` owns the private exact-definition decision
+snapshot, keyed by coherent profile and linked-checkout family; startup reads it and the MCP
+transaction journal passively. Invalid review state blocks exact private review, while an independent
+trusted user/managed broad grant remains admission authority. Nonterminal recovery keeps mutation
+fail-closed, and startup never performs recovery writes.
+
+`persistence.ts` is the only MCP mutation authority. It preserves unrelated JSON fields plus the
+practical BOM, newline, indentation, and trailing-newline posture while changing one declaration,
+exact review record, or native runtime-disable list. Its dedicated MCP
+transaction codec and journal namespace authenticate profile, checkout family, target, mutation, and
+before/after bytes, with create-only staging, compare-and-swap publication, rollback, and bounded
+cleanup. This namespace reuses the generic transaction engine but cannot consume or be consumed as a
+plugin lifecycle transaction.
+
+`service.ts` is the authority shared by standalone commands and the interactive TUI. Direct mutations
+and explicit TUI administration can inspect and recover before fresh startup-equivalent assembly;
+dry-runs and passive status never recover. The remaining order is eligibility or opaque confirmation
+validation → durable mutation → fresh assembly → runtime reconciliation → host exposure. Review confirmation authority and activation/reconnect admissions are process-local opaque
+objects bound to exact definition, owner, policy, profile, and family; public inventory never carries
+the digest. Authentication deliberately stops at an unavailable result and performs no persistence or
+live work. Completed rollback or commit with complete cleanup is terminal durable evidence; pending
+recovery or cleanup remains nonterminal. Runtime and exposure outcomes stay separate so a committed
+write is not confused with a failed or uncertain live effect.
+
+The runtime remains the process/client owner. It serializes per-name desired generations, retires a
+route before cleanup, and accepts activation only through the service-minted opaque transition. A
+same-definition re-enable/reconnect reuses its cached immutable catalog; a changed definition performs
+new discovery. Main-session exposure serializes host registration and active-set publication, owns
+names only after exact source/definition verification, merges only its names into a fresh host active
+set, and validates current routing at call time. Tools and live resource catalogs can therefore add,
+remove, or refresh after startup without entering agent-local catalogs; prompt routing can refresh,
+while Pi palette metadata remains startup-bounded.
+
+**Placement:** administration model, safe inventory, exact review state, MCP transaction persistence,
+and action orchestration. Transport/process ownership remains in `runtime/`; source precedence remains
+in `discovery/`.
 
 ### `engine/` — the deterministic enforcement primitives
 
@@ -380,19 +425,23 @@ where to start reading, not the extent of its cluster.
 
 - **MCP runtime** (`mcp.ts`, `mcp-remote.ts`, `mcp-tools.ts`, `mcp-prompts.ts`,
   `mcp-resources.ts`) — starts only **enabled, policy-admitted** discovery-resolved servers without
-  blocking extension load. Blocked identities never enter this layer. `mcp.ts` owns transport lifecycle, capability negotiation, immutable initial tool/prompt/
-  resource snapshots, live status, and recovery-aware operations over the current client;
+  blocking extension load. Blocked identities never enter this layer. `mcp.ts` owns transport
+  lifecycle, capability negotiation, definition-bound tool/prompt/resource snapshots, live status,
+  and recovery-aware operations over the current client;
   `mcp-remote.ts` owns the safe remote adapter and typed failure/disconnect evidence. Tool catalogs
   become guarded `mcp__<server>__<tool>` proxies, prompt catalogs feed the user-input and palette
-  path, and a settled initial snapshot advertising resource capability conditionally registers two
-  guarded fixed tools even when its catalog is empty or failed. Recovery cannot widen any catalog or
-  inherited tool set, and the fixed resource schemas survive reconnect and terminal retained states.
+  path. When the live main-session catalog first gains an advertised resource capability, including
+  through changed-definition administration, exposure registers and activates two guarded fixed tools
+  even when that catalog is empty or failed. Same-definition recovery cannot widen a catalog or
+  inherited tool set; an administratively admitted changed definition is rediscovered and reconciled
+  through dynamic main-session exposure. Fixed resource host registration may survive retirement,
+  while active exposure is removed when no live main-session definition remains capable.
   The enablement gate is enforced by construction: no enabled server means no MCP context; no
-  published prompt means no prompt metadata; and no advertised resource capability in the settled
-  initial snapshots means no resource-tool schemas. Owned resources close with the session.
-  `agent-mcp.ts` composes immutable named-agent catalogs and routing from borrowed eligible session
-  servers plus one owned agent-inline runtime; a published session route quietly wins any same-name
-  inline admission result. Selected main sessions retain that scope for the session and project its
+  published prompt means no prompt metadata; and no advertised resource capability in the live
+  main-session catalog means no active resource-tool schemas. Owned resources close with the session.
+  `agent-mcp.ts` composes immutable selected-main and named-dispatch catalogs and routing from borrowed
+  eligible session servers plus one owned agent-inline runtime; a published session route quietly wins
+  any same-name inline admission result. Selected main sessions retain that scope for the session and project its
   owned inventory into selected-authority `/mcp` and `/doctor` output. Dispatch starts its scope after
   initial worktree admission and before tool gating or the first provider request, retains it through
   scoped stop hooks and checkpoint recovery, then awaits shutdown before worktree release and terminal settlement. A successful later
@@ -531,10 +580,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    MCP servers begin connecting in the background, non-blocking) are constructed. All
    Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered, the guard
    extension is installed on tool events, and extension load creates the MCP exposure transaction.
-   When initial settlement completes, that transaction publishes stable proxies, the prompt command
-   catalog, and conditional resource tools. The later async `resources_discover` event awaits the
-   settled exposure and writes frontmatter-only stubs for each eligible user-invocable skill and
-   published MCP prompt so it appears in the `/` palette. The per-session scratch dir is created
+   When initial settlement completes, that transaction publishes stable proxies and the prompt command
+   catalog; it conditionally publishes resource tools when the live catalog is capable. Later
+   administration can first register or retire that active resource exposure. The async
+   `resources_discover` event awaits settled exposure and performs startup prompt discovery/publication,
+   writing frontmatter-only stubs for each eligible user-invocable skill and published MCP prompt so it
+   appears in the `/` palette. The per-session scratch dir is created
    eagerly here and its literal path held for injection.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register

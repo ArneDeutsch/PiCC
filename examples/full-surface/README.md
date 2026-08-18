@@ -43,7 +43,10 @@ Coverage map (each canary string is asserted by tests):
 shape. Both names are intentionally inert in this fixture: `fixture-session` has no configured
 session server and project-inline `fixture-inline` is unapproved. The fixture proves
 loading, static reporting, and topology only; focused runtime tests own connection reuse, dispatch
-isolation, and cleanup behavior.
+isolation, and cleanup behavior. Likewise, the selected-main fixture covers identity/prompt wiring only;
+focused integration tests own selected-main MCP administration, required-capability admission, dynamic
+status composition, stale-route fencing, and runtime/exposure outcome coverage rather than adding an
+optional fixture walkthrough.
 
 The background command documents the directional settlement guidance (focused runtime tests prove the
 behavior): an eligible uncollected current task gets one bounded next-turn notice, but a terminal

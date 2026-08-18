@@ -29,6 +29,7 @@ const repoRoot = path.resolve(".");
 const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
 const launcherSource = path.join(repoRoot, "bin", "picc.mjs");
 const pluginAdapterSource = path.join(repoRoot, "bin", "picc-plugin.mjs");
+const mcpAdapterSource = path.join(repoRoot, "bin", "picc-mcp.mjs");
 const runtimeSelectorSource = path.join(repoRoot, "bin", "picc-runtime.mjs");
 const inventoryIncompleteWarning = (classes: string, actions = "repair") => `PiCC plugin inventory may be incomplete (${classes}). ${actions.includes("format") ? "Update PiCC or report the unsupported plugin-state format. " : ""}${actions.includes("repair") ? "Repair the malformed or unreadable Claude plugin state outside PiCC. " : ""}Run PiCC interactively in the same project and profile, then use \`/doctor\` for details.`;
 const sourceFallbackNotice = "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.";
@@ -84,6 +85,7 @@ function installLauncher(root: string): void {
   write(path.join(root, "bin", "picc-admin.mjs"), fs.readFileSync(adminSource, "utf8"));
   write(path.join(root, "bin", "picc.mjs"), fs.readFileSync(launcherSource, "utf8"));
   write(path.join(root, "bin", "picc-plugin.mjs"), fs.readFileSync(pluginAdapterSource, "utf8"));
+  write(path.join(root, "bin", "picc-mcp.mjs"), fs.readFileSync(mcpAdapterSource, "utf8"));
   write(path.join(root, "bin", "picc-runtime.mjs"), fs.readFileSync(runtimeSelectorSource, "utf8"));
 }
 
@@ -97,14 +99,18 @@ function installVerifiedRuntime(root: string, options: {
   const extension = "export default function picc() {}\n";
   const index = "export const runtime = 'compiled';\n//# sourceMappingURL=index.js.map\n";
   const plugin = options.pluginCode ?? "export function runPluginInventoryCli(argv, output) { output.log(`compiled:${argv.join(':')}`); return 0; }\n//# sourceMappingURL=plugin-inventory-cli.js.map\n";
+  const mcp = "export function runMcpAdministrationCli(argv, output) { output.log(`compiled-mcp:${argv.join(':')}`); return 0; }\n//# sourceMappingURL=mcp-administration-cli.js.map\n";
   const indexMap = JSON.stringify({ version: 3, file: "index.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const pluginMap = JSON.stringify({ version: 3, file: "plugin-inventory-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
+  const mcpMap = JSON.stringify({ version: 3, file: "mcp-administration-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const contents = new Map([
     ["picc/index.js", extension],
     ["dist/index.js", index],
     ["dist/index.js.map", indexMap],
     ["dist/plugin-inventory-cli.js", plugin],
     ["dist/plugin-inventory-cli.js.map", pluginMap],
+    ["dist/mcp-administration-cli.js", mcp],
+    ["dist/mcp-administration-cli.js.map", mcpMap],
   ]);
   for (const [relative, contentsValue] of contents) write(path.join(root, ...relative.split("/")), contentsValue);
 
@@ -120,6 +126,7 @@ function installVerifiedRuntime(root: string, options: {
   if (options.sourceMatched) {
     write(path.join(root, "src", "index.ts"), "export const source = true;\n");
     write(path.join(root, "src", "plugin-inventory-cli.ts"), options.sourcePluginCode ?? "export function runPluginInventoryCli() { return 0; }\n");
+    write(path.join(root, "src", "mcp-administration-cli.ts"), "export function runMcpAdministrationCli() { return 0; }\n");
     write(path.join(root, "tsconfig.runtime.json"), JSON.stringify({
       compilerOptions: {
         target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", lib: ["ES2022"], strict: true,
@@ -142,7 +149,7 @@ function installVerifiedRuntime(root: string, options: {
   const manifest = {
     schemaVersion: 1, package: identity.package, compiler: identity.compiler, sources: identity.sources,
     sourceDigest: identity.sourceDigest, files, runtimeDigest: digest(files),
-    entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js" },
+    entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
   };
   write(path.join(root, "dist", "picc-runtime.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -477,7 +484,7 @@ process.exit(23);
 
   it("fails every installed runtime category before Pi or source startup", () => {
     for (const category of ["missing", "corrupt", "version-mismatch"] as const) {
-      for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"]]) {
+      for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"], ["mcp", "list"]]) {
         const root = makePackage({ source: false });
         installLauncher(root);
         if (category !== "missing") installVerifiedRuntime(root);
@@ -520,6 +527,7 @@ process.exit(23);
       packageJson.dependencies.jiti = "2.7.0";
       write(packageJsonPath, JSON.stringify(packageJson));
       write(path.join(root, "src", "plugin-inventory-cli.ts"), "export function runPluginInventoryCli() { return 0; }\n");
+      write(path.join(root, "src", "mcp-administration-cli.ts"), "export function runMcpAdministrationCli() { return 0; }\n");
       copyJiti(path.join(root, "node_modules", "jiti"));
       if (state !== "missing") {
         installVerifiedRuntime(root, { sourceMatched: true });
@@ -533,7 +541,7 @@ process.exit(23);
       write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
         `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify(process.argv.slice(2)));`);
 
-      for (const argv of [["--theme", "dark"], ["plugin", "list"], ["plugin", "details", "same@market"]]) {
+      for (const argv of [["--theme", "dark"], ["plugin", "list"], ["plugin", "details", "same@market"], ["mcp", "list"]]) {
         const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
           cwd: root, encoding: "utf8",
         });
@@ -557,7 +565,7 @@ process.exit(23);
     write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
       `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(piCanary)}, "started");`);
 
-    for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"]]) {
+    for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"], ["mcp", "list"]]) {
       const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
         cwd: root, encoding: "utf8",
       });
@@ -658,6 +666,16 @@ process.exit(23);
       expect(fs.existsSync(sourceCanary)).toBe(false);
       expect(fs.existsSync(path.join(root, "node_modules", "jiti"))).toBe(false);
     }
+  });
+
+  it("routes MCP argv before Pi with exact argv preservation and keeps near-prefixes as Pi input", () => {
+    const root = makePackage({ source: false, withCli: false });
+    installLauncher(root); installVerifiedRuntime(root);
+    const mcp = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "mcp", "add", "name", "--", "node", "--flag"], { cwd: root, encoding: "utf8" });
+    expect(mcp).toMatchObject({ status: 0, stdout: "compiled-mcp:add:name:--:node:--flag\n", stderr: "" });
+    const canary = path.join(root, "pi-argv.json"); write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify(process.argv.slice(2)));`);
+    const near = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "mcpx", "list"], { cwd: root, encoding: "utf8" });
+    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "mcpx", "list"]);
   });
 
   it("routes plugin argv before Pi resolution and reports an unavailable packaged entrypoint safely", () => {
@@ -1433,7 +1451,8 @@ require("node:module").syncBuiltinESMExports();
     expect(result.stdout).toContain("picc plugin <command>");
     expect(result.stdout).toContain("Local marketplace/plugin lifecycle and offline recovery");
     expect(result.stdout).toContain("picc plugin --help");
-    expect(result.stdout).toContain("--agent <name>");
+    expect(result.stdout).toContain("       picc plugin <command>\n       picc mcp <command>\n\nPiCC options:");
+    expect(result.stdout).toContain("  mcp              Standalone MCP server administration\n                   Run picc mcp --help for the strict command grammar");
     expect(result.stdout).not.toMatch(/JSON|live.refresh/iu);
   });
 });

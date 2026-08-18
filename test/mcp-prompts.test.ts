@@ -4,6 +4,7 @@ import {
   buildMcpPromptCatalog,
   convertMcpPromptResult,
   invokeMcpPrompt,
+  McpPromptCatalogStore,
   McpPromptInvocationError,
   mapMcpPromptArguments,
   matchMcpPromptInvocation,
@@ -26,6 +27,19 @@ function onlyCommand(info: McpPromptInfo = prompt()) {
 }
 
 describe("MCP prompt catalog", () => {
+  it("atomically replaces the typed-invocation catalog while retaining dynamic reserved-name precedence", () => {
+    let reserved: readonly string[] = [];
+    const store = new McpPromptCatalogStore(() => reserved);
+    store.refresh([prompt()]);
+    expect(store.current().commands.map((command) => command.name)).toEqual(["mcp__server__review"]);
+    reserved = ["mcp__server__review"];
+    store.refresh([prompt()]);
+    expect(store.current().commands).toEqual([]);
+    expect(store.current().diagnostics).toEqual([
+      "Local command /mcp__server__review takes precedence over a colliding MCP prompt.",
+    ]);
+  });
+
   it("normalizes spaces, punctuation, Unicode, and controls while retaining opaque raw routing names", () => {
     const catalog = buildMcpPromptCatalog([
       prompt({ serverName: "my\u001b server", promptName: "say.hi/世界", description: "hello\u001bworld" }),

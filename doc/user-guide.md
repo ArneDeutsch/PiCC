@@ -580,7 +580,7 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | `/skills` | Categorize loaded skills by typed-slash availability; unsupported-name and reserved-shadowing rows separately state whether direct `Skill` invocation remains allowed |
 | `/agents` | List the custom and built-in subagent catalog permitted by the current agent policy, with tools, read-only marker, model, and worktree-isolation; the output identifies when session settings disable dispatch |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
-| `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and settle advertised tool, prompt, and resource catalogs or time out. See [MCP server settings](#6-security--permission-posture) |
+| `/mcp` | Stable bounded MCP status; interactive use is immediate, while one-shot text/JSON waits for bounded catalog settlement. `/mcp manage` opens interactive administration in the TUI. See [MCP administration](#mcp-administration) |
 | `/plugin`, `/plugin list`, `/plugin details name@marketplace` | Observational inventory plus focused interactive lifecycle actions; see [Installed plugins](#installed-plugins) |
 | `/plugins` | Exact observational list alias; never mutates or reloads |
 | `/reload-plugins` | In the interactive TUI, validate and adopt a complete plugin generation through Pi reload; headless modes give guidance only |
@@ -594,6 +594,84 @@ built-ins appear in the `/` menu with their description and argument hint — ty
 start typing a name to filter. Selecting one expands the skill into your turn exactly as Claude Code
 does.
 
+### MCP administration
+
+Bare `/mcp` retains the status surface. In the interactive TUI, `/mcp manage` opens bounded server
+details and eligible approve, reject, enable, disable, reconnect, and authentication actions. The
+exact deep links `/mcp approve`, `/mcp reject`, `/mcp enable`, `/mcp disable`, `/mcp reconnect`, and
+`/mcp authenticate` preselect an action; they take no tail arguments. Manage, approve, reject, and
+authenticate are wholly PiCC-defined. The fixed enable, disable, and reconnect links are PiCC-defined
+shortcuts whose no-tail syntax deliberately differs from Claude's textual grammar. Authentication
+reports unavailable: PiCC does not implement OAuth login, logout, token storage, or refresh.
+
+Headless slash administration never prompts or mutates. Use bare `/mcp` for status and `picc mcp`
+for supported configuration work. The standalone family runs without normal Pi session, hook, or
+plugin startup:
+
+```text
+picc mcp list [--scope|-s local|project|user]
+picc mcp get <name> [--scope|-s local|project|user]
+picc mcp add [--dry-run] [--scope|-s ...] ...
+picc mcp add-json [--dry-run] [--scope|-s ...] <name> <json>
+picc mcp add-json [--dry-run] [--scope|-s ...] <name> --json-file <path|->
+picc mcp remove [--dry-run] [--scope|-s ...] <name>
+picc mcp reset-project-choices [--dry-run]
+```
+
+Run `picc mcp --help` for the exact grammar. Invalid syntax returns bounded help pointing there.
+Mutations default to `local` and run directly without a confirmation prompt. `--dry-run` evaluates
+the current safe snapshot without recovery or writes, so it can refuse while the corresponding direct
+action would first recover. Project scope writes `.mcp.json`; local and user scope update the
+applicable native project and user records.
+Unscoped `list`/`get` show the bounded acquired inventory and effective winner; scoped reads are a
+PiCC extension. Unscoped remove succeeds only for one unambiguous mutable declaration when the
+bounded inventory omitted nothing; otherwise pass an explicit `--scope`. List/get may start only
+eligible winners in a transient bounded runtime to report connected, authentication-needed, or failed
+health and capability counts, then attempt bounded shutdown.
+
+For `add-json`, file, stdin, and inline input have a 1 MiB UTF-8 byte limit. Inline JSON and
+`--env`/`--header` values can expose credentials in argv and shell history; for credential-bearing
+definitions prefer `add-json --json-file <path|->` (file or stdin).
+Output is a fixed field-selected projection and does not echo
+definitions, commands, arguments, environment/header values, URLs, or raw failures. Stdio `add`
+uses a mandatory `--` before the command. Add also accepts `--transport|-t`, `--env|-e`, and
+`--header|-H`; remote add supports static HTTP/SSE headers. OAuth and
+`add-from-claude-desktop` remain unavailable.
+
+Declarations, project review decisions, and native runtime disablement are separate state. Approve
+or reject a project definition in the TUI; use `reset-project-choices` to clear only PiCC-owned exact
+definition review records across the active profile and checkout family. Enable/disable changes only
+the native `disabledMcpServers` list and cannot activate unsupported default-off
+`enabledMcpServers`. User/managed compatibility settings remain independent broad grants, while PiCC
+review is bound to the exact execution definition, source family, and agent owner. Invalid private
+review state blocks that exact review path but does not revoke an applicable trusted broad grant. A
+same-name changed definition therefore returns to pending review when broad authority does not admit
+it. Checkout-local approval keys never authorize.
+Verified linked worktrees share the review family and recovery boundary; moving the checkout or
+profile can make a stale action fail closed.
+
+Mutation results distinguish eligibility, recovery, durable write, runtime reconciliation, and host
+exposure. A committed write can be reported separately from a failed or uncertain live effect. If a
+transaction leaves recovery pending, startup and direct writes remain fail-closed until recovery completes. Reopen `/mcp
+manage` in the TUI to execute service-owned rollback preparation; a completed rollback opens the fresh
+inventory, while pending or uncertain recovery stays blocked. Standalone reads and dry-runs only
+diagnose it. Preserve the named files and inspect effects when persistence cleanup, runtime cleanup,
+or host exposure is uncertain; committed/rolled-back with complete cleanup are terminal durable
+outcomes, while pending recovery or cleanup is not. One count-only startup notice points pending TUI
+sessions to `/mcp manage`; print/JSON/RPC modes do not recover or wait for review input.
+
+Disable retires the current route before cleanup; enable can reconnect an eligible stdio definition
+only after confirmed cleanup. PiCC-defined manual reconnect is available for eligible failed stdio and
+supported remote main-session servers. Stdio servers do not reconnect automatically; supported remote
+servers retain their bounded automatic reconnect policy. Same-definition reconnect or re-enable reuses
+its immutable catalog; a changed execution definition
+is rediscovered and refreshes main-session tools, prompts, and resources through the host. The fixed
+resource tools are first registered and activated when the live main-session catalog first gains a
+resource-capable definition, including through changed-definition administration. Host registration
+may persist after the last such definition retires, but active exposure is removed. MCP
+`list_changed` notifications remain unsupported, prompt palette stubs remain bounded to startup
+prompt discovery and publication, and agent-inline catalogs stay isolated from the parent and siblings.
+
 ### MCP prompts and resources
 
 The `/` palette is the primary way to discover connected MCP prompts. Their command form is
@@ -604,16 +682,17 @@ server's declared order; quote multi-word values with single or double quotes, f
 If palette publication fails, the typed fallback is usable only when you already know the raw server
 and prompt names and can normalize them this way. PiCC owns the
 `.claude/.picc/prompts` palette metadata, attempts to git-exclude that path, and regenerates it
-during startup resource discovery and after `/reload`. Invocation replaces that user turn with
+during startup prompt discovery/publication and after `/reload`. Invocation replaces that user turn with
 bounded, explicitly untrusted prompt
 content. Generated palette files persist metadata only and never write prompt bodies or results;
 successful transformed content follows ordinary conversation and session transcript retention.
 
-When any settled initial server snapshot advertises resources, the model receives
+When the live main-session catalog first gains an advertised resource capability, the model receives
 `ListMcpResourcesTool` and `ReadMcpResourceTool`, including for an empty or
 `resources/list`-failed catalog.
-The schemas remain registered through reconnect and terminal retained states; they are absent only
-when no initial settled snapshot advertised resources. Deny either fixed name directly, or use the
+Host registration can remain through reconnect, terminal retention, and later retirement, but active
+model exposure is absent whenever no live main-session definition advertises resources. Deny either
+fixed name directly, or use the
 generic top-level forms
 `ListMcpResourcesTool(server:...)`, `ReadMcpResourceTool(server:...)`, and
 `ReadMcpResourceTool(uri:...)`; `mcp__server` and `Read(...)` are not aliases. Foreground
@@ -621,10 +700,11 @@ subagents and conversation forks inherit these tools through normal `tools:`/`di
 gating, while non-fork background subagents do not. MCP prompt commands remain user-only.
 
 Resource text and complete in-budget binary as labeled base64 are bounded by the configured MCP
-content budget; oversized or unsupported content degrades visibly. Prompt and resource catalogs are
-immutable initial snapshots. To discover server changes, run `/reload` (which reloads extensions and
-prompts) or exit and start PiCC again; reconnecting or resuming alone does not refresh them. MCP
-resources have no `@` attachment or autocomplete. See the
+content budget; oversized or unsupported content degrades visibly. Same-definition catalogs remain
+immutable across reconnect and ignored `list_changed` notifications. An administratively admitted
+changed definition is rediscovered and refreshes main-session tool/resource exposure, but startup
+prompt palette stubs do not republish dynamically; exact typed prompt routing follows the live
+catalog. MCP resources have no `@` attachment or autocomplete. See the
 [capability matrix](supported-features.md) for exhaustive limits and deferred MCP surfaces.
 
 ### Harness configuration
@@ -843,8 +923,9 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
-**MCP server configuration and gates.** PiCC reads native Claude state without modifying it. The
-default profile uses user-scoped settings and artifacts under `~/.claude` with native MCP state in
+**MCP server configuration and gates.** PiCC reads native Claude state and changes only targeted MCP
+declarations or runtime-disable lists through its administration transactions. The default profile
+uses user-scoped settings and artifacts under `~/.claude` with native MCP state in
 `~/.claude.json`. `PICC_CLAUDE_USER_DIR`, then `CLAUDE_CONFIG_DIR`, can select a different coherent
 user profile for user-scoped settings and artifacts, imported installed-plugin state and data,
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
@@ -880,14 +961,13 @@ are unsupported for both selected-main and dispatched-agent scopes.
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →
 project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower
 priority, with its existing managed → untracked local → project → user ordering. Fields never merge
-across same-name definitions. Native user and local winners start without the project approval gate. Project `.mcp.json` and committed
-project-settings extension winners remain pending until approved as described below. An exact name
-in the selected native project's `disabledMcpServers` disables an authentic native or `.mcp.json`
-winner before expansion. `enabledMcpServers` is recognized and reported but cannot activate
-Claude's default-off built-ins. Native MCP management through Claude Code must target the same
-active user profile. When PiCC uses `PICC_CLAUDE_USER_DIR`, run Claude Code for that maintenance
-operation with `CLAUDE_CONFIG_DIR` pointing to the same directory; otherwise Claude Code may update
-a different profile.
+across same-name definitions. Native user and local winners start without project review. Project `.mcp.json` and committed
+project-settings extension winners remain pending until an applicable exact PiCC review or broad
+compatibility grant permits them. An exact name in the selected native project's
+`disabledMcpServers` disables an authentic native or `.mcp.json` winner before expansion; ordinary
+interactive enable/disable edits only that list. `enabledMcpServers` is recognized and reported but
+cannot activate Claude's default-off built-ins. Standalone `picc mcp` uses the selected coherent
+profile; external Claude Code maintenance must target that same profile.
 
 For project-local native state, PiCC canonicalizes real paths so equivalent spellings and symlinks
 select the same project. A verified linked worktree also considers its main checkout identity.
@@ -902,10 +982,9 @@ behavior for canonical-equivalent records.
 
 Without standalone exclusive control, a missing native state file preserves `.mcp.json` and
 settings-extension sources. If the file is present but unusable (for example, malformed or
-unreadable), PiCC starts no MCP server and emits a bounded value-redacted warning. Preserve or back up the active user profile. PiCC has no repair
-command: restore a known-good backup of the active profile or its native state. If no
-known-good backup is available, preserve the profile and seek appropriate support. Restart PiCC
-after recovery. Use `/mcp` or `/doctor` for safe diagnostics.
+unreadable), PiCC starts no MCP server and emits a bounded value-redacted warning. Preserve or back
+up the active user profile and restore a known-good native state; administration refuses unsafe
+input rather than rewriting it. Use `/mcp` or `/doctor` for safe diagnostics.
 These bounds and fail-closed rules apply to native state, not the older `.mcp.json` loader.
 
 **Managed MCP policy.** A platform-fixed `managed-mcp.json` has the minimal valid root shape
@@ -963,34 +1042,32 @@ non-protocol HTTP failure bodies/status/redirect targets, and SDK/fetch exceptio
 valid MCP metadata, prompt/resource content, successful tool results, and protocol-level errors
 remain untrusted, server-controlled model content.
 
-Project-scope MCP servers (`.mcp.json`, `mcpServers` in the committed
-`.claude/settings.json`, or project-agent inline definitions) are pending by default and never start until you approve them. Approve
-selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
-untracked `.claude/settings.local.json`. User approval settings live in `settings.json` inside the
-active user profile directory (`~/.claude/settings.json` by default, or inside the selected override
-directory). `enableAllProjectMcpServers` trusts current and future project servers;
-`disabledMcpjsonServers` declines named servers and wins over approval. Approvals in a git-tracked
-`settings.local.json` do not work; create approval content yourself rather than reusing
-project-supplied content.
+Project-scope MCP servers (`.mcp.json`, committed settings `mcpServers`, or project-agent inline
+definitions) are pending by default. Interactive approve/reject records a PiCC-private decision for
+the exact execution definition, source family, checkout family, and agent owner. A changed same-name
+definition requires review again; project-agent approval cannot authorize another owner or the main
+session. `reset-project-choices` removes these review decisions without removing declarations or
+runtime disablement.
 
-Approval is persisted by sanitized server name, not by a command, URL, or header fingerprint. A
-later project revision can change a same-name definition without another approval. Re-review project
-MCP definitions after updates and before launching with secrets. Static authentication material is
-confined to the currently configured origin across redirects; approval does not make an endpoint
-immutable.
+The compatibility settings remain broader: `enabledMcpjsonServers` grants a normalized name and
+`enableAllProjectMcpServers` grants current and future project servers; `disabledMcpjsonServers`
+rejects names and wins. Only user/managed compatibility settings authorize. An untracked local
+settings file may contribute declarations but its approval keys do not authorize, and a tracked one
+is demoted to project scope. Static authentication material remains confined to the configured
+origin across redirects; review does not make an endpoint immutable.
 
 Remote startup and transient recovery are bounded. An initial `tools/list` failure is fatal to that
 server's staged capability publication: it publishes no capability snapshot, `mcp__...` proxies, or
 fixed resource tools. Separately, a `resources/list` failure on an otherwise successfully settled
 resource-advertising server retains that advertised capability and registers the fixed resource
-tools with an attributable catalog failure. Fix the endpoint, headers, or network, then run `/reload`
-or exit and start PiCC again. Retained catalogs and automatic recovery apply only after successful
-initial publication.
+tools with an attributable catalog failure. Fix the endpoint, headers, or network, then use eligible
+interactive reconnect or restart PiCC. Retained same-definition catalogs and automatic remote
+recovery apply only after successful initial publication.
 During an
 outage, the original tool proxies stay present and return a transient local failure; after recovery
-stops or a permanent failure, those proxies return a terminal local failure until the server is
-fixed and the extension is reloaded. An authentication or authorization failure means to check the
-configured static headers, not that OAuth is required. Use `/mcp` for current lifecycle state and
+stops or a permanent failure, those proxies return a terminal local failure until reconnect or a
+changed-definition replacement succeeds. An authentication or authorization failure means to check
+the configured static headers; the authentication entry point cannot perform OAuth. Use `/mcp` for current lifecycle state and
 `/doctor` for configuration compatibility.
 The [capability matrix](supported-features.md) owns alternative transports, deprecations, retry
 policy, and unsupported surfaces.
@@ -1040,7 +1117,7 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
-| MCP pending-approval notice at every startup | Review the pending servers and choose approval or decline under [MCP server settings](#6-security--permission-posture). Use `/mcp` for bounded status and settings guidance, or `/doctor` for broader compatibility findings. |
+| MCP pending-review notice at every TUI startup | Open `/mcp manage` and approve or reject the exact definitions, or use broad trusted user/managed compatibility settings deliberately. Bare `/mcp` remains status; `/doctor` shows broader findings. |
 | Managed MCP policy is fail closed or a repaired policy is not taking effect | Use `/mcp` or `/doctor` to inspect the reported authority, compiler observations, and any redacted source label. Ask the administrator to repair either the platform-fixed standalone `managed-mcp.json` or the reported managed-settings system file or ordered drop-in. Then use `/reload` or restart PiCC; `/new` does not reload policy. |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the session was persisted and its process exited, reopen that exact session before `/compact`; a one-shot ephemeral print/JSON session cannot be reopened, so start a replacement session and resend retained input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from caller-owned client/request history where available, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. Any presented post-compaction RPC cancellation is terminal: recover input from caller-owned client/request history where available, inspect possible effects, terminate PiCC, and start a fresh process and fresh session without reopening or resubmitting in the affected session. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; print, JSON, and presented post-compaction RPC cancellation use status **3**. |

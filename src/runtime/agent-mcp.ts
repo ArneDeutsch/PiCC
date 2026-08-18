@@ -56,8 +56,17 @@ export interface AgentMcpScope extends AgentMcpRuntimeSource {
   retryUnconfirmedShutdown(): Promise<McpCleanupOutcome>;
 }
 
+export interface AgentMcpSessionSnapshot {
+  readonly tools: readonly McpToolInfo[];
+  readonly resourceServers: readonly McpResourceServerInfo[];
+  readonly serverStates: readonly McpServerState[];
+  readonly publishedServerNames: ReadonlySet<string>;
+}
+
 export interface CreateAgentMcpScopeOptions {
   readonly sessionRuntime: AgentMcpRuntimeSource;
+  /** Settled once by an owner that must authenticate collision semantics before scope creation. */
+  readonly sessionSnapshot?: AgentMcpSessionSnapshot;
   readonly declaration?: Pick<AgentMcpDeclaration, "items"> &
     Partial<Pick<AgentMcpDeclaration, "diagnostics">>;
   readonly inlineConfig: ResolvedAgentMcpConfig;
@@ -77,19 +86,39 @@ type Route = { readonly kind: RouteSource; readonly source: AgentMcpRuntimeSourc
  * Settles the borrowed session catalog, starts only non-colliding admitted inline servers, and
  * publishes one dispatch-local immutable capability scope. It never registers capabilities globally.
  */
+export async function settleAgentMcpSessionSnapshot(
+  sessionRuntime: AgentMcpRuntimeSource,
+  signal?: AbortSignal,
+): Promise<AgentMcpSessionSnapshot> {
+  await abortable(sessionRuntime.whenSettled(), signal);
+  const tools = sessionRuntime.tools();
+  const resourceServers = sessionRuntime.resourceServers();
+  const serverStates = sessionRuntime.serverStates();
+  if (!Array.isArray(tools) || !Array.isArray(resourceServers) || !Array.isArray(serverStates)) {
+    throw new Error("Agent MCP settled session inventory is malformed");
+  }
+  const publishedServerNames = new Set([
+    ...serverStates.filter(isPublishedState).map((state) => state.name),
+    ...tools.map((entry) => entry.serverName),
+    ...resourceServers.map((entry) => entry.serverName),
+  ]);
+  return Object.freeze({
+    tools: Object.freeze([...tools]),
+    resourceServers: Object.freeze([...resourceServers]),
+    serverStates: Object.freeze([...serverStates]),
+    publishedServerNames,
+  });
+}
+
 export async function createAgentMcpScope(
   options: CreateAgentMcpScopeOptions,
 ): Promise<AgentMcpScope> {
-  await abortable(options.sessionRuntime.whenSettled(), options.signal);
-
-  const sessionTools = options.sessionRuntime.tools();
-  const sessionResources = options.sessionRuntime.resourceServers();
-  const sessionStates = options.sessionRuntime.serverStates();
-  const sessionNames = new Set([
-    ...sessionStates.filter(isPublishedState).map((state) => state.name),
-    ...sessionTools.map((entry) => entry.serverName),
-    ...sessionResources.map((entry) => entry.serverName),
-  ]);
+  const sessionSnapshot = options.sessionSnapshot ??
+    await settleAgentMcpSessionSnapshot(options.sessionRuntime, options.signal);
+  const sessionTools = sessionSnapshot.tools;
+  const sessionResources = sessionSnapshot.resourceServers;
+  const sessionStates = sessionSnapshot.serverStates;
+  const sessionNames = new Set(sessionSnapshot.publishedServerNames);
   const declarationItems = options.declaration?.items ?? [];
   // Omission and a genuinely clean empty list inherit. An explicitly malformed
   // declaration with no valid survivors must not widen into the session universe.

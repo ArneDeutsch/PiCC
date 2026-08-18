@@ -25,10 +25,10 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-prompts")).toContain("exact Claude edge formatting");
 
     expect(lookupCapability("feature.mcp-resources")).toMatchObject({ tier: "partial" });
-    expect(note("feature.mcp-resources")).toContain("conditionally expose ListMcpResourcesTool and ReadMcpResourceTool");
+    expect(note("feature.mcp-resources")).toContain("conditionally exposes ListMcpResourcesTool and ReadMcpResourceTool");
     expect(note("feature.mcp-resources")).toContain("advertised-empty or `resources/list`-failed catalog");
-    expect(note("feature.mcp-resources")).toContain("remain registered across reconnect and terminal retained states");
-    expect(note("feature.mcp-resources")).toContain("absent only when the settled initial snapshots contain no advertised resource capability");
+    expect(note("feature.mcp-resources")).toContain("Host registration may persist");
+    expect(note("feature.mcp-resources")).toContain("active exposure retires");
     expect(note("feature.mcp-resources")).toContain("labeled complete base64");
     expect(note("feature.mcp-resources")).toContain("resource `@` attachment/autocomplete");
   });
@@ -66,9 +66,9 @@ describe("MCP prompt and resource capability registry", () => {
 
   it("pins list/read routing, representation, and bounds", () => {
     const list = note("tool.ListMcpResourcesTool");
-    expect(list).toContain("settled capability snapshot advertises resources");
+    expect(list).toContain("live main-session catalog gains an advertised resource capability");
     expect(list).toContain("advertised-empty or `resources/list`-failed catalog");
-    expect(list).toContain("remains registered across reconnect and terminal retained states");
+    expect(list).toContain("Host registration may persist");
     expect(list).toContain("one exact `server`");
     expect(list).toContain("256 servers");
     expect(list).toContain("1,024 resources per server");
@@ -76,8 +76,8 @@ describe("MCP prompt and resource capability registry", () => {
     expect(list).toContain("clipMaxTokens");
 
     const read = note("tool.ReadMcpResourceTool");
-    expect(read).toContain("settled initial advertised-resource condition");
-    expect(read).toContain("retained across reconnect and terminal retained states");
+    expect(read).toContain("same first-live-capability condition");
+    expect(read).toContain("host registration may persist");
     expect(read).toContain("exact `server` and opaque `uri`");
     expect(read).toContain("may read an unlisted URI");
     expect(read).toContain("complete labeled base64 only when it fits");
@@ -88,14 +88,13 @@ describe("MCP prompt and resource capability registry", () => {
 
   it("owns capability discovery retries and immutable catalogs at the cross-transport level", () => {
     const proxy = note("tool.mcp__*");
-    expect(proxy).toContain("catalog across remote outages and terminal failure remains immutable");
-    expect(proxy).toContain("After global main-session aggregate initial settlement, ordinary sessions register one immutable universe");
-    expect(proxy).toContain("A selected main agent composes a session-owned universe from borrowed eligible globals and its own admitted inline runtime");
-    expect(proxy).toContain("publishes only selected-owned inline state in selected-authority diagnostics");
-    expect(proxy).toContain("Dispatched agents compose a dispatch-local universe by the same route rules");
-    expect(proxy).toContain("parent and sibling inline capabilities do not propagate");
-    expect(proxy).toContain("Both restrict/drop it via tools:/disallowedTools:");
-    expect(proxy).toContain("reconnect never widens any universe");
+    expect(proxy).toContain("For one exact execution definition, the first successfully discovered name/schema/description catalog remains immutable");
+    expect(proxy).toContain("After aggregate initial settlement, the main session can add, retire, or exact-definition-refresh registrations");
+    expect(proxy).toContain("selected main agent composes a session-owned universe from borrowed eligible globals and its own admitted inline runtime");
+    expect(proxy).toContain("Dispatched agents compose immutable dispatch-local universes by the same route rules");
+    expect(proxy).toContain("Both restrict/drop them via tools:/disallowedTools:");
+    expect(proxy).toContain("parent or sibling inline capabilities do not propagate");
+    expect(proxy).toContain("Reconnect never widens a same-definition universe");
 
     const aggregate = note("feature.mcp");
     expect(aggregate).toContain("Every advertised tools, prompts, or resources capability list");
@@ -112,13 +111,17 @@ describe("MCP prompt and resource capability registry", () => {
     const remote = note("feature.mcp-remote-transports");
     expect(remote).toContain("Initial connection");
     expect(remote).toContain("five reconnects");
+    expect(remote).toContain("Eligible failed main-session remote servers also expose PiCC-defined manual reconnect");
+    expect(remote).toContain("automatic reconnection remains remote-only");
+    expect(aggregate).toContain("eligible failed main-session stdio and supported remote servers expose PiCC-defined manual reconnect");
+    expect(aggregate).toContain("stdio children do not reconnect automatically");
     expect(remote).toContain("capability-list discovery");
     expect(remote).toContain("belong to feature.mcp");
     expect(remote).not.toContain("discovery retries only network/5xx");
 
     const listChanged = note("feature.mcp-list-changed");
     expect(listChanged).toContain("tools/list_changed, prompts/list_changed, and resources/list_changed");
-    expect(listChanged).toContain("tool, prompt, and resource catalogs remain immutable");
+    expect(listChanged).toContain("same-definition catalogs remain immutable");
   });
 
   it("keeps prompt bounds separate from tool-result clipping and the unsupported Claude token cap", () => {
@@ -151,29 +154,82 @@ describe("MCP prompt and resource capability registry", () => {
     expect(frontmatter).toContain("can own admitted inline stdio/HTTP/SSE runtimes");
     expect(frontmatter).toContain("published routes win same-name collisions");
     expect(frontmatter).toContain("Selected-main ownership lasts for the session");
-    expect(frontmatter).toContain("publishes only owned inline state in selected-authority /mcp and /doctor sections");
-    expect(frontmatter).toContain("shuts down before global MCP");
+    expect(frontmatter).toContain("publishes only selected-owned inline state in selected-authority /mcp and /doctor sections");
+    expect(frontmatter).toContain("missing, invalid, blocked, disabled, pending/rejected, or startup-failed as an admission failure");
     expect(frontmatter).toContain("Dispatch ownership starts after SubagentStart/worktree admission");
-    expect(frontmatter).toContain("stays absent from parent inventory");
-    expect(frontmatter).toContain("qualifies setup/cleanup in child/result framing");
-    expect(frontmatter).toContain("shuts down before worktree release");
+    expect(frontmatter).toContain("remains absent from parent inventory");
+    expect(frontmatter).toContain("bounded child/result warnings rather than blocking parent admission");
     expect(frontmatter).toContain("Nested omitted/clean-empty declarations inherit eligible globals");
     expect(frontmatter).toContain("parent-inline routes do not propagate");
     expect(frontmatter).not.toContain("only capabilities they independently declare");
-    expect(frontmatter).toContain("Project approval, the disabledMcpjsonServers project-decline gate, managed policy, tool gates, cwd pinning, collision order, lifecycle, resume, diagnostics, and non-propagation are PiCC-defined or inferred");
-    expect(frontmatter).toContain("Plugin agents strip the field and managed agents retain inert evidence");
-    expect(frontmatter).toContain("managed-agent execution");
-    expect(frontmatter).not.toContain("managed agents remain dispatchable");
-    expect(note("feature.mcp-prompts")).toContain("agent-inline prompt catalogs are intentionally not published, so prompt commands remain main-session-only");
+    expect(frontmatter).toContain("managed agents retain inert evidence");
+    expect(frontmatter).toContain("managed-agent MCP execution");
+    expect(frontmatter).not.toContain("managed-agent execution,");
+    expect(frontmatter).toContain("General admission, policy, lifecycle, cleanup, exposure, status, and transport mechanics are owned by the corresponding feature.mcp-* entries");
+    expect(frontmatter).toContain("prompt commands remain main-session-only");
 
     const approval = note("feature.mcp-project-approval");
-    expect(approval).toContain("Ordinary global pending servers surface as a bounded one-time session-start notice");
-    expect(approval).toContain("/mcp carries bounded approval and decline guidance");
-    expect(approval).toContain("A selected-main inline pending declaration prevents selected admission");
-    expect(approval).toContain("appears through selected recovery diagnostics");
-    expect(approval).toContain("dispatch-inline static pending declarations appear in /doctor");
+    expect(approval).toContain("Ordinary pending servers surface as a count-only one-time TUI notice");
+    expect(approval).toContain("pointing to `/mcp manage`");
+    expect(approval).toContain("dispatch-inline static pending declarations appear only in /doctor");
     expect(approval).toContain("dispatch-time setup or cleanup outcomes appear only in bounded Agent/TaskOutput results");
     expect(approval).toContain("Only selected-owned inline state enters the parent selected-authority /mcp section");
+  });
+});
+
+
+describe("MCP administration capability registry", () => {
+  it.each([
+    ["feature.mcp", [/Same-definition catalogs remain immutable/i, /changed execution definition.*rediscovered/i, /palette stubs remain startup-bounded/i]],
+    ["feature.mcp-prompts", [/exact typed routing/i, /palette stubs remain startup-bounded/i, /not dynamically republished/i]],
+    ["feature.mcp-resources", [/first gains an advertised resource capability/i, /changed-definition administration/i, /active exposure retires/i]],
+    ["feature.mcp-remote-transports", [/manual reconnect/i, /static-header-only/i]],
+    ["feature.mcp-cli-management", [/bounded transient health discovery/i, /Dry-run.*without recovery or writes/i, /transaction\/recovery taxonomy/i, /Unscoped remove refuses ambiguity and any inventory with omitted declarations/i, /explicit `--scope`/i, /file\/stdin avoids argv exposure/i, /add-from-claude-desktop import command.*unavailable/i, /Byte-identical output.*unavailable/i]],
+    ["feature.mcp-control-status", [/bare \/mcp.*invokes no recovery/i, /TUI-only/i, /headless administration.*no-action/i]],
+    ["feature.mcp-runtime-enabled", [/not-supported|never activates/i, /default-off/i]],
+    ["feature.mcp-claude-json-scopes", [/project scope writes `\.mcp\.json`/i, /unrelated state is preserved/i]],
+    ["feature.mcp-project-approval", [/exact-definition review/i, /Invalid private review state blocks that exact review path/i, /independent trusted broad authority/i]],
+    ["setting.enableAllProjectMcpServers", [/blanket approval/i, /user and managed settings/i]],
+  ] as const)("pins %s administration semantics without editorial sentence coupling", (id, patterns) => {
+    const value = lookupCapability(id);
+    expect(value, id).toBeDefined();
+    for (const pattern of patterns) expect(value!.note, `${id}: ${pattern.source}`).toMatch(pattern);
+  });
+
+  it("distinguishes same-definition immutability from changed-definition host refresh", () => {
+    const proxy = note("tool.mcp__*");
+    expect(proxy).toContain("changed definition is rediscovered and refreshes main-session host registration");
+    expect(proxy).toContain("serialized PiCC-owned active-set merging");
+    expect(proxy).toContain("call-time route validation");
+    expect(note("feature.mcp-capability-discovery")).toContain("changed definition performs fresh discovery");
+    expect(note("feature.mcp-capability-discovery")).toContain("prompt palette stubs remain startup-bounded");
+    expect(note("feature.mcp-list-changed")).toContain("not list_changed support");
+  });
+
+  it("records scoped CLI, interactive review, runtime toggle, and OAuth limits", () => {
+    expect(lookupCapability("feature.mcp-cli-management")).toMatchObject({ tier: "partial" });
+    expect(note("feature.mcp-cli-management")).toContain("local/project/user declaration scopes");
+    expect(note("feature.mcp-cli-management")).toContain("file/stdin avoids argv exposure");
+    expect(note("feature.mcp-cli-management")).toContain("add-from-claude-desktop import command");
+    expect(note("feature.mcp-cli-management")).toContain("unavailable");
+    expect(note("feature.mcp-project-approval")).toContain("normalized execution definition, source family, linked-checkout family, and agent owner");
+    expect(note("feature.mcp-project-approval")).toContain("headless modes never prompt");
+    expect(note("feature.mcp-runtime-disabled")).toContain("edits only this list");
+    expect(lookupCapability("feature.mcp-runtime-enabled")).toMatchObject({ tier: "not-supported" });
+    expect(note("feature.mcp-control-status")).toContain("exact no-tail deep links");
+    expect(lookupCapability("feature.mcp-oauth")).toMatchObject({ tier: "not-supported" });
+    expect(note("feature.mcp-oauth")).toContain("performs no login, logout, token storage, refresh, or runtime action");
+  });
+
+  it("keeps private review distinct from broad compatibility settings", () => {
+    expect(note("setting.enableAllProjectMcpServers")).toContain("blanket approval");
+    expect(note("setting.enableAllProjectMcpServers")).toContain("user and managed settings");
+    expect(note("setting.enabledMcpjsonServers")).toContain("distinct from PiCC private exact-definition review");
+    expect(note("setting.disabledMcpjsonServers")).toContain("separate private exact-definition decision");
+    expect(note("setting.mcpServers")).toContain("exact PiCC review or a broad user/managed compatibility grant");
+    expect(note("feature.mcp-project-approval")).toContain("Checkout-local and committed project approval keys never authorize");
+    expect(note("feature.mcp-capability-discovery")).toContain("dynamic main-session host refresh");
+    expect(note("agent.frontmatter.mcpServers")).toContain("interactive per-tool approval");
   });
 });
 
@@ -193,10 +249,10 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "setting.mcpServers": "These config leaves share PiCC's parsed server-entry path, whole-entry precedence, expansion behavior, partial tier, and configuration-file remedy.",
   "feature.mcp-websocket": "The WebSocket transport and its entry fields share PiCC's absent client transport, non-safety conclusion, and supported-transport remedy.",
   "feature.mcp-server-always-load": "The config field and its tool-loading effect are one ignored server field with the same startup/search deficit and do-not-rely remedy.",
-  "feature.mcp-claude-json-scopes": "Native local, user, and scope-precedence leaves share one read-only loader, partial identity/recovery policy, and coherent user-profile-backed configuration.",
-  "feature.mcp-cli-management": "These terminal management and import commands are all absent while file configuration remains the common PiCC remedy.",
-    "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
-  "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf share PiCC's immutable initial catalogs and the same non-safety remedy.",
+  "feature.mcp-claude-json-scopes": "Native local/user loading, targeted mutation, precedence, identity, and recovery share one coherent profile and linked-worktree family boundary.",
+  "feature.mcp-cli-management": "The aggregate remains partial because PiCC implements most management leaves with qualified output, scoped reads, and recovery, while the independently audited add-from-claude-desktop leaf is explicitly not supported.",
+  "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
+  "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf remain unsupported even though explicit changed-definition administration can refresh host exposure.",
   "feature.mcp-max-result-size-chars": "The metadata and persistence behavior are the same unsupported per-tool text-threshold contract, distinct from generic clipping.",
   "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share PiCC's partial boundary: ordinary-main failures remain human-only, selected-main setup denies admission, and dispatched setup or cleanup qualifies bounded child or parent surfaces.",
   "feature.mcp-server-instructions": "Instruction forwarding and its truncation rule share one absent model-context behavior and non-safety conclusion.",
@@ -329,12 +385,12 @@ const RAW_MCP_SURFACES: readonly AuditSurfaceWithoutEvidence[] = [
   s("runtime.disabled", "MCP reference", "disabledMcpServers", "Disable a server without removing it", "feature.mcp-runtime-disabled", "partial", true),
   s("runtime.enabled", "MCP reference", "enabledMcpServers", "Managing your servers", "feature.mcp-runtime-enabled", "not-supported", false),
   s("management.status", "MCP reference", "/mcp command", "Managing your servers", "feature.mcp-control-status", "partial"),
-  s("management.list", "MCP reference", "claude mcp list", "Managing your servers", "feature.mcp-cli-management", "not-supported", false),
-  s("management.get", "MCP reference", "claude mcp get", "Managing your servers", "feature.mcp-cli-management", "not-supported", false),
-  s("management.remove", "MCP reference", "claude mcp remove", "Managing your servers", "feature.mcp-cli-management", "not-supported", false),
-  s("management.reset-project-choices", "MCP reference", "claude mcp reset-project-choices", "Project scope", "feature.mcp-cli-management", "not-supported", false),
-  s("management.add", "MCP reference", "claude mcp add", "Installing MCP servers", "feature.mcp-cli-management", "not-supported", false),
-  s("management.add-json", "MCP reference", "claude mcp add-json", "Add MCP servers from JSON configuration", "feature.mcp-cli-management", "not-supported", false),
+  s("management.list", "MCP reference", "claude mcp list", "Managing your servers", "feature.mcp-cli-management", "partial", false),
+  s("management.get", "MCP reference", "claude mcp get", "Managing your servers", "feature.mcp-cli-management", "partial", false),
+  s("management.remove", "MCP reference", "claude mcp remove", "Managing your servers", "feature.mcp-cli-management", "partial", false),
+  s("management.reset-project-choices", "MCP reference", "claude mcp reset-project-choices", "Project scope", "feature.mcp-cli-management", "partial", false),
+  s("management.add", "MCP reference", "claude mcp add", "Installing MCP servers", "feature.mcp-cli-management", "partial", false),
+  s("management.add-json", "MCP reference", "claude mcp add-json", "Add MCP servers from JSON configuration", "feature.mcp-cli-management", "partial", false),
   s("management.add-from-claude-desktop", "MCP reference", "claude mcp add-from-claude-desktop", "Import MCP servers from Claude Desktop", "feature.mcp-cli-management", "not-supported", false),
   s("management.connectors", "MCP reference", "Claude.ai connectors", "Use MCP servers from claude.ai", "feature.mcp-connectors", "not-supported", false),
   s("management.server-mode", "MCP reference", "claude mcp serve", "Use Claude Code as an MCP server", "feature.mcp-server-mode", "not-supported"),
@@ -550,6 +606,11 @@ const EXPECTED_SURFACE_KEYS = [
 
 const ALLOWED_QUALITIES = new Set(["documented", "observed", "inferred", "unverified"]);
 
+// This frozen exception keeps one independently audited unsupported leaf distinct from its aggregate.
+const EXPECTED_TIER_MISMATCHES = new Map<string, { readonly capabilityId: string; readonly leaf: SupportTier; readonly aggregate: SupportTier }>([
+  ["management.add-from-claude-desktop", { capabilityId: "feature.mcp-cli-management", leaf: "not-supported", aggregate: "partial" }],
+]);
+
 describe("dated Claude Code MCP surface audit", () => {
   it("pins the closed independent surface-key inventory without duplicates", () => {
     const keys = MCP_SURFACES.map((row) => row.surfaceKey).sort();
@@ -575,7 +636,9 @@ describe("dated Claude Code MCP surface audit", () => {
       expect(row.authorityHeading.trim(), row.surfaceKey).not.toBe("");
       const entry = lookupCapability(row.capabilityId);
       expect(entry, row.surfaceKey).toBeDefined();
-      expect(entry?.tier, row.surfaceKey).toBe(row.tier);
+      const mismatch = EXPECTED_TIER_MISMATCHES.get(row.surfaceKey);
+      expect(entry?.tier, row.surfaceKey).toBe(mismatch?.aggregate ?? row.tier);
+      if (mismatch !== undefined) expect(row).toMatchObject({ capabilityId: mismatch.capabilityId, tier: mismatch.leaf });
       expect(Object.hasOwn(entry!, "safetyRelevant"), `${row.surfaceKey}: explicit safety`).toBe(true);
       expect(entry?.safetyRelevant, row.surfaceKey).toBe(row.safetyRelevant);
       expect(entry?.evidence, `${row.surfaceKey}: complete exact evidence policy`).toEqual(row.evidence);
@@ -592,6 +655,18 @@ describe("dated Claude Code MCP surface audit", () => {
         expect(rationale, row.surfaceKey).not.toContain("Shares one PiCC behavior");
       }
     }
+  });
+
+  it("pins the sole exact aggregate/leaf tier mismatch", () => {
+    expect([...EXPECTED_TIER_MISMATCHES]).toEqual([["management.add-from-claude-desktop", {
+      capabilityId: "feature.mcp-cli-management", leaf: "not-supported", aggregate: "partial",
+    }]]);
+    const actual = MCP_SURFACES.flatMap((row) => {
+      const aggregate = lookupCapability(row.capabilityId)?.tier;
+      return aggregate === row.tier ? [] : [[row.surfaceKey, { capabilityId: row.capabilityId, leaf: row.tier, aggregate }]];
+    });
+    expect(actual).toEqual([...EXPECTED_TIER_MISMATCHES]);
+    expect(note("feature.mcp-cli-management")).toMatch(/add-from-claude-desktop import command.*unavailable/i);
   });
 
   it("enforces evidence and relationship invariants for audited capabilities", () => {
@@ -647,7 +722,7 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(note("feature.mcp-server-always-load")).toContain("use Claude Code if the startup guarantee is required");
     expect(note("feature.mcp-url-without-type-validation")).toContain("valid `command` as stdio and ignore its URL");
     expect(note("feature.mcp-url-without-type-validation")).toContain("set an explicit `type`");
-    expect(note("feature.mcp-list-changed")).toContain("retains the previous catalogs when a list_changed refresh fails");
+    expect(note("feature.mcp-list-changed")).toContain("retains previous catalogs when a list_changed refresh fails");
     expect(note("feature.mcp-plugin-servers")).toContain("lifecycle and reload behavior");
     expect(note("feature.mcp-plugin-servers")).toContain("placeholder expansion/substitution");
     expect(note("feature.mcp-plugin-servers")).toContain("transport-specific substitution/support behavior");

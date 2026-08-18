@@ -459,10 +459,17 @@ function mapLocalAvailabilityError(error: unknown, serverName: string, toolName:
 }
 
 /**
- * Build one proxy `ToolDefinition` per tool in the retained initial catalog.
- * Fresh proxy instances delegate every execution to their live source, so a
- * retained proxy follows recovery without registration or schema changes.
+ * Build a proxy `ToolDefinition` for the supplied definition. Its execution
+ * delegates to the live source, so same-definition recovery needs no new
+ * registration; changed dynamic definitions are refreshed by their coordinator.
  */
+export function buildMcpProxyTool(info: McpToolInfo, runtime: Pick<McpToolSource, "callTool">): ToolDefinition | undefined {
+  return buildMcpProxyTools({
+    tools: () => [info],
+    callTool: runtime.callTool.bind(runtime),
+  })[0];
+}
+
 export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
   const out: ToolDefinition[] = [];
   for (const info of runtime.tools()) {

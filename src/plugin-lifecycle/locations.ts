@@ -12,6 +12,11 @@ import type {
 
 export type LifecyclePlatform = "win32" | "posix";
 
+export enum OwnedStateStoreNamespace {
+  Plugins = "plugins",
+  Mcp = "mcp",
+}
+
 export interface LifecycleLocationInputs {
   readonly homeDir: string;
   readonly profilePath: string;
@@ -24,6 +29,7 @@ export interface LifecycleLocationInputs {
 
 export interface LifecycleLocations {
   readonly platform: LifecyclePlatform;
+  readonly storeNamespace: OwnedStateStoreNamespace;
   readonly root: string;
   readonly profileKey: LifecycleProfileKey;
   readonly profileRoot: string;
@@ -76,18 +82,22 @@ export function checkoutFamilyLocationKey(value: string, platform: LifecyclePlat
   return locationKey(value, platform, "checkout") as ContractResult<CheckoutFamilyKey>;
 }
 
-export function createLifecycleLocations(inputs: LifecycleLocationInputs): ContractResult<LifecycleLocations> {
+function createNamespacedLifecycleLocations(
+  inputs: LifecycleLocationInputs,
+  storeNamespace: OwnedStateStoreNamespace,
+): ContractResult<LifecycleLocations> {
   const api = pathApi(inputs.platform);
   const profileKey = profileLocationKey(inputs.profilePath, inputs.platform);
   const home = canonicalLocationIdentity(inputs.homeDir, inputs.platform);
   if (!profileKey.ok) return profileKey;
   if (!home.ok) return home;
 
-  const root = api.join(home.value, ".picc", "plugins", "v1");
+  const root = api.join(home.value, ".picc", storeNamespace, "v1");
   const profileRoot = api.join(root, "profiles", profileKey.value);
   if (inputs.project === undefined) {
     return { ok: true, value: Object.freeze({
       platform: inputs.platform,
+      storeNamespace,
       root,
       profileKey: profileKey.value,
       profileRoot,
@@ -104,6 +114,7 @@ export function createLifecycleLocations(inputs: LifecycleLocationInputs): Contr
   const checkoutFamilyRoot = api.join(profileRoot, "checkouts", checkoutFamilyKey.value);
   return { ok: true, value: Object.freeze({
     platform: inputs.platform,
+    storeNamespace,
     root,
     profileKey: profileKey.value,
     profileRoot,
@@ -114,6 +125,14 @@ export function createLifecycleLocations(inputs: LifecycleLocationInputs): Contr
     checkoutFamilyRoot,
     checkoutFamilyPluginsRoot: api.join(checkoutFamilyRoot, "plugins"),
   }) };
+}
+
+export function createLifecycleLocations(inputs: LifecycleLocationInputs): ContractResult<LifecycleLocations> {
+  return createNamespacedLifecycleLocations(inputs, OwnedStateStoreNamespace.Plugins);
+}
+
+export function createMcpLifecycleLocations(inputs: LifecycleLocationInputs): ContractResult<LifecycleLocations> {
+  return createNamespacedLifecycleLocations(inputs, OwnedStateStoreNamespace.Mcp);
 }
 
 export function lifecycleSettingsTarget(

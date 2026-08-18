@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -17,6 +18,7 @@ import {
   type ToolCallDescriptor,
 } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
+import { resolveClaudeProfile } from "./discovery/claude-profile.js";
 import type { ManagedMcpDiscoveryOptions } from "./discovery/managed-policy.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
@@ -125,6 +127,9 @@ import { loadSkillBodyResult, substituteToolRules, substituteVariables } from ".
 import { pluginRuntimeDataAuthorization, prepareAuthorizedPluginDataLocation, resolvePluginDataLocation, revalidatePluginDataLocation } from "./claude/plugin-paths.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
+import type { McpCatalogDelta, McpRuntimeControlResult } from "./runtime/mcp-control.js";
+import { McpMainSessionExposure, type McpExposureResult } from "./runtime/mcp-exposure.js";
+import { openMcpAdministration } from "./runtime/mcp-administration-focus.js";
 import { createAgentMcpScope, type AgentMcpScope } from "./runtime/agent-mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import {
@@ -165,6 +170,26 @@ import {
   sanitizedSubprocessEnv,
 } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
+import { createMcpLifecycleLocations } from "./plugin-lifecycle/locations.js";
+import { establishOwnedStateStore, type OwnedStateStore } from "./plugin-lifecycle/state-store.js";
+import { projectIdentities } from "./util/project-identity.js";
+import {
+  inspectMcpPendingOperation,
+  persistMcpMutation,
+  recoverMcpPendingOperation,
+  type McpPendingOperationProjection,
+  type McpPersistenceContext,
+  type McpPersistenceMutation,
+  type McpPersistenceResult,
+} from "./mcp-administration/persistence.js";
+import {
+  createMcpAdministrationService,
+  openMcpAdministrationRuntimeTransition,
+  type McpAdministrationFreshState,
+  type McpAdministrationLiveAction,
+  type McpAdministrationLivePort,
+  type McpAdministrationOperationOutcome,
+} from "./mcp-administration/service.js";
 import {
   SELECTED_MAIN_AGENT_ENTRY,
   SELECTED_MAIN_AGENT_INITIAL_PROMPT,
@@ -528,7 +553,16 @@ export interface PiccTestSeam {
     | "diagnostics"
     | "serverStates"
     | "shutdown"
-  >;
+  > & Partial<Pick<McpRuntime, "reconcileServer" | "reconnectServer" | "disableServer">>;
+  /** TEST-ONLY persistence/assembly and exposure seams for session composition. */
+  mcpAdministration?: {
+    inspectPending?: () => Promise<McpPendingOperationProjection>;
+    recover?: () => Promise<McpPersistenceResult>;
+    mutate?: (mutation: McpPersistenceMutation) => Promise<McpPersistenceResult>;
+    assemble?: () => McpAdministrationFreshState | Promise<McpAdministrationFreshState>;
+    captureService?: (service: ReturnType<typeof createMcpAdministrationService>) => void;
+    exposure?: { apply(delta: McpCatalogDelta): Promise<McpExposureResult>; promptCatalog(): McpPromptCatalog };
+  };
   /** TEST-ONLY lifecycle composition override for focused plugin UI wiring. */
   pluginLifecycle?: (project: LoadedProject) => Promise<{ readonly ok: true; readonly value: PluginLifecyclePort } | { readonly ok: false; readonly code: string; readonly message: string }>;
   /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
@@ -2110,6 +2144,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     env: process.env,
     settingsEnv: project.settings.env,
   });
+  let currentMcpConfig = project.mcp;
+  let latestMcpAdministrationProject: LoadedProject | undefined = project;
   let selectedMainMcpInventory: SelectedMainMcpInventorySource | undefined;
   const selectedMainMcp = new SelectedMainMcpScopeController({
     replaceSelectedMainMcpInventory(slot, source) {
@@ -2304,7 +2340,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     prepareMcpFor: async (agent, spawnCwd, signal) => {
       const declaration = agent.agentMcp;
       const inlineConfig = declaration
-        ? project.agentMcpAdmission?.resolve(declaration) ?? { servers: Object.freeze([]), diagnostics: Object.freeze([]), diagnosticOwnership: Object.freeze([]) }
+        ? project.agentMcpAdmission?.resolveOwned?.(declaration, { name: agent.name, scope: declaration.scope }) ??
+          project.agentMcpAdmission?.resolve(declaration) ?? { servers: Object.freeze([]), diagnostics: Object.freeze([]), diagnosticOwnership: Object.freeze([]) }
         : { servers: Object.freeze([]), diagnostics: Object.freeze([]), diagnosticOwnership: Object.freeze([]) };
       const scope = await createAgentMcpScope({
         sessionRuntime: mcpRuntime,
@@ -3531,6 +3568,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return boundedPromptRecoveryMessage(`MCP prompt discovery failed for servers ${subject}.`);
   }
 
+  let currentMcpReservedNames = (): Set<string> => new Set();
+
   function mcpPromptReservedNames(): Set<string> {
     const names = new Set<string>([...piBuiltinNames, ...controlCommands.keys()]);
     const suffixCounts = new Map<string, number>();
@@ -3554,59 +3593,292 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return names;
   }
 
-  const mcpExposure = (async () => {
+  function mcpWireFingerprint(value: unknown): string {
+    const seen = new WeakSet<object>();
+    let encoded = "unrepresentable";
+    try {
+      encoded = JSON.stringify(value, (_key, candidate: unknown) => {
+        if (typeof candidate === "bigint") return String(candidate);
+        if (typeof candidate !== "object" || candidate === null) return candidate;
+        if (seen.has(candidate)) return "[circular]";
+        seen.add(candidate);
+        if (Array.isArray(candidate)) return candidate;
+        return Object.fromEntries(Object.entries(candidate as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)));
+      }) ?? "undefined";
+    } catch { /* fixed fallback */ }
+    return `mcp-wire-v1:${createHash("sha256").update(encoded).digest("hex")}`;
+  }
+
+  const coordinatorSourceInfos = new Set<unknown>();
+  const coordinatorSourceKeys = new Set<string>();
+  const coordinatorModulePath = path.resolve(fileURLToPath(import.meta.url));
+  const coordinatorModulePaths = new Set([
+    coordinatorModulePath,
+    ...(path.basename(path.dirname(coordinatorModulePath)) === "dist"
+      ? [path.join(path.dirname(path.dirname(coordinatorModulePath)), "picc", "index.js")]
+      : []),
+  ]);
+  const sourceInfoKey = (value: unknown): string | undefined => {
+    if (typeof value !== "object" || value === null) return undefined;
+    const source = value as Record<string, unknown>;
+    return [source.path, source.source, source.scope, source.origin, source.baseDir ?? ""].every((part) => typeof part === "string")
+      ? JSON.stringify([source.path, source.source, source.scope, source.origin, source.baseDir ?? ""])
+      : undefined;
+  };
+  try {
+    for (const tool of pi.getAllTools?.() ?? []) {
+      if (!["Agent", "Task", "Skill", "SlashCommand"].includes(tool.name)) continue;
+      coordinatorSourceInfos.add(tool.sourceInfo);
+      const key = sourceInfoKey(tool.sourceInfo);
+      if (key !== undefined) coordinatorSourceKeys.add(key);
+    }
+  } catch { /* exposure fails closed if provenance cannot later be established */ }
+  const configuredExposure = new McpMainSessionExposure({
+    host: {
+      registerTool: (definition) => pi.registerTool(definition),
+      getActiveTools: () => pi.getActiveTools(),
+      getAllTools: () => pi.getAllTools(),
+      setActiveTools: (names) => pi.setActiveTools(names),
+      isCoordinatorSourceInfo: (sourceInfo) => {
+        const key = sourceInfoKey(sourceInfo);
+        const sourcePath = typeof sourceInfo?.path === "string" ? path.resolve(sourceInfo.path) : undefined;
+        return coordinatorSourceInfos.has(sourceInfo) || (key !== undefined && coordinatorSourceKeys.has(key)) ||
+          (sourcePath !== undefined && coordinatorModulePaths.has(sourcePath)) || (testSeam !== undefined && sourceInfo === undefined);
+      },
+    },
+    source: mcpRuntime,
+    permissionGate: permissionEngine,
+    clipMaxTokens: config.compaction.clipMaxTokens,
+    reservedPromptNames: () => currentMcpReservedNames(),
+    prepareTool: (definition) => mainCheckpointGate.wrapTool(routeMainSessionTool(definition, {
+      fallbackCallDisplayName: definition.label,
+    }) as unknown as Record<string, unknown>) as unknown as ToolDefinition<any, any>,
+  });
+  const mainMcpExposure = testSeam?.mcpAdministration?.exposure ?? configuredExposure;
+
+  function initialMcpCatalogDeltas(): McpCatalogDelta[] {
+    const declarations = new Map((currentMcpConfig.administration?.declarations ?? [])
+      .filter((entry) => entry.precedence === "winner" && entry.definitionDigest !== undefined && entry.agentOwner === undefined)
+      .map((entry) => [entry.name, entry.definitionDigest!] as const));
+    const tools = new Map<string, ReturnType<typeof mcpRuntime.tools>>();
+    const prompts = new Map<string, ReturnType<typeof mcpRuntime.prompts>>();
+    for (const tool of mcpRuntime.tools()) tools.set(tool.serverName, [...(tools.get(tool.serverName) ?? []), tool]);
+    for (const prompt of mcpRuntime.prompts()) prompts.set(prompt.serverName, [...(prompts.get(prompt.serverName) ?? []), prompt]);
+    const resources = new Map(mcpRuntime.resourceServers().map((entry) => [entry.serverName, entry] as const));
+    const names = new Set([...tools.keys(), ...prompts.keys(), ...resources.keys()]);
+    return [...names].flatMap((serverName) => {
+      const definitionFingerprint = declarations.get(serverName) ?? (testSeam?.mcpRuntime === undefined ? undefined : `test-seam:${serverName}`);
+      if (definitionFingerprint === undefined) return [];
+      const resource = resources.get(serverName);
+      return [Object.freeze({
+        serverName, definitionFingerprint, generation: 1, kind: "publish" as const,
+        tools: Object.freeze((tools.get(serverName) ?? []).map((info) => Object.freeze({
+          info, wireDefinitionFingerprint: mcpWireFingerprint([info.toolName, info.description, info.inputSchema]),
+        }))),
+        prompts: Object.freeze((prompts.get(serverName) ?? []).map((info) => Object.freeze({
+          info, wireDefinitionFingerprint: mcpWireFingerprint([info.promptName, info.description, info.arguments]),
+        }))),
+        ...(resource === undefined ? {} : { resourceServer: Object.freeze({ info: resource, wireDefinitionFingerprint: mcpWireFingerprint(resource.resources) }) }),
+      })];
+    });
+  }
+
+  async function applyExposureDeltas(deltas: readonly McpCatalogDelta[]): Promise<import("./mcp-administration/service.js").McpAdministrationOperationOutcome> {
+    if (deltas.length === 0) return Object.freeze({ state: "not-requested" as const });
+    let failure: "exposure-failed" | "generation-stale" | undefined;
+    for (const delta of deltas) {
+      try {
+        // Initial publication occupies generation 1; runtime-owned route generations are shifted by one.
+        const result = await mainMcpExposure.apply(Object.freeze({ ...delta, generation: delta.generation + 1 }));
+        if (result.state === "failed") {
+          failure = "exposure-failed";
+          console.error(`PiCC: MCP: exposure failed for ${JSON.stringify(delta.serverName)}`);
+        } else if (result.state === "stale" && failure === undefined) failure = "generation-stale";
+      } catch {
+        failure = "exposure-failed";
+        console.error(`PiCC: MCP: exposure failed for ${JSON.stringify(delta.serverName)}`);
+      }
+    }
+    try {
+      mcpPromptCatalog = mainMcpExposure.promptCatalog();
+    } catch (error) {
+      mcpExposureFailure = boundedMcpErrorText(error);
+      mcpPromptCatalog = buildMcpPromptCatalog([], []);
+      console.error(`PiCC: MCP exposure failed: ${mcpExposureFailure}`);
+      return Object.freeze({ state: "failed" as const, reasonCode: "exposure-failed" as const });
+    }
+    if (failure === undefined) mcpExposureFailure = undefined;
+    return failure === undefined
+      ? Object.freeze({ state: "succeeded" as const })
+      : Object.freeze({ state: "failed" as const, reasonCode: failure });
+  }
+
+  let initialMcpExposureReady: Promise<void> = Promise.resolve();
+  const mcpLivePort: McpAdministrationLivePort = Object.freeze({
+    async apply(request: Parameters<McpAdministrationLivePort["apply"]>[0]) {
+      await initialMcpExposureReady;
+      const selectedAffected = selectedMainActionAffectsActiveScope(request.action);
+      if (request.transitions.length === 0 && !selectedAffected) {
+        return Object.freeze({
+          runtime: Object.freeze({ state: "not-requested" as const }),
+          exposure: Object.freeze({ state: "not-requested" as const }),
+        });
+      }
+      const runtimeResults: McpRuntimeControlResult[] = [];
+      for (const sealed of request.transitions) {
+        const transition = openMcpAdministrationRuntimeTransition(sealed);
+        if (transition === undefined) {
+          runtimeResults.push({ state: "failed", reason: "definition-unavailable", cleanup: "not-required", deltas: [] });
+          continue;
+        }
+        try {
+          if (transition.kind === "retire") runtimeResults.push(await mcpRuntime.disableServer!(transition.serverName));
+          else if (transition.kind === "activate") runtimeResults.push(await mcpRuntime.reconcileServer!(transition.admission));
+          else if (transition.kind === "reconnect") runtimeResults.push(await mcpRuntime.reconnectServer!(transition.admission));
+          else {
+            runtimeResults.push(await mcpRuntime.disableServer!(transition.serverName));
+            runtimeResults.push(await mcpRuntime.reconcileServer!(transition.admission));
+          }
+        } catch {
+          runtimeResults.push({ state: "failed", reason: "connection-failed", cleanup: "unconfirmed", deltas: [] });
+        }
+      }
+      // Exposure receives every terminal delta even when runtime cleanup is uncertain.
+      let exposure = await applyExposureDeltas(runtimeResults.flatMap((result) => result.deltas));
+      const failed = runtimeResults.find((result) => result.state === "failed");
+      let runtime: McpAdministrationOperationOutcome = runtimeResults.length === 0
+        ? Object.freeze({ state: "not-requested" as const })
+        : failed === undefined
+          ? Object.freeze({ state: "succeeded" as const })
+          : Object.freeze({ state: "failed" as const, reasonCode: failed.reason === "generation-stale" ? "generation-stale" as const : "runtime-failed" as const });
+      if (selectedAffected) {
+        const selected = await rebuildSelectedMainMcpScope(latestMcpAdministrationProject);
+        runtime = composeMcpAdministrationOutcome(runtime, selected.runtime);
+        exposure = composeMcpAdministrationOutcome(exposure, selected.exposure);
+      }
+      return Object.freeze({ runtime, exposure });
+    },
+  });
+
+  function passiveMcpStore(locations: ReturnType<typeof createMcpLifecycleLocations> & { ok: true }): OwnedStateStore {
+    const root = locations.value.profileRoot;
+    return Object.freeze({
+      root, profileRoot: root, profileKey: locations.value.profileKey,
+      artifactsRoot: path.join(root, "artifacts", "sha256"), recordsRoot: path.join(root, "records"),
+      stagingRoot: path.join(root, "staging"), generationsRoot: path.join(root, "generations"),
+      journalsRoot: path.join(root, "journals"), receiptsRoot: path.join(root, "receipts"),
+      locksRoot: path.join(root, "locks"), quarantineRoot: path.join(root, "quarantine"), dataRoot: locations.value.dataRoot,
+    });
+  }
+
+  const profile = resolveClaudeProfile({ env: process.env, homeDir: os.homedir() });
+  const identities = projectIdentities(project.root);
+  const familyPath = identities[0];
+  const activePath = identities.at(-1);
+  const mcpLocations = familyPath === undefined || activePath === undefined ? undefined : createMcpLifecycleLocations({
+    homeDir: os.homedir(), profilePath: project.userDir, platform: process.platform === "win32" ? "win32" : "posix",
+    project: { activeCheckoutPath: activePath, checkoutFamilyPath: familyPath },
+  });
+  const validMcpLocations = mcpLocations?.ok === true && mcpLocations.value.checkoutFamilyKey !== undefined ? mcpLocations : undefined;
+  const passiveStore = validMcpLocations === undefined ? undefined : passiveMcpStore(validMcpLocations);
+  const capturedProfilePath = path.resolve(project.userDir);
+  const capturedProjectRoot = path.resolve(project.root);
+  const capturedFamilyKey = validMcpLocations?.value.checkoutFamilyKey;
+  const capturedProfileKey = validMcpLocations?.value.profileKey;
+  const authorityFingerprint = capturedFamilyKey === undefined || capturedProfileKey === undefined ? "unavailable" : `sha256:${createHash("sha256").update(`${capturedProfileKey}\0${capturedFamilyKey}`, "utf8").digest("hex")}`;
+  let writableMcpStore: OwnedStateStore | undefined;
+  const persistenceContext = async (): Promise<McpPersistenceContext> => {
+    if (validMcpLocations === undefined) throw new Error("MCP administration authority unavailable");
+    if (writableMcpStore === undefined) {
+      const established = await establishOwnedStateStore(validMcpLocations.value, os.homedir());
+      if (!established.ok) throw new Error("MCP administration storage unavailable");
+      writableMcpStore = established.value;
+    }
+    return {
+      store: writableMcpStore, profilePath: profile.nativeStatePath, projectRoot: capturedProjectRoot,
+      checkoutFamilyKey: capturedFamilyKey!, authorityFingerprint,
+      revalidateAuthority: () => {
+        try {
+          const freshProfile = resolveClaudeProfile({ env: process.env, homeDir: os.homedir() });
+          const fresh = loadEffectiveProject();
+          const freshIdentities = projectIdentities(fresh.root);
+          const freshFamily = freshIdentities[0];
+          const freshActive = freshIdentities.at(-1);
+          if (freshFamily === undefined || freshActive === undefined || path.resolve(freshProfile.userDir) !== capturedProfilePath ||
+            path.resolve(fresh.userDir) !== capturedProfilePath || path.resolve(fresh.root) !== capturedProjectRoot) {
+            return { ok: false as const, code: "changed-authority", message: "authority changed" };
+          }
+          const freshLocations = createMcpLifecycleLocations({
+            homeDir: os.homedir(), profilePath: fresh.userDir, platform: process.platform === "win32" ? "win32" : "posix",
+            project: { activeCheckoutPath: freshActive, checkoutFamilyPath: freshFamily },
+          });
+          if (!freshLocations.ok || freshLocations.value.profileKey !== passiveStore?.profileKey || freshLocations.value.checkoutFamilyKey !== capturedFamilyKey) {
+            return { ok: false as const, code: "changed-authority", message: "authority changed" };
+          }
+          const freshFingerprint = `sha256:${createHash("sha256").update(`${freshLocations.value.profileKey}\0${freshLocations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
+          return freshFingerprint === authorityFingerprint
+            ? { ok: true as const, value: { profileKey: freshLocations.value.profileKey, checkoutFamilyKey: capturedFamilyKey!, authorityFingerprint } }
+            : { ok: false as const, code: "changed-authority", message: "authority changed" };
+        } catch { return { ok: false as const, code: "changed-authority", message: "authority changed" }; }
+      },
+    };
+  };
+  const assembleMcpAdministration = async (): Promise<McpAdministrationFreshState> => {
+    const fresh = loadEffectiveProject();
+    latestMcpAdministrationProject = fresh;
+    currentMcpConfig = fresh.mcp;
+    return { mcp: fresh.mcp, reviewIdentity: {
+      profileKey: fresh.mcpStartupAuthority.profileKey ?? passiveStore?.profileKey ?? "unavailable",
+      checkoutFamilyKey: fresh.mcpStartupAuthority.checkoutFamilyKey ?? validMcpLocations?.value.checkoutFamilyKey ?? "unavailable",
+    }, liveStates: mcpRuntime.serverStates().map((state) => ({
+      name: state.name, state: state.state === "retrying" ? "connecting" : state.state,
+      ...(state.toolCount === undefined ? {} : { toolCount: state.toolCount }),
+      ...(state.promptCount === undefined ? {} : { promptCount: state.promptCount }),
+      ...(state.resourceCount === undefined ? {} : { resourceCount: state.resourceCount }),
+    })) };
+  };
+  const inspectPending = testSeam?.mcpAdministration?.inspectPending ?? (async (): Promise<McpPendingOperationProjection> => {
+    if (passiveStore === undefined) return { pending: true, status: "invalid" };
+    try { await fs.promises.lstat(passiveStore.profileRoot); return inspectMcpPendingOperation(passiveStore); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { pending: false, status: "clear" } : { pending: true, status: "invalid" }; }
+  });
+  const mcpAdministrationService = createMcpAdministrationService({
+    inspectPending,
+    recover: testSeam?.mcpAdministration?.recover ?? (async () => recoverMcpPendingOperation(await persistenceContext())),
+    mutate: testSeam?.mcpAdministration?.mutate ?? (async (mutation) => persistMcpMutation(await persistenceContext(), mutation)),
+    assemble: testSeam?.mcpAdministration?.assemble ?? assembleMcpAdministration,
+    live: mcpLivePort,
+  });
+  testSeam?.mcpAdministration?.captureService?.(mcpAdministrationService);
+
+  const mcpExposure = initialMcpExposureReady = (async () => {
     try {
       await mcpRuntime.whenSettled();
-      mcpPromptCatalog = buildMcpPromptCatalog(mcpRuntime.prompts(), mcpPromptReservedNames());
+      for (const delta of initialMcpCatalogDeltas()) {
+        try {
+          const result = await mainMcpExposure.apply(delta);
+          // A bounded per-server failure must not discard valid sibling catalogs.
+          if (result.state === "failed") console.error(`PiCC: MCP: exposure failed for ${JSON.stringify(delta.serverName)}`);
+        } catch {
+          console.error(`PiCC: MCP: exposure failed for ${JSON.stringify(delta.serverName)}`);
+        }
+      }
+      mcpPromptCatalog = mainMcpExposure.promptCatalog();
+      mcpExposureFailure = undefined;
       const failedRecords: FailedPromptNamespace[] = [];
       const retainedPrefixes = new Set<string>();
       let omittedFailedServers = 0;
       for (const state of mcpRuntime.serverStates()) {
         if (state.promptsAdvertised !== true || state.promptDiscoveryError === undefined) continue;
         const record = failedPromptNamespace(state.name);
-        if (
-          !record || retainedPrefixes.has(record.commandPrefix) ||
-          failedRecords.length >= failedPromptRecordLimit
-        ) {
-          omittedFailedServers += 1;
-          continue;
-        }
-        retainedPrefixes.add(record.commandPrefix);
-        failedRecords.push(record);
+        if (!record || retainedPrefixes.has(record.commandPrefix) || failedRecords.length >= failedPromptRecordLimit) { omittedFailedServers += 1; continue; }
+        retainedPrefixes.add(record.commandPrefix); failedRecords.push(record);
       }
-      failedPromptNamespaces = Object.freeze({
-        records: Object.freeze(failedRecords),
-        omittedCount: omittedFailedServers,
-      });
-      for (const diag of [...mcpRuntime.diagnostics(), ...mcpPromptCatalog.diagnostics]) {
-        console.error(`PiCC: MCP: ${diag}`);
-      }
-
-      const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(mcpRuntime)];
-      if (mcpRuntime.resourceServers().length > 0) {
-        definitions.push(...buildMcpResourceTools(mcpRuntime, {
-          clipMaxTokens: config.compaction.clipMaxTokens,
-        }));
-      }
-      const admitted = new Set(
-        permissionEngine.gateTools(undefined, undefined, definitions.map((tool) => tool.name)),
-      );
-      for (const definition of definitions) {
-        if (!admitted.has(definition.name)) continue;
-        try {
-          pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definition, {
-            fallbackCallDisplayName: definition.label,
-          }) as unknown as Record<string, unknown>));
-        } catch (err) {
-          console.error(
-            `PiCC: failed to register MCP tool "${definition.name}": ${boundedMcpErrorText(err)}`,
-          );
-        }
-      }
+      failedPromptNamespaces = Object.freeze({ records: Object.freeze(failedRecords), omittedCount: omittedFailedServers });
+      for (const diag of [...mcpRuntime.diagnostics(), ...mcpPromptCatalog.diagnostics]) console.error(`PiCC: MCP: ${diag}`);
     } catch (err) {
-      // Retain a bounded failed-exposure state so MCP-shaped input cannot become
-      // an ordinary provider prompt after startup failed. A genuine settled
-      // zero-prompt runtime remains distinguishable and keeps passthrough.
+      // A transaction-level settlement/catalog failure blocks MCP-shaped passthrough; genuine
+      // zero-prompt catalogs and contained per-server failures must remain usable outcomes.
       mcpExposureFailure = boundedMcpErrorText(err);
       mcpPromptCatalog = buildMcpPromptCatalog([], []);
       console.error(`PiCC: MCP exposure failed: ${mcpExposureFailure}`);
@@ -4008,6 +4280,158 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       transcriptPath,
     });
   };
+  function selectedMainActionAffectsActiveScope(action: McpAdministrationLiveAction): boolean {
+    if (selectedMainSnapshot?.kind !== "selected") return false;
+    if (!("agentOwner" in action) || action.agentOwner === undefined) return true;
+    const scope = selectedMainSnapshot.source.scope;
+    return (scope === "project" || scope === "user") &&
+      action.agentOwner.name === selectedMainSnapshot.resolvedName && action.agentOwner.scope === scope;
+  }
+
+  type SelectedMainMcpRebuildResult = Readonly<{
+    runtime: McpAdministrationOperationOutcome;
+    exposure: McpAdministrationOperationOutcome;
+  }>;
+  const operationNotRequested = (): McpAdministrationOperationOutcome =>
+    Object.freeze({ state: "not-requested" as const });
+  const operationSucceeded = (): McpAdministrationOperationOutcome =>
+    Object.freeze({ state: "succeeded" as const });
+  const operationFailed = (reasonCode: "runtime-failed" | "exposure-failed"): McpAdministrationOperationOutcome =>
+    Object.freeze({ state: "failed" as const, reasonCode });
+  function composeMcpAdministrationOutcome(
+    ordinary: McpAdministrationOperationOutcome,
+    selected: McpAdministrationOperationOutcome,
+  ): McpAdministrationOperationOutcome {
+    if (ordinary.state === "failed") return ordinary;
+    if (selected.state === "failed") return selected;
+    if (ordinary.state === "succeeded" || selected.state === "succeeded") return operationSucceeded();
+    return operationNotRequested();
+  }
+
+  function publishSelectedMainMcpAdapter(adapter: SelectedMainMcpAdapter): McpAdministrationOperationOutcome {
+    try {
+      const allowed = new Set(adapter.tools().map((tool) => `mcp__${tool.serverName}__${tool.toolName}`));
+      if (adapter.resourceServers().length > 0) {
+        allowed.add(ListMcpResourcesTool);
+        allowed.add(ReadMcpResourceTool);
+      }
+      const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(adapter)];
+      if (adapter.resourceServers().length > 0) {
+        definitions.push(...buildMcpResourceTools(adapter, {
+          clipMaxTokens: config.compaction.clipMaxTokens,
+        }));
+      }
+      for (const definition of definitions) {
+        pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definition, {
+          fallbackCallDisplayName: definition.label,
+        }) as unknown as Record<string, unknown>));
+        registeredSelectedMainMcpNames.add(definition.name);
+      }
+      selectedMainMcpAdapter = adapter;
+      selectedMainMcpAllowedNames = allowed;
+      const reconciler = activeSelectedMainToolReconciler();
+      reconciler.setPolicy(selectedMainPolicy);
+      return reconciler.reconcile(registeredMainToolNames()).ok
+        ? operationSucceeded()
+        : operationFailed("exposure-failed");
+    } catch {
+      return operationFailed("exposure-failed");
+    }
+  }
+
+  async function fenceSelectedMainMcpAfterFailure(
+    message: string,
+    runtime: McpAdministrationOperationOutcome,
+    exposure: McpAdministrationOperationOutcome = operationNotRequested(),
+  ): Promise<SelectedMainMcpRebuildResult> {
+    let cleanupUnconfirmed = false;
+    try {
+      const revoked = await selectedMainMcp.replace(undefined);
+      cleanupUnconfirmed = revoked.cleanup.unconfirmed.length > 0 ||
+        revoked.diagnostics.some((entry) => entry.reason === "cleanup-unconfirmed" || entry.reason === "cleanup-failed");
+    } catch {
+      cleanupUnconfirmed = true;
+    }
+    selectedMainMcpAdapter = undefined;
+    selectedMainMcpAllowedNames = new Set();
+    let fencedExposure = exposure;
+    try {
+      const reconciler = activeSelectedMainToolReconciler();
+      reconciler.setPolicy(selectedMainPolicy);
+      if (!reconciler.reconcile(registeredMainToolNames()).ok) fencedExposure = operationFailed("exposure-failed");
+      else if (fencedExposure.state === "not-requested") fencedExposure = operationSucceeded();
+    } catch {
+      fencedExposure = operationFailed("exposure-failed");
+    }
+    selectedMainAdmissionFailure = `${message}${cleanupUnconfirmed ? " Selected MCP cleanup remains unconfirmed; exit this process without resuming the session." : ""}`;
+    return Object.freeze({ runtime, exposure: fencedExposure });
+  }
+
+  async function rebuildSelectedMainMcpScope(
+    freshProject: LoadedProject | undefined,
+  ): Promise<SelectedMainMcpRebuildResult> {
+    const snapshot = selectedMainSnapshot;
+    if (snapshot?.kind !== "selected" || selectedMainDefinition === undefined || freshProject === undefined) {
+      return fenceSelectedMainMcpAfterFailure(
+        "Selected main-session MCP authority could not be authenticated after administration; start a fresh PiCC process and session.",
+        operationFailed("runtime-failed"),
+      );
+    }
+    const freshAgent = findByName(freshProject.agents, snapshot.requestedName);
+    const sameSource = freshAgent !== undefined && freshAgent.name === snapshot.resolvedName &&
+      freshAgent.source.path === snapshot.source.path && freshAgent.source.scope === snapshot.source.scope &&
+      freshAgent.source.pluginId === snapshot.source.pluginId;
+    if (!sameSource) {
+      return fenceSelectedMainMcpAfterFailure(
+        "Selected main-session MCP authority changed during administration; start a fresh PiCC process and session.",
+        operationFailed("runtime-failed"),
+      );
+    }
+    let freshDeclaration: ClaudeAgent["agentMcp"];
+    try {
+      // Fresh reload authenticates only the exact MCP declaration/admission state. The session's
+      // prompt, policy, hooks, model, skills, memory, and identity remain the frozen snapshot.
+      freshDeclaration = preparePluginAgentOwner(freshAgent).agentMcp;
+    } catch {
+      return fenceSelectedMainMcpAfterFailure(
+        "Selected main-session MCP definition could not be prepared after administration; start a fresh PiCC process and session.",
+        operationFailed("runtime-failed"),
+      );
+    }
+    let transition: SelectedMainMcpTransitionOutcome | undefined;
+    try {
+      transition = await selectedMainMcp.replace({
+        agentIdentity: snapshot.resolvedName,
+        sessionRuntime: mcpRuntime,
+        declaration: freshDeclaration,
+        admissionContext: freshProject.agentMcpAdmission,
+        inlineDeps: {
+          projectRoot: freshProject.root,
+          spawnCwd: cwdState.get(),
+          sessionId: `${sessionId}:selected-main`,
+          env: process.env,
+          settingsEnv: freshProject.settings.env,
+        },
+      });
+    } catch { /* fixed failure below */ }
+    if (transition === undefined || !selectedMcpTransitionConfirmed(transition, true)) {
+      return fenceSelectedMainMcpAfterFailure(
+        "Selected main-session MCP replacement could not be confirmed after administration; provider admission is closed. Start a fresh PiCC process and session.",
+        operationFailed("runtime-failed"),
+      );
+    }
+    const exposure = publishSelectedMainMcpAdapter(selectedMainMcp.adapter());
+    if (exposure.state === "failed") {
+      return fenceSelectedMainMcpAfterFailure(
+        "Selected main-session MCP capability publication could not be confirmed after administration; provider admission is closed. Start a fresh PiCC process and session.",
+        operationSucceeded(),
+        exposure,
+      );
+    }
+    selectedMainAdmissionFailure = undefined;
+    return Object.freeze({ runtime: operationSucceeded(), exposure });
+  }
+
   const selectedMcpTransitionConfirmed = (
     outcome: SelectedMainMcpTransitionOutcome,
     installed: boolean,
@@ -4384,35 +4808,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
 
     const adapter = selectedMainMcp.adapter();
-    const allowedMcpNames = new Set(adapter.tools().map((tool) => `mcp__${tool.serverName}__${tool.toolName}`));
-    if (adapter.resourceServers().length > 0) {
-      allowedMcpNames.add(ListMcpResourcesTool);
-      allowedMcpNames.add(ReadMcpResourceTool);
-    }
-    const definitions: ToolDefinition<any, any>[] = [...buildMcpProxyTools(adapter)];
-    if (adapter.resourceServers().length > 0) {
-      definitions.push(...buildMcpResourceTools(adapter, {
-        clipMaxTokens: config.compaction.clipMaxTokens,
-      }));
-    }
-    try {
-      for (const definitionTool of definitions) {
-        pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(definitionTool, {
-          fallbackCallDisplayName: definitionTool.label,
-        }) as unknown as Record<string, unknown>));
-        registeredSelectedMainMcpNames.add(definitionTool.name);
-      }
-    } catch {
+    if (publishSelectedMainMcpAdapter(adapter).state === "failed") {
       await denyTransition(snapshot.requestedName,
-        "MCP tool or resource publication failed; no provider request was admitted. Start a fresh PiCC process and session.", true);
+        "MCP publication or tool publication could not be confirmed; no provider request was admitted. Start a fresh PiCC process and session.", true);
       return;
     }
     selectedMainSnapshot = snapshot;
     selectedMainDefinition = definition;
     selectedMainHookPublished = selectedHookRunner !== undefined;
     selectedMainPolicy = policy;
-    selectedMainMcpAdapter = adapter;
-    selectedMainMcpAllowedNames = allowedMcpNames;
     if (!await reconcileSelectedTools(ctx)) return;
 
     if (snapshot.initialPrompt && !selectedMainAgentInitialPromptDelivered(branch, snapshot.requestedName)) {
@@ -4606,7 +5010,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // newly loaded extension's startup may present it; /new and same-instance
       // lifecycle events cannot replay it.
       if (event.reason === "startup" && !mcpStartupNoticePresented) {
-        const mcpStartupNotice = buildMcpStartupNotice(project.mcp, compat.mcpPendingNotice);
+        const mcpStartupNotice = buildMcpStartupNotice(project.mcp, ctx.mode === "tui" ? compat.mcpPendingNotice : undefined);
         if (mcpStartupNotice) {
           mcpStartupNoticePresented = true;
           if (ctx.mode === "tui") ctx.ui?.notify?.(mcpStartupNotice, "warning");
@@ -6247,6 +6651,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const MCP_ARGUMENT_RESPONSE =
     "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
+  const MCP_HEADLESS_ADMINISTRATION_GUIDANCE =
+    "No equivalent action was performed in this mode. The interactive PiCC TUI is required for project review and runtime actions; open it and use /mcp manage. Use bare /mcp to inspect status. Standalone picc mcp commands manage declarations; trusted user/managed settings provide only broad project-review compatibility grants, not enable, disable, or reconnect controls. Run picc mcp --help for supported commands.";
+  const MCP_HEADLESS_AUTHENTICATION_GUIDANCE =
+    "No authentication action was performed. PiCC does not currently provide MCP OAuth, token storage, or browser authentication. Configure supported static headers in the applicable MCP server declaration when the server accepts them; run picc mcp --help for supported configuration commands.";
+  const MCP_DEEP_LINK_ACTIONS = new Map<string, import("./runtime/mcp-administration-render.js").McpAdministrationUiAction | undefined>([
+    ["manage", undefined], ["approve", "approve"], ["reject", "reject"], ["enable", "enable"],
+    ["disable", "disable"], ["reconnect", "reconnect"], ["authenticate", "authenticate"],
+  ]);
   const CONTROL_ERROR_RESPONSE =
     "PiCC could not produce that control-command report. No action occurred; try again or run /doctor.";
   const PLUGIN_RELOAD_GUIDANCE =
@@ -6361,14 +6773,41 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       render: async () => PLUGIN_RELOAD_GUIDANCE,
     }],
     ["mcp", {
-      description: "PiCC: read-only MCP server status",
+      description: "PiCC: read-only MCP status; fixed TUI administration deep links",
       render: async (args, ctx) => {
-        if (args.trim()) return MCP_ARGUMENT_RESPONSE;
+        const trimmed = args.trim();
+        if (trimmed.length > 0) {
+          const token = /^[A-Za-z-]+$/u.test(trimmed) ? trimmed.toLowerCase() : undefined;
+          if (token === undefined || !MCP_DEEP_LINK_ACTIONS.has(token)) return MCP_ARGUMENT_RESPONSE;
+          if (ctx?.mode !== "tui") return token === "authenticate" ? MCP_HEADLESS_AUTHENTICATION_GUIDANCE : MCP_HEADLESS_ADMINISTRATION_GUIDANCE;
+          const recoveryAwarePort: import("./runtime/mcp-administration-focus.js").McpAdministrationActionPort = Object.freeze({
+            inventory: async () => {
+              const prepared = await mcpAdministrationService.prepareInventoryAfterRecovery();
+              if (prepared.recovery.state !== "not-requested") {
+                const recovery = prepared.recovery;
+                const completed = prepared.eligibility.eligible && recovery.cleanup === "complete" &&
+                  (recovery.state === "rolled-back" || recovery.state === "committed" && recovery.effect === "unchanged");
+                const notice = completed
+                  ? `MCP recovery completed: state=${recovery.state}; effect=${recovery.effect}; cleanup=${recovery.cleanup}. Fresh inventory loaded.`
+                  : `MCP recovery remains pending: declarations are intentionally hidden; state=${recovery.state}; effect=${recovery.effect}; cleanup=${recovery.cleanup}. Retry /mcp manage and inspect /doctor.`;
+                ctx.ui?.notify?.(notice, completed ? "info" : "warning");
+              }
+              return prepared.inventory;
+            },
+            interactivePrepare: mcpAdministrationService.interactivePrepare,
+            confirmedExecute: mcpAdministrationService.confirmedExecute,
+          });
+          const opened = await openMcpAdministration(ctx, recoveryAwarePort, {
+            ...(MCP_DEEP_LINK_ACTIONS.get(token) === undefined ? {} : { initialAction: MCP_DEEP_LINK_ACTIONS.get(token)! }),
+          });
+          if (opened.opened) return undefined;
+          return opened.message;
+        }
         if (isTextPrintMode(ctx) || ctx?.mode === "json") {
           await (testSeam?.mcpControl?.whenSettled ?? (() => mcpRuntime.whenSettled()))();
         }
         const render = testSeam?.mcpControl?.render ?? renderMcpStatusReport;
-        const globalReport = render(project.mcp, observableMcpServerStates());
+        const globalReport = render(currentMcpConfig, observableMcpServerStates());
         if (selectedMainSnapshot?.kind !== "selected") return globalReport;
         const status = selectedMainMcpStatus();
         const selectedRows = status.rows.length > 0
@@ -6396,6 +6835,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     "login", "logout", "model", "name", "new", "quit", "reload", "resume",
     "scoped-models", "session", "settings", "share", "tree", "trust", "help",
   ]);
+  currentMcpReservedNames = mcpPromptReservedNames;
 
   function reservedBuiltinName(name: string): string | undefined {
     const normalized = name.toLowerCase();

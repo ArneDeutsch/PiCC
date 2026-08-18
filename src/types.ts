@@ -902,8 +902,8 @@ export interface ResolvedMcpConfig {
   servers: ResolvedMcpServer[];
   /** Config-level findings (malformed file, ignored project-scope approvals). */
   diagnostics: string[];
-  /** Authoritative native state was present but unusable, so all MCP is inactive. */
-  failClosed?: "native-state-unusable";
+  /** Explicit acquisition authority that made all MCP inactive. */
+  failClosed?: "native-state-unusable" | "administration-recovery-pending";
   /** Fixed provenance for safe fail-closed repair guidance; never a resolved path. */
   failClosedProfile?: ClaudeProfileSource;
   /** Optional for legacy/test literals; policy-aware resolver outputs always populate it. */
@@ -914,6 +914,8 @@ export interface ResolvedMcpConfig {
   policyFailures?: readonly Readonly<McpPolicySourceFailure>[];
   /** True only when discovery established that ordinary sources were suppressed. */
   policyOrdinarySourcesSuppressed?: boolean;
+  /** Resolver-owned, immutable declaration/review projection. */
+  administration?: import("./mcp-administration/model.js").McpAdministrationTrace;
 }
 
 interface ResolvedAgentMcpServerCommon {
@@ -958,11 +960,17 @@ export interface ResolvedAgentMcpConfig {
   readonly servers: readonly ResolvedAgentMcpServer[];
   readonly diagnostics: readonly string[];
   readonly diagnosticOwnership: readonly AgentMcpDiagnosticOwnership[];
+  /** Present when the caller supplies the owning agent identity. */
+  readonly administration?: import("./mcp-administration/model.js").McpAdministrationTrace;
 }
 
 /** Project-captured authority for resolving one declaration into unstarted configuration. */
 export interface AgentMcpAdmissionContext {
   readonly resolve: (declaration: AgentMcpDeclaration) => ResolvedAgentMcpConfig;
+  readonly resolveOwned?: (
+    declaration: AgentMcpDeclaration,
+    owner: import("./mcp-administration/model.js").McpAgentOwner,
+  ) => ResolvedAgentMcpConfig;
 }
 
 // ---------------------------------------------------------------------------

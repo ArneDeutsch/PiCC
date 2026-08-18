@@ -1,6 +1,7 @@
 import type {
   AgentMcpAdmissionContext,
   AgentMcpDeclaration,
+  AgentMcpDiagnosticOwnership,
   HookOutcome,
   HookPayload,
   ResolvedAgentMcpConfig,
@@ -9,8 +10,10 @@ import type {
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import {
   createAgentMcpScope,
+  settleAgentMcpSessionSnapshot,
   type AgentMcpRuntimeSource,
   type AgentMcpScope,
+  type AgentMcpSessionSnapshot,
   type CreateAgentMcpScopeOptions,
 } from "./agent-mcp.js";
 import type {
@@ -303,11 +306,39 @@ export class SelectedMainMcpScopeController {
       if (next === undefined) return this.outcome(false, cleanup, diagnostics);
 
       this.currentIdentity = safeIdentity(next.agentIdentity);
+      let sessionSnapshot: AgentMcpSessionSnapshot;
+      try {
+        sessionSnapshot = await settleAgentMcpSessionSnapshot(next.sessionRuntime, next.signal);
+      } catch {
+        diagnostics.push(this.diagnostic("setup-failed", this.currentIdentity));
+        return this.outcome(false, cleanup, diagnostics);
+      }
       let inlineConfig = EMPTY_INLINE_CONFIG;
       if (next.declaration !== undefined) {
         try {
-          if (next.admissionContext === undefined) throw new Error("missing admission authority");
-          inlineConfig = next.admissionContext.resolve(next.declaration);
+          const resolveOwned = next.admissionContext?.resolveOwned;
+          if (typeof resolveOwned !== "function") throw new Error("missing owned admission authority");
+          inlineConfig = resolveOwned(next.declaration, {
+            name: next.agentIdentity,
+            scope: next.declaration.scope,
+          });
+          const published = sessionSnapshot.publishedServerNames;
+          if (hasFatalSelectedMcpDiagnostics(
+            next.declaration.diagnostics,
+            next.declaration.diagnosticOwnership,
+            published,
+          ) || hasFatalSelectedMcpDiagnostics(
+            inlineConfig.diagnostics,
+            inlineConfig.diagnosticOwnership,
+            published,
+          )) {
+            throw new Error("invalid declared capability");
+          }
+          for (const item of next.declaration.items) {
+            if (item.kind !== "inline" || published.has(item.name)) continue;
+            const admitted = inlineConfig.servers.find((server) => server.name === item.name);
+            if (admitted?.status !== "enabled") throw new Error("required inline capability unavailable");
+          }
         } catch {
           diagnostics.push(this.diagnostic("setup-failed", this.currentIdentity));
           return this.outcome(false, cleanup, diagnostics);
@@ -318,6 +349,7 @@ export class SelectedMainMcpScopeController {
       try {
         scope = await this.createScope({
           sessionRuntime: next.sessionRuntime,
+          sessionSnapshot,
           declaration: next.declaration,
           inlineConfig,
           inlineDeps: next.inlineDeps,
@@ -331,10 +363,16 @@ export class SelectedMainMcpScopeController {
       // Ownership begins at factory return, before any untrusted scope inspection.
       let borrowedNames: ReadonlySet<string>;
       try {
-        diagnostics.push(...scope.setupOutcomes().map((entry) =>
+        const setupOutcomes = scope.setupOutcomes();
+        diagnostics.push(...setupOutcomes.map((entry) =>
           this.diagnostic(entry.kind, entry.serverName)));
-        if (scope.diagnostics().length > 0) {
+        const setupDiagnostics = scope.diagnostics();
+        if (setupDiagnostics.length > 0) {
           diagnostics.push(this.diagnostic("setup-diagnostic", this.currentIdentity));
+        }
+        if (setupOutcomes.length > 0) {
+          const failedCleanup = await this.cleanupScope(scope, this.currentIdentity, diagnostics);
+          return this.outcome(false, failedCleanup, diagnostics);
         }
         if (typeof scope.borrowedServerNames !== "function") {
           throw new Error("missing borrowed-route provenance");
@@ -524,6 +562,18 @@ export class SelectedMainMcpScopeController {
     this.transitions = result.then(() => undefined, () => undefined);
     return result;
   }
+}
+
+function hasFatalSelectedMcpDiagnostics(
+  diagnostics: readonly string[],
+  ownership: readonly AgentMcpDiagnosticOwnership[],
+  publishedServerNames: ReadonlySet<string>,
+): boolean {
+  if (diagnostics.length !== ownership.length) return diagnostics.length > 0;
+  return diagnostics.some((_diagnostic, index) => {
+    const owner = ownership[index];
+    return owner?.kind !== "server" || !publishedServerNames.has(owner.serverName);
+  });
 }
 
 function emptyHookOutcome(): HookOutcome {

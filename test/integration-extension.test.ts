@@ -1444,7 +1444,7 @@ describe("session lifecycle hooks", () => {
     expect(doctor).toContain("disabledMcpjsonServers");
     expect(doctor).toContain("Main-session MCP status (agent declaration findings and remediation appear under Compatibility findings):");
     expect(doctor).toContain('project agent "future-agent" references MCP server "fixture-session"');
-    expect(doctor).toContain('inline MCP server "fixture-inline" is pending PiCC project approval');
+    expect(doctor).toContain('inline MCP server "fixture-inline" is pending PiCC project review');
     expect(doctor).toContain("Startup health and deterministic cleanup are dispatch-time only");
     expect(doctor).not.toContain("declares dispatch-local mcpServers");
     expect(doctor).not.toContain("MCP servers will not start");
@@ -5174,6 +5174,52 @@ describe("selected main-session lifecycle composition", () => {
     expect(runtimeCalls).toEqual([]);
   });
 
+  it("keeps a usable selected MCP scope active while surfacing its redacted setup warning", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const calls: string[] = [];
+    const originalSend = owner.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    Object.assign(owner.api, {
+      getFlag: () => "selected-main",
+      sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+        originalSend(message, options);
+        if (message.customType === "picc-selected-main-agent-initial-prompt") branch.push({ type: "custom_message", ...message });
+      },
+    });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      selectedMainMcpScopeFactory: async () => ({
+        whenSettled: async () => {},
+        tools: () => [{ serverName: "usable", toolName: "run", description: "usable", inputSchema: { type: "object" } }],
+        resourceServers: () => [], serverStates: () => [{ name: "usable", transport: "stdio" as const, state: "connected" as const }],
+        callTool: async () => { calls.push("run"); return { content: [] }; }, readResource: async () => ({ contents: [] }),
+        diagnostics: () => ["RAW_NONBLOCKING_SETUP_DIAGNOSTIC"], setupOutcomes: () => [],
+        knownToolNames: () => ["mcp__usable__run"], borrowedServerNames: () => [],
+        shutdown: async () => ({ confirmed: ["usable"], unconfirmed: [], diagnostics: [] }),
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }),
+      }),
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return { ...loaded, agents: loaded.agents.map((agent) => agent.name === "selected-main"
+          ? { ...agent, tools: ["mcp__usable__run"], initialPrompt: undefined }
+          : agent) };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch, getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    expect(owner.notifications.map(({ text }) => text).join("\n")).toContain("redacted nonblocking diagnostic");
+    expect(JSON.stringify(owner.notifications)).not.toContain("RAW_NONBLOCKING_SETUP_DIAGNOSTIC");
+    await expect(owner.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+    await owner.tools.get("mcp__usable__run").execute("usable", {});
+    expect(calls).toEqual(["run"]);
+  });
+
   it("composes the selected MCP universe, diagnostics, collision ownership, and stale-call revocation", async () => {
     const owner = fakePi();
     const branch: Record<string, unknown>[] = [];
@@ -5266,6 +5312,16 @@ describe("selected main-session lifecycle composition", () => {
               deny: [...loaded.settings.permissions.deny, "mcp__global-b__ping"],
             },
           },
+          agentMcpAdmission: {
+            resolve: () => ({ servers: [], diagnostics: [], diagnosticOwnership: [] }),
+            resolveOwned: () => ({ servers: [{
+              name: "c-inline", source: "subagent-inline" as const, status: "enabled" as const,
+              transport: "stdio" as const, command: "unused", rawCommand: "unused", args: [], env: {}, diagnostics: [],
+            }, {
+              name: "collision", source: "subagent-inline" as const, status: "pending-approval" as const,
+              transport: "stdio" as const, diagnostics: ["RAW_COLLIDING_PENDING_SECRET"],
+            }], diagnostics: ["RAW_COLLIDING_ADMISSION_SECRET"], diagnosticOwnership: [{ kind: "server" as const, serverName: "collision" }] }),
+          },
           agents: loaded.agents.map((agent) => agent.name === "selected-main" ? {
             ...agent,
             tools: [
@@ -5277,6 +5333,7 @@ describe("selected main-session lifecycle composition", () => {
               scope: "project" as const,
               items: [
                 { kind: "reference" as const, name: "global-a" },
+                { kind: "inline" as const, name: "collision", entry: { name: "collision", command: "must-not-start", args: [], env: {}, skipped: false } },
                 { kind: "inline" as const, name: "c-inline", entry: { name: "c-inline", command: "unused", args: [], env: {}, skipped: false } },
               ],
               diagnostics: [], diagnosticOwnership: [],
@@ -5318,6 +5375,7 @@ describe("selected main-session lifecycle composition", () => {
     })).content[0].text).toContain("inline-resource");
     expect((await owner.tools.get("mcp__collision__ping").execute("collision", {})).content[0].text)
       .toContain("global-collision-route");
+    expect(JSON.stringify(owner.notifications)).not.toMatch(/RAW_COLLIDING_|redacted nonblocking diagnostic/u);
 
     await owner.commands.get("mcp").handler("", ctx);
     const mcpReport = String(owner.entries.at(-1)?.data?.output);
@@ -5917,9 +5975,8 @@ describe("MCP timeout diagnostic delivery (zero-enabled project)", () => {
 describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
   // standing pending case), so the failed-connect path gets its own minimal
-  // project: an approved server whose command cannot spawn. The approval rides
-  // an UNTRACKED settings.local.json (no git repo → the tracked probe fails
-  // open), so the enablement gate itself is exercised for real.
+  // project: a user-approved server whose command cannot spawn. Each test uses
+  // a temporary selected profile so checkout-local settings cannot self-approve.
   function makeFailingMcpProject(): string {
     const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-"));
     fs.writeFileSync(
@@ -5929,20 +5986,24 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
       }),
       "utf8",
     );
-    fs.mkdirSync(path.join(mcpDir, ".claude"), { recursive: true });
-    fs.writeFileSync(
-      path.join(mcpDir, ".claude", "settings.local.json"),
-      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
-      "utf8",
-    );
     return mcpDir;
   }
 
-  function cleanupFailingMcpProject(mcpDir: string): void {
-    process.chdir(dir);
+  function makeFailingMcpUserDir(): string {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-user-"));
+    fs.writeFileSync(
+      path.join(userDir, "settings.json"),
+      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
+      "utf8",
+    );
+    return userDir;
+  }
+
+  function cleanupFailingMcpDirectory(tempDir: string | undefined): void {
+    if (tempDir === undefined) return;
     // Best-effort: Windows can EPERM a just-vacated cwd (handle release lag).
     try {
-      fs.rmSync(mcpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       /* leftover temp dir is harmless */
     }
@@ -5951,13 +6012,20 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   it(
     "a failed server reaches the /doctor posture line, fires the one-time warning notify, and drains diagnostics to stderr",
     async () => {
-      const mcpDir = makeFailingMcpProject();
-      process.chdir(mcpDir);
+      const previousCwd = process.cwd();
+      const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+      const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+      let mcpDir: string | undefined;
+      let userDir: string | undefined;
       // Installed BEFORE wiring: the settle-time diagnostics drain runs inside
       // the detached registration step, any time after connect settles.
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const p = fakePi();
       try {
+        mcpDir = makeFailingMcpProject();
+        userDir = makeFailingMcpUserDir();
+        process.chdir(mcpDir);
+        process.env.PICC_CLAUDE_USER_DIR = userDir;
         picc(p.api as never, { onInitializationSettled: p.captureInitialization });
         await p.waitForInitialization();
         // The first-turn barrier awaits MCP settle + registration, so after this
@@ -5988,8 +6056,15 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
         expect(doctor).not.toContain("picc-no-such-command-t05");
       } finally {
         errSpy.mockRestore();
-        await p.fire("session_shutdown", { reason: "other" });
-        cleanupFailingMcpProject(mcpDir);
+        try {
+          await p.fire("session_shutdown", { reason: "other" });
+        } finally {
+          process.chdir(previousCwd);
+          if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+          else delete process.env.PICC_CLAUDE_USER_DIR;
+          cleanupFailingMcpDirectory(mcpDir);
+          cleanupFailingMcpDirectory(userDir);
+        }
       }
     },
     60_000,
@@ -5998,11 +6073,18 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   it(
     "the one-time failure notice falls back to stderr when the ctx has no UI",
     async () => {
-      const mcpDir = makeFailingMcpProject();
-      process.chdir(mcpDir);
+      const previousCwd = process.cwd();
+      const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+      const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+      let mcpDir: string | undefined;
+      let userDir: string | undefined;
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const p = fakePi();
       try {
+        mcpDir = makeFailingMcpProject();
+        userDir = makeFailingMcpUserDir();
+        process.chdir(mcpDir);
+        process.env.PICC_CLAUDE_USER_DIR = userDir;
         picc(p.api as never, { onInitializationSettled: p.captureInitialization });
         await p.waitForInitialization();
         // printCtx models real Pi print mode: hasUI false → stderr fallback.
@@ -6014,8 +6096,15 @@ describe("MCP failed-connect surfacing (dedicated temp project)", () => {
         expect(errText).toContain("run /doctor for details");
       } finally {
         errSpy.mockRestore();
-        await p.fire("session_shutdown", { reason: "other" });
-        cleanupFailingMcpProject(mcpDir);
+        try {
+          await p.fire("session_shutdown", { reason: "other" });
+        } finally {
+          process.chdir(previousCwd);
+          if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+          else delete process.env.PICC_CLAUDE_USER_DIR;
+          cleanupFailingMcpDirectory(mcpDir);
+          cleanupFailingMcpDirectory(userDir);
+        }
       }
     },
     60_000,

@@ -417,12 +417,20 @@ describe("installed release tarball", () => {
       expect(fs.existsSync(path.join(packageRoot, "tsconfig.runtime.json"))).toBe(false);
       const runtimeManifest = JSON.parse(
         fs.readFileSync(path.join(packageRoot, "dist", "picc-runtime.json"), "utf8"),
-      ) as { entries: { extension: string; pluginInventory: string }; files: Array<{ path: string }> };
+      ) as {
+        entries: { extension: string; pluginInventory: string; mcpAdministration: string };
+        files: Array<{ path: string }>;
+      };
       expect(runtimeManifest.entries).toEqual({
         extension: "picc/index.js",
         pluginInventory: "dist/plugin-inventory-cli.js",
+        mcpAdministration: "dist/mcp-administration-cli.js",
       });
-      for (const entry of ["dist/index.js", "dist/plugin-inventory-cli.js"]) {
+      for (const entry of [
+        "dist/index.js",
+        "dist/plugin-inventory-cli.js",
+        "dist/mcp-administration-cli.js",
+      ]) {
         expect(runtimeManifest.files.map((record) => record.path)).toContain(entry);
         expect(runtimeManifest.files.map((record) => record.path)).toContain(`${entry}.map`);
         const sourceMap = JSON.parse(fs.readFileSync(path.join(packageRoot, `${entry}.map`), "utf8")) as Record<string, unknown>;

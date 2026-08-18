@@ -136,7 +136,7 @@ describe("release file policy", () => {
     expect(RELEASE_STATIC_FILES).toEqual([...RELEASE_STATIC_FILES].sort((left, right) =>
       Buffer.compare(Buffer.from(left), Buffer.from(right))));
     expect(RELEASE_FILE_POLICY.prefixes).toEqual(["dist/", "src/"]);
-    for (const required of ["bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.js"]) {
+    for (const required of ["bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.js"]) {
       expect(RELEASE_STATIC_FILES).toContain(required);
       expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => required.startsWith(prefix))).toBe(false);
     }

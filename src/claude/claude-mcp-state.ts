@@ -224,6 +224,13 @@ function preflightBlock(value: unknown): BlockPreflight {
   return { ok: true, block: value };
 }
 
+export interface NativeProjectRecordSelection {
+  readonly familyIdentity: string;
+  readonly selectedKey?: string;
+  readonly selectedRecord?: Record<string, unknown>;
+  readonly matchingKeys: readonly string[];
+}
+
 interface LocalMcpProjection {
   block: Record<string, unknown>;
   disabled: readonly string[];
@@ -319,6 +326,54 @@ function isEligibleLocalPath(value: string): boolean {
   return value.startsWith("/") && !value.startsWith("//") && path.posix.isAbsolute(value);
 }
 
+export type NativeProjectRecordSelectionResult =
+  | { readonly ok: true; readonly value: NativeProjectRecordSelection }
+  | { readonly ok: false; readonly diagnostic: string };
+
+export function selectNativeProjectRecord(inputs: {
+  root: Record<string, unknown>;
+  projectRoot: string;
+  canonicalizeProject?: (candidate: string) => CanonicalDirectoryResult;
+  identifyProject?: (projectRoot: string) => readonly string[];
+  rejectMultipleMatches?: boolean;
+}): NativeProjectRecordSelectionResult {
+  let identities: readonly string[];
+  try { identities = (inputs.identifyProject ?? projectIdentities)(inputs.projectRoot); } catch { identities = []; }
+  const familyIdentity = identities[0];
+  if (familyIdentity === undefined) return { ok: false, diagnostic: "Active project identity could not be established" };
+  if (!isEligibleLocalPath(familyIdentity)) return { ok: false, diagnostic: "Active project identity uses an unsupported path class" };
+  if (!Object.hasOwn(inputs.root, "projects")) return { ok: true, value: { familyIdentity, matchingKeys: [] } };
+  if (!isRecord(inputs.root.projects)) return { ok: false, diagnostic: "Native Claude project state has an invalid shape" };
+  const records = Object.entries(inputs.root.projects);
+  if (records.length > CLAUDE_MCP_STATE_LIMITS.projects) return { ok: false, diagnostic: "Native Claude project state exceeds the project-count limit" };
+  if (records.some(([key]) => key.length > CLAUDE_MCP_STATE_LIMITS.projectKeyChars)) return { ok: false, diagnostic: "Native Claude project state contains an oversized project key" };
+  const budget: MaterialBudget = { properties: 0, chars: 0 };
+  for (const [, record] of records) if (!boundedMaterial(record, 0, budget)) return { ok: false, diagnostic: "Native Claude project records exceed structural limits" };
+  const canonicalize = inputs.canonicalizeProject ?? ((candidate: string) => canonicalDirectory(candidate));
+  const matches: Array<{ key: string; record: unknown; projection: LocalMcpProjection }> = [];
+  let comparison: LocalMcpProjection | undefined;
+  for (const [candidate, record] of records) {
+    if (!isEligibleLocalPath(candidate)) continue;
+    let canonical: CanonicalDirectoryResult;
+    try { canonical = canonicalize(candidate); } catch { canonical = { kind: "indeterminate" }; }
+    if (canonical.kind === "indeterminate") return { ok: false, diagnostic: "Native Claude project identity could not be determined safely" };
+    if (canonical.kind !== "canonical" || canonical.path !== familyIdentity) continue;
+    const projected = localMcpProjection(record);
+    if (!projected.ok) return { ok: false, diagnostic: projected.diagnostic };
+    if (comparison !== undefined && !equivalentLocalMcp(comparison, projected.projection)) return { ok: false, diagnostic: "Native Claude project MCP state has conflicting matching records" };
+    comparison ??= projected.projection;
+    matches.push({ key: candidate, record, projection: projected.projection });
+  }
+  if (inputs.rejectMultipleMatches === true && matches.length > 1) return { ok: false, diagnostic: "Native Claude project state has ambiguous matching records" };
+  let selected = matches.find((match) => match.key === familyIdentity);
+  for (const match of matches) if (selected === undefined || (selected.key !== familyIdentity && match.key < selected.key)) selected = match;
+  return { ok: true, value: {
+    familyIdentity,
+    ...(selected === undefined ? {} : { selectedKey: selected.key, selectedRecord: selected.record as Record<string, unknown> }),
+    matchingKeys: matches.map(({ key }) => key),
+  } };
+}
+
 /** Load one inert, read-only snapshot of Claude's native MCP state. Never throws. */
 export function loadClaudeMcpState(options: LoadClaudeMcpStateOptions): ClaudeMcpStateResult {
   const snapshot = readSnapshot(options.statePath, options.fileSystem);
@@ -337,17 +392,13 @@ export function loadClaudeMcpState(options: LoadClaudeMcpStateOptions): ClaudeMc
     return unusable("Native Claude user state exceeds structural limits");
   }
 
-  let identities: readonly string[];
-  try {
-    identities = (options.identifyProject ?? projectIdentities)(options.projectRoot);
-  } catch {
-    identities = [];
-  }
-  const familyIdentity = identities[0];
-  if (familyIdentity === undefined) return unusable("Active project identity could not be established");
-  if (!isEligibleLocalPath(familyIdentity)) {
-    return unusable("Active project identity uses an unsupported path class");
-  }
+  const selection = selectNativeProjectRecord({
+    root,
+    projectRoot: options.projectRoot,
+    ...(options.canonicalizeProject === undefined ? {} : { canonicalizeProject: options.canonicalizeProject }),
+    ...(options.identifyProject === undefined ? {} : { identifyProject: options.identifyProject }),
+  });
+  if (!selection.ok) return unusable(selection.diagnostic);
 
   const userPreflight = preflightBlock(
     Object.hasOwn(root, "mcpServers") ? root.mcpServers : Object.create(null),
@@ -359,57 +410,11 @@ export function loadClaudeMcpState(options: LoadClaudeMcpStateOptions): ClaudeMc
   }
   const userBlock = userPreflight.block;
 
-  const matchingRecords: Array<{ key: string; record: unknown }> = [];
-  if (Object.hasOwn(root, "projects")) {
-    if (!isRecord(root.projects)) return unusable("Native Claude project state has an invalid shape");
-    const records = Object.entries(root.projects);
-    if (records.length > CLAUDE_MCP_STATE_LIMITS.projects) {
-      return unusable("Native Claude project state exceeds the project-count limit");
-    }
-    if (records.some(([key]) => key.length > CLAUDE_MCP_STATE_LIMITS.projectKeyChars)) {
-      return unusable("Native Claude project state contains an oversized project key");
-    }
-    const projectRecordBudget: MaterialBudget = { properties: 0, chars: 0 };
-    for (const [, record] of records) {
-      if (!boundedMaterial(record, 0, projectRecordBudget)) {
-        return unusable("Native Claude project records exceed structural limits");
-      }
-    }
-    const canonicalize = options.canonicalizeProject ?? ((candidate: string) => canonicalDirectory(candidate));
-    for (const [candidate, record] of records) {
-      if (!isEligibleLocalPath(candidate)) continue;
-      let canonical: CanonicalDirectoryResult;
-      try {
-        canonical = canonicalize(candidate);
-      } catch {
-        canonical = { kind: "indeterminate" };
-      }
-      if (canonical.kind === "indeterminate") {
-        return unusable("Native Claude project identity could not be determined safely");
-      }
-      if (canonical.kind === "canonical" && canonical.path === familyIdentity) {
-        matchingRecords.push({ key: candidate, record });
-      }
-    }
-  }
-
-  const projectedMatches: Array<{ key: string; projection: LocalMcpProjection }> = [];
-  let comparison: LocalMcpProjection | undefined;
-  for (const match of matchingRecords) {
-    const projected = localMcpProjection(match.record);
-    if (!projected.ok) return unusable(projected.diagnostic);
-    if (comparison !== undefined && !equivalentLocalMcp(comparison, projected.projection)) {
-      return unusable("Native Claude project MCP state has conflicting matching records");
-    }
-    comparison ??= projected.projection;
-    projectedMatches.push({ key: match.key, projection: projected.projection });
-  }
-
-  let selected = projectedMatches.find((match) => match.key === familyIdentity);
-  for (const match of projectedMatches) {
-    if (selected === undefined || (selected.key !== familyIdentity && match.key < selected.key)) selected = match;
-  }
-  const selectedProjection: LocalMcpProjection = selected?.projection ?? {
+  const projected = selection.value.selectedRecord === undefined
+    ? undefined
+    : localMcpProjection(selection.value.selectedRecord);
+  if (projected !== undefined && !projected.ok) return unusable(projected.diagnostic);
+  const selectedProjection: LocalMcpProjection = projected?.projection ?? {
     block: Object.create(null) as Record<string, unknown>,
     disabled: [],
   };

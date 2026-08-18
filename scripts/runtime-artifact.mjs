@@ -5,11 +5,14 @@ import { inspectTarball } from "./tarball-inspect.mjs";
 const MANIFEST_PATH = "dist/picc-runtime.json";
 const EXTENSION_ENTRY = "picc/index.js";
 const INVENTORY_ENTRY = "dist/plugin-inventory-cli.js";
+const MCP_ADMINISTRATION_ENTRY = "dist/mcp-administration-cli.js";
 const REQUIRED_RUNTIME_FILES = [
   "dist/index.js",
   "dist/index.js.map",
   INVENTORY_ENTRY,
   `${INVENTORY_ENTRY}.map`,
+  MCP_ADMINISTRATION_ENTRY,
+  `${MCP_ADMINISTRATION_ENTRY}.map`,
 ];
 const HEX = /^[0-9a-f]{64}$/u;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -93,8 +96,9 @@ function validateManifest(value) {
       || !validRecords(value.files) || !HEX.test(value.sourceDigest) || !HEX.test(value.runtimeDigest)) {
     fail("runtime identity is malformed for schema version 1");
   }
-  if (!exactKeys(value.entries, ["extension", "pluginInventory"])
-      || value.entries.extension !== EXTENSION_ENTRY || value.entries.pluginInventory !== INVENTORY_ENTRY) {
+  if (!exactKeys(value.entries, ["extension", "pluginInventory", "mcpAdministration"])
+      || value.entries.extension !== EXTENSION_ENTRY || value.entries.pluginInventory !== INVENTORY_ENTRY
+      || value.entries.mcpAdministration !== MCP_ADMINISTRATION_ENTRY) {
     fail("runtime identity has invalid fixed entrypoints");
   }
   const paths = new Set(value.files.map((record) => record.path));

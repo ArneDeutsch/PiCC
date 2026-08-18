@@ -10,6 +10,24 @@ import type { ManagedMcpResult } from "../claude/managed-mcp.js";
 import { compileMcpPolicy, evaluateMcpPolicy, MCP_POLICY_LIMITS } from "../engine/mcp-policy.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { sanitizedSubprocessEnv } from "../util/env.js";
+import {
+  MCP_ADMINISTRATION_MODEL_VERSION,
+  type McpAdministrationDeclaration,
+  type McpAdministrationTrace,
+  type McpAgentOwner,
+  type McpReviewPosture,
+  type McpReviewSnapshot,
+} from "../mcp-administration/model.js";
+import {
+  commandBasename,
+  createMcpReviewDefinitionDigest,
+  createMcpReviewIdentity,
+  matchesMcpReviewRecord,
+  MCP_REVIEW_DEFINITION_VERSION,
+  safeRemoteOrigin,
+  staticMcpHeaderCount,
+  validateAndCopyMcpReviewSnapshot,
+} from "../mcp-administration/review-definition.js";
 import type {
   AgentMcpAdmissionContext,
   AgentMcpDeclaration,
@@ -44,9 +62,9 @@ import type {
  * MCP closed; standalone exclusive managed input bypasses ordinary/native loading.
  * - Git-tracked local demotion (mandatory gate rule): a `settings.local.json`
  *   that is tracked in the project repository is attacker-committable, so its
- *   MCP contribution is treated as PROJECT scope (approvals ignored, servers
- *   pending) with a diagnostic. Probe failure / no git repo fails OPEN
- *   (treated as untracked) so non-git projects keep working.
+ *   MCP contribution is treated as PROJECT scope with a diagnostic. Git
+ *   provenance may change a local declaration's origin, but checkout-local
+ *   approval keys never authorize; probe failure cannot make them authoritative.
  * - `${VAR}` / `${VAR:-default}` expansion applies to command/args/env at
  *   resolution time; unset-without-default keeps the literal and records a
  *   warning naming the VARIABLE NAME only (never values).
@@ -57,7 +75,7 @@ import type {
 
 /**
  * Probe seam: is `filePath` tracked by git in the project repository?
- * `undefined` = probe failed (no git, no repo, …) → callers FAIL OPEN.
+ * `undefined` means provenance is indeterminate. It never authorizes approval.
  */
 export type GitTrackedProbe = (filePath: string, projectRoot: string) => boolean | undefined;
 
@@ -88,6 +106,8 @@ export interface ResolveMcpConfigOptions {
   env?: NodeJS.ProcessEnv;
   /** Test seam; defaults to a `git ls-files --error-unmatch` child call. */
   isGitTracked?: GitTrackedProbe;
+  /** Immutable PiCC-owned exact-definition review decisions. */
+  reviewSnapshot?: McpReviewSnapshot;
   /** Deterministic counters for enabled-only remote work. */
   remoteWorkHooksForTest?: RemoteMcpWorkHooks;
   /** Production handoff of captured authority; callback failure cannot affect ordinary resolution. */
@@ -115,6 +135,8 @@ const ORIGIN_RANK: Record<McpOrigin, number> = {
   "managed-mcp": 7,
 };
 
+export const MCP_ADMINISTRATION_TRACE_LIMITS = Object.freeze({ declarations: 512 });
+
 interface Candidate {
   entry: RawMcpEntry;
   origin: McpOrigin;
@@ -123,6 +145,74 @@ interface Candidate {
   /** Global discovery index; among equal ranks the later (nearer) file wins. */
   order: number;
   source: McpSourceClass;
+}
+
+function emptyAdministration(
+  policyPosture: CompiledMcpPolicy["posture"],
+  ordinarySuppressed: boolean,
+  reviewInvalid: boolean,
+): McpAdministrationTrace {
+  return Object.freeze({
+    version: MCP_ADMINISTRATION_MODEL_VERSION,
+    policyPosture,
+    observations: Object.freeze([
+      ...(ordinarySuppressed ? ["ordinary-sources-suppressed-by-managed-mcp" as const] : []),
+      ...(reviewInvalid ? ["review-snapshot-unavailable-or-invalid" as const] : []),
+    ]),
+    declarations: Object.freeze([]),
+    omittedDeclarationCount: 0,
+  });
+}
+
+function settingsMcpSource(scope: McpSettingsEntry["scope"]): McpSourceClass {
+  return scope === "managed" ? "settings-managed"
+    : scope === "local" ? "settings-local"
+      : scope === "project" ? "settings-project" : "settings-user";
+}
+
+function candidateAuthority(source: McpSourceClass): McpAdministrationDeclaration["authority"] {
+  if (source === "native-local") return Object.freeze({ kind: "mutable", scope: "local" });
+  if (source === "project-mcpjson") return Object.freeze({ kind: "mutable", scope: "project" });
+  if (source === "native-user") return Object.freeze({ kind: "mutable", scope: "user" });
+  return Object.freeze({ kind: "read-only", sourceClass: source });
+}
+
+function matchingReview(
+  snapshot: McpReviewSnapshot | undefined,
+  source: McpSourceClass | "subagent-inline",
+  name: string,
+  digest: string | undefined,
+  owner?: McpAgentOwner,
+  declarationScope?: AgentMcpDeclaration["scope"],
+): "approved" | "rejected" | undefined {
+  if (snapshot === undefined || digest === undefined ||
+    (owner !== undefined && declarationScope !== undefined && owner.scope !== declarationScope)) return undefined;
+  const identity = createMcpReviewIdentity({ snapshot, source, serverName: name, ...(owner === undefined ? {} : { agentOwner: owner }) });
+  let approved = false;
+  for (const candidate of snapshot.records) {
+    if (!matchesMcpReviewRecord(candidate, identity, digest)) continue;
+    if (candidate.decision === "rejected") return "rejected";
+    approved = true;
+  }
+  return approved ? "approved" : undefined;
+}
+
+function safeDeclarationSummary(entry: RawMcpEntry): McpAdministrationDeclaration["summary"] {
+  const basename = entry.remote === undefined && !entry.skipped ? commandBasename(entry.command) : undefined;
+  const origin = entry.remote === undefined ? undefined : safeRemoteOrigin(entry.remote.rawUrl);
+  return Object.freeze({
+    ...(entry.remote === undefined
+      ? (entry.skipped ? {} : { transport: "stdio" as const, ...(basename === undefined ? {} : { commandBasename: basename }) })
+      : {
+          transport: entry.remote.transportKind,
+          configuredType: entry.remote.configuredType,
+          ...(origin === undefined ? {} : { remoteOrigin: origin }),
+        }),
+    argumentCount: entry.args.length,
+    environmentKeyCount: Object.keys(entry.env).length,
+    headerKeyCount: entry.remote === undefined ? 0 : staticMcpHeaderCount(entry),
+    timeoutConfigured: entry.timeoutMs !== undefined,
+  });
 }
 
 /**
@@ -148,8 +238,8 @@ function defaultGitTrackedProbe(filePath: string, projectRoot: string): boolean 
     // case-insensitive filesystem (Windows/macOS) the loader happily reads a
     // committed ".claude/Settings.local.json" via the lowercase name, but git
     // pathspecs are case-sensitive — probing the lexical spelling would answer
-    // "untracked" and bypass the demotion gate. realpath failure fails OPEN
-    // (outer catch), like every other probe failure.
+    // "untracked" and bypass the declaration-origin demotion. A failed probe
+    // cannot establish demotion and never makes checkout-local approvals authoritative.
     const realFile = fs.realpathSync.native(filePath);
     const realRoot = fs.realpathSync.native(projectRoot);
     const rel = path.relative(realRoot, realFile);
@@ -442,24 +532,27 @@ function validateAgentDeclaration(value: unknown): ValidatedAgentDeclaration | u
   return { scope, diagnosticOwnership, items };
 }
 
-// Normalized declarations are inert parser output. Captured authority resolves them
-// into unstarted config without filesystem, process, DNS, or transport effects.
+// Captured agent admission consumes preclassified policy/review authority. It resolves inert
+// declarations without later filesystem or Git I/O and cannot mutate ordinary MCP resolution.
 function createAgentMcpAdmissionContext(input: {
   policy: CompiledMcpPolicy;
   env: NodeJS.ProcessEnv;
   enabledNames?: ReadonlySet<string>;
   disabledNames?: ReadonlySet<string>;
   enableAll?: boolean;
+  reviewSnapshot?: McpReviewSnapshot;
+  reviewSnapshotInvalid?: boolean;
   unavailable?: boolean;
   remoteWorkHooksForTest?: RemoteMcpWorkHooks;
 }): AgentMcpAdmissionContext {
   const enabledNames = input.enabledNames ?? new Set<string>();
   const disabledNames = input.disabledNames ?? new Set<string>();
   const unavailable = input.unavailable === true;
-  const resolve = (declaration: AgentMcpDeclaration): ResolvedAgentMcpConfig => {
+  const resolve = (declaration: AgentMcpDeclaration, owner?: McpAgentOwner): ResolvedAgentMcpConfig => {
     const diagnostics: string[] = [];
     const diagnosticOwnership: AgentMcpDiagnosticOwnership[] = [];
     const servers: ResolvedAgentMcpServer[] = [];
+    const administrationEntries: NormalizedAgentMcpEntry[] = [];
     let diagnosticCount = 0;
     let diagnosticsOmitted = false;
     const collectDiagnostics = (messages: readonly string[], perServer = false): string[] => {
@@ -482,10 +575,53 @@ function createAgentMcpAdmissionContext(input: {
         diagnostics.push(AGENT_ADMISSION_OMISSION);
         diagnosticOwnership.push(unowned());
       }
+      const administration = owner === undefined ? undefined : Object.freeze({
+        version: MCP_ADMINISTRATION_MODEL_VERSION,
+        policyPosture: input.policy.posture,
+        observations: Object.freeze(input.reviewSnapshotInvalid === true
+          ? ["review-snapshot-unavailable-or-invalid" as const]
+          : []),
+        declarations: Object.freeze(administrationEntries.map((entry) => {
+          const server = servers.find((candidate) => candidate.name === entry.name);
+          const digest = createMcpReviewDefinitionDigest(entry as RawMcpEntry);
+          const exact = matchingReview(input.reviewSnapshot, "subagent-inline", entry.name, digest, owner, declaration.scope);
+          const broadAll = declaration.scope === "project" && input.enableAll === true;
+          const broadName = declaration.scope === "project" && enabledNames.has(sanitizeForListMatch(entry.name));
+          const rejectedCompatibility = disabledNames.has(sanitizeForListMatch(entry.name));
+          const review: McpReviewPosture = declaration.scope !== "project"
+            ? "not-required"
+            : rejectedCompatibility ? "rejected-compatibility"
+              : exact === "rejected" ? "rejected-exact"
+                : broadAll ? "approved-broad-all"
+                  : broadName ? "approved-broad-name"
+                    : exact === "approved" ? "approved-exact" : "pending";
+          const serverInactiveReason = server !== undefined && "inactiveReason" in server
+            ? server.inactiveReason
+            : undefined;
+          const policy: McpAdministrationDeclaration["policy"] = server?.status === "blocked"
+            ? (serverInactiveReason as McpPolicyInactiveReason)
+            : entry.skipped || entry.notConfigured ? "invalid" : "allowed";
+          return Object.freeze({
+            name: entry.name,
+            source: "subagent-inline" as const,
+            agentOwner: Object.freeze({ ...owner }),
+            authority: Object.freeze({ kind: "read-only" as const, sourceClass: "subagent-inline" as const }),
+            precedence: "winner" as const,
+            ...(digest === undefined ? {} : { definitionVersion: MCP_REVIEW_DEFINITION_VERSION, definitionDigest: digest }),
+            summary: safeDeclarationSummary(entry as RawMcpEntry),
+            policy,
+            review,
+            status: server?.status ?? "skipped",
+            ...(serverInactiveReason === undefined ? {} : { inactiveReason: serverInactiveReason }),
+          });
+        })),
+        omittedDeclarationCount: 0,
+      }) satisfies McpAdministrationTrace | undefined;
       return Object.freeze({
         servers: Object.freeze(servers),
         diagnostics: Object.freeze(diagnostics),
         diagnosticOwnership: Object.freeze(diagnosticOwnership),
+        ...(administration === undefined ? {} : { administration }),
       });
     };
     try {
@@ -520,6 +656,7 @@ function createAgentMcpAdmissionContext(input: {
           continue;
         }
         const entry = item.entry;
+        administrationEntries.push(entry);
         const transportIdentity = entry.remote === undefined
           ? { transport: "stdio" as const }
           : { transport: entry.remote.transportKind, configuredType: entry.remote.configuredType };
@@ -552,9 +689,17 @@ function createAgentMcpAdmissionContext(input: {
           servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "disabled", inactiveReason: "mcpjson-rejected", diagnostics: [] });
           continue;
         }
-        if (validated.scope === "project" && input.enableAll !== true && !enabledNames.has(sanitizeForListMatch(entry.name))) {
-          servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "pending-approval", inactiveReason: "mcpjson-unapproved", diagnostics: [] });
-          continue;
+        if (validated.scope === "project") {
+          const digest = createMcpReviewDefinitionDigest(entry as RawMcpEntry);
+          const exact = matchingReview(input.reviewSnapshot, "subagent-inline", entry.name, digest, owner, validated.scope);
+          if (exact === "rejected") {
+            servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "disabled", inactiveReason: "mcpjson-rejected", diagnostics: [] });
+            continue;
+          }
+          if (input.enableAll !== true && !enabledNames.has(sanitizeForListMatch(entry.name)) && exact !== "approved") {
+            servers.push({ name: entry.name, source: "subagent-inline", ...transportIdentity, status: "pending-approval", inactiveReason: "mcpjson-unapproved", diagnostics: [] });
+            continue;
+          }
         }
 
         if (entry.remote !== undefined) {
@@ -624,7 +769,10 @@ function createAgentMcpAdmissionContext(input: {
     }
     return finish();
   };
-  return Object.freeze({ resolve });
+  return Object.freeze({
+    resolve: (declaration: AgentMcpDeclaration) => resolve(declaration),
+    resolveOwned: (declaration: AgentMcpDeclaration, owner: McpAgentOwner) => resolve(declaration, owner),
+  });
 }
 
 function publishAgentAdmission(
@@ -640,6 +788,8 @@ function publishAgentAdmission(
 
 /** Resolve precedence + the enablement gate into the runtime's data contract. */
 export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConfig {
+  const reviewValidation = validateAndCopyMcpReviewSnapshot(opts.reviewSnapshot);
+  const reviewSnapshot = reviewValidation.snapshot;
   const environment = snapshotEnvironment(opts.env ?? process.env);
   const env = environment.env;
   const probe = opts.isGitTracked ?? defaultGitTrackedProbe;
@@ -696,17 +846,21 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
       policy,
       env,
+      ...(reviewSnapshot === undefined ? {} : { reviewSnapshot }),
+      ...(reviewValidation.invalid ? { reviewSnapshotInvalid: true } : {}),
       ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
     }));
-    return { servers: [], diagnostics, ...policySnapshot };
+    return { servers: [], diagnostics, ...policySnapshot, administration: emptyAdministration(policy.posture, managedMcp.status !== "absent", reviewValidation.invalid) };
   }
   if (policy.posture === "exclusive-empty") {
     publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
       policy,
       env,
+      ...(reviewSnapshot === undefined ? {} : { reviewSnapshot }),
+      ...(reviewValidation.invalid ? { reviewSnapshotInvalid: true } : {}),
       ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
     }));
-    return { servers: [], diagnostics, ...policySnapshot };
+    return { servers: [], diagnostics, ...policySnapshot, administration: emptyAdministration(policy.posture, true, reviewValidation.invalid) };
   }
 
   const exclusive = managedMcp.status === "loaded";
@@ -723,6 +877,8 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
       policy,
       env,
       unavailable: true,
+      ...(reviewSnapshot === undefined ? {} : { reviewSnapshot }),
+      ...(reviewValidation.invalid ? { reviewSnapshotInvalid: true } : {}),
       ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
     }));
     return {
@@ -732,6 +888,7 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
       ...(opts.nativeStateProfile === undefined ? {} : { failClosedProfile: opts.nativeStateProfile }),
       ...policySnapshot,
       policyPosture: "fail-closed",
+      administration: emptyAdministration("fail-closed", false, reviewValidation.invalid),
     };
   }
   if (nativeState.kind === "loaded") diagnostics.push(...nativeState.diagnostics.map(neutralizeControlChars));
@@ -740,7 +897,7 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
   const ordinarySettings = exclusive ? [] : opts.mcpSettings;
   const normalizedSettingsServers = ordinarySettings.map((entry) => entry.servers === undefined
     ? []
-    : normalizeMcpServerBlock(entry.servers, "MCP settings"));
+    : normalizeMcpServerBlock(entry.servers, settingsMcpSource(entry.scope)));
   const isPolicyAdmissible = (server: RawMcpEntry, source: McpSourceClass): boolean =>
     !server.skipped && !server.notConfigured && evaluateMcpPolicy(policy, server.remote === undefined
       ? { name: server.name, source, transport: "stdio", command: server.command, args: server.args }
@@ -791,8 +948,8 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
           (entry.enableAllProjectMcpServers !== undefined || approvalNames.has(sanitizeForListMatch(name))) &&
           isPolicyAdmissible(target.server, target.source));
         if (!serverClassificationMatters && !approvalClassificationMatters) break;
-        // A misbehaving injected probe must not break never-throw: a throw is
-        // just another probe failure, and probe failure fails OPEN (untracked).
+        // A misbehaving injected probe must not break never-throw. Failure leaves
+        // declaration origin unchanged but never authorizes checkout-local approval.
         const tracked = classifyTracked(entry.sourcePath);
         if (tracked === true) {
           origin = "settings-project";
@@ -823,27 +980,15 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     for (const name of entry.disabledMcpjsonServers ?? []) {
       disabledNames.add(sanitizeForListMatch(name));
     }
-    const honored = origin === "settings-local" || origin === "settings-user" || origin === "settings-managed";
+    const honored = origin === "settings-user" || origin === "settings-managed";
     if (!honored) {
       if (entry.enableAllProjectMcpServers !== undefined || entry.enabledMcpjsonServers !== undefined) {
-        if (demoted) {
-          pushDiag(
-            `MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in ` +
-              `${entry.sourcePath} cannot work while the file is tracked by git. Approve only explicitly ` +
-              `trusted server names with "enabledMcpjsonServers" in user settings (~/.claude/settings.json, ` +
-              `or the configured user directory). Create a local file from scratch only after a reviewed ` +
-              `repository change stops tracking or removes the path; do not reuse project-supplied MCP content`,
-          );
-        } else {
-          pushDiag(
-            `MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope ` +
-              `settings are ignored — a cloned repo must not self-approve. Independently review server ` +
-              `definitions, then add only explicitly trusted server names to "enabledMcpjsonServers" in ` +
-              `user settings (~/.claude/settings.json, or the configured user directory) or a clean untracked ` +
-              `.claude/settings.local.json; never copy project-supplied mcpServers, approval keys, or blanket ` +
-              `approval (${entry.sourcePath})`,
-          );
-        }
+        pushDiag(
+          `MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in checkout-controlled ` +
+            `settings are ignored because project bytes cannot authorize project MCP definitions. Independently ` +
+            `review definitions, then use user or managed settings compatibility grants, or PiCC's private ` +
+            `exact-definition review state (${entry.sourcePath}${demoted ? "; tracked local file" : ""})`,
+        );
       }
       continue;
     }
@@ -854,29 +999,15 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     }
   }
 
-  // Agent project approvals use the same authority rules without mutating the
-  // ordinary resolution result. Local provenance is classified before capture;
-  // resolving the captured authority performs no filesystem or Git I/O.
-  let agentEnableAll: boolean | undefined;
-  const agentEnabledNames = new Set<string>();
-  if (opts.captureAgentMcpAdmission !== undefined) {
-    for (const entry of ordinarySettings) {
-      let honored = entry.scope === "managed" || entry.scope === "user";
-      if (entry.scope === "local" &&
-        (entry.enableAllProjectMcpServers !== undefined || (entry.enabledMcpjsonServers?.length ?? 0) > 0)) {
-        honored = classifyTracked(entry.sourcePath) !== true;
-      }
-      if (!honored) continue;
-      if (entry.enableAllProjectMcpServers !== undefined) agentEnableAll = entry.enableAllProjectMcpServers;
-      for (const name of entry.enabledMcpjsonServers ?? []) agentEnabledNames.add(sanitizeForListMatch(name));
-    }
-  }
+  // Agent project approvals consume the same user/managed compatibility grants.
   publishAgentAdmission(opts.captureAgentMcpAdmission, createAgentMcpAdmissionContext({
     policy,
     env,
-    enabledNames: agentEnabledNames,
+    enabledNames,
     disabledNames,
-    ...(agentEnableAll === undefined ? {} : { enableAll: agentEnableAll }),
+    ...(enableAll === undefined ? {} : { enableAll }),
+    ...(reviewSnapshot === undefined ? {} : { reviewSnapshot }),
+    ...(reviewValidation.invalid ? { reviewSnapshotInvalid: true } : {}),
     ...(opts.remoteWorkHooksForTest === undefined ? {} : { remoteWorkHooksForTest: opts.remoteWorkHooksForTest }),
   }));
 
@@ -884,7 +1015,9 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
   let order = 0;
   // Map (not a plain object): server names may be "constructor"/"toString".
   const winners = new Map<string, Candidate>();
+  const candidates: Candidate[] = [];
   const consider = (candidate: Candidate): void => {
+    candidates.push(candidate);
     const current = winners.get(candidate.entry.name);
     if (
       current === undefined ||
@@ -930,18 +1063,12 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
       });
     }
   }
-  for (const { entry, origin } of entries) {
+  for (const [entryIndex, { entry, origin }] of entries.entries()) {
     if (entry.servers === undefined) continue;
     // Source reports the physical settings scope; a tracked local contribution
     // stays settings-local for display even when gating demotes its origin.
-    const source: McpSourceClass = entry.scope === "managed"
-      ? "settings-managed"
-      : entry.scope === "local"
-        ? "settings-local"
-        : entry.scope === "project"
-          ? "settings-project"
-          : "settings-user";
-    for (const raw of normalizeMcpServerBlock(entry.servers, source)) {
+    const source = settingsMcpSource(entry.scope);
+    for (const raw of normalizedSettingsServers[entryIndex]!) {
       consider({
         entry: raw,
         origin,
@@ -1009,29 +1136,28 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
             policyInactiveReason = "policy-candidate-invalid";
             break;
         }
-      } else if (
-      authentic &&
-      nativeState.kind === "loaded" &&
-      nativeState.disabledMcpServers.has(entry.name)
-    ) {
-      status = "disabled";
-      inactiveReason = "native-runtime-disabled";
-    } else if (
-      (!authentic || source === "project-mcpjson") &&
-      disabledNames.has(sanitizeForListMatch(entry.name))
-    ) {
-      status = "disabled";
-      inactiveReason = "mcpjson-rejected";
-    } else if (
-      projectApprovalRequired &&
-      enableAll !== true &&
-      !enabledNames.has(sanitizeForListMatch(entry.name))
-    ) {
-      status = "pending-approval";
-      inactiveReason = "mcpjson-unapproved";
-    } else {
-      status = "enabled";
-    }
+      } else {
+        const digest = createMcpReviewDefinitionDigest(entry);
+        const exactReview = projectApprovalRequired
+          ? matchingReview(reviewSnapshot, source, entry.name, digest)
+          : undefined;
+        if ((!authentic || source === "project-mcpjson") && disabledNames.has(sanitizeForListMatch(entry.name))) {
+          status = "disabled";
+          inactiveReason = "mcpjson-rejected";
+        } else if (projectApprovalRequired && exactReview === "rejected") {
+          status = "disabled";
+          inactiveReason = "mcpjson-rejected";
+        } else if (projectApprovalRequired && enableAll !== true &&
+          !enabledNames.has(sanitizeForListMatch(entry.name)) && exactReview !== "approved") {
+          status = "pending-approval";
+          inactiveReason = "mcpjson-unapproved";
+        } else if (authentic && nativeState.kind === "loaded" && nativeState.disabledMcpServers.has(entry.name)) {
+          status = "disabled";
+          inactiveReason = "native-runtime-disabled";
+        } else {
+          status = "enabled";
+        }
+      }
     }
 
     const common = {
@@ -1128,10 +1254,67 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     });
   }
 
+  const traceCandidates = [
+    ...candidates.filter((candidate) => winners.get(candidate.entry.name) === candidate),
+    ...candidates.filter((candidate) => winners.get(candidate.entry.name) !== candidate),
+  ].slice(0, MCP_ADMINISTRATION_TRACE_LIMITS.declarations);
+  const omittedDeclarationCount = candidates.length - traceCandidates.length;
+  const administrationDeclarations = traceCandidates.map((candidate): McpAdministrationDeclaration => {
+    const { entry, source, projectApprovalRequired } = candidate;
+    const winner = winners.get(entry.name) === candidate;
+    const resolved = winner ? servers.find((server) => server.name === entry.name) : undefined;
+    const digest = createMcpReviewDefinitionDigest(entry);
+    const exact = projectApprovalRequired ? matchingReview(reviewSnapshot, source, entry.name, digest) : undefined;
+    const rejectedCompatibility = (!candidate.authentic || source === "project-mcpjson") &&
+      disabledNames.has(sanitizeForListMatch(entry.name));
+    const broadAll = projectApprovalRequired && enableAll === true;
+    const broadName = projectApprovalRequired && enabledNames.has(sanitizeForListMatch(entry.name));
+    const review: McpReviewPosture = !projectApprovalRequired
+      ? "not-required"
+      : rejectedCompatibility ? "rejected-compatibility"
+        : exact === "rejected" ? "rejected-exact"
+          : broadAll ? "approved-broad-all"
+            : broadName ? "approved-broad-name"
+              : exact === "approved" ? "approved-exact" : "pending";
+    const policyDecision = entry.skipped || entry.notConfigured ? undefined : evaluateMcpPolicy(policy, entry.remote === undefined
+      ? { name: entry.name, source, transport: "stdio", command: entry.command, args: entry.args }
+      : { name: entry.name, source, transport: entry.remote.transportKind, url: entry.remote.rawUrl });
+    const policyTrace = entry.skipped || entry.notConfigured
+      ? "invalid"
+      : policyDecision?.status === "allowed" ? "allowed"
+        : agentPolicyReason(policyDecision?.reason ?? "candidate-invalid") ?? "policy-candidate-invalid";
+    const resolvedInactiveReason = resolved !== undefined && "inactiveReason" in resolved
+      ? resolved.inactiveReason
+      : undefined;
+    return Object.freeze({
+      name: entry.name,
+      source,
+      authority: candidateAuthority(source),
+      precedence: winner ? "winner" : "shadowed",
+      ...(digest === undefined ? {} : { definitionVersion: MCP_REVIEW_DEFINITION_VERSION, definitionDigest: digest }),
+      summary: safeDeclarationSummary(entry),
+      policy: policyTrace,
+      review,
+      status: winner ? (resolved?.status ?? "skipped") : "shadowed",
+      ...(resolvedInactiveReason === undefined ? {} : { inactiveReason: resolvedInactiveReason }),
+    });
+  });
+  const administration: McpAdministrationTrace = Object.freeze({
+    version: MCP_ADMINISTRATION_MODEL_VERSION,
+    policyPosture: policy.posture,
+    observations: Object.freeze([
+      ...(managedMcp.status === "absent" ? [] : ["ordinary-sources-suppressed-by-managed-mcp" as const]),
+      ...(reviewValidation.invalid ? ["review-snapshot-unavailable-or-invalid" as const] : []),
+      ...(omittedDeclarationCount > 0 ? ["administration-declarations-omitted" as const] : []),
+    ]),
+    declarations: Object.freeze(administrationDeclarations),
+    omittedDeclarationCount,
+  });
   return {
     servers,
     diagnostics,
     ...policySnapshot,
     policyObservations: Object.freeze([...admissionObservations]),
+    administration,
   };
 }

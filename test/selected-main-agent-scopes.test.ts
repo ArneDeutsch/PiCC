@@ -118,8 +118,11 @@ function declaration(...items: Array<{ kind: "reference" | "inline"; name: strin
   };
 }
 
-function admission(inlineConfig: ResolvedAgentMcpConfig): AgentMcpAdmissionContext {
-  return { resolve: vi.fn(() => inlineConfig) };
+function admission(
+  inlineConfig: ResolvedAgentMcpConfig,
+  resolveOwned: AgentMcpAdmissionContext["resolveOwned"] = vi.fn(() => inlineConfig),
+): AgentMcpAdmissionContext {
+  return { resolve: vi.fn(() => inlineConfig), resolveOwned };
 }
 
 function runtime(options: {
@@ -371,29 +374,30 @@ describe("selected main MCP scope", () => {
     expect(host.current?.serverStates()).toEqual([]);
   });
 
-  it("resolves declarations with captured admission and never starts pending/disabled/blocked/unavailable inline servers", async () => {
+  it("requires every declared inline capability to be freshly enabled before factory work", async () => {
     const nonEnabled = ["pending-approval", "disabled", "blocked", "unavailable"] as const;
     for (const status of nonEnabled) {
-      const startInline = vi.fn(() => runtime());
-      const factory = (options: CreateAgentMcpScopeOptions) => createAgentMcpScope({ ...options, startInline });
+      const factory = vi.fn(async () => fakeScope());
       const controller = new SelectedMainMcpScopeController(inventoryHost(), factory);
-      const declarationValue = declaration({ kind: "inline", name: status });
       const result = await controller.replace({
         agentIdentity: status,
         sessionRuntime: runtime(),
-        declaration: declarationValue,
+        declaration: declaration({ kind: "inline", name: status }),
         admissionContext: admission(config({
-          ...inline(status),
-          status,
-          diagnostics: ["RAW_ADMISSION_SECRET"],
+          ...inline(status), status, diagnostics: ["RAW_ADMISSION_SECRET"],
         } as ResolvedAgentMcpConfig["servers"][number])),
         inlineDeps: deps,
       });
-      expect(result.installed).toBe(true);
-      expect(startInline).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ installed: false, diagnostics: [{ reason: "setup-failed", identity: status }] });
+      expect(factory).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain("RAW_ADMISSION_SECRET");
     }
 
-    for (const authority of [undefined, { resolve: () => { throw new Error("RAW AUTHORITY"); } }]) {
+    for (const authority of [
+      undefined,
+      { resolve: () => config() },
+      { resolve: () => config(), resolveOwned: () => { throw new Error("RAW AUTHORITY"); } },
+    ]) {
       const factory = vi.fn(async () => fakeScope());
       const controller = new SelectedMainMcpScopeController(inventoryHost(), factory);
       const result = await controller.replace({
@@ -406,6 +410,108 @@ describe("selected main MCP scope", () => {
       expect(result.diagnostics).toEqual([{ reason: "setup-failed", identity: "blocked" }]);
       expect(factory).not.toHaveBeenCalled();
     }
+  });
+
+  it("uses exact selected-owner admission so sibling decisions and broad grants cannot override it", async () => {
+    const selectedDeclaration = declaration({ kind: "inline", name: "owned" });
+    const enabled = config(inline("owned"));
+    const rejected = config({ ...inline("owned"), status: "disabled" });
+    const resolve = vi.fn(() => enabled);
+    const resolveOwned = vi.fn((_: AgentMcpDeclaration, owner: { name: string; scope: string }) =>
+      owner.name === "selected" ? rejected : enabled);
+    const factory = vi.fn(async () => fakeScope());
+    const controller = new SelectedMainMcpScopeController(inventoryHost(), factory);
+
+    const denied = await controller.replace({
+      agentIdentity: "selected", sessionRuntime: runtime(), declaration: selectedDeclaration,
+      admissionContext: { resolve, resolveOwned }, inlineDeps: deps,
+    });
+    expect(denied.installed).toBe(false);
+    expect(resolve).not.toHaveBeenCalled();
+    expect(resolveOwned).toHaveBeenCalledWith(selectedDeclaration, { name: "selected", scope: "project" });
+    expect(factory).not.toHaveBeenCalled();
+
+    resolveOwned.mockImplementation((_, owner) => owner.name === "sibling" ? rejected : enabled);
+    const approved = await controller.replace({
+      agentIdentity: "selected", sessionRuntime: runtime(), declaration: selectedDeclaration,
+      admissionContext: { resolve, resolveOwned }, inlineDeps: deps,
+    });
+    expect(approved.installed).toBe(true);
+    expect(factory).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["missing", fakeScope({ setupOutcomes: () => [{ serverName: "required", kind: "missing-reference" }] })],
+    ["startup", fakeScope({ setupOutcomes: () => [{ serverName: "required", kind: "inline-startup-failed" }] })],
+  ] as const)("treats required selected MCP %s degradation as admission failure", async (_label, scope) => {
+    const shutdown = vi.spyOn(scope, "shutdown");
+    const controller = new SelectedMainMcpScopeController(inventoryHost(), async () => scope);
+    const result = await controller.replace(install("required-owner", runtime()));
+    expect(result.installed).toBe(false);
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(JSON.stringify(result)).not.toContain("RAW_SETUP_SECRET");
+    await expect(controller.adapter().callTool("required", "run", {})).rejects.toThrow("not active");
+  });
+
+  it("installs a usable scope with only an additional redacted setup diagnostic", async () => {
+    const callTool = vi.fn(async () => ({ content: [] }));
+    const scope = fakeScope({
+      tools: () => [tool("usable", "run")],
+      diagnostics: () => ["RAW_SETUP_SECRET"],
+      callTool,
+    });
+    const shutdown = vi.spyOn(scope, "shutdown");
+    const controller = new SelectedMainMcpScopeController(inventoryHost(), async () => scope);
+    const result = await controller.replace(install("diagnostic-owner", runtime()));
+    expect(result).toMatchObject({ installed: true, diagnostics: [{ reason: "setup-diagnostic", identity: "diagnostic-owner" }] });
+    expect(shutdown).not.toHaveBeenCalled();
+    await controller.adapter().callTool("usable", "run", {});
+    expect(callTool).toHaveBeenCalledOnce();
+    expect(JSON.stringify(result)).not.toContain("RAW_SETUP_SECRET");
+  });
+
+  it("lets a published session route satisfy a pending duplicate inline declaration without warning or owned startup", async () => {
+    const calls: string[] = [];
+    const session = runtime({
+      tools: [tool("same", "run")],
+      states: [{ name: "same", transport: "stdio", state: "connected" }],
+      calls,
+    });
+    const startInline = vi.fn(() => runtime());
+    const factory = (options: CreateAgentMcpScopeOptions) => createAgentMcpScope({ ...options, startInline });
+    const controller = new SelectedMainMcpScopeController(inventoryHost(), factory);
+    const duplicate = {
+      ...declaration({ kind: "inline", name: "same" }),
+      diagnostics: ["RAW_COLLISION_DIAGNOSTIC"],
+      diagnosticOwnership: [{ kind: "server" as const, serverName: "same" }],
+    };
+    const pending = config({
+      ...inline("same"), status: "pending-approval", diagnostics: ["RAW_PENDING_SECRET"],
+    } as ResolvedAgentMcpConfig["servers"][number]);
+    const result = await controller.replace({
+      agentIdentity: "selected", sessionRuntime: session, declaration: duplicate,
+      admissionContext: admission({
+        ...pending,
+        diagnostics: ["RAW_COLLISION_ADMISSION"],
+        diagnosticOwnership: [{ kind: "server", serverName: "same" }],
+      }),
+      inlineDeps: deps,
+    });
+    expect(result).toEqual({ installed: true, cleanup: EMPTY_EXPECTED_CLEANUP, diagnostics: [] });
+    expect(startInline).not.toHaveBeenCalled();
+    await controller.adapter().callTool("same", "run", {});
+    expect(calls).toEqual(["same:run"]);
+  });
+
+  it("fails closed before admission when settled session inventory cannot be read", async () => {
+    const session = runtime();
+    session.tools = () => { throw new Error("RAW_SESSION_INVENTORY"); };
+    const factory = vi.fn(async () => fakeScope());
+    const controller = new SelectedMainMcpScopeController(inventoryHost(), factory);
+    const result = await controller.replace(install("inventory-owner", session));
+    expect(result).toMatchObject({ installed: false, diagnostics: [{ reason: "setup-failed", identity: "inventory-owner" }] });
+    expect(factory).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("RAW_SESSION_INVENTORY");
   });
 
   it.each(["absent", "throwing"] as const)(
@@ -770,7 +876,7 @@ describe("selected main MCP scope", () => {
     const items = Array.from({ length: 140 }, (_, index) => ({ kind: "reference" as const, name: `missing-${index}` }));
     const controller = new SelectedMainMcpScopeController(inventoryHost());
     const result = await controller.replace(install("bounded\u0000", runtime(), declaration(...items), config()));
-    expect(result.installed).toBe(true);
+    expect(result.installed).toBe(false);
     expect(result.diagnostics).toHaveLength(128);
     expect(result.diagnostics.every((entry) => entry.reason === "missing-reference")).toBe(true);
     expect(JSON.stringify(result)).not.toMatch(/[\p{Cc}\p{Cf}]/u);

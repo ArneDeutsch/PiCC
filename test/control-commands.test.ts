@@ -12,6 +12,7 @@ import { fakeSdk } from "./helpers/fake-sdk.js";
 import { createHookProcessFixture } from "./helpers/hook-process.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadClaudeProject } from "../src/project.js";
+import { bindMcpDeclarationDefinition } from "../src/mcp-administration/persistence.js";
 
 /**
  * Control commands render through transcript entries outside model context.
@@ -331,6 +332,270 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
     }
   });
 
+  it("keeps fixed administration deep links TUI-only and no-tail without touching service state headlessly", async () => {
+    let inspections = 0;
+    const binding = bindMcpDeclarationDefinition("fixture", { type: "http", url: "https://example.test/mcp" });
+    if (!binding.ok) throw new Error(binding.message);
+    const { fresh, root } = await freshControlPi({
+      mcpAdministration: {
+        inspectPending: async () => { inspections += 1; return { pending: false, status: "clear" }; },
+        assemble: async () => ({
+          reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+          liveStates: [{ name: "fixture", state: "failed" }],
+          mcp: { servers: [{ name: "fixture", source: "project-mcpjson", status: "enabled", transport: "http", configuredType: "http", url: "https://example.test/mcp", headers: {}, diagnostics: [] }], diagnostics: [], policyPosture: "absent", administration: {
+            version: 1, policyPosture: "absent", observations: [], declarations: [{
+              name: "fixture", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, precedence: "winner",
+              definitionVersion: binding.value.definitionVersion, definitionDigest: binding.value.definitionDigest,
+              summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+              policy: "allowed", review: "approved-exact", status: "enabled",
+            }], omittedDeclarationCount: 0,
+          } },
+        } as never),
+      },
+    });
+    try {
+      const tokens = ["manage", "approve", "reject", "enable", "disable", "reconnect", "authenticate"] as const;
+      for (const [mode, ctx] of [
+        ["print", fresh.printCtx()],
+        ["json", fresh.ctx({ mode: "json", hasUI: false })],
+        ["rpc", fresh.rpcCtx()],
+      ] as const) {
+        for (const token of tokens) {
+          const outcome = await fresh.fire("input", { text: `/mcp ${token}`, source: mode }, ctx);
+          expect(outcome).toEqual({ action: "handled" });
+          const output = String(fresh.entries.at(-1)?.data.output);
+          if (token === "authenticate") {
+            expect(output).toContain("No authentication action was performed");
+            expect(output).toContain("does not currently provide MCP OAuth, token storage, or browser authentication");
+            expect(output).toContain("supported static headers");
+            expect(output).toContain("picc mcp --help");
+            expect(output).not.toMatch(/TUI|required for project review|open it|OAuth login|browser was opened|token was stored/u);
+          } else {
+            expect(output).toContain("No equivalent action was performed");
+            expect(output).toContain("bare /mcp to inspect status");
+            expect(output).toContain("TUI is required for project review and runtime actions");
+            expect(output).toContain("Standalone picc mcp commands manage declarations");
+            expect(output).toContain("broad project-review compatibility grants");
+            expect(output).toContain("not enable, disable, or reconnect controls");
+            expect(output).toContain("picc mcp --help");
+          }
+          expect(output).not.toMatch(/picc mcp (?:approve|reject|enable|disable|reconnect|authenticate)/u);
+        }
+      }
+      expect(inspections).toBe(0);
+      expect(fresh.customs).toHaveLength(0);
+
+      for (const token of tokens) {
+        await fresh.commands.get("mcp").handler(`${token} TRAILING_SECRET`, fresh.tuiCtx());
+        expect(String(fresh.entries.at(-1)?.data.output)).toContain("status-only");
+        expect(String(fresh.entries.at(-1)?.data.output)).not.toContain("TRAILING_SECRET");
+      }
+      expect(inspections).toBe(0);
+
+      const noticesBeforePassivePreparation = fresh.notifications.length;
+      for (const token of tokens) {
+        const opening = fresh.commands.get("mcp").handler(token, fresh.tuiCtx());
+        await vi.waitFor(() => expect(fresh.customs).toHaveLength(tokens.indexOf(token) + 1));
+        const custom = fresh.customs.at(-1)!;
+        await custom.ready;
+        const rendered = custom.render(80).join("\n");
+        if (token !== "manage") expect(rendered).toContain(token === "authenticate" ? "Authentication" : token[0]!.toUpperCase() + token.slice(1));
+        custom.input("\u001b");
+        if (token !== "manage") custom.input("\u001b");
+        await opening;
+      }
+      expect(inspections).toBeGreaterThanOrEqual(tokens.length);
+      expect(fresh.notifications).toHaveLength(noticesBeforePassivePreparation);
+      const inspectionsBeforeAbnormal = inspections;
+
+      let abnormalComponent: { render(width: number): string[]; handleInput?(data: string): void } | undefined;
+      const abnormalRelease = deferred<void>();
+      const baseCtx = fresh.tuiCtx() as any;
+      const abnormalCtx = fresh.tuiCtx({ ui: { ...baseCtx.ui, custom: async (factory: any) => {
+        abnormalComponent = await factory({ requestRender() {} }, { fg: (_role: string, text: string) => text, bold: (text: string) => text, italic: (text: string) => text }, { matches: () => false }, () => {});
+        await abnormalRelease.promise;
+      } } });
+      const abnormal = fresh.commands.get("mcp").handler("approve", abnormalCtx);
+      await vi.waitFor(() => expect(abnormalComponent).toBeDefined());
+      abnormalComponent!.render(80);
+      abnormalComponent!.handleInput?.("\r");
+      abnormalComponent!.render(80);
+      abnormalComponent!.handleInput?.("\r");
+      await vi.waitFor(() => expect(inspections).toBeGreaterThan(inspectionsBeforeAbnormal));
+      abnormalRelease.resolve();
+      await abnormal;
+      const abnormalOutput = String(fresh.entries.at(-1)?.data.output);
+      expect(abnormalOutput).toContain("abnormally after submission");
+      expect(abnormalOutput).toContain("aggregate effect");
+      expect(abnormalOutput).not.toContain("no action was started");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers before a TUI administration snapshot while blocked recovery and passive routes stay fail-closed", async () => {
+    const binding = bindMcpDeclarationDefinition("recovered", { type: "http", url: "https://example.test/mcp" });
+    if (!binding.ok) throw new Error(binding.message);
+    const recoveredState = {
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      liveStates: [{ name: "recovered", state: "failed" }],
+      mcp: { servers: [{ name: "recovered", source: "project-mcpjson", status: "enabled", transport: "http", configuredType: "http", url: "https://example.test/mcp", headers: {}, diagnostics: [] }], diagnostics: [], policyPosture: "absent", administration: {
+        version: 1, policyPosture: "absent", observations: [], declarations: [{
+          name: "recovered", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, precedence: "winner",
+          definitionVersion: binding.value.definitionVersion, definitionDigest: binding.value.definitionDigest,
+          summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+          policy: "allowed", review: "approved-exact", status: "enabled",
+        }], omittedDeclarationCount: 0,
+      } },
+    } as const;
+
+    let pending = true; let recoveries = 0; let assemblies = 0;
+    const recovered = await freshControlPi({
+      mcpControl: { render: () => "PASSIVE_STATUS" },
+      mcpAdministration: {
+        inspectPending: async () => ({ pending, status: pending ? "pending" : "clear" } as never),
+        recover: async () => { recoveries += 1; pending = false; return { state: "rolled-back", operationId: "op", effect: "unchanged", cleanup: "complete", retrySafe: true }; },
+        assemble: async () => { assemblies += 1; return recoveredState as never; },
+      },
+    });
+    try {
+      const passiveNotices = recovered.fresh.notifications.length;
+      await recovered.fresh.commands.get("mcp").handler("", recovered.fresh.tuiCtx());
+      expect(String(recovered.fresh.entries.at(-1)?.data.output)).toBe("PASSIVE_STATUS");
+      await recovered.fresh.fire("input", { text: "/mcp manage", source: "rpc" }, recovered.fresh.rpcCtx());
+      expect(recoveries).toBe(0);
+      expect(assemblies).toBe(0);
+      expect(recovered.fresh.notifications).toHaveLength(passiveNotices);
+
+      const opening = recovered.fresh.commands.get("mcp").handler("manage", recovered.fresh.tuiCtx());
+      await vi.waitFor(() => expect(recovered.fresh.customs).toHaveLength(1));
+      const custom = recovered.fresh.customs[0]!;
+      await custom.ready;
+      expect(custom.render(80).join("\n")).toContain("recovered");
+      expect(recoveries).toBe(1);
+      expect(assemblies).toBe(1);
+      expect(recovered.fresh.notifications.at(-1)).toEqual({
+        text: "MCP recovery completed: state=rolled-back; effect=unchanged; cleanup=complete. Fresh inventory loaded.",
+        severity: "info",
+      });
+      custom.input("\u001b");
+      await opening;
+    } finally {
+      fs.rmSync(recovered.root, { recursive: true, force: true });
+    }
+
+    let blockedRecoveries = 0; let blockedAssemblies = 0; let blockedMutations = 0;
+    const blocked = await freshControlPi({ mcpAdministration: {
+      inspectPending: async () => ({ pending: true, status: "pending" } as never),
+      recover: async () => { blockedRecoveries += 1; return { state: "pending-recovery", operationId: "op", effect: "uncertain", cleanup: "pending", retrySafe: false, reasonCode: "pending-recovery" }; },
+      assemble: async () => { blockedAssemblies += 1; return recoveredState as never; },
+      mutate: async () => { blockedMutations += 1; return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false }; },
+    } });
+    try {
+      const opening = blocked.fresh.commands.get("mcp").handler("approve", blocked.fresh.tuiCtx());
+      await vi.waitFor(() => expect(blocked.fresh.customs).toHaveLength(1));
+      const custom = blocked.fresh.customs[0]!;
+      await custom.ready;
+      const blockedText = custom.render(80).join("\n");
+      expect(blockedText).toContain("declarations 0");
+      expect(blockedText).not.toContain("recovered");
+      expect(blocked.fresh.notifications.at(-1)).toEqual({
+        text: "MCP recovery remains pending: declarations are intentionally hidden; state=pending-recovery; effect=uncertain; cleanup=pending. Retry /mcp manage and inspect /doctor.",
+        severity: "warning",
+      });
+      expect(blockedRecoveries).toBe(1);
+      expect(blockedAssemblies).toBe(0);
+      custom.input("\r");
+      expect(blockedMutations).toBe(0);
+      custom.input("\u001b"); custom.input("\u001b");
+      await opening;
+    } finally {
+      fs.rmSync(blocked.root, { recursive: true, force: true });
+    }
+  });
+
+  it("composes activation and cleanup-uncertain retirement through durable, fresh, runtime, and exposure ordering", async () => {
+    const events: string[] = [];
+    const definition = { command: process.execPath, args: ["fixture.cjs"] };
+    const binding = bindMcpDeclarationDefinition("fixture", definition);
+    if (!binding.ok) throw new Error(binding.message);
+    const declaration = (status: "pending-approval" | "enabled" | "disabled", review: "pending" | "approved-exact" | "rejected-exact") => ({
+      name: "fixture", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, precedence: "winner",
+      definitionVersion: binding.value.definitionVersion, definitionDigest: binding.value.definitionDigest,
+      summary: { transport: "stdio", commandBasename: "node", argumentCount: 1, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+      policy: "allowed", review, status,
+    });
+    let phase: "pending" | "enabled" | "rejected" = "pending";
+    const state = () => ({
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      mcp: {
+        servers: phase === "enabled" ? [{ name: "fixture", source: "project-mcpjson", status: "enabled", transport: "stdio", command: process.execPath, rawCommand: process.execPath, args: ["fixture.cjs"], env: {}, diagnostics: [] }] : [],
+        diagnostics: [], policyPosture: "absent",
+        administration: { version: 1, policyPosture: "absent", observations: [], declarations: [declaration(
+          phase === "pending" ? "pending-approval" : phase === "enabled" ? "enabled" : "disabled",
+          phase === "pending" ? "pending" : phase === "enabled" ? "approved-exact" : "rejected-exact",
+        )], omittedDeclarationCount: 0 },
+      },
+    });
+    const runtime = {
+      whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [],
+      callTool: async () => ({ content: [] }), getPrompt: async () => ({ messages: [] }), readResource: async () => ({ contents: [] }),
+      diagnostics: () => [], serverStates: () => [], shutdown: async () => {},
+      reconcileServer: async () => { events.push("runtime"); return { state: "succeeded", deltas: [{
+        serverName: "fixture", definitionFingerprint: binding.value.definitionDigest, generation: 1, kind: "publish", tools: [], prompts: [],
+      }] }; },
+      reconnectServer: async () => ({ state: "succeeded", deltas: [] }),
+      disableServer: async () => { events.push("runtime-retire"); return { state: "failed", reason: "cleanup-uncertain", deltas: [{
+        serverName: "fixture", definitionFingerprint: binding.value.definitionDigest, generation: 2, kind: "retire", tools: [], prompts: [],
+      }] }; },
+    };
+    const { fresh, root } = await freshControlPi({
+      mcpRuntime: runtime as never,
+      mcpAdministration: {
+        inspectPending: async () => ({ pending: false, status: "clear" }),
+        mutate: async () => { events.push("durable"); phase = phase === "pending" ? "enabled" : "rejected"; return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false }; },
+        assemble: async () => { events.push(`assemble:${phase}`); return state() as never; },
+        exposure: {
+          apply: async (delta) => { events.push(`exposure:${delta.generation}`); return {
+            state: "applied", serverName: delta.serverName, generation: delta.generation,
+            registered: [], refreshed: [], activated: [], deactivated: [], denied: [], collisions: [], failures: [], paletteRefreshAvailable: false,
+          }; },
+          promptCatalog: () => ({ prompts: [], byCommand: new Map(), diagnostics: [] }) as never,
+        },
+      },
+    });
+    try {
+      const opening = fresh.commands.get("mcp").handler("approve", fresh.tuiCtx());
+      await vi.waitFor(() => expect(fresh.customs).toHaveLength(1));
+      const custom = fresh.customs[0]!;
+      await custom.ready;
+      await vi.waitFor(() => expect(custom.render(80).join("\n")).toContain("Approve"));
+      custom.input("\r");
+      await vi.waitFor(() => expect(custom.render(80).join("\n")).toContain("Confirm approve"));
+      custom.input("\r");
+      await vi.waitFor(() => expect(events).toContain("exposure:2"));
+      expect(events.slice(-4)).toEqual(["durable", "assemble:enabled", "runtime", "exposure:2"]);
+      custom.input("\u001b"); custom.input("\u001b");
+      await opening;
+
+      const rejecting = fresh.commands.get("mcp").handler("reject", fresh.tuiCtx());
+      await vi.waitFor(() => expect(fresh.customs).toHaveLength(2));
+      const rejection = fresh.customs[1]!;
+      await rejection.ready;
+      await vi.waitFor(() => expect(rejection.render(80).join("\n")).toContain("Reject"));
+      rejection.input("\r");
+      await vi.waitFor(() => expect(rejection.render(80).join("\n")).toContain("Confirm reject"));
+      rejection.input("\r");
+      await vi.waitFor(() => expect(events).toContain("exposure:3"));
+      expect(events.slice(-4)).toEqual(["durable", "assemble:rejected", "runtime-retire", "exposure:3"]);
+      expect(events.filter((event) => event === "durable")).toHaveLength(2);
+      rejection.input("\u001b"); rejection.input("\u001b");
+      await rejecting;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("accepts whitespace-only tails and mixed case but does not intercept /mcpx", async () => {
     const { fresh, root } = await freshControlPi({ mcpControl: { render: () => "MCP SNAPSHOT" } });
     try {
@@ -345,9 +610,16 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
   });
 
   it.each([
+    ["manage deep link", "/mcp manage", false],
+    ["approve deep link", "/mcp approve", false],
+    ["reject deep link", "/mcp reject", false],
+    ["enable deep link", "/mcp enable", false],
+    ["disable deep link", "/mcp disable", false],
+    ["reconnect deep link", "/mcp reconnect", false],
+    ["authenticate deep link", "/mcp authenticate", false],
     ["unsupported arguments", "/mcp ARGUMENT_CANARY", false],
     ["processing failure", "/mcp", true],
-  ] as const)("recognized /mcp %s skips hooks and colliding fork skills", async (_case, input, failRender) => {
+  ] as const)("recognized /mcp %s wins over hook, skill, MCP-prompt, and model collisions", async (_case, input, failRender) => {
     let hookFixture: ReturnType<typeof createHookProcessFixture> | undefined;
     const sdk = fakeSdk({ replies: ["FORK_ACTION_CANARY"] });
     const { fresh, root } = await freshControlPi(
@@ -359,6 +631,10 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
             return "UNEXPECTED_RENDER";
           },
         },
+        mcpAdministration: { exposure: {
+          apply: async () => { throw new Error("MCP_PROMPT_APPLY_CANARY"); },
+          promptCatalog: () => ({ prompts: [{ commandName: "mcp", serverName: "collision", promptName: "collision", description: "MCP_PROMPT_COLLISION_CANARY", arguments: [] }], byCommand: new Map([["mcp", { commandName: "mcp", serverName: "collision", promptName: "collision", description: "MCP_PROMPT_COLLISION_CANARY", arguments: [] }]]), diagnostics: [] }) as never,
+        } },
       },
       (projectRoot) => {
         hookFixture = createHookProcessFixture(projectRoot);
@@ -384,7 +660,7 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
       },
     );
     try {
-      const result = await fresh.fire("input", { text: input, source: "interactive" }, fresh.tuiCtx());
+      const result = await fresh.fire("input", { text: input, source: "rpc" }, fresh.rpcCtx());
       expect(result).toEqual({ action: "handled" });
       expect(hookFixture!.exists("submit.entered")).toBe(false);
       expect(hookFixture!.spawnedChildren()).toHaveLength(0);
@@ -392,7 +668,7 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
       expect(fresh.messages).toEqual([]);
       expect(fresh.userMessages).toEqual([]);
       expect(JSON.stringify({ entries: fresh.entries, messages: fresh.messages, userMessages: fresh.userMessages, result }))
-        .not.toMatch(/ARGUMENT_CANARY|PROCESSING_CANARY|HOOK_ACTION_CANARY|FORK_(?:ACTION|SKILL_BODY)_CANARY/);
+        .not.toMatch(/ARGUMENT_CANARY|PROCESSING_CANARY|HOOK_ACTION_CANARY|MCP_PROMPT_(?:APPLY|COLLISION)_CANARY|FORK_(?:ACTION|SKILL_BODY)_CANARY/);
     } finally {
       await hookFixture!.cleanup("submit");
       fs.rmSync(root, { recursive: true, force: true });
@@ -686,7 +962,7 @@ describe("managed MCP snapshot status and aggregate startup notice", () => {
       await fresh.fire("session_start", { reason: "new" }, fresh.tuiCtx());
       const notices = fresh.notifications.filter((item) => item.text.includes("MCP"));
       expect(notices).toHaveLength(1);
-      expect(notices[0]!.text).toContain("pending approval");
+      expect(notices[0]!.text).toContain("need review — run /mcp manage");
       expect(notices[0]!.text).toContain('MCP policy blocked 1 server(s): "blocked"');
       expect(notices[0]!.text.length).toBeLessThan(1_000);
 
@@ -720,7 +996,7 @@ describe("managed MCP snapshot status and aggregate startup notice", () => {
       await fresh.fire("session_start", { reason: "new" }, ctx);
       const stderr = error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("MCP policy blocked"));
       expect(stderr).toHaveLength(1);
-      expect(stderr[0]).toContain("pending approval");
+      expect(stderr[0]).not.toContain("need review");
       expect(fresh.notifications).toEqual([]);
       expect(fresh.messages).toEqual([]);
       expect(stderr.join("\n")).not.toMatch(/(?:PENDING_(?:COMMAND|ARG)|BLOCKED_COMMAND)_SECRET_CANARY/u);
