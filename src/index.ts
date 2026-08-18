@@ -5653,7 +5653,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const MCP_ARGUMENT_RESPONSE =
     "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
   const MCP_HEADLESS_ADMINISTRATION_GUIDANCE =
-    "No equivalent action was performed in this mode. Open an interactive PiCC TUI and use /mcp manage. Use bare /mcp to inspect status or trusted user/managed settings for review and runtime controls. For supported configuration commands only, run picc mcp --help.";
+    "No equivalent action was performed in this mode. The interactive PiCC TUI is required for project review and runtime actions; open it and use /mcp manage. Use bare /mcp to inspect status. Standalone picc mcp commands manage declarations; trusted user/managed settings provide only broad project-review compatibility grants, not enable, disable, or reconnect controls. Run picc mcp --help for supported commands.";
   const MCP_DEEP_LINK_ACTIONS = new Map<string, import("./runtime/mcp-administration-render.js").McpAdministrationUiAction | undefined>([
     ["manage", undefined], ["approve", "approve"], ["reject", "reject"], ["enable", "enable"],
     ["disable", "disable"], ["reconnect", "reconnect"], ["authenticate", "authenticate"],
@@ -5724,7 +5724,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const token = /^[A-Za-z-]+$/u.test(trimmed) ? trimmed.toLowerCase() : undefined;
           if (token === undefined || !MCP_DEEP_LINK_ACTIONS.has(token)) return MCP_ARGUMENT_RESPONSE;
           if (ctx?.mode !== "tui") return MCP_HEADLESS_ADMINISTRATION_GUIDANCE;
-          const opened = await openMcpAdministration(ctx, mcpAdministrationService, {
+          const recoveryAwarePort: import("./runtime/mcp-administration-focus.js").McpAdministrationActionPort = Object.freeze({
+            inventory: async () => {
+              const prepared = await mcpAdministrationService.prepareInventoryAfterRecovery();
+              if (prepared.recovery.state !== "not-requested") {
+                const recovery = prepared.recovery;
+                const completed = prepared.eligibility.eligible && recovery.cleanup === "complete" &&
+                  (recovery.state === "rolled-back" || recovery.state === "committed" && recovery.effect === "unchanged");
+                const notice = completed
+                  ? `MCP recovery completed: state=${recovery.state}; effect=${recovery.effect}; cleanup=${recovery.cleanup}. Fresh inventory loaded.`
+                  : `MCP recovery remains pending: declarations are intentionally hidden; state=${recovery.state}; effect=${recovery.effect}; cleanup=${recovery.cleanup}. Retry /mcp manage and inspect /doctor.`;
+                ctx.ui?.notify?.(notice, completed ? "info" : "warning");
+              }
+              return prepared.inventory;
+            },
+            interactivePrepare: mcpAdministrationService.interactivePrepare,
+            confirmedExecute: mcpAdministrationService.confirmedExecute,
+          });
+          const opened = await openMcpAdministration(ctx, recoveryAwarePort, {
             ...(MCP_DEEP_LINK_ACTIONS.get(token) === undefined ? {} : { initialAction: MCP_DEEP_LINK_ACTIONS.get(token)! }),
           });
           if (opened.opened) return undefined;

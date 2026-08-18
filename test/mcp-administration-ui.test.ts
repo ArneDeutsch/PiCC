@@ -290,6 +290,20 @@ describe("MCP administration focused UI", () => {
     expect(narrowSupported).toContain("4 retained servers above"); expect(narrowSupported).toContain("4 retained servers below");
     expect(narrowSupported).toContain("navigate · Enter details");
     expect(narrowSupported).not.toContain("> [selected] 3-");
+
+    const longResult = renderMcpAdministration({
+      ...c.view(),
+      phase: {
+        kind: "result", action: "approve", effect: "unconfirmed",
+        message: "m".repeat(400), recovery: "r".repeat(160), durable: "d".repeat(160),
+        runtime: "t".repeat(160), exposure: `HIDDEN-TAIL-${"x".repeat(150)}`,
+      },
+    }, { width: 16, theme }).lines;
+    const longResultText = normalized(longResult);
+    expect(longResultText).toContain("Result detail omitted; resize to view.");
+    expect(longResultText).toContain("Enter/← return");
+    expect(longResultText).not.toContain("HIDDEN-TAIL");
+    for (const line of longResult) expect(visibleWidth(line)).toBeLessThanOrEqual(16);
   });
 
   it("returns bounded no-change outcomes for unavailable, snapshot, construction, render, repaint, close, and dispose failures", async () => {

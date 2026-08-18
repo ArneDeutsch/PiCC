@@ -274,7 +274,12 @@ export function renderMcpAdministration(view: McpAdministrationRenderView, optio
         : view.phase.kind === "result" ? "Enter/← return · R refresh · Esc close" : "Esc close";
   const footer: string[] = [];
   add(footer, options.theme, "muted", help, width);
-  const body = [...lines.slice(0, Math.max(0, 48 - footer.length)), ...footer];
+  const bodyLimit = Math.max(0, 48 - footer.length);
+  const clipped = lines.length > bodyLimit;
+  const omission: string[] = [];
+  if (clipped && view.phase.kind === "result") add(omission, options.theme, "warning", "Result detail omitted; resize to view.", width);
+  const retainedLimit = Math.max(0, bodyLimit - omission.length);
+  const body = [...lines.slice(0, retainedLimit), ...omission, ...footer];
   const bounded = clampLines(body, width).map((line) => {
     try { return visibleWidth(line) <= width ? line : ""; } catch { return ""; }
   });

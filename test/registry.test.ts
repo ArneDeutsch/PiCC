@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -247,9 +248,11 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 describe("CAPABILITY_REGISTRY invariants", () => {
-  it("has no duplicate ids", () => {
-    const ids = CAPABILITY_REGISTRY.map((e) => e.id);
-    expect(new Set(ids).size).toBe(ids.length);
+  it("pins the exact sorted 244-ID inventory", () => {
+    const ids = CAPABILITY_REGISTRY.map((entry) => entry.id).sort();
+    expect(ids).toHaveLength(244);
+    expect(new Set(ids).size).toBe(244);
+    expect(createHash("sha256").update(ids.join("\n")).digest("hex")).toBe("a07c9e70356acc28499c5ca25339701a43de3b6b69624915df9bae605713f00a");
   });
 
   it("every entry has a non-empty one-line note", () => {
@@ -302,15 +305,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
+    { id: "tool.mcp__*", tier: "partial", core: [/transport-neutral MCP tool proxies/, /current client/, /changed definition is rediscovered/], gap: [/fixed local transient\/terminal wording/], precedence: [/deny enforcement/, /subagent inheritance/, /serialized PiCC-owned active-set merging/, /call-time route validation/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
     { id: "setting.mcpServers", tier: "partial", core: [/retained PiCC compatibility extension/, /explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/unconfirmed upstream settings-file semantics/, /upstream ordering interaction is unverified/, /Native runtime disablement applies only to authentic native\/\.mcp\.json winners, never settings-extension winners/], precedence: [/present standalone managed-mcp\.json suppresses this source entirely/, /authentic Claude sources always outrank it/, /native local > project \.mcp\.json > native user/, /managed settings extension > untracked settings\.local\.json extension > project settings extension > user settings extension/, /central policy admission before approval, native disablement, or materialization/, /all applicable inactive gates run before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-remote-transports/] },
-    { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
-    { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
-    { id: "setting.disabledMcpjsonServers", tier: "partial", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-verified Claude Code 2.1.218/, /accumulate-and-dedupe across settings files are PiCC-defined or inferred/] },
+    { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/checkout-local and committed project occurrences cannot authorize/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
+    { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/broad per-name compatibility approval list/, /user and managed settings/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/checkout-local and committed project occurrences cannot authorize/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
+    { id: "setting.disabledMcpjsonServers", tier: "partial", core: [/broad per-name compatibility decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/, /separate private exact-definition decision/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-verified Claude Code 2.1.218/, /accumulate-and-dedupe across settings files are PiCC-defined or inferred/] },
     { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /admitted from standalone managed MCP or selected from native Claude local\/user state/, /non-blockingly/, /aggregate initial-settlement opportunity/, /advertised tools, prompts, or resources capability list/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], precedence: [/Standalone exclusive control and settings policy are resolved before post-admission materialization/, /blocked servers never reach runtime/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
-    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/read-only native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /bounded individual server definitions retain skip-or-adjust handling/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent project record semantics.*remain inferred or unverified/], precedence: [/Native state is acquired only when standalone managed MCP is absent/, /central policy admission before native disablement or materialization/, /local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/], parity: [/not verified Claude behavior for multiple canonical-equivalent project records/, /State is never modified/] },
-    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], precedence: [/after central policy admission/, /when standalone exclusive control is absent/], visibility: [/cannot edit the list/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/after central policy admission/, /only when standalone exclusive control is absent/, /disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/Ordinary main-session pending servers/, /session-start notice/, /\/mcp carries bounded approval/, /Agent-inline static pending declarations appear only in \/doctor/, /bounded Agent\/TaskOutput results/, /absent from the parent \/mcp/, /re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp-claude-json-scopes", tier: "partial", core: [/native Claude state loading/, /top-level user mcpServers/, /canonical project's local mcpServers/, /public local\/user\/project scope concepts are documented/, /one coherent user profile/, /user-scoped settings and artifacts/, /imported installed-plugin state and data/, /Project and managed contributions plus supplementary authorized plugin roots remain in effect/, /Bounded canonical-equivalent MCP projections coalesce when equivalent/, /transactionally add\/remove local and user declarations/, /unrelated state is preserved/], gap: [/private \.claude\.json physical shape is inferred/, /conservative PiCC policies/, /upstream canonicalization/, /multiple canonical-equivalent project record semantics.*remain inferred or unverified/], precedence: [/Native state is acquired only when standalone managed MCP is absent/, /central policy admission before native disablement or materialization/, /local > project \.mcp\.json > user/, /settings extension/], visibility: [/Only conflicting projections or invalid matching project-record, MCP-block, or runtime-list shapes make matching project state unusable and fail all MCP loading closed/, /absent state file preserves other sources/, /fails all MCP closed before expansion/, /bounded value-redacted diagnostics/] },
+    { id: "feature.mcp-runtime-disabled", tier: "partial", safetyRelevant: true, core: [/exact-name `disabledMcpServers`/, /final pre-expansion deny/, /authentic native local, project \.mcp\.json, and native user winners/, /transactionally edits only this list/], gap: [/does not disable settings-extension winners/, /exact private-state persistence, list interpretation, upstream matching.*inferred or unverified/], precedence: [/after central policy admission/, /when standalone exclusive control is absent/], visibility: [/reconciles eligible main-session runtime\/exposure/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /private exact-definition review/, /broad user\/managed compatibility approval/], gap: [/UI, storage, linked-worktree state, and exact digest mechanics are PiCC-defined/], precedence: [/after central policy admission/, /only when standalone exclusive control is absent/, /disabledMcpjsonServers always rejects/, /Native local and user definitions are not project-gated/, /native disabledMcpServers before expansion/], visibility: [/count-only one-time TUI notice/, /headless modes never prompt/, /Agent-inline static pending declarations appear only in \/doctor/, /bounded Agent\/TaskOutput results/, /absent from the parent \/mcp/], parity: [/Claude trust-dialog parity/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /tool\/prompt\/resource capability counts/, /advertised-empty/, /capability-discovery-failed/, /terminal-retained catalogs/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
     { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/Initial connection/, /reconnects/], precedence: [/aggregate MCP_TIMEOUT/, /permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/feature\.mcp/, /setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
@@ -438,14 +441,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
     const approval = lookupCapability("feature.mcp-project-approval")?.note ?? "";
     for (const qualification of [
-      "git-tracked settings.local.json is demoted to project scope",
-      "committed project-scope approvals are ignored",
-      "bounded one-time session-start notice",
-      "bounded approval and decline guidance",
-      "Each UTF-16 code unit",
-      "astral symbol therefore becomes '__'",
-      "normalization collisions",
-      "name-based, not definition-bound",
+      "normalized execution definition, source family, linked-checkout family, and agent owner",
+      "changed same-name definitions and different owners return to pending",
+      "Checkout-local and committed project approval keys never authorize",
+      "count-only one-time TUI notice",
+      "headless modes never prompt",
+      "Broad compatibility names still use underscore normalization",
+      "reset-project-choices clears only private review",
     ]) expect(approval, qualification).toContain(qualification);
   });
 
@@ -507,7 +509,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(oauth).toContain("static headers are PiCC's supported alternative");
     expect(lookupCapability("agent.frontmatter.mcpServers")).toMatchObject({ tier: "partial" });
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("references borrow published routes without duplicate clients");
-    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("disabledMcpjsonServers project-decline gate");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("disabledMcpjsonServers compatibility-decline gate");
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).not.toContain("runtime disablement");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("ordinary MCP tools themselves still run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
@@ -559,12 +561,13 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }]);
     const note = lookupCapability("agent.frontmatter.mcpServers")?.note ?? "";
     for (const piCcDefined of [
-      "PiCC's name-based project approval",
+      "exact execution-definition/source-family/agent-owner project review",
       "PiCC-defined collision precedence",
       "PiCC-defined lifecycle behavior",
       "pins stdio to that launch cwd",
       "Completed in-process resume reconstructs",
-      "ephemeral scopes never enter parent /mcp or /doctor live status",
+      "ephemeral scopes never enter parent /mcp, /doctor live status, or dynamic host exposure",
+      "Checkout-local approval keys never authorize",
       "verified selection/nesting/collision/diagnostic parity",
     ]) expect(note, piCcDefined).toContain(piCcDefined);
   });
@@ -617,7 +620,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     ]) expect(managedConfig?.note, phrase).toContain(phrase);
 
     expect(lookupCapability("setting.strictPluginOnlyCustomization.mcp")?.note).toContain(
-      "manual/CLI/runtime source delivery are themselves unsupported rather than governed",
+      "standalone administration mutates supported native/.mcp.json inputs and does not make this restriction effective",
     );
     expect(lookupCapability("feature.mcp-plugin-servers")?.note).toContain("plugin-bundled MCP servers are deferred");
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inline stdio/HTTP/SSE servers are dispatch-owned");
@@ -684,8 +687,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const predicate of [
       /standalone `managed-mcp\.json`[\s\S]*exclusive administrator authority/,
       /managed-settings[\s\S]*policy and admits each raw effective winner before expansion, approval, native disablement, or[\s\S]*runtime materialization/,
-      /Agent-inline\s+admission uses the same immutable policy and approval snapshot[\s\S]*materializes only inside its named\s+dispatch/,
-      /never widens ordinary MCP sources or the parent inventory[\s\S]*Future plugin or explicit\s+runtime\/CLI adapters must cross the same seam before their sources can be claimed as supported/,
+      /Agent-inline\s+admission uses captured, preclassified policy\/review authority[\s\S]*materializes only inside its named\s+dispatch without later filesystem or Git acquisition/,
+      /never mutates ordinary resolution or widens\s+ordinary MCP sources or the parent inventory/,
+      /Future plugin or explicit\s+runtime\/CLI adapters must\s+cross the same seam before their sources can be claimed as supported/,
     ]) expect(discoverySection).toMatch(predicate);
     const loaderSection = section(architecture, "### `claude/` — parse each artifact format (loaders only, no runtime)");
     expect(loaderSection).toMatch(/MCP server entries \(standalone `managed-mcp\.json`[\s\S]*`managed-mcp\.ts`/);
@@ -1706,7 +1710,7 @@ describe("buildCompatReport", () => {
       'references MCP server "missing-session"',
       'inline MCP server "blocked" is blocked because admission policy state is unavailable',
       'inline MCP server "disabled" was declined by disabledMcpjsonServers',
-      'inline MCP server "pending" is pending PiCC project approval',
+      'inline MCP server "pending" is pending PiCC project review',
       'inline MCP server "skipped" was skipped because its supported inline definition is invalid',
       "Startup health and deterministic cleanup are dispatch-time only",
       "do not appear in parent /mcp live status",
@@ -1714,7 +1718,12 @@ describe("buildCompatReport", () => {
     expect(evidence).toContain("stateful\\\\u202Eagent");
     expect(evidence).not.toContain("stateful\u202eagent");
     expect(evidence).not.toContain("Agent mcpServers item 2");
-    expect(renderDoctorReport(project, report)).toContain("enabledMcpjsonServers");
+    expect(evidence).toContain("use interactive `/mcp manage` to review the exact execution definition");
+    expect(evidence).toContain("broader per-name compatibility approval through enabledMcpjsonServers in user or managed settings");
+    expect(evidence).toContain("disabledMcpjsonServers in an applicable settings scope to decline");
+    const doctorReport = renderDoctorReport(project, report);
+    expect(doctorReport).toContain("enabledMcpjsonServers");
+    expect(doctorReport).not.toContain("settings.local.json");
   });
 
   it("retains structured declaration diagnostics when a configured route may be unpublished", () => {
@@ -2636,8 +2645,8 @@ describe("buildCompatReport", () => {
     expect(evidence).toContain("enabledMcpjsonServers");
     expect(evidence).toContain("disabledMcpjsonServers");
     const note = pending[0]!.capability.note;
-    expect(note).toContain("name-based, not definition-bound");
-    expect(note).toContain("re-review definitions after project MCP changes");
+    expect(note).toContain("private review binds normalized execution definition");
+    expect(note).toContain("changed same-name definitions and different owners return to pending");
     // Startup discloses only the count and review route; /doctor retains the
     // names and settings remediation without putting either in the notice.
     const notice = report.mcpPendingNotice ?? "";
@@ -2765,7 +2774,7 @@ describe("buildCompatReport", () => {
     );
     expect(byId.has("feature.mcp")).toBe(false);
     const rendered = renderDoctorReport(project, report);
-    expect(rendered).toContain("the `oauth` field is ignored");
+    expect(rendered).toContain("The `oauth` field is ignored");
     expect(rendered).toContain("server still runs when otherwise usable");
     expect(rendered).toContain("OAuth behavior is absent");
     expect(rendered).toContain("must not rely on `oauth` under PiCC");
@@ -2921,9 +2930,9 @@ describe("buildCompatReport", () => {
       .filter((finding) => finding.capability.id === "feature.mcp")
       .map((finding) => finding.evidence);
     expect(evidence).toEqual([
-      "Project-scope MCP approval settings were ignored because a project cannot authorize itself; review definitions before approving exact trusted names from user-controlled settings.",
-      "A tracked local MCP settings contribution was demoted to project scope, so any servers it contributes require independent user approval; review definitions before approving exact trusted names.",
-      "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.",
+      "Project-scope MCP approval settings were ignored because a project cannot authorize itself. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.",
+      "A tracked local MCP settings contribution was demoted to project scope, so it cannot authorize contributed servers. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.",
+      "MCP approval settings in a tracked local settings file were rejected. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.",
       "Project .mcp.json is unreadable; restore file access or remove it, then run /reload or restart PiCC.",
       "Project .mcp.json is malformed JSON; repair it as strict JSON, then run /reload or restart PiCC.",
       "Project .mcp.json has the wrong object shape; make the root and mcpServers block objects, then run /reload or restart PiCC.",
@@ -3347,20 +3356,24 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     expect(trackedNotice).not.toContain("alias");
   });
 
-  it("provides bounded named-approval and decline guidance through /doctor", () => {
+  it("separates exact interactive review from bounded broad approval and decline guidance through /doctor", () => {
     const report = buildCompatReport(pendingProject);
     const pending = report.findings.find(
       (finding) => finding.capability.id === "feature.mcp-project-approval",
     );
     const evidence = pending?.evidence ?? "";
+    expect(evidence).toContain("use interactive `/mcp manage` to review exact execution definitions");
     expect(evidence).toContain('"enabledMcpjsonServers": ["example-server"]');
     expect(evidence).toContain("the server names you explicitly trust");
-    expect(evidence).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(evidence).toContain("For broader per-name compatibility approval instead");
+    expect(evidence).toContain("user or managed settings only");
+    expect(evidence).not.toContain("settings.local.json");
     expect(evidence).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-"');
     expect(evidence).toContain('astral symbol therefore becomes "__"');
     expect(evidence).toContain("One persisted named approval can therefore match a differently named current or future server");
     expect(evidence).toContain("re-review aliases when project MCP names change");
     expect(evidence).toContain("disabledMcpjsonServers");
+    expect(evidence).toContain("in an applicable settings scope to decline");
     expect(evidence).toContain('Do not set "enableAllProjectMcpServers": true as a shortcut');
     expect(evidence).toContain("it approves all current and future project servers");
   });

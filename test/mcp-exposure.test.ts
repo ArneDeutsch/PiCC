@@ -102,6 +102,7 @@ function fixture(options: { foreign?: string[]; denied?: Set<string> } = {}) {
   const host = new FakeHost(options.foreign);
   const denied = options.denied ?? new Set<string>();
   let resources: McpResourceServerInfo[] = [];
+  let readResource = async (_server: string, uri: string) => ({ contents: [{ uri, text: "resource" }] });
   const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
   let promptFailure = false;
   const exposure = new McpMainSessionExposure({
@@ -109,7 +110,7 @@ function fixture(options: { foreign?: string[]; denied?: Set<string> } = {}) {
     source: {
       callTool,
       resourceServers: () => resources,
-      readResource: async (_server, uri) => ({ contents: [{ uri, text: "resource" }] }),
+      readResource: (server, uri) => readResource(server, uri),
     },
     permissionGate: {
       gateTools: (_granted, _disallowed, names) => names.filter((name) => !denied.has(name)),
@@ -123,12 +124,18 @@ function fixture(options: { foreign?: string[]; denied?: Set<string> } = {}) {
   return {
     exposure, host, denied, callTool,
     setResources: (value: McpResourceServerInfo[]) => { resources = value; },
+    setResourceClient: (value: McpResourceServerInfo[], reader: typeof readResource) => { resources = value; readResource = reader; },
     setPromptFailure: (value: boolean) => { promptFailure = value; },
   };
 }
 
 async function execute(tool: ToolDefinition<any, any>, params: Record<string, unknown> = {}) {
   return tool.execute("call", params, undefined, undefined, {} as never);
+}
+
+async function executeText(tool: ToolDefinition<any, any>, params: Record<string, unknown> = {}): Promise<string> {
+  const result = await execute(tool, params);
+  return result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
 }
 
 describe("McpMainSessionExposure tool ownership and generations", () => {
@@ -544,14 +551,30 @@ describe("McpMainSessionExposure tool ownership and generations", () => {
 });
 
 describe("McpMainSessionExposure resource and prompt projections", () => {
-  it("activates fixed resource tools while any capable server exists and removes them with the last server", async () => {
-    const { exposure, host, setResources } = fixture();
-    const resourceServer: McpResourceServerInfo = { serverName: "srv", resources: [] };
-    setResources([resourceServer]);
-    const publish = delta({ tools: [], resourceServer: { info: resourceServer, wireDefinitionFingerprint: "resources-a" } });
-    await exposure.apply(publish);
+  it("replaces a changed definition's resource catalog/client and retires the final active tools", async () => {
+    const { exposure, host, setResourceClient } = fixture();
+    const resourceA: McpResourceServerInfo = { serverName: "srv", resources: [{ serverName: "srv", uri: "resource://a", name: "catalog-a" }] };
+    const resourceB: McpResourceServerInfo = { serverName: "srv", resources: [{ serverName: "srv", uri: "resource://b", name: "catalog-b" }] };
+    const clientA = vi.fn(async (_server: string, uri: string) => ({ contents: [{ uri, text: "client-a" }] }));
+    const clientB = vi.fn(async (_server: string, uri: string) => ({ contents: [{ uri, text: "client-b" }] }));
+    setResourceClient([resourceA], clientA);
+    const publishA = delta({ tools: [], resourceServer: { info: resourceA, wireDefinitionFingerprint: "resources-a" } });
+    await exposure.apply(publishA);
+    const list = host.definitions.get("ListMcpResourcesTool")!;
+    const read = host.definitions.get("ReadMcpResourceTool")!;
+    expect(await executeText(list, { server: "srv" })).toContain("catalog-a");
+    expect(await executeText(read, { server: "srv", uri: "resource://a" })).toContain("client-a");
+
+    setResourceClient([resourceB], clientB);
+    await exposure.apply(delta({ generation: 2, definitionFingerprint: "definition-b", tools: [], resourceServer: { info: resourceB, wireDefinitionFingerprint: "resources-b" } }));
+    const currentList = await executeText(host.definitions.get("ListMcpResourcesTool")!, { server: "srv" });
+    const currentRead = await executeText(host.definitions.get("ReadMcpResourceTool")!, { server: "srv", uri: "resource://b" });
+    expect(currentList).toContain("catalog-b"); expect(currentList).not.toContain("catalog-a");
+    expect(currentRead).toContain("client-b"); expect(currentRead).not.toContain("client-a");
+    expect(clientA).toHaveBeenCalledOnce(); expect(clientB).toHaveBeenCalledOnce();
     expect(host.active).toEqual(expect.arrayContaining(["ListMcpResourcesTool", "ReadMcpResourceTool"]));
-    await exposure.apply(delta({ ...publish, kind: "retire", generation: 2 }));
+
+    await exposure.apply(delta({ kind: "retire", generation: 3, definitionFingerprint: "definition-b", tools: [], resourceServer: { info: resourceB, wireDefinitionFingerprint: "resources-b" } }));
     expect(host.active).not.toContain("ListMcpResourcesTool");
     expect(host.active).not.toContain("ReadMcpResourceTool");
   });

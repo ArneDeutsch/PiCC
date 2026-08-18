@@ -63,7 +63,7 @@ describe("renderCapabilityMatrix", () => {
     expect(row("feature.mcp-managed-config")).toMatch(/⚠ \| partial[\s\S]*`feature.managed-policy`[\s\S]*`feature.mcp-project-approval`[\s\S]*PiCC-defined \/mcp and \/doctor summaries[\s\S]*not Claude UI parity/);
     expect(row("feature.managed-policy")).toMatch(/partial[\s\S]*`feature.managed-policy-windows-registry`[\s\S]*system managed settings file followed by lexically ordered drop-in files/);
     expect(row("feature.managed-policy-windows-registry")).toMatch(/⚠ \| not-supported[\s\S]*`feature.managed-policy`[\s\S]*HKLM and HKCU are neither queried nor probed[\s\S]*silently ignored/);
-    expect(row("setting.strictPluginOnlyCustomization.mcp")).toContain("manual/CLI/runtime source delivery are themselves unsupported rather than governed");
+    expect(row("setting.strictPluginOnlyCustomization.mcp")).toContain("standalone administration mutates supported native/.mcp.json inputs and does not make this restriction effective");
   });
 
   it("projects local plugin lifecycle and excluded policy truth into distinct rows", () => {

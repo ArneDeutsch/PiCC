@@ -532,8 +532,8 @@ function validateAgentDeclaration(value: unknown): ValidatedAgentDeclaration | u
   return { scope, diagnosticOwnership, items };
 }
 
-// Normalized declarations are inert parser output. Captured authority resolves them
-// into unstarted config without filesystem, process, DNS, or transport effects.
+// Captured agent admission consumes preclassified policy/review authority. It resolves inert
+// declarations without later filesystem or Git I/O and cannot mutate ordinary MCP resolution.
 function createAgentMcpAdmissionContext(input: {
   policy: CompiledMcpPolicy;
   env: NodeJS.ProcessEnv;

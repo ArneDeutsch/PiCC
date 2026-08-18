@@ -812,7 +812,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
               : server.status === "disabled"
                 ? `${identity} was declined by disabledMcpjsonServers; after reviewing the definition, remove its exact name from that list to enable it or remove the declaration.`
                 : server.status === "pending-approval"
-                  ? `${identity} is pending PiCC project approval; review the definition, then add its exact name to enabledMcpjsonServers in user-controlled settings or add it to disabledMcpjsonServers to decline it.`
+                  ? `${identity} is pending PiCC project review; use interactive \`/mcp manage\` to review the exact execution definition, or grant broader per-name compatibility approval through enabledMcpjsonServers in user or managed settings. Add it to disabledMcpjsonServers in an applicable settings scope to decline it.`
                   : server.status === "not-configured"
                     ? `${identity} is not configured with a usable transport; add one supported inline command or URL definition, or remove it.`
                     : server.status === "skipped" && server.inactiveReason === "admission-unavailable"
@@ -1080,13 +1080,16 @@ function mcpConfigDiagnosticEvidence(diagnostic: string, mcp: ResolvedMcpConfig)
     return "Native enabledMcpServers was recognized, but PiCC does not support this enablement capability and the list cannot authorize default-off servers.";
   }
   if (/MCP approvals .*cannot work while .*tracked by git/u.test(diagnostic)) {
-    return "MCP approval settings in a tracked local settings file were rejected; stop tracking the file and create a clean user-controlled local file, or approve exact trusted names in user settings.";
+    return "MCP approval settings in a tracked local settings file were rejected. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.";
   }
   if (/tracked by git.*treated as project scope/u.test(diagnostic)) {
-    return "A tracked local MCP settings contribution was demoted to project scope, so any servers it contributes require independent user approval; review definitions before approving exact trusted names.";
+    return "A tracked local MCP settings contribution was demoted to project scope, so it cannot authorize contributed servers. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.";
   }
   if (/MCP approvals .*project-scope settings are ignored/u.test(diagnostic)) {
-    return "Project-scope MCP approval settings were ignored because a project cannot authorize itself; review definitions before approving exact trusted names from user-controlled settings.";
+    return "Project-scope MCP approval settings were ignored because a project cannot authorize itself. Use interactive `/mcp manage` for exact execution-definition review, or place a broader per-name compatibility approval in user or managed settings.";
+  }
+  if (diagnostic.includes("MCP administration recovery is pending")) {
+    return "MCP administration rollback remains pending, so declarations are hidden and startup is fail closed. Preserve configuration and use interactive `/mcp manage` to retry service-owned rollback.";
   }
   if (diagnostic.includes(".mcp.json is unreadable")) {
     return "Project .mcp.json is unreadable; restore file access or remove it, then run /reload or restart PiCC.";
@@ -1191,8 +1194,8 @@ function mcpPendingEditDetail(pendingNames: string[]): string {
       ? `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for the server names you explicitly trust`
       : `inspect your MCP configuration, then add server names you explicitly trust to "enabledMcpjsonServers"`;
   return (
-    `${enable} in user settings or a clean, user-controlled, untracked .claude/settings.local.json; add names to ` +
-    `"disabledMcpjsonServers" to decline them. Each UTF-16 code unit outside ASCII letters, digits, ` +
+    `use interactive \`/mcp manage\` to review exact execution definitions. For broader per-name compatibility approval instead, ${enable} in user or managed settings only; add names to ` +
+    `"disabledMcpjsonServers" in an applicable settings scope to decline them. Each UTF-16 code unit outside ASCII letters, digits, ` +
     `"_", and "-" becomes "_"; an astral symbol therefore becomes "__". One persisted named approval can therefore match a differently named current or ` +
     `future server; re-review aliases when project MCP names change. Changes apply after reload or in a new session; this guidance does not ` +
     `change settings. Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current ` +
@@ -1403,6 +1406,9 @@ function mcpPostureLine(
   }
   if (mcp.failClosed === "native-state-unusable") {
     return `MCP: fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(mcp)}`;
+  }
+  if (mcp.failClosed === "administration-recovery-pending") {
+    return "MCP: declarations are hidden and startup is fail closed because MCP administration rollback is pending. Use interactive `/mcp manage` to retry service-owned rollback. Preserve configuration if it remains pending; bounded recovery diagnosis follows below.";
   }
   const policy = mcpPolicySummary(mcp);
   if (mcp.policyPosture === "exclusive-empty" || mcp.policyPosture === "fail-closed") {
@@ -1649,9 +1655,10 @@ function mcpStatusPendingGuidance(
     : `Inspect your MCP configuration, then add server names you explicitly trust to "enabledMcpjsonServers".`;
   return [
     "Pending-server guidance (read-only):",
-    `${enable} Put approvals in user settings or a clean, user-controlled, untracked .claude/settings.local.json.`,
+    "Use interactive `/mcp manage` to review exact execution definitions.",
+    `${enable} This is a broader per-name compatibility approval; put it in user or managed settings only.`,
     `Each UTF-16 code unit outside ASCII letters, digits, "_", and "-" becomes "_"; an astral symbol therefore becomes "__". One persisted named approval can therefore match a differently named current or future server; re-review aliases when project MCP names change.`,
-    `Add server names to "disabledMcpjsonServers" to decline them. Changes apply after reload or in a new session; /mcp did not change settings.`,
+    `Add server names to "disabledMcpjsonServers" in an applicable settings scope to decline them. Changes apply after reload or in a new session; /mcp did not change settings.`,
     `Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current and future project servers.`,
   ];
 }
@@ -1677,11 +1684,14 @@ export function renderMcpStatusReport(
   );
   const lines = ["MCP status (read-only)"];
   const nativeStateUnusable = config.failClosed === "native-state-unusable";
-  const policySummary = nativeStateUnusable ? undefined : mcpPolicySummary(config);
+  const administrationRecoveryPending = config.failClosed === "administration-recovery-pending";
+  const policySummary = nativeStateUnusable || administrationRecoveryPending ? undefined : mcpPolicySummary(config);
   if (policySummary) lines.push(policySummary);
   const aggregateOnly = config.policyPosture === "exclusive-empty" || config.policyPosture === "fail-closed";
   if (nativeStateUnusable) {
     lines.push(`MCP is fail closed because native Claude state is unusable. ${mcpFailClosedRecovery(config)}`);
+  } else if (administrationRecoveryPending) {
+    lines.push("MCP declarations are hidden and startup is fail closed because administration rollback is pending. Open `/mcp manage` in an interactive TUI to retry service-owned rollback. Preserve configuration and inspect the bounded `/doctor` diagnosis if it remains pending.");
   } else if (config.servers.length === 0 && !aggregateOnly) {
     lines.push(
       otherConfigDiagnostics
@@ -1693,7 +1703,7 @@ export function renderMcpStatusReport(
   }
 
   const liveByName = mcpLiveByName(liveStates);
-  const suppressRows = aggregateOnly || nativeStateUnusable;
+  const suppressRows = aggregateOnly || nativeStateUnusable || administrationRecoveryPending;
   const detailCount = suppressRows ? 0 : Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
   const indexed = config.servers.map((server, index) => ({ server, index }));
   const selected = suppressRows

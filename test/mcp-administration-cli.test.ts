@@ -17,6 +17,7 @@ const inventory: McpAdministrationInventory = {
   ],
 };
 const persistence = { state: "committed", retrySafe: false, effect: "changed", cleanup: "complete" } as const;
+const transientProbeWarning = "PiCC MCP: eligible winners may be transiently started or contacted for bounded health/capability probing, then bounded shutdown is attempted.";
 function harness(overrides: Partial<{ inventory: McpAdministrationInventory; preparation: unknown; preview: unknown; execute: unknown; health: Record<string, "connected" | "auth-needed" | "failed"> }> = {}) {
   const calls: unknown[] = []; const writes: unknown[] = [];
   const currentInventory = overrides.inventory ?? inventory;
@@ -61,12 +62,12 @@ describe("standalone MCP administration grammar", () => {
   });
 
   it("renders exact global and command-specific help for both accepted forms", async () => {
-    const expectedGlobal = `Usage: picc mcp <command>\n\nCommands:\n  list [--scope|-s local|project|user]\n  get <name> [--scope|-s local|project|user]\n  add [--dry-run] [--scope|-s ...] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n  add [--dry-run] [--scope|-s ...] --transport|-t http|sse <name> <url> [--header|-H "Name: Value" ...]\n  add-json [--dry-run] [--scope|-s ...] <name> <json>\n  add-json [--dry-run] [--scope|-s ...] <name> --json-file <path|->\n  remove [--dry-run] [--scope|-s ...] <name>\n  reset-project-choices [--dry-run]\n  help [command]\n\nList/get report a bounded acquired inventory; omitted declarations are counted. Scoped reads are a PiCC extension.\nUse picc mcp <command> --help for command grammar.\nMutations run directly without confirmation. --dry-run prints the same semantic plan without writing.\nInline JSON may expose credentials in argv and shell history; prefer --json-file or --json-file -.`;
+    const expectedGlobal = `Usage: picc mcp <command>\n\nCommands:\n  list [--scope|-s local|project|user]\n  get <name> [--scope|-s local|project|user]\n  add [--dry-run] [--scope|-s ...] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n  add [--dry-run] [--scope|-s ...] --transport|-t http|sse <name> <url> [--header|-H "Name: Value" ...]\n  add-json [--dry-run] [--scope|-s ...] <name> <json>\n  add-json [--dry-run] [--scope|-s ...] <name> --json-file <path|->\n  remove [--dry-run] [--scope|-s ...] <name>\n  reset-project-choices [--dry-run]\n  help [command]\n\nList/get report a bounded acquired inventory; omitted declarations are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.\nUse picc mcp <command> --help for command grammar.\nMutations run directly without confirmation. --dry-run evaluates the current safe snapshot without recovery or writes and may refuse where direct execution first recovers.\nInline JSON and --env/--header values may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.`;
     const expected: Record<string, string> = {
-      list: "Usage: picc mcp list [--scope|-s local|project|user]\nReports a bounded acquired inventory and the effective winner; any omissions are counted. Scoped reads are a PiCC extension.",
-      get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Scoped reads are a PiCC extension.",
-      add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable.",
-      "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; prefer file/stdin.",
+      list: "Usage: picc mcp list [--scope|-s local|project|user]\nReports a bounded acquired inventory and the effective winner; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
+      get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
+      add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable. --env/--header values may be exposed in argv and shell history; for credentials prefer add-json --json-file <path|->.",
+      "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.",
       remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration and refuses ambiguity.",
       "reset-project-choices": "Usage: picc mcp reset-project-choices [--dry-run]\nResets PiCC-owned review choices across the active profile and checkout family; declarations and runtime-disable choices are preserved.",
     };
@@ -100,18 +101,34 @@ describe("standalone MCP administration grammar", () => {
 
 describe("standalone MCP administration semantics", () => {
   it("shows all unscoped collisions, effective winner, scoped reads, and stable health rows", async () => {
-    const h = harness({ health: { same: "connected" } }); expect(await h.run(["get", "same"])).toBe(0); expect(h.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=2; omitted=0\nsame: scope=local; precedence=winner; source=native-local; policy=allowed; review=not-required; status=enabled; health=connected; transport=stdio; capabilities=2/1/0\nsame: scope=user; precedence=shadowed; source=native-user; policy=allowed; review=not-required; status=shadowed; health=not-probed; transport=http; capabilities=0/0/0"]); expect(h.stderr).toEqual([]); const text = h.stdout[0]!;
+    const h = harness({ health: { same: "connected" } }); expect(await h.run(["get", "same"])).toBe(0); expect(h.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=2; omitted=0\nsame: scope=local; precedence=winner; source=native-local; policy=allowed; review=not-required; status=enabled; health=connected; transport=stdio; capabilities=2/1/0\nsame: scope=user; precedence=shadowed; source=native-user; policy=allowed; review=not-required; status=shadowed; health=not-probed; transport=http; capabilities=0/0/0"]); expect(h.stderr).toEqual([transientProbeWarning]); const text = h.stdout[0]!;
     const auth = harness({ health: { same: "auth-needed" } }); expect(await auth.run(["get", "same", "-s", "local"])).toBe(0); expect(auth.stdout.join("\n")).toContain("health=auth-needed");
     const failed = harness({ health: { same: "failed" } }); expect(await failed.run(["get", "same", "-s", "local"])).toBe(0); expect(failed.stdout.join("\n")).toContain("health=failed");
     const scoped = harness(); expect(await scoped.run(["list", "-s", "project"])).toBe(0); expect(scoped.stdout.join("\n")).toContain("health=pending-review"); expect(scoped.stdout.join("\n")).toContain("health=rejected"); expect(scoped.stdout.join("\n")).not.toContain("scope=local");
-    const missing = harness(); expect(await missing.run(["get", "missing"])).toBe(1); expect(missing.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=0; omitted=0\nNo matching MCP servers."]); expect(missing.stderr).toEqual([]);
-    const recoveryInventory: McpAdministrationInventory = { ...inventory, servers: [], remediation: "administration-recovery-pending", omittedDeclarationCount: 3 }; const blockedRead = harness({ inventory: recoveryInventory }); expect(await blockedRead.run(["list"])).toBe(0); expect(blockedRead.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=0; omitted=3\nRecovery: reads cannot recover pending MCP administration state; retry the original mutation that left recovery pending.\nNo matching MCP servers."]); expect(blockedRead.stderr).toEqual([]);
+    const missing = harness(); expect(await missing.run(["get", "missing"])).toBe(1); expect(missing.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=0; omitted=0\nNo matching MCP servers."]); expect(missing.stderr).toEqual([transientProbeWarning]);
+    const recoveryInventory: McpAdministrationInventory = { ...inventory, servers: [], remediation: "administration-recovery-pending", omittedDeclarationCount: 3 }; const blockedRead = harness({ inventory: recoveryInventory }); expect(await blockedRead.run(["list"])).toBe(0); expect(blockedRead.stdout).toEqual(["MCP inventory: policy=active-rules; declarations=0; omitted=3\nRecovery: reads cannot recover pending MCP administration state; open `/mcp manage` in an interactive TUI to attempt service-owned recovery, then retry this read.\nNo matching MCP servers."]); expect(blockedRead.stderr).toEqual([transientProbeWarning]);
+
+    const ordered = harness();
+    expect(await ordered.run(["list"], { services: async () => {
+      expect(ordered.stderr).toEqual([transientProbeWarning]);
+      return { ok: false as const, code: "fixture-unavailable", message: "fixture unavailable" };
+    } })).toBe(1);
+    expect(ordered.stderr).toEqual([transientProbeWarning, "PiCC MCP: administration unavailable (fixture-unavailable)."]);
   });
 
   it("executes noninteractive mutations directly and dry-run never executes", async () => {
     const direct = harness(); expect(await direct.run(["remove", "-s", "local", "name"])).toBe(0); expect(direct.calls).toEqual([["execute", { kind: "remove", scope: "local", name: "name" }]]); expect(direct.stdout).toEqual(["MCP result: action=remove; target=local name\nEligibility: eligible", "Durable: state=committed; effect=changed; cleanup=complete"]); expect(direct.stderr).toEqual([]);
     const dry = harness(); expect(await dry.run(["remove", "--dry-run", "-s", "user", "name"])).toBe(0); expect(dry.calls).toEqual([["preview", { kind: "remove", scope: "user", name: "name" }]]); expect(dry.stdout).toEqual(["MCP dry-run: action=remove; target=user name\nEligibility: eligible\nWrites: none (dry-run)"]); expect(dry.stderr).toEqual([]);
     const unscopedDry = harness(); expect(await unscopedDry.run(["remove", "--dry-run", "pending"])).toBe(0); expect(unscopedDry.inventoryCall).toHaveBeenCalledOnce(); expect(unscopedDry.prepareInventoryAfterRecovery).not.toHaveBeenCalled(); expect(unscopedDry.calls).toEqual([["preview", { kind: "remove", scope: "project", name: "pending" }]]);
+
+    const blockedPreview = harness({ preview: { inventory, eligibility: { eligible: false, reasonCode: "recovery-pending" } } });
+    expect(await blockedPreview.run(["remove", "--dry-run", "-s", "local", "name"])).toBe(1);
+    expect(blockedPreview.stdout.at(-1)).toBe("Action: dry-run cannot recover pending MCP administration state; open `/mcp manage` in an interactive TUI to attempt service-owned recovery, then retry the original dry-run.");
+    expect(blockedPreview.stdout.join("\n")).not.toContain("without --dry-run");
+    const blockedDirect = harness({ execute: { inventory, eligibility: { eligible: false, reasonCode: "recovery-pending" }, recovery: { state: "pending-recovery", retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery" }, durable: { state: "not-requested" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } } });
+    expect(await blockedDirect.run(["remove", "-s", "local", "name"])).toBe(1);
+    expect(blockedDirect.stdout).toContain("Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.");
+    expect(blockedDirect.stdout.join("\n")).not.toContain("dry-run cannot recover");
   });
 
   it("resolves unscoped removal through fresh service inventory and bounds ambiguity", async () => {
@@ -198,10 +215,10 @@ describe("standalone MCP production composition", () => {
         expect(events).toEqual(expectedEvents[failure]); expect(admittedConfig).toBe(fresh.mcp); expect(admittedConfig).not.toBe(initial.mcp); expect(startRuntime).toHaveBeenCalledOnce();
         if (failure === "start") expect(shutdown).not.toHaveBeenCalled(); else expect(shutdown).toHaveBeenCalledOnce();
         if (failure === "none") {
-          expect(code).toBe(0); expect(stdout).toEqual(["MCP inventory: policy=absent; declarations=1; omitted=0\nremote: scope=user; precedence=winner; source=native-user; policy=allowed; review=not-required; status=enabled; health=auth-needed; transport=http; capabilities=3/2/1\nAuthentication guidance: verify configured static headers; OAuth login is unavailable and deferred."]); expect(stderr).toEqual([]);
+          expect(code).toBe(0); expect(stdout).toEqual(["MCP inventory: policy=absent; declarations=1; omitted=0\nremote: scope=user; precedence=winner; source=native-user; policy=allowed; review=not-required; status=enabled; health=auth-needed; transport=http; capabilities=3/2/1\nAuthentication guidance: verify configured static headers; OAuth login is unavailable and deferred."]); expect(stderr).toEqual([transientProbeWarning]);
           expect(handle.value.health("remote")).toEqual({ state: "auth-needed", tools: 3, prompts: 2, resources: 1 });
         } else {
-          expect(code).toBe(1); expect(stdout).toEqual([]); expect(stderr).toEqual(["PiCC MCP: administration failed without exposing input details."]);
+          expect(code).toBe(1); expect(stdout).toEqual([]); expect(stderr).toEqual([transientProbeWarning, "PiCC MCP: administration failed without exposing input details."]);
         }
       }
     } finally { fs.rmSync(root, { recursive: true, force: true }); }

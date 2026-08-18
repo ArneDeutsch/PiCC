@@ -366,9 +366,11 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
           const output = String(fresh.entries.at(-1)?.data.output);
           expect(output).toContain("No equivalent action was performed");
           expect(output).toContain("bare /mcp to inspect status");
-          expect(output).toContain("trusted user/managed settings");
+          expect(output).toContain("TUI is required for project review and runtime actions");
+          expect(output).toContain("Standalone picc mcp commands manage declarations");
+          expect(output).toContain("broad project-review compatibility grants");
+          expect(output).toContain("not enable, disable, or reconnect controls");
           expect(output).toContain("picc mcp --help");
-          expect(output).toContain("supported configuration commands only");
           expect(output).not.toMatch(/picc mcp (?:approve|reject|enable|disable|reconnect|authenticate)/u);
         }
       }
@@ -382,6 +384,7 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
       }
       expect(inspections).toBe(0);
 
+      const noticesBeforePassivePreparation = fresh.notifications.length;
       for (const token of tokens) {
         const opening = fresh.commands.get("mcp").handler(token, fresh.tuiCtx());
         await vi.waitFor(() => expect(fresh.customs).toHaveLength(tokens.indexOf(token) + 1));
@@ -394,6 +397,7 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
         await opening;
       }
       expect(inspections).toBeGreaterThanOrEqual(tokens.length);
+      expect(fresh.notifications).toHaveLength(noticesBeforePassivePreparation);
       const inspectionsBeforeAbnormal = inspections;
 
       let abnormalComponent: { render(width: number): string[]; handleInput?(data: string): void } | undefined;
@@ -418,6 +422,87 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
       expect(abnormalOutput).not.toContain("no action was started");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers before a TUI administration snapshot while blocked recovery and passive routes stay fail-closed", async () => {
+    const binding = bindMcpDeclarationDefinition("recovered", { type: "http", url: "https://example.test/mcp" });
+    if (!binding.ok) throw new Error(binding.message);
+    const recoveredState = {
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      liveStates: [{ name: "recovered", state: "failed" }],
+      mcp: { servers: [{ name: "recovered", source: "project-mcpjson", status: "enabled", transport: "http", configuredType: "http", url: "https://example.test/mcp", headers: {}, diagnostics: [] }], diagnostics: [], policyPosture: "absent", administration: {
+        version: 1, policyPosture: "absent", observations: [], declarations: [{
+          name: "recovered", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, precedence: "winner",
+          definitionVersion: binding.value.definitionVersion, definitionDigest: binding.value.definitionDigest,
+          summary: { transport: "http", remoteOrigin: "https://example.test", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+          policy: "allowed", review: "approved-exact", status: "enabled",
+        }], omittedDeclarationCount: 0,
+      } },
+    } as const;
+
+    let pending = true; let recoveries = 0; let assemblies = 0;
+    const recovered = await freshControlPi({
+      mcpControl: { render: () => "PASSIVE_STATUS" },
+      mcpAdministration: {
+        inspectPending: async () => ({ pending, status: pending ? "pending" : "clear" } as never),
+        recover: async () => { recoveries += 1; pending = false; return { state: "rolled-back", operationId: "op", effect: "unchanged", cleanup: "complete", retrySafe: true }; },
+        assemble: async () => { assemblies += 1; return recoveredState as never; },
+      },
+    });
+    try {
+      const passiveNotices = recovered.fresh.notifications.length;
+      await recovered.fresh.commands.get("mcp").handler("", recovered.fresh.tuiCtx());
+      expect(String(recovered.fresh.entries.at(-1)?.data.output)).toBe("PASSIVE_STATUS");
+      await recovered.fresh.fire("input", { text: "/mcp manage", source: "rpc" }, recovered.fresh.rpcCtx());
+      expect(recoveries).toBe(0);
+      expect(assemblies).toBe(0);
+      expect(recovered.fresh.notifications).toHaveLength(passiveNotices);
+
+      const opening = recovered.fresh.commands.get("mcp").handler("manage", recovered.fresh.tuiCtx());
+      await vi.waitFor(() => expect(recovered.fresh.customs).toHaveLength(1));
+      const custom = recovered.fresh.customs[0]!;
+      await custom.ready;
+      expect(custom.render(80).join("\n")).toContain("recovered");
+      expect(recoveries).toBe(1);
+      expect(assemblies).toBe(1);
+      expect(recovered.fresh.notifications.at(-1)).toEqual({
+        text: "MCP recovery completed: state=rolled-back; effect=unchanged; cleanup=complete. Fresh inventory loaded.",
+        severity: "info",
+      });
+      custom.input("\u001b");
+      await opening;
+    } finally {
+      fs.rmSync(recovered.root, { recursive: true, force: true });
+    }
+
+    let blockedRecoveries = 0; let blockedAssemblies = 0; let blockedMutations = 0;
+    const blocked = await freshControlPi({ mcpAdministration: {
+      inspectPending: async () => ({ pending: true, status: "pending" } as never),
+      recover: async () => { blockedRecoveries += 1; return { state: "pending-recovery", operationId: "op", effect: "uncertain", cleanup: "pending", retrySafe: false, reasonCode: "pending-recovery" }; },
+      assemble: async () => { blockedAssemblies += 1; return recoveredState as never; },
+      mutate: async () => { blockedMutations += 1; return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false }; },
+    } });
+    try {
+      const opening = blocked.fresh.commands.get("mcp").handler("approve", blocked.fresh.tuiCtx());
+      await vi.waitFor(() => expect(blocked.fresh.customs).toHaveLength(1));
+      const custom = blocked.fresh.customs[0]!;
+      await custom.ready;
+      const blockedText = custom.render(80).join("\n");
+      expect(blockedText).toContain("declarations 0");
+      expect(blockedText).not.toContain("recovered");
+      expect(blocked.fresh.notifications.at(-1)).toEqual({
+        text: "MCP recovery remains pending: declarations are intentionally hidden; state=pending-recovery; effect=uncertain; cleanup=pending. Retry /mcp manage and inspect /doctor.",
+        severity: "warning",
+      });
+      expect(blockedRecoveries).toBe(1);
+      expect(blockedAssemblies).toBe(0);
+      custom.input("\r");
+      expect(blockedMutations).toBe(0);
+      custom.input("\u001b"); custom.input("\u001b");
+      await opening;
+    } finally {
+      fs.rmSync(blocked.root, { recursive: true, force: true });
     }
   });
 

@@ -584,9 +584,13 @@ describe("MCP pending guidance", () => {
     const names = Array.from({ length: count }, (_, index) => `pending-${index}`);
     const mcp = config(names.map((name) => server(name, "pending-approval")));
     const status = renderMcpStatusReport(mcp, []);
+    expect(status).toContain("Use interactive `/mcp manage` to review exact execution definitions.");
     expect(status).toContain("enabledMcpjsonServers");
+    expect(status).toContain("broader per-name compatibility approval");
+    expect(status).toContain("user or managed settings only");
     expect(status).toContain("disabledMcpjsonServers");
-    expect(status).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(status).toContain("in an applicable settings scope to decline");
+    expect(status).not.toContain("settings.local.json");
     expect(status).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-" becomes "_"');
     expect(status).toContain('an astral symbol therefore becomes "__"');
     expect(status).toContain("One persisted named approval can therefore match a differently named current or future server");
@@ -675,17 +679,21 @@ describe("MCP pending guidance", () => {
     expect(report).toContain("Omitted 2 servers (enabled: 2)");
   });
 
-  it("keeps tracked-local diagnostics out of /mcp while retaining safe guidance", () => {
+  it("keeps tracked-local diagnostics out of /mcp and never recommends local approval", () => {
     const secretPath = "C:/TRACKED_LOCAL_PATH_CANARY/.claude/settings.local.json";
     const mcp = config(
       [server("pending", "pending-approval")],
       [`tracked local configuration at ${secretPath}`],
     );
     const report = renderMcpStatusReport(mcp, []);
-    expect(report).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(report).toContain("Use interactive `/mcp manage` to review exact execution definitions.");
+    expect(report).toContain("user or managed settings only");
+    expect(report).not.toContain("settings.local.json");
     expect(report).not.toContain("TRACKED_LOCAL_PATH_CANARY");
     const doctorReport = doctor(mcp);
-    expect(doctorReport).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(doctorReport).toContain("use interactive `/mcp manage` to review exact execution definitions");
+    expect(doctorReport).toContain("user or managed settings only");
+    expect(doctorReport).not.toContain("settings.local.json");
     expect(doctorReport).not.toContain("TRACKED_LOCAL_PATH_CANARY");
   });
 });
@@ -734,6 +742,29 @@ describe("managed MCP policy status foundation", () => {
     const doctorReport = doctor(mcp);
     expect(doctorReport).toContain("If access is expected, request an administrator policy change");
     expect(mcpGuidanceSegment(doctorReport)).not.toMatch(/repair|recover/iu);
+  });
+
+  it("diagnoses pending administration recovery explicitly while keeping declarations hidden", () => {
+    const mcp: ResolvedMcpConfig = {
+      servers: [server("HIDDEN_NAME_CANARY", "enabled")],
+      diagnostics: ["MCP administration recovery is pending; run an MCP administration action to complete rollback before startup"],
+      failClosed: "administration-recovery-pending",
+      policyPosture: "fail-closed",
+      policyAuthority: "user-controlled",
+    };
+    const status = renderMcpStatusReport(mcp, []);
+    expect(status).toContain("declarations are hidden and startup is fail closed because administration rollback is pending");
+    expect(status).toContain("Open `/mcp manage` in an interactive TUI to retry service-owned rollback");
+    expect(status).toContain("Preserve configuration and inspect the bounded `/doctor` diagnosis if it remains pending");
+    expect(status).not.toContain("HIDDEN_NAME_CANARY");
+
+    const doctorReport = doctor(mcp);
+    expect(doctorReport).toContain("declarations are hidden and startup is fail closed because MCP administration rollback is pending");
+    expect(doctorReport).toContain("Use interactive `/mcp manage` to retry service-owned rollback");
+    expect(doctorReport).toContain("Preserve configuration if it remains pending; bounded recovery diagnosis follows below");
+    expect(doctorReport).toContain("MCP administration rollback remains pending, so declarations are hidden and startup is fail closed");
+    expect(doctorReport).not.toContain("inspect the bounded `/doctor` diagnosis");
+    expect(doctorReport).not.toContain("HIDDEN_NAME_CANARY");
   });
 
   it("prioritizes native-state recovery over generic policy fail-closed prose", () => {

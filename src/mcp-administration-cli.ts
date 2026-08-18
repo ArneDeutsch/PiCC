@@ -28,19 +28,20 @@ Commands:
   reset-project-choices [--dry-run]
   help [command]
 
-List/get report a bounded acquired inventory; omitted declarations are counted. Scoped reads are a PiCC extension.
+List/get report a bounded acquired inventory; omitted declarations are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.
 Use picc mcp <command> --help for command grammar.
-Mutations run directly without confirmation. --dry-run prints the same semantic plan without writing.
-Inline JSON may expose credentials in argv and shell history; prefer --json-file or --json-file -.`;
+Mutations run directly without confirmation. --dry-run evaluates the current safe snapshot without recovery or writes and may refuse where direct execution first recovers.
+Inline JSON and --env/--header values may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.`;
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
-  list: "Usage: picc mcp list [--scope|-s local|project|user]\nReports a bounded acquired inventory and the effective winner; any omissions are counted. Scoped reads are a PiCC extension.",
-  get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Scoped reads are a PiCC extension.",
-  add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable.",
-  "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; prefer file/stdin.",
+  list: "Usage: picc mcp list [--scope|-s local|project|user]\nReports a bounded acquired inventory and the effective winner; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
+  get: "Usage: picc mcp get <name> [--scope|-s local|project|user]\nReports the bounded acquired effective winner and same-name collisions; any omissions are counted. Eligible winners may be transiently started/contacted for bounded health and capability probing, then bounded shutdown is attempted. Scoped reads are a PiCC extension.",
+  add: "Usage: picc mcp add [--dry-run] [--scope|-s local|project|user] [--transport|-t stdio] <name> [--env|-e KEY=VALUE ...] -- <command> [args...]\n       picc mcp add [--dry-run] [--scope|-s local|project|user] --transport|-t http|sse <name> <url> [--header|-H \"Name: Value\" ...]\nDefault scope: local. Static headers are supported; OAuth login is unavailable. --env/--header values may be exposed in argv and shell history; for credentials prefer add-json --json-file <path|->.",
+  "add-json": "Usage: picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> <json>\n       picc mcp add-json [--dry-run] [--scope|-s local|project|user] <name> --json-file <path|->\nDefault scope: local. Inline JSON may expose credentials in argv and shell history; for credential-bearing definitions prefer add-json --json-file <path|->.",
   remove: "Usage: picc mcp remove [--dry-run] [--scope|-s local|project|user] <name>\nWithout --scope, removes the sole mutable same-name declaration and refuses ambiguity.",
   "reset-project-choices": "Usage: picc mcp reset-project-choices [--dry-run]\nResets PiCC-owned review choices across the active profile and checkout family; declarations and runtime-disable choices are preserved.",
 });
 const SYNTAX = "PiCC MCP: invalid arguments. Run `picc mcp --help` for usage.";
+const TRANSIENT_PROBE_WARNING = "PiCC MCP: eligible winners may be transiently started or contacted for bounded health/capability probing, then bounded shutdown is attempted.";
 
 export interface McpAdministrationCliOutput { log(message: string): void; error(message: string): void }
 export interface McpHealthProjection { readonly state: "connected" | "auth-needed" | "failed"; readonly tools: number; readonly prompts: number; readonly resources: number }
@@ -211,7 +212,7 @@ function healthText(row: McpAdministrationInventoryItem, projected: McpHealthPro
 }
 function renderInventory(inventory: McpAdministrationInventory, rows: readonly McpAdministrationInventoryItem[], handle: McpCliServiceHandle, scoped = false): string {
   const lines = [`MCP inventory${scoped ? " (PiCC scoped-read extension)" : ""}: policy=${inventory.policyPosture}; declarations=${rows.length}; omitted=${inventory.omittedDeclarationCount}`];
-  if (inventory.remediation !== undefined) lines.push("Recovery: reads cannot recover pending MCP administration state; retry the original mutation that left recovery pending.");
+  if (inventory.remediation !== undefined) lines.push("Recovery: reads cannot recover pending MCP administration state; open `/mcp manage` in an interactive TUI to attempt service-owned recovery, then retry this read.");
   for (const row of rows) {
     const projected = probeEligible(row) ? handle.health(row.name) : undefined; const authority = row.authority.kind === "mutable" ? row.authority.scope : `read-only:${row.authority.sourceClass}`;
     lines.push(`${renderedName(row.name)}: scope=${authority}; precedence=${row.precedence}; source=${row.source}; policy=${row.policy}; review=${row.review}; status=${row.status}; health=${healthText(row, projected)}; transport=${row.summary.transport ?? "unsupported"}; capabilities=${projected?.tools ?? row.capabilityCounts.tools}/${projected?.prompts ?? row.capabilityCounts.prompts}/${projected?.resources ?? row.capabilityCounts.resources}`);
@@ -232,9 +233,11 @@ function renderRecovery(result: McpAdministrationResult["recovery"]): string {
   if (result.state === "not-requested") return "";
   return `Recovery: state=${result.state}; effect=${result.effect}; cleanup=${result.cleanup}${result.reasonCode === undefined ? "" : `; reason=${result.reasonCode}`}`;
 }
-function remediation(reasonCode: string): string | undefined {
+function remediation(reasonCode: string, dryRun = false): string | undefined {
   return ({
-    "recovery-pending": "Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.",
+    "recovery-pending": dryRun
+      ? "Action: dry-run cannot recover pending MCP administration state; open `/mcp manage` in an interactive TUI to attempt service-owned recovery, then retry the original dry-run."
+      : "Action: retry this administration command to continue safe rollback; no new writes are allowed until recovery completes.",
     "invalid-authority": "Action: rerun from the intended project and selected Claude profile after any project/profile change.",
     "stale-state": "Action: reacquire current MCP state and retry the command.",
     busy: "Action: wait for the competing MCP administration operation to finish, then retry.",
@@ -263,6 +266,7 @@ export async function runMcpAdministrationCli(argv: readonly string[], output: M
     parsed = { kind: "mutation", action: { kind: "add", scope: parsed.addJson.scope, name: parsed.addJson.name, definition: source.value }, dryRun: parsed.addJson.dryRun };
   }
   const health = parsed.kind === "list" || parsed.kind === "get";
+  if (health) output.error(TRANSIENT_PROBE_WARNING);
   let composed: StoreResult<McpCliServiceHandle>;
   try { composed = await (options.services ?? ((enabled) => createProductionMcpCliServices({ ...options, health: enabled })))(health); }
   catch { output.error("PiCC MCP: administration unavailable (composition-failed)."); return 1; }
@@ -284,7 +288,7 @@ export async function runMcpAdministrationCli(argv: readonly string[], output: M
         preparedRecovery = "recovery" in resolution ? resolution.recovery as McpAdministrationResult["recovery"] : undefined;
         if (preparedRecovery !== undefined && preparedRecovery.state !== "not-requested") output.log(renderRecovery(preparedRecovery));
         if (!resolution.eligibility.eligible) {
-          const guidance = remediation(resolution.eligibility.reasonCode); if (guidance !== undefined) output.log(guidance); return 1;
+          const guidance = remediation(resolution.eligibility.reasonCode, removeDryRun); if (guidance !== undefined) output.log(guidance); return 1;
         }
         const matches = resolution.inventory.servers.filter((row) => row.name === removeName && row.authority.kind === "mutable" && row.agentOwner === undefined);
         if (matches.length === 0) { output.error("PiCC MCP: no mutable server with that exact name was found."); output.log(remediation("server-not-found")!); return 1; }
@@ -295,7 +299,7 @@ export async function runMcpAdministrationCli(argv: readonly string[], output: M
     }
     if (parsed.dryRun) {
       const preview = await handle.service.preview(parsed.action);
-      output.log(resultPlan(parsed.action, preview, true)); const guidance = remediation(preview.eligibility.reasonCode); if (guidance !== undefined) output.log(guidance); return preview.eligibility.eligible ? 0 : 1;
+      output.log(resultPlan(parsed.action, preview, true)); const guidance = remediation(preview.eligibility.reasonCode, true); if (guidance !== undefined) output.log(guidance); return preview.eligibility.eligible ? 0 : 1;
     }
     const result = await handle.service.execute(parsed.action);
     if (parsed.action.kind === "add" && result.eligibility.eligible && result.durable.state === "committed" && result.durable.cleanup === "complete") { output.log(renderAddedState(parsed.action, result.inventory)); return 0; }
