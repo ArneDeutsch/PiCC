@@ -606,7 +606,7 @@ describe("MCP administration orchestration", () => {
   });
 
   it("keeps an authenticated add commit successful but live-inert after a concurrent exact-name replacement", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-service-evidence-"));
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-service-evidence-")));
     try {
       const home = path.join(root, "home");
       const project = path.join(root, "project");

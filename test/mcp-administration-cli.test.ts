@@ -202,7 +202,7 @@ function productionProject(root: string, home: string): LoadedProject {
 
 describe("standalone MCP production composition", () => {
   it("pins exact fresh-runtime lifecycle and deterministic operational failure", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-production-")); const home = path.join(root, "home"); const project = path.join(root, "project"); fs.mkdirSync(home); fs.mkdirSync(project);
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-production-"))); const home = path.join(root, "home"); const project = path.join(root, "project"); fs.mkdirSync(home); fs.mkdirSync(project);
     const expectedEvents = {
       none: ["fresh-load", "start", "settle", "states", "shutdown", "inventory-complete"],
       settle: ["fresh-load", "start", "settle", "shutdown"],
@@ -237,7 +237,7 @@ describe("standalone MCP production composition", () => {
   });
 
   it("keeps an authenticated create commit successful after a concurrent deletion and reports not-visible without live startup", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-deleted-")); const home = path.join(root, "home"); const project = path.join(root, "project"); fs.mkdirSync(home); fs.mkdirSync(project);
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-deleted-"))); const home = path.join(root, "home"); const project = path.join(root, "project"); fs.mkdirSync(home); fs.mkdirSync(project);
     try {
       const startRuntime = vi.fn(); const absentProject = () => { const loaded = productionProject(project, home); return { ...loaded, mcp: { ...loaded.mcp, administration: { ...loaded.mcp.administration!, declarations: [] } } }; };
       const handle = await createProductionMcpCliServices({ cwd: project, homeDir: home, env: {}, health: false, startRuntime, loadProject: absentProject });
@@ -255,7 +255,7 @@ describe("standalone MCP production composition", () => {
   });
 
   it("constructs no runtime for mutations and fails closed when freshly reloaded authority drifts", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-authority-")); const home = path.join(root, "home"); const project = path.join(root, "project"); const drift = path.join(root, "drift"); fs.mkdirSync(home); fs.mkdirSync(project); fs.mkdirSync(drift);
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-cli-authority-"))); const home = path.join(root, "home"); const project = path.join(root, "project"); const drift = path.join(root, "drift"); fs.mkdirSync(home); fs.mkdirSync(project); fs.mkdirSync(drift);
     try {
       const startRuntime = vi.fn(); const stable = await createProductionMcpCliServices({ cwd: project, homeDir: home, env: {}, health: false, loadProject: () => productionProject(project, home), startRuntime });
       expect(stable.ok).toBe(true); if (!stable.ok) return; await expect(stable.value.service.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({ eligibility: { eligible: true }, durable: { state: "committed" } }); expect(startRuntime).not.toHaveBeenCalled();

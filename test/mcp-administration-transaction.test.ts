@@ -9,7 +9,7 @@ import type { TransactionFaultPhase } from "../src/plugin-lifecycle/transaction.
 import { acquireLifecycleLocks, releaseLifecycleLocks } from "../src/plugin-lifecycle/locks.js";
 
 async function setup() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-transaction-")); const home = path.join(root, "home"); const project = path.join(root, "project");
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-transaction-"))); const home = path.join(root, "home"); const project = path.join(root, "project");
   fs.mkdirSync(home); fs.mkdirSync(project); const profile = path.join(home, ".claude.json"); fs.writeFileSync(profile, "{}\n");
   const locations = createMcpLifecycleLocations({ homeDir: home, profilePath: profile, platform: process.platform === "win32" ? "win32" : "posix",
     project: { activeCheckoutPath: project, checkoutFamilyPath: project } }); if (!locations.ok || !locations.value.checkoutFamilyKey) throw new Error("locations");
