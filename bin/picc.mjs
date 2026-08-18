@@ -8,6 +8,7 @@ const HELP = `Usage: picc [Pi options]
 PiCC options:
   -h, --help       Show this help
   -v, --version    Show PiCC and embedded Pi versions
+  --agent <name>   Run the main session as a Claude-format custom agent
   update           Update or repair PiCC
   plugin           Local marketplace/plugin lifecycle and offline recovery
                    Run picc plugin --help for the strict command grammar

@@ -84,11 +84,12 @@ The full, always-current compatibility matrix is in
 
 ## Control surface
 
-Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives an explicit
-project compatibility report; bare `/mcp` shows bounded MCP status and, in the TUI, `/mcp manage`
-opens interactive administration; `/usage` reports a per-subagent token/cost breakdown; `/quota` reports
-provider quota headers; `alt+a` opens the subagent status panel. Outside a session, `picc mcp`
-provides scoped MCP inventory and configuration commands.
+Inside a session: `/skills` lists loaded skills; `/agents` lists the subagent catalog permitted by
+the current main-agent policy; `/doctor` gives an explicit project compatibility report; bare `/mcp`
+shows bounded passive status, while TUI-only `/mcp manage` opens interactive administration; `/usage`
+reports a per-subagent token/cost breakdown; `/quota` reports provider quota headers; `alt+a` opens the
+subagent status panel. Outside a session, `picc mcp` provides scoped MCP inventory and configuration
+commands.
 Eligible user-invocable skills whose names do not conflict with built-ins appear in the `/`
 autocomplete menu. Model and per-model steering are
 configured outside the project — see the [user guide](doc/user-guide.md#5-control-surface-project-external).

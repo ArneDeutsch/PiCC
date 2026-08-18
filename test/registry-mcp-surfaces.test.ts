@@ -90,9 +90,10 @@ describe("MCP prompt and resource capability registry", () => {
     const proxy = note("tool.mcp__*");
     expect(proxy).toContain("For one exact execution definition, the first successfully discovered name/schema/description catalog remains immutable");
     expect(proxy).toContain("After aggregate initial settlement, the main session can add, retire, or exact-definition-refresh registrations");
-    expect(proxy).toContain("Named agents instead compose an immutable dispatch-local universe from borrowed eligible session servers and their own admitted inline runtime");
-    expect(proxy).toContain("then restrict/drop it via tools:/disallowedTools:");
-    expect(proxy).toContain("parent and sibling inline capabilities do not propagate");
+    expect(proxy).toContain("selected main agent composes a session-owned universe from borrowed eligible globals and its own admitted inline runtime");
+    expect(proxy).toContain("Dispatched agents compose immutable dispatch-local universes by the same route rules");
+    expect(proxy).toContain("Both restrict/drop them via tools:/disallowedTools:");
+    expect(proxy).toContain("parent or sibling inline capabilities do not propagate");
     expect(proxy).toContain("Reconnect never widens a same-definition universe");
 
     const aggregate = note("feature.mcp");
@@ -147,26 +148,32 @@ describe("MCP prompt and resource capability registry", () => {
     expect(note("feature.mcp-sampling")).toContain("cannot ask PiCC to run model generations");
   });
 
-  it("pins named-agent gating, background resources, and main-session-only prompt commands", () => {
+  it("pins selected-main and dispatched-agent gating, ownership, and prompt publication", () => {
     const frontmatter = note("agent.frontmatter.mcpServers");
-    expect(frontmatter).toContain("omitted or clean-empty declarations, including on nested agents, inherit eligible published main-session routes");
-    expect(frontmatter).toContain("references borrow published routes without duplicate clients");
-    expect(frontmatter).toContain("inline stdio/HTTP/SSE servers are dispatch-owned and isolated from parents and siblings");
-    expect(frontmatter).toContain("Parent-inline routes do not propagate to nested children");
-    expect(frontmatter).toContain("non-empty declaration selection and parent-inline non-propagation are inferred, unverified choices");
+    expect(frontmatter).toContain("Selected-main and dispatched user/project agents borrow eligible published routes");
+    expect(frontmatter).toContain("can own admitted inline stdio/HTTP/SSE runtimes");
+    expect(frontmatter).toContain("published routes win same-name collisions");
+    expect(frontmatter).toContain("Selected-main ownership lasts for the session");
+    expect(frontmatter).toContain("publishes only selected-owned inline state in selected-authority /mcp and /doctor sections");
+    expect(frontmatter).toContain("missing, invalid, blocked, disabled, pending/rejected, or startup-failed as an admission failure");
+    expect(frontmatter).toContain("Dispatch ownership starts after SubagentStart/worktree admission");
+    expect(frontmatter).toContain("remains absent from parent inventory");
+    expect(frontmatter).toContain("bounded child/result warnings rather than blocking parent admission");
+    expect(frontmatter).toContain("Nested omitted/clean-empty declarations inherit eligible globals");
+    expect(frontmatter).toContain("parent-inline routes do not propagate");
     expect(frontmatter).not.toContain("only capabilities they independently declare");
-    expect(frontmatter).toContain("managed agents remain dispatchable but retain the field only as inert evidence");
+    expect(frontmatter).toContain("managed agents retain inert evidence");
     expect(frontmatter).toContain("managed-agent MCP execution");
-    expect(frontmatter).not.toContain("managed-agent execution");
-    expect(frontmatter).toContain("The combined universe is gated by agent tools:/disallowedTools:, deny permissions, command hooks, timeouts, managed policy, PiCC's exact execution-definition/source-family/agent-owner project review or broad user/managed compatibility approval, the disabledMcpjsonServers compatibility-decline gate, and the existing non-fork background resource-tool filter");
-    expect(frontmatter).toContain("Prompt commands remain main-session-only");
+    expect(frontmatter).not.toContain("managed-agent execution,");
+    expect(frontmatter).toContain("General admission, policy, lifecycle, cleanup, exposure, status, and transport mechanics are owned by the corresponding feature.mcp-* entries");
+    expect(frontmatter).toContain("prompt commands remain main-session-only");
 
     const approval = note("feature.mcp-project-approval");
     expect(approval).toContain("Ordinary pending servers surface as a count-only one-time TUI notice");
     expect(approval).toContain("pointing to `/mcp manage`");
-    expect(approval).toContain("Agent-inline static pending declarations appear only in /doctor");
+    expect(approval).toContain("dispatch-inline static pending declarations appear only in /doctor");
     expect(approval).toContain("dispatch-time setup or cleanup outcomes appear only in bounded Agent/TaskOutput results");
-    expect(approval).toContain("agent-inline state is absent from the parent /mcp");
+    expect(approval).toContain("Only selected-owned inline state enters the parent selected-authority /mcp section");
   });
 });
 
@@ -220,9 +227,9 @@ describe("MCP administration capability registry", () => {
     expect(note("setting.enabledMcpjsonServers")).toContain("distinct from PiCC private exact-definition review");
     expect(note("setting.disabledMcpjsonServers")).toContain("separate private exact-definition decision");
     expect(note("setting.mcpServers")).toContain("exact PiCC review or a broad user/managed compatibility grant");
-    expect(note("agent.frontmatter.mcpServers")).toContain("Checkout-local approval keys never authorize");
-    expect(note("agent.frontmatter.mcpServers")).toContain("dynamic host exposure");
-    expect(note("agent.frontmatter.mcpServers")).toContain("interactive per-tool permission approval");
+    expect(note("feature.mcp-project-approval")).toContain("Checkout-local and committed project approval keys never authorize");
+    expect(note("feature.mcp-capability-discovery")).toContain("dynamic main-session host refresh");
+    expect(note("agent.frontmatter.mcpServers")).toContain("interactive per-tool approval");
   });
 });
 
@@ -247,7 +254,7 @@ const GROUPING_RATIONALES: Readonly<Record<string, string>> = {
   "feature.mcp-cli-invocation-controls": "These invocation/loading flags share PiCC's absent Claude CLI parser and non-safety conclusion; normal discovery remains active without --bare's general MCP suppression.",
   "feature.mcp-list-changed": "The three list_changed notifications and failed-refresh retention leaf remain unsupported even though explicit changed-definition administration can refresh host exposure.",
   "feature.mcp-max-result-size-chars": "The metadata and persistence behavior are the same unsupported per-tool text-threshold contract, distinct from generic clipping.",
-  "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share PiCC's partial boundary: main-session failures remain human-only, while bounded named-agent setup and cleanup degradation qualifies child or parent model surfaces at its lifecycle boundary.",
+  "feature.mcp-model-failure-visibility": "Failed-server reporting and tool-search selection dependency share PiCC's partial boundary: ordinary-main failures remain human-only, selected-main setup denies admission, and dispatched setup or cleanup qualifies bounded child or parent surfaces.",
   "feature.mcp-server-instructions": "Instruction forwarding and its truncation rule share one absent model-context behavior and non-safety conclusion.",
   "feature.mcp-managed-config": "The standalone managed source, exclusive/empty behavior, fail-closed hardening, and deferred delivery/source limits form one partial administrator-control boundary." ,
   "feature.mcp-oauth": "OAuth login, logout, and dynamic registration share the absent credential flow, non-safety tier, and static-header remedy.",
@@ -694,16 +701,21 @@ describe("dated Claude Code MCP surface audit", () => {
     expect(lookupCapability("feature.mcp-runtime-enabled")).toMatchObject({ tier: "not-supported", safetyRelevant: false });
     expect(lookupCapability("feature.mcp-model-failure-visibility")).toMatchObject({ tier: "partial", safetyRelevant: false });
     const failureVisibility = note("feature.mcp-model-failure-visibility");
-    expect(failureVisibility).toContain("Main-session startup failures are not injected into MAIN-SESSION model context, and raw failure details are not model-reported");
-    expect(failureVisibility).toContain("explicit named-agent reference to a configured route that is unpublished at dispatch may instead receive bounded PiCC-defined unavailability wording");
-    expect(failureVisibility).toContain("direct named-agent inline setup degradation settles before the first child provider request");
-    expect(failureVisibility).toContain("one bounded PiCC-defined warning reaches that child and later qualifies Agent/TaskOutput");
-    expect(failureVisibility).toContain("Cleanup degradation is discovered only after child work and therefore qualifies the parent-facing result, not the already-finished child request");
-    expect(failureVisibility).toContain("No warning exposes raw config or runtime errors");
+    expect(failureVisibility).toContain("Ordinary main-session startup failures are not injected into model context");
+    expect(failureVisibility).toContain("raw failure details are not model-reported");
+    expect(failureVisibility).toContain("remain human-visible through /mcp, /doctor, warnings, and stderr");
+    expect(failureVisibility).toContain("Selected-main MCP setup, publication, or uncertain cleanup instead fails admission before provider work");
+    expect(failureVisibility).toContain("redacted recovery diagnostics");
+    expect(failureVisibility).toContain("A dispatched agent's unpublished reference or inline setup degradation settles before its first request");
+    expect(failureVisibility).toContain("receives bounded PiCC-defined warning context that later qualifies Agent/TaskOutput");
+    expect(failureVisibility).toContain("cleanup discovered after child work qualifies only the parent-facing result");
+    expect(failureVisibility).toContain("No path exposes raw config or runtime errors");
     const aggregate = note("feature.mcp");
-    expect(aggregate).toContain("main-session startup failures are not injected into MAIN-SESSION model context, and raw failure details are not model-reported");
-    expect(aggregate).toContain("explicit named-agent reference to a configured route that is unpublished at dispatch may receive bounded PiCC-defined unavailability wording");
-    expect(aggregate).toContain("direct named-agent inline setup degradation receives bounded warning context before that child's first provider request");
+    expect(aggregate).toContain("main-session startup failures are not injected into MAIN-SESSION model context");
+    expect(aggregate).toContain("raw failure details are not model-reported");
+    expect(aggregate).toContain("Selected-main setup failure denies provider admission with redacted recovery");
+    expect(aggregate).toContain("explicit dispatched-agent reference to an unpublished route may receive bounded PiCC-defined unavailability wording");
+    expect(aggregate).toContain("direct dispatch-inline setup degradation receives bounded warning context before that child's first provider request");
     expect(note("feature.mcp-websocket")).toContain("stdio, HTTP, and SSE alternatives");
     expect(note("feature.mcp-websocket")).toContain("no unchanged-project PiCC path");
     expect(note("feature.mcp-server-always-load")).toContain("Check `/mcp` readiness");

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import picc, { type PiccTestSeam } from "../src/index.js";
+import { loadClaudeProject } from "../src/project.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import type { McpLifecycleState, McpToolInfo } from "../src/runtime/mcp.js";
@@ -1430,6 +1431,102 @@ describe("MCP administration exposure composition", () => {
       process.chdir(originalCwd);
       await shutdownExtension(pi);
     }
+  });
+
+  it.each(["reject", "reset", "runtime-failure", "exposure-failure", "diagnostic-only"] as const)("rebuilds fresh selected MCP authority for %s without replacing the frozen non-MCP identity", async (scenario) => {
+    const originalCwd = process.cwd(); const dir = makeTempDir("picc-mcp-selected-admin-"); const pi = fakePi();
+    const selectedOwner = { name: "worker", scope: "project" as const }; const otherOwner = { name: "other", scope: "project" as const };
+    const digest = `mcp-review-v1:${"b".repeat(64)}`; const branch: Record<string, unknown>[] = []; const events: string[] = [];
+    let service: McpAdministrationService | undefined; let review: "approved-broad-all" | "approved-exact" | "rejected-exact" | "pending" = "approved-broad-all";
+    let globalEnabled = true; let mutateIdentity = false; let generation = 0; let runtimeFault = false; let exposureFault = false; let diagnosticOnly = false;
+    const summary = { transport: "stdio", commandBasename: "node", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false } as const;
+    const declarations = () => [
+      { name: "borrowed", source: "native-user", authority: { kind: "mutable", scope: "user" }, precedence: "winner", definitionVersion: 1, definitionDigest: digest, summary, policy: "allowed", review: "not-required", status: globalEnabled ? "enabled" : "disabled", ...(globalEnabled ? {} : { inactiveReason: "native-runtime-disabled" }) },
+      { name: "owned", source: "subagent-inline", agentOwner: selectedOwner, authority: { kind: "read-only", sourceClass: "subagent-inline" }, precedence: "winner", definitionVersion: 1, definitionDigest: digest, summary, policy: "allowed", review, status: review === "rejected-exact" ? "disabled" : review === "pending" ? "pending-approval" : "enabled" },
+      { name: "owned", source: "subagent-inline", agentOwner: otherOwner, authority: { kind: "read-only", sourceClass: "subagent-inline" }, precedence: "winner", definitionVersion: 1, definitionDigest: digest, summary, policy: "allowed", review: "approved-exact", status: "enabled" },
+    ] as const;
+    const administration = () => ({ version: 1, policyPosture: "absent", observations: [], declarations: declarations(), omittedDeclarationCount: 0 }) as const;
+    const selectedServer = () => ({ name: "owned", source: "subagent-inline", status: review === "rejected-exact" ? "disabled" : review === "pending" ? "pending-approval" : "enabled", transport: "stdio", command: "node", rawCommand: "node", args: [], env: {}, diagnostics: [] }) as const;
+    const originalSend = pi.api.sendMessage as (message: Record<string, unknown>, options?: Record<string, unknown>) => void;
+    const originalSetActiveTools = pi.api.setActiveTools as (names: string[]) => void;
+    const originalRegisterTool = pi.api.registerTool as (definition: Record<string, unknown>) => void;
+    Object.assign(pi.api, { getFlag: () => "worker", sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+      originalSend(message, options); if (message.customType === "picc-selected-main-agent-initial-prompt") branch.push({ type: "custom_message", ...message });
+    }, registerTool: (definition: Record<string, unknown>) => { if (exposureFault) throw new Error("RAW_EXPOSURE_FAULT"); originalRegisterTool(definition); },
+      setActiveTools: (names: string[]) => { if (exposureFault) throw new Error("RAW_EXPOSURE_FAULT"); originalSetActiveTools(names); } });
+    try {
+      process.chdir(dir); writeProjectFile(dir, "CLAUDE.md", "selected administration fixture\n");
+      writeProjectFile(dir, ".claude/agents/worker.md", ["---", "name: worker", "description: frozen owner", "tools: [mcp__borrowed__echo, mcp__owned__echo]", "mcpServers:", "  - borrowed", "  - owned:", "      command: node", "---", "FROZEN SELECTED BODY", ""].join("\n"));
+      picc(pi.api as never, {
+        managedSettingsPaths: [], managedArtifactDirs: [],
+        loadProject: (options) => {
+          const loaded = loadClaudeProject(options); const resolved = { servers: [selectedServer()], diagnostics: [], diagnosticOwnership: [], administration: administration() };
+          return { ...loaded,
+            agents: loaded.agents.map((agent) => agent.name === "worker" && mutateIdentity ? { ...agent, body: "MUTATED BODY MUST NOT ENTER SESSION", tools: ["Read"] } : agent),
+            mcp: { ...loaded.mcp, servers: globalEnabled ? [{ name: "borrowed", source: "native-user", status: "enabled", transport: "stdio", command: "node", rawCommand: "node", args: [], env: {}, diagnostics: [] }] : [], administration: administration() } as never,
+            agentMcpAdmission: { resolve: () => resolved as never, resolveOwned: (_declaration: unknown, owner: { name: string }) => owner.name === "worker" ? resolved as never : { ...resolved, servers: [{ ...selectedServer(), status: "enabled" }] } as never },
+          };
+        },
+        mcpRuntime: { whenSettled: async () => {}, tools: () => globalEnabled ? [{ serverName: "borrowed", toolName: "echo", description: "global", inputSchema: { type: "object" } }] : [], prompts: () => [], resourceServers: () => [], diagnostics: () => [], serverStates: () => globalEnabled ? [{ name: "borrowed", transport: "stdio", state: "connected" }] : [], shutdown: async () => {}, callTool: async () => ({ content: [{ type: "text", text: "GLOBAL" }] }), getPrompt: async () => ({ messages: [] }), readResource: async () => ({ contents: [] }), disableServer: async () => ({ state: "succeeded", deltas: [] }), reconcileServer: async () => ({ state: "succeeded", deltas: [] }), reconnectServer: async () => ({ state: "succeeded", deltas: [] }) } as never,
+        selectedMainMcpScopeFactory: async () => {
+          const ownGeneration = ++generation; events.push(`start:${ownGeneration}:${review}:${globalEnabled}`);
+          if (runtimeFault) throw new Error("RAW_RUNTIME_FACTORY_FAULT");
+          const tools = [...(globalEnabled ? [{ serverName: "borrowed", toolName: "echo", description: "borrowed", inputSchema: { type: "object" } }] : []), { serverName: "owned", toolName: "echo", description: "owned", inputSchema: { type: "object" } }];
+          return { whenSettled: async () => {}, tools: () => tools, resourceServers: () => [], serverStates: () => tools.map(({ serverName }) => ({ name: serverName, transport: "stdio" as const, state: "connected" as const })), callTool: async (server: string) => ({ content: [{ type: "text", text: `SELECTED-${ownGeneration}:${server}` }] }), readResource: async () => ({ contents: [] }), diagnostics: () => diagnosticOnly ? ["RAW_NONBLOCKING_DIAGNOSTIC"] : [], setupOutcomes: () => [], knownToolNames: () => tools.map(({ serverName, toolName }) => `mcp__${serverName}__${toolName}`), borrowedServerNames: () => globalEnabled ? ["borrowed"] : [], shutdown: async () => { events.push(`stop:${ownGeneration}`); return { confirmed: ["owned"], unconfirmed: [], diagnostics: [] }; }, retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: [], diagnostics: [] }) };
+        },
+        mcpAdministration: { inspectPending: async () => ({ pending: false, status: "clear" }), mutate: async (mutation) => {
+          if (mutation.kind === "set-review" && mutation.record.agentOwner?.name === selectedOwner.name) { mutateIdentity = true; review = mutation.record.decision === "approved" ? "approved-exact" : "rejected-exact"; }
+          if (mutation.kind === "reset-review") review = "pending";
+          if (mutation.kind === "set-runtime-disabled" && mutation.name === "borrowed") globalEnabled = !mutation.disabled;
+          return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false };
+        }, captureService: (captured) => { service = captured; } }, onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      const manager = { getBranch: () => branch, getEntries: () => branch, appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }) };
+      const ctx = pi.tuiCtx({ sessionManager: manager, isProjectTrusted: () => true }); await pi.fire("session_start", { reason: "startup" }, ctx);
+      const initialOwned = pi.tools.get("mcp__owned__echo"); const initialBorrowed = pi.tools.get("mcp__borrowed__echo"); expect(generation).toBe(1);
+      await expect(service!.execute({ kind: "reject", name: "owned", agentOwner: otherOwner })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } }); expect(generation).toBe(1);
+      const approvedResult = await service!.execute({ kind: "approve", name: "owned", agentOwner: selectedOwner });
+      expect(approvedResult).toMatchObject({ runtime: { state: "succeeded" }, exposure: { state: "succeeded" } }); expect(generation).toBe(2);
+      await expect(initialOwned.execute("stale-approved", {})).rejects.toThrow(/not active/u);
+      const prompt = String((await pi.fire("before_agent_start", { systemPrompt: "ordinary" }, ctx))?.systemPrompt); expect(prompt).toContain("FROZEN SELECTED BODY"); expect(prompt).not.toContain("MUTATED BODY MUST NOT ENTER SESSION"); expect(pi.activeTools.has("mcp__owned__echo")).toBe(true);
+      const disabledResult = await service!.execute({ kind: "disable", name: "borrowed" });
+      expect(disabledResult).toMatchObject({ runtime: { state: "succeeded" }, exposure: { state: "succeeded" } }); expect(generation).toBe(3);
+      await expect(initialBorrowed.execute("stale-borrowed", {})).rejects.toThrow(/not active/u); expect(pi.activeTools.has("mcp__borrowed__echo")).toBe(false); expect(pi.activeTools.has("mcp__owned__echo")).toBe(true);
+      const beforeReject = pi.tools.get("mcp__owned__echo");
+      if (scenario === "reject" || scenario === "reset") {
+        const restrictive = await (scenario === "reject"
+          ? service!.execute({ kind: "reject", name: "owned", agentOwner: selectedOwner })
+          : service!.execute({ kind: "reset-project-choices" }));
+        expect(restrictive).toMatchObject({
+          inventory: { servers: expect.arrayContaining([expect.objectContaining({
+            name: "owned", agentOwner: selectedOwner,
+            status: scenario === "reject" ? "disabled" : "pending-approval",
+          })]) },
+          runtime: { state: "failed", reasonCode: "runtime-failed" }, exposure: { state: "succeeded" },
+        });
+        expect(generation).toBe(3);
+      } else {
+        runtimeFault = scenario === "runtime-failure"; exposureFault = scenario === "exposure-failure"; diagnosticOnly = scenario === "diagnostic-only";
+        const failed = service!.execute({ kind: "enable", name: "borrowed" });
+        await expect(failed).resolves.toMatchObject(scenario === "runtime-failure"
+          ? { runtime: { state: "failed", reasonCode: "runtime-failed" }, exposure: { state: "succeeded" } }
+          : scenario === "exposure-failure"
+            ? { runtime: { state: "succeeded" }, exposure: { state: "failed", reasonCode: "exposure-failed" } }
+            : { runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+        expect(generation).toBe(4);
+      }
+      await expect(beforeReject.execute("stale-restricted", {})).rejects.toThrow(/not active/u);
+      if (scenario === "diagnostic-only") {
+        expect(pi.activeTools.has("mcp__owned__echo")).toBe(true);
+        await expect(pi.fire("before_provider_request", {}, ctx)).resolves.toBeUndefined();
+      } else {
+        if (scenario !== "exposure-failure") expect(pi.activeTools.has("mcp__owned__echo")).toBe(false);
+        await expect(pi.fire("before_provider_request", {}, ctx)).rejects.toThrow(/admission is closed/u);
+      }
+      expect(events.slice(0, 6)).toEqual(["start:1:approved-broad-all:true", "stop:1", "start:2:approved-exact:true", "stop:2", "start:3:approved-exact:false", "stop:3"]);
+      expect(JSON.stringify(pi.notifications)).not.toMatch(/RAW_(?:RUNTIME|EXPOSURE|NONBLOCKING)_/u);
+    } finally { process.chdir(originalCwd); await shutdownExtension(pi); }
   });
 
   it("consumes scoped replacement, multi-reset, partial outcome, and cleanup-uncertain transitions", async () => {

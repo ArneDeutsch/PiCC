@@ -318,7 +318,7 @@ describe("tool-map", () => {
 
   it("reports touched files only for file tools", () => {
     expect(touchedFilePath("read", { path: "a.ts" }, "/work")).toBe("a.ts");
-    expect(touchedFilePath("edit", { file_path: "b.ts" }, "/work")).toBe("b.ts");
+    expect(touchedFilePath("edit", { path: "b.ts" }, "/work")).toBe("b.ts");
     expect(touchedFilePath("MultiEdit", { file_path: "x.ts" }, "/work")).toBe("x.ts");
     const cwd = path.resolve("worktree");
     expect(touchedFilePath("NotebookEdit", { notebook_path: "notes/book.ipynb" }, cwd))

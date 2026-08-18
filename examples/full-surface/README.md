@@ -23,6 +23,7 @@ Coverage map (each canary string is asserted by tests):
 | disable-model-invocation + unknown frontmatter | `skills/secret-ritual` | `FS-SKILL-USERONLY-BODY` |
 | Legacy command + args | `.claude/commands/ship.md` | `FS-LEGACY-SHIP` |
 | Nested subagents (depth 2 — **explicit opt-in** via `subagents.maxDepth: 2` in `.claude/settings.json`; nesting is off by default/main-session-only) | `agents/planner.md` → researcher | — |
+| Selected main session (`picc --agent selected-main`) | `agents/selected-main.md` | `FS-SELECTED-MAIN-BODY`, `FS-SELECTED-MAIN-INITIAL` |
 | Background dispatch + collection-aware `TaskOutput` delivery (terminal collection suppresses a redundant notice; running poll does not) | `agents/async-researcher.md`, `.claude/commands/bg-research.md` | `FS-BG-TASKOUTPUT` |
 | Read-only gating / web tools / locked YAML | `agents/reviewer.md`, `researcher.md` | — |
 | isolation: worktree | `agents/isolated-worker.md` | — |
@@ -42,7 +43,10 @@ Coverage map (each canary string is asserted by tests):
 shape. Both names are intentionally inert in this fixture: `fixture-session` has no configured
 session server and project-inline `fixture-inline` is unapproved. The fixture proves
 loading, static reporting, and topology only; focused runtime tests own connection reuse, dispatch
-isolation, and cleanup behavior.
+isolation, and cleanup behavior. Likewise, the selected-main fixture covers identity/prompt wiring only;
+focused integration tests own selected-main MCP administration, required-capability admission, dynamic
+status composition, stale-route fencing, and runtime/exposure outcome coverage rather than adding an
+optional fixture walkthrough.
 
 The background command documents the directional settlement guidance (focused runtime tests prove the
 behavior): an eligible uncollected current task gets one bounded next-turn notice, but a terminal

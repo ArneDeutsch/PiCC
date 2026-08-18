@@ -1410,6 +1410,14 @@ require("node:module").syncBuiltinESMExports();
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
       "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",
     ]);
+
+    const selected = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--agent", "selected-main", "-p", "hello"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(selected.status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
+      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "--agent", "selected-main", "-p", "hello",
+    ]);
   });
 
   it("keeps version actionable and successful for every invalid installed runtime category", () => {

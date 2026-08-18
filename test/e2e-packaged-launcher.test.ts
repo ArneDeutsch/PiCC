@@ -12,6 +12,7 @@ import {
   createE2ELive,
   REPO_ROOT,
   TEST_TIMEOUT_MS,
+  systemText,
   toolNames,
   toolResultText,
 } from "./helpers/e2e-live.js";
@@ -451,6 +452,8 @@ describe("installed release tarball", () => {
       const command = "node -e 'const e=process.env; console.log(JSON.stringify({sessionId:e.PI_SESSION_ID??null,sessionFile:e.PI_SESSION_FILE??null,provider:e.PI_PROVIDER??null,model:e.PI_MODEL??null,reasoning:e.PI_REASONING_LEVEL??null,project:e.CLAUDE_PROJECT_DIR??null,setting:e.PACKAGED_SETTING??null,skip:e.PI_SKIP_VERSION_CHECK??null,launcher:e.PICC_LAUNCHER_PID??null}))'";
       const result = await runPi({
         launcherPath: launcher,
+        fixture: "full-surface",
+        agent: "selected-main",
         prompt: "run the packaged environment probe",
         script: [
           { toolCalls: [{ name: "bash", args: { command } }] },
@@ -464,8 +467,9 @@ describe("installed release tarball", () => {
         },
       });
 
-      expect(result.code).toBe(0);
+      expect(result.code, result.stderr).toBe(0);
       expect(result.requests.length).toBeGreaterThanOrEqual(2);
+      expect(systemText(result.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY");
       expect(toolNames(result.requests[0]!)).toContain("Agent");
       const bash = toolResultText(result.requests[1]!);
       expect(bash).toContain('"sessionId":null');

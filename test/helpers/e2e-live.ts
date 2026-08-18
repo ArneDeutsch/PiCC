@@ -104,6 +104,14 @@ export interface RunPiOptions {
   secondaryModel?: { provider: string; id: string; credential: string };
   /** Keep session persistence ON (drops --no-session) — transcript scenarios. */
   persistSession?: boolean;
+  /** Reuse an earlier run's materialized project for a real process-resume journey. */
+  fixtureDir?: string;
+  /** Reuse and refresh an earlier run's Pi agent directory for process resume. */
+  agentDir?: string;
+  /** Open this exact persisted session before processing the print prompt. */
+  sessionPath?: string;
+  /** Select a Claude-format main-session agent through PiCC's extension flag. */
+  agent?: string;
   /** Override model capacity for deterministic usage-threshold scenarios. */
   contextWindow?: number;
   /** Merge into the real Pi settings file. */
@@ -292,8 +300,8 @@ export function createE2ELive({
   }
 
   async function startPi(opts: RunPiOptions): Promise<StartedPi> {
-    const fixture = materializeFixture(opts.fixture ?? "hello-claude");
-    fixtures.push(fixture);
+    const fixture = opts.fixtureDir ?? materializeFixture(opts.fixture ?? "hello-claude");
+    if (!fixtures.includes(fixture)) fixtures.push(fixture);
     opts.setup?.(fixture);
 
     const defaultModelCredential =
@@ -307,13 +315,26 @@ export function createE2ELive({
         : []),
     ]);
     const mock = await startMockModel(opts.script, opts.classifier, authorizationDigestsByModel);
-    const agentDir = makeAgentDir(
+    const agentDir = opts.agentDir ?? makeAgentDir(
       mock.url,
       defaultModelCredential,
       opts.secondaryModel,
       opts.contextWindow,
       opts.piSettings,
     );
+    if (opts.agentDir !== undefined) {
+      fs.mkdirSync(agentDir, { recursive: true });
+      const refreshed = makeAgentDir(
+        mock.url,
+        defaultModelCredential,
+        opts.secondaryModel,
+        opts.contextWindow,
+        opts.piSettings,
+      );
+      for (const name of ["models.json", "auth.json", "settings.json"]) {
+        fs.copyFileSync(path.join(refreshed, name), path.join(agentDir, name));
+      }
+    }
     const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
     const isolatedHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-home-"));
     tempDirs.push(emptyUserDir, isolatedHomeDir);
@@ -432,7 +453,13 @@ export function createE2ELive({
             ? [CLI_PATH, "-e", COMPILED_EXTENSION_PATH]
             : [opts.launcherPath!]),
           ...(opts.persistSession ? [] : ["--no-session"]),
-          ...(opts.interactiveTerminal ? ["--mode", "interactive"] : opts.modeArgs ?? ["-p", opts.prompt]),
+          ...(opts.agent === undefined ? [] : ["--agent", opts.agent]),
+          ...(opts.interactiveTerminal
+            ? ["--mode", "interactive"]
+            : opts.modeArgs ?? [
+                ...(opts.sessionPath === undefined ? [] : ["--session", opts.sessionPath]),
+                "-p", opts.prompt,
+              ]),
         ],
         {
           cwd: fixture,

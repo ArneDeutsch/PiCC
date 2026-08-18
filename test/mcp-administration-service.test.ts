@@ -324,7 +324,9 @@ describe("MCP administration orchestration", () => {
         const action = { kind, name: source, ...(owner === undefined ? {} : { agentOwner: owner }) } as const;
         const result = await h.service.execute(action);
         expect(result.eligibility, `${source} ${kind}`).toEqual({ eligible: true, reasonCode: "eligible" });
-        const liveExpected = kind === "approve" && owner === undefined;
+        const ordinaryActivation = kind === "approve" && owner === undefined;
+        const ownerScopeRebuild = owner !== undefined;
+        const liveExpected = ordinaryActivation || ownerScopeRebuild;
         expect(result).toMatchObject({ recovery: { state: "not-requested" }, durable: { state: "committed", effect: "changed", cleanup: "complete" }, runtime: { state: liveExpected ? "succeeded" : "not-requested" }, exposure: { state: liveExpected ? "succeeded" : "not-requested" } });
         expect(h.mutate).toHaveBeenCalledWith({ kind: "set-review", record: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test", source, serverName: source, ...(owner === undefined ? {} : { agentOwner: owner }), definitionVersion: 1, definitionDigest: beforeServer.definitionDigest, decision: kind === "approve" ? "approved" : "rejected" } });
         if (!liveExpected) {
@@ -332,6 +334,12 @@ describe("MCP administration orchestration", () => {
           continue;
         }
         const request = h.apply.mock.calls[0]![0];
+        if (ownerScopeRebuild) {
+          expect(request.action).toEqual({ kind, name: source, agentOwner: owner });
+          expect(request.transitions).toEqual([]);
+          expect(request.runtimeAdmission).toBeUndefined();
+          continue;
+        }
         expect(request.action).toEqual(action);
         expect(request.runtimeAdmission === undefined ? undefined : openMcpAdministrationRuntimeAdmission(request.runtimeAdmission)?.binding).toEqual(kind === "approve" ? admissionBinding(afterServer) : undefined);
       }
@@ -441,12 +449,17 @@ describe("MCP administration orchestration", () => {
     const main = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" } });
     const agent = declaration({ name: "same", source: "subagent-inline", agentOwner: owner, review: "approved-exact" });
     const agentReview = harness([fresh([main, agent]), fresh([main, { ...agent, review: "rejected-exact", status: "disabled" }])]);
-    await expect(agentReview.service.execute({ kind: "reject", name: "same", agentOwner: owner })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
-    expect(agentReview.apply).not.toHaveBeenCalled();
+    await expect(agentReview.service.execute({ kind: "reject", name: "same", agentOwner: owner })).resolves.toMatchObject({ runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+    expect(agentReview.apply).toHaveBeenCalledOnce();
+    expect(agentReview.apply.mock.calls[0]![0]).toMatchObject({
+      action: { kind: "reject", name: "same", agentOwner: owner },
+      transitions: [],
+    });
 
     const agentReset = harness([fresh([main, agent]), fresh([main, { ...agent, review: "pending", status: "pending-approval" }])]);
-    await expect(agentReset.service.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({ runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
-    expect(agentReset.apply).not.toHaveBeenCalled();
+    await expect(agentReset.service.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({ runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+    expect(agentReset.apply).toHaveBeenCalledOnce();
+    expect(agentReset.apply.mock.calls[0]![0]).toMatchObject({ action: { kind: "reset-project-choices" }, transitions: [] });
 
     const target = declaration({ name: "target", source: "native-user", authority: { kind: "mutable", scope: "user" } });
     const unrelatedBefore = declaration({ name: "unrelated", source: "native-user", authority: { kind: "mutable", scope: "user" } });

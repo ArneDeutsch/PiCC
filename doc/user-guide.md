@@ -20,10 +20,10 @@ in-memory model. From then on, on Pi's own agent loop:
 - **Skills** run either as `/slash` commands or via the model's `Skill` tool, with full argument,
   variable, and shell-injection processing — the body loads only on activation (progressive
   disclosure).
-- **Subagents** dispatch via the `Agent` tool into fresh, isolated sessions and return their final
-  message verbatim; a failed dispatch is a loud failure naming the cause, never a silent empty
-  success. **Worktrees** swap the session's working directory so the project's own git tooling
-  detects worktree mode.
+- **Custom agents** can supply the main-session identity, or dispatch via the `Agent` tool into
+  fresh, isolated subagent sessions. Dispatched agents return their final message verbatim; a failed
+  dispatch is a loud failure naming the cause, never a silent empty success. **Worktrees** swap the
+  session's working directory so the project's own git tooling detects worktree mode.
 
 Ordinary project loading writes no tracked project file. Explicit plugin lifecycle actions may write
 selected settings declarations as described under [Installed plugins](#installed-plugins). For the
@@ -202,6 +202,29 @@ cd /path/to/your-claude-project     # the one with CLAUDE.md and .claude/
 picc
 ```
 
+### Select a custom agent for the main session
+
+Run `picc --agent <name>`, or set `"agent": "<name>"` in Claude settings. Selection precedence is
+command line, then the identity persisted on the current session branch, then the resolved setting.
+This is separate from PiCC's agent-definition precedence: managed, then nearest project, then user,
+then lower-precedence plugin agents, with the first same-named definition winning. Claude's separate
+CLI-defined `--agents` definitions are unsupported and do not participate. The startup notice names
+both the selector source and winning definition; `/doctor`, `/agents`, and `/mcp` show the
+effective restrictions and selected MCP authority.
+
+A selected definition replaces the ordinary main identity for every turn and applies its tool and
+subagent restrictions, model/effort choices, supported hooks and MCP servers, skills, memory, and
+prompt context. Unlike Claude's auto-submitted, command/skill-processed composition, PiCC records an
+`initialPrompt` once as a separate no-trigger user-role message on the live selected branch. Selection
+and that message are proved synchronously before provider admission, but a new persisted session is
+not reopenable from disk until Pi persists it, currently after the first assistant response. Once
+persisted, resume does not replay `initialPrompt` and re-resolves the selected name against the current
+definitions. A
+missing fresh CLI/setting selection stops before provider work. For a no-tools recovery identity, do
+not resume the affected branch: exit PiCC and start a new non-resumed session with an available
+`picc --agent <name>`, or omit/remove the selection to use the ordinary identity. The generated
+[capability matrix](supported-features.md) is the exhaustive source for per-field limits.
+
 On startup PiCC loads these Claude Code artifacts. Paths beginning with `~/.claude` below are for
 the default user profile; see [Environment variables](#environment-variables) for the active
 user-profile base when an override is selected.
@@ -212,7 +235,7 @@ user-profile base when an override is selected.
 | Memory | auto memory: `MEMORY.md` from the per-project memory dir under `~/.claude/projects/…/memory`; gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
 | Rules | `.claude/rules/**/*.md` (unconditional at start; `paths:`-scoped inject when you touch matching files) |
 | Skills | `.claude/skills/**/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/**/*.md` legacy commands (recursive, `sub:name`-qualified on collisions) |
-| Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
+| Agents | `.claude/agents/*.md` (+ user scope) — selectable as the main identity or dispatchable via `Agent`; built-in `general-purpose`, `Explore`, and `Plan` types are dispatch-only |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
 | MCP servers | platform-fixed standalone `managed-mcp.json`, or native Claude user/project-local state + `.mcp.json` + the PiCC settings `mcpServers` extension, plus `mcpServers:` frontmatter on user/project agents; source-specific policy, approval, and disablement apply |
@@ -555,7 +578,7 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | Command | What it does |
 |---|---|
 | `/skills` | Categorize loaded skills by typed-slash availability; unsupported-name and reserved-shadowing rows separately state whether direct `Skill` invocation remains allowed |
-| `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
+| `/agents` | List the custom and built-in subagent catalog permitted by the current agent policy, with tools, read-only marker, model, and worktree-isolation; the output identifies when session settings disable dispatch |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/mcp` | Stable bounded MCP status; interactive use is immediate, while one-shot text/JSON waits for bounded catalog settlement. `/mcp manage` opens interactive administration in the TUI. See [MCP administration](#mcp-administration) |
 | `/plugin`, `/plugin list`, `/plugin details name@marketplace` | Observational inventory plus focused interactive lifecycle actions; see [Installed plugins](#installed-plugins) |
@@ -908,17 +931,21 @@ user profile for user-scoped settings and artifacts, imported installed-plugin s
 memory, and native state. Project and managed contributions plus supplementary authorized plugin
 roots remain in effect.
 
-User/project agent `mcpServers:` lists may reference an eligible session server by name or define an
-inline stdio/HTTP/SSE server. References reuse the main session's published connection; inline servers belong only to
-that dispatch, and PiCC attempts and awaits their shutdown before releasing its worktree. Managed policy, project approval,
+User/project agent `mcpServers:` lists may reference an eligible global session server by name or
+define an inline stdio/HTTP/SSE server. References reuse the published connection. An inline server
+belongs to either the selected main session or one dispatched subagent: selected-main servers live
+until session replacement/shutdown and appear in the selected-authority sections of `/mcp` and
+`/doctor`; dispatched servers live only for that dispatch and are shut down before its worktree is
+released. Managed policy, project approval,
 the `disabledMcpjsonServers` project-decline gate, agent tool filters, permissions, hooks, and timeouts still apply. A published
 session route wins a same-name inline declaration regardless of that declaration's admission status,
 without starting a duplicate or warning. Missing, invalid, blocked, disabled, pending, or
-startup-failed capability produces a bounded warning before the child's first request and around its
-reported result. Cleanup uncertainty is known only after child work, so it preserves and qualifies
-the result and receives one session-shutdown retry. Neither warning shows raw configuration. Inline
-servers do not appear in the parent `/mcp` or `/doctor` live inventory, do not pass to siblings or
-nested children, and keep their launch cwd after a later EnterWorktree. A nested agent with omitted
+startup-failed capability prevents selected-main admission; for a dispatched child it produces a
+bounded warning before the first request and around
+the reported result. Child cleanup uncertainty is known only after child work, so it preserves and
+qualifies the result and receives one session-shutdown retry. Neither path shows raw configuration.
+Dispatch-owned inline servers do not appear in the parent `/mcp` or `/doctor` live inventory, do not
+pass to siblings or nested children, and keep their launch cwd after a later EnterWorktree. A nested agent with omitted
 or clean-empty `mcpServers` still inherits eligible published main-session routes. When the server must follow,
 enter the desired worktree first and make a fresh `Agent` dispatch; `SendMessage` does not migrate an
 existing agent or its server. In-process resume reuses the original cwd but applies the current loaded definition and policy
@@ -928,8 +955,8 @@ Managed agents remain dispatchable, but their `mcpServers` field is retained onl
 and ignored. PiCC's non-empty declaration selection and rule that a parent's inline servers do not
 propagate to nested children are inferred, unverified choices. Its cancellation, project approval,
 collision, warning, cwd, and resume rules are likewise PiCC-defined hardening rather than verified
-Claude Code parity. Custom agent definitions cannot execute in the main session; plugin
-MCP/source references, WebSocket, `--strict-mcp-config`, and `--bare` are also unsupported.
+Claude Code parity. Plugin MCP/source references, WebSocket, `--strict-mcp-config`, and `--bare`
+are unsupported for both selected-main and dispatched-agent scopes.
 
 When standalone managed MCP is absent, native definitions resolve as whole entries in local →
 project `.mcp.json` → user order; the PiCC settings `mcpServers` compatibility extension is lower

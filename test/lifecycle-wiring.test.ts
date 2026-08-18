@@ -11,6 +11,7 @@ import { WorktreeManager, type WorktreeReapResult } from "../src/runtime/worktre
 import type { SubagentTranscriptReapResult } from "../src/runtime/subagent-transcript-retention.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { loadClaudeProject } from "../src/project.js";
 
 /**
  * Wired-lifecycle coverage (review finding: zero tests fired after_provider_response,
@@ -51,6 +52,7 @@ function worktreeResult(overrides: Partial<WorktreeReapResult> = {}): WorktreeRe
 function persistedManager(file: string, cwd = dir, sessionDir = path.dirname(file)) {
   return {
     getEntries: () => [],
+    getBranch: () => [],
     getSessionFile: () => file,
     getCwd: () => cwd,
     getSessionDir: () => sessionDir,
@@ -97,10 +99,17 @@ beforeAll(async () => {
   w("src/a.ts", "export {};\n");
   w("src/b.ts", "export {};\n");
   w(".githooks/pre-commit", "#!/bin/sh\nexit 0\n");
+  w(".claude/session-end-marker.cjs", "const fs=require('node:fs');fs.appendFileSync(process.argv[2],process.argv[3]+'\\n');\n");
+  const sessionEndScript = path.join(dir, ".claude", "session-end-marker.cjs").replaceAll("\\", "/");
   w(
     ".claude/settings.json",
     JSON.stringify({
-      env: { GIT_DIR: "project-controlled-git-dir", PROJECT_GIT_CANARY: "project-setting" },
+      env: {
+        GIT_DIR: "project-controlled-git-dir",
+        PROJECT_GIT_CANARY: "project-setting",
+        HOOK_NODE: process.execPath.replaceAll("\\", "/"),
+        SESSION_END_SCRIPT: sessionEndScript,
+      },
       permissions: { ask: ["Bash(git push *)"] },
       hooks: {
         SessionStart: ["startup", "resume", "clear", "fork"].map((source) => ({
@@ -116,7 +125,7 @@ beforeAll(async () => {
             hooks: [
               {
                 type: "command",
-                command: 'echo end >> "$CLAUDE_PROJECT_DIR/.claude/.session-end-log"',
+                command: 'exec "$HOOK_NODE" "$SESSION_END_SCRIPT" "$CLAUDE_PROJECT_DIR/.claude/.session-end-log" end',
               },
             ],
           },
@@ -1477,7 +1486,9 @@ describe("lifecycle wiring", () => {
     for (let i = 0; i < 8; i++) await pi.fire("agent_settled", {}, pi.ctx());
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(8);
 
-    await pi.fire("session_start", { reason: "switch" }, pi.ctx());
+    await pi.fire("session_start", { reason: "switch" }, pi.ctx({
+      sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
+    }));
     await pi.fire("agent_settled", {}, pi.ctx());
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
@@ -1486,7 +1497,9 @@ describe("lifecycle wiring", () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {
-      await pi.fire("session_start", { reason }, pi.ctx());
+      await pi.fire("session_start", { reason }, pi.ctx({
+        sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
+      }));
     }
     expect(fs.readFileSync(log, "utf8").trim().split(/\r?\n/u)).toEqual([
       "startup", "startup", "clear", "resume", "fork",
@@ -1498,6 +1511,119 @@ describe("lifecycle wiring", () => {
     fs.rmSync(log, { force: true });
     await pi.fire("session_shutdown", { reason: "other" });
     expect(fs.existsSync(log)).toBe(true);
+  });
+
+  it("reports uncertain selected MCP cleanup only after selected and base SessionEnd run once", async () => {
+    const owner = fakePi();
+    const branch: Record<string, unknown>[] = [];
+    const events: string[] = [];
+    const hookOutcome = () => ({ block: false, askDowngraded: false, diagnostics: [] });
+    Object.assign(owner.api, { getFlag: () => "lifecycle-selected" });
+    picc(owner.api as never, {
+      managedSettingsPaths: [], managedArtifactDirs: [],
+      baseHookRunner: {
+        hasHooks: () => true,
+        fire: async (eventName: string) => {
+          if (eventName === "SessionEnd") events.push("base-session-end");
+          return hookOutcome();
+        },
+      },
+      selectedMainHookRunnerFactory: () => ({
+        hasHooks: () => true,
+        fire: async (eventName: string) => {
+          if (eventName === "SessionEnd") events.push("selected-session-end");
+          return hookOutcome();
+        },
+      }),
+      selectedMainMcpScopeFactory: async () => ({
+        whenSettled: async () => {}, tools: () => [], resourceServers: () => [],
+        serverStates: () => [{ name: "uncertain", transport: "stdio" as const, state: "connected" as const }],
+        callTool: async () => ({ content: [] }), readResource: async () => ({ contents: [] }),
+        diagnostics: () => [], setupOutcomes: () => [], knownToolNames: () => [], borrowedServerNames: () => [],
+        shutdown: async () => {
+          events.push("selected-mcp-cleanup-unconfirmed");
+          return { confirmed: [], unconfirmed: ["uncertain"], diagnostics: [] };
+        },
+        retryUnconfirmedShutdown: async () => ({ confirmed: [], unconfirmed: ["uncertain"], diagnostics: [] }),
+      }),
+      mcpRuntime: {
+        whenSettled: async () => {}, tools: () => [], prompts: () => [], resourceServers: () => [],
+        callTool: async () => ({ content: [] }), getPrompt: async () => ({ messages: [] }),
+        readResource: async () => ({ contents: [] }), diagnostics: () => [], serverStates: () => [],
+        shutdown: async () => { events.push("global-mcp-shutdown"); },
+      },
+      loadProject: (options) => {
+        const loaded = loadClaudeProject(options);
+        return {
+          ...loaded,
+          agents: [...loaded.agents, {
+            name: "lifecycle-selected", description: "lifecycle", body: "selected lifecycle",
+            tools: [], toolRestrictionValidation: { tools: "valid" as const, disallowedTools: "absent" as const },
+            hooks: { SessionEnd: [] }, metadata: {}, unknownKeys: [], diagnostics: [],
+            source: { scope: "project" as const, path: "selected" },
+          }],
+        };
+      },
+      onInitializationSettled: owner.captureInitialization,
+    });
+    await owner.waitForInitialization();
+    const manager = {
+      getBranch: () => branch,
+      getEntries: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+    };
+    const ctx = owner.printCtx({ sessionManager: manager, isProjectTrusted: () => true });
+    await owner.fire("session_start", { reason: "startup" }, ctx);
+    await expect(owner.fire("session_shutdown", { reason: "other" }, ctx))
+      .rejects.toThrow("Selected main MCP shutdown cleanup was unconfirmed");
+    expect(events).toEqual([
+      "selected-mcp-cleanup-unconfirmed",
+      "global-mcp-shutdown",
+      "base-session-end",
+      "selected-session-end",
+    ]);
+  });
+
+  it("delivers selected and base SessionEnd once while the selected runner still owns its slot", async () => {
+    const definition = path.join(dir, ".claude", "agents", "lifecycle-selected.md");
+    const baseLog = path.join(dir, ".claude", ".session-end-log");
+    const selectedLog = path.join(dir, ".claude", ".selected-session-end-log");
+    fs.mkdirSync(path.dirname(definition), { recursive: true });
+    fs.writeFileSync(definition, [
+      "---",
+      "name: lifecycle-selected",
+      "description: Selected lifecycle owner",
+      "hooks:",
+      "  SessionEnd:",
+      "    - hooks:",
+      "        - type: command",
+      "          command: 'exec \"$HOOK_NODE\" \"$SESSION_END_SCRIPT\" \"$CLAUDE_PROJECT_DIR/.claude/.selected-session-end-log\" selected'",
+      "---",
+      "Selected lifecycle identity.",
+    ].join("\n"));
+    fs.rmSync(baseLog, { force: true });
+    fs.rmSync(selectedLog, { force: true });
+    const selectedPi = fakePi();
+    Object.assign(selectedPi.api, { getFlag: (name: string) => name === "agent" ? "lifecycle-selected" : undefined });
+    try {
+      picc(selectedPi.api as never, { onInitializationSettled: selectedPi.captureInitialization });
+      await selectedPi.waitForInitialization();
+      const branch: Record<string, unknown>[] = [];
+      const manager = {
+        getBranch: () => branch,
+        getEntries: () => branch,
+        appendCustomEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+      };
+      await selectedPi.fire("session_start", { reason: "startup" }, selectedPi.printCtx({
+        sessionManager: manager,
+        isProjectTrusted: () => true,
+      }));
+      await selectedPi.fire("session_shutdown", { reason: "other" });
+      expect(fs.readFileSync(baseLog, "utf8").trim().split(/\r?\n/u)).toEqual(["end"]);
+      expect(fs.readFileSync(selectedLog, "utf8").trim().split(/\r?\n/u)).toEqual(["selected"]);
+    } finally {
+      fs.rmSync(definition, { force: true });
+    }
   });
 
   it("atomically enables canonical child report, background, and panel composition", async () => {
@@ -1753,6 +1879,11 @@ describe("lifecycle wiring", () => {
     };
     internals.subagentRuntime.shutdownCheckpointPaused = async () => { order.push("checkpoint-paused-cleanup"); };
     internals.subagentRuntime.shutdownMcpScopes = async () => { order.push("scoped-mcp-shutdown"); };
+    const shutdownSelectedMainBeforeGlobal = internals.selectedMainMcp.shutdownBeforeGlobal.bind(internals.selectedMainMcp);
+    internals.selectedMainMcp.shutdownBeforeGlobal = async (shutdownGlobal) => {
+      order.push("selected-main-mcp-shutdown");
+      return shutdownSelectedMainBeforeGlobal(shutdownGlobal);
+    };
     const fireHook = internals.inputHooks.fire.bind(internals.inputHooks);
     internals.inputHooks.fire = async (...args: any[]) => {
       if (args[0] === "SessionEnd") order.push("session-end");
@@ -1771,6 +1902,7 @@ describe("lifecycle wiring", () => {
       "ordinary-background-joined",
       "checkpoint-paused-cleanup",
       "scoped-mcp-shutdown",
+      "selected-main-mcp-shutdown",
       "global-mcp-shutdown",
       "session-end",
     ]);

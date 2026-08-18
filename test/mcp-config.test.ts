@@ -2017,6 +2017,37 @@ describe("resolveMcpConfig — agent-inline admission", () => {
     expect(mismatched.administration?.declarations[0]?.review).toBe("pending");
   });
 
+  it("lets matching exact owner rejection override a broad grant without affecting a sibling owner", () => {
+    const declaration = normalizeAgentMcpDeclaration([{ srv: { command: "node" } }], "project");
+    let initialAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({ captureAgentMcpAdmission: (context) => { initialAdmission = context; } });
+    const digest = initialAdmission!.resolveOwned!(declaration, { name: "selected", scope: "project" })
+      .administration!.declarations[0]!.definitionDigest!;
+    const reviewSnapshot: McpReviewSnapshot = {
+      version: 1, profileKey: "profile-a", checkoutFamilyKey: "family-a",
+      records: [{
+        profileKey: "profile-a", checkoutFamilyKey: "family-a", source: "subagent-inline",
+        serverName: "srv", agentOwner: { name: "selected", scope: "project" },
+        definitionVersion: 1, definitionDigest: digest, decision: "rejected",
+      }],
+    };
+    let admission: AgentMcpAdmissionContext | undefined;
+    resolve({
+      entries: [entry("user", "/u", { enableAllProjectMcpServers: true })],
+      reviewSnapshot,
+      captureAgentMcpAdmission: (context) => { admission = context; },
+    });
+    expect(admission!.resolveOwned!(declaration, { name: "selected", scope: "project" }).servers[0]?.status).toBe("disabled");
+    expect(admission!.resolveOwned!(declaration, { name: "sibling", scope: "project" }).servers[0]?.status).toBe("enabled");
+
+    let exactAdmission: AgentMcpAdmissionContext | undefined;
+    resolve({
+      reviewSnapshot: { ...reviewSnapshot, records: [{ ...reviewSnapshot.records[0]!, decision: "approved" }] },
+      captureAgentMcpAdmission: (context) => { exactAdmission = context; },
+    });
+    expect(exactAdmission!.resolveOwned!(declaration, { name: "selected", scope: "project" }).servers[0]?.status).toBe("enabled");
+  });
+
   it("keeps a project-owned agent declaration pending when only user owner scope has exact review", () => {
     const declaration = normalizeAgentMcpDeclaration([{ srv: { command: "node" } }], "project");
     let initialAdmission: AgentMcpAdmissionContext | undefined;

@@ -60,8 +60,9 @@ export function toClaudeCall(
 ): ToolCallDescriptor {
   const tool = toClaudeToolName(piToolName);
   const mapped: Record<string, unknown> = { ...input };
-  if (mapped.file_path === undefined && typeof mapped.path === "string") {
-    mapped.file_path = mapped.path;
+  if (piToolName in PI_TO_CLAUDE) {
+    delete mapped.file_path;
+    if (typeof input.path === "string") mapped.file_path = input.path;
   }
   return { tool, input: mapped, cwd };
 }
@@ -78,11 +79,16 @@ export function applyUpdatedInput(
 ): void {
   const isBuiltin = piToolName in PI_TO_CLAUDE;
   for (const [key, value] of Object.entries(updated)) {
-    if (isBuiltin && key === "file_path") {
-      input.path = value;
-    } else {
-      input[key] = value;
-    }
+    if (isBuiltin && (key === "file_path" || key === "path")) continue;
+    input[key] = value;
+  }
+  if (!isBuiltin) return;
+
+  delete input.file_path;
+  if (Object.prototype.hasOwnProperty.call(updated, "path")) {
+    input.path = updated.path;
+  } else if (Object.prototype.hasOwnProperty.call(updated, "file_path")) {
+    input.path = updated.file_path;
   }
 }
 
@@ -102,7 +108,7 @@ export function touchedFilePath(
     }
   }
   if (["Read", "Write", "Edit", "MultiEdit"].includes(tool)) {
-    const p = input.file_path ?? input.path;
+    const p = piToolName in PI_TO_CLAUDE ? input.path : (input.file_path ?? input.path);
     return typeof p === "string" ? p : undefined;
   }
   return undefined;

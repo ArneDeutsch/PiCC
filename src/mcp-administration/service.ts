@@ -648,7 +648,9 @@ export function createMcpAdministrationService(dependencies: McpAdministrationSe
       const retireOnly = !finalEligibility.eligible && finalEligibility.reasonCode === "stale-state";
       if (!finalEligibility.eligible && !retireOnly) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       const request = liveRequest(action, beforeState, afterState, addBinding, retireOnly);
-      if (request.transitions.length === 0) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+      const scopeReconciliationAction =
+        ("agentOwner" in action && action.agentOwner !== undefined) || action.kind === "reset-project-choices";
+      if (request.transitions.length === 0 && !scopeReconciliationAction) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       try { const live = await dependencies.live.apply(request); return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: live.runtime, exposure: live.exposure }); }
       catch { return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: Object.freeze({ state: "failed" as const, reasonCode: "live-port-failure" }), exposure: NOT_REQUESTED }); }
     }

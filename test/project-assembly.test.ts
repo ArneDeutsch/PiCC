@@ -910,6 +910,44 @@ describe("loadClaudeProject — agent MCP admission assembly", () => {
 });
 
 describe("loadClaudeProject — multi-scope precedence", () => {
+  it("resolves same-named agent definitions through managed, nearest-project, root-project, and user scopes", () => {
+    const { base, repo, userDir } = makeBase();
+    const pkg = path.join(repo, "packages", "app");
+    const managed = path.join(base, "managed");
+    const agent = (description: string, body: string) => `---\nname: reviewer\ndescription: ${description}\n---\n${body}`;
+    fs.mkdirSync(pkg, { recursive: true });
+    write(path.join(userDir, "agents", "reviewer.md"), agent("user", "USER BODY"));
+    expect(findByName(load(pkg, userDir).agents, "reviewer")).toMatchObject({
+      body: "USER BODY",
+      source: { scope: "user" },
+    });
+
+    write(path.join(repo, ".claude", "agents", "reviewer.md"), agent("root", "ROOT BODY"));
+    expect(findByName(load(pkg, userDir).agents, "reviewer")).toMatchObject({
+      body: "ROOT BODY",
+      source: { scope: "project", path: path.join(repo, ".claude", "agents", "reviewer.md") },
+    });
+
+    write(path.join(pkg, ".claude", "agents", "reviewer.md"), agent("nearest", "NEAREST BODY"));
+    expect(findByName(load(pkg, userDir).agents, "reviewer")).toMatchObject({
+      body: "NEAREST BODY",
+      source: { scope: "project", path: path.join(pkg, ".claude", "agents", "reviewer.md") },
+    });
+
+    write(path.join(managed, "agents", "reviewer.md"), agent("managed", "MANAGED BODY"));
+    const managedWinner = loadClaudeProject({
+      cwd: pkg,
+      userDir,
+      homeDir: path.dirname(userDir),
+      managedSettingsPaths: [],
+      managedArtifactDirs: [managed],
+    });
+    expect(findByName(managedWinner.agents, "reviewer")).toMatchObject({
+      body: "MANAGED BODY",
+      source: { scope: "managed", path: path.join(managed, "agents", "reviewer.md") },
+    });
+  });
+
   it("resolves a same-named skill at pkg/root/user scopes to the nearest project one; user-only skills stay usable", () => {
     const { repo, userDir } = makeBase();
     const pkg = path.join(repo, "packages", "app");
@@ -944,6 +982,36 @@ describe("loadClaudeProject — multi-scope precedence", () => {
 });
 
 describe("loadClaudeProject — plugin namespacing", () => {
+  it("uses a unique namespaced plugin agent as the bare-name fallback", () => {
+    const { repo, userDir } = makeBase();
+    const pluginRoot = makeMarketplacePlugin(userDir, "official", "alpha");
+    write(
+      path.join(pluginRoot, "agents", "reviewer.md"),
+      "---\nname: reviewer\ndescription: plugin reviewer\n---\nPLUGIN REVIEWER BODY",
+    );
+    write(
+      path.join(userDir, "settings.json"),
+      JSON.stringify({ enabledPlugins: { "alpha@official": true } }),
+    );
+
+    const pluginFallback = load(repo, userDir);
+    expect(findByName(pluginFallback.agents, "reviewer")).toMatchObject({
+      name: "alpha:reviewer",
+      body: "PLUGIN REVIEWER BODY",
+      source: { scope: "plugin", pluginName: "alpha" },
+    });
+
+    write(
+      path.join(userDir, "agents", "reviewer.md"),
+      "---\nname: reviewer\ndescription: user reviewer\n---\nUSER REVIEWER BODY",
+    );
+    expect(findByName(load(repo, userDir).agents, "reviewer")).toMatchObject({
+      name: "reviewer",
+      body: "USER REVIEWER BODY",
+      source: { scope: "user" },
+    });
+  });
+
   it("keeps a plugin skill alongside a same-named project skill instead of dropping it", () => {
     const { repo, userDir } = makeBase();
     writeSkill(path.join(repo, ".claude", "skills"), "deploy", "project deploy");
