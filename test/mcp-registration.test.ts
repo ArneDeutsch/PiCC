@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -1501,6 +1502,12 @@ describe("MCP administration exposure composition", () => {
       await run({ kind: "remove", scope: "local", name: "same" }, [high, lowShadow], [lowWinner]);
       expect(events).toEqual(["disable:same", "reconcile:same", "exposure:retire:same", "exposure:publish:same"]);
 
+      const drifted = declaration("same", "native-local", { definitionDigest: `mcp-review-v1:${"f".repeat(64)}` });
+      await expect(run({ kind: "remove", scope: "user", name: "same" }, [declaration("same", "native-user")], [drifted])).resolves.toMatchObject({
+        eligibility: { eligible: false, reasonCode: "stale-state" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" },
+      });
+      expect(events).toEqual(["disable:same", "exposure:retire:same"]);
+
       const first = declaration("first", "project-mcpjson");
       const second = declaration("second", "settings-project");
       await run({ kind: "reset-project-choices" }, [first, second], [
@@ -1519,6 +1526,149 @@ describe("MCP administration exposure composition", () => {
         runtime: { state: "failed", reasonCode: "runtime-failed" }, exposure: { state: "succeeded" },
       });
       expect(events).toEqual(["disable:cleanup", "exposure:retire:cleanup"]);
+    } finally {
+      process.chdir(originalCwd); await shutdownExtension(pi);
+    }
+  });
+
+  it("shares default administration authority across linked extension instances and recovers an interrupted transaction when opening management", async () => {
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const homeVariable = process.platform === "win32" ? "USERPROFILE" : "HOME";
+    const previousHome = process.env[homeVariable];
+    const base = makeTempDir("picc-mcp-linked-default-");
+    const main = path.join(base, "main");
+    const linked = path.join(base, "linked");
+    const userDir = path.join(base, "profile");
+    const home = path.join(base, "home");
+    fs.mkdirSync(main, { recursive: true }); fs.mkdirSync(userDir, { recursive: true }); fs.mkdirSync(home, { recursive: true });
+    writeProjectFile(main, "CLAUDE.md", "linked default authority fixture\n");
+    execFileSync("git", ["init"], { cwd: main, stdio: "pipe" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: main });
+    execFileSync("git", ["config", "user.name", "PiCC Test"], { cwd: main });
+    execFileSync("git", ["add", "CLAUDE.md"], { cwd: main });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: main, stdio: "pipe" });
+    execFileSync("git", ["worktree", "add", "--detach", linked, "HEAD"], { cwd: main, stdio: "pipe" });
+    let first: FakePi | undefined; let second: FakePi | undefined;
+    let firstService: McpAdministrationService | undefined;
+    try {
+      process.env.PICC_CLAUDE_USER_DIR = userDir; process.env[homeVariable] = home;
+      process.chdir(main); first = fakePi();
+      picc(first.api as never, { mcpAdministration: { captureService: (service) => { firstService = service; } }, onInitializationSettled: first.captureInitialization });
+      await first.waitForInitialization();
+
+      const target = path.resolve(main, ".mcp.json");
+      const realRename = fs.promises.rename.bind(fs.promises);
+      let interrupted = false;
+      const rename = vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
+        await realRename(from, to);
+        if (!interrupted && path.resolve(String(to)) === target) { interrupted = true; throw new Error("interrupt-after-publication"); }
+      });
+      try {
+        await expect(firstService!.execute({ kind: "add", scope: "project", name: "interrupted", definition: { command: process.execPath } })).resolves.toMatchObject({
+          durable: { state: "pending-recovery", effect: "uncertain", cleanup: "pending" },
+        });
+      } finally { rename.mockRestore(); }
+      expect(interrupted).toBe(true);
+
+      process.chdir(linked); second = fakePi();
+      picc(second.api as never, { onInitializationSettled: second.captureInitialization });
+      await second.waitForInitialization();
+      const opening = second.commands.get("mcp").handler("manage", second.tuiCtx());
+      await vi.waitFor(() => expect(second!.customs).toHaveLength(1));
+      const custom = second.customs[0]!; await custom.ready;
+      expect(second.notifications.at(-1)).toMatchObject({ severity: "info", text: expect.stringContaining("MCP recovery completed: state=rolled-back") });
+      expect(custom.render(80).join("\n")).toContain("PiCC MCP administration");
+      expect(fs.existsSync(path.join(main, ".mcp.json"))).toBe(false);
+      custom.input("\u001b"); await opening;
+    } finally {
+      if (second !== undefined) await shutdownExtension(second).catch(() => undefined);
+      if (first !== undefined) await shutdownExtension(first).catch(() => undefined);
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR; else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      if (previousHome === undefined) delete process.env[homeVariable]; else process.env[homeVariable] = previousHome;
+      try { execFileSync("git", ["worktree", "remove", "--force", linked], { cwd: main, stdio: "pipe" }); } catch { /* temp-root cleanup remains bounded */ }
+    }
+  });
+
+  it("retires the callable old provider on restrictive same-name drift without exposing the replacement or unrelated routes", async () => {
+    const originalCwd = process.cwd();
+    const dir = makeTempDir("picc-mcp-restrictive-drift-");
+    const pi = fakePi();
+    let service: McpAdministrationService | undefined;
+    let useAfter = false;
+    let targetRoute: "A" | "retired" | "B" = "A";
+    const calls: string[] = [];
+    const digestA = `mcp-review-v1:${"a".repeat(64)}`;
+    const digestB = `mcp-review-v1:${"b".repeat(64)}`;
+    const declaration = (name: string, definitionDigest: string, source = "native-user") => ({
+      name, source, authority: { kind: "mutable", scope: source === "native-user" ? "user" : "local" }, precedence: "winner",
+      definitionVersion: 1, definitionDigest,
+      summary: { transport: "stdio", commandBasename: "node", argumentCount: 0, environmentKeyCount: 0, headerKeyCount: 0, timeoutConfigured: false },
+      policy: "allowed", review: "not-required", status: "enabled",
+    });
+    const targetA = declaration("same", digestA);
+    const targetB = declaration("same", digestB, "native-local");
+    const unrelated = declaration("unrelated", digestA);
+    const state = (items: any[]) => ({
+      reviewIdentity: { profileKey: "profile-test", checkoutFamilyKey: "checkout-test" },
+      liveStates: items.map((item) => ({ name: item.name, state: "connected" })),
+      mcp: { servers: items.map((item) => ({ name: item.name, source: item.source, status: "enabled", transport: "stdio", command: "node", rawCommand: "node", args: [], env: {}, diagnostics: [] })),
+        diagnostics: [], policyPosture: "absent", administration: { version: 1, policyPosture: "absent", observations: [], declarations: items, omittedDeclarationCount: 0 } },
+    });
+    const runtime = {
+      whenSettled: async () => {},
+      tools: () => [
+        { serverName: "same", toolName: "echo", description: "same provider", inputSchema: { type: "object" } },
+        { serverName: "unrelated", toolName: "echo", description: "unrelated provider", inputSchema: { type: "object" } },
+      ],
+      prompts: () => [], resourceServers: () => [], diagnostics: () => [],
+      serverStates: () => [{ name: "same", transport: "stdio", state: targetRoute === "retired" ? "disabled" : "connected" }, { name: "unrelated", transport: "stdio", state: "connected" }],
+      shutdown: async () => {},
+      callTool: async (serverName: string) => {
+        if (serverName === "same") {
+          calls.push(`same:${targetRoute}`);
+          if (targetRoute === "retired") throw new Error("provider A is retired");
+          return { content: [{ type: "text", text: `provider-${targetRoute}` }] };
+        }
+        calls.push("unrelated"); return { content: [{ type: "text", text: "unrelated-active" }] };
+      },
+      readResource: async () => ({ contents: [] }), getPrompt: async () => ({ messages: [] }),
+      disableServer: async (name: string) => {
+        if (name === "same") targetRoute = "retired";
+        return { state: "succeeded", deltas: [{ serverName: name, definitionFingerprint: `test-seam:${name}`, generation: 2, kind: "retire", tools: [], prompts: [] }] };
+      },
+      reconcileServer: async () => { targetRoute = "B"; calls.push("reconcile:B"); return { state: "succeeded", deltas: [] }; },
+      reconnectServer: async () => ({ state: "succeeded", deltas: [] }),
+    };
+    try {
+      process.chdir(dir); writeProjectFile(dir, "CLAUDE.md", "restrictive drift fixture\n");
+      picc(pi.api as never, {
+        mcpRuntime: runtime as never,
+        mcpAdministration: {
+          inspectPending: async () => ({ pending: false, status: "clear" }),
+          mutate: async () => { useAfter = true; return { state: "committed", effect: "changed", cleanup: "complete", retrySafe: false }; },
+          assemble: async () => state(useAfter ? [targetB, unrelated] : [targetA, unrelated]) as never,
+          captureService: (captured) => { service = captured; },
+        },
+        onInitializationSettled: pi.captureInitialization,
+      });
+      await pi.waitForInitialization();
+      await pi.fire("before_agent_start", { systemPrompt: "base" }, pi.tuiCtx());
+      const retainedA = pi.tools.get("mcp__same__echo");
+      const unrelatedTool = pi.tools.get("mcp__unrelated__echo");
+      expect(await retainedA.execute("before", {})).toMatchObject({ content: [{ text: "provider-A" }] });
+      expect(pi.activeTools.has("mcp__same__echo")).toBe(true);
+      expect(pi.activeTools.has("mcp__unrelated__echo")).toBe(true);
+
+      await expect(service!.execute({ kind: "remove", scope: "user", name: "same" })).resolves.toMatchObject({
+        eligibility: { eligible: false, reasonCode: "stale-state" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" },
+      });
+      expect(pi.activeTools.has("mcp__same__echo")).toBe(false);
+      expect(pi.activeTools.has("mcp__unrelated__echo")).toBe(true);
+      await expect(retainedA.execute("after", {})).rejects.toThrow(/retired/u);
+      await expect(unrelatedTool.execute("unrelated", {})).resolves.toMatchObject({ content: [{ text: "unrelated-active" }] });
+      expect(calls).toEqual(["same:A", "same:retired", "unrelated"]);
     } finally {
       process.chdir(originalCwd); await shutdownExtension(pi);
     }

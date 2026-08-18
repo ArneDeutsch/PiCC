@@ -364,13 +364,21 @@ describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
           const outcome = await fresh.fire("input", { text: `/mcp ${token}`, source: mode }, ctx);
           expect(outcome).toEqual({ action: "handled" });
           const output = String(fresh.entries.at(-1)?.data.output);
-          expect(output).toContain("No equivalent action was performed");
-          expect(output).toContain("bare /mcp to inspect status");
-          expect(output).toContain("TUI is required for project review and runtime actions");
-          expect(output).toContain("Standalone picc mcp commands manage declarations");
-          expect(output).toContain("broad project-review compatibility grants");
-          expect(output).toContain("not enable, disable, or reconnect controls");
-          expect(output).toContain("picc mcp --help");
+          if (token === "authenticate") {
+            expect(output).toContain("No authentication action was performed");
+            expect(output).toContain("does not currently provide MCP OAuth, token storage, or browser authentication");
+            expect(output).toContain("supported static headers");
+            expect(output).toContain("picc mcp --help");
+            expect(output).not.toMatch(/TUI|required for project review|open it|OAuth login|browser was opened|token was stored/u);
+          } else {
+            expect(output).toContain("No equivalent action was performed");
+            expect(output).toContain("bare /mcp to inspect status");
+            expect(output).toContain("TUI is required for project review and runtime actions");
+            expect(output).toContain("Standalone picc mcp commands manage declarations");
+            expect(output).toContain("broad project-review compatibility grants");
+            expect(output).toContain("not enable, disable, or reconnect controls");
+            expect(output).toContain("picc mcp --help");
+          }
           expect(output).not.toMatch(/picc mcp (?:approve|reject|enable|disable|reconnect|authenticate)/u);
         }
       }

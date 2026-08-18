@@ -384,6 +384,24 @@ describe("MCP administration orchestration", () => {
     expect(result).toMatchObject({ durable: { state: "committed", effect: "changed" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
   });
 
+  it("treats a rejected choice that becomes freshly approved during reset as stale and retires only prior approved routes", async () => {
+    const approved = declaration({ name: "approved", source: "project-mcpjson", review: "approved-exact", status: "enabled" });
+    const rejected = declaration({ name: "rejected", source: "settings-project", review: "rejected-exact", status: "disabled" });
+    const h = harness([fresh([approved, rejected]), fresh([
+      { ...approved, review: "pending", status: "pending-approval" },
+      { ...rejected, review: "approved-exact", status: "enabled" },
+    ])]);
+
+    await expect(h.service.execute({ kind: "reset-project-choices" })).resolves.toMatchObject({
+      eligibility: { eligible: false, reasonCode: "stale-state" },
+      durable: { state: "committed", effect: "changed" },
+      runtime: { state: "succeeded" }, exposure: { state: "succeeded" },
+    });
+    const transitions = h.apply.mock.calls[0]![0].transitions.map(openMcpAdministrationRuntimeTransition);
+    expect(transitions).toEqual([{ kind: "retire", serverName: "approved" }]);
+    expect(transitions).not.toEqual(expect.arrayContaining([expect.objectContaining({ kind: expect.stringMatching(/activate|replace/u) })]));
+  });
+
   it("derives only exact ownerless effective-winner transitions for shadow removal, reveal, reset, and agent review", async () => {
     const high = declaration({ name: "same", source: "native-local", authority: { kind: "mutable", scope: "local" }, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE });
     const lowShadow = declaration({ name: "same", source: "native-user", authority: { kind: "mutable", scope: "user" }, precedence: "shadowed", status: "shadowed" });
@@ -699,15 +717,20 @@ describe("MCP administration orchestration", () => {
     ];
     for (const row of rows) {
       const h = harness([fresh([row.before]), fresh([row.after])]);
+      const shouldRetire = row.label === "disable stale";
       await expect(h.service.execute(row.action), row.label).resolves.toEqual({
         inventory: expectedInventory([row.after]),
         eligibility: { eligible: false, reasonCode: row.reasonCode },
         recovery: { state: "not-requested" },
         durable: committed(),
-        runtime: { state: "not-requested" },
-        exposure: { state: "not-requested" },
+        runtime: { state: shouldRetire ? "succeeded" : "not-requested" },
+        exposure: { state: shouldRetire ? "succeeded" : "not-requested" },
       });
-      expect(h.apply, row.label).not.toHaveBeenCalled();
+      if (shouldRetire) {
+        const request = h.apply.mock.calls[0]![0];
+        expect(request.runtimeAdmission).toBeUndefined();
+        expect(request.transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([{ kind: "retire", serverName: "toggle" }]);
+      } else expect(h.apply, row.label).not.toHaveBeenCalled();
     }
   });
 
@@ -719,10 +742,32 @@ describe("MCP administration orchestration", () => {
       eligibility: { eligible: false, reasonCode: "stale-state" },
       recovery: { state: "not-requested" },
       durable: committed(),
-      runtime: { state: "not-requested" },
-      exposure: { state: "not-requested" },
+      runtime: { state: "succeeded" },
+      exposure: { state: "succeeded" },
     });
-    expect(h.apply).not.toHaveBeenCalled();
+    const request = h.apply.mock.calls[0]![0];
+    expect(request.runtimeAdmission).toBeUndefined();
+    expect(request.transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([{ kind: "retire", serverName: "stale" }]);
+  });
+
+  it("retires only causally targeted old routes when restrictive commits are followed by definition drift", async () => {
+    const unrelatedBefore = declaration({ name: "unrelated", source: "native-user", authority: { kind: "mutable", scope: "user" } });
+    const unrelatedAfter = { ...unrelatedBefore, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const }, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE };
+    const targets = [
+      { action: { kind: "remove", scope: "user", name: "target" } as const, before: declaration({ name: "target", source: "native-user", authority: { kind: "mutable", scope: "user" } }) },
+      { action: { kind: "disable", name: "target" } as const, before: declaration({ name: "target", source: "native-user", authority: { kind: "mutable", scope: "user" } }) },
+      { action: { kind: "reject", name: "target" } as const, before: declaration({ name: "target", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, review: "approved-exact" }) },
+      { action: { kind: "reset-project-choices" } as const, before: declaration({ name: "target", source: "project-mcpjson", authority: { kind: "mutable", scope: "project" }, review: "approved-exact" }) },
+    ];
+    for (const { action, before } of targets) {
+      const replacement = { ...before, source: "native-local" as const, authority: { kind: "mutable" as const, scope: "local" as const }, review: "not-required" as const, definitionDigest: CONTROL_DIGEST_B_FOR_SERVICE };
+      const h = harness([fresh([before, unrelatedBefore]), fresh([replacement, unrelatedAfter])]);
+      const result = await h.service.execute(action);
+      expect(result).toMatchObject({ eligibility: { eligible: false, reasonCode: "stale-state" }, durable: { state: "committed", effect: "changed" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+      const request = h.apply.mock.calls[0]![0];
+      expect(request.runtimeAdmission).toBeUndefined();
+      expect(request.transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([{ kind: "retire", serverName: "target" }]);
+    }
   });
 
   it("passes only a secret-free action descriptor after exact durable postconditions", async () => {
@@ -877,8 +922,9 @@ describe("MCP interactive confirmation authority", () => {
     const disabled = { ...base, status: "disabled" as const, inactiveReason: "native-runtime-disabled" as const };
     const after = harness([fresh([base]), fresh([base]), fresh([disabled, duplicate])]);
     const preparedAfter = await after.service.interactivePrepare(selector(base), "disable");
-    await expect(after.service.confirmedExecute(preparedAfter.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" }, durable: { state: "committed" }, runtime: { state: "not-requested" }, exposure: { state: "not-requested" } });
-    expect(after.mutate).toHaveBeenCalledOnce(); expect(after.apply).not.toHaveBeenCalled();
+    await expect(after.service.confirmedExecute(preparedAfter.authority!)).resolves.toMatchObject({ eligibility: { reasonCode: "stale-state" }, durable: { state: "committed" }, runtime: { state: "succeeded" }, exposure: { state: "succeeded" } });
+    expect(after.mutate).toHaveBeenCalledOnce();
+    expect(after.apply.mock.calls[0]![0].transitions.map(openMcpAdministrationRuntimeTransition)).toEqual([{ kind: "retire", serverName: "native" }]);
   });
 
   it("never recovers during confirmation and blocks pending work at both pre-mutation boundaries", async () => {

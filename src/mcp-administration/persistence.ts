@@ -69,6 +69,7 @@ function reason(code: McpPersistenceReasonCode): string {
   return ({ "no-op": "The requested MCP state is already current", "already-exists": "An MCP declaration with that name already exists in the selected scope", "invalid-authority": "MCP persistence authority is invalid or changed", "invalid-input": "The MCP mutation input is invalid", "invalid-state": "The target MCP state is malformed or unsafe", "ambiguous-project-state": "Consolidate or remove canonical-equivalent project entries in the selected .claude.json", stale: "The target MCP state changed concurrently", busy: "Another MCP administration operation holds the required lock", "storage-failure": "MCP persistence storage failed before a durable result", "pending-recovery": "MCP rollback remains pending and blocks new writes", "cleanup-pending": "The durable result is terminal but operation artifact cleanup remains pending" })[code];
 }
 function rejected(code: McpPersistenceReasonCode): McpPersistenceResult { return { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: code, reason: reason(code) }; }
+function pendingRecovery(operationId: string): McpPersistenceResult { return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") }; }
 
 async function readJson(target: string, absent: boolean): Promise<StoreResult<JsonDocument>> {
   try {
@@ -212,21 +213,21 @@ function codecFor(context: McpPersistenceContext, reviewPath: string) {
   return createMcpTransactionCodec({ store: context.store, profilePath: path.resolve(context.profilePath), projectMcpPath: path.join(path.resolve(context.projectRoot), ".mcp.json"), checkoutFamilyKey: context.checkoutFamilyKey, authorityFingerprint: context.authorityFingerprint, reviewStatePath: reviewPath, revalidateAuthority: () => currentAuthority(context), revalidateParticipant: (evidence) => revalidateParticipant(context, evidence) });
 }
 async function recoverPending(context: McpPersistenceContext, reviewPath: string, faults?: TransactionFaultSeam): Promise<McpPersistenceResult | undefined> {
-  const pending = await listPendingJournals(context.store); if (!pending.ok) return { state: "pending-recovery", operationId: "unknown", retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+  const pending = await listPendingJournals(context.store); if (!pending.ok) return pendingRecovery("unknown");
   if (pending.value.length === 0) return undefined; const operationId = pending.value[0]!; const codec = codecFor(context, reviewPath);
-  const registry = createTransactionCodecRegistry([codec]); if (!registry.ok) return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+  const registry = createTransactionCodecRegistry([codec]); if (!registry.ok) return pendingRecovery(operationId);
   const preview = await previewRecovery({ store: context.store, operationId, registry: registry.value });
-  if (!preview.ok || !preview.value.actions.includes("rollback")) return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
-  const journal = await readTransactionJournal(context.store, operationId); if (!journal.ok) return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+  if (!preview.ok || !preview.value.actions.includes("rollback")) return pendingRecovery(operationId);
+  const journal = await readTransactionJournal(context.store, operationId); if (!journal.ok) return pendingRecovery(operationId);
   let held = retainedLeases(context.store).get(operationId);
   if (held === undefined) {
     const acquired = await acquireLifecycleLocks({ store: context.store, operationId, identities: journal.value.requiredLocks, expectedRecoveryOperationId: operationId, ...(context.processOwnershipProbe === undefined ? {} : { processProbe: context.processOwnershipProbe }) });
-    if (!acquired.ok) return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+    if (!acquired.ok) return pendingRecovery(operationId);
     held = acquired.value; retainedLeases(context.store).set(operationId, held);
   }
   const recoveryStore = retainedLeaseStores.get(held) ?? context.store;
   const recovered = await recoverTransaction({ store: recoveryStore, operationId, action: "rollback", confirmedProducerSchema: preview.value.producerSchema, confirmedProducerVersion: preview.value.producerVersion, confirmedPlanDigest: preview.value.planDigest, confirmedConfirmationDigest: preview.value.confirmationDigest, registry: registry.value, lease: held, ...(faults === undefined ? {} : { faults }) });
-  if (!recovered.ok) return { state: "pending-recovery", operationId, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+  if (!recovered.ok) return pendingRecovery(operationId);
   retainedLeases(context.store).delete(operationId); retainedLeaseStores.delete(held); const clean = await cleanupArtifacts(artifacts(recovered.value.participants)); const released = await releaseLifecycleLocks(held).catch(() => ({ ok: false as const })); return cleanupPosture(terminal("rolled-back", operationId, "unchanged", true, clean), released.ok);
 }
 
@@ -235,9 +236,9 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
   try {
     const projectMcpPath = path.join(path.resolve(context.projectRoot), ".mcp.json"); const reviewPath = mcpReviewStatePath(context.store, context.checkoutFamilyKey);
     const pending = await listPendingJournals(context.store);
-    if (!pending.ok) return { state: "pending-recovery", operationId: "unknown", retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+    if (!pending.ok) return pendingRecovery("unknown");
     if (pending.value.length > 0) {
-      if (!reviewPath.ok) return { state: "pending-recovery", operationId: pending.value[0]!, retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: reason("pending-recovery") };
+      if (!reviewPath.ok) return pendingRecovery(pending.value[0]!);
       const recovered = await recoverPending(context, reviewPath.value, options.faults); if (recovered !== undefined) return recovered;
     }
     if (!reviewPath.ok || !/^sha256:[a-f0-9]{64}$/.test(context.authorityFingerprint) || !(await currentAuthority(context)).ok) return rejected("invalid-authority");
@@ -315,18 +316,29 @@ export async function persistMcpMutation(context: McpPersistenceContext, mutatio
     if (result.state === "pending-recovery") { retainedLeases(context.store).set(operationId, lease.value); retainedLeaseStores.set(lease.value, context.store); return result; }
     const released = await releaseLifecycleLocks(lease.value).catch(() => ({ ok: false as const })); return cleanupPosture(result, released.ok);
   } catch {
+    const pending = await listPendingJournals(context.store);
+    if (!pending.ok) return pendingRecovery("unknown");
+    if (pending.value[0] !== undefined) return pendingRecovery(pending.value[0]);
     const clean = await cleanupArtifacts(ownedArtifacts); return { state: "rejected", retrySafe: true, effect: "unchanged", cleanup: clean ? "complete" : "pending", reasonCode: clean ? "storage-failure" : "cleanup-pending", reason: reason(clean ? "storage-failure" : "cleanup-pending") };
   }
 }
 
 export async function recoverMcpPendingOperation(context: McpPersistenceContext, options: { readonly faults?: TransactionFaultSeam } = {}): Promise<McpPersistenceResult> {
+  let observedOperationId: string | undefined;
   try {
+    const pending = await listPendingJournals(context.store);
+    if (!pending.ok) return pendingRecovery("unknown");
+    const operationId = pending.value[0];
+    observedOperationId = operationId;
     const reviewPath = mcpReviewStatePath(context.store, context.checkoutFamilyKey);
+    if (operationId !== undefined) {
+      if (!reviewPath.ok) return pendingRecovery(operationId);
+      return (await recoverPending(context, reviewPath.value, options.faults)) ?? pendingRecovery(operationId);
+    }
     if (!reviewPath.ok || !/^sha256:[a-f0-9]{64}$/.test(context.authorityFingerprint) || !(await currentAuthority(context)).ok) return rejected("invalid-authority");
-    const recovered = await recoverPending(context, reviewPath.value, options.faults);
-    return recovered ?? { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") };
+    return { state: "committed", retrySafe: true, effect: "unchanged", cleanup: "complete", reasonCode: "no-op", reason: reason("no-op") };
   } catch {
-    return rejected("storage-failure");
+    return observedOperationId === undefined ? rejected("storage-failure") : pendingRecovery(observedOperationId);
   }
 }
 

@@ -1906,6 +1906,22 @@ describe("loadClaudeProject — MCP private startup authority", () => {
     expect(load(f.repo, f.userDir).mcp.servers.find((server) => server.name === "reviewed")).toMatchObject({ status: "disabled", inactiveReason: "mcpjson-rejected" });
   });
 
+  it("shares exact review admission across linked checkout-family views and makes changed definitions pending in both", async () => {
+    const f = await startupFixture(); const main = f.repo; const linked = path.join(f.base, "linked"); const admin = path.join(main, ".git", "worktrees", "linked");
+    fs.mkdirSync(linked, { recursive: true }); write(path.join(linked, ".git"), `gitdir: ${admin}`); write(path.join(admin, "gitdir"), path.join(linked, ".git")); write(path.join(admin, "commondir"), "../..");
+    write(path.join(main, ".mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "old" } } }));
+    write(path.join(linked, ".mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "old" } } }));
+    const mainInitial = load(main, f.userDir); const linkedInitial = load(linked, f.userDir);
+    expect(mainInitial.mcpStartupAuthority.checkoutFamilyKey).toBe(linkedInitial.mcpStartupAuthority.checkoutFamilyKey);
+    const declaration = mainInitial.mcp.administration?.declarations.find((item) => item.name === "shared"); if (declaration?.definitionDigest === undefined) throw new Error("digest");
+    expect(await persistMcpMutation(f.context, { kind: "set-review", record: { profileKey: f.store.profileKey, checkoutFamilyKey: f.checkoutFamilyKey, source: "project-mcpjson", serverName: "shared", definitionVersion: 1, definitionDigest: declaration.definitionDigest, decision: "approved" } })).toMatchObject({ state: "committed" });
+    expect(load(main, f.userDir).mcp.servers.find((server) => server.name === "shared")).toMatchObject({ status: "enabled" });
+    expect(load(linked, f.userDir).mcp.servers.find((server) => server.name === "shared")).toMatchObject({ status: "enabled" });
+    write(path.join(main, ".mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "changed-main" } } }));
+    write(path.join(linked, ".mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "changed-linked" } } }));
+    for (const checkout of [main, linked]) expect(load(checkout, f.userDir).mcp.servers.find((server) => server.name === "shared")).toMatchObject({ status: "pending-approval", inactiveReason: "mcpjson-unapproved" });
+  });
+
   it("treats malformed private review state as unavailable without granting exact approval", async () => {
     const f = await startupFixture();
     write(path.join(f.repo, ".mcp.json"), JSON.stringify({ mcpServers: { reviewed: { command: "run" } } }));

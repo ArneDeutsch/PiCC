@@ -3612,7 +3612,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const capturedProfilePath = path.resolve(project.userDir);
   const capturedProjectRoot = path.resolve(project.root);
   const capturedFamilyKey = validMcpLocations?.value.checkoutFamilyKey;
-  const authorityFingerprint = capturedFamilyKey === undefined ? "unavailable" : `sha256:${createHash("sha256").update(`${capturedProfilePath}\0${capturedProjectRoot}\0${capturedFamilyKey}`, "utf8").digest("hex")}`;
+  const capturedProfileKey = validMcpLocations?.value.profileKey;
+  const authorityFingerprint = capturedFamilyKey === undefined || capturedProfileKey === undefined ? "unavailable" : `sha256:${createHash("sha256").update(`${capturedProfileKey}\0${capturedFamilyKey}`, "utf8").digest("hex")}`;
   let writableMcpStore: OwnedStateStore | undefined;
   const persistenceContext = async (): Promise<McpPersistenceContext> => {
     if (validMcpLocations === undefined) throw new Error("MCP administration authority unavailable");
@@ -3642,7 +3643,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           if (!freshLocations.ok || freshLocations.value.profileKey !== passiveStore?.profileKey || freshLocations.value.checkoutFamilyKey !== capturedFamilyKey) {
             return { ok: false as const, code: "changed-authority", message: "authority changed" };
           }
-          const freshFingerprint = `sha256:${createHash("sha256").update(`${path.resolve(fresh.userDir)}\0${path.resolve(fresh.root)}\0${freshLocations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
+          const freshFingerprint = `sha256:${createHash("sha256").update(`${freshLocations.value.profileKey}\0${freshLocations.value.checkoutFamilyKey}`, "utf8").digest("hex")}`;
           return freshFingerprint === authorityFingerprint
             ? { ok: true as const, value: { profileKey: freshLocations.value.profileKey, checkoutFamilyKey: capturedFamilyKey!, authorityFingerprint } }
             : { ok: false as const, code: "changed-authority", message: "authority changed" };
@@ -5654,6 +5655,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
   const MCP_HEADLESS_ADMINISTRATION_GUIDANCE =
     "No equivalent action was performed in this mode. The interactive PiCC TUI is required for project review and runtime actions; open it and use /mcp manage. Use bare /mcp to inspect status. Standalone picc mcp commands manage declarations; trusted user/managed settings provide only broad project-review compatibility grants, not enable, disable, or reconnect controls. Run picc mcp --help for supported commands.";
+  const MCP_HEADLESS_AUTHENTICATION_GUIDANCE =
+    "No authentication action was performed. PiCC does not currently provide MCP OAuth, token storage, or browser authentication. Configure supported static headers in the applicable MCP server declaration when the server accepts them; run picc mcp --help for supported configuration commands.";
   const MCP_DEEP_LINK_ACTIONS = new Map<string, import("./runtime/mcp-administration-render.js").McpAdministrationUiAction | undefined>([
     ["manage", undefined], ["approve", "approve"], ["reject", "reject"], ["enable", "enable"],
     ["disable", "disable"], ["reconnect", "reconnect"], ["authenticate", "authenticate"],
@@ -5723,7 +5726,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (trimmed.length > 0) {
           const token = /^[A-Za-z-]+$/u.test(trimmed) ? trimmed.toLowerCase() : undefined;
           if (token === undefined || !MCP_DEEP_LINK_ACTIONS.has(token)) return MCP_ARGUMENT_RESPONSE;
-          if (ctx?.mode !== "tui") return MCP_HEADLESS_ADMINISTRATION_GUIDANCE;
+          if (ctx?.mode !== "tui") return token === "authenticate" ? MCP_HEADLESS_AUTHENTICATION_GUIDANCE : MCP_HEADLESS_ADMINISTRATION_GUIDANCE;
           const recoveryAwarePort: import("./runtime/mcp-administration-focus.js").McpAdministrationActionPort = Object.freeze({
             inventory: async () => {
               const prepared = await mcpAdministrationService.prepareInventoryAfterRecovery();

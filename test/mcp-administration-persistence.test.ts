@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { normalizeMcpServerBlock } from "../src/claude/mcp-config.js";
 import { createMcpLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { establishOwnedStateStore, type OwnedStateStore } from "../src/plugin-lifecycle/state-store.js";
-import { mcpPersistenceDeclarationEvidence, persistMcpMutation } from "../src/mcp-administration/persistence.js";
+import { mcpPersistenceDeclarationEvidence, persistMcpMutation, recoverMcpPendingOperation } from "../src/mcp-administration/persistence.js";
 import { createMcpAdministrationService } from "../src/mcp-administration/service.js";
 import type { ResolvedMcpConfig } from "../src/types.js";
 import { createMcpReviewDefinitionDigest, matchesMcpReviewRecord } from "../src/mcp-administration/review-definition.js";
@@ -214,15 +214,35 @@ describe("recoverable scoped MCP persistence", () => {
     execFileSync("git", ["worktree", "add", "--detach", linked, "HEAD"], { cwd: main, stdio: "pipe" });
     try {
       const mainIdentities = projectIdentities(main); const linkedIdentities = projectIdentities(linked); expect(mainIdentities[0]).toBe(linkedIdentities[0]);
-      const f = await fixture(main); const linkedLocations = createMcpLifecycleLocations({ homeDir: f.home, profilePath: f.profile, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: linkedIdentities.at(-1)!, checkoutFamilyPath: linkedIdentities[0]! } }); if (!linkedLocations.ok || linkedLocations.value.checkoutFamilyKey === undefined) throw new Error("linked locations"); const linkedStore = await establishOwnedStateStore(linkedLocations.value, f.home); if (!linkedStore.ok) throw new Error(linkedStore.message); expect(linkedLocations.value.checkoutFamilyKey).toBe(f.context.checkoutFamilyKey);
-      const linkedContext = { ...f.context, store: linkedStore.value, projectRoot: linked, checkoutFamilyKey: linkedLocations.value.checkoutFamilyKey, identifyProject: () => linkedIdentities };
+      const f = await fixture(main);
+      const composeContext = async (projectRoot: string, identities: readonly string[]) => {
+        const locations = createMcpLifecycleLocations({ homeDir: f.home, profilePath: f.profile, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: identities.at(-1)!, checkoutFamilyPath: identities[0]! } });
+        if (!locations.ok || locations.value.checkoutFamilyKey === undefined) throw new Error("locations");
+        const store = await establishOwnedStateStore(locations.value, f.home); if (!store.ok) throw new Error(store.message);
+        const checkoutFamilyKey = locations.value.checkoutFamilyKey;
+        const authorityFingerprint = f.context.authorityFingerprint;
+        return { store: store.value, profilePath: f.profile, projectRoot, checkoutFamilyKey, authorityFingerprint,
+          identifyProject: () => projectIdentities(projectRoot),
+          revalidateAuthority: () => {
+            const freshIdentities = projectIdentities(projectRoot); const freshLocations = createMcpLifecycleLocations({ homeDir: f.home, profilePath: f.profile, platform: process.platform === "win32" ? "win32" : "posix", project: { activeCheckoutPath: freshIdentities.at(-1)!, checkoutFamilyPath: freshIdentities[0]! } });
+            if (!freshLocations.ok || freshLocations.value.profileKey !== store.value.profileKey || freshLocations.value.checkoutFamilyKey !== checkoutFamilyKey) return { ok: false as const, code: "changed-authority", message: "changed" };
+            return { ok: true as const, value: { profileKey: store.value.profileKey, checkoutFamilyKey, authorityFingerprint } };
+          } };
+      };
+      const mainContext = await composeContext(main, mainIdentities); const linkedContext = await composeContext(linked, linkedIdentities);
+      expect(linkedContext.checkoutFamilyKey).toBe(mainContext.checkoutFamilyKey); expect(linkedContext.authorityFingerprint).toBe(mainContext.authorityFingerprint);
       const oldEntry = normalizeMcpServerBlock({ shared: { command: "old" } }, "linked fixture")[0]!; const oldDigest = createMcpReviewDefinitionDigest(oldEntry)!;
-      const identity = { profileKey: f.store.profileKey, checkoutFamilyKey: f.context.checkoutFamilyKey, source: "project-mcpjson" as const, serverName: "shared" }; const approved = { ...identity, definitionVersion: 1 as const, definitionDigest: oldDigest, decision: "approved" as const };
-      expect((await persistMcpMutation(f.context, { kind: "set-review", record: approved })).state).toBe("committed"); const fromLinked = await readMcpReviewState({ store: linkedStore.value, checkoutFamilyKey: linkedContext.checkoutFamilyKey }); if (!fromLinked.ok) throw new Error(fromLinked.message); expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, oldDigest)).toBe(true);
-      expect((await persistMcpMutation(f.context, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed");
-      expect(await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "pending-main" } }, { faults: { hit(phase) { if (phase === "after-replacement") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery", effect: "uncertain" });
-      expect(await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "blocked-linked", definition: { command: "must-not-apply" } })).toMatchObject({ state: "rolled-back", effect: "unchanged" }); expect(fs.readFileSync(path.join(main, ".mcp.json"), "utf8")).not.toContain("pending-main"); expect(fs.existsSync(path.join(linked, ".mcp.json"))).toBe(true);
-      expect((await persistMcpMutation(f.context, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-main" } })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-linked" } })).state).toBe("committed");
+      const identity = { profileKey: mainContext.store.profileKey, checkoutFamilyKey: mainContext.checkoutFamilyKey, source: "project-mcpjson" as const, serverName: "shared" }; const approved = { ...identity, definitionVersion: 1 as const, definitionDigest: oldDigest, decision: "approved" as const };
+      expect((await persistMcpMutation(mainContext, { kind: "set-review", record: approved })).state).toBe("committed"); const fromLinked = await readMcpReviewState({ store: linkedContext.store, checkoutFamilyKey: linkedContext.checkoutFamilyKey }); if (!fromLinked.ok) throw new Error(fromLinked.message); expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, oldDigest)).toBe(true);
+      expect((await persistMcpMutation(mainContext, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed");
+      expect(await persistMcpMutation(mainContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "pending-main" } }, { faults: { hit(phase) { if (phase === "after-replacement") throw new Error("pending"); } } })).toMatchObject({ state: "pending-recovery", effect: "uncertain", cleanup: "pending", retrySafe: false });
+      const journalNames = fs.readdirSync(linkedContext.store.journalsRoot); expect(journalNames).toHaveLength(1);
+      const uncertainContext = { ...linkedContext, revalidateAuthority: () => ({ ok: false as const, code: "changed-authority", message: "SECRET_PATH_CANARY" }) };
+      expect(await recoverMcpPendingOperation(uncertainContext)).toEqual({ state: "pending-recovery", operationId: expect.any(String), retrySafe: false, effect: "uncertain", cleanup: "pending", reasonCode: "pending-recovery", reason: "MCP rollback remains pending and blocks new writes" });
+      expect(fs.readdirSync(linkedContext.store.journalsRoot)).toEqual(journalNames);
+      expect(JSON.stringify(await recoverMcpPendingOperation(uncertainContext))).not.toContain("SECRET_PATH_CANARY");
+      expect(await recoverMcpPendingOperation(linkedContext)).toMatchObject({ state: "rolled-back", effect: "unchanged", cleanup: "complete" }); expect(fs.readFileSync(path.join(main, ".mcp.json"), "utf8")).not.toContain("pending-main"); expect(fs.existsSync(path.join(linked, ".mcp.json"))).toBe(true);
+      expect((await persistMcpMutation(mainContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-main" } })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "remove-declaration", scope: "project", name: "shared" })).state).toBe("committed"); expect((await persistMcpMutation(linkedContext, { kind: "set-declaration", scope: "project", name: "shared", definition: { command: "changed-linked" } })).state).toBe("committed");
       const mainChanged = createMcpReviewDefinitionDigest(normalizeMcpServerBlock((JSON.parse(fs.readFileSync(path.join(main, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers, "main changed")[0]!)!; const linkedChanged = createMcpReviewDefinitionDigest(normalizeMcpServerBlock((JSON.parse(fs.readFileSync(path.join(linked, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers, "linked changed")[0]!)!;
       expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, mainChanged)).toBe(false); expect(matchesMcpReviewRecord(fromLinked.value.records[0]!, identity, linkedChanged)).toBe(false);
     } finally { try { execFileSync("git", ["worktree", "remove", "--force", linked], { cwd: main, stdio: "pipe" }); } catch { fs.rmSync(linked, { recursive: true, force: true }); } }

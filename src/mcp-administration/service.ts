@@ -383,8 +383,27 @@ function postcommitEligibility(
   addBinding?: McpDeclarationDefinitionBinding,
   durable: McpPersistenceResult | { readonly state: "not-requested" } = NOT_REQUESTED,
 ): McpAdministrationEligibility {
-  if (action.kind === "reset-project-choices") return eligible();
-  if (action.kind === "remove") return exactScope(after, action.name, action.scope) === undefined ? eligible() : denied("stale-state");
+  if (action.kind === "reset-project-choices") {
+    const afterDeclarations = afterState.mcp.administration?.declarations ?? [];
+    const resetSettled = (beforeState.mcp.administration?.declarations ?? []).every((beforeDeclaration) => {
+      if (beforeDeclaration.agentOwner !== undefined ||
+        (beforeDeclaration.review !== "approved-exact" && beforeDeclaration.review !== "rejected-exact") ||
+        !PROJECT_REVIEW_SOURCES.has(beforeDeclaration.source as never) || !validPrivateDefinition(beforeDeclaration)) return true;
+      return afterDeclarations.some((candidate) => candidate.name === beforeDeclaration.name && candidate.agentOwner === undefined &&
+        candidate.source === beforeDeclaration.source && candidate.definitionVersion === beforeDeclaration.definitionVersion &&
+        candidate.definitionDigest === beforeDeclaration.definitionDigest && candidate.review === "pending");
+    });
+    return resetSettled ? eligible() : denied("stale-state");
+  }
+  if (action.kind === "remove") {
+    if (exactScope(after, action.name, action.scope) !== undefined) return denied("stale-state");
+    const afterWinner = privateDeclaration(afterState, action.name);
+    if (afterWinner === undefined) return eligible();
+    const revealedBefore = (beforeState.mcp.administration?.declarations ?? []).some((candidate) => candidate.name === afterWinner.name &&
+      candidate.agentOwner === undefined && candidate.precedence === "shadowed" && candidate.source === afterWinner.source &&
+      candidate.definitionVersion === afterWinner.definitionVersion && candidate.definitionDigest === afterWinner.definitionDigest);
+    return revealedBefore ? eligible() : denied("stale-state");
+  }
   if (action.kind !== "add" && (beforeState.reviewIdentity.profileKey !== afterState.reviewIdentity.profileKey ||
     beforeState.reviewIdentity.checkoutFamilyKey !== afterState.reviewIdentity.checkoutFamilyKey)) return denied("stale-state");
   const afterServer = winner(after, action.name, "agentOwner" in action ? action.agentOwner : undefined);
@@ -516,8 +535,31 @@ function runtimeTransitionsFor(
   return Object.freeze(transitions);
 }
 
-function liveRequest(action: McpAdministrationAction, beforeState: McpAdministrationFreshState, afterState: McpAdministrationFreshState, addBinding?: McpDeclarationDefinitionBinding): McpAdministrationLiveRequest {
-  const transitions = runtimeTransitionsFor(action, beforeState, afterState, addBinding);
+function restrictiveRetireOnlyTransitions(
+  action: McpAdministrationAction,
+  beforeState: McpAdministrationFreshState,
+): readonly McpAdministrationRuntimeTransition[] {
+  if (action.kind !== "remove" && action.kind !== "disable" && action.kind !== "reject" && action.kind !== "reset-project-choices") return Object.freeze([]);
+  if ("agentOwner" in action && action.agentOwner !== undefined) return Object.freeze([]);
+  const before = effectiveWinners(beforeState);
+  const names = new Set<string>();
+  if (action.kind === "reset-project-choices") {
+    for (const [name, winner] of before) {
+      if (winner.declaration.review === "approved-exact" && PROJECT_REVIEW_SOURCES.has(winner.declaration.source as never)) names.add(name);
+    }
+  } else {
+    const oldWinner = before.get(action.name);
+    if (oldWinner !== undefined && (action.kind !== "remove" || oldWinner.declaration.authority.kind === "mutable" && oldWinner.declaration.authority.scope === action.scope)) names.add(action.name);
+  }
+  return Object.freeze([...names].sort().map((serverName) => mintTransition({ kind: "retire", serverName })));
+}
+
+function liveRequest(action: McpAdministrationAction, beforeState: McpAdministrationFreshState, afterState: McpAdministrationFreshState, addBinding?: McpDeclarationDefinitionBinding, retireOnly = false): McpAdministrationLiveRequest {
+  // Reset is restrictive by definition. Re-derive only retirements from the prior effective
+  // approved routes so even a future eligibility regression cannot activate drifted declarations.
+  const transitions = retireOnly || action.kind === "reset-project-choices"
+    ? restrictiveRetireOnlyTransitions(action, beforeState)
+    : runtimeTransitionsFor(action, beforeState, afterState, addBinding);
   const admission = transitions.map((transition) => runtimeTransitions.get(transition)).find((contents) => contents?.kind === "activate" || contents?.kind === "replace" || contents?.kind === "reconnect")?.admission;
   return Object.freeze({ action: liveAction(action), transitions, ...(admission === undefined ? {} : { runtimeAdmission: admission }) });
 }
@@ -598,13 +640,14 @@ export function createMcpAdministrationService(dependencies: McpAdministrationSe
         return Object.freeze({ inventory: after, eligibility: denied(reason), recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       }
       if (durable.cleanup === "pending") return Object.freeze({ inventory: after, eligibility: denied("cleanup-pending"), recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
-      if (confirmationBinding !== undefined && !confirmedBindingMatches(afterState, after, confirmationBinding, "after")) {
-        return Object.freeze({ inventory: after, eligibility: denied("stale-state"), recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
-      }
-      const finalEligibility = postcommitEligibility(action, beforeState, afterState, before, after, addBinding, durable);
-      if (!finalEligibility.eligible) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+      const confirmationSettled = confirmationBinding === undefined || confirmedBindingMatches(afterState, after, confirmationBinding, "after");
+      const finalEligibility = confirmationSettled
+        ? postcommitEligibility(action, beforeState, afterState, before, after, addBinding, durable)
+        : denied("stale-state");
       if (durable.effect === "unchanged" || dependencies.live === undefined || action.kind === "authenticate") return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
-      const request = liveRequest(action, beforeState, afterState, addBinding);
+      const retireOnly = !finalEligibility.eligible && finalEligibility.reasonCode === "stale-state";
+      if (!finalEligibility.eligible && !retireOnly) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
+      const request = liveRequest(action, beforeState, afterState, addBinding, retireOnly);
       if (request.transitions.length === 0) return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: NOT_REQUESTED, exposure: NOT_REQUESTED });
       try { const live = await dependencies.live.apply(request); return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: live.runtime, exposure: live.exposure }); }
       catch { return Object.freeze({ inventory: after, eligibility: finalEligibility, recovery, durable, runtime: Object.freeze({ state: "failed" as const, reasonCode: "live-port-failure" }), exposure: NOT_REQUESTED }); }
