@@ -20,6 +20,7 @@ export const RELEASE_STATIC_FILES = Object.freeze([
   "LICENSE",
   "README.md",
   "bin/picc-admin.mjs",
+  "bin/picc-mcp.mjs",
   "bin/picc-plugin.mjs",
   "bin/picc-runtime.mjs",
   "bin/picc-update.mjs",

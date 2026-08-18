@@ -45,11 +45,14 @@ function sorted<T extends { path: string }>(records: T[]) {
 
 const sourceFiles = new Map([
   ["src/index.ts", content("deliberately invalid TypeScript }}} @@@\n")],
+  ["src/mcp-administration-cli.ts", content("export const mcpAdministration = true;\n")],
   ["src/plugin-inventory-cli.ts", content("export const inventory = true;\n")],
 ]);
 const runtimeFiles = new Map([
   ["dist/index.js", content("export default function picc() {}\n//# sourceMappingURL=index.js.map\n")],
   ["dist/index.js.map", content(JSON.stringify({ version: 3, file: "index.js", sourceRoot: "", sources: ["../src/index.ts"], names: [], mappings: "" }))],
+  ["dist/mcp-administration-cli.js", content("export const mcpAdministration = true;\n//# sourceMappingURL=mcp-administration-cli.js.map\n")],
+  ["dist/mcp-administration-cli.js.map", content(JSON.stringify({ version: 3, file: "mcp-administration-cli.js", sources: ["../src/mcp-administration-cli.ts"], names: [], mappings: "" }))],
   ["dist/plugin-inventory-cli.js", content("export const inventory = true;\n//# sourceMappingURL=plugin-inventory-cli.js.map\n")],
   ["dist/plugin-inventory-cli.js.map", content(JSON.stringify({ version: 3, file: "plugin-inventory-cli.js", sources: ["../src/plugin-inventory-cli.ts"], names: [], mappings: "" }))],
   ["picc/index.js", content("export { default } from '../dist/index.js';\n")],
@@ -92,7 +95,11 @@ function validArtifact(changes: ArtifactChanges = {}) {
     sourceDigest,
     files: runtimeRecords,
     runtimeDigest: sha(JSON.stringify(runtimeRecords)),
-    entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js" },
+    entries: {
+      extension: "picc/index.js",
+      pluginInventory: "dist/plugin-inventory-cli.js",
+      mcpAdministration: "dist/mcp-administration-cli.js",
+    },
   };
   changes.transformManifest?.(manifest);
   const root = changes.root ?? "package";
@@ -310,6 +317,8 @@ describe("schema-v1 runtime artifact policy", () => {
     ["dist/index.js.map", "extension map"],
     ["dist/plugin-inventory-cli.js", "plugin runtime"],
     ["dist/plugin-inventory-cli.js.map", "plugin map"],
+    ["dist/mcp-administration-cli.js", "MCP administration runtime"],
+    ["dist/mcp-administration-cli.js.map", "MCP administration map"],
     ["picc/index.js", "wrapper"],
   ])("rejects missing and corrupt required %s (%s)", (name) => {
     expectInvariant(() => verify(validArtifact({ remove: [name] })), /generated runtime contents are missing/u);
@@ -356,10 +365,15 @@ describe("schema-v1 runtime artifact policy", () => {
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { delete manifest.compiler.configPath; } })), /identity is malformed/u);
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.extension = "dist/index.js"; } })), /fixed entrypoints/u);
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.pluginInventory = "dist/index.js"; } })), /fixed entrypoints/u);
-    expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => {
-      manifest.files = manifest.files.filter((item: any) => item.path !== "picc/index.js");
-      manifest.runtimeDigest = sha(JSON.stringify(manifest.files));
-    } })), /required runtime record/u);
+    expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.mcpAdministration = "dist/index.js"; } })), /fixed entrypoints/u);
+    expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { delete manifest.entries.mcpAdministration; } })), /fixed entrypoints/u);
+    expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.extra = "dist/index.js"; } })), /fixed entrypoints/u);
+    for (const required of ["picc/index.js", "dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map"]) {
+      expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => {
+        manifest.files = manifest.files.filter((item: any) => item.path !== required);
+        manifest.runtimeDigest = sha(JSON.stringify(manifest.files));
+      } })), /required runtime record/u);
+    }
   });
 
   it.each([
