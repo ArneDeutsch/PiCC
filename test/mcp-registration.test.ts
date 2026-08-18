@@ -1672,7 +1672,12 @@ describe("MCP administration exposure composition", () => {
       picc(second.api as never, { onInitializationSettled: second.captureInitialization });
       await second.waitForInitialization();
       const opening = second.commands.get("mcp").handler("manage", second.tuiCtx());
-      await vi.waitFor(() => expect(second!.customs).toHaveLength(1));
+      await waitUntil({
+        description: "recovered MCP administration custom entry to open",
+        predicate: () => second!.customs.length === 1,
+        describeObserved: () => `current custom count=${second!.customs.length}`,
+      });
+      expect(second.customs).toHaveLength(1);
       const custom = second.customs[0]!; await custom.ready;
       expect(second.notifications.at(-1)).toMatchObject({ severity: "info", text: expect.stringContaining("MCP recovery completed: state=rolled-back") });
       expect(custom.render(80).join("\n")).toContain("PiCC MCP administration");
