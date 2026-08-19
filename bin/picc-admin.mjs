@@ -37,20 +37,51 @@ function readJson(filename) {
   try { return JSON.parse(fs.readFileSync(filename, "utf8")); } catch { return undefined; }
 }
 
-export function canonicalPath(filename) {
-  const resolved = fs.realpathSync.native(filename);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+export function physicalPath(filename) {
+  return fs.realpathSync.native(filename);
 }
 
-export function isPathInside(candidate, parent) {
-  const relative = path.relative(parent, candidate);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+// Keep comparison behavior explicit so identity keys cannot leak into filesystem operations.
+export const canonicalPath = physicalPath;
+
+function pathApi(platform) {
+  return platform === "win32" ? path.win32 : path.posix;
+}
+
+function foldForComparison(value, platform) {
+  return platform === "win32" ? value.toLowerCase() : value;
+}
+
+export function pathIdentity(physicalAbsolutePath, platform = process.platform) {
+  if (typeof physicalAbsolutePath !== "string" || !pathApi(platform).isAbsolute(physicalAbsolutePath)) {
+    throw new TypeError("Path identity requires a physical absolute path");
+  }
+  return foldForComparison(physicalAbsolutePath, platform);
+}
+
+export function pathsEqual(left, right, platform = process.platform) {
+  return pathIdentity(left, platform) === pathIdentity(right, platform);
+}
+
+export function isPathInside(candidate, parent, platform = process.platform) {
+  const api = pathApi(platform);
+  const relative = api.relative(pathIdentity(parent, platform), pathIdentity(candidate, platform));
+  return relative === "" || (!relative.startsWith(`..${api.sep}`) && relative !== ".." && !api.isAbsolute(relative));
+}
+
+export function deduplicatePhysicalPaths(paths, platform = process.platform) {
+  const retained = new Map();
+  for (const physical of paths) {
+    const key = pathIdentity(physical, platform);
+    if (!retained.has(key)) retained.set(key, physical);
+  }
+  return [...retained.values()];
 }
 
 export function findPackageRoot(moduleUrl = import.meta.url) {
   let current = path.dirname(fileURLToPath(moduleUrl));
   for (;;) {
-    if (readJson(path.join(current, "package.json"))?.name === "@arnedeutsch/picc") return canonicalPath(current);
+    if (readJson(path.join(current, "package.json"))?.name === "@arnedeutsch/picc") return physicalPath(current);
     const parent = path.dirname(current);
     if (parent === current) throw new Error("PiCC package root is unavailable");
     current = parent;
@@ -67,7 +98,7 @@ function executableFile(filename) {
   try {
     if (!fs.statSync(filename).isFile()) return undefined;
     if (process.platform !== "win32") fs.accessSync(filename, fs.constants.X_OK);
-    return canonicalPath(filename);
+    return physicalPath(filename);
   } catch { return undefined; }
 }
 
@@ -108,7 +139,7 @@ export function discoverNpmCommand({ env = process.env, execPath = process.execP
   );
   for (const candidate of candidates) {
     const cli = executableFile(candidate);
-    if (cli) return { command: canonicalPath(execPath), args: [cli] };
+    if (cli) return { command: physicalPath(execPath), args: [cli] };
   }
   if (process.platform !== "win32") {
     const npm = findExecutableOnPath("npm", env);
@@ -131,25 +162,29 @@ export function discoverGlobalNpmRoot() {
   });
   const output = result.status === 0 ? result.stdout?.trim() : "";
   try {
-    return output && path.isAbsolute(output) && fs.statSync(output).isDirectory() ? canonicalPath(output) : undefined;
+    return output && path.isAbsolute(output) && fs.statSync(output).isDirectory() ? physicalPath(output) : undefined;
   } catch { return undefined; }
 }
 
 export function classifyInstallation({ packageRoot } = {}) {
   try {
-    const root = canonicalPath(packageRoot ?? findPackageRoot());
+    const root = physicalPath(packageRoot ?? findPackageRoot());
     const git = fs.lstatSync(path.join(root, ".git"), { throwIfNoEntry: false });
     const lock = fs.lstatSync(path.join(root, "package-lock.json"), { throwIfNoEntry: false });
     return git && (git.isFile() || git.isDirectory()) && lock?.isFile() ? "source" : "installed";
   } catch { return "installed"; }
 }
 
+export function pathComponentEquals(left, right, platform = process.platform) {
+  return foldForComparison(left, platform) === foldForComparison(right, platform);
+}
+
 function containingNodeModules(packageRoot) {
-  let current = canonicalPath(packageRoot);
+  let current = physicalPath(packageRoot);
   for (;;) {
     const parent = path.dirname(current);
-    if (path.basename(parent).toLowerCase() === "node_modules") return parent;
-    if (path.basename(path.dirname(parent)).toLowerCase() === "node_modules" && path.basename(parent).startsWith("@")) return path.dirname(parent);
+    if (pathComponentEquals(path.basename(parent), "node_modules")) return parent;
+    if (pathComponentEquals(path.basename(path.dirname(parent)), "node_modules") && path.basename(parent).startsWith("@")) return path.dirname(parent);
     if (parent === current) return undefined;
     current = parent;
   }
@@ -159,16 +194,14 @@ function admissibleNodeModules(packageRoot) {
   const roots = [];
   try {
     const local = path.join(packageRoot, "node_modules");
-    if (fs.statSync(local).isDirectory()) roots.push(canonicalPath(local));
+    if (fs.statSync(local).isDirectory()) roots.push(physicalPath(local));
   } catch { /* dependencies may be missing */ }
   const containing = containingNodeModules(packageRoot);
   if (containing) {
-    try {
-      const canonical = canonicalPath(containing);
-      if (!roots.includes(canonical)) roots.push(canonical);
-    } catch { /* ignore unusable containing root */ }
+    try { roots.push(physicalPath(containing)); }
+    catch { /* ignore unusable containing root */ }
   }
-  return roots;
+  return deduplicatePhysicalPaths(roots);
 }
 
 function resolveSuitePackage(name, roots) {
@@ -182,7 +215,7 @@ function resolveSuitePackage(name, roots) {
       return { problem: "has an invalid package directory" };
     }
     try {
-      const packageRoot = canonicalPath(logicalRoot);
+      const packageRoot = physicalPath(logicalRoot);
       if (!isPathInside(packageRoot, nodeModules)) return { problem: "escapes its dependency root" };
       const manifestPath = path.join(logicalRoot, "package.json");
       const stat = fs.lstatSync(manifestPath, { throwIfNoEntry: false });
@@ -202,7 +235,7 @@ function suiteFailure(reason) {
 
 export function validatePiSuite({ packageRoot = findPackageRoot() } = {}) {
   let root;
-  try { root = canonicalPath(packageRoot); } catch { return suiteFailure("The PiCC package root is unavailable"); }
+  try { root = physicalPath(packageRoot); } catch { return suiteFailure("The PiCC package root is unavailable"); }
   const manifest = readJson(path.join(root, "package.json"));
   if (!manifest) return suiteFailure("PiCC package metadata is unreadable");
   const declarations = new Map();
@@ -233,7 +266,7 @@ export function resolvePiCli(packageRoot = findPackageRoot()) {
   if (!suite.ok) return suite;
   const codingRoot = suite.resolved["@earendil-works/pi-coding-agent"];
   try {
-    const cli = canonicalPath(path.join(codingRoot, "dist", "cli.js"));
+    const cli = physicalPath(path.join(codingRoot, "dist", "cli.js"));
     if (!fs.statSync(cli).isFile() || !isPathInside(cli, codingRoot)) return suiteFailure("The embedded Pi CLI escaped its package root");
     return { ...suite, cli };
   } catch { return suiteFailure("The embedded Pi CLI is unavailable"); }

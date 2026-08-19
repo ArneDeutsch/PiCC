@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
-  canonicalPath,
+  physicalPath,
   classifyInstallation,
   compareStableVersions,
   discoverGlobalNpmRoot,
@@ -15,6 +15,7 @@ import {
   findPackageRoot,
   isPathInside,
   parseStableExactVersion,
+  pathsEqual,
   resolvePiCli,
 } from "./picc-admin.mjs";
 import { verifyCompiledRuntime } from "./picc-runtime.mjs";
@@ -271,7 +272,7 @@ export async function runUpdate(options = {}) {
   if (action === "help") { output.log(HELP); return 0; }
   if (!["check", "update"].includes(action)) { output.error("PiCC: invalid update action."); return 1; }
   let root;
-  try { root = canonicalPath(options.packageRoot ?? findPackageRoot(import.meta.url)); }
+  try { root = physicalPath(options.packageRoot ?? findPackageRoot(import.meta.url)); }
   catch { output.error("PiCC: package root is unavailable."); return 1; }
   const manifest = readManifest(root);
   if (!manifest) { output.error("PiCC: package metadata is malformed."); return 1; }
@@ -288,15 +289,15 @@ export async function runUpdate(options = {}) {
   let globalRoot;
   let globalPackage;
   try {
-    globalRoot = discoveredGlobalRoot ? canonicalPath(discoveredGlobalRoot) : undefined;
+    globalRoot = discoveredGlobalRoot ? physicalPath(discoveredGlobalRoot) : undefined;
     const candidate = globalRoot ? path.join(globalRoot, "@arnedeutsch", "picc") : undefined;
-    globalPackage = candidate && fs.statSync(candidate).isDirectory() ? canonicalPath(candidate) : undefined;
+    globalPackage = candidate && fs.statSync(candidate).isDirectory() ? physicalPath(candidate) : undefined;
     if (globalPackage && !isPathInside(globalPackage, globalRoot)) globalPackage = undefined;
   } catch {
     globalRoot = undefined;
     globalPackage = undefined;
   }
-  if (globalRoot && globalPackage === root) {
+  if (globalRoot && globalPackage && pathsEqual(globalPackage, root)) {
     return handleGlobal({ action, root, globalRoot, manifest, output, runNpm, validateRuntime, validateSuite });
   }
   output.error("Outcome: this installed PiCC copy is owned by another package manager or project and was not modified. Update it through that owner; for the documented global npm install run `npm install --global @arnedeutsch/picc@latest`.");

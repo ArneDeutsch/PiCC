@@ -2,15 +2,21 @@ import fs from "node:fs";
 import { createRequire, setSourceMapsSupport } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { canonicalPath, classifyInstallation, isPathInside } from "./picc-admin.mjs";
+import {
+  physicalPath,
+  classifyInstallation,
+  deduplicatePhysicalPaths,
+  isPathInside,
+  pathComponentEquals,
+} from "./picc-admin.mjs";
 import { selectPiccRuntime } from "./picc-runtime.mjs";
 
 const UNAVAILABLE = "PiCC plugin inventory is unavailable in this build. Update or reinstall PiCC.";
 
 function containingNodeModules(packageRoot) {
   const parent = path.dirname(packageRoot);
-  if (path.basename(parent).toLowerCase() === "node_modules") return parent;
-  if (path.basename(path.dirname(parent)).toLowerCase() === "node_modules" && path.basename(parent).startsWith("@")) {
+  if (pathComponentEquals(path.basename(parent), "node_modules")) return parent;
+  if (pathComponentEquals(path.basename(path.dirname(parent)), "node_modules") && path.basename(parent).startsWith("@")) {
     return path.dirname(parent);
   }
   return undefined;
@@ -25,23 +31,23 @@ function allowedDependencyRoots(packageRoot) {
   ]) {
     if (!candidate || !boundary) continue;
     try {
-      const root = canonicalPath(candidate);
-      if (isPathInside(root, boundary) && fs.statSync(root).isDirectory() && !roots.includes(root)) roots.push(root);
+      const root = physicalPath(candidate);
+      if (isPathInside(root, boundary) && fs.statSync(root).isDirectory()) roots.push(root);
     } catch {
       // A dependency root that is absent, unreadable, or escaped is not trusted.
     }
   }
-  return roots;
+  return deduplicatePhysicalPaths(roots);
 }
 
 function trustedEntrypoint(packageRoot, relativePath) {
-  const entrypoint = canonicalPath(path.join(packageRoot, ...relativePath.split("/")));
+  const entrypoint = physicalPath(path.join(packageRoot, ...relativePath.split("/")));
   if (!isPathInside(entrypoint, packageRoot) || !fs.statSync(entrypoint).isFile()) throw new Error("entrypoint unavailable");
   return entrypoint;
 }
 
 function trustedJitiApi(packageRoot) {
-  const piccManifestPath = canonicalPath(path.join(packageRoot, "package.json"));
+  const piccManifestPath = physicalPath(path.join(packageRoot, "package.json"));
   if (!isPathInside(piccManifestPath, packageRoot) || !fs.statSync(piccManifestPath).isFile()) {
     throw new Error("PiCC manifest unavailable");
   }
@@ -52,8 +58,8 @@ function trustedJitiApi(packageRoot) {
   for (const root of allowedDependencyRoots(packageRoot)) {
     try {
       const resolver = createRequire(path.join(root, ".picc-loader.cjs"));
-      const manifestPath = canonicalPath(resolver.resolve("jiti/package.json"));
-      const owner = canonicalPath(path.dirname(manifestPath));
+      const manifestPath = physicalPath(resolver.resolve("jiti/package.json"));
+      const owner = physicalPath(path.dirname(manifestPath));
       if (!isPathInside(owner, root) || !isPathInside(manifestPath, owner)) continue;
       if (!fs.statSync(owner).isDirectory() || !fs.statSync(manifestPath).isFile()) continue;
 
@@ -61,7 +67,7 @@ function trustedJitiApi(packageRoot) {
       const staticExport = manifest?.exports?.["./static"]?.import;
       if (manifest?.name !== "jiti" || declarations.length === 0 || !declarations.every((version) => version === manifest.version)) continue;
       if (typeof staticExport !== "string" || !staticExport.startsWith("./")) continue;
-      const api = canonicalPath(path.join(owner, staticExport));
+      const api = physicalPath(path.join(owner, staticExport));
       if (!isPathInside(api, owner) || !fs.statSync(api).isFile()) continue;
       return api;
     } catch {

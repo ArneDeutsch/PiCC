@@ -7,9 +7,10 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
   PI_SUITE_PACKAGES,
-  canonicalPath,
+  physicalPath,
   findPackageRoot,
   parseStableExactVersion,
+  pathsEqual,
   validatePiSuite,
 } from "../bin/picc-admin.mjs";
 import { collectCompilationIdentity, verifyCompiledRuntime } from "../bin/picc-runtime.mjs";
@@ -99,7 +100,7 @@ function readManifest(root) {
 
 export function verifyReleaseAdmission({ packageRoot, event, tag } = {}) {
   let root;
-  try { root = canonicalPath(packageRoot ?? findPackageRoot(import.meta.url)); }
+  try { root = physicalPath(packageRoot ?? findPackageRoot(import.meta.url)); }
   catch { fail("package root is unavailable"); }
   const manifest = readManifest(root);
   if (manifest?.name !== "@arnedeutsch/picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) fail("package name/version/type must identify @arnedeutsch/picc as a stable ESM package");
@@ -120,10 +121,9 @@ function regularArtifact(tarball) {
   const resolved = path.resolve(tarball);
   const stat = fs.lstatSync(resolved, { throwIfNoEntry: false });
   if (!stat?.isFile() || stat.isSymbolicLink()) fail("tarball must be a regular file");
-  const canonical = canonicalPath(resolved);
-  const comparable = process.platform === "win32" ? resolved.toLowerCase() : resolved;
-  if (canonical !== comparable) fail("tarball must be canonical");
-  return canonical;
+  const physical = physicalPath(resolved);
+  if (!pathsEqual(physical, resolved)) fail("tarball must be canonical");
+  return physical;
 }
 
 export function hashArtifact(tarball) {

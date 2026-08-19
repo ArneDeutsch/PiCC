@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { canonicalPath, findPackageRoot, isPathInside, parseStableExactVersion, spawnNpm } from "../bin/picc-admin.mjs";
+import { physicalPath, findPackageRoot, isPathInside, parseStableExactVersion, spawnNpm } from "../bin/picc-admin.mjs";
 import { verifyCompiledRuntime } from "../bin/picc-runtime.mjs";
 import { buildRuntime } from "./build-runtime.mjs";
 import { verifyRuntimeArtifact } from "./runtime-artifact.mjs";
@@ -39,12 +39,12 @@ function collect(child) {
 
 function emptyOutputDirectory(outputDir, packageRoot) {
   const resolved = path.resolve(outputDir);
-  const canonical = canonicalPath(resolved);
+  const physical = physicalPath(resolved);
   const stat = fs.lstatSync(resolved, { throwIfNoEntry: false });
   if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new Error("Pack output must be a regular directory");
-  if (isPathInside(canonical, packageRoot) || isPathInside(packageRoot, canonical)) throw new Error("Pack output must be outside the project tree");
-  if (fs.readdirSync(canonical).length !== 0) throw new Error("Pack output directory must be empty");
-  return canonical;
+  if (isPathInside(physical, packageRoot) || isPathInside(packageRoot, physical)) throw new Error("Pack output must be outside the project tree");
+  if (fs.readdirSync(physical).length !== 0) throw new Error("Pack output directory must be empty");
+  return physical;
 }
 
 function sha256(filename) {
@@ -62,7 +62,7 @@ export async function packRelease({
   runtimeVerifier = verifyCompiledRuntime,
   artifactVerifier = verifyRuntimeArtifact,
 } = {}) {
-  const root = canonicalPath(packageRoot);
+  const root = physicalPath(packageRoot);
   const admission = admissionVerifier({ packageRoot: root, event, tag });
   const manifest = admission.manifest;
   if (manifest?.name !== "@arnedeutsch/picc" || manifest?.type !== "module" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
@@ -83,7 +83,7 @@ export async function packRelease({
       !record.filename.endsWith(".tgz")) {
     throw new Error("npm pack did not return one matching @arnedeutsch/picc artifact");
   }
-  const tarball = canonicalPath(path.join(destination, record.filename));
+  const tarball = physicalPath(path.join(destination, record.filename));
   if (!isPathInside(tarball, destination) || !fs.statSync(tarball).isFile()) throw new Error("npm pack artifact escaped its destination");
   if (fs.readdirSync(destination).filter((entry) => entry.endsWith(".tgz")).length !== 1) throw new Error("npm pack produced an ambiguous artifact set");
   artifactVerifier({
