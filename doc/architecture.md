@@ -18,8 +18,8 @@ in see [`doc/testing.md`](testing.md).
 │  TUI · session persistence · built-in tools (read/write/edit/bash/  │
 │  grep/find/ls) · extension event bus                                │
 └───────────────▲──────────────────────────────── loads as extension ─┘
-                │ default export picc(pi)  (installed: picc/index.js;
-                │                           explicit source: src/index.ts)
+                │ default export picc(pi)  (canonical: picc/index.ts;
+                │                           direct source/API: src/index.ts)
 ┌───────────────┴─────────────────────────────────────────────────────┐
 │  PiCC (this repo) — one Pi extension bundle                          │
 │                                                                      │
@@ -37,22 +37,29 @@ in see [`doc/testing.md`](testing.md).
 ### The Pi ⇄ PiCC boundary
 
 PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as one extension
-bundle. `src/index.ts` remains the TypeScript authoring and implementation composition root. The
-installed Pi boundary instead receives `picc/index.js`, a stable wrapper that verifies product
-identity before importing the generated `dist/index.js`; explicit source development may give Pi
-`src/index.ts` directly. The pinned, tested dependency graph is recorded in
-[`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
+bundle. `src/extension.ts` owns the implementation and wiring; `picc/index.ts` is the canonical
+Pi-hosted bootstrap, while `src/index.ts` remains the direct source/public-API bootstrap and
+re-export surface. The pinned, tested dependency graph and detailed bootstrap contract are recorded
+in [`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
 supplies Claude Code compatibility and **never** reimplements auth, the provider layer, or the TUI
 shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend
 the seam instead.
 
-Source and generated JavaScript are two representations of one product. The PiCC launcher selects
-the representation and verifies any compiled runtime before extension load: installed mode therefore
+Runtime paths have two distinct forms: filesystem access and module loading retain native physical
+spelling, while equality, containment, and deduplication use a separate case-folded comparison
+identity on Windows. A comparison key is never an execution path; detailed mechanics live in “How
+PiCC attaches to Pi” in [`doc/pi-integration.md`](pi-integration.md).
+
+Source and generated JavaScript are two representations of one product. An ordinary launcher-backed
+initial load verifies once in its child host and hands that authenticated selection to the canonical
+bootstrap for one-time consumption. A direct `picc/index.ts` bootstrap load selects and verifies
+independently. Every canonical reload freshly selects; compiled-pinned reloads fully re-verify and
+enforce their generation, while source-pinned processes keep retained source even if selection now
+finds a valid build. Only source selections carry source-representation loading evidence. Explicit
+`src/index.ts` hosting
+is source-only. Installed mode
 fails closed rather than reaching retained TypeScript, while a source checkout may disclose a
-development fallback. A
-compiled selection pins its verified generation for the process, so Pi's `/reload` cannot adopt a
-new build. Source-hosted reload remains source-hosted and may observe source edits under Pi's reload
-semantics.
+source fallback. See “How PiCC attaches to Pi” in [`doc/pi-integration.md`](pi-integration.md).
 
 The carve-out: PiCC does render **its own** tool rows, built on Pi's `pi-tui` primitives — that is
 what `tool-shell.ts` and `subagent-render.ts` are. Rendering a surface PiCC owns is in scope;
@@ -167,7 +174,7 @@ Invariants across the folder:
   Authoritative native MCP state and standalone managed MCP are deliberate exceptions: absence
   preserves lower inputs, but a present unusable authority returns an explicit fail-closed result so
   uncertainty cannot activate a server. A broken project must never crash the harness:
-  `src/index.ts` catches load failure and returns quietly.
+  `src/extension.ts` catches load failure and returns quietly.
 - **Progressive disclosure is a hard requirement, not an optimization.** Skill frontmatter is
   parsed; the body is **never** stored on the returned object and is re-read only on activation. A
   change that eagerly holds bodies defeats the whole design.
@@ -498,9 +505,9 @@ where to start reading, not the extent of its cluster.
   `search-tool-render.ts`, `routine-tool-render.ts`, `default-collapsed-tool-render.ts`, with
   display-name/path formatting in `tool-display.ts`) — the central main-session family router,
   self-shell framing, and guarded human renderers for specialized and safely classified settled
-  tool rows. `pi-tui-runtime.ts` is the narrow package-instance bridge for Pi-owned mutable
-  singletons and constructor identity in the supported two-copy production layout. Decoration
-  changes only presentation and never canonical model-facing results.
+  tool rows. `runtime-host.ts` supplies TUI constructors, helpers, and mutable singleton state from
+  the host-owned evaluated package graph even when npm retains duplicate physical package files.
+  Decoration changes only presentation and never canonical model-facing results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that
@@ -566,12 +573,19 @@ Single-consumer logic stays with its consumer.
 
 ## Request / turn data flow
 
-The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
+The wiring lives in `src/extension.ts`, which registers tools and Pi event handlers.
 
-1. **Extension load.** Before this implementation root runs, an installed or checkout-compiled
-   wrapper verifies and pins the compiled runtime generation; a source-checkout launcher instead may
-   have emitted its TypeScript-fallback notice. Explicit external-Pi source hosting performs neither
-   launcher selection nor compiled-generation verification. The process env is then made UTF-8-safe,
+1. **Extension load.** An ordinary launcher-backed initial load arrives through `picc/index.ts`
+   after the child host has selected and verified the representation once; the bootstrap consumes
+   that authenticated selection and installs the host-owned package graph before evaluating the
+   implementation. A direct `picc/index.ts` load acquires that graph and selects and verifies
+   independently; explicit `src/index.ts` hosting loads source without compiled authority. Every
+   canonical reload freshly selects. A compiled-pinned reload fully re-verifies and enforces its
+   generation; a source-pinned process continues loading retained source even if selection finds a
+   valid build, and only a source selection carries source-representation loading evidence. A source
+   handoff carries no
+   compiled authority. The
+   process env is then made UTF-8-safe,
    and `loadClaudeProject()` assembles the project model. MCP loading resolves standalone authority
    and immutable managed-settings policy, admits raw winners, and materializes only enabled results.
    Project opening and observation perform no plugin acquisition, trust approval, lifecycle recovery,
@@ -590,7 +604,7 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
    from an async step whose settlement is awaited by the ordinary input-admission seam rather than
-   by load returning. The fixed replacement set is owned by `coreToolNames` in `src/index.ts`, and
+   by load returning. The fixed replacement set is owned by `coreToolNames` in `src/extension.ts`, and
    preparation completes for the whole set before registration begins. Any initialization failure
    rejects project task input before hooks or provider dispatch because Pi's stock built-ins cannot
    honor PiCC's live worktree cwd. Failure cleanup is remove-only for that fixed set: it cannot widen

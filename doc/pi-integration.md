@@ -14,30 +14,50 @@
 
 Pi extensions may be TypeScript modules loaded through Pi's loader or ordinary JavaScript modules;
 they export `default function (pi: ExtensionAPI)` (async allowed; awaited before startup completes).
-PiCC is **one extension bundle** authored and composed at `src/index.ts`, but the installed product
-attaches through verified JavaScript.
+PiCC is **one extension bundle**. `src/extension.ts` owns implementation composition, event
+handlers, tool wiring, and command registration. `picc/index.ts` is the canonical Pi-hosted
+bootstrap; `src/index.ts` is the direct source/public-API bootstrap and re-export surface.
 
 Launch modes we support:
 - `pi -e <path-to-PiCC>/src/index.ts` in the target project (explicit source development), or that
-  path in Pi's `extensions` settings for persistent source hosting.
+  path in Pi's `extensions` settings for persistent source hosting. This source-only bootstrap
+  acquires the shared runtime graph itself and loads `src/extension.ts`; it carries no compiled
+  selection authority.
 - A source-checkout `picc` launcher, which selects source-matched compiled JavaScript when available
   and otherwise discloses the permitted TypeScript fallback. A damaged runtime is not a fallback.
-- An installed `picc` launcher, which verifies the package-matched runtime before giving Pi the
-  `picc/index.js` wrapper and never falls back to retained TypeScript. Standalone plugin inventory
-  uses the same selection and compiled verification without starting the normal extension runtime.
+- An installed `picc` launcher, which selects only package-matched compiled JavaScript and never
+  falls back to retained TypeScript. Standalone plugin inventory and lifecycle, and standalone MCP
+  administration, each use their own selection and verification route without starting the normal
+  Pi extension runtime.
+
+The ordinary launcher starts one child host. That child resolves Pi's CLI and shared package graph,
+performs the complete initial selection and verification once, then passes the authenticated
+selection to `picc/index.ts` for one-time consumption before loading `src/extension.ts`'s compiled or
+source representation. The parent launcher does not repeat Pi-suite validation, runtime selection,
+or runtime verification. The source handoff carries only the chosen representation; it never grants
+compiled authority. A direct load
+of the canonical `picc/index.ts` bootstrap without the child-host handoff acquires its own host graph
+and selects and verifies independently. Explicit `src/index.ts` hosting remains source-only.
 
 The launcher also owns PiCC administration routing, including standalone `picc plugin` lifecycle
-commands that do not start the normal Pi extension runtime, and validates one coherent installed Pi
-suite before running its coding-agent CLI with the extension preloaded. Pi CLI resolution starts from
-PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose
-`dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`. The wrapper's
-`picc/` path deliberately preserves Pi's visible **`picc`** extension label for initial load and
-reload.
+commands that do not start the normal Pi extension runtime. Pi CLI resolution starts from PiCC's
+package tree rather than the target cwd and executes the exact `pi` bin path declared by the
+resolved `@earendil-works/pi-coding-agent` package. That manifest field is a narrow pinned
+integration watchpoint: it is not permission to import arbitrary private package paths. The
+`picc/` bootstrap path deliberately preserves Pi's visible **`picc`** extension label for initial
+load and reload.
 
-The PiCC launcher fixes the selected representation for the process. For a compiled selection, the
-wrapper verifies and pins one generation, so Pi's `/reload` cannot adopt a new build before exit and
-relaunch. Source fallback and explicit external-Pi hosting remain source-hosted and may observe
-source edits under Pi's reload semantics; they do not promise compiled-generation pinning.
+Every canonical reload freshly selects a candidate and never consumes the initial one-shot
+selection. A compiled-pinned process fully re-verifies and enforces its pinned generation, so
+`/reload` cannot adopt a new build before exit and relaunch. A source-pinned process remains on its
+retained source representation even when fresh selection now finds a valid build. Only a fresh
+source selection carries the representation evidence that authorizes loading source; evidence from
+a compiled selection does not freshly verify the retained source that is actually loaded. Explicit `src/index.ts` hosting
+remains Pi-owned source reload without compiled authority.
+
+Filesystem operations retain `fs.realpathSync.native()` spelling. On Windows, equality,
+containment, and deduplication derive a separate case-folded comparison identity and never feed that
+folded value back into module loading or filesystem access.
 
 PiCC registers the string-valued `agent` extension flag synchronously. Pi applies its value after
 registration and before `session_start`, where PiCC reads it; the launcher only forwards the CLI
@@ -64,9 +84,9 @@ disables Pi's checker. An externally configured `PI_SKIP_VERSION_CHECK` remains 
 | Stop hook | `pi.on("agent_settled")` + `pi.sendUserMessage(..., { deliverAs: "followUp" })` to continue when a Stop hook blocks a successfully completed logical settlement. Logically unsuccessful outcomes bypass ordinary Stop handling; physical stop reasons alone do not decide the logical outcome because proactive checkpoints have the narrow exception described below. A terminal-main `pending` warns without changing process status in TUI. One-shot print reports on stderr, JSON appends a structured incomplete entry, and both set a generic nonzero status without replacing a checkpoint-specific status. Long-lived RPC appends the same structured entry while Pi owns its eventual shutdown status. |
 | PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can cancel), `pi.on("session_compact")`; PiCC restores SessionStart(compact) context and recent skill bodies through `pi.sendMessage`, while PostCompact output is diagnostic-only |
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, conditional MCP resource tools, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` stops only after Pi completes all sibling results in the requested batch. PiCC late-registers and activates both fixed resource tools when the live main-session catalog first gains an advertised resource capability, including through an administratively admitted changed definition; an advertised-empty or `resources/list`-failed catalog still qualifies after otherwise successful settlement. Host registration may persist across reconnect, terminal retention, or retirement, while `setActiveTools()` removes active exposure when no current main-session definition remains capable. An initial `tools/list` failure publishes no capability snapshot or fixed resource tools. |
-| PiCC control commands | The command map in `src/index.ts` is the single owner of PiCC command registration and dispatch; reserved-name lookup consumes that map alongside Pi's built-in-name set. `pi.registerCommand(name, { description, handler })` provides interactive routing. In the shared `pi.on("input")` handler, checkpoint replay/disposition and extension-sourced bypass run first; for admitted non-extension user input across modes, the fallback parses the same map and handles reserved Pi built-in tokens that Pi's exact interactive router missed. Those recognized inputs stay outside hooks, skills, and model context, with output using the protocol-safe transport below. Registered handlers get `ExtensionCommandContext`. Exact TUI `/mcp` administration deep links pass the focused controller a narrow service port whose inventory first invokes service-owned recovery preparation; successful rollback supplies its fresh inventory, while uncertain recovery remains blocked. Bare `/mcp` and headless routing never invoke recovery. Interactive `/reload-plugins` validates and records one candidate handoff before calling terminal `ctx.reload()`. Validation rejection never calls Pi. Once Pi starts shutdown/rebuild, the API provides no rollback or strict terminal activation result: an exactly rejected replacement contributes its active `session_start(reason: "reload")` context's graceful `ctx.shutdown()` closure to the matching reload attempt. After Pi returns from `ctx.reload()`, the outgoing handler schedules that one-shot request for the next timer turn and immediately throws authoritative new-session guidance, allowing Pi to render the error first. The request is best-effort; failure or absence of replacement startup cannot use the invalidated outgoing context or claim termination, and a later Pi-owned failure may remain Pi-owned reload-error reporting. |
+| PiCC control commands | The command map in `src/extension.ts` is the single owner of PiCC command registration and dispatch; reserved-name lookup consumes that map alongside Pi's built-in-name set. `pi.registerCommand(name, { description, handler })` provides interactive routing. In the shared `pi.on("input")` handler, checkpoint replay/disposition and extension-sourced bypass run first; for admitted non-extension user input across modes, the fallback parses the same map and handles reserved Pi built-in tokens that Pi's exact interactive router missed. Those recognized inputs stay outside hooks, skills, and model context, with output using the protocol-safe transport below. Registered handlers get `ExtensionCommandContext`. Exact TUI `/mcp` administration deep links pass the focused controller a narrow service port whose inventory first invokes service-owned recovery preparation; successful rollback supplies its fresh inventory, while uncertain recovery remains blocked. Bare `/mcp` and headless routing never invoke recovery. Interactive `/reload-plugins` validates and records one candidate handoff before calling terminal `ctx.reload()`. Validation rejection never calls Pi. Once Pi starts shutdown/rebuild, the API provides no rollback or strict terminal activation result: an exactly rejected replacement contributes its active `session_start(reason: "reload")` context's graceful `ctx.shutdown()` closure to the matching reload attempt. After Pi returns from `ctx.reload()`, the outgoing handler schedules that one-shot request for the next timer turn and immediately throws authoritative new-session guidance, allowing Pi to render the error first. The request is best-effort; failure or absence of replacement startup cannot use the invalidated outgoing context or claim termination, and a later Pi-owned failure may remain Pi-owned reload-error reporting. |
 | Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and placed in the foreground-glyph self shell (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` until the one outer checkpoint wrapper. Ordinary user input awaits successful registration of this fixed core set before hooks or provider dispatch. |
-| Pi-owned TUI runtime bridge | The supported production layout currently has PiCC's declared direct `@earendil-works/pi-tui` dependency and a second physical copy nested under `pi-coding-agent`. Stateless helpers and structural `{ render(width): string[] }` components cross that tested package boundary. `pi-tui-runtime.ts` instead resolves Pi's package context for mutable keybinding/capability singletons and the constructor-sensitive native Edit `Box`. Physical deduplication is optional; the direct dependency remains intentional. |
+| Pi-owned TUI runtime identity | npm's shrinkwrapped layout may retain duplicate package files, but a Pi-hosted process evaluates one host-owned Pi-suite and TypeBox graph. `runtime-host.ts` projects all PiCC imports from that graph, preserving mutable singleton state and constructor identity for keybindings, TUI capability state, schemas, and native Edit's `Box`. This is evaluated-runtime coherence, not a physical-deduplication claim. |
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. Pi's `pending` stop reason is streaming-only; if a malformed/custom child nevertheless settles with terminal `pending`, PiCC fails it loudly as incomplete and retains bounded partial output rather than reporting success. A terminal provider error likewise fails loudly with capped, sanitized cause text and retained partial output. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
 | Session managers (main selected identity and subagent transcripts) | Main selected-agent persistence reads only `ctx.sessionManager.getBranch()` and writes a versioned selection record through `appendCustomEntry`; branch absence/uncertainty never degrades to the lower-priority setting. A versioned `pi.sendMessage` custom user message with `triggerTurn: false` carries `initialPrompt`. PiCC proves both records synchronously on the live selected branch before provider admission, but for a new persisted session Pi does not create a reopenable on-disk session until it persists the first assistant response. Once persisted, resume re-resolves selection and does not replay `initialPrompt`. Subagents use `SessionManager.create(cwd, sessionDir, { id })` — persisted transcript, the default (Pi names the file `<stamp>_<id>.jsonl`); `SessionManager.open(path, sessionDir, cwd)` — reopen the same file to resume and append; `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })` — read a source transcript and write a **brand-new** file, so a `subagent_type: "fork"` child inherits the parent conversation without touching the parent's history; `SessionManager.inMemory(cwd)` — the non-resumable fallback when no transcript is available or persistence ownership cannot be admitted (no main-session file, unavailable persistence support, a failed `create` or ownership check, or an SDK without persisted sessions). Retention deletion admission also depends on the active manager's `getSessionFile()` persisted-file identity, `getCwd()`, and `getSessionDir()`, plus the bounded first JSONL record remaining a `type: "session"` header whose `id`, `timestamp`, and `cwd` agree with that identity. These are churn watchpoints: uncertainty preserves data. Settings: `SettingsManager.inMemory(settings)`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels. Selected-main application restores the captured host baseline, applies PiCC config, then the selected override; aliases and unavailable/refused values retain the working choice with a warning rather than claiming exact Claude resolution. |
@@ -312,11 +332,13 @@ timeout.
   Same-definition reconnect must not churn registration, and every proxy must validate its route at
   call time. The fake-host causal suite and real-Pi registration pin fail loudly if these assumptions
   change; snippet-less registration must also leave the base prompt unchanged.
-- The package-instance bridge in `src/runtime/pi-tui-runtime.ts` depends on Node package-context
-  resolution finding Pi's nested `pi-tui` when duplicate physical copies are installed. Structural
-  component interchange, separate renderer-slot `lastComponent` caches, and call-before-result
-  lifecycle sequencing are installed-Pi contracts pinned by tests — not Claude parity or timeless
-  upstream guarantees. Recheck them on every Pi upgrade; deduplication must not be assumed.
+- The child host must continue supplying the complete host-owned Pi-suite and TypeBox graph before
+  PiCC implementation evaluation. npm may retain duplicate physical files, but constructor,
+  singleton, and schema identity must remain coherent in the evaluated process. The installed-Pi
+  contract tests pin this boundary; recheck it on every Pi upgrade.
+- Pi CLI startup depends on the resolved coding-agent package's strict `bin.pi` declaration. Recheck
+  that declared entry and its containment on every Pi upgrade; do not replace it with an assumed
+  private path.
 - Tool-row glyph framing, mutation presentation, and settled interactive collapse couple
   `src/runtime/tool-shell.ts`, `src/runtime/routine-tool-render.ts`, and
   `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. A pending call-only update
