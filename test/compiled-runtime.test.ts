@@ -78,6 +78,27 @@ function expectFailure(result: unknown, category: "missing" | "source-stale" | "
   expect(result).toStrictEqual({ ok: false, category, reason: expect.any(String) });
 }
 
+function expectNeutralStartupContextMismatch(result: unknown): void {
+  expect(result).toStrictEqual({ ok: false, category: "corrupt", reason: expect.any(String) });
+  const reason = (result as { reason: string }).reason;
+  expect(reason).toMatch(/startup context.*exit.*relaunch/isu);
+  expect(reason.length).toBeLessThan(200);
+  expect(reason).not.toMatch(/damag|build|updat|version|repair|reinstall|selection|authority|authentic|loader|provenance|evidence|digest|identity key|host graph|pending|retained|handoff|internal/iu);
+}
+
+function runIsolatedRuntime(body: string, roots: Record<string, string> = { fixtureRoot }): unknown {
+  const runtimeUrl = pathToFileURL(path.join(repositoryRoot, "bin", "picc-runtime.mjs")).href;
+  const source = `
+    import fs from "node:fs";
+    import { pathToFileURL } from "node:url";
+    const runtimeUrl = ${JSON.stringify(runtimeUrl)};
+    const runtime = await import(runtimeUrl + ${JSON.stringify(`?isolated=${Date.now()}-${Math.random()}`)});
+    const roots = ${JSON.stringify(roots)};
+    ${body}
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", source], { encoding: "utf8" })) as unknown;
+}
+
 function expectVerified(checkSource = true): RuntimeManifest {
   const expectedManifest = manifest();
   expect(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource })).toStrictEqual({
@@ -438,6 +459,158 @@ describe("compiled runtime identity", () => {
     expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
   });
 
+  it("binds package, compiler, bootstrap, runtime, and source evidence to exact successful reads", () => {
+    const realRead = fs.readFileSync;
+    const readRaceCases = [
+      ["package.json", "source-stale"], ["package-lock.json", "source-stale"], ["tsconfig.runtime.json", "source-stale"],
+      ["dist/picc-runtime.json", "corrupt"],
+    ] as const;
+    for (const [relative, category] of readRaceCases) {
+      const target = path.join(fixtureRoot, ...relative.split("/"));
+      let mutated = false;
+      vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        const bytes = realRead(candidate, ...(args as []));
+        if (!mutated && path.resolve(String(candidate)) === target) {
+          mutated = true;
+          fs.appendFileSync(target, " ");
+        }
+        return bytes;
+      }) as typeof fs.readFileSync);
+      expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource: true }), category);
+      vi.restoreAllMocks();
+      buildRuntime({ packageRoot: fixtureRoot });
+    }
+
+    const runtimeReadTarget = path.join(fixtureRoot, "dist", "index.js");
+    let runtimeMutated = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((candidate: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = realRead(candidate, ...(args as []));
+      if (!runtimeMutated && path.resolve(String(candidate)) === runtimeReadTarget) {
+        runtimeMutated = true;
+        fs.appendFileSync(runtimeReadTarget, "// changed immediately after exact read\n");
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    const runtimeReadRace = verifyCompiledRuntime({ packageRoot: fixtureRoot });
+    expectFailure(runtimeReadRace, "corrupt");
+    expect(JSON.stringify(runtimeReadRace).length).toBeLessThan(200);
+    expect(JSON.stringify(runtimeReadRace)).not.toMatch(/changed immediately|exact read|index\.js/iu);
+    vi.restoreAllMocks();
+    buildRuntime({ packageRoot: fixtureRoot });
+
+    const typescriptPackage = fs.realpathSync.native(path.join(fixtureRoot, "node_modules", "typescript", "package.json"));
+    const realLstat = fs.lstatSync;
+    let typescriptStats = 0;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, options?: fs.StatOptions) => {
+      const stat = realLstat(candidate, options as never);
+      if (path.resolve(String(candidate)) !== typescriptPackage || options?.bigint !== true || ++typescriptStats === 1) return stat;
+      const changed = Object.create(stat) as fs.BigIntStats & { ctimeNs: bigint };
+      Object.defineProperty(changed, "ctimeNs", { value: (stat as unknown as fs.BigIntStats).ctimeNs + 1n });
+      return changed;
+    }) as typeof fs.lstatSync);
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource: true }), "source-stale");
+    vi.restoreAllMocks();
+
+    const bootstrap = path.join(fixtureRoot, "picc", "index.ts");
+    const runtimeFile = path.join(fixtureRoot, "dist", "index.js");
+    const lateBootstrap = path.join(fixtureRoot, "picc", "late.ts");
+    const latePackage = path.join(fixtureRoot, "late-package-entry");
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = realRead(target, ...(args as []));
+      if (path.resolve(String(target)) === runtimeFile && !fs.existsSync(lateBootstrap)) {
+        fs.appendFileSync(bootstrap, "// replaced after its verified read\n");
+        fs.writeFileSync(lateBootstrap, "export {};\n");
+        fs.writeFileSync(latePackage, "inventory drift\n");
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
+    vi.restoreAllMocks();
+    fs.rmSync(lateBootstrap);
+    fs.rmSync(latePackage);
+    buildRuntime({ packageRoot: fixtureRoot });
+
+    const firstSource = path.join(fixtureRoot, "src", "index.ts");
+    const laterSource = path.join(fixtureRoot, "src", "mcp-administration-cli.ts");
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = realRead(target, ...(args as []));
+      if (path.resolve(String(target)) === laterSource) fs.appendFileSync(firstSource, "// changed after source read\n");
+      return bytes;
+    }) as typeof fs.readFileSync);
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource: true }), "source-stale");
+    vi.restoreAllMocks();
+    buildRuntime({ packageRoot: fixtureRoot });
+
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = realRead(target, ...(args as []));
+      if (path.resolve(String(target)) === runtimeFile) fs.writeFileSync(path.join(fixtureRoot, "dist", "late.js"), "export {};\n");
+      return bytes;
+    }) as typeof fs.readFileSync);
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
+  });
+
+  it("rejects source inventory add, delete, and rename races", () => {
+    const sourceRoot = path.join(fixtureRoot, "src");
+    const source = path.join(sourceRoot, "plugin-inventory-cli.ts");
+    const original = fs.readFileSync(source);
+    const realReaddir = fs.readdirSync;
+    const mutations = [
+      () => fs.writeFileSync(path.join(sourceRoot, "added.ts"), "export {};\n"),
+      () => fs.rmSync(source),
+      () => fs.renameSync(source, path.join(sourceRoot, "renamed.ts")),
+    ];
+    for (const mutate of mutations) {
+      let changed = false;
+      vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, options?: unknown) => {
+        const entries = realReaddir(target, options as never);
+        if (!changed && path.resolve(String(target)) === sourceRoot) {
+          changed = true;
+          mutate();
+        }
+        return entries;
+      }) as typeof fs.readdirSync);
+      expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource: true }), "source-stale");
+      vi.restoreAllMocks();
+      fs.rmSync(path.join(sourceRoot, "added.ts"), { force: true });
+      fs.rmSync(path.join(sourceRoot, "renamed.ts"), { force: true });
+      fs.writeFileSync(source, original);
+      buildRuntime({ packageRoot: fixtureRoot });
+    }
+  });
+
+  it("rejects unstable or unsupported high-resolution file and directory evidence", () => {
+    const realLstat = fs.lstatSync;
+    for (const target of [path.join(fixtureRoot, "dist", "index.js"), path.join(fixtureRoot, "src"), fs.realpathSync.native(path.join(fixtureRoot, "node_modules", "typescript", "package.json"))]) {
+      vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, options?: fs.StatOptions) => {
+        const stat = realLstat(candidate, options as never);
+        if (path.resolve(String(candidate)) !== target || options?.bigint !== true) return stat;
+        const unsupported = Object.create(stat) as fs.BigIntStats & { mtimeNs: undefined };
+        Object.defineProperty(unsupported, "mtimeNs", { value: undefined });
+        return unsupported;
+      }) as typeof fs.lstatSync);
+      expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource: true }), target.includes(`${path.sep}dist${path.sep}`) ? "corrupt" : "source-stale");
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("bounds unstable source fallback capture as build-and-relaunch recovery", () => {
+    fs.renameSync(path.join(fixtureRoot, "dist"), path.join(fixtureRoot, "saved dist"));
+    const realLstat = fs.lstatSync;
+    let rootBigintCalls = 0;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, options?: fs.StatOptions) => {
+      const stat = realLstat(candidate, options as never);
+      if (path.resolve(String(candidate)) !== fixtureRoot || options?.bigint !== true || ++rootBigintCalls === 1) return stat;
+      const unsupported = Object.create(stat) as fs.BigIntStats & { ctimeNs: undefined };
+      Object.defineProperty(unsupported, "ctimeNs", { value: undefined });
+      return unsupported;
+    }) as typeof fs.lstatSync);
+    const result = selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" });
+    expectFailure(result, "corrupt");
+    if (result.ok) throw new Error("expected source fallback capture to fail");
+    expect(result.reason).toMatch(/build.*exit.*relaunch/isu);
+    expect(result.reason).not.toMatch(/selection|authentic|loader|provenance|evidence|digest|internal/iu);
+  });
+
   it("returns installation-aware exact selector unions without forwarding verifier prose", () => {
     const expectedManifest = manifest();
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({
@@ -465,7 +638,7 @@ describe("compiled runtime identity", () => {
       ok: true, mode: "source", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "src/plugin-inventory-cli.ts", mcpAdministrationPath: "src/mcp-administration-cli.ts" },
       notice: {
         category: "source-stale",
-        message: "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC; `/reload` cannot switch runtime representation.",
+        message: "PiCC is using TypeScript source because the compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root; `/reload` cannot apply this runtime change, so exit PiCC and relaunch.",
       },
     });
     fs.appendFileSync(path.join(fixtureRoot, "dist", "index.js"), "// corrupt\n");
@@ -655,5 +828,322 @@ describe("compiled runtime identity", () => {
 
     fs.writeFileSync(path.join(fixtureRoot, "picc", "index.js"), "export default function legacy() {}\n");
     expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
+  });
+
+  it.each(["missing", "source-stale"] as const)("hands off %s source mode once while refusing authentic replacement and replay", (category) => {
+    if (category === "missing") fs.renameSync(path.join(fixtureRoot, "dist"), path.join(fixtureRoot, "saved dist"));
+    else fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// stale source handoff\n");
+    const result = runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      const replacement = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      let forgedMessage = "";
+      try { runtime.installInitialRuntimeSelection(structuredClone(selected)); } catch (error) { forgedMessage = String(error); }
+      runtime.installInitialRuntimeSelection(selected);
+      let replacementMessage = "";
+      try { runtime.installInitialRuntimeSelection(replacement); } catch (error) { replacementMessage = String(error); }
+      const realRead = fs.readFileSync;
+      const realLstat = fs.lstatSync;
+      let reads = 0;
+      let verifierCalls = 0;
+      fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+      fs.lstatSync = (...args) => { verifierCalls += 1; return realLstat(...args); };
+      const adopted = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      const adoption = { reads, verifierCalls };
+      const retained = runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: adopted });
+      let notices = 0;
+      console.error = () => { notices += 1; };
+      const firstNotice = runtime.presentPiccSourceNotice({ packageRoot: roots.fixtureRoot, installationKind: "source", representation: retained, selection: adopted });
+      const repeatedNotice = runtime.presentPiccSourceNotice({ packageRoot: roots.fixtureRoot, installationKind: "source", representation: retained, selection: adopted });
+      const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      const directCounts = { reads: reads - adoption.reads, verifierCalls: verifierCalls - adoption.verifierCalls, mode: direct.mode };
+      const reloadRetained = runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: direct });
+      const reloadNotice = runtime.presentPiccSourceNotice({ packageRoot: roots.fixtureRoot, installationKind: "source", representation: reloadRetained, selection: direct });
+      let replayMessage = "";
+      try { runtime.installInitialRuntimeSelection(selected); } catch (error) { replayMessage = String(error); }
+      console.log(JSON.stringify({ category: adopted.notice.category, same: adopted === selected, forgedMessage, replacementMessage, replayMessage, adoption, direct: directCounts, reloadRetainedSame: reloadRetained === retained, notices, firstNotice, repeatedNotice, reloadNotice }));
+    `) as {
+      category: string; same: boolean; forgedMessage: string; replacementMessage: string; replayMessage: string;
+      adoption: { reads: number; verifierCalls: number }; direct: { reads: number; verifierCalls: number; mode: string };
+      reloadRetainedSame: boolean; notices: number; firstNotice: boolean; repeatedNotice: boolean; reloadNotice: boolean;
+    };
+    expect(result).toMatchObject({ category, same: true, adoption: { reads: 0 }, direct: { mode: "source" }, reloadRetainedSame: true, notices: 1, firstNotice: true, repeatedNotice: false, reloadNotice: false });
+    expect(result.adoption.verifierCalls).toBeGreaterThan(0);
+    if (category === "source-stale") {
+      expect(result.direct.reads).toBeGreaterThan(0);
+      expect(result.direct.verifierCalls).toBeGreaterThan(result.adoption.verifierCalls);
+    } else {
+      expect(result.direct.reads).toBe(0);
+      expect(result.direct.verifierCalls).toBeGreaterThan(0);
+    }
+    for (const message of [result.replacementMessage, result.replayMessage]) {
+      expect(message).toMatch(/build.*exit.*relaunch/isu);
+      expect(message).not.toMatch(/selection|authentic|loader|provenance|evidence|digest|internal/iu);
+    }
+    expect(result.forgedMessage).toMatch(/startup.*repair.*relaunch/isu);
+    expect(result.forgedMessage).not.toMatch(/build|selection|authentic|loader|provenance|evidence|digest|internal/iu);
+    buildRuntime({ packageRoot: fixtureRoot });
+  });
+
+  it("consumes mismatched or changed handoffs and falls back to full verification afterward", () => {
+    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc other runtime "));
+    try {
+      const crossRoot = runIsolatedRuntime(`
+        const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        runtime.installInitialRuntimeSelection(selected);
+        const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.otherRoot, installationKind: "installed" });
+        const realRead = fs.readFileSync;
+        let reads = 0;
+        fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+        const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        console.log(JSON.stringify({ mismatch, directOk: direct.ok, reads }));
+      `, { fixtureRoot, otherRoot }) as { mismatch: { ok: boolean; category: string; reason: string }; directOk: boolean; reads: number };
+      expectNeutralStartupContextMismatch(crossRoot.mismatch);
+      expect(crossRoot).toMatchObject({ directOk: true });
+      expect(crossRoot.reads).toBeGreaterThan(0);
+
+      const changed = runIsolatedRuntime(`
+        const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        runtime.installInitialRuntimeSelection(selected);
+        fs.appendFileSync(roots.fixtureRoot + "/dist/index.js", "// changed after handoff\\n");
+        const adopted = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        console.log(JSON.stringify(adopted));
+      `) as { ok: boolean; reason: string };
+      expect(changed.ok).toBe(false);
+      expect(changed.reason).toContain("Update or reinstall PiCC, then relaunch");
+    } finally {
+      fs.rmSync(otherRoot, { recursive: true, force: true });
+      buildRuntime({ packageRoot: fixtureRoot });
+    }
+  });
+
+  it("consumes install-kind, package, source, and inventory drift with bounded recovery before a complete next selection", () => {
+    const installKind = runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      runtime.installInitialRuntimeSelection(selected);
+      const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      let reads = 0;
+      const realRead = fs.readFileSync;
+      fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+      const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      console.log(JSON.stringify({ mismatch, directOk: direct.ok, reads }));
+    `) as { mismatch: { ok: boolean; category: string; reason: string }; directOk: boolean; reads: number };
+    expectNeutralStartupContextMismatch(installKind.mismatch);
+    expect(installKind).toMatchObject({ directOk: true });
+    expect(installKind.reads).toBeGreaterThan(0);
+
+    for (const mutation of ["package", "inventory", "symlink"] as const) {
+      const result = runIsolatedRuntime(`
+        const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        runtime.installInitialRuntimeSelection(selected);
+        if (${JSON.stringify(mutation)} === "package") {
+          const packagePath = roots.fixtureRoot + "/package.json";
+          const value = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+          value.version = "9.9.9";
+          fs.writeFileSync(packagePath, JSON.stringify(value));
+        } else if (${JSON.stringify(mutation)} === "inventory") {
+          fs.writeFileSync(roots.fixtureRoot + "/dist/unexpected.js", "export {};\\n");
+        } else {
+          const target = roots.fixtureRoot + "/dist/index.js";
+          const realLstat = fs.lstatSync;
+          fs.lstatSync = (...args) => {
+            const stat = realLstat(...args);
+            if (String(args[0]).replaceAll("\\\\", "/").toLowerCase() !== target.replaceAll("\\\\", "/").toLowerCase()) return stat;
+            const linked = Object.create(stat);
+            linked.isSymbolicLink = () => true;
+            return linked;
+          };
+        }
+        const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        let reads = 0;
+        const realRead = fs.readFileSync;
+        fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+        const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+        console.log(JSON.stringify({ mismatch, direct, reads }));
+      `) as { mismatch: { ok: boolean; reason: string }; direct: { ok: boolean; category?: string }; reads: number };
+      expect(result.mismatch.ok, mutation).toBe(false);
+      expect(result.mismatch.reason).toMatch(/relaunch/u);
+      expect(result.mismatch.reason).not.toMatch(/selection|authentic|loader|provenance|evidence|digest|internal/iu);
+      expect(result.direct.ok).toBe(false);
+      expect(result.reads).toBeGreaterThan(0);
+      buildRuntime({ packageRoot: fixtureRoot });
+    }
+
+    fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// source fallback\n");
+    const sourceMutation = runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.installInitialRuntimeSelection(selected);
+      fs.appendFileSync(roots.fixtureRoot + "/src/index.ts", "// changed after install\\n");
+      const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      let reads = 0;
+      const realRead = fs.readFileSync;
+      fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+      const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      console.log(JSON.stringify({ mismatch, directMode: direct.mode, reads }));
+    `) as { mismatch: { ok: boolean; reason: string }; directMode: string; reads: number };
+    expect(sourceMutation).toMatchObject({ mismatch: { ok: false }, directMode: "source" });
+    expect(sourceMutation.mismatch.reason).toMatch(/build.*relaunch/isu);
+    expect(sourceMutation.reads).toBeGreaterThan(0);
+  });
+
+  it("refuses retained representation and generation replacement while allowing a rebuilt generation in a fresh process", () => {
+    const buildPath = path.join(repositoryRoot, "scripts", "build-runtime.mjs");
+    const representation = runIsolatedRuntime(`
+      const compiled = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: compiled });
+      fs.appendFileSync(roots.fixtureRoot + "/src/index.ts", "// force source mode\\n");
+      const source = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.installInitialRuntimeSelection(source);
+      const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      console.log(JSON.stringify(mismatch));
+    `) as { ok: boolean; reason: string };
+    expect(representation.ok).toBe(false);
+    expect(representation.reason).toMatch(/\/reload.*cannot apply this runtime change.*exit.*relaunch/isu);
+    expect(representation.reason).not.toMatch(/representation|generation/iu);
+    buildRuntime({ packageRoot: fixtureRoot });
+
+    const generation = runIsolatedRuntime(`
+      const oldSelection = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      fs.appendFileSync(roots.fixtureRoot + "/src/index.ts", "// next generation\\n");
+      const builder = await import(pathToFileURL(roots.buildPath).href);
+      builder.buildRuntime({ packageRoot: roots.fixtureRoot });
+      const rebuilt = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: rebuilt });
+      runtime.installInitialRuntimeSelection(oldSelection);
+      const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      console.log(JSON.stringify({ mismatch, rebuiltOk: rebuilt.ok, changed: oldSelection.manifest.runtimeDigest !== rebuilt.manifest.runtimeDigest }));
+    `, { fixtureRoot, buildPath }) as { mismatch: { ok: boolean; reason: string }; rebuiltOk: boolean; changed: boolean };
+    expect(generation).toMatchObject({ mismatch: { ok: false }, rebuiltOk: true, changed: true });
+    expect(generation.mismatch.reason).toMatch(/\/reload.*cannot apply this runtime change.*exit.*relaunch/isu);
+    expect(generation.mismatch.reason).not.toMatch(/representation|generation/iu);
+
+    const fresh = runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      console.log(JSON.stringify({ ok: selected.ok, mode: selected.mode }));
+    `) as { ok: boolean; mode: string };
+    expect(fresh).toStrictEqual({ ok: true, mode: "compiled" });
+  });
+
+  it("keeps source reload source-hosted after a build and does not carry handoff state into a fresh process", () => {
+    fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// source reload\n");
+    const buildPath = path.join(repositoryRoot, "scripts", "build-runtime.mjs");
+    const result = runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.installInitialRuntimeSelection(selected);
+      const adopted = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      const retained = runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: adopted });
+      const builder = await import(pathToFileURL(roots.buildPath).href);
+      builder.buildRuntime({ packageRoot: roots.fixtureRoot });
+      const reloaded = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      const repinned = runtime.pinPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source", selection: reloaded });
+      console.log(JSON.stringify({ retainedMode: retained.mode, reloadMode: reloaded.mode, repinnedMode: repinned.mode, sameRepresentation: repinned === retained }));
+    `, { fixtureRoot, buildPath }) as { retainedMode: string; reloadMode: string; repinnedMode: string; sameRepresentation: boolean };
+    expect(result).toStrictEqual({ retainedMode: "source", reloadMode: "compiled", repinnedMode: "source", sameRepresentation: true });
+    expect(runIsolatedRuntime(`
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      console.log(JSON.stringify({ ok: selected.ok, mode: selected.mode }));
+    `)).toStrictEqual({ ok: true, mode: "compiled" });
+  });
+
+  it.skipIf(process.platform !== "win32")("folds Windows case aliases only for retained representation and source notice ownership", () => {
+    fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// source alias\n");
+    const result = runIsolatedRuntime(`
+      const alias = roots.fixtureRoot.replace(/^[A-Za-z]:/, drive => (drive[0] === drive[0].toUpperCase() ? drive[0].toLowerCase() : drive[0].toUpperCase()) + ":");
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "source" });
+      runtime.installInitialRuntimeSelection(selected);
+      const adopted = runtime.selectPiccRuntime({ packageRoot: alias, installationKind: "source" });
+      const retained = runtime.pinPiccRuntime({ packageRoot: alias, installationKind: "source", selection: adopted });
+      let notices = 0;
+      console.error = () => { notices += 1; };
+      runtime.presentPiccSourceNotice({ packageRoot: roots.fixtureRoot, installationKind: "source", representation: retained, selection: adopted });
+      runtime.presentPiccSourceNotice({ packageRoot: alias, installationKind: "source", representation: retained, selection: adopted });
+      console.log(JSON.stringify({ same: adopted === selected, nativeRoot: retained.root === fs.realpathSync.native(roots.fixtureRoot), notices }));
+    `) as { same: boolean; nativeRoot: boolean; notices: number };
+    expect(result).toStrictEqual({ same: true, nativeRoot: true, notices: 1 });
+  });
+
+  it.skipIf(process.platform === "win32")("keeps POSIX case-distinct physical roots separate", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "picc case roots "));
+    const lower = path.join(parent, "runtime");
+    const upper = path.join(parent, "Runtime");
+    try {
+      fs.cpSync(fixtureRoot, lower, { recursive: true, dereference: false });
+      fs.cpSync(fixtureRoot, upper, { recursive: true, dereference: false });
+      const result = runIsolatedRuntime(`
+        const selected = runtime.selectPiccRuntime({ packageRoot: roots.lower, installationKind: "installed" });
+        runtime.installInitialRuntimeSelection(selected);
+        const mismatch = runtime.selectPiccRuntime({ packageRoot: roots.upper, installationKind: "installed" });
+        let reads = 0;
+        const realRead = fs.readFileSync;
+        fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+        const direct = runtime.selectPiccRuntime({ packageRoot: roots.lower, installationKind: "installed" });
+        console.log(JSON.stringify({ mismatchOk: mismatch.ok, directOk: direct.ok, reads }));
+      `, { lower, upper }) as { mismatchOk: boolean; directOk: boolean; reads: number };
+      expect(result).toMatchObject({ mismatchOk: false, directOk: true });
+      expect(result.reads).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects forged and failed handoffs, ignores ambient slots, delegates query identities, and consumes before implementation failure", () => {
+    const result = runIsolatedRuntime(`
+      const saved = roots.fixtureRoot + "/saved dist";
+      fs.renameSync(roots.fixtureRoot + "/dist", saved);
+      const failed = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      let failedMessage = "";
+      try { runtime.installInitialRuntimeSelection(failed); } catch (error) { failedMessage = String(error); }
+      fs.renameSync(saved, roots.fixtureRoot + "/dist");
+
+      const selected = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      let forgedMessage = "";
+      try { runtime.installInitialRuntimeSelection(structuredClone(selected)); } catch (error) { forgedMessage = String(error); }
+      const ambientSlot = Symbol.for("@arnedeutsch/picc.initial-runtime-selection.v1");
+      Object.defineProperty(process, ambientSlot, { value: { consume: () => structuredClone(selected) }, configurable: true });
+      Object.defineProperty(globalThis, ambientSlot, { value: structuredClone(selected), configurable: true });
+      runtime.installInitialRuntimeSelection(selected);
+      const consumer = await import(runtimeUrl + "?initial-consumer=query-import");
+      const alias = process.platform === "win32"
+        ? roots.fixtureRoot.replace(/^[A-Za-z]:/, drive => (drive[0] === drive[0].toUpperCase() ? drive[0].toLowerCase() : drive[0].toUpperCase()) + ":")
+        : roots.fixtureRoot;
+      const realRead = fs.readFileSync;
+      const realLstat = fs.lstatSync;
+      let reads = 0;
+      let verifierCalls = 0;
+      fs.readFileSync = (...args) => { reads += 1; return realRead(...args); };
+      fs.lstatSync = (...args) => { verifierCalls += 1; return realLstat(...args); };
+      const adopted = consumer.selectPiccRuntime({ packageRoot: alias, installationKind: "installed" });
+      const adoption = { reads, verifierCalls, same: adopted === selected };
+      const retained = consumer.pinPiccRuntime({ packageRoot: alias, installationKind: "installed", selection: adopted });
+      const implementationPath = retained.mode === "compiled" ? "dist/extension.js" : "src/extension.ts";
+
+      let implementationFailed = false;
+      try {
+        await import(pathToFileURL(roots.fixtureRoot + "/" + implementationPath).href);
+      } catch { implementationFailed = true; }
+      reads = 0;
+      verifierCalls = 0;
+      const direct = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      const directCounts = { reads, verifierCalls };
+      let replayMessage = "";
+      try { runtime.installInitialRuntimeSelection(selected); } catch (error) { replayMessage = String(error); }
+      fs.appendFileSync(roots.fixtureRoot + "/dist/index.js", "// corrupt reload\\n");
+      const corrupt = runtime.selectPiccRuntime({ packageRoot: roots.fixtureRoot, installationKind: "installed" });
+      console.log(JSON.stringify({ failedMessage, forgedMessage, adoption, retainedMode: retained.mode, implementationFailed, directOk: direct.ok, directCounts, replayMessage, corrupt }));
+    `) as {
+      failedMessage: string; forgedMessage: string; adoption: { reads: number; verifierCalls: number; same: boolean };
+      retainedMode: string; implementationFailed: boolean; directOk: boolean; directCounts: { reads: number; verifierCalls: number }; replayMessage: string; corrupt: { ok: boolean; category: string };
+    };
+    for (const message of [result.failedMessage, result.forgedMessage, result.replayMessage]) {
+      expect(message).toMatch(/startup.*repair.*relaunch/isu);
+      expect(message).not.toMatch(/selection|authentic|loader|provenance|evidence|digest|internal/iu);
+    }
+    expect(result.adoption).toMatchObject({ reads: 0, same: true });
+    expect(result.adoption.verifierCalls).toBeGreaterThan(0);
+    expect(result.retainedMode).toBe("compiled");
+    expect(result.implementationFailed).toBe(true);
+    expect(result.directOk).toBe(true);
+    expect(result.directCounts.reads).toBeGreaterThan(0);
+    expect(result.directCounts.verifierCalls).toBeGreaterThan(result.adoption.verifierCalls);
+    expect(result.corrupt).toMatchObject({ ok: false, category: "corrupt" });
   });
 });

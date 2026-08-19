@@ -69,6 +69,8 @@ function makePackage(options: {
   if (options.source ?? true) {
     fs.mkdirSync(path.join(root, ".git"), { recursive: true });
     write(path.join(root, "package-lock.json"), "{}");
+    write(path.join(root, "src", "index.ts"), "export default function picc() {}\n");
+    write(path.join(root, "tsconfig.runtime.json"), "{}\n");
   }
   write(path.join(root, "picc", "index.ts"), "export default function picc() {}\n");
   for (const name of PI_SUITE_PACKAGES) {
@@ -599,7 +601,9 @@ process.exit(23);
       expect(result.stdout).toContain(state === "corrupt"
         ? "Runtime unavailable (corrupt): The source-checkout compiled runtime is damaged."
         : "Runtime source fallback (source-stale): PiCC is using TypeScript source because the compiled runtime does not match this checkout.");
-      expect(result.stdout).toContain("Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC");
+      expect(result.stdout).toContain(state === "corrupt"
+        ? "Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC"
+        : "Run `npm run build` from the PiCC checkout root; `/reload` cannot apply this runtime change, so exit PiCC and relaunch");
       expect(result.stdout).toContain(state === "corrupt" ? "Runtime unavailable" : "Runtime source fallback");
       expect(result.stdout).not.toMatch(/[0-9a-f]{64}/u);
       expect(result.stdout).not.toContain(root);
