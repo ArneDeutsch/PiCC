@@ -208,7 +208,7 @@ export class SubagentPanelFocusController {
 
   /**
    * True while the focused component is open. The typed-fork Esc watcher in
-   * src/index.ts consults this to PASS a lone Esc through to the component:
+   * src/extension.ts consults this to PASS a lone Esc through to the component:
    * raw terminal-input listeners run BEFORE the focused component in pi-tui,
    * so without this gate a panel-close Esc would abort an in-flight fork.
    */
@@ -752,7 +752,7 @@ export class SubagentPanelFocusController {
       }
       // Deliberately NO UserPromptSubmit hook here — a PiCC decision, not a
       // parity claim: those hooks fire on the MAIN session's prompt turns
-      // (the `input` handler in src/index.ts), and Claude Code leaves its
+      // (the `input` handler in src/extension.ts), and Claude Code leaves its
       // steering hook behavior undocumented, so PiCC pins "steer text goes
       // straight to the running session" rather than inventing a contract.
       try {

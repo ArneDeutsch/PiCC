@@ -1084,7 +1084,7 @@ describe("subagent hooks carry agent_id/agent_type; transcript_path stays = main
     const h = fakeSdk({ replies: ["done"] });
     // The runtime must construct the scoped runner WITHOUT a subagent-transcript
     // getter (no second argument) — the runner then keeps the MAIN session
-    // transcript_path (index.ts fallback). Re-pointing it at the subagent's own
+    // transcript_path (src/extension.ts fallback). Re-pointing it at the subagent's own
     // file would violate Claude Code parity (review round 2).
     const optsSeen: Array<unknown> = [];
     const makeScopedHookRunner = (_config: Record<string, unknown>, ...rest: unknown[]) => {

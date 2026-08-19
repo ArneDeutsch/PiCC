@@ -1,4 +1,4 @@
-import { Type } from "typebox";
+import { Type } from "../runtime-host.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { McpResourceInfo, McpResourceServerInfo } from "./mcp.js";
 import {

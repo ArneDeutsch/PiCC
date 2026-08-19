@@ -3,12 +3,10 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 
-// Parent-only guard (tester NIT-2): the last test boots the REAL picc harness
-// with only the Pi SDK's session creation faked, so it can dispatch a real
-// subagent and inspect the tool list that subagent's session actually receives.
-// This file has no static import of the Pi module, so this mock cleanly
-// intercepts subagents.ts's dynamic `loadRealSdk` import (unlike sendmessage.test,
-// whose top-level SessionManager import defeats interception).
+// Before host installation, fake-sdk's subagent imports can reach the bridge
+// fallback and re-enter this coding-agent mock. Keep the real public host exports,
+// but defer the fake session helper until dispatch so this hoisted mock finishes
+// first. The final harness tests inspect the resulting child options.
 const rcMock = vi.hoisted(() => ({
   created: [] as Array<Record<string, unknown>>,
   // Capture DefaultResourceLoader options so a dispatch's systemPromptOverride
@@ -18,17 +16,23 @@ const rcMock = vi.hoisted(() => ({
 }));
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
-  const { fakeSdk: makeFakeSdk } = await import("./helpers/fake-sdk.js");
-  const { sdk } = makeFakeSdk({ replies: ["rc-nit2-done"], created: rcMock.created });
-  const BaseLoader = sdk.DefaultResourceLoader as new (o: Record<string, unknown>) => unknown;
+  let fakeSdkPromise: Promise<{
+    createAgentSession(options: Record<string, unknown>): unknown;
+  }> | undefined;
+  const acquireFakeSdk = () => fakeSdkPromise ??= import("./helpers/fake-sdk.js")
+    .then(({ fakeSdk: makeFakeSdk }) =>
+      makeFakeSdk({ replies: ["rc-nit2-done"], created: rcMock.created }).sdk);
   return {
     ...real,
-    createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
-    DefaultResourceLoader: class extends (BaseLoader as new (o: Record<string, unknown>) => object) {
-      constructor(o: Record<string, unknown>) {
-        super(o);
-        rcMock.loaderOptions.push(o);
+    createAgentSession: async (options: Record<string, unknown>) =>
+      (await acquireFakeSdk()).createAgentSession(options),
+    DefaultResourceLoader: class {
+      readonly options: Record<string, unknown>;
+      constructor(options: Record<string, unknown>) {
+        this.options = options;
+        rcMock.loaderOptions.push(options);
       }
+      async reload(): Promise<void> {}
     },
     SessionManager: { inMemory: () => ({}) },
     SettingsManager: { inMemory: () => ({}) },
@@ -2023,7 +2027,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       worktrees,
       // subagentMaxDepth: allow one level of nesting so the parent can spawn a child.
       maxDepth: 2,
-      // Mirror index.ts's real wiring: the dispatching subagent's Agent tool carries
+      // Mirror src/extension.ts's real wiring: the dispatching subagent's Agent tool carries
       // dispatchCwd sourced from its own dispatch-local subCwd.
       customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd: CwdState | undefined, _notebook, _activation, _stop) =>
         depth + 1 <= 2 && subCwd
@@ -4730,7 +4734,7 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
 
       // general-purpose inherits ALL tools (tools: undefined) → gateTools grants
       // every known Claude name INCLUDING SendMessage. The subagent's session must
-      // still never receive a SendMessage tool: the one-line guard in index.ts's
+      // still never receive a SendMessage tool: the one-line guard in src/extension.ts's
       // customToolsFor must hold under inherit-all (and claudeToolsToPiBuiltins
       // never maps SendMessage to a Pi builtin).
       const before = rcMock.created.length;
@@ -4774,7 +4778,7 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
   });
 });
 
-// Wiring-seam revert-catcher: the scratchpad path is computed in index.ts's
+// Wiring-seam revert-catcher: the scratchpad path is computed in src/extension.ts's
 // activation and threaded into BOTH the main-session before_agent_start suffix AND
 // buildSubagentSystemPrompt's suffix. Boots the REAL harness (same pattern as the
 // parent-guard test above) so a dropped call-site arg on either path ships RED.

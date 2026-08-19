@@ -1,9 +1,7 @@
 import path from "node:path";
-import {
-  createEditToolDefinition,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createEditToolDefinition } from "../runtime-host.js";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import { neutralizePiEditBoxBackground, piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import { themedFg } from "./render-util.js";
 import {

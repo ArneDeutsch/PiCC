@@ -1,5 +1,3 @@
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   getKeybindings,
@@ -26,8 +24,6 @@ interface RenderTool {
   renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): Component;
 }
 
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
 const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
 const definitions = {
   ...TUI_KEYBINDINGS,
@@ -115,14 +111,9 @@ function deepFreeze<T>(value: T): T {
 }
 
 function withBinding<T>(keys: string[], run: () => T): T {
-  const previousRoot = getKeybindings();
-  const previousPi = piTui.getKeybindings();
-  setKeybindings(new KeybindingsManager(definitions, { "app.tools.expand": ["root-only"] as never }));
-  piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": keys as never }));
-  try { return run(); } finally {
-    piTui.setKeybindings(previousPi);
-    setKeybindings(previousRoot);
-  }
+  const previous = getKeybindings();
+  setKeybindings(new KeybindingsManager(definitions, { "app.tools.expand": keys as never }));
+  try { return run(); } finally { setKeybindings(previous); }
 }
 
 function paint(

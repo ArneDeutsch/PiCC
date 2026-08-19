@@ -2,15 +2,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picomatch from "picomatch";
-import { Type } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  defineTool,
-  truncateHead,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { Type } from "../../runtime-host.js";
+import { StringEnum } from "../../runtime-host.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, defineTool, truncateHead } from "../../runtime-host.js";
 
 /**
  * Search tools: Claude-named `Grep` and `Glob`.

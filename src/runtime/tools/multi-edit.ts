@@ -1,12 +1,9 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Type } from "typebox";
-import {
-  defineTool,
-  generateDiffString,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { Type } from "../../runtime-host.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, generateDiffString } from "../../runtime-host.js";
+import { withFileMutationQueue } from "../../runtime-host.js";
 
 /**
  * `MultiEdit`: an atomic, sequential multi-edit tool — the Claude Code

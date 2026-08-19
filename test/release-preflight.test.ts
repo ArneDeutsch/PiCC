@@ -129,7 +129,7 @@ describe("release identity", () => {
       expectedSourceDigest: "c".repeat(64),
     });
     expect(inspected.archiveBytes.toString("utf8")).toBe("release bytes");
-    expect(inspected.filePolicy.files).toContain("picc/index.js");
+    expect(inspected.filePolicy.files).toContain("picc/index.ts");
     expect(inspected.filePolicy.prefixes).toContain("dist/");
 
     fs.appendFileSync(tarball, "changed");
@@ -143,7 +143,7 @@ describe("release file policy", () => {
     expect(RELEASE_STATIC_FILES).toEqual([...RELEASE_STATIC_FILES].sort((left, right) =>
       Buffer.compare(Buffer.from(left), Buffer.from(right))));
     expect(RELEASE_FILE_POLICY.prefixes).toEqual(["dist/", "src/"]);
-    for (const required of ["bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.js"]) {
+    for (const required of ["bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.ts"]) {
       expect(RELEASE_STATIC_FILES).toContain(required);
       expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => required.startsWith(prefix))).toBe(false);
     }
@@ -423,7 +423,7 @@ describe("release workflow", () => {
       bin: { picc: "bin/picc.mjs" },
     });
     expect(packageJson.files).toEqual([
-      "dist", "src", "picc/index.js", "picc/index.ts", "bin", "examples", "doc/*.md",
+      "dist", "src", "picc/index.ts", "bin", "examples", "doc/*.md",
       "CONTRIBUTING.md", "LICENSE", "README.md",
     ]);
     expect(packageJson.dependencies).not.toHaveProperty("jiti");

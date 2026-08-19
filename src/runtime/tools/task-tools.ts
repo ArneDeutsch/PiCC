@@ -1,6 +1,7 @@
-import { Type } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "../../runtime-host.js";
+import { StringEnum } from "../../runtime-host.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool } from "../../runtime-host.js";
 
 /**
  * Task tracking tools: the `Task*` surface

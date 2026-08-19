@@ -1,12 +1,9 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { Type } from "typebox";
-import {
-  isContextOverflow,
-  isRetryableAssistantError,
-  type AssistantMessage,
-} from "@earendil-works/pi-ai";
+import { Type, runtimeHostGraph } from "../runtime-host.js";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { isContextOverflow, isRetryableAssistantError } from "../runtime-host.js";
 import type {
   ClaudeAgent,
   Diagnostic,
@@ -532,9 +529,8 @@ export interface DispatchResult {
 }
 
 async function loadRealSdk(): Promise<PiSdk> {
-  const mod = await import("@earendil-works/pi-coding-agent");
   const { resolveGitBashPath } = await import("../engine/shell-inject.js");
-  const m = mod as unknown as Record<string, any>;
+  const m = runtimeHostGraph.codingAgent as unknown as Record<string, any>;
   const shellPath = resolveGitBashPath();
   return {
     createAgentSession: (options) => m.createAgentSession(options),
@@ -686,7 +682,7 @@ function isEnvTruthy(value: string | undefined): boolean {
 
 /**
  * HookRunner-shaped facade multiplexing the session runner with an agent's
- * scoped runner — same pattern as index.ts's HookMultiplexer,
+ * scoped runner — same pattern as src/extension.ts's HookMultiplexer,
  * but per-dispatch and discarded with it.
  */
 function multiplexHookRunners(base: HookRunnerLike, scoped: HookRunnerLike): HookRunnerLike {
@@ -3182,7 +3178,7 @@ export class SubagentRuntime {
       requireActiveGeneration();
 
       // Subagent built-ins from the SHARED factory: the exact same seven tool
-      // implementations the main session builds (index.ts), constructed here
+      // implementations the main session builds (src/extension.ts), constructed here
       // against the dispatch-local `subCwd` — NEVER the orchestrator cwd. The
       // execute closure rebinds per call via `subCwd.get()`, so after THIS agent's
       // own EnterWorktree its built-ins re-resolve to the new worktree cwd in

@@ -72,13 +72,13 @@ export interface AssemblyInputs {
    * Per-session native-safe scratch dir literal path. When set, a
    * scratchpad section is injected on ALL platforms (mirroring Claude Code) naming
    * this literal path and steering temp files here instead of `/tmp`. Computed once
-   * in index.ts (the composition root) so this module never imports from `engine/`.
+   * in src/extension.ts (the composition root) so this module never imports from `engine/`.
    */
   scratchDir?: string;
   /**
    * True when the shell↔native namespace split (Windows + pinned Git Bash) means a
    * bare `/tmp/...` written via the Bash tool is unreadable by the native file tools.
-   * Gates the extra Windows note under the scratchpad section. Computed in index.ts
+   * Gates the extra Windows note under the scratchpad section. Computed in src/extension.ts
    * from `shellNamespaceDiffersFromNative()` — same reason: no `engine/` import here.
    */
   windowsTempNote?: boolean;
@@ -161,7 +161,7 @@ You are running a project authored for Claude Code. Honor its conventions:
 /**
  * Conservative memory-write policy. Single-line string, shared verbatim by the
  * main-session auto-memory guidance below and the per-agent `memory:` guidance in
- * index.ts so the two can never drift. It opens with a deference clause so a project's
+ * src/extension.ts so the two can never drift. It opens with a deference clause so a project's
  * own CLAUDE.md eager-write opt-in overrides the conservative default — that section is
  * emitted earlier and would otherwise lose to a bare conservative directive.
  */

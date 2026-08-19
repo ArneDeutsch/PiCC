@@ -1,8 +1,4 @@
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  truncateHead,
-} from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "../runtime-host.js";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
   SUPPORTED_IMAGE_MIMES,

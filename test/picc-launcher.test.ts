@@ -104,7 +104,7 @@ function installVerifiedRuntime(root: string, options: {
   const pluginMap = JSON.stringify({ version: 3, file: "plugin-inventory-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const mcpMap = JSON.stringify({ version: 3, file: "mcp-administration-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const contents = new Map([
-    ["picc/index.js", extension],
+    ["picc/index.ts", extension],
     ["dist/index.js", index],
     ["dist/index.js.map", indexMap],
     ["dist/plugin-inventory-cli.js", plugin],
@@ -149,7 +149,7 @@ function installVerifiedRuntime(root: string, options: {
   const manifest = {
     schemaVersion: 1, package: identity.package, compiler: identity.compiler, sources: identity.sources,
     sourceDigest: identity.sourceDigest, files, runtimeDigest: digest(files),
-    entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
+    entries: { extension: "picc/index.ts", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
   };
   write(path.join(root, "dist", "picc-runtime.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -427,7 +427,7 @@ describe("launcher behavior", () => {
     expect(result.stderr).not.toMatch(/incomplete or inconsistent/);
   });
 
-  it("routes installed and source-classified interactive launches through the verified compiled wrapper", () => {
+  it("routes installed and source-classified interactive launches through the canonical TypeScript bootstrap", () => {
     for (const installationKind of ["installed", "source"] as const) {
       const root = makePackage({ source: installationKind === "source" });
       installLauncher(root);
@@ -436,6 +436,7 @@ describe("launcher behavior", () => {
       const sourceCanary = path.join(root, "source-started");
       const jitiCanary = path.join(root, "jiti-started");
       write(path.join(root, "picc", "index.ts"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sourceCanary)}, "started");`);
+      installVerifiedRuntime(root, { sourceMatched: installationKind === "source" });
       write(path.join(root, "node_modules", "jiti", "package.json"), JSON.stringify({
         name: "jiti", version: "2.7.0", type: "module", exports: "./index.js",
       }));
@@ -465,7 +466,7 @@ process.exit(23);
         argv: string[]; kind: string; version: string; parent: string; cwd: string; nodeOptions: string;
         sourceMapsEnabled: boolean; descendantStatus: number; descendantNodeOptions: string;
       };
-      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "--model", "openai/test"]);
+      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
       expect(launched).toMatchObject({
         kind: installationKind, version: "0.1.1", cwd: root, nodeOptions: "--no-warnings",
         sourceMapsEnabled: true, descendantStatus: 0, descendantNodeOptions: "--no-warnings",
@@ -482,7 +483,7 @@ process.exit(23);
     }
   });
 
-  it("fails every installed runtime category before Pi or source startup", () => {
+  it("rejects an unavailable installed runtime before interactive or administration bootstrap execution", () => {
     for (const category of ["missing", "corrupt", "version-mismatch"] as const) {
       for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"], ["mcp", "list"]]) {
         const root = makePackage({ source: false });
@@ -504,11 +505,10 @@ process.exit(23);
         const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
           cwd: root, encoding: "utf8",
         });
-        expect(result.status, `${category}:${argv.join(" ")}`).toBe(1);
         expect(result.stdout).toBe("");
+        expect(result.status, `${category}:${argv.join(" ")}`).toBe(1);
         expect(result.stderr).toContain(category === "missing" ? "runtime is missing" : category === "corrupt" ? "runtime is damaged" : "runtime is version-incoherent");
         expect(result.stderr).toContain("TypeScript source was not used");
-        expect(result.stderr).toContain("picc update");
         expect(result.stderr).toContain("installation owner");
         expect(fs.existsSync(piCanary)).toBe(false);
         expect(fs.existsSync(sourceCanary)).toBe(false);
@@ -516,7 +516,7 @@ process.exit(23);
     }
   });
 
-  it("discloses source missing, ordinary drift, and package-version drift once on every runtime route", () => {
+  it("keeps the parent quiet while source administration discloses fallback once", () => {
     for (const state of ["missing", "source-stale", "package-drift"] as const) {
       const root = makePackage();
       installLauncher(root);
@@ -547,8 +547,9 @@ process.exit(23);
         });
         expect(result.status, `${state}:${argv.join(" ")}`).toBe(0);
         expect(result.stdout).toBe("");
-        expect(result.stderr.match(/PiCC is using TypeScript source/gu)).toHaveLength(1);
-        expect(result.stderr).toContain(state === "missing" ? "compiled runtime is missing" : "does not match this checkout");
+        const normalLaunch = argv[0] === "--theme";
+        expect(result.stderr.match(/PiCC is using TypeScript source/gu) ?? []).toHaveLength(normalLaunch ? 0 : 1);
+        if (!normalLaunch) expect(result.stderr).toContain(state === "missing" ? "compiled runtime is missing" : "does not match this checkout");
       }
       expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual([
         "-e", canonicalPath(path.join(root, "picc", "index.ts")), "--theme", "dark",
@@ -556,7 +557,7 @@ process.exit(23);
     }
   });
 
-  it("refuses corrupt source-checkout output for interactive and plugin commands", () => {
+  it("rejects a corrupt source-checkout runtime before interactive or administration bootstrap execution", () => {
     const root = makePackage();
     installLauncher(root);
     installVerifiedRuntime(root, { sourceMatched: true });
@@ -605,7 +606,7 @@ process.exit(23);
     }
   });
 
-  it("keeps source-checkout recovery actionable when the runtime selector cannot import", () => {
+  it("keeps version and normal-launch recovery actionable when the selector cannot load", () => {
     const root = makePackage();
     installLauncher(root);
     fs.rmSync(path.join(root, "bin", "picc-runtime.mjs"));
@@ -627,7 +628,7 @@ process.exit(23);
         expected: {
           status: 1,
           stdout: "",
-          stderr: "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+          stderr: "PiCC: The source-checkout runtime could not be verified. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
         },
       },
     ] as const;
@@ -675,7 +676,7 @@ process.exit(23);
     expect(mcp).toMatchObject({ status: 0, stdout: "compiled-mcp:add:name:--:node:--flag\n", stderr: "" });
     const canary = path.join(root, "pi-argv.json"); write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify(process.argv.slice(2)));`);
     const near = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "mcpx", "list"], { cwd: root, encoding: "utf8" });
-    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "mcpx", "list"]);
+    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "mcpx", "list"]);
   });
 
   it("routes plugin argv before Pi resolution and reports an unavailable packaged entrypoint safely", () => {
@@ -1403,10 +1404,7 @@ require("node:module").syncBuiltinESMExports();
     const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
       cwd: root, encoding: "utf8",
     });
-    expect(plugins).toMatchObject({
-      status: 0, stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
-    });
+    expect(plugins).toMatchObject({ status: 0, stdout: "", stderr: "" });
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
       "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",
     ]);

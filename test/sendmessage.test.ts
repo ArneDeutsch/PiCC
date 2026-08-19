@@ -577,7 +577,7 @@ describe("SendMessage tool — steer + refusals", () => {
       subagentRegistry: registry,
       getMainSessionFile: () => main,
     });
-    // Synthetic fork target locked to a narrow toolset — exactly what index.ts's
+    // Synthetic fork target locked to a narrow toolset — exactly what src/extension.ts's
     // forkDispatch builds for an agent-less context:fork skill.
     const forkOverride = makeAgent({
       name: "fork:my-skill",

@@ -242,9 +242,6 @@ it(
     const fixtureSource = path.join(REPO_ROOT, "examples", "full-surface");
     const fixtureBefore = treeSnapshot(fixtureSource);
     const packageBefore = treeSnapshot(packageRoot);
-    const runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
-    const savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
-    const packagedRuntimeCanary = path.join(root, "packaged-runtime-canary");
     const preloadCanary = path.join(root, "packaged-preload-canary");
     const preloadScript = path.join(root, "packaged-preload-canary.cjs");
     fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
@@ -283,7 +280,6 @@ it(
       });
     });
     try {
-      fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(packagedRuntimeCanary)}, "executed"); export default function canary() {}\n`);
       const added = await run([
         "marketplace", "add", LIFECYCLE_MARKETPLACE,
         "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"),
@@ -347,14 +343,12 @@ it(
       expect(networkDescriptor).toContain("127.0.0.1");
       expect(fs.existsSync(lifecycle.lifecycleTrace)).toBe(false);
       expect(fs.existsSync(lifecycle.runtimeCanary)).toBe(false);
-      expect(fs.existsSync(packagedRuntimeCanary)).toBe(false);
       expect(fs.existsSync(preloadCanary)).toBe(false);
     } finally {
       const cleanupErrors: unknown[] = [];
       const cleanupStep = async (step: () => void | Promise<void>) => {
         try { await step(); } catch (error) { cleanupErrors.push(error); }
       };
-      await cleanupStep(() => fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint));
       await cleanupStep(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
       await cleanupStep(() => lifecycle.cleanup());
       await cleanupStep(() => cleanupFixture(project));
@@ -412,7 +406,7 @@ describe("installed release tarball", () => {
         "CONTRIBUTING.md", "LICENSE", "README.md", "bin", "dist", "doc", "examples",
         "package.json", "picc", "src",
       ]);
-      expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.js", "index.ts"]);
+      expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.ts"]);
       expect(fs.existsSync(path.join(packageRoot, "scripts"))).toBe(false);
       expect(fs.existsSync(path.join(packageRoot, "tsconfig.runtime.json"))).toBe(false);
       const runtimeManifest = JSON.parse(
@@ -422,10 +416,12 @@ describe("installed release tarball", () => {
         files: Array<{ path: string }>;
       };
       expect(runtimeManifest.entries).toEqual({
-        extension: "picc/index.js",
+        extension: "picc/index.ts",
         pluginInventory: "dist/plugin-inventory-cli.js",
         mcpAdministration: "dist/mcp-administration-cli.js",
       });
+      expect(runtimeManifest.files.filter((record) => record.path.startsWith("picc/")))
+        .toEqual([{ path: "picc/index.ts", sha256: expect.any(String) }]);
       for (const entry of [
         "dist/index.js",
         "dist/plugin-inventory-cli.js",
@@ -484,16 +480,13 @@ describe("installed release tarball", () => {
       expect(result.stdout).toContain("PACKAGED_EXTENSION_OK");
       expect(result.stderr).not.toMatch(/latest-version|api\.openai\.com|anthropic\.com/iu);
 
-      const compiledEntry = path.join(packageRoot, "dist", "index.js");
-      const sourceEntry = path.join(packageRoot, "picc", "index.ts");
-      const originalCompiled = fs.readFileSync(compiledEntry);
-      const originalSource = fs.readFileSync(sourceEntry);
-      const sourceCanary = path.join(temporaryDirectory("picc-packaged-tamper-"), "source-executed");
+      const bootstrapEntry = path.join(packageRoot, "picc", "index.ts");
+      const originalBootstrap = fs.readFileSync(bootstrapEntry);
+      const bootstrapCanary = path.join(temporaryDirectory("picc-packaged-tamper-"), "bootstrap-executed");
       try {
-        fs.appendFileSync(compiledEntry, "\n");
         fs.writeFileSync(
-          sourceEntry,
-          `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sourceCanary)}, "executed"); export default function canary() {}\n`,
+          bootstrapEntry,
+          `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(bootstrapCanary)}, "executed"); export default function canary() {}\n`,
         );
         const tampered = await runPi({
           launcherPath: launcher,
@@ -503,10 +496,9 @@ describe("installed release tarball", () => {
         expect(tampered.code).toBe(1);
         expect(tampered.requests).toHaveLength(0);
         expect(tampered.stderr).toContain("installed PiCC runtime is damaged");
-        expect(fs.existsSync(sourceCanary)).toBe(false);
+        expect(fs.existsSync(bootstrapCanary)).toBe(false);
       } finally {
-        fs.writeFileSync(compiledEntry, originalCompiled);
-        fs.writeFileSync(sourceEntry, originalSource);
+        fs.writeFileSync(bootstrapEntry, originalBootstrap);
       }
     },
     TEST_TIMEOUT_MS,

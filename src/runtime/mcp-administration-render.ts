@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "../runtime-host.js";
 import type { McpAdministrationInventory, McpAdministrationInventoryItem } from "../mcp-administration/model.js";
 import type { McpAdministrationReasonCode } from "../mcp-administration/service.js";
 import { clampLines, pushWrapped, sanitizeDisplayText, themedFg } from "./render-util.js";

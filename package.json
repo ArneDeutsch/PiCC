@@ -36,7 +36,6 @@
   "files": [
     "dist",
     "src",
-    "picc/index.js",
     "picc/index.ts",
     "bin",
     "examples",
@@ -52,7 +51,8 @@
     "build": "node scripts/build-runtime.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
-    "typecheck:all": "npm run typecheck && npm run typecheck:test",
+    "typecheck:bootstrap": "tsc -p tsconfig.bootstrap.json",
+    "typecheck:all": "npm run typecheck && npm run typecheck:test && npm run typecheck:bootstrap",
     "test": "vitest run --project unit",
     "verify": "npm run typecheck:all && npm run test:unit",
     "test:watch": "vitest --project unit",

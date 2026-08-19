@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
 import type { TSchema } from "typebox";
@@ -34,6 +33,7 @@ import {
   type ProgressSnapshot,
 } from "../src/runtime/subagent-progress.js";
 import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
+import * as piTui from "@earendil-works/pi-tui";
 import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
 import {
   fakeSdk,
@@ -46,13 +46,6 @@ import {
   formatSubagentRecoveryGuidance,
   type SubagentRecoveryDisposition,
 } from "../src/runtime/subagent-recovery.js";
-
-const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = piRequire("@earendil-works/pi-tui") as {
-  KeybindingsManager: new (definitions: Record<string, unknown>, bindings?: Record<string, unknown>) => unknown;
-  TUI_KEYBINDINGS: Record<string, unknown>;
-  setKeybindings(manager: unknown): void;
-};
 
 /** onUpdate payload shape + streaming-capable tool view. */
 type ToolUpdate = {
@@ -514,7 +507,7 @@ describe("opted-in retained background outcomes", () => {
     expect(collapsed).not.toContain("retained text");
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
     try {
@@ -1012,7 +1005,7 @@ describe("settlement notices", () => {
     for (const n of notices) n.commit();
     return notices.map((n) => n.content);
   };
-  /** Drain with the registry-miss fallback wired (index.ts's real third arg). */
+  /** Drain with the registry-miss fallback wired (src/extension.ts's real third arg). */
   const drainWithFallback = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) => {
     const notices = bg.drainSettlementNotices(
       (a) => sub.isSettledNoticeArmed(a),
@@ -1574,7 +1567,7 @@ describe("settlement notices", () => {
     const notices1 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
     expect(notices1).toHaveLength(2);
 
-    // Simulate index.ts's per-notice delivery loop where the FIRST send throws
+    // Simulate src/extension.ts's per-notice delivery loop where the FIRST send throws
     // BEFORE its commit() — the second still delivers + commits.
     const delivered: string[] = [];
     let threwOnce = false;
@@ -2926,7 +2919,7 @@ describe("nested background bound — per-depth budgets", () => {
     });
 
     // Reachability: the nested Agent tool is built WITH a backgroundTasks registry
-    // (as production does via customToolsFor / index.ts) — otherwise the inner
+    // (as production does via customToolsFor / src/extension.ts) — otherwise the inner
     // dispatch would take the foreground arm and prove nothing.
     const nestedRegistry = new BackgroundTaskRegistry();
     const runtime = makeRuntime([makeAgent({ name: "outer" }), makeAgent({ name: "leaf" })], sdk, {
@@ -4359,7 +4352,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   it("uses the configured expansion cue on Agent, TaskOutput, and settlement records", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
@@ -4392,7 +4385,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   it("does not let hostile subagent labels impersonate full or compact renderer-owned cues", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
@@ -4412,7 +4405,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   it("keeps a compact cue for hostile subagent labels or fails open when it cannot fit", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
@@ -4443,7 +4436,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   it("bounds huge expanded and unbound completion bodies at unusable widths, then restores them", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     const huge = `HUGE_SUBAGENT_SENTINEL:${"body".repeat(300_000)}`;
     const details = Object.freeze({
@@ -4455,7 +4448,7 @@ describe("settlement completion record (details + exactly-once)", () => {
       finalText: huge,
     });
     for (const binding of [["ctrl+o"], []] as const) {
-      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding }));
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding as never }));
       const component = renderSettlementRecord(details, { expanded: binding.length > 0 }, undefined)!;
       const tiny = component.render(6);
       expect(tiny.length).toBeLessThanOrEqual(2);
@@ -4471,7 +4464,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   it("fails open frozen complete Agent, TaskOutput, and settlement records exactly once when unbound", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
     try {
@@ -4557,7 +4550,7 @@ describe("settlement completion record (details + exactly-once)", () => {
   ])("deduplicates complete error framing without substring collisions: $name", ({ error, body, expected }) => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
     try {

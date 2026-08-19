@@ -123,17 +123,16 @@ async function main() {
       selection = await selectRuntime(packageRoot, installationKind);
     } catch {
       return fail(installationKind === "source"
-        ? "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC."
-        : "PiCC: runtime selection is unavailable. TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.");
+        ? "PiCC: The source-checkout runtime could not be verified. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC."
+        : "PiCC: The installed PiCC runtime could not be verified. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.");
     }
     if (!selection.ok) return fail(runtimeFailure(selection, installationKind));
-    if (selection.notice) console.error(selection.notice.message);
 
     const resolution = admin.resolvePiCli(packageRoot);
     if (!resolution.ok) return fail(`PiCC: ${resolution.reason}`);
     let extension;
     try {
-      extension = admin.canonicalPath(path.join(packageRoot, ...selection.entries.extensionPath.split("/")));
+      extension = admin.canonicalPath(path.join(packageRoot, "picc", "index.ts"));
       if (!admin.isPathInside(extension, packageRoot) || !fs.statSync(extension).isFile()) throw new Error();
     } catch { return fail(INITIALIZATION_FAILED); }
     const child = spawn(process.execPath, ["--enable-source-maps", resolution.cli, "-e", extension, ...argv], {

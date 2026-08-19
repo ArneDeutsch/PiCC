@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "../runtime-host.js";
 import { AGENT_COLOR_ANSI, tintAgentColor } from "./agent-color.js";
 import {
   DETAIL_FIELD_MAX_LENGTH,

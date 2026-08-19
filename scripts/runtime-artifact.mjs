@@ -3,7 +3,7 @@ import path from "node:path";
 import { inspectTarball } from "./tarball-inspect.mjs";
 
 const MANIFEST_PATH = "dist/picc-runtime.json";
-const EXTENSION_ENTRY = "picc/index.js";
+const EXTENSION_ENTRY = "picc/index.ts";
 const INVENTORY_ENTRY = "dist/plugin-inventory-cli.js";
 const MCP_ADMINISTRATION_ENTRY = "dist/mcp-administration-cli.js";
 const REQUIRED_RUNTIME_FILES = [
@@ -214,7 +214,7 @@ export function verifyRuntimeArtifact({ archiveBytes, expectedPackage, expectedS
   const recordedRuntime = new Set(manifest.files.map((record) => record.path));
   const archiveRuntime = [...inspected.files.keys()].filter((name) =>
     (name.startsWith("dist/") && name !== MANIFEST_PATH)
-    || (name.startsWith("picc/") && (name.endsWith(".js") || name.endsWith(".js.map"))));
+    || name.startsWith("picc/"));
   if (archiveRuntime.some((name) => !recordedRuntime.has(name))) fail("generated runtime contents contain unexpected files");
   if ([...recordedRuntime].some((name) => !inspected.files.has(name))) fail("generated runtime contents are missing files");
 

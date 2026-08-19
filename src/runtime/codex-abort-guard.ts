@@ -5,7 +5,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { openAICodexResponsesApi } from "@earendil-works/pi-ai/compat";
+import { openAICodexResponsesApi } from "../runtime-host.js";
 
 // Pi's public compat entry re-exports the public Codex API loader and is the
 // extension-loader-safe spelling (the loader aliases the pi-ai package root).

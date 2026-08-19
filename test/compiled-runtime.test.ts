@@ -52,7 +52,7 @@ function writeFixture(): void {
   config.compilerOptions.types = [];
   fs.writeFileSync(path.join(fixtureRoot, "tsconfig.runtime.json"), `${JSON.stringify(config, null, 2)}\n`);
   fs.mkdirSync(path.join(fixtureRoot, "picc"));
-  fs.copyFileSync(path.join(repositoryRoot, "picc", "index.js"), path.join(fixtureRoot, "picc", "index.js"));
+  fs.copyFileSync(path.join(repositoryRoot, "picc", "index.ts"), path.join(fixtureRoot, "picc", "index.ts"));
   fs.mkdirSync(path.join(fixtureRoot, "bin"));
   fs.copyFileSync(path.join(repositoryRoot, "bin", "picc-runtime.mjs"), path.join(fixtureRoot, "bin", "picc-runtime.mjs"));
   fs.symlinkSync(path.join(repositoryRoot, "node_modules"), path.join(fixtureRoot, "node_modules"), "junction");
@@ -83,7 +83,7 @@ function expectVerified(checkSource = true): RuntimeManifest {
   expect(verifyCompiledRuntime({ packageRoot: fixtureRoot, checkSource })).toStrictEqual({
     ok: true,
     manifest: expectedManifest,
-    entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
+    entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
   });
   return expectedManifest;
 }
@@ -158,7 +158,7 @@ describe("compiled runtime identity", () => {
       .map((recordPath) => ({ path: recordPath, sha256: hashFile(path.join(fixtureRoot, ...recordPath.split("/"))) }));
     const canonicalFiles = [
       "dist/index.js", "dist/index.js.map", "dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map", "dist/nested/café.js", "dist/nested/café.js.map",
-      "dist/plugin-inventory-cli.js", "dist/plugin-inventory-cli.js.map", "picc/index.js",
+      "dist/plugin-inventory-cli.js", "dist/plugin-inventory-cli.js.map", "picc/index.ts",
     ].map((recordPath) => ({ path: recordPath, sha256: hashFile(path.join(fixtureRoot, ...recordPath.split("/"))) }));
     expect(first.package).toStrictEqual(canonicalPackage);
     expect(first.compiler).toStrictEqual(canonicalCompiler);
@@ -180,10 +180,10 @@ describe("compiled runtime identity", () => {
     const sources = [{ path: "src/index.ts", sha256: "1".repeat(64) }];
     const files = [
       { path: "dist/index.js", sha256: "2".repeat(64) },
-      { path: "picc/index.js", sha256: "3".repeat(64) },
+      { path: "picc/index.ts", sha256: "3".repeat(64) },
     ];
     expect(digest({ package: packageIdentity, compiler, sources })).toBe("eed003bd1c6c2ccd6695227e890208a2ec3c5268b08f0b96d4566fe6fd438464");
-    expect(digest(files)).toBe("d67be9d39cd2b99f71eebb15b2c7e8cbec52eb714b171aba00ebf52a63774169");
+    expect(digest(files)).toBe("434689296a605ecc5818fa61861f276e8978c5c9a70a9d2dcb6860e6c069c770");
   });
 
   it("invalidates add, change, delete, and rename source mutations but ignores unrelated files", () => {
@@ -441,7 +441,7 @@ describe("compiled runtime identity", () => {
   it("returns installation-aware exact selector unions without forwarding verifier prose", () => {
     const expectedManifest = manifest();
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({
-      ok: true, mode: "compiled", entries: { extensionPath: "picc/index.js", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
+      ok: true, mode: "compiled", entries: { extensionPath: "picc/index.ts", pluginInventoryPath: "dist/plugin-inventory-cli.js", mcpAdministrationPath: "dist/mcp-administration-cli.js" },
       manifest: expectedManifest, notice: null,
     });
     const saved = path.join(fixtureRoot, "saved dist");
@@ -489,6 +489,53 @@ describe("compiled runtime identity", () => {
       category: "version-mismatch",
       reason: "The installed PiCC runtime is version-incoherent. Update or reinstall PiCC, then relaunch.",
     });
+  });
+
+  it("retains frozen snapshots of every supplied package namespace export", async () => {
+    const runtimeUrl = pathToFileURL(path.join(repositoryRoot, "bin", "picc-runtime.mjs"));
+    runtimeUrl.searchParams.set("namespace-snapshot", "focused");
+    const runtime = await import(runtimeUrl.href);
+    const witnesses = {
+      agentCore: ["Agent", "calculateContextTokens"],
+      ai: ["StringEnum", "Type"],
+      aiCompat: ["StringEnum", "openAICodexResponsesApi"],
+      codingAgent: ["SessionManager", "createAgentSession", "defineTool", "withFileMutationQueue"],
+      tui: ["Box", "KeybindingsManager", "getKeybindings", "visibleWidth"],
+      typebox: ["Type", "Object"],
+      typeboxCompile: ["Compile", "Validator"],
+    } as const;
+    const graph = Object.fromEntries(Object.entries(witnesses).map(([packageName, names]) => [
+      packageName,
+      Object.fromEntries([
+        ...names.map((name) => [name, Object.freeze({ packageName, name })]),
+        ["unwitnessed", Object.freeze({ packageName, name: "unwitnessed" })],
+      ]),
+    ])) as Record<string, Record<string, unknown>>;
+    const originalWitness = graph.agentCore!.Agent;
+    const originalUnwitnessed = graph.agentCore!.unwitnessed;
+
+    const retained = runtime.installRuntimeHostGraph(graph) as Record<string, Record<string, unknown>>;
+    expect(Object.isFrozen(retained)).toBe(true);
+    for (const packageName of Object.keys(witnesses)) {
+      expect(retained[packageName]).not.toBe(graph[packageName]);
+      expect(Object.isFrozen(retained[packageName])).toBe(true);
+      expect(Reflect.ownKeys(retained[packageName]!)).toEqual(Reflect.ownKeys(graph[packageName]!));
+      for (const key of Reflect.ownKeys(graph[packageName]!)) {
+        expect(retained[packageName]![key as string]).toBe(graph[packageName]![key as string]);
+      }
+    }
+
+    graph.agentCore!.Agent = Object.freeze({ changed: "witness" });
+    graph.agentCore!.unwitnessed = Object.freeze({ changed: "unwitnessed" });
+    expect(retained.agentCore!.Agent).toBe(originalWitness);
+    expect(retained.agentCore!.unwitnessed).toBe(originalUnwitnessed);
+
+    const matchingGraph = Object.fromEntries(Object.entries(retained).map(([name, namespace]) => [name, { ...namespace }]));
+    expect(runtime.installRuntimeHostGraph(matchingGraph)).toBe(retained);
+    expect(() => runtime.installRuntimeHostGraph({
+      ...matchingGraph,
+      agentCore: { ...matchingGraph.agentCore, Agent: Object.freeze({ mismatch: true }) },
+    })).toThrow("refused to mix non-identical Pi runtime package graphs");
   });
 
   it("keeps compiler diagnostics and source excerpts out of bounded build failures", () => {
@@ -594,48 +641,19 @@ describe("compiled runtime identity", () => {
     expect(portableStack).not.toContain("dist/index.js:");
   });
 
-  it("pins one process generation before cached-code import and exposes complete exact wrapper recovery", async () => {
-    const wrapperUrl = pathToFileURL(path.join(fixtureRoot, "picc", "index.js")).href;
-    fs.mkdirSync(path.join(fixtureRoot, ".git"));
-    const saved = path.join(fixtureRoot, "saved dist");
-    fs.renameSync(path.join(fixtureRoot, "dist"), saved);
-    await expect(import(`${wrapperUrl}?source-missing`)).rejects.toMatchObject({
-      message: "The source-checkout compiled PiCC runtime is unavailable or damaged. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch.",
-    });
-    fs.renameSync(saved, path.join(fixtureRoot, "dist"));
+  it("binds the sole TypeScript bootstrap and rejects changed, linked, and legacy entry state", () => {
+    const bootstrap = path.join(fixtureRoot, "picc", "index.ts");
+    const builtManifest = manifest();
+    expect(builtManifest.entries.extension).toBe("picc/index.ts");
+    expect(builtManifest.files.find((record) => record.path === "picc/index.ts")?.sha256).toBe(hashFile(bootstrap));
 
-    await expect(import(`${wrapperUrl}?source-ok`)).resolves.toHaveProperty("default");
-    fs.appendFileSync(path.join(fixtureRoot, "src", "index.ts"), "// reload drift\n");
-    const staleImport = import(`${wrapperUrl}?source-stale`);
-    await expect(staleImport).rejects.toMatchObject({
-      message: "The compiled runtime does not match this checkout. Run `npm run build` from the PiCC checkout root, exit PiCC, and relaunch; `/reload` cannot switch runtime representation.",
-    });
-    await staleImport.catch((error: unknown) => {
-      expect(String(error)).not.toContain(fixtureRoot);
-      expect(String(error)).not.toMatch(/[0-9a-f]{64}/u);
-    });
-
+    fs.appendFileSync(bootstrap, "// changed\n");
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
     buildRuntime({ packageRoot: fixtureRoot });
-    await expect(import(`${wrapperUrl}?rebuilt-generation`)).rejects.toMatchObject({
-      message: "The verified PiCC runtime changed while this process was running. Exit PiCC and relaunch; `/reload` cannot switch runtime generation.",
-    });
 
-    fs.rmSync(path.join(fixtureRoot, ".git"), { recursive: true });
-    const packageJson = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "package.json"), "utf8")) as { version: string };
-    packageJson.version = "9.9.9";
-    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify(packageJson));
-    await expect(import(`${wrapperUrl}?installed-version`)).rejects.toMatchObject({
-      message: "The installed PiCC runtime is unavailable, damaged, or version-incoherent. Update or reinstall PiCC, then relaunch.",
-    });
-    fs.appendFileSync(path.join(fixtureRoot, "dist", "index.js"), "// corrupt\n");
-    const installedCorrupt = import(`${wrapperUrl}?installed-corrupt`);
-    await expect(installedCorrupt).rejects.toMatchObject({
-      message: "The installed PiCC runtime is unavailable, damaged, or version-incoherent. Update or reinstall PiCC, then relaunch.",
-    });
-    await installedCorrupt.catch((error: unknown) => {
-      expect(String(error)).not.toContain(fixtureRoot);
-      expect(String(error)).not.toMatch(/[0-9a-f]{64}/u);
-      expect(String(error)).not.toContain("build-runtime");
-    });
+    symlinkFileCase("picc/index.ts", () => expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt"));
+
+    fs.writeFileSync(path.join(fixtureRoot, "picc", "index.js"), "export default function legacy() {}\n");
+    expectFailure(verifyCompiledRuntime({ packageRoot: fixtureRoot }), "corrupt");
   });
 });

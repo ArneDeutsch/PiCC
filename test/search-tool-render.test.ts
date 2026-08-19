@@ -16,9 +16,9 @@ vi.mock("../src/runtime/render-util.js", async (importOriginal) => {
 });
 
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import * as piTui from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   createFindToolDefinition,
@@ -67,13 +67,6 @@ const grepDetails = {
   totalEntries: 2,
   returnedEntries: 2,
   truncated: false,
-};
-
-const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = piRequire("@earendil-works/pi-tui") as {
-  KeybindingsManager: new (definitions: Record<string, unknown>, bindings?: Record<string, unknown>) => unknown;
-  TUI_KEYBINDINGS: Record<string, unknown>;
-  setKeybindings(manager: unknown): void;
 };
 
 const globDetails = {
@@ -422,9 +415,9 @@ describe("compact search rendering decorator", () => {
   ])("keeps detail reachable with $name", ({ binding, cue, reveals }) => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
-    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding }));
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding as never }));
     try {
       const body = "src/retained.ts:1:needle";
       const rendered = callAndFinalize(
@@ -442,7 +435,7 @@ describe("compact search rendering decorator", () => {
   it("does not let hostile patterns impersonate full or compact renderer-owned cues", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
@@ -462,7 +455,7 @@ describe("compact search rendering decorator", () => {
   it("keeps a truthful cue with hostile labels at narrow widths and fails open when no cue fits", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
@@ -645,7 +638,7 @@ describe("compact search rendering decorator", () => {
   it("bounds huge expanded, unbound, and error bodies at unusable widths and restores detail after resize", () => {
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
     };
     const huge = `${detailSanitizerEvidence.sentinel}:${"row".repeat(350_000)}`;
     const value = textResult(huge, { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
@@ -1758,7 +1751,7 @@ describe("lowercase stock search result lifecycle", () => {
 
   it("uses remapped cues and semantic empty, warning, and separator theme roles", () => {
     const definitions = { ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } };
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" } };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
     try {
       for (const entry of families) {
@@ -1784,7 +1777,7 @@ describe("lowercase stock search result lifecycle", () => {
 
   it("fails open under an unbound action and keeps the cue through narrow/wide repaints", () => {
     const definitions = { ...piTui.TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } };
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" } };
     piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
     try {
       for (const entry of families) {

@@ -55,7 +55,7 @@ const runtimeFiles = new Map([
   ["dist/mcp-administration-cli.js.map", content(JSON.stringify({ version: 3, file: "mcp-administration-cli.js", sources: ["../src/mcp-administration-cli.ts"], names: [], mappings: "" }))],
   ["dist/plugin-inventory-cli.js", content("export const inventory = true;\n//# sourceMappingURL=plugin-inventory-cli.js.map\n")],
   ["dist/plugin-inventory-cli.js.map", content(JSON.stringify({ version: 3, file: "plugin-inventory-cli.js", sources: ["../src/plugin-inventory-cli.ts"], names: [], mappings: "" }))],
-  ["picc/index.js", content("export { default } from '../dist/index.js';\n")],
+  ["picc/index.ts", content("export { default } from '../dist/index.js';\n")],
 ]);
 const compiler = {
   typescriptVersion: "7.0.2",
@@ -82,7 +82,7 @@ type ArtifactChanges = {
   root?: string;
 };
 function validArtifact(changes: ArtifactChanges = {}) {
-  const packageJson = changes.packageJson ?? { ...PACKAGE, main: "picc/index.js", devDependencies: { jiti: "2.7.0" } };
+  const packageJson = changes.packageJson ?? { ...PACKAGE, main: "picc/index.ts", devDependencies: { jiti: "2.7.0" } };
   const files = new Map<string, Buffer>([...sourceFiles, ...runtimeFiles]);
   for (const name of changes.remove ?? []) files.delete(name);
   for (const [name, bytes] of changes.replace ?? []) files.set(name, bytes);
@@ -96,7 +96,7 @@ function validArtifact(changes: ArtifactChanges = {}) {
     files: runtimeRecords,
     runtimeDigest: sha(JSON.stringify(runtimeRecords)),
     entries: {
-      extension: "picc/index.js",
+      extension: "picc/index.ts",
       pluginInventory: "dist/plugin-inventory-cli.js",
       mcpAdministration: "dist/mcp-administration-cli.js",
     },
@@ -319,7 +319,7 @@ describe("schema-v1 runtime artifact policy", () => {
     ["dist/plugin-inventory-cli.js.map", "plugin map"],
     ["dist/mcp-administration-cli.js", "MCP administration runtime"],
     ["dist/mcp-administration-cli.js.map", "MCP administration map"],
-    ["picc/index.js", "wrapper"],
+    ["picc/index.ts", "bootstrap"],
   ])("rejects missing and corrupt required %s (%s)", (name) => {
     expectInvariant(() => verify(validArtifact({ remove: [name] })), /generated runtime contents are missing/u);
     expectInvariant(() => verify(validArtifact({ replace: new Map([[name, content("corrupt")]]) })), /generated runtime failed its integrity/u);
@@ -344,7 +344,7 @@ describe("schema-v1 runtime artifact policy", () => {
     } })), /runtime and package identities/u);
   });
 
-  it.each(["dist/forgotten.js", "picc/forgotten.js"])(
+  it.each(["dist/forgotten.js", "picc/forgotten.js", "picc/index.js"])(
     "rejects unexpected generated output %s even when the caller policy allows its prefix",
     (name) => {
       const extra = { name: `package/${name}`, bytes: content("unexpected") };
@@ -368,7 +368,7 @@ describe("schema-v1 runtime artifact policy", () => {
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.mcpAdministration = "dist/index.js"; } })), /fixed entrypoints/u);
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { delete manifest.entries.mcpAdministration; } })), /fixed entrypoints/u);
     expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => { manifest.entries.extra = "dist/index.js"; } })), /fixed entrypoints/u);
-    for (const required of ["picc/index.js", "dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map"]) {
+    for (const required of ["picc/index.ts", "dist/mcp-administration-cli.js", "dist/mcp-administration-cli.js.map"]) {
       expectInvariant(() => verify(validArtifact({ transformManifest: (manifest) => {
         manifest.files = manifest.files.filter((item: any) => item.path !== required);
         manifest.runtimeDigest = sha(JSON.stringify(manifest.files));

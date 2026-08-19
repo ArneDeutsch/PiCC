@@ -80,7 +80,6 @@ export const RELEASE_STATIC_FILES = Object.freeze([
   "examples/hello-claude/README.md",
   "examples/hello-claude/src/hello.js",
   "package.json",
-  "picc/index.js",
   "picc/index.ts",
 ]);
 

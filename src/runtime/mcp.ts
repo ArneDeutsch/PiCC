@@ -439,7 +439,7 @@ export class McpRuntime {
 
   /**
    * Connect failures, timeouts, dropped tools, stderr excerpts — all bounded.
-   * This is the stderr feed: the registration wiring (src/index.ts) drains it
+   * This is the stderr feed: the registration wiring (src/extension.ts) drains it
    * to console.error once settle completes, one line per diagnostic.
    */
   diagnostics(): string[] {

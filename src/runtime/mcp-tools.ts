@@ -1,7 +1,7 @@
-import { Compile } from "typebox/compile";
+import { Compile } from "../runtime-host.js";
 import type { TSchema } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { semanticDisplayRow } from "./tool-display.js";
 import { sanitizeDisplayText, themedFg } from "./render-util.js";

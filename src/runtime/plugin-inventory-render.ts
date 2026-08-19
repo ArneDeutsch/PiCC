@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "../runtime-host.js";
 import type { PluginInventoryComponent, PluginInventoryDiagnostic, PluginInventoryProvenance } from "../plugin-inventory.js";
 import { clampLines, pushWrapped, themedFg } from "./render-util.js";
 import { PLUGIN_INVENTORY_VIEWS, type PluginInventoryModelView, type PluginInventoryRow, type PluginInventoryWorkflow } from "./plugin-inventory-model.js";

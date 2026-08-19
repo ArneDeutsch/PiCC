@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 const MANIFEST_NAME = "picc-runtime.json";
 const CONFIG_PATH = "tsconfig.runtime.json";
 const LOCK_PATH = "package-lock.json";
-const EXTENSION_ENTRY = "picc/index.js";
+const EXTENSION_ENTRY = "picc/index.ts";
 const INVENTORY_ENTRY = "dist/plugin-inventory-cli.js";
 const MCP_ADMINISTRATION_ENTRY = "dist/mcp-administration-cli.js";
 const SOURCE_EXTENSION_ENTRY = "picc/index.ts";
@@ -22,6 +22,21 @@ const REQUIRED_RUNTIME_FILES = [
 ];
 const HEX = /^[0-9a-f]{64}$/u;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
+const GRAPH_KEYS = ["agentCore", "ai", "aiCompat", "codingAgent", "tui", "typebox", "typeboxCompile"];
+const GRAPH_WITNESSES = Object.freeze({
+  agentCore: ["Agent", "calculateContextTokens"],
+  ai: ["StringEnum", "Type"],
+  aiCompat: ["StringEnum", "openAICodexResponsesApi"],
+  codingAgent: ["SessionManager", "createAgentSession", "defineTool", "withFileMutationQueue"],
+  tui: ["Box", "KeybindingsManager", "getKeybindings", "visibleWidth"],
+  typebox: ["Type", "Object"],
+  typeboxCompile: ["Compile", "Validator"],
+});
+
+let retainedGraph;
+let fallbackGraph;
+const retainedRepresentations = new Map();
+const presentedSourceNotices = new Set();
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -257,7 +272,7 @@ function isMissingError(error) {
  * @property {string} sourceDigest
  * @property {RuntimeFileRecord[]} files
  * @property {string} runtimeDigest
- * @property {{extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js"}} entries
+ * @property {{extension: "picc/index.ts", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js"}} entries
  */
 /** @typedef {{extensionPath: string, pluginInventoryPath: string, mcpAdministrationPath: string}} RuntimeEntries */
 /** @typedef {{ok: true, manifest: RuntimeManifestV1, entries: RuntimeEntries} | {ok: false, category: "missing" | "source-stale" | "corrupt" | "version-mismatch", reason: string}} VerifyResult */
@@ -279,6 +294,18 @@ export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDi
       : failure("corrupt", "The compiled PiCC runtime cannot be accessed safely.");
   }
   if (distStat.isSymbolicLink() || !distStat.isDirectory()) return failure("corrupt", "The compiled PiCC runtime directory is invalid.");
+
+  let bootstrapFiles;
+  try {
+    const bootstrapDirectory = path.join(root, "picc");
+    assertNoLinksPath(root, bootstrapDirectory, "directory");
+    bootstrapFiles = walkRegularFiles(bootstrapDirectory);
+  } catch {
+    return failure("corrupt", "The PiCC extension bootstrap directory is invalid.");
+  }
+  if (JSON.stringify(bootstrapFiles) !== JSON.stringify(["index.ts"])) {
+    return failure("corrupt", "The PiCC extension bootstrap has missing, legacy, case-colliding, or unexpected files.");
+  }
 
   const manifestPath = path.join(dist, MANIFEST_NAME);
   let manifestStat;
@@ -349,6 +376,120 @@ export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDi
   }
 
   return { ok: true, manifest, entries: { extensionPath: manifest.entries.extension, pluginInventoryPath: manifest.entries.pluginInventory, mcpAdministrationPath: manifest.entries.mcpAdministration } };
+}
+
+function validatedPhysicalRoot(packageRoot) {
+  if (typeof packageRoot !== "string" || packageRoot.length === 0 || !path.isAbsolute(packageRoot)) throw new TypeError("packageRoot must be an absolute physical path");
+  const resolved = path.resolve(packageRoot);
+  const physical = fs.realpathSync.native(resolved);
+  if (physical !== packageRoot) throw new TypeError("packageRoot must retain its native physical spelling");
+  return physical;
+}
+
+function validateInstallKind(installationKind) {
+  if (installationKind !== "installed" && installationKind !== "source") throw new TypeError("installationKind must be 'installed' or 'source'");
+}
+
+function graphIsValid(graph) {
+  if (!exactKeys(graph, GRAPH_KEYS)) return false;
+  for (const [packageName, names] of Object.entries(GRAPH_WITNESSES)) {
+    const namespace = graph[packageName];
+    if (namespace === null || (typeof namespace !== "object" && typeof namespace !== "function")) return false;
+    for (const name of names) if (!(name in namespace)) return false;
+  }
+  return true;
+}
+
+function sameGraph(left, right) {
+  for (const [packageName, names] of Object.entries(GRAPH_WITNESSES)) {
+    for (const name of names) if (left[packageName][name] !== right[packageName][name]) return false;
+  }
+  return true;
+}
+
+function snapshotNamespace(namespace) {
+  const retained = {};
+  for (const key of Reflect.ownKeys(namespace)) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(namespace, key);
+    Reflect.defineProperty(retained, key, {
+      value: namespace[key],
+      enumerable: descriptor?.enumerable ?? false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(retained);
+}
+
+export function installRuntimeHostGraph(graph) {
+  if (!graphIsValid(graph)) throw new TypeError("PiCC runtime host graph is malformed.");
+  if (retainedGraph !== undefined) {
+    if (!sameGraph(retainedGraph, graph)) throw new Error("PiCC refused to mix non-identical Pi runtime package graphs in one process.");
+    return retainedGraph;
+  }
+  retainedGraph = Object.freeze(Object.fromEntries(GRAPH_KEYS.map((key) => [key, snapshotNamespace(graph[key])])));
+  return retainedGraph;
+}
+
+export function getRuntimeHostGraph() {
+  return retainedGraph;
+}
+
+export function acquireFallbackRuntimeHostGraph() {
+  if (retainedGraph !== undefined) return Promise.resolve(retainedGraph);
+  fallbackGraph ??= Promise.all([
+    import("@earendil-works/pi-agent-core"), import("@earendil-works/pi-ai"), import("@earendil-works/pi-ai/compat"),
+    import("@earendil-works/pi-coding-agent"), import("@earendil-works/pi-tui"), import("typebox"), import("typebox/compile"),
+  ]).then(([agentCore, ai, aiCompat, codingAgent, tui, typebox, typeboxCompile]) =>
+    installRuntimeHostGraph({ agentCore, ai, aiCompat, codingAgent, tui, typebox, typeboxCompile }));
+  return fallbackGraph;
+}
+
+export function pinPiccRuntime({ packageRoot, installationKind, selection }) {
+  const root = validatedPhysicalRoot(packageRoot);
+  validateInstallKind(installationKind);
+  if (selection === null || typeof selection !== "object" || selection.ok !== true || (selection.mode !== "compiled" && selection.mode !== "source")) {
+    throw new TypeError("selection must be a successful PiCC runtime selection");
+  }
+  if (installationKind === "installed" && selection.mode !== "compiled") throw new TypeError("installed PiCC cannot pin source mode");
+  let generation;
+  if (selection.mode === "compiled") {
+    const sourceDigest = selection.manifest?.sourceDigest;
+    const runtimeDigest = selection.manifest?.runtimeDigest;
+    if (!HEX.test(sourceDigest) || !HEX.test(runtimeDigest) || selection.notice !== null) throw new TypeError("compiled PiCC generation is malformed");
+    generation = Object.freeze({ sourceDigest, runtimeDigest });
+  } else if (selection.manifest !== undefined || (selection.notice?.category !== "missing" && selection.notice?.category !== "source-stale")
+    || typeof selection.notice.message !== "string" || selection.notice.message.length === 0) {
+    throw new TypeError("source PiCC selection is malformed");
+  }
+  const key = root.toUpperCase().toLowerCase();
+  const retained = retainedRepresentations.get(key);
+  if (retained?.mode === "source") {
+    if (retained.root !== root || retained.installationKind !== installationKind) throw new Error("PiCC refused to replace the source runtime identity in this process.");
+    return retained;
+  }
+  const candidate = Object.freeze({ root, installationKind, mode: selection.mode, generation });
+  if (retained !== undefined) {
+    if (retained.root !== candidate.root || retained.installationKind !== candidate.installationKind || retained.mode !== candidate.mode
+      || retained.generation?.sourceDigest !== candidate.generation?.sourceDigest || retained.generation?.runtimeDigest !== candidate.generation?.runtimeDigest) {
+      throw new Error("The verified PiCC runtime changed while this process was running. Exit PiCC and relaunch; `/reload` cannot switch runtime generation.");
+    }
+    return retained;
+  }
+  retainedRepresentations.set(key, candidate);
+  return candidate;
+}
+
+export function presentPiccSourceNotice({ packageRoot, installationKind, representation, selection }) {
+  const root = validatedPhysicalRoot(packageRoot);
+  validateInstallKind(installationKind);
+  if (installationKind !== "source" || representation?.root !== root || representation.mode !== "source" || selection?.ok !== true || selection.mode !== "source"
+    || selection.notice === null || typeof selection.notice?.message !== "string") throw new TypeError("source notice state is malformed");
+  const key = root.toUpperCase().toLowerCase();
+  if (presentedSourceNotices.has(key)) return false;
+  presentedSourceNotices.add(key);
+  console.error(selection.notice.message);
+  return true;
 }
 
 /**

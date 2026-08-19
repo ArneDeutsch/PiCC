@@ -57,7 +57,7 @@ describe("native-safe temp paths: Git Bash write → native Read (first attempt)
     "reads a Bash-written UTF-8 file addressed in toNativeSafeTempForm on the first try",
     async () => {
       // Own scratch dir. realpath first, matching the production sequence in
-      // src/index.ts (GitHub runners' os.tmpdir() can hand back an 8.3 short form).
+      // src/extension.ts (GitHub runners' os.tmpdir() can hand back an 8.3 short form).
       dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "picc-native-temp-")));
 
       // The harness form: forward-slash, drive-letter path both namespaces resolve
@@ -75,7 +75,7 @@ describe("native-safe temp paths: Git Bash write → native Read (first attempt)
         { stdio: "ignore" },
       );
 
-      // Read side: the REAL native Pi Read tool, wired exactly as src/index.ts does
+      // Read side: the REAL native Pi Read tool, wired exactly as src/extension.ts does
       // — the factory takes a cwd STRING (not a thunk). `createReadTool` returns an
       // `AgentTool` whose `execute` takes `(toolCallId, params, signal?, onUpdate?)`
       // — 4 args, no trailing ctx. Its params schema names the target `path`.

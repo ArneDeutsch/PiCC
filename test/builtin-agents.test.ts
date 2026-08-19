@@ -178,8 +178,8 @@ describe("built-in agents through the extension", () => {
   });
 
   it("main-session prompt DOES include the interaction posture", async () => {
-    // Proves index.ts:1046 (before_agent_start) passes includeInteractionPosture: true,
-    // while the :623 subagent call site leaves it unset.
+    // Proves the main-session `before_agent_start` handler in src/extension.ts passes
+    // includeInteractionPosture: true, while buildSubagentSystemPrompt leaves it unset.
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }))
       .systemPrompt as string;
     expect(prompt).toContain("## Working with the user");
