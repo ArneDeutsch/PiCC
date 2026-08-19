@@ -129,6 +129,7 @@ describe("release identity", () => {
       expectedSourceDigest: "c".repeat(64),
     });
     expect(inspected.archiveBytes.toString("utf8")).toBe("release bytes");
+    expect(inspected.filePolicy.files).toContain("bin/picc-host.mjs");
     expect(inspected.filePolicy.files).toContain("picc/index.ts");
     expect(inspected.filePolicy.prefixes).toContain("dist/");
 
@@ -143,7 +144,7 @@ describe("release file policy", () => {
     expect(RELEASE_STATIC_FILES).toEqual([...RELEASE_STATIC_FILES].sort((left, right) =>
       Buffer.compare(Buffer.from(left), Buffer.from(right))));
     expect(RELEASE_FILE_POLICY.prefixes).toEqual(["dist/", "src/"]);
-    for (const required of ["bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.ts"]) {
+    for (const required of ["bin/picc-host.mjs", "bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.ts"]) {
       expect(RELEASE_STATIC_FILES).toContain(required);
       expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => required.startsWith(prefix))).toBe(false);
     }

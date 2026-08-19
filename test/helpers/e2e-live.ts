@@ -29,7 +29,8 @@ import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const realPiCli = resolveRealPiCli({ repoRoot: REPO_ROOT });
 export const CLI_PATH = realPiCli.cliPath;
-export const COMPILED_EXTENSION_PATH = path.join(REPO_ROOT, "picc", "index.js");
+export const CANONICAL_BOOTSTRAP_PATH = path.join(REPO_ROOT, "picc", "index.ts");
+export const COMPILED_LAUNCHER_PATH = path.join(REPO_ROOT, "bin", "picc.mjs");
 export const cliMissing = realPiCli.missing;
 export const RUN_TIMEOUT_MS = 90_000;
 export const TEST_TIMEOUT_MS = 120_000;
@@ -147,7 +148,7 @@ export interface StartedPi {
   stop(): Promise<void>;
 }
 
-export type E2ERuntime = "compiled" | "source-fallback" | "installed-launcher";
+export type E2ERuntime = "compiled" | "direct-bootstrap" | "source-fallback" | "installed-launcher";
 
 export interface E2ELive {
   startPi: (opts: RunPiOptions) => Promise<StartedPi>;
@@ -395,10 +396,10 @@ export function createE2ELive({
     };
     const stop = (): Promise<void> => stopFor("harness-stop");
     try {
-      if (runtime === "compiled" && opts.launcherPath !== undefined) {
-        throw new Error("The compiled E2E runtime selects the verified wrapper directly; launcherPath is forbidden");
+      if ((runtime === "compiled" || runtime === "direct-bootstrap") && opts.launcherPath !== undefined) {
+        throw new Error(`${runtime} E2E runtime owns its launch path; launcherPath is forbidden`);
       }
-      if (runtime !== "compiled" && opts.launcherPath === undefined) {
+      if ((runtime === "source-fallback" || runtime === "installed-launcher") && opts.launcherPath === undefined) {
         throw new Error(`${runtime} E2E runtime requires launcherPath`);
       }
       if (opts.interactiveTerminal && opts.modeArgs !== undefined) {
@@ -450,8 +451,10 @@ export function createE2ELive({
         process.execPath,
         [
           ...(runtime === "compiled"
-            ? [CLI_PATH, "-e", COMPILED_EXTENSION_PATH]
-            : [opts.launcherPath!]),
+            ? [COMPILED_LAUNCHER_PATH]
+            : runtime === "direct-bootstrap"
+              ? [CLI_PATH, "-e", CANONICAL_BOOTSTRAP_PATH]
+              : [opts.launcherPath!]),
           ...(opts.persistSession ? [] : ["--no-session"]),
           ...(opts.agent === undefined ? [] : ["--agent", opts.agent]),
           ...(opts.interactiveTerminal

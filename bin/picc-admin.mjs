@@ -261,14 +261,38 @@ export function validatePiSuite({ packageRoot = findPackageRoot() } = {}) {
   return { ok: true, version: [...declarations.values()][0], resolved };
 }
 
+function declaredPiBin(manifest) {
+  const bin = manifest?.bin;
+  if (bin === null || typeof bin !== "object" || Array.isArray(bin) || Object.getPrototypeOf(bin) !== Object.prototype) return undefined;
+  const declared = bin.pi;
+  if (typeof declared !== "string" || declared.length === 0 || declared !== declared.normalize("NFC")) return undefined;
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(declared) || declared.includes("\\") || declared.startsWith("/") || /^[A-Za-z]:/u.test(declared) || /^[a-z][a-z0-9+.-]*:/iu.test(declared)) return undefined;
+  const parts = declared.split("/");
+  return parts.every((part) => part.length > 0 && part !== "." && part !== "..") ? parts : undefined;
+}
+
+function resolveDeclaredBin(packageRoot, parts) {
+  let current = packageRoot;
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) throw new Error("linked declared bin");
+    if (index < parts.length - 1 ? !stat.isDirectory() : !stat.isFile()) throw new Error("invalid declared bin");
+  }
+  const physical = physicalPath(current);
+  if (!isPathInside(physical, packageRoot)) throw new Error("escaped declared bin");
+  return physical;
+}
+
 export function resolvePiCli(packageRoot = findPackageRoot()) {
   const suite = validatePiSuite({ packageRoot });
   if (!suite.ok) return suite;
   const codingRoot = suite.resolved["@earendil-works/pi-coding-agent"];
+  const codingManifest = readJson(path.join(codingRoot, "package.json"));
+  const parts = declaredPiBin(codingManifest);
+  if (!parts) return suiteFailure("The embedded Pi CLI is unavailable");
   try {
-    const cli = physicalPath(path.join(codingRoot, "dist", "cli.js"));
-    if (!fs.statSync(cli).isFile() || !isPathInside(cli, codingRoot)) return suiteFailure("The embedded Pi CLI escaped its package root");
-    return { ...suite, cli };
+    return { ...suite, cli: resolveDeclaredBin(codingRoot, parts) };
   } catch { return suiteFailure("The embedded Pi CLI is unavailable"); }
 }
 

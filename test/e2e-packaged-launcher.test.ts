@@ -52,7 +52,7 @@ function readSourceManifest(): SourceManifest {
   };
 }
 
-const { runPi, cleanup } = createE2ELive({ runtime: "installed-launcher" });
+const { startPi, runPi, cleanup } = createE2ELive({ runtime: "installed-launcher" });
 const sourceManifest = readSourceManifest();
 const expectedPiPins = PI_SUITE_PACKAGES.map((name) => sourceManifest.dependencies[name]);
 const expectedPiVersion = expectedPiPins[0]!;
@@ -407,6 +407,7 @@ describe("installed release tarball", () => {
         "package.json", "picc", "src",
       ]);
       expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.ts"]);
+      expect(fs.statSync(path.join(packageRoot, "bin", "picc-host.mjs")).isFile()).toBe(true);
       expect(fs.existsSync(path.join(packageRoot, "scripts"))).toBe(false);
       expect(fs.existsSync(path.join(packageRoot, "tsconfig.runtime.json"))).toBe(false);
       const runtimeManifest = JSON.parse(
@@ -446,14 +447,16 @@ describe("installed release tarball", () => {
       expect(version).toContain("Install installed");
 
       const command = "node -e 'const e=process.env; console.log(JSON.stringify({sessionId:e.PI_SESSION_ID??null,sessionFile:e.PI_SESSION_FILE??null,provider:e.PI_PROVIDER??null,model:e.PI_MODEL??null,reasoning:e.PI_REASONING_LEVEL??null,project:e.CLAUDE_PROJECT_DIR??null,setting:e.PACKAGED_SETTING??null,skip:e.PI_SKIP_VERSION_CHECK??null,launcher:e.PICC_LAUNCHER_PID??null}))'";
-      const result = await runPi({
+      const live = await startPi({
         launcherPath: launcher,
         fixture: "full-surface",
         agent: "selected-main",
-        prompt: "run the packaged environment probe",
+        prompt: "unused",
+        interactiveTerminal: true,
         script: [
           { toolCalls: [{ name: "bash", args: { command } }] },
           { text: "PACKAGED_EXTENSION_OK" },
+          { text: "PACKAGED_AFTER_RELOAD" },
         ],
         setup(fixture) {
           const settingsPath = path.join(fixture, ".claude", "settings.json");
@@ -462,10 +465,20 @@ describe("installed release tarball", () => {
           fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
         },
       });
+      live.sendInput("run the packaged environment probe");
+      await live.waitForText("PACKAGED_EXTENSION_OK", 30_000);
+      live.sendInput("/reload");
+      await live.waitForText("Reloaded keybindings, extensions", 30_000);
+      live.sendInput("prove the packaged runtime after reload");
+      await live.waitForText("PACKAGED_AFTER_RELOAD", 30_000);
+      live.sendInput("/quit");
+      live.closeInput();
+      const result = await live.completion;
 
       expect(result.code, result.stderr).toBe(0);
-      expect(result.requests.length).toBeGreaterThanOrEqual(2);
+      expect(result.requests.length).toBeGreaterThanOrEqual(3);
       expect(systemText(result.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY");
+      expect(systemText(result.requests.at(-1)!)).toContain("FS-SELECTED-MAIN-BODY");
       expect(toolNames(result.requests[0]!)).toContain("Agent");
       const bash = toolResultText(result.requests[1]!);
       expect(bash).toContain('"sessionId":null');
@@ -478,6 +491,7 @@ describe("installed release tarball", () => {
       expect(bash).toContain('"launcher":null');
       expect(bash).toContain(`"project":${JSON.stringify(result.fixture)}`);
       expect(result.stdout).toContain("PACKAGED_EXTENSION_OK");
+      expect(result.stdout).toContain("PACKAGED_AFTER_RELOAD");
       expect(result.stderr).not.toMatch(/latest-version|api\.openai\.com|anthropic\.com/iu);
 
       const bootstrapEntry = path.join(packageRoot, "picc", "index.ts");
