@@ -25,12 +25,10 @@ import { deferred, waitUntil, type Deferred } from "./async.js";
  */
 
 /**
- * The REAL Pi SessionManager, injected (not statically imported) so that
- * vi.mock factories which `await import` this helper — e.g. builtin-agents.test,
- * whose factory mocks the very `@earendil-works/pi-coding-agent` module this used
- * to import at eval time — cannot deadlock on the circular module load. Persisted-
- * transcript tests call `useRealSessionManager(SessionManager)` once at module
- * scope; every other test leaves it unset and dispatches stay in-memory.
+ * The REAL Pi SessionManager is injected rather than statically imported from
+ * the coding-agent package. Persisted-transcript tests call
+ * `useRealSessionManager(SessionManager)` once at module scope; every other test
+ * leaves it unset and dispatches stay in-memory.
  */
 type RealSessionManager = {
   create(cwd: string, sessionDir: string, opts: { id: string }): PiSessionManagerLike;

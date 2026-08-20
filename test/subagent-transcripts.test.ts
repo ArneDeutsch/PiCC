@@ -31,9 +31,8 @@ import {
   type FakeSessionState,
 } from "./helpers/fake-sdk.js";
 
-// These tests exercise the REAL Pi SessionManager (create/flush/open) — inject it
-// so fakeSdk's default persistedSessionManager persists to disk. Kept out of a
-// static fake-sdk import so builtin-agents' vi.mock factory can't deadlock.
+// These tests exercise the REAL Pi SessionManager (create/flush/open), so inject
+// it once and let fakeSdk's persistedSessionManager use disk-backed session state.
 useRealSessionManager(SessionManager);
 
 /**

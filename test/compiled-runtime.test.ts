@@ -611,6 +611,60 @@ describe("compiled runtime identity", () => {
     expect(result.reason).not.toMatch(/selection|authentic|loader|provenance|evidence|digest|internal/iu);
   });
 
+  it("permits missing-dist source fallback only with the exact sole TypeScript bootstrap inventory", () => {
+    const dist = path.join(fixtureRoot, "dist");
+    const savedDist = path.join(fixtureRoot, "saved dist");
+    fs.renameSync(dist, savedDist);
+    const bootstrapDirectory = path.join(fixtureRoot, "picc");
+    const bootstrap = path.join(bootstrapDirectory, "index.ts");
+    const originalBootstrap = fs.readFileSync(bootstrap);
+    const cases: Array<{ name: string; mutate: () => void; restore: () => void }> = [
+      {
+        name: "missing",
+        mutate: () => fs.rmSync(bootstrap),
+        restore: () => fs.writeFileSync(bootstrap, originalBootstrap),
+      },
+      {
+        name: "legacy JavaScript",
+        mutate: () => fs.writeFileSync(path.join(bootstrapDirectory, "index.js"), "export default function legacy() {}\n"),
+        restore: () => fs.rmSync(path.join(bootstrapDirectory, "index.js"), { force: true }),
+      },
+      {
+        name: "unexpected",
+        mutate: () => fs.writeFileSync(path.join(bootstrapDirectory, "unexpected.ts"), "export {};\n"),
+        restore: () => fs.rmSync(path.join(bootstrapDirectory, "unexpected.ts"), { force: true }),
+      },
+    ];
+    const caseCollision = path.join(bootstrapDirectory, "Index.ts");
+    if (!fs.existsSync(caseCollision)) {
+      cases.push({
+        name: "case-colliding",
+        mutate: () => fs.writeFileSync(caseCollision, "export {};\n"),
+        restore: () => fs.rmSync(caseCollision, { force: true }),
+      });
+    }
+
+    try {
+      expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" })).toMatchObject({ ok: true, mode: "source" });
+      for (const testCase of cases) {
+        testCase.mutate();
+        try {
+          const sourceResult = selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "source" });
+          expect(sourceResult.ok, testCase.name).toBe(false);
+          expectFailure(sourceResult, "corrupt");
+          const installedResult = selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" });
+          expect(installedResult.ok, testCase.name).toBe(false);
+          expectFailure(installedResult, "missing");
+        } finally {
+          testCase.restore();
+        }
+      }
+    } finally {
+      if (!fs.existsSync(bootstrap)) fs.writeFileSync(bootstrap, originalBootstrap);
+      fs.renameSync(savedDist, dist);
+    }
+  });
+
   it("returns installation-aware exact selector unions without forwarding verifier prose", () => {
     const expectedManifest = manifest();
     expect(selectPiccRuntime({ packageRoot: fixtureRoot, installationKind: "installed" })).toStrictEqual({

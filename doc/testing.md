@@ -153,8 +153,8 @@ npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool na
 Vitest's `-t` is a regular-expression filter, so an unanchored leaf name is not exact.
 
 The runner is [vitest](https://vitest.dev). Unit and integration tests are TypeScript run through
-`tsx`/vitest and do not require a PiCC runtime build. The e2e layer needs the resolved
-package-declared `bin.pi` CLI from `@earendil-works/pi-coding-agent`; `npm ci` provides it. Broad
+`tsx`/vitest and do not require a PiCC runtime build. The e2e layer needs Pi's installed CLI;
+`npm ci` provides it. Broad
 compiled e2e requires the current verified PiCC runtime produced by `npm run build` or
 `npm run setup`.
 `test:e2e:source-fallback` requires the same preparation to seed `dist` before its isolated witness

@@ -207,6 +207,16 @@ function walkRegularFiles(root, evidence) {
   return output;
 }
 
+function captureExactBootstrapInventory(root, evidence) {
+  const bootstrapDirectory = path.join(root, "picc");
+  assertNoLinksPath(root, bootstrapDirectory, "directory");
+  const bootstrapFiles = walkRegularFiles(bootstrapDirectory, evidence);
+  if (JSON.stringify(bootstrapFiles) !== JSON.stringify(["index.ts"])) {
+    throw new Error("invalid bootstrap inventory");
+  }
+  return bootstrapFiles;
+}
+
 function physicalRuntimePath(packageRoot, distDirectory, manifestPath) {
   if (manifestPath.startsWith("dist/")) return path.join(distDirectory, ...manifestPath.slice(5).split("/"));
   return path.join(packageRoot, ...manifestPath.split("/"));
@@ -330,8 +340,12 @@ function freezeVerificationEvidence(evidence) {
 function captureSourceRepresentationEvidence(root) {
   const evidence = createVerificationEvidence();
   evidence.inventories.set(root, Object.freeze({ path: root, identity: stableStat(root, "directory") }));
-  for (const directory of [path.join(root, "src"), path.join(root, "picc")]) {
-    const relativePaths = walkRegularFiles(directory, evidence);
+  const sourceDirectory = path.join(root, "src");
+  const bootstrapDirectory = path.join(root, "picc");
+  for (const [directory, relativePaths] of [
+    [sourceDirectory, walkRegularFiles(sourceDirectory, evidence)],
+    [bootstrapDirectory, captureExactBootstrapInventory(root, evidence)],
+  ]) {
     for (const relativePath of relativePaths) {
       const target = path.join(directory, ...relativePath.split("/"));
       evidence.files.set(target, Object.freeze({ root: directory, path: target, identity: stableStat(target, "file") }));
@@ -341,7 +355,9 @@ function captureSourceRepresentationEvidence(root) {
     const target = path.join(root, relativePath);
     evidence.files.set(target, Object.freeze({ root, path: target, identity: stableStat(target, "file") }));
   }
-  return freezeVerificationEvidence(evidence);
+  const captured = freezeVerificationEvidence(evidence);
+  if (!evidenceStillMatches(captured)) throw new Error("source representation changed during capture");
+  return captured;
 }
 
 function evidenceStillMatches(evidence) {
@@ -407,15 +423,9 @@ export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDi
   }
   if (distStat.isSymbolicLink() || !distStat.isDirectory()) return failure("corrupt", "The compiled PiCC runtime directory is invalid.");
 
-  let bootstrapFiles;
   try {
-    const bootstrapDirectory = path.join(root, "picc");
-    assertNoLinksPath(root, bootstrapDirectory, "directory");
-    bootstrapFiles = walkRegularFiles(bootstrapDirectory, evidence);
+    captureExactBootstrapInventory(root, evidence);
   } catch {
-    return failure("corrupt", "The PiCC extension bootstrap directory is invalid.");
-  }
-  if (JSON.stringify(bootstrapFiles) !== JSON.stringify(["index.ts"])) {
     return failure("corrupt", "The PiCC extension bootstrap has missing, legacy, case-colliding, or unexpected files.");
   }
 

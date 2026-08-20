@@ -45,21 +45,12 @@ supplies Claude Code compatibility and **never** reimplements auth, the provider
 shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend
 the seam instead.
 
-Runtime paths have two distinct forms: filesystem access and module loading retain native physical
-spelling, while equality, containment, and deduplication use a separate case-folded comparison
-identity on Windows. A comparison key is never an execution path; detailed mechanics live in “How
-PiCC attaches to Pi” in [`doc/pi-integration.md`](pi-integration.md).
-
-Source and generated JavaScript are two representations of one product. An ordinary launcher-backed
-initial load verifies once in its child host and hands that authenticated selection to the canonical
-bootstrap for one-time consumption. A direct `picc/index.ts` bootstrap load selects and verifies
-independently. Every canonical reload freshly selects; compiled-pinned reloads fully re-verify and
-enforce their generation, while source-pinned processes keep retained source even if selection now
-finds a valid build. Only source selections carry source-representation loading evidence. Explicit
-`src/index.ts` hosting
-is source-only. Installed mode
-fails closed rather than reaching retained TypeScript, while a source checkout may disclose a
-source fallback. See “How PiCC attaches to Pi” in [`doc/pi-integration.md`](pi-integration.md).
+At this boundary, filesystem access and module loading retain native physical spelling, Windows
+comparison identity is separately case-folded, and a supported bootstrap installs one host-owned
+package graph before implementation evaluation. An ordinary child-host launch verifies once and
+hands one authenticated initial selection to `picc/index.ts`; direct canonical loads and
+reload/replacement verify independently, while a source handoff carries no compiled authority. See
+“How PiCC attaches to Pi” in [`doc/pi-integration.md`](pi-integration.md) for detailed mechanics.
 
 The carve-out: PiCC does render **its own** tool rows, built on Pi's `pi-tui` primitives — that is
 what `tool-shell.ts` and `subagent-render.ts` are. Rendering a surface PiCC owns is in scope;
@@ -465,7 +456,7 @@ where to start reading, not the extent of its cluster.
   worktree-cwd pinning, warning and result framing, and in-process resume reconstruction are also
   PiCC-defined coherence choices, not parity claims.
 
-- **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
+- **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `extension.ts` and child wiring
   in `subagents.ts`) — on supported model APIs, a session-local controller observes fresh successful
   tool-requesting assistant usage, queues threshold pressure while the requested tools finish, handles
   complete batches at `turn_end`, and samples again at final provider admission. Newly known pressure
@@ -575,17 +566,10 @@ Single-consumer logic stays with its consumer.
 
 The wiring lives in `src/extension.ts`, which registers tools and Pi event handlers.
 
-1. **Extension load.** An ordinary launcher-backed initial load arrives through `picc/index.ts`
-   after the child host has selected and verified the representation once; the bootstrap consumes
-   that authenticated selection and installs the host-owned package graph before evaluating the
-   implementation. A direct `picc/index.ts` load acquires that graph and selects and verifies
-   independently; explicit `src/index.ts` hosting loads source without compiled authority. Every
-   canonical reload freshly selects. A compiled-pinned reload fully re-verifies and enforces its
-   generation; a source-pinned process continues loading retained source even if selection finds a
-   valid build, and only a source selection carries source-representation loading evidence. A source
-   handoff carries no
-   compiled authority. The
-   process env is then made UTF-8-safe,
+1. **Extension load.** `picc/index.ts` installs the host-owned package graph before evaluating the
+   selected implementation; explicit `src/index.ts` hosting acquires that graph and loads the source
+   implementation directly. Bootstrap selection and verification mechanics are recorded in “How
+   PiCC attaches to Pi” in [`pi-integration.md`](pi-integration.md). The process env is then made UTF-8-safe,
    and `loadClaudeProject()` assembles the project model. MCP loading resolves standalone authority
    and immutable managed-settings policy, admits raw winners, and materializes only enabled results.
    Project opening and observation perform no plugin acquisition, trust approval, lifecycle recovery,

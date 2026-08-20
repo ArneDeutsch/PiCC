@@ -3615,7 +3615,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const coordinatorModulePaths = new Set([
     coordinatorModulePath,
     ...(path.basename(path.dirname(coordinatorModulePath)) === "dist"
-      ? [path.join(path.dirname(path.dirname(coordinatorModulePath)), "picc", "index.js")]
+      ? [path.join(path.dirname(path.dirname(coordinatorModulePath)), "picc", "index.ts")]
       : []),
   ]);
   const sourceInfoKey = (value: unknown): string | undefined => {

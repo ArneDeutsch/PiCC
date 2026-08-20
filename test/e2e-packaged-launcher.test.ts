@@ -15,6 +15,7 @@ import {
   systemText,
   toolNames,
   toolResultText,
+  userText,
 } from "./helpers/e2e-live.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import {
@@ -447,10 +448,11 @@ describe("installed release tarball", () => {
       expect(version).toContain("Install installed");
 
       const command = "node -e 'const e=process.env; console.log(JSON.stringify({sessionId:e.PI_SESSION_ID??null,sessionFile:e.PI_SESSION_FILE??null,provider:e.PI_PROVIDER??null,model:e.PI_MODEL??null,reasoning:e.PI_REASONING_LEVEL??null,project:e.CLAUDE_PROJECT_DIR??null,setting:e.PACKAGED_SETTING??null,skip:e.PI_SKIP_VERSION_CHECK??null,launcher:e.PICC_LAUNCHER_PID??null}))'";
+      const packagedProbePrompt = "run the packaged environment probe";
       const live = await startPi({
         launcherPath: launcher,
-        fixture: "full-surface",
-        agent: "selected-main",
+        fixture: "hello-claude",
+        agent: "packaged-main",
         prompt: "unused",
         interactiveTerminal: true,
         script: [
@@ -459,14 +461,49 @@ describe("installed release tarball", () => {
           { text: "PACKAGED_AFTER_RELOAD" },
         ],
         setup(fixture) {
+          fs.writeFileSync(
+            path.join(fixture, ".claude", "agents", "packaged-main.md"),
+            [
+              "---",
+              "name: packaged-main",
+              "description: Minimal selected identity for the packaged launcher witness",
+              "tools:",
+              "  - Bash",
+              "  - Agent",
+              "initialPrompt: \"PACKAGED-MAIN-INITIAL\"",
+              "---",
+              "PACKAGED-MAIN-BODY",
+              "",
+            ].join("\n"),
+          );
           const settingsPath = path.join(fixture, ".claude", "settings.json");
           const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
           settings.env = { PACKAGED_SETTING: "configured-value" };
           fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
         },
       });
-      live.sendInput("run the packaged environment probe");
-      await live.waitForText("PACKAGED_EXTENSION_OK", 30_000);
+      const firstPhaseDeadline = Date.now() + 60_000;
+      const remainingFirstPhaseBudget = (milestone: string): number => {
+        const remainingMs = firstPhaseDeadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error(`Packaged launch first-phase budget exhausted before ${milestone}`);
+        }
+        return remainingMs;
+      };
+      await live.waitForText(
+        "PACKAGED-MAIN-INITIAL",
+        remainingFirstPhaseBudget("packaged-main readiness"),
+      );
+      live.sendInput(packagedProbePrompt);
+      await live.waitForRequest(
+        (request) => userText(request).includes(packagedProbePrompt),
+        1,
+        remainingFirstPhaseBudget("packaged probe request admission"),
+      );
+      await live.waitForText(
+        "PACKAGED_EXTENSION_OK",
+        remainingFirstPhaseBudget("packaged extension response"),
+      );
       live.sendInput("/reload");
       await live.waitForText("Reloaded keybindings, extensions", 30_000);
       live.sendInput("prove the packaged runtime after reload");
@@ -477,8 +514,8 @@ describe("installed release tarball", () => {
 
       expect(result.code, result.stderr).toBe(0);
       expect(result.requests.length).toBeGreaterThanOrEqual(3);
-      expect(systemText(result.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY");
-      expect(systemText(result.requests.at(-1)!)).toContain("FS-SELECTED-MAIN-BODY");
+      expect(systemText(result.requests[0]!)).toContain("PACKAGED-MAIN-BODY");
+      expect(systemText(result.requests.at(-1)!)).toContain("PACKAGED-MAIN-BODY");
       expect(toolNames(result.requests[0]!)).toContain("Agent");
       const bash = toolResultText(result.requests[1]!);
       expect(bash).toContain('"sessionId":null');
