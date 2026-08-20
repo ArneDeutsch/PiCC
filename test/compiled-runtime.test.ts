@@ -38,7 +38,7 @@ function hashFile(file: string): string {
 }
 
 function writeFixture(): void {
-  fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc runtime path with spaces "));
+  fixtureRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "picc runtime path with spaces ")));
   fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ name: "@arnedeutsch/picc", version: "0.1.1", type: "module" }));
   fs.writeFileSync(path.join(fixtureRoot, "package-lock.json"), '{"lockfileVersion":3}\n');
   fs.mkdirSync(path.join(fixtureRoot, "src", "nested"), { recursive: true });

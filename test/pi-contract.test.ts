@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -58,6 +59,7 @@ import {
   PI_SUITE_PACKAGES,
   validatePiSuite,
 } from "../bin/picc-admin.mjs";
+import { buildRuntime } from "../scripts/build-runtime.mjs";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -3295,7 +3297,7 @@ describe("ToolExecutionComponent threads the prior render component as ctx.lastC
 
 describe("real Pi loader runtime graph", () => {
   it("keeps compiled, source, and direct source entries on Pi aliases in exactly the default and forced-native children", () => {
-    const scratchRoot = mkdtempSync(join(tmpdir(), "picc-real-loader-"));
+    const scratchRoot = fs.realpathSync.native(mkdtempSync(join(tmpdir(), "picc-real-loader-")));
     const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
     const childScript = String.raw`
       import { createHash } from "node:crypto";
@@ -3306,7 +3308,8 @@ describe("real Pi loader runtime graph", () => {
 
       const repositoryRoot = process.env.PICC_TEST_ROOT;
       const scratch = process.env.PICC_TEST_SCRATCH;
-      const productFiles = ["bin", "dist", "picc", "src", "package.json", "package-lock.json", "tsconfig.runtime.json"];
+      const seedDist = process.env.PICC_TEST_SEED_DIST;
+      const productFiles = ["bin", "picc", "src", "package.json", "package-lock.json", "tsconfig.runtime.json"];
       const runtimeDependencies = ["@modelcontextprotocol/sdk", "jsonc-parser", "picomatch", "semver", "tar-stream", "yaml", "yauzl"];
       const copyProduct = (target) => {
         fs.mkdirSync(target, { recursive: true });
@@ -3350,8 +3353,8 @@ describe("real Pi loader runtime graph", () => {
       const hostileMarker = path.join(scratch, "hostile-evaluated");
       copyProduct(compiledRoot);
       copyProduct(sourceRoot);
-      fs.cpSync(path.join(compiledRoot, "dist"), compiledSeed, { recursive: true });
-      fs.rmSync(path.join(sourceRoot, "dist"), { recursive: true, force: true });
+      fs.cpSync(seedDist, path.join(compiledRoot, "dist"), { recursive: true });
+      fs.cpSync(seedDist, compiledSeed, { recursive: true });
       fs.mkdirSync(path.join(sourceRoot, ".git"));
       fs.mkdirSync(hostileCwd);
       installHostileCandidates(hostileCwd, hostileMarker);
@@ -3461,10 +3464,32 @@ describe("real Pi loader runtime graph", () => {
       console.log(JSON.stringify({ compiled: compiledFirst.path, source: sourceSecond.path }));
     `;
     try {
+      const seedRoot = join(scratchRoot, "compiled-seed-root");
+      mkdirSync(seedRoot);
+      for (const name of ["src", "picc", "package.json", "package-lock.json", "tsconfig.runtime.json"]) {
+        fs.cpSync(join(repositoryRoot, name), join(seedRoot, name), { recursive: true });
+      }
+      const seedNodeModules = join(seedRoot, "node_modules");
+      fs.symlinkSync(join(repositoryRoot, "node_modules"), seedNodeModules, "junction");
+      try {
+        buildRuntime({ packageRoot: seedRoot });
+      } finally {
+        try {
+          fs.rmSync(seedNodeModules, { recursive: true, force: true });
+        } finally {
+          if (fs.existsSync(seedNodeModules)) throw new Error("isolated build node_modules link remained after seed compilation");
+        }
+      }
+      const seedDist = join(seedRoot, "dist");
       for (const forced of [false, true]) {
         const caseScratch = join(scratchRoot, forced ? "forced-native" : "true-default");
         mkdirSync(caseScratch);
-        const env: NodeJS.ProcessEnv = { ...process.env, PICC_TEST_ROOT: repositoryRoot, PICC_TEST_SCRATCH: caseScratch };
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          PICC_TEST_ROOT: repositoryRoot,
+          PICC_TEST_SCRATCH: caseScratch,
+          PICC_TEST_SEED_DIST: seedDist,
+        };
         if (forced) env.JITI_TRY_NATIVE = "true";
         else delete env.JITI_TRY_NATIVE;
         const result = spawnSync(process.execPath, ["--input-type=module", "-e", childScript], {
