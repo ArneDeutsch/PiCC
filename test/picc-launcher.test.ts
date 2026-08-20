@@ -63,7 +63,7 @@ function makePackage(options: {
   withCli?: boolean;
 } = {}): string {
   const root = options.root ?? temp("picc-launcher-");
-  const piVersion = options.piVersion ?? "0.82.0";
+  const piVersion = options.piVersion ?? "0.84.2";
   const dependencies = Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, piVersion]));
   write(path.join(root, "package.json"), JSON.stringify({
     name: "@arnedeutsch/picc", version: "0.1.1", type: "module", dependencies,
@@ -255,7 +255,7 @@ describe("direct Pi package validation", () => {
       "partial staging directory",
     );
 
-    expect(validatePiSuite({ packageRoot: root })).toMatchObject({ ok: true, version: "0.82.0" });
+    expect(validatePiSuite({ packageRoot: root })).toMatchObject({ ok: true, version: "0.84.2" });
     expect(resolvePiCli(root)).toMatchObject({ ok: true });
     installLauncher(root);
     expect(spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], {
@@ -268,13 +268,13 @@ describe("direct Pi package validation", () => {
     fs.rmSync(path.join(missing, "node_modules", "@earendil-works", "pi-ai"), { recursive: true });
     expect(validatePiSuite({ packageRoot: missing })).toMatchObject({
       ok: false,
-      reason: expect.stringMatching(/pi-ai is missing \(expected 0\.82\.0\).*picc update/),
+      reason: expect.stringMatching(/pi-ai is missing \(expected 0\.84\.2\).*picc update/),
     });
 
     const mismatch = makePackage({ installedVersions: { "@earendil-works/pi-tui": "9.9.9" } });
     expect(validatePiSuite({ packageRoot: mismatch })).toMatchObject({
       ok: false,
-      reason: expect.stringMatching(/pi-tui is 9\.9\.9; expected 0\.82\.0.*picc update/),
+      reason: expect.stringMatching(/pi-tui is 9\.9\.9; expected 0\.84\.2.*picc update/),
     });
   });
 
@@ -289,7 +289,7 @@ describe("direct Pi package validation", () => {
       reason: expect.stringMatching(/declarations disagree/),
     });
 
-    manifest.dependencies["@earendil-works/pi-ai"] = "^0.82.0";
+    manifest.dependencies["@earendil-works/pi-ai"] = "^0.84.2";
     write(manifestPath, JSON.stringify(manifest));
     expect(validatePiSuite({ packageRoot: root })).toMatchObject({
       ok: false,
@@ -304,7 +304,7 @@ describe("direct Pi package validation", () => {
     fs.rmSync(path.join(root, "node_modules"), { recursive: true });
     for (const name of PI_SUITE_PACKAGES) {
       write(path.join(prefix, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({
-        name, version: "0.82.0", ...(name === "@earendil-works/pi-coding-agent" ? { bin: { pi: "dist/cli.js" } } : {}),
+        name, version: "0.84.2", ...(name === "@earendil-works/pi-coding-agent" ? { bin: { pi: "dist/cli.js" } } : {}),
       }));
     }
     write(path.join(prefix, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), "process.exit(0);\n");
@@ -317,7 +317,7 @@ describe("direct Pi package validation", () => {
     const launched = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/hoisted"], { cwd: prefix, encoding: "utf8" });
     expect(launched).toMatchObject({ status: 0, stdout: "", stderr: "" });
     expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toMatchObject({
-      argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/hoisted"],
+      argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--model", "openai/hoisted"],
     });
   });
 
@@ -327,7 +327,7 @@ describe("direct Pi package validation", () => {
     makePackage({ root, source: false, withCli: false });
     fs.rmSync(path.join(root, "node_modules"), { recursive: true });
     for (const name of PI_SUITE_PACKAGES) {
-      write(path.join(prefix, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version: "0.82.0" }));
+      write(path.join(prefix, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version: "0.84.2" }));
     }
     write(path.join(root, "node_modules", "@earendil-works", "pi-ai", "README"), "broken nearer package");
 
@@ -370,7 +370,7 @@ describe("direct Pi package validation", () => {
     expect(resolvePiCli(root)).toMatchObject({ ok: true, cli: canonicalPath(path.join(codingRoot, "commands", "pinned.mjs")) });
     const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/test"], { cwd: root, encoding: "utf8" });
     expect(result).toMatchObject({ status: 0, stdout: "", stderr: "" });
-    expect(JSON.parse(fs.readFileSync(declaredCanary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
+    expect(JSON.parse(fs.readFileSync(declaredCanary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--model", "openai/test"]);
     expect(fs.existsSync(defaultCanary)).toBe(false);
   });
 
@@ -520,7 +520,7 @@ describe("launcher behavior", () => {
     const result = spawnSync(process.execPath, [path.join(linked, "bin", "picc.mjs"), "--model", "openai/linked"], { cwd: consumer, encoding: "utf8" });
     expect(result).toMatchObject({ status: 0, stdout: "", stderr: "" });
     const observed = JSON.parse(fs.readFileSync(canary, "utf8")) as { argv: string[]; cwd: string; lineage: string; parent: number };
-    expect(observed).toMatchObject({ argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/linked"], cwd: consumer });
+    expect(observed).toMatchObject({ argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--model", "openai/linked"], cwd: consumer });
     expect(observed.lineage).toBe(String(observed.parent));
   });
 
@@ -590,7 +590,7 @@ describe("launcher behavior", () => {
       cwd: root, encoding: "utf8",
     });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/pi-ai is 9\.9\.9; expected 0\.82\.0.*picc update/);
+    expect(result.stderr).toMatch(/pi-ai is 9\.9\.9; expected 0\.84\.2.*picc update/);
     expect(result.stderr).not.toMatch(/incomplete or inconsistent/);
   });
 
@@ -625,7 +625,7 @@ fs.writeFileSync(process.env.PICC_TEST_CANARY, JSON.stringify({
 }));
 process.exit(23);
 `);
-      const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/test"], {
+      const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/test", "--", "--model", "forwarded"], {
         cwd: root, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "--no-warnings", PICC_TEST_CANARY: canary },
       });
       expect(result).toMatchObject({ status: 23, stdout: "", stderr: "" });
@@ -633,7 +633,7 @@ process.exit(23);
         argv: string[]; kind: string; version: string; parent: string; cwd: string; nodeOptions: string;
         sourceMapsEnabled: boolean; descendantStatus: number; descendantNodeOptions: string;
       };
-      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
+      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--model", "openai/test", "--", "--model", "forwarded"]);
       expect(launched).toMatchObject({
         kind: installationKind, version: "0.1.1", cwd: root, nodeOptions: "--no-warnings",
         sourceMapsEnabled: true, descendantStatus: 0, descendantNodeOptions: "--no-warnings",
@@ -646,7 +646,7 @@ process.exit(23);
         cwd: root, encoding: "utf8",
       });
       expect(version).toMatchObject({ status: 0, stderr: "" });
-      expect(version.stdout).toBe(`PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall ${installationKind}\nRuntime compiled (verified)\n`);
+      expect(version.stdout).toBe(`PiCC 0.1.1\nEmbedded Pi 0.84.2\nInstall ${installationKind}\nRuntime compiled (verified)\n`);
 
       const directEnv: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: "--no-warnings", PICC_TEST_CANARY: canary };
       delete directEnv.PICC_LAUNCHER_PID;
@@ -657,7 +657,7 @@ process.exit(23);
       });
       expect(direct).toMatchObject({ status: 23, stdout: "", stderr: "" });
       expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toMatchObject({
-        argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/direct"],
+        argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--model", "openai/direct"],
         nodeOptions: "--no-warnings", sourceMapsEnabled: true,
       });
     }
@@ -806,10 +806,10 @@ process.on("exit", () => fs.writeFileSync(${JSON.stringify(witness)}, JSON.strin
       cwd: repoRoot, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: `--require ${JSON.stringify(preload)}` },
       timeout: 20_000,
     });
-    expect(result).toMatchObject({ status: 0, stdout: "0.83.0\n", stderr: "" });
+    expect(result).toMatchObject({ status: 0, stdout: "0.84.2\n", stderr: "" });
     expect(JSON.parse(fs.readFileSync(witness, "utf8"))).toEqual({
       title: "pi", codingAgent: "true", warningSuppressed: true, dispatcherInitialized: true,
-      argv: [process.execPath, realCli.cli, "-e", canonicalPath(path.join(repoRoot, "picc", "index.ts")), "--version"],
+      argv: [process.execPath, realCli.cli, "-e", canonicalPath(path.join(repoRoot, "picc", "index.ts")), "-nc", "--version"],
     });
   });
 
@@ -882,7 +882,7 @@ process.on("exit", () => fs.writeFileSync(${JSON.stringify(witness)}, JSON.strin
         if (!normalLaunch) expect(result.stderr).toContain(state === "missing" ? "compiled runtime is missing" : "does not match this checkout");
       }
       expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual([
-        "-e", canonicalPath(path.join(root, "picc", "index.ts")), "--theme", "dark",
+        "-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--theme", "dark",
       ]);
     }
   });
@@ -951,7 +951,7 @@ process.on("exit", () => fs.writeFileSync(${JSON.stringify(witness)}, JSON.strin
         argv: ["--version"],
         expected: {
           status: 0,
-          stdout: "PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall source\nRuntime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+          stdout: "PiCC 0.1.1\nEmbedded Pi 0.84.2\nInstall source\nRuntime unavailable (launcher): Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
           stderr: "",
         },
       },
@@ -1008,7 +1008,7 @@ process.on("exit", () => fs.writeFileSync(${JSON.stringify(witness)}, JSON.strin
     expect(mcp).toMatchObject({ status: 0, stdout: "compiled-mcp:add:name:--:node:--flag\n", stderr: "" });
     const canary = path.join(root, "pi-argv.json"); write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify(process.argv.slice(2)));`);
     const near = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "mcpx", "list"], { cwd: root, encoding: "utf8" });
-    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "mcpx", "list"]);
+    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "mcpx", "list"]);
   });
 
   it("routes plugin argv before Pi resolution and reports an unavailable packaged entrypoint safely", () => {
@@ -1731,14 +1731,14 @@ require("node:module").syncBuiltinESMExports();
       cwd: root, encoding: "utf8",
     });
     expect(version).toMatchObject({ status: 0, stderr: "" });
-    expect(version.stdout).toBe("PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n");
+    expect(version.stdout).toBe("PiCC 0.1.1\nEmbedded Pi 0.84.2\nInstall source\nRuntime source fallback (missing): PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n");
 
     const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
       cwd: root, encoding: "utf8",
     });
     expect(plugins).toMatchObject({ status: 0, stdout: "", stderr: "" });
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
-      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",
+      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "plugins",
     ]);
 
     const selected = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--agent", "selected-main", "-p", "hello"], {
@@ -1746,7 +1746,7 @@ require("node:module").syncBuiltinESMExports();
     });
     expect(selected.status).toBe(0);
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
-      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "--agent", "selected-main", "-p", "hello",
+      "-e", canonicalPath(path.join(root, "picc", "index.ts")), "-nc", "--agent", "selected-main", "-p", "hello",
     ]);
   });
 

@@ -79,7 +79,7 @@ function outputCapture() {
 }
 
 const healthyRuntime = () => ({ ok: true, entries: {}, manifest: {} });
-const healthySuite = () => ({ ok: true, version: "0.83.0" });
+const healthySuite = () => ({ ok: true, version: "0.84.2" });
 const piFailure = (reason: string) => ({ ok: false, reason: `${reason}. Run \`picc update\` or reinstall PiCC.` });
 const cleanGit = () => child();
 
@@ -110,7 +110,7 @@ describe("source checkout update", () => {
 
     expect(result).toBe(0);
     expect(calls).toEqual(["git", "runtime", "pi"]);
-    expect(capture.logs.join("\n")).toMatch(/clean.*verified runtime.*0\.83\.0/i);
+    expect(capture.logs.join("\n")).toMatch(/clean.*verified runtime.*0\.84\.2/i);
   });
 
   it.each([
@@ -295,15 +295,15 @@ describe("source checkout update", () => {
       runNpm: () => child(),
       buildRuntime: () => undefined,
       validateRuntime: healthyRuntime,
-      validateSuite: () => piFailure("@earendil-works/pi-ai is 0.82.0; expected 0.83.0"),
+      validateSuite: () => piFailure("@earendil-works/pi-ai is 0.82.0; expected 0.84.2"),
       output: capture.sink,
     });
 
     expect(result).toBe(1);
     expect(capture.logs).not.toEqual(expect.arrayContaining([expect.stringMatching(/^Outcome:/)]));
-    expect(capture.errors.join("\n")).toMatch(/Pi validation failed.*pi-ai is 0\.82\.0; expected 0\.83\.0/i);
+    expect(capture.errors.join("\n")).toMatch(/Pi validation failed.*pi-ai is 0\.82\.0; expected 0\.84\.2/i);
     expect(capture.errors).toEqual([
-      "PiCC: the runtime build completed but Pi validation failed. @earendil-works/pi-ai is 0.82.0; expected 0.83.0.",
+      "PiCC: the runtime build completed but Pi validation failed. @earendil-works/pi-ai is 0.82.0; expected 0.84.2.",
       "After correcting the reported embedded Pi problem, run `npm ci --ignore-scripts --no-audit --no-fund` from the PiCC checkout root, then run `npm run build` from the PiCC checkout root, then run `picc update --check`.",
     ]);
     expect(capture.errors.join("\n")).not.toContain("Run `picc update` or reinstall PiCC.");
@@ -395,11 +395,11 @@ describe("source checkout update", () => {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
       dependencies?: Record<string, string>;
     };
-    manifest.dependencies = Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.83.0"]));
+    manifest.dependencies = Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.84.2"]));
     write(manifestPath, JSON.stringify(manifest));
     for (const name of PI_SUITE_PACKAGES) {
       write(path.join(root, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({
-        name, version: "0.83.0",
+        name, version: "0.84.2",
       }));
     }
     const capture = outputCapture();

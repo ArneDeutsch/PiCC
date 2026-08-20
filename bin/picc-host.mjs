@@ -57,7 +57,7 @@ async function main() {
     }
     if (!selection.ok) return fail(runtimeFailure(selection, installationKind));
 
-    process.argv = [process.execPath, resolution.cli, "-e", extension, ...process.argv.slice(2)];
+    process.argv = [process.execPath, resolution.cli, "-e", extension, "-nc", ...process.argv.slice(2)];
     try {
       await import(url.pathToFileURL(resolution.cli).href);
     } catch {

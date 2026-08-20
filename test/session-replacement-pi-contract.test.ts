@@ -291,7 +291,7 @@ async function commitTreeSelectionThroughInteractiveMode(
   return ordering;
 }
 
-describe("Pi 0.83 assembled session transition contract", () => {
+describe("Pi 0.84.2 assembled session transition contract", () => {
   it("replaces an active PiCC session only after abort persistence and shutdown", async () => {
     const h = await assembledHarness();
     const previousCwd = process.cwd();

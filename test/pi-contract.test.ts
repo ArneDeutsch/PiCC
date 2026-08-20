@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
+import { satisfies } from "semver";
 import {
   closeOpenAICodexWebSocketSessions,
   resetOpenAICodexWebSocketDebugStats,
@@ -79,9 +80,10 @@ async function createInstalledContractSession(options: {
   extensionFactory?: (api: any) => void;
   sessionManager?: any;
   enableTools?: boolean;
+  settings?: Record<string, unknown>;
 }) {
   const sdk: any = await import("@earendil-works/pi-coding-agent");
-  const settingsManager = sdk.SettingsManager.inMemory();
+  const settingsManager = sdk.SettingsManager.inMemory(options.settings);
   const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
   modelRuntime.hasConfiguredAuth = () => true;
   modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
@@ -179,7 +181,7 @@ describe("mock wire request classification", () => {
   });
 });
 
-describe("pi 0.83.0 API contract", () => {
+describe("pi 0.84.2 API contract", () => {
   it("exports the transient assistant classifier while context overflow remains a separate category", () => {
     const message = (errorMessage: string): AssistantMessage => ({
       role: "assistant",
@@ -244,30 +246,157 @@ describe("pi 0.83.0 API contract", () => {
     expect(result.errorMessage).toBe("Provider finish_reason: provider_mystery");
   });
 
-  it("declares and resolves the four direct Pi 0.83.0 packages", () => {
+  it("declares and resolves the direct Pi 0.84.2 suite and its coordinated companions", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+      version: string;
       dependencies: Record<string, string>;
       engines: { node: string };
     };
 
+    expect(manifest.version).toBe("0.1.1");
     expect(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, manifest.dependencies[name]])))
-      .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.83.0"])));
+      .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.84.2"])));
     expect(manifest.engines.node).toBe(">=22.19.0");
     expect(validatePiSuite({ packageRoot: root }))
-      .toMatchObject({ ok: true, version: "0.83.0" });
+      .toMatchObject({ ok: true, version: "0.84.2" });
 
-    for (const name of PI_SUITE_PACKAGES) {
-      const installed = JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")) as {
+    const codingAgentRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const resolveInstalledManifest = (name: string) => {
+      const candidates = codingAgentRequire.resolve.paths(name) ?? [];
+      const manifestPath = candidates
+        .map((candidate) => join(candidate, name, "package.json"))
+        .find((candidate) => existsSync(candidate));
+      expect(manifestPath, `${name} must resolve from coding-agent's installed context`).toBeTruthy();
+      return JSON.parse(readFileSync(manifestPath!, "utf8")) as {
         name: string;
         version: string;
+        dependencies?: Record<string, string>;
         engines?: { node?: string };
+        bin?: Record<string, string>;
+        exports?: Record<string, unknown>;
       };
+    };
+    const installedSuite = new Map(PI_SUITE_PACKAGES.map((name) => [name, resolveInstalledManifest(name)]));
+    for (const [name, installed] of installedSuite) {
       expect(installed, name).toMatchObject({
         name,
-        version: "0.83.0",
+        version: "0.84.2",
         engines: { node: ">=22.19.0" },
       });
+    }
+
+    const codingAgent = installedSuite.get("@earendil-works/pi-coding-agent")!;
+    expect(codingAgent.bin).toEqual({ pi: "dist/cli.js" });
+    expect(codingAgent.exports).toMatchObject({
+      ".": expect.any(Object),
+      "./rpc-entry": expect.any(Object),
+      "./client": expect.any(Object),
+    });
+
+    const companions = [
+      "@earendil-works/pi-client",
+      "@earendil-works/pi-protocol",
+      "@earendil-works/pi-telemetry",
+    ];
+    for (const name of companions) {
+      expect(manifest.dependencies).not.toHaveProperty(name);
+      expect(PI_SUITE_PACKAGES).not.toContain(name);
+      const installed = resolveInstalledManifest(name);
+      const declaredRanges = [...installedSuite.values()]
+        .map((owner) => owner.dependencies?.[name])
+        .filter((range): range is string => typeof range === "string");
+      expect(declaredRanges.length, `${name} must be declared by the installed coordinated graph`).toBeGreaterThan(0);
+      expect(installed).toMatchObject({ name, version: "0.84.2", engines: { node: ">=22.19.0" } });
+      expect(declaredRanges.every((range) => satisfies(installed.version, range))).toBe(true);
+    }
+  });
+
+  it("keeps PiCC permission blocks non-terminating despite the additive blocked-result hint", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "picc-block-terminate-contract-"));
+    const managedSettings = join(dir, "managed-settings.json");
+    fs.writeFileSync(managedSettings, JSON.stringify({ permissions: { deny: ["Bash(echo blocked)"] } }));
+    const pi = fakePi();
+    try {
+      picc(pi.api as never, {
+        managedSettingsPaths: [managedSettings],
+        onInitializationSettled: (completion) => pi.captureInitialization(completion),
+      });
+      const result = await pi.fire("tool_call", {
+        toolCallId: "blocked-contract",
+        toolName: "bash",
+        input: { command: "echo blocked" },
+      });
+      expect(result).toMatchObject({ block: true, reason: expect.any(String) });
+      expect(result).not.toHaveProperty("terminate");
+      await pi.waitForInitialization();
+    } finally {
+      await pi.fire("session_shutdown");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps configured default built-ins selective without dropping extension tools", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-default-tools-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    let session: any;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        enableTools: true,
+        settings: { defaultTools: ["read"] },
+        streamSimple: () => completedContractMessage(ai, "unused"),
+        extensionFactory: (api) => api.registerTool({
+          name: "contract_custom",
+          label: "Contract custom",
+          description: "Pins custom-tool retention under defaultTools.",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+          execute: async () => ({ content: [{ type: "text", text: "custom" }] }),
+        }),
+      }));
+      expect(session.getActiveToolNames().sort()).toEqual(["contract_custom", "read"]);
+    } finally {
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes images added by the installed post-tool hook", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-post-hook-image-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let session: any;
+    let providerCalls = 0;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        enableTools: true,
+        settings: { images: { autoResize: false } },
+        streamSimple: () => providerCalls++ === 0
+          ? contractAssistantMessage(ai, [{
+              type: "toolCall", id: "post-hook-image", name: "contract_image", arguments: {},
+            }], "toolUse")
+          : completedContractMessage(ai, "done"),
+        extensionFactory: (api) => {
+          api.registerTool({
+            name: "contract_image",
+            label: "Contract image",
+            description: "Returns content replaced by the post-tool hook.",
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+            execute: async () => ({ content: [{ type: "text", text: "replace me" }] }),
+          });
+          api.on("tool_result", (event: any) => event.toolName === "contract_image"
+            ? { content: [{ type: "image", data: png, mimeType: "image/jpg" }] }
+            : undefined);
+        },
+      }));
+      await session.prompt("run image contract");
+      expect(providerCalls).toBe(2);
+      expect(session.messages.find((message: any) => message.role === "toolResult"))
+        .toMatchObject({ content: [{ type: "image", data: png, mimeType: "image/jpeg" }] });
+    } finally {
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 
@@ -314,11 +443,11 @@ describe("pi 0.83.0 API contract", () => {
     }) as typeof fetch;
     try {
       process.env.PI_SKIP_VERSION_CHECK = "1";
-      await expect(versionCheck.checkForNewPiVersion("0.83.0")).resolves.toBeUndefined();
+      await expect(versionCheck.checkForNewPiVersion("0.84.2")).resolves.toBeUndefined();
       expect(requests).toBe(0);
 
       delete process.env.PI_SKIP_VERSION_CHECK;
-      await expect(versionCheck.checkForNewPiVersion("0.83.0")).resolves.toMatchObject({ version: "999.0.0" });
+      await expect(versionCheck.checkForNewPiVersion("0.84.2")).resolves.toMatchObject({ version: "999.0.0" });
       expect(requests).toBe(1);
     } finally {
       globalThis.fetch = previousFetch;
@@ -913,6 +1042,59 @@ describe("pi 0.83.0 API contract", () => {
     );
   });
 
+  it("publishes manual compaction completion after releasing prompt admission", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-compaction-release-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const manager = SessionManager.inMemory(cwd);
+    manager.appendMessage({ role: "user", content: "old request ".repeat(100), timestamp: 1 } as never);
+    manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old response ".repeat(100) }],
+      stopReason: "stop",
+      timestamp: 2,
+    } as never);
+    manager.appendMessage({ role: "user", content: "recent request", timestamp: 3 } as never);
+    manager.appendMessage({
+      role: "assistant", content: [{ type: "text", text: "recent response" }], stopReason: "stop", timestamp: 4,
+    } as never);
+    let session: any;
+    let releasedPrompt: Promise<void> | undefined;
+    let providerCalls = 0;
+    let providerCallsAtCompactionEnd = 0;
+    const events: Array<{ type: string; isCompacting: boolean }> = [];
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        sessionManager: manager,
+        settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+        streamSimple: () => providerCalls++ === 0
+          ? completedContractMessage(ai, "installed compact summary")
+          : completedContractMessage(ai, "released prompt complete"),
+      }));
+      session.subscribe((event: any) => {
+        if (event.type !== "compaction_start" && event.type !== "compaction_end") return;
+        events.push({ type: event.type, isCompacting: session.isCompacting });
+        if (event.type === "compaction_end") {
+          providerCallsAtCompactionEnd = providerCalls;
+          releasedPrompt = session.prompt("released at compaction end");
+        }
+      });
+      await session.compact();
+      await releasedPrompt;
+      expect(events).toEqual([
+        { type: "compaction_start", isCompacting: true },
+        { type: "compaction_end", isCompacting: false },
+      ]);
+      expect(providerCalls).toBe(providerCallsAtCompactionEnd + 1);
+      expect(session.messages).toContainEqual(expect.objectContaining({
+        role: "user", content: [expect.objectContaining({ text: "released at compaction end" })],
+      }));
+    } finally {
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("keeps custom entries rebuild-visible after compaction but outside model context", () => {
     const session = SessionManager.inMemory(process.cwd());
     const firstKept = session.appendMessage({ role: "user", content: "kept user turn" } as never);
@@ -1138,6 +1320,62 @@ describe("pi 0.83.0 API contract", () => {
     } finally {
       provider.resolve();
       await run?.catch(() => undefined);
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records no-trigger extension messages during an active run without queue or provider admission", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "picc-active-no-trigger-contract-"));
+    const ai: any = await import("@earendil-works/pi-ai");
+    const release = deferred<void>();
+    let extensionApi: any;
+    let session: any;
+    let providerCalls = 0;
+    try {
+      ({ session } = await createInstalledContractSession({
+        cwd,
+        streamSimple: () => {
+          providerCalls += 1;
+          const stream = ai.createAssistantMessageEventStream();
+          const message = {
+            role: "assistant", content: [{ type: "text", text: "active response" }],
+            api: "openai-completions", provider: "mock", model: "contract-model",
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            stopReason: "stop", timestamp: Date.now(),
+          };
+          stream.push({ type: "start", partial: message });
+          void release.promise.then(() => {
+            stream.push({ type: "done", reason: "stop", message });
+            stream.end(message);
+          });
+          return stream;
+        },
+        extensionFactory: (api) => { extensionApi = api; },
+      }));
+      const running = session.prompt("hold active run");
+      await waitUntil({ predicate: () => providerCalls === 1, description: "active provider admission" });
+      extensionApi.sendMessage({
+        customType: "picc-active-no-trigger",
+        content: "record only",
+        display: false,
+      }, { triggerTurn: false });
+      await waitUntil({
+        predicate: () => session.messages.some((message: any) => message.customType === "picc-active-no-trigger"),
+        description: "active no-trigger message recording",
+      });
+      expect(providerCalls).toBe(1);
+      expect(session.getSteeringMessages()).toEqual([]);
+      expect(session.getFollowUpMessages()).toEqual([]);
+      expect(session.sessionManager.getBranch()).toContainEqual(expect.objectContaining({
+        type: "custom_message", customType: "picc-active-no-trigger", content: "record only",
+      }));
+      release.resolve();
+      await running;
+      expect(providerCalls).toBe(1);
+    } finally {
+      release.resolve();
       session?.dispose?.();
       rmSync(cwd, { recursive: true, force: true });
     }
