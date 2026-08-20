@@ -77,6 +77,8 @@ export interface LoadSettingsOptions {
   ordinarySettingsProbe?: OrdinarySettingsProbe;
   /** Low-level probe IO used only to exercise production race classification deterministically. */
   ordinarySettingsIo?: OrdinarySettingsIo;
+  /** Target environment key semantics; injectable for cross-platform precedence tests. */
+  platform?: NodeJS.Platform;
 }
 
 const DEFERRED_TOP_KEYS = new Set([
@@ -765,6 +767,7 @@ function applySettingsFile(
   scope: Scope,
   source: string,
   out: ClaudeSettings,
+  platform: NodeJS.Platform,
   managedState?: ManagedApplyState,
 ): void {
   for (const [key, value] of Object.entries(raw)) {
@@ -793,6 +796,12 @@ function applySettingsFile(
         }
         for (const [envKey, envVal] of Object.entries(value)) {
           if (skipUnsafeKey(envKey, "env", source, out.diagnostics)) continue;
+          if (platform === "win32") {
+            const normalized = envKey.toLowerCase();
+            for (const existing of Object.keys(out.env)) {
+              if (existing.toLowerCase() === normalized) delete out.env[existing];
+            }
+          }
           out.env[envKey] = expandEnvVars(String(envVal));
         }
         break;
@@ -1212,7 +1221,7 @@ export function loadSettings(opts: LoadSettingsOptions): LoadedClaudeSettings {
       continue;
     }
     if (!projectPolicy(parsed, file.scope, file.path)) continue;
-    applySettingsFile(parsed, file.scope, file.path, settings);
+    applySettingsFile(parsed, file.scope, file.path, settings, opts.platform ?? process.platform);
   }
 
   const managed = discoverManagedPolicy({
@@ -1254,6 +1263,7 @@ export function loadSettings(opts: LoadSettingsOptions): LoadedClaudeSettings {
         "managed",
         event.source.source,
         settings,
+        opts.platform ?? process.platform,
         managedState,
       );
     }

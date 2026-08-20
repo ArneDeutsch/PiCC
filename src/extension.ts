@@ -97,7 +97,7 @@ import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { renderMainSessionTool } from "./runtime/main-session-tool-render.js";
-import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
+import { buildBashSpawnEnv, buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
   UnconfirmedHostDeadlineError,
@@ -1059,6 +1059,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("user_bash", () => {
     clearStartupSuppression();
   });
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: async (command: string, cwd: string, options: Record<string, any>) => {
+        const readiness = await builtInRegistration;
+        if (!readiness.ok) {
+          throw new Error("PiCC direct Bash is unavailable because startup initialization failed. Check the PiCC installation, then restart PiCC.");
+        }
+        const localOperations = readiness.localBashOperations;
+        if (!localOperations) {
+          throw new Error("PiCC direct Bash is unavailable in this Pi installation. Update or repair Pi, then restart PiCC.");
+        }
+        return localOperations.exec(command, cwd, {
+          ...options,
+          env: buildBashSpawnEnv(options.env ?? process.env, project.settings.env ?? {}, project.root),
+        });
+      },
+    },
+  }));
 
   const config = loadPiCCConfig(project.root);
   // Config-validation findings (malformed file, out-of-range compaction knob reverted
@@ -3133,7 +3151,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           mainCheckpointGate.withReplayAuthorization(input, () => {
             pi.sendUserMessage(input.content as any, { deliverAs: input.delivery });
           });
-          // Pi's void return proves enqueue/admission only. The controller keeps
+          // Pi's void return proves only that the call returned. The controller keeps
           // custody until the matching authenticated message_start confirms host start.
           return { delivered: true, pendingHostStart: true } as const;
         },
@@ -3480,7 +3498,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // the same built-in registration settlement.
   const coreToolNames = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   type BuiltInReadiness =
-    | { ok: true }
+    | { ok: true; localBashOperations?: { exec: (...args: any[]) => any } }
     | { ok: false; cause: string; possiblePartialCommit: boolean; cleanup: string; cleanupVerified: boolean };
   const boundedCause = (value: unknown): string => {
     let candidate: unknown = value;
@@ -3540,12 +3558,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ) as unknown as Record<string, unknown>;
         return mainCheckpointGate.wrapTool(rendered);
       });
+      const createdLocalBashOperations = typeof sdk.createLocalBashOperations === "function"
+        ? sdk.createLocalBashOperations(shellPath ? { shellPath } : undefined)
+        : undefined;
+      const localBashOperations = createdLocalBashOperations
+        && typeof createdLocalBashOperations.exec === "function"
+        ? createdLocalBashOperations
+        : undefined;
       registrationBegan = true;
       for (const definition of prepared) pi.registerTool(definition);
-      if (shellPath && typeof sdk.createLocalBashOperations === "function") {
-        pi.on("user_bash", () => ({ operations: sdk.createLocalBashOperations({ shellPath }) }));
-      }
-      return { ok: true };
+      return { ok: true, ...(localBashOperations ? { localBashOperations } : {}) };
     } catch (err) {
       return {
         ok: false,
@@ -6445,17 +6467,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         await controller.failAfterCommittedSummary(generation, "restoration");
       } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
-        if (recovered.recovered) {
-          const recoveryMode = readableContextMode(checkpointContext);
-          if (recoveryMode === "print" || recoveryMode === "json" || recoveryMode === "rpc") {
-            publishCheckpoint({
-              category: "checkpoint-recovered",
-              generation,
-              action: "manual-recovery",
-            }, checkpointContext);
-          }
-          reportRejectedShadows(recovered.rejected, checkpointContext);
-        }
+        if (recovered.recovered) reportRejectedShadows(recovered.rejected, checkpointContext);
       }
     }
     if (activeCompactionOperation === operation) activeCompactionOperation = undefined;

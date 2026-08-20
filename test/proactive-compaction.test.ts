@@ -6997,18 +6997,12 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         if (mode === "print") {
           expect(errors).toEqual([
             "PiCC: Manual compaction recovered the paused session; explicitly continue when ready.",
-            "PiCC: Manual compaction recovered the paused session; explicitly continue when ready.",
             "PiCC: 1 queued input was not replayed. Resend 1 text input.",
           ]);
           expect(recovered).toEqual([]);
         } else {
           expect(errors).toEqual([]);
           expect(recovered.map((entry) => entry.data)).toEqual([
-            {
-              category: "checkpoint-recovered",
-              generation,
-              notice: "Manual compaction recovered the paused session; explicitly continue when ready.",
-            },
             {
               category: "checkpoint-recovered",
               generation,

@@ -832,6 +832,14 @@ excludes; project configuration overrides user configuration):
   startup failed, **do not
   compact again**: start a new session and resend the retained input.
 
+  JSON and RPC `message_update` records use Pi's official delta-only stream: they do not include
+  cumulative `message` or `assistantMessageEvent.partial` fields. For each record, inspect
+  `assistantMessageEvent`, group content by its `contentIndex`, and branch on its `type`: append the
+  event's `delta` for `text_delta` and `thinking_delta`, or buffer it as a JSON-argument fragment
+  for `toolcall_delta`. A `toolcall_end` event's `toolCall` is authoritative for the completed call.
+  Top-level `usage` is cumulative for the current assistant response, and `message_start`/`message_end`
+  remain the authoritative message boundaries.
+
   JSON and RPC expose uncorrelated `picc-checkpoint-lifecycle` custom entries: category
   `checkpoint-exhausted` marks a paused boundary, `checkpoint-cancelled` marks a cancelled checkpoint
   (`restart-process` for live RPC post-compaction cancellation), `checkpoint-resumed` marks resumed work, and

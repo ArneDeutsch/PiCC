@@ -264,8 +264,8 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
         .trim().split(/\r?\n/u);
       expect(markerLines).toHaveLength(1);
       const marker = JSON.parse(markerLines[0]!);
-      expect(marker).toEqual({ skip: "1", launcher: null, aiAgent: "pi" });
-      expect(marker.aiAgent).not.toBe("inherited-host-canary-must-not-reach-bash");
+      expect(marker).toEqual({ skip: null, launcher: null, aiAgent: null });
+      expect(JSON.stringify(marker)).not.toContain("inherited-host-canary-must-not-reach-bash");
     } finally {
       live.closeInput();
       await live.stop();
@@ -1048,10 +1048,14 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         const lifecycle = records.filter((record) => record.type === "entry_appended" &&
           record.entry?.customType === "picc-checkpoint-lifecycle");
         expect(lifecycle.map((record) => record.entry.data.category)).toEqual([
-          "checkpoint-armed", "checkpoint-exhausted", "checkpoint-recovered", "checkpoint-recovered",
+          "checkpoint-armed", "checkpoint-exhausted", "checkpoint-recovered",
         ]);
         expect(lifecycle[1]!.entry.data).toMatchObject({
           action: "manual-recovery", failureCategory: "operational",
+        });
+        expect(lifecycle[2]!.entry.data).toMatchObject({
+          generation: lifecycle[1]!.entry.data.generation,
+          action: "manual-recovery",
         });
         expect(lifecycle.every((record) => record.id === undefined)).toBe(true);
         expect(records.filter((record) => record.type === "response" &&
@@ -1059,6 +1063,8 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             "rpc-initial-t02", "rpc-sentinel-t02", "rpc-compact-t02", "rpc-pending-t02",
             "rpc-continuation-t02", "rpc-pending-retry-t02",
           ].includes(record.id))).toHaveLength(6);
+        expect(records.filter((record) => record.type === "response" &&
+          record.id === "rpc-continuation-t02")).toHaveLength(1);
         const hiddenTerminal = records.filter((record) => record.type === "message_end" &&
           JSON.stringify(record).includes("RPC_HIDDEN_CONTINUATION_T02"));
         const pendingTerminal = records.filter((record) => record.type === "message_end" &&
@@ -1413,8 +1419,11 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           [1, "checkpoint-armed"],
           [1, "checkpoint-exhausted"],
           [1, "checkpoint-recovered"],
-          [1, "checkpoint-recovered"],
         ]);
+        expect(lifecycle[2]!.entry.data).toMatchObject({
+          generation: lifecycle[1]!.entry.data.generation,
+          action: "manual-recovery",
+        });
 
         const mainFiles = findSessionFiles(result.agentDir).filter((file) => !file.includes(".subagents"));
         expect(mainFiles).toHaveLength(1);

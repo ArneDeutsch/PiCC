@@ -862,7 +862,7 @@ export class MidRunCompactionController {
     // it publishes through the state it was handed and its identity guard already declines
     // to mutate a controller that replaced it.
     this.cancellation = undefined;
-    this.emit("checkpoint-recovered");
+    this.emit("checkpoint-recovered", this.generation, { action: "manual-recovery" });
     return { recovered: true, rejected };
   }
 

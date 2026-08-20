@@ -37,8 +37,9 @@ function applyEnvironmentOverlay(
 /**
  * Build a managed-child environment in the required precedence order: inherit,
  * remove PiCC launcher/host-only context, apply deliberate settings, then
- * surface-required values. On Windows, overlays replace every inherited casing
- * alias because the process environment treats keys case-insensitively.
+ * surface-required values. Those ambient markers are process-lineage hints, not
+ * authority for project children. On Windows, overlays replace every inherited
+ * casing alias because the process environment treats keys case-insensitively.
  */
 export function sanitizedSubprocessEnv(
   inherited: Record<string, string | undefined>,
