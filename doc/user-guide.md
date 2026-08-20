@@ -111,12 +111,17 @@ On Windows:
   cd <path-to-your-claude-code-project>
   node <path-to-PiCC>/bin/picc.mjs
   ```
-- Or, if you already use Pi, load the extension directly:
-  `pi -e <path-to-PiCC>/src/index.ts`
-- Or add it permanently to Pi's config (`~/.pi/agent/settings.json`):
+- Or, if you already use Pi, host the extension directly for development:
+  `pi -nc -e <path-to-PiCC>/src/index.ts`
+- Or add it permanently to Pi's config (`~/.pi/agent/settings.json`), provided every Pi invocation
+  that loads it also uses `-nc`:
   ```json
   { "extensions": ["<path-to-picc>/src/index.ts"] }
   ```
+
+Canonical `picc` launchers supply Pi's public `-nc`. PiCC owns Claude-format CLAUDE.md, rules,
+memory, skills, and agent context; loading it into plain Pi without `-nc` also enables Pi's native
+context-file loader, which an extension cannot disable after startup.
 
 ### Runtime selection and recovery
 
@@ -128,7 +133,7 @@ selection.
 |---|---|---|
 | Published/global installation | Verified installed JavaScript for interactive and standalone plugin commands. Missing, damaged, or version-incoherent output fails closed; TypeScript is never substituted. Run `picc update`, or repair/reinstall through the package manager or project that owns the copy. | Installation already contains the built runtime and source maps; lifecycle scripts are not required. `/reload` keeps the verified compiled generation selected for the process. Exit and relaunch after update or repair. |
 | Source-checkout `picc` or `node …/bin/picc.mjs` | Uses verified JavaScript when it matches the checkout. Missing or stale output produces a notice and uses TypeScript source; damaged output fails closed. Run `npm run build` from the PiCC checkout root, then exit and relaunch. | `npm run setup` installs locked dependencies, builds and verifies the runtime, then globally links the checkout. `picc update` synchronizes locked dependencies, builds for the checked-out revision, and verifies the product without changing tracked source. A compiled selection stays on its verified generation; source fallback stays source-hosted and may observe source edits under Pi's reload semantics. `/reload` cannot adopt a new build. |
-| External Pi with `pi -e <path-to-PiCC>/src/index.ts` (or that path in Pi settings) | Explicit TypeScript development path; it does not use PiCC launcher selection or compiled-runtime verification. | Prepare dependencies with `npm ci`. Update ownership stays with the external Pi installation. Reloading remains source-hosted and may observe source edits under Pi's reload semantics; it never switches to compiled output. |
+| External Pi with `pi -nc -e <path-to-PiCC>/src/index.ts` (or that path in Pi settings with `-nc` on every invocation) | Explicit TypeScript development path; it does not use PiCC launcher selection or compiled-runtime verification. `-nc` leaves Claude-format context assembly solely to PiCC. | Prepare dependencies with `npm ci`. Update ownership stays with the external Pi installation. Reloading remains source-hosted and may observe source edits under Pi's reload semantics; it never switches to compiled output. |
 
 Generated external source maps support source-oriented stack traces for compiled execution, though
 exact stack formatting depends on Node and the host. The retained TypeScript files are for explicit
@@ -157,7 +162,7 @@ independently. `/picc-update` repeats installation-aware guidance and never chan
 installation. It is available only when the extension recognizes a direct launcher lineage; that
 lineage check is not authentication.
 
-Deliberately hosting PiCC through an external Pi (`pi -e <path-to-PiCC>/src/index.ts`) leaves update
+Deliberately hosting PiCC through an external Pi (`pi -nc -e <path-to-PiCC>/src/index.ts`) leaves update
 ownership with that Pi installation. PiCC does not register `/picc-update` there, and Pi's native
 update behavior remains available. A project skill named `/update` is likewise independent and is
 never shadowed by PiCC.
@@ -398,7 +403,7 @@ Then use it like Claude Code:
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
-In the interactive TUI, each main-session tool row has one foreground state marker: `○` running,
+In the regular interactive TUI, each main-session tool row has one foreground state marker: `○` running,
 `●` success, `✗` failure, or `■` stopped/aborted. Lifecycle tools show the meaningful underlying
 outcome even when their transport call succeeds. An ordinary settled Read appears as
 `● read <path><optional-range>`, Bash as `● bash $ <command><optional-timeout>`, and NotebookEdit as
@@ -440,7 +445,7 @@ Every subagent is visible, both to you and to the coordinating model:
   configured. The agent id in the dispatch result identifies its file. If the main transcript or Pi
   persistence API is unavailable, or persistence creation or
   ownership admission fails, the dispatch runs in memory instead and is not resumable.
-- **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
+- **Status panel.** In the regular interactive TUI, a panel below the input shows the whole agent tree live —
   no `TaskOutput` await needed. Each individually rendered active agent uses one physical status row.
   When row space permits, a muted separator precedes a bounded live-activity payload after the
   dispatch description, or after identity when there is no distinct description. In the normal theme,
@@ -494,8 +499,9 @@ Every subagent is visible, both to you and to the coordinating model:
   the record if never awaited; an agent that settles while you are away from the prompt gets it when
   the conversation next continues. Nested agents (depth ≥ 2) get no record of their own — they keep
   Pi's default notice box and appear in the panel tree and their parent's transcript only.
-- **Esc** cancels a running *foreground* dispatch (it reports as aborted). Esc while *awaiting* a
-  background task only detaches the wait — the task keeps running; retrieve it with `TaskOutput`.
+- **Esc (regular interactive TUI)** cancels a running *foreground* dispatch (it reports as aborted).
+  Esc while *awaiting* a background task only detaches the wait — the task keeps running; retrieve it
+  with `TaskOutput`.
 - **`SendMessage`** continues a finished subagent with its context intact, or redirects a running
   background one, addressed by its `agent-<id>`. Resuming normally keeps that agent id and creates a
   new task id, so the agent id is the reliable correlation key. A foreground or background agent
@@ -512,6 +518,8 @@ Every subagent is visible, both to you and to the coordinating model:
   Resume is process-lifetime only — after you quit and relaunch `picc`, a prior agent id no longer
   resolves — fork dispatches are never resumable, and a user-stopped
   agent refuses resume and steering permanently.
+In this section, interactive TUI means the regular TUI.
+
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
   interactive TUI.
 
@@ -761,9 +769,11 @@ excludes; project configuration overrides user configuration):
   checkpoint; high displayed context by itself does not prove that a checkpoint is armed. Before
   admitting another ordinary model request, PiCC samples usage again and
   blocks the ordinary request before provider transport if newly known threshold pressure requires a
-  checkpoint. Only after the run and its complete tool batch settle may PiCC start one Pi compaction
-  transaction and resume the same
-  logical work; it never compacts across an unresolved provider response or tool batch. Completed
+  checkpoint. Only after the run and its complete tool batch settle may PiCC start one PiCC-owned Pi
+  compaction transaction for that generation and resume the same logical work; it never compacts
+  across an unresolved provider response or tool batch. A colliding native automatic attempt may be
+  cancelled, client manual recovery may commit, and a later idle native threshold transaction may
+  complete; those physical origins do not violate the per-PiCC-generation guarantee. Completed
   results and queued input remain pending. Pi can automatically recover an eligible transient summary
   transport failure inside that transaction. Summary retries stay
   bounded by Pi's configured summarization retry policy; PiCC-created subagents use Pi's in-memory
@@ -771,7 +781,7 @@ excludes; project configuration overrides user configuration):
   checkpoint stops PiCC continuation but may wait for Pi's configured summary retries to settle.
   Only an exact aborted terminal assistant response from the first resumed continuation followed by settlement of that same run is recoverable.
   That first resumed continuation may already have changed files, used tools, or caused external effects;
-  after cancellation PiCC starts no second continuation or retained-input replay. In the TUI it reconciles Pi-restored queue text into
+  after cancellation PiCC starts no second continuation or retained-input replay. In the regular TUI it reconciles Pi-restored queue text into
   one editor draft in steering FIFO, follow-up FIFO, then pre-existing draft order, separated by blank
   lines. Equal duplicates are preserved, and an inexact editor match is never overwritten. A leading
   slash is only text in that draft and remains inert until you press Enter, when normal command routing
@@ -779,9 +789,10 @@ excludes; project configuration overrides user configuration):
   retained-input record. Cancelling a subagent checkpoint aborts its compaction. Quota, authentication, cancellation,
   deterministic provider errors, and PreCompact policy blocks are not made broadly retryable. If
   compaction or mandatory restoration cannot complete, work remains paused rather than continuing
-  near the limit. Live RPC cancellation during post-compaction retained replay is unsupported: Pi
-  0.83 may drain native queued input before PiCC can present the cancellation. If PiCC does present
-  it, use the reported counts and stage with caller-owned client/request history where available,
+  near the limit. Live RPC cancellation during post-compaction retained replay is unsupported:
+  `abort()` may leave native queued input for Pi to drain before PiCC can present the cancellation.
+  If PiCC does present it, use the reported counts and stage with caller-owned client/request history
+  where available,
   inspect possible effects, then
   terminate PiCC and start a fresh process and fresh session; never deliberately resubmit in the
   affected RPC session. The action is `restart-process` and status is 3. Print and JSON are likewise
@@ -790,15 +801,15 @@ excludes; project configuration overrides user configuration):
   does not verify reopened persistence. Caller-owned client/request history is a recovery source
   where available, not PiCC-verified persistence. A
   sink failure leaves custody unresolved and
-  refuses retry rather than guessing; failure to show a decorative TUI notice does not undo successful
+  refuses retry rather than guessing; failure to show a decorative regular-TUI notice does not undo successful
   editor or report custody.
 
   This gate applies only to models using Pi's `openai-completions`, `openai-responses`, or
-  `openai-codex-responses` API. It covers interactive TUI, print, JSON, and RPC operation. TUI
-  reports status and recovery in-session. Print reports progress on stderr; two records are
+  `openai-codex-responses` API. It covers regular interactive TUI, print, JSON, and RPC operation.
+  The regular TUI reports status and recovery in-session. Print reports progress on stderr; two records are
   persisted outside JSON/RPC — an exhaustion with its recovery guidance, and a report of queued
   input a checkpoint could not deliver — and Pi-owned stdout does not prove the logical work
-  completed. The process status does report one thing: outside the TUI, a **main-session**
+  completed. The process status does report one thing: outside the regular TUI, a **main-session**
   checkpoint PiCC reports as paused or cancelled sets exit status **3** in print and JSON modes and
   for every presented live-RPC post-compaction cancellation. This is distinct
   from `0` and from the status Pi's own print-mode failures use, so a scripted caller can tell
@@ -806,11 +817,14 @@ excludes; project configuration overrides user configuration):
   does not turn the earlier partial paused/cancelled outcome into a one-shot success. A subagent
   checkpoint's ending never sets it, so `0` is not proof that a dispatched agent
   finished its work. Pi overrides it when print mode itself fails. For a confirmed recoverable
-  pre-commit ending, a still-live RPC session can run `/compact`, then explicitly continue. If the
-  session was persisted and its process exited, reopen that exact session in Pi's session picker
+  pre-commit ending, a still-live RPC client can invoke `compact`, wait for it to settle, then send an
+  explicit continuation. A `prompt` submitted while stock Pi is actively compacting can be rejected
+  with `success:false` before PiCC admission; clients must check the acknowledgement and retry only
+  after manual compaction and continuation settle. Rejected input was never queued or in PiCC custody.
+  If the session was persisted and its process exited, reopen that exact session in Pi's session picker
   before `/compact`, then explicitly continue. A one-shot ephemeral print/JSON session cannot be
   reopened; start a replacement session and resend the retained input. If PiCC says it could not
-  confirm that checkpoint host work stopped, first copy any restored TUI draft or recover headless
+  confirm that checkpoint host work stopped, first copy any restored regular-TUI draft or recover headless
   input from caller-owned client/request history where available. Then exit PiCC completely, start a fresh PiCC process and a
   fresh session, do not reopen the affected session, and resend it. If a PreCompact hook blocked a
   confirmed recoverable attempt, first repair or disable that hook (or allow a manual trigger), then
@@ -828,9 +842,9 @@ excludes; project configuration overrides user configuration):
   `/fork`, and `/reload` are refused; terminate PiCC and start a fresh process and fresh session.
   Read `checkpoint-resumed`
   as superseded by any later terminal record for the same run — resumed work can still fail after
-  it, and the terminal record is then the last word. An RPC prompt acknowledgement is not a
-  checkpoint-completion acknowledgement. Pi may also
-  emit native physical-run or compaction-error records that extensions cannot suppress or redact.
+  it, and the terminal record is then the last word. A successful RPC prompt acknowledgement is not
+  a checkpoint-completion acknowledgement; `success:false` means the prompt was not admitted. Pi may
+  also emit native physical-run or compaction-error records that extensions cannot suppress or redact.
   A PiCC subagent retained after pre-commit operational or hook exhaustion is recovered with awaited
   `SendMessage` by agent id after repairing the cause, or abandoned with `TaskStop` before the process
   exits. A terminal post-commit child can only be abandoned and replaced. On confirmed shutdown,

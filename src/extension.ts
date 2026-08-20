@@ -1563,9 +1563,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
      * dispatched through an API whose completion Pi announces (see the `triggerTurn`
      * note at the send site for the one precondition that carries), or the
      * `agent_settled` handler invocation currently deciding this run's ending. It
-     * goes false at exactly one place — the Stop-continuation hand-off, where PiCC
-     * has bet on a `pi.sendUserMessage` that returns void and that Pi may drop
-     * without ever starting a turn.
+     * goes false at exactly one place — the Stop-continuation hand-off, after the
+     * bounded identity-authenticated asynchronous admission resolves successfully.
+     * Refusal or timeout keeps custody with PiCC and concludes fail closed.
      *
      * It is a claim about who owes a settlement, not a proof: the handler
      * invocation's own coverage has one exception, named at the `agent_settled`
@@ -2734,8 +2734,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     const mode = checkpointMode(ctx);
-    // `stderr` is the TUI once Pi has stopped it: the ending still has to reach the reader,
-    // and their scrollback is what survives the teardown.
+    // After renderer teardown, stderr is the remaining visible channel regardless of
+    // the active renderer's exit or scrollback policy.
     const surface = mode === "tui" && sessionRenderingStopped ? "stderr" : mode;
     const baseText = checkpointText(event);
     // Every headless exhaustion is rephrased, the post-commit one included: it is the
