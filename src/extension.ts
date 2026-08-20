@@ -1487,14 +1487,38 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * that was abandoned and its successor.
    */
   let printWriteChain: { epoch: object; tail: Promise<void> } | undefined;
+  type StopContinuationSettlement = "pending" | "admitted" | "refused";
   interface StopContinuationCapability {
     readonly epoch: object;
     readonly controller: MidRunCompactionController;
     readonly generation: number;
     readonly resumeToken: ResumeToken;
     readonly text: string;
-    consumed: boolean;
+    readonly admission: Promise<boolean>;
+    readonly settlement: () => StopContinuationSettlement;
+    readonly resolveAdmission: (admitted: boolean) => boolean;
   }
+  const STOP_CONTINUATION_ADMISSION_TIMEOUT_MS = 1_000;
+  const createStopContinuationCapability = (
+    identity: Omit<StopContinuationCapability, "admission" | "settlement" | "resolveAdmission">,
+  ): StopContinuationCapability => {
+    let resolveResult!: (admitted: boolean) => void;
+    let state: StopContinuationSettlement = "pending";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const admission = new Promise<boolean>((resolve) => { resolveResult = resolve; });
+    const resolveAdmission = (admitted: boolean): boolean => {
+      if (state !== "pending") return false;
+      state = admitted ? "admitted" : "refused";
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      resolveResult(admitted);
+      return true;
+    };
+    timer = setTimeout(() => resolveAdmission(false), STOP_CONTINUATION_ADMISSION_TIMEOUT_MS);
+    return { ...identity, admission, settlement: () => state, resolveAdmission };
+  };
   const stopContinuationAdmission = new AsyncLocalStorage<StopContinuationCapability>();
   type CompactionOperationOrigin = "picc-proactive" | "pi-native-auto" | "user-manual";
   interface CompactionLifecycleOperation {
@@ -5348,37 +5372,46 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   pi.on("input", async (event: any, ctx: any) => {
+    const stopCapability = stopContinuationAdmission.getStore();
+    let exactStopContinuation = false;
     try {
+      exactStopContinuation = stopCapability !== undefined && event.source === "extension" &&
+        event.text === stopCapability.text && event.images === undefined &&
+        event.streamingBehavior === undefined;
       // Extension continuations are internal. Every other admitted input is a
       // user boundary and clears the retained Pi startup flag before processing.
       if (event.source !== "extension") clearStartupSuppression();
       if (selectedMainAdmissionFailure !== undefined) {
+        stopCapability?.resolveAdmission(false);
         selectedMainNotice(ctx, selectedMainAdmissionFailure, "error");
         return { action: "handled" };
       }
-      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
-      const stopCapability = stopContinuationAdmission.getStore();
       if (stopCapability) {
-        if (!stopCapability.consumed && event.source === "extension" &&
-            event.text === stopCapability.text && event.images === undefined &&
-            event.streamingBehavior === undefined) {
-          const controller = mainCheckpointGate.currentController();
-          const snapshot = controller.snapshot();
-          const resume = activeMainResume;
-          if (stopCapability.epoch === checkpointSessionEpoch &&
-              stopCapability.controller === controller &&
-              stopCapability.generation === snapshot.generation &&
-              stopCapability.resumeToken === resume?.token &&
-              resume.epoch === stopCapability.epoch &&
-              resume.generation === stopCapability.generation &&
-              resume.token.generation === stopCapability.generation &&
-              snapshot.phase === "resuming") {
-            stopCapability.consumed = true;
-            return { action: "continue" };
+        if (stopCapability.settlement() === "pending") {
+          if (exactStopContinuation) {
+            const controller = mainCheckpointGate.currentController();
+            const snapshot = controller.snapshot();
+            const resume = activeMainResume;
+            if (stopCapability.epoch === checkpointSessionEpoch &&
+                stopCapability.controller === controller &&
+                stopCapability.generation === snapshot.generation &&
+                stopCapability.resumeToken === resume?.token &&
+                resume.epoch === stopCapability.epoch &&
+                resume.generation === stopCapability.generation &&
+                resume.token.generation === stopCapability.generation &&
+                snapshot.phase === "resuming" && stopCapability.resolveAdmission(true)) {
+              return { action: "continue" };
+            }
           }
+          stopCapability.resolveAdmission(false);
+          return { action: "handled" };
         }
-        return { action: "handled" };
+        // AsyncLocalStorage descendants retain the capability after its waiter settles.
+        // Consume only the duplicate continuation; unrelated extension work has no
+        // authority from this capability and follows ordinary admission below.
+        if (exactStopContinuation) return { action: "handled" };
       }
+      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition !== "accept" && inputDisposition !== "quarantine") {
         rejectOrdinaryInput(inputDisposition, event, ctx);
@@ -5767,6 +5800,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return accept({ action: "continue" });
     } catch (err) {
       debug(`input handler error: ${(err as Error).message}`);
+      if (stopCapability &&
+          (stopCapability.settlement() === "pending" || exactStopContinuation)) {
+        stopCapability.resolveAdmission(false);
+        return { action: "handled" };
+      }
       // Once a checkpoint has closed admission, capture/hook/pipeline failures
       // cannot reopen transport by falling through to Pi. If quarantine could not
       // reach the normal capture path, preserve/report the raw input here.
@@ -5796,10 +5834,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   /**
    * `settled` false means a Stop hook blocked and a continuation was issued instead.
-   * `continuationAdmitted` then reports PiCC's own admission decision, which is the
-   * one way a continuation can fail to start a turn that PiCC can actually see —
-   * Pi's `sendUserMessage` returns void, and its other ways of ending without a turn
-   * (no model, expired credentials, a pre-turn throw) are invisible from here.
+   * `continuationAdmitted` then reports PiCC's own bounded admission decision, which
+   * is the one way a continuation can fail to start a turn that PiCC can actually
+   * see. Pi's extension wrapper returns before asynchronous input admission settles;
+   * other ways of ending after admission but without a turn remain invisible here.
    *
    * It is reported as refused whenever a resumed run is live and the continuation
    * went out without a capability, because PiCC then refuses it in its own `input`
@@ -5867,23 +5905,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (resume && resume.epoch === checkpointSessionEpoch &&
             resume.generation === snapshot.generation &&
             resume.token.generation === snapshot.generation && snapshot.phase === "resuming") {
-          const capability: StopContinuationCapability = {
+          const capability = createStopContinuationCapability({
             epoch: checkpointSessionEpoch,
             controller,
             generation: snapshot.generation,
             resumeToken: resume.token,
             text: continuation,
-            consumed: false,
-          };
-          // Pi reaches the `input` event synchronously from `sendUserMessage`, and
-          // PiCC's own admission decides in that handler's synchronous prefix, so
-          // `consumed` is already final when the send returns. That depends on PiCC
-          // being the first extension registering an `input` handler: Pi awaits each
-          // handler in extension order, so an extension ahead of PiCC whose handler
-          // awaits would defer this decision past the send and make `consumed` read a
-          // stale `false` — abandoning a run that is in fact healthy.
-          stopContinuationAdmission.run(capability, () => pi.sendUserMessage(continuation));
-          return { settled: false, continuationAdmitted: capability.consumed };
+          });
+          try {
+            const sent = stopContinuationAdmission.run(
+              capability,
+              () => pi.sendUserMessage(continuation) as unknown,
+            );
+            if (sent && typeof (sent as PromiseLike<unknown>).then === "function") {
+              void Promise.resolve(sent).catch(() => { capability.resolveAdmission(false); });
+            }
+          } catch {
+            capability.resolveAdmission(false);
+          }
+          return { settled: false, continuationAdmitted: await capability.admission };
         }
         // No capability could be minted — either no resumed run is carrying this
         // continuation, or authority moved while the hook ran. In the first case

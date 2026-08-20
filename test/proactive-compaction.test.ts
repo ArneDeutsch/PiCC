@@ -3145,13 +3145,6 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       }
       if (!capturedStaleStopInput) {
         capturedStaleStopInput = true;
-        stopAdmissionResults.push(pi.fire("input", {
-          text: content, source: "extension", images: [{ type: "image", data: "mismatch" }],
-          streamingBehavior: undefined,
-        }, high));
-        stopAdmissionResults.push(pi.fire("input", {
-          text: content, source: "extension", images: undefined, streamingBehavior: "followUp",
-        }, high));
         stopAdmissionResults.push(staleStopInput.promise.then(() => pi.fire("input", {
           text: content, source: "extension", images: undefined, streamingBehavior: undefined,
         }, high)));
@@ -3159,6 +3152,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       stopAdmissionResults.push(pi.fire("input", {
         text: content, source: "extension", images: undefined, streamingBehavior: undefined,
       }, high));
+      // A second exact occurrence cannot consume the one-shot capability again.
       stopAdmissionResults.push(pi.fire("input", {
         text: content, source: "extension", images: undefined, streamingBehavior: undefined,
       }, high));
@@ -3245,7 +3239,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       staleStopInput.resolve();
       const admission = await Promise.all(stopAdmissionResults);
       expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
-      expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
+      expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(9);
       expect(outerDone).toBe(true);
       expect(fs.existsSync(inputHookCount)).toBe(false);
       expect(controller.snapshot().phase).toBe("idle");
@@ -4325,15 +4319,212 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(lines.join(" ")).not.toContain("PiCC proactive compaction");
   });
 
+  it("awaits Stop admission, refuses duplicates, and preserves ordinary descendant error handling", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const sent = deferred<void>();
+    const results: unknown[] = [];
+    const ctx = resumeCtx();
+    const recoveryEntriesBefore = pi.entries
+      .filter((entry) => entry.data.category === "checkpoint-input-recovery").length;
+    let sendReturned = false;
+    let admissionObservedAfterReturn = false;
+    let admissionTask: Promise<void> | undefined;
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      admissionTask = Promise.resolve().then(async () => {
+        admissionObservedAfterReturn = sendReturned;
+        results.push(await pi.fire("input", {
+          text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+        }, ctx));
+        const disposition = vi.spyOn(mainCheckpointGate, "ordinaryInputDisposition");
+        disposition.mockImplementationOnce(() => { throw new Error("ordinary input failed"); });
+        try {
+          results.push(await pi.fire("input", {
+            text: "unrelated descendant extension input", source: "extension",
+            images: undefined, streamingBehavior: undefined,
+          }, ctx));
+        } finally {
+          disposition.mockRestore();
+        }
+        results.push(await pi.fire("input", {
+          text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+        }, ctx));
+      });
+      sendReturned = true;
+      sent.resolve();
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-async-admission", ctx));
+      vi.useFakeTimers();
+      nested = pi.fire("agent_settled", {}, ctx);
+      await sent.promise;
+      await nested;
+      await admissionTask;
+      expect(admissionObservedAfterReturn).toBe(true);
+      expect(results).toEqual([
+        { action: "continue" },
+        { action: "handled" },
+        { action: "handled" },
+      ]);
+      expect(pi.entries
+        .filter((entry) => entry.data.category === "checkpoint-input-recovery").slice(recoveryEntriesBefore))
+        .toEqual([expect.objectContaining({ data: expect.objectContaining({ count: 1 }) })]);
+      expect(mainCheckpointGate.currentController().snapshot().phase).toBe("resuming");
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
+      fs.rmSync(marker, { force: true });
+      await pi.fire("agent_settled", {}, ctx);
+      await outer;
+      expect(mainCheckpointGate.currentController().snapshot())
+        .toMatchObject({ phase: "idle", admission: "open" });
+    } finally {
+      vi.useRealTimers();
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      for (const pending of [nested, outer, admissionTask]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["malformed", (): any => null],
+    ["throwing", (): any => ({
+      source: "extension",
+      get text(): string { throw new Error("event text failed"); },
+    })],
+  ] as const)(
+    "refuses a %s Stop-continuation event through the handler catch without waiting for timeout",
+    async (ending, inputEvent) => {
+      const marker = path.join(dir, ".claude", "block-stop");
+      const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+      const sent = deferred<void>();
+      const ctx = resumeCtx();
+      let admission: Promise<unknown> | undefined;
+      pi.api.sendUserMessage = (content: any, options: any) => {
+        originalSendUserMessage(content, options);
+        if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+        admission = pi.fire("input", inputEvent(), ctx);
+        sent.resolve();
+      };
+      let outer: Promise<unknown> | undefined;
+      let nested: Promise<unknown> | undefined;
+      fs.writeFileSync(marker, "block");
+      try {
+        ({ outer } = await driveResumeToResuming(`stop-continuation-event-${ending}`, ctx));
+        vi.useFakeTimers();
+        nested = pi.fire("agent_settled", {}, ctx);
+        await sent.promise;
+        expect(admission).toBeDefined();
+        await expect(admission!).resolves.toEqual({ action: "handled" });
+        expect(vi.getTimerCount()).toBe(0);
+        await nested;
+        await outer;
+        expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+          phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+        });
+      } finally {
+        vi.useRealTimers();
+        pi.api.sendUserMessage = originalSendUserMessage;
+        fs.rmSync(marker, { force: true });
+        for (const pending of [admission, nested, outer]) void pending?.catch(() => undefined);
+      }
+    },
+  );
+
+  it.each(["throw", "reject"] as const)(
+    "fails a %s Stop-continuation send closed and clears its admission timer",
+    async (ending) => {
+      const marker = path.join(dir, ".claude", "block-stop");
+      const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+      const ctx = resumeCtx();
+      pi.api.sendUserMessage = (content: any, options: any) => {
+        originalSendUserMessage(content, options);
+        if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+        if (ending === "throw") throw new Error("send failed");
+        return Promise.reject(new Error("send rejected"));
+      };
+      let outer: Promise<unknown> | undefined;
+      fs.writeFileSync(marker, "block");
+      try {
+        ({ outer } = await driveResumeToResuming(`stop-continuation-send-${ending}`, ctx));
+        vi.useFakeTimers();
+        await pi.fire("agent_settled", {}, ctx);
+        await outer;
+        expect(vi.getTimerCount()).toBe(0);
+        expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+          phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+        });
+      } finally {
+        vi.useRealTimers();
+        pi.api.sendUserMessage = originalSendUserMessage;
+        fs.rmSync(marker, { force: true });
+        void outer?.catch(() => undefined);
+      }
+    },
+  );
+
+  it("times out Stop-continuation admission and refuses its late exact occurrence", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const releaseLate = deferred<void>();
+    const sent = deferred<void>();
+    const ctx = resumeCtx();
+    let lateAdmission: Promise<unknown> | undefined;
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      lateAdmission = releaseLate.promise.then(() => pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+      }, ctx));
+      sent.resolve();
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let restoreTimeoutSpy: (() => void) | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-admission-timeout", ctx));
+      vi.useFakeTimers();
+      const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+      restoreTimeoutSpy = () => timeoutSpy.mockRestore();
+      nested = pi.fire("agent_settled", {}, ctx);
+      await sent.promise;
+      const deadlineIndex = timeoutSpy.mock.calls.findIndex((args) => args[1] === 1_000);
+      const deadline = timeoutSpy.mock.results[deadlineIndex]?.value as
+        | { hasRef?: () => boolean }
+        | undefined;
+      expect(deadline?.hasRef?.()).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_001);
+      await nested;
+      await outer;
+      expect(vi.getTimerCount()).toBe(0);
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      releaseLate.resolve();
+      await expect(lateAdmission).resolves.toEqual({ action: "handled" });
+      expect(mainCheckpointGate.currentController().ordinaryInputDisposition()).not.toBe("accept");
+    } finally {
+      releaseLate.resolve();
+      restoreTimeoutSpy?.();
+      vi.useRealTimers();
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      for (const pending of [nested, outer, lateAdmission]) void pending?.catch(() => undefined);
+    }
+  });
+
   it("abandons a resumed run when PiCC's own admission refuses its Stop continuation", async () => {
     const marker = path.join(dir, ".claude", "block-stop");
     const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
     const admissions: Array<Promise<unknown>> = [];
     const ctx = resumeCtx();
-    // Pi reaches the input event synchronously from sendUserMessage, so the fake
-    // delivers it the same way. A queued `followUp` is a shape PiCC's own capability
-    // check will not admit, and that refusal is the one way a continuation's death is
-    // observable at all.
+    // This fake delivers admission synchronously to isolate PiCC's shape-mismatch
+    // refusal. Throw, rejection, and timeout endings have separate owners above.
     pi.api.sendUserMessage = (content: any, options: any) => {
       originalSendUserMessage(content, options);
       if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
