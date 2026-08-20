@@ -5096,7 +5096,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("message_end", (event: any, ctx: any) => {
-    mainCheckpointGate.assistantMessageEnded(event?.message, ctx);
+    const role = event?.message?.role;
+    if (role === "assistant" || role === "custom") {
+      mainCheckpointGate.assistantMessageEnded(event.message, ctx);
+    }
     const resume = activeMainResume;
     if (resume?.triggerStarted && event?.message?.role === "assistant" && event.message.stopReason === "aborted" &&
         mainCheckpointGate.currentController().resumedAborted(resume.token)) {

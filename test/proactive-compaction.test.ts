@@ -4858,7 +4858,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     sendGuardContext = false,
   ) => {
     await pi.fire("session_start", { reason: "new" }, ctx);
-    mainCheckpointGate.assistantMessageEnded({
+    await pi.fire("message_end", { message: {
       role: "assistant",
       stopReason: "toolUse",
       content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
@@ -4866,7 +4866,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         input: 900, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 900,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-    }, ctx);
+    } }, ctx);
     let guardContext: Record<string, unknown> | undefined;
     if (sendGuardContext) {
       const nested = path.join(dir, "guard-context");
@@ -4883,8 +4883,22 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
     });
     const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: checkpointAbortRequested });
-    mainCheckpointGate.turnEnded(ctx, ctx.mode);
+    await pi.fire("tool_execution_end", {
+      toolCallId: id, result, isError: checkpointAbortRequested,
+    }, ctx);
+    const toolResultMessage = {
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "probe",
+      content: result.content,
+      isError: checkpointAbortRequested,
+      timestamp: Date.now(),
+      ...(result.details === undefined ? {} : { details: result.details }),
+      ...(result.terminate === true ? { terminate: true } : {}),
+    };
+    await pi.fire("message_start", { message: toolResultMessage }, ctx);
+    await pi.fire("message_end", { message: toolResultMessage }, ctx);
+    await pi.fire("turn_end", {}, ctx);
     if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
     const controller = mainCheckpointGate.currentController();
     expect(controller.snapshot()).toMatchObject({
