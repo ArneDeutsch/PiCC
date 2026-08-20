@@ -3888,6 +3888,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Guard: deny rules + PreToolUse/PostToolUse hooks + on-touch context injection
   // ---------------------------------------------------------------------------
+  const checkpointAwareGuardPi = {
+    on: pi.on.bind(pi),
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) =>
+      pi.sendMessage(mainCheckpointGate.authorizeDefensiveContextSend(message), options),
+  };
   createGuardExtension({
     engine: permissionEngine,
     hooks: hookRunnerFacade,
@@ -3912,7 +3917,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       return decision;
     },
-  })(pi);
+  })(checkpointAwareGuardPi);
 
   // ---------------------------------------------------------------------------
   // System prompt assembly (every turn — also compaction preservation)
@@ -5955,14 +5960,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     checkpointContext = ctx;
     const terminalAssistant = latestAssistantMessage(ctx);
     const physicalUnsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
-    const checkpointSnapshot = mainCheckpointGate.currentController().snapshot();
-    // Pi persists either PiCC-owned pre-commit stop mechanism as aborted. The
-    // active awaiting generation still owns the authorized checkpoint settlement.
-    // `checkpointAbortRequested` only selects abort instead of terminate and is
-    // deliberately excluded from this exception's eligibility.
-    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "aborted" &&
-      activeMainResume === undefined && mainCheckpointGate.isActive() &&
-      checkpointSnapshot.phase === "awaiting-settlement";
+    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "error" &&
+      activeMainResume === undefined && mainCheckpointGate.consumeDefensiveCutoff(terminalAssistant);
     const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
     if (unsuccessful && terminalAssistant.stopReason === "pending") {
       const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";
@@ -6018,7 +6017,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           : "abandoned");
       } else {
         if (resume === undefined && !mainCheckpointGate.isLogicalRunStopped() &&
-            terminalAssistant.stopReason !== "aborted" && snapshot.phase === "awaiting-settlement") {
+            snapshot.phase === "awaiting-settlement") {
           controller.exhaustUnsuccessfulAwaitingSettlement(snapshot.generation);
         }
         // Ordinary unsuccessful settlement still revokes callbacks captured by its run.
