@@ -1,11 +1,6 @@
-import { Type } from "typebox";
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  defineTool,
-  truncateHead,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { Type } from "../../runtime-host.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, defineTool, truncateHead } from "../../runtime-host.js";
 
 /**
  * Web tools: `WebFetch` / `WebSearch` — research skills and agent `tools:`

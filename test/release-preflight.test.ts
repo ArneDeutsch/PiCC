@@ -29,8 +29,7 @@ function temp(prefix: string) {
   const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix))); temporary.push(dir); return dir;
 }
 function canonical(file: string) {
-  const real = fs.realpathSync.native(file);
-  return process.platform === "win32" ? real.toLowerCase() : real;
+  return fs.realpathSync.native(file);
 }
 function fixture() {
   const root = temp("picc-release-source-");
@@ -89,6 +88,14 @@ describe("release identity", () => {
       .toThrow(/public access and the picc executable/);
   });
 
+  it("passes physical package spelling through admission while comparing aliases safely", () => {
+    const root = fixture();
+    const alias = path.join(temp("picc-release-alias-"), "package-alias");
+    fs.symlinkSync(root, alias, process.platform === "win32" ? "junction" : "dir");
+    const admitted = verifyReleaseAdmission({ packageRoot: alias, event: "manual" });
+    expect(admitted.packageRoot).toBe(root);
+  });
+
   it("checks source version, tag, exact Pi pins, and artifact hash", () => {
     const root = fixture();
     const runtimeVerifier = () => ({ ok: true, manifest: { sourceDigest: "a".repeat(64) } });
@@ -122,7 +129,8 @@ describe("release identity", () => {
       expectedSourceDigest: "c".repeat(64),
     });
     expect(inspected.archiveBytes.toString("utf8")).toBe("release bytes");
-    expect(inspected.filePolicy.files).toContain("picc/index.js");
+    expect(inspected.filePolicy.files).toContain("bin/picc-host.mjs");
+    expect(inspected.filePolicy.files).toContain("picc/index.ts");
     expect(inspected.filePolicy.prefixes).toContain("dist/");
 
     fs.appendFileSync(tarball, "changed");
@@ -136,7 +144,7 @@ describe("release file policy", () => {
     expect(RELEASE_STATIC_FILES).toEqual([...RELEASE_STATIC_FILES].sort((left, right) =>
       Buffer.compare(Buffer.from(left), Buffer.from(right))));
     expect(RELEASE_FILE_POLICY.prefixes).toEqual(["dist/", "src/"]);
-    for (const required of ["bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.js"]) {
+    for (const required of ["bin/picc-host.mjs", "bin/picc-mcp.mjs", "bin/picc.mjs", "doc/testing.md", "examples/hello-claude/CLAUDE.md", "picc/index.ts"]) {
       expect(RELEASE_STATIC_FILES).toContain(required);
       expect(RELEASE_FILE_POLICY.prefixes.some((prefix) => required.startsWith(prefix))).toBe(false);
     }
@@ -148,19 +156,22 @@ describe("release file policy", () => {
 });
 
 describe("pack release", () => {
-  it("binds one npm pack JSON record to source identity, output, and SHA", async () => {
+  it("binds one npm pack JSON record to physical source identity, output, and SHA", async () => {
     const root = fixture();
+    const rootAlias = path.join(temp("picc-release-pack-alias-"), "package-alias");
+    fs.symlinkSync(root, rootAlias, process.platform === "win32" ? "junction" : "dir");
     const output = temp("picc-release-output-");
     const filename = "arnedeutsch-picc-1.2.3.tgz";
     let call: any;
     const operations: string[] = [];
     const runtimeManifest = { sourceDigest: "a".repeat(64), runtimeDigest: "b".repeat(64) };
     const result = await (packRelease as any)({
-      packageRoot: root,
+      packageRoot: rootAlias,
       outputDir: output,
       event: "manual",
       admissionVerifier: (options: any) => {
         operations.push("admit");
+        expect(options.packageRoot).toBe(root);
         return verifyReleaseAdmission(options);
       },
       build: () => { operations.push("build"); },
@@ -413,7 +424,7 @@ describe("release workflow", () => {
       bin: { picc: "bin/picc.mjs" },
     });
     expect(packageJson.files).toEqual([
-      "dist", "src", "picc/index.js", "picc/index.ts", "bin", "examples", "doc/*.md",
+      "dist", "src", "picc/index.ts", "bin", "examples", "doc/*.md",
       "CONTRIBUTING.md", "LICENSE", "README.md",
     ]);
     expect(packageJson.dependencies).not.toHaveProperty("jiti");

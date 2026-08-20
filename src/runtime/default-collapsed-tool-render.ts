@@ -1,10 +1,6 @@
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  formatSize,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "../runtime-host.js";
+import { truncateToWidth, visibleWidth } from "../runtime-host.js";
 import {
   adaptedEditPreviewError,
   recognizeMultiEditSuccess,

@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRequire } from "node:module";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import * as piTui from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -12,9 +11,6 @@ import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { formatToolDisplayName } from "../src/runtime/tool-display.js";
 import { createWebFetchTool, createWebSearchTool } from "../src/runtime/tools/web-tools.js";
 
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTuiEntry = requireFromPi.resolve("@earendil-works/pi-tui");
-const piTui = await import(pathToFileURL(piTuiEntry).href) as typeof import("@earendil-works/pi-tui");
 const { Box: PiBox } = piTui;
 const bindingDefinitions = {
   ...piTui.TUI_KEYBINDINGS,

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -24,10 +24,12 @@ import { encodePluginStableSelector } from "../src/plugin-lifecycle/plugin-servi
 import { createLifecycleLocations } from "../src/plugin-lifecycle/locations.js";
 import { createRecordEnvelope, establishOwnedStateStore, ownedRecordPartition } from "../src/plugin-lifecycle/state-store.js";
 import { projectIdentities } from "../src/util/project-identity.js";
+import { waitUntil } from "./helpers/async.js";
 
 const repoRoot = path.resolve(".");
 const adminSource = path.join(repoRoot, "bin", "picc-admin.mjs");
 const launcherSource = path.join(repoRoot, "bin", "picc.mjs");
+const hostSource = path.join(repoRoot, "bin", "picc-host.mjs");
 const pluginAdapterSource = path.join(repoRoot, "bin", "picc-plugin.mjs");
 const mcpAdapterSource = path.join(repoRoot, "bin", "picc-mcp.mjs");
 const runtimeSelectorSource = path.join(repoRoot, "bin", "picc-runtime.mjs");
@@ -69,11 +71,15 @@ function makePackage(options: {
   if (options.source ?? true) {
     fs.mkdirSync(path.join(root, ".git"), { recursive: true });
     write(path.join(root, "package-lock.json"), "{}");
+    write(path.join(root, "src", "index.ts"), "export default function picc() {}\n");
+    write(path.join(root, "tsconfig.runtime.json"), "{}\n");
   }
   write(path.join(root, "picc", "index.ts"), "export default function picc() {}\n");
   for (const name of PI_SUITE_PACKAGES) {
     const version = options.installedVersions?.[name] ?? piVersion;
-    write(path.join(root, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version }));
+    write(path.join(root, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({
+      name, version, ...(name === "@earendil-works/pi-coding-agent" ? { bin: { pi: "dist/cli.js" } } : {}),
+    }));
   }
   if (options.withCli ?? true) {
     write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), "process.exit(0);\n");
@@ -83,6 +89,7 @@ function makePackage(options: {
 
 function installLauncher(root: string): void {
   write(path.join(root, "bin", "picc-admin.mjs"), fs.readFileSync(adminSource, "utf8"));
+  write(path.join(root, "bin", "picc-host.mjs"), fs.readFileSync(hostSource, "utf8"));
   write(path.join(root, "bin", "picc.mjs"), fs.readFileSync(launcherSource, "utf8"));
   write(path.join(root, "bin", "picc-plugin.mjs"), fs.readFileSync(pluginAdapterSource, "utf8"));
   write(path.join(root, "bin", "picc-mcp.mjs"), fs.readFileSync(mcpAdapterSource, "utf8"));
@@ -104,7 +111,7 @@ function installVerifiedRuntime(root: string, options: {
   const pluginMap = JSON.stringify({ version: 3, file: "plugin-inventory-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const mcpMap = JSON.stringify({ version: 3, file: "mcp-administration-cli.js", sourceRoot: "", sources: [], names: [], mappings: "" });
   const contents = new Map([
-    ["picc/index.js", extension],
+    ["picc/index.ts", extension],
     ["dist/index.js", index],
     ["dist/index.js.map", indexMap],
     ["dist/plugin-inventory-cli.js", plugin],
@@ -149,7 +156,7 @@ function installVerifiedRuntime(root: string, options: {
   const manifest = {
     schemaVersion: 1, package: identity.package, compiler: identity.compiler, sources: identity.sources,
     sourceDigest: identity.sourceDigest, files, runtimeDigest: digest(files),
-    entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
+    entries: { extension: "picc/index.ts", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
   };
   write(path.join(root, "dist", "picc-runtime.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -296,11 +303,22 @@ describe("direct Pi package validation", () => {
     makePackage({ root, source: false, withCli: false });
     fs.rmSync(path.join(root, "node_modules"), { recursive: true });
     for (const name of PI_SUITE_PACKAGES) {
-      write(path.join(prefix, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version: "0.82.0" }));
+      write(path.join(prefix, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({
+        name, version: "0.82.0", ...(name === "@earendil-works/pi-coding-agent" ? { bin: { pi: "dist/cli.js" } } : {}),
+      }));
     }
     write(path.join(prefix, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), "process.exit(0);\n");
 
     expect(resolvePiCli(root)).toMatchObject({ ok: true });
+    installLauncher(root);
+    installVerifiedRuntime(root);
+    const canary = path.join(prefix, "hoisted-host.json");
+    write(path.join(prefix, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify({ argv: process.argv.slice(2), lineage: process.env.PICC_LAUNCHER_PID, parent: process.ppid }));`);
+    const launched = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/hoisted"], { cwd: prefix, encoding: "utf8" });
+    expect(launched).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toMatchObject({
+      argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/hoisted"],
+    });
   });
 
   it("does not hide a broken nearer package behind a healthy hoisted copy", () => {
@@ -335,12 +353,85 @@ describe("direct Pi package validation", () => {
     });
   });
 
+  it("executes a valid non-default declared Pi bin and never the undeclared default", () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const codingRoot = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    const manifestPath = path.join(codingRoot, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { bin: { pi: string } };
+    manifest.bin.pi = "commands/pinned.mjs";
+    write(manifestPath, JSON.stringify(manifest));
+    const declaredCanary = path.join(root, "declared-ran");
+    const defaultCanary = path.join(root, "default-ran");
+    write(path.join(codingRoot, "commands", "pinned.mjs"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(declaredCanary)}, JSON.stringify(process.argv.slice(2)));`);
+    write(path.join(codingRoot, "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(defaultCanary)}, "ran");`);
+
+    expect(resolvePiCli(root)).toMatchObject({ ok: true, cli: canonicalPath(path.join(codingRoot, "commands", "pinned.mjs")) });
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/test"], { cwd: root, encoding: "utf8" });
+    expect(result).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(declaredCanary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
+    expect(fs.existsSync(defaultCanary)).toBe(false);
+  });
+
+  it("rejects missing, malformed, absolute, escaping, and linked Pi bin declarations", () => {
+    const unavailable = {
+      ok: false,
+      reason: "The embedded Pi CLI is unavailable. Run `picc update` or reinstall PiCC.",
+    };
+    const expectUnavailable = (result: ReturnType<typeof resolvePiCli>, label?: string) => {
+      expect(result, label).toEqual(unavailable);
+      expect(result, label).not.toHaveProperty("cli");
+    };
+    const declarations: Array<[string, unknown]> = [
+      ["missing", undefined], ["null-bin", null], ["array-bin", []], ["string-bin", "dist/cli.js"],
+      ["empty", { pi: "" }], ["non-string-pi", { pi: 7 }], ["non-nfc", { pi: "dist/cafe\u0301.js" }],
+      ["control", { pi: "dist/cli\u0007.js" }], ["uri-scheme", { pi: "file:dist/cli.js" }],
+      ["absolute", { pi: path.resolve("dist/cli.js") }], ["drive", { pi: "C:/cli.js" }],
+      ["backslash", { pi: "dist\\cli.js" }], ["dot", { pi: "./dist/cli.js" }],
+      ["escape", { pi: "../cli.js" }], ["empty-component", { pi: "dist//cli.js" }],
+    ];
+    for (const [label, bin] of declarations) {
+      const root = makePackage();
+      const manifestPath = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { bin?: unknown };
+      if (bin === undefined) delete manifest.bin; else manifest.bin = bin;
+      write(manifestPath, JSON.stringify(manifest));
+      expectUnavailable(resolvePiCli(root), label);
+    }
+
+    const nonRegular = makePackage({ withCli: false });
+    fs.mkdirSync(path.join(nonRegular, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), { recursive: true });
+    expectUnavailable(resolvePiCli(nonRegular), "non-regular");
+
+    const linkedTarget = makePackage({ withCli: false });
+    const linkedTargetRoot = path.join(linkedTarget, "node_modules", "@earendil-works", "pi-coding-agent");
+    const outsideTarget = temp("picc-linked-bin-target-");
+    fs.symlinkSync(outsideTarget, path.join(linkedTargetRoot, "cli-link"), process.platform === "win32" ? "junction" : "dir");
+    const targetManifestPath = path.join(linkedTargetRoot, "package.json");
+    const targetManifest = JSON.parse(fs.readFileSync(targetManifestPath, "utf8")) as { bin: { pi: string } };
+    targetManifest.bin.pi = "cli-link";
+    write(targetManifestPath, JSON.stringify(targetManifest));
+    expectUnavailable(resolvePiCli(linkedTarget), "linked target");
+
+    const linkedDirectory = makePackage({ withCli: false });
+    const linkedRoot = path.join(linkedDirectory, "node_modules", "@earendil-works", "pi-coding-agent");
+    const outsideDirectory = temp("picc-linked-bin-directory-");
+    write(path.join(outsideDirectory, "cli.js"), "process.exit(0);\n");
+    fs.symlinkSync(outsideDirectory, path.join(linkedRoot, "commands"), process.platform === "win32" ? "junction" : "dir");
+    const linkedManifestPath = path.join(linkedRoot, "package.json");
+    const linkedManifest = JSON.parse(fs.readFileSync(linkedManifestPath, "utf8")) as { bin: { pi: string } };
+    linkedManifest.bin.pi = "commands/cli.js";
+    write(linkedManifestPath, JSON.stringify(linkedManifest));
+    expectUnavailable(resolvePiCli(linkedDirectory), "linked component");
+  });
+
   it("rejects a package-directory or CLI symlink escape", () => {
     const packageEscape = makePackage();
     const logicalAgent = path.join(packageEscape, "node_modules", "@earendil-works", "pi-coding-agent");
     const outsideAgent = temp("picc-agent-escape-");
     write(path.join(outsideAgent, "package.json"), JSON.stringify({
-      name: "@earendil-works/pi-coding-agent", version: "0.82.0",
+      name: "@earendil-works/pi-coding-agent", version: "0.82.0", bin: { pi: "dist/cli.js" },
     }));
     write(path.join(outsideAgent, "dist", "cli.js"), "process.exit(0);\n");
     fs.rmSync(logicalAgent, { recursive: true });
@@ -354,9 +445,9 @@ describe("direct Pi package validation", () => {
       const logicalCli = path.join(cliEscape, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
       fs.mkdirSync(path.dirname(logicalCli), { recursive: true });
       fs.symlinkSync(outsideCli, logicalCli);
-      expect(resolvePiCli(cliEscape)).toMatchObject({
+      expect(resolvePiCli(cliEscape)).toEqual({
         ok: false,
-        reason: expect.stringMatching(/escaped|unavailable/),
+        reason: "The embedded Pi CLI is unavailable. Run `picc update` or reinstall PiCC.",
       });
     }
   });
@@ -416,6 +507,82 @@ describe("installation and executable discovery", () => {
 });
 
 describe("launcher behavior", () => {
+  it("crosses the real parent-to-host boundary from a linked checkout", () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const consumer = temp("picc-linked-checkout-");
+    const linked = path.join(consumer, "node_modules", "@arnedeutsch", "picc");
+    fs.mkdirSync(path.dirname(linked), { recursive: true });
+    fs.symlinkSync(root, linked, process.platform === "win32" ? "junction" : "dir");
+    const canary = path.join(consumer, "linked-host.json");
+    write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), lineage: process.env.PICC_LAUNCHER_PID, parent: process.ppid }));`);
+    const result = spawnSync(process.execPath, [path.join(linked, "bin", "picc.mjs"), "--model", "openai/linked"], { cwd: consumer, encoding: "utf8" });
+    expect(result).toMatchObject({ status: 0, stdout: "", stderr: "" });
+    const observed = JSON.parse(fs.readFileSync(canary, "utf8")) as { argv: string[]; cwd: string; lineage: string; parent: number };
+    expect(observed).toMatchObject({ argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/linked"], cwd: consumer });
+    expect(observed.lineage).toBe(String(observed.parent));
+  });
+
+  it("spawns only the contained host on the ordinary parent route without suite or runtime work", () => {
+    const root = makePackage({ installedVersions: { "@earendil-works/pi-ai": "9.9.9" } });
+    installLauncher(root);
+    fs.rmSync(path.join(root, "bin", "picc-runtime.mjs"));
+    const canary = path.join(root, "parent-host.json");
+    write(path.join(root, "bin", "picc-host.mjs"), [
+      'import fs from "node:fs";',
+      `fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify({ argv: process.argv.slice(2), sourceMaps: process.sourceMapsEnabled, parent: process.ppid, lineage: process.env.PICC_LAUNCHER_PID }));`,
+      "process.exitCode = 29;",
+    ].join("\n"));
+
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "--model", "openai/test"], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(result).toMatchObject({ status: 29, stdout: "", stderr: "" });
+    const observed = JSON.parse(fs.readFileSync(canary, "utf8")) as {
+      argv: string[]; sourceMaps: boolean; parent: number; lineage: string;
+    };
+    expect(observed).toMatchObject({ argv: ["--model", "openai/test"], sourceMaps: true });
+    expect(observed.lineage).toBe(String(observed.parent));
+  });
+
+  it("gives the host one suite resolution, selector, and complete verification pass", () => {
+    for (const mode of ["compiled", "source"] as const) {
+      const root = makePackage();
+      installLauncher(root);
+      if (mode === "compiled") installVerifiedRuntime(root, { sourceMatched: true });
+      const counter = path.join(root, `${mode}-counts.json`);
+      const adminPath = path.join(root, "bin", "picc-admin.mjs");
+      write(adminPath, fs.readFileSync(adminPath, "utf8").replace(
+        "export function validatePiSuite({ packageRoot = findPackageRoot() } = {}) {",
+        "export function validatePiSuite({ packageRoot = findPackageRoot() } = {}) { globalThis.__piccCounts.suite += 1;",
+      ));
+      const runtimePath = path.join(root, "bin", "picc-runtime.mjs");
+      write(runtimePath, fs.readFileSync(runtimePath, "utf8")
+        .replace("export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDirectory }) {", "export function verifyCompiledRuntime({ packageRoot, checkSource = false, distDirectory }) { globalThis.__piccCounts.content += 1;")
+        .replace("export function selectPiccRuntime({ packageRoot, installationKind }) {", "export function selectPiccRuntime({ packageRoot, installationKind }) { globalThis.__piccCounts.selector += 1;")
+        .replace("export function installInitialRuntimeSelection(selection) {", "export function installInitialRuntimeSelection(selection) { globalThis.__piccCounts.install += 1; globalThis.__piccCounts[selection.mode === 'compiled' ? 'compiledAuthority' : 'representationOnly'] += 1;"));
+      const cli = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+      write(cli, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(counter)}, JSON.stringify(globalThis.__piccCounts));`);
+      const preload = path.join(root, "counts.cjs");
+      write(preload, "globalThis.__piccCounts = { suite: 0, selector: 0, content: 0, install: 0, compiledAuthority: 0, representationOnly: 0 };\n");
+      const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], {
+        cwd: root, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: `--require ${JSON.stringify(preload)}` },
+      });
+      expect(result).toMatchObject({ status: 0, stdout: "", stderr: "" });
+      expect(JSON.parse(fs.readFileSync(counter, "utf8"))).toEqual({
+        suite: 1, selector: 1, content: 1, install: 1,
+        compiledAuthority: mode === "compiled" ? 1 : 0,
+        representationOnly: mode === "source" ? 1 : 0,
+      });
+    }
+
+    const host = fs.readFileSync(hostSource, "utf8");
+    expect(host.match(/runtime\.selectPiccRuntime\(/gu)).toHaveLength(1);
+    expect(host.match(/runtime\.installInitialRuntimeSelection\(/gu)).toHaveLength(1);
+    expect(host).not.toMatch(/verifyCompiledRuntime|manifest\s*:/u);
+  });
+
   it("surfaces the validator's precise package failure instead of a generic runtime error", () => {
     const root = makePackage({ installedVersions: { "@earendil-works/pi-ai": "9.9.9" } });
     installLauncher(root);
@@ -427,7 +594,7 @@ describe("launcher behavior", () => {
     expect(result.stderr).not.toMatch(/incomplete or inconsistent/);
   });
 
-  it("routes installed and source-classified interactive launches through the verified compiled wrapper", () => {
+  it("routes installed and source-classified interactive launches through the canonical TypeScript bootstrap", () => {
     for (const installationKind of ["installed", "source"] as const) {
       const root = makePackage({ source: installationKind === "source" });
       installLauncher(root);
@@ -436,6 +603,7 @@ describe("launcher behavior", () => {
       const sourceCanary = path.join(root, "source-started");
       const jitiCanary = path.join(root, "jiti-started");
       write(path.join(root, "picc", "index.ts"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sourceCanary)}, "started");`);
+      installVerifiedRuntime(root, { sourceMatched: installationKind === "source" });
       write(path.join(root, "node_modules", "jiti", "package.json"), JSON.stringify({
         name: "jiti", version: "2.7.0", type: "module", exports: "./index.js",
       }));
@@ -465,7 +633,7 @@ process.exit(23);
         argv: string[]; kind: string; version: string; parent: string; cwd: string; nodeOptions: string;
         sourceMapsEnabled: boolean; descendantStatus: number; descendantNodeOptions: string;
       };
-      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "--model", "openai/test"]);
+      expect(launched.argv).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/test"]);
       expect(launched).toMatchObject({
         kind: installationKind, version: "0.1.1", cwd: root, nodeOptions: "--no-warnings",
         sourceMapsEnabled: true, descendantStatus: 0, descendantNodeOptions: "--no-warnings",
@@ -479,10 +647,173 @@ process.exit(23);
       });
       expect(version).toMatchObject({ status: 0, stderr: "" });
       expect(version.stdout).toBe(`PiCC 0.1.1\nEmbedded Pi 0.82.0\nInstall ${installationKind}\nRuntime compiled (verified)\n`);
+
+      const directEnv: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: "--no-warnings", PICC_TEST_CANARY: canary };
+      delete directEnv.PICC_LAUNCHER_PID;
+      delete directEnv.PICC_INSTALL_KIND;
+      delete directEnv.PICC_VERSION;
+      const direct = spawnSync(process.execPath, [path.join(root, "bin", "picc-host.mjs"), "--model", "openai/direct"], {
+        cwd: root, encoding: "utf8", env: directEnv,
+      });
+      expect(direct).toMatchObject({ status: 23, stdout: "", stderr: "" });
+      expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toMatchObject({
+        argv: ["-e", canonicalPath(path.join(root, "picc", "index.ts")), "--model", "openai/direct"],
+        nodeOptions: "--no-warnings", sourceMapsEnabled: true,
+      });
     }
   });
 
-  it("fails every installed runtime category before Pi or source startup", () => {
+  it("forwards portable streams and preserves a distinct declared-CLI exit status", () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const cli = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+    write(cli, `let input = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { process.stdout.write("out:" + input); process.stderr.write("err:" + input); process.exitCode = 37; });`);
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], {
+      cwd: root, encoding: "utf8", input: "portable-stream\n",
+    });
+    expect(result).toMatchObject({ status: 37, stdout: "out:portable-stream\n", stderr: "err:portable-stream\n" });
+  });
+
+  it.skipIf(process.platform === "win32")("uses natural POSIX process-group signal delivery once and leaves no orphan", async () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const ready = path.join(root, "signal-ready.json");
+    const received = path.join(root, "signal-received.json");
+    write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({ pid: process.pid }));
+let count = 0;
+let settling = false;
+process.on("SIGTERM", () => {
+  count += 1;
+  if (settling) return;
+  settling = true;
+  setTimeout(() => {
+    fs.writeFileSync(${JSON.stringify(received)}, JSON.stringify({ count, signal: "SIGTERM" }));
+    process.removeAllListeners("SIGTERM");
+    process.kill(process.pid, "SIGTERM");
+  }, 150);
+});
+setInterval(() => {}, 1000);
+`);
+    const child = spawn(process.execPath, [path.join(root, "bin", "picc.mjs")], {
+      cwd: root, stdio: "ignore", detached: true,
+    });
+    const ending = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    const launcherPid = child.pid;
+    let hostPid: number | undefined;
+    const isGone = (pid: number) => {
+      try { process.kill(pid, 0); return false; } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+    try {
+      expect(launcherPid).toBeTypeOf("number");
+      await waitUntil({ predicate: () => fs.existsSync(ready), description: "declared Pi CLI signal readiness", timeoutMs: 10_000 });
+      hostPid = (JSON.parse(fs.readFileSync(ready, "utf8")) as { pid: number }).pid;
+      process.kill(-launcherPid!, "SIGTERM");
+      await expect(ending).resolves.toEqual({ code: null, signal: "SIGTERM" });
+      await waitUntil({ predicate: () => fs.existsSync(received), description: "natural host SIGTERM witness", timeoutMs: 5_000 });
+      expect(JSON.parse(fs.readFileSync(received, "utf8"))).toEqual({ count: 1, signal: "SIGTERM" });
+      await waitUntil({ predicate: () => isGone(launcherPid!), description: "launcher process-group leader termination", timeoutMs: 5_000 });
+      await waitUntil({ predicate: () => isGone(hostPid!), description: "host process termination without orphan", timeoutMs: 5_000 });
+    } finally {
+      if (launcherPid !== undefined) {
+        try { process.kill(-launcherPid, "SIGKILL"); } catch {}
+      }
+      if (hostPid !== undefined) {
+        try { process.kill(hostPid, "SIGKILL"); } catch {}
+      }
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")("preserves the Windows host process witness and distinct status", () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const witness = path.join(root, "windows-host.json");
+    write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(witness)}, JSON.stringify({ pid: process.pid, parent: process.ppid, lineage: process.env.PICC_LAUNCHER_PID })); process.exitCode = 41;`);
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], { cwd: root, encoding: "utf8" });
+    expect(result).toMatchObject({ status: 41, signal: null, stdout: "", stderr: "" });
+    const observed = JSON.parse(fs.readFileSync(witness, "utf8")) as { pid: number; parent: number; lineage: string };
+    expect(observed.pid).not.toBe(observed.parent);
+    expect(observed.lineage).toBe(String(observed.parent));
+  });
+
+  it("maps a parent spawn failure to bounded recovery", () => {
+    const root = makePackage();
+    installLauncher(root);
+    const preload = path.join(root, "fail-spawn.cjs");
+    write(preload, `const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+childProcess.spawn = () => { const child = new EventEmitter(); child.kill = () => false; queueMicrotask(() => child.emit("error", new Error("private spawn detail"))); return child; };
+require("node:module").syncBuiltinESMExports();
+`);
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], {
+      cwd: root, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: `--require ${JSON.stringify(preload)}` },
+    });
+    expect(result).toMatchObject({
+      status: 1, stdout: "", stderr: "PiCC: could not start the embedded Pi runtime. Run `picc update` or reinstall PiCC.\n",
+    });
+    expect(result.stderr).not.toContain("private spawn detail");
+  });
+
+  it("terminates boundedly when declared-CLI partial evaluation opens a live handle then fails", () => {
+    const root = makePackage();
+    installLauncher(root);
+    installVerifiedRuntime(root, { sourceMatched: true });
+    const evaluated = path.join(root, "partial-cli-evaluated");
+    write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(evaluated)}, String(process.pid));
+setInterval(() => {}, 1000);
+throw new Error("private import detail");
+`);
+    const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs")], {
+      cwd: root, encoding: "utf8", timeout: 5_000,
+    });
+    expect(result).toEqual(expect.objectContaining({
+      status: 1, signal: null, stdout: "", stderr: "PiCC: could not start the embedded Pi runtime. Run `picc update` or reinstall PiCC.\n",
+    }));
+    expect(result.error).toBeUndefined();
+    expect(fs.readFileSync(evaluated, "utf8")).toMatch(/^[1-9]\d*$/u);
+    expect(result.stderr).not.toContain("private import detail");
+  });
+
+  it("preserves the pinned declared Pi CLI top-level side effects", () => {
+    const witness = path.join(temp("picc-real-cli-witness-"), "side-effects.json");
+    const preload = path.join(path.dirname(witness), "witness.cjs");
+    const realCli = resolvePiCli(repoRoot);
+    expect(realCli).toMatchObject({ ok: true, cli: expect.any(String) });
+    if (!("cli" in realCli) || typeof realCli.cli !== "string") throw new Error("the pinned Pi CLI did not resolve");
+    const undiciEntry = path.join(path.dirname(path.dirname(realCli.cli)), "node_modules", "undici", "index.js");
+    write(preload, `const fs = require("node:fs");
+const undici = require(${JSON.stringify(undiciEntry)});
+const beforeDispatcher = undici.getGlobalDispatcher();
+const beforeWarning = process.emitWarning;
+process.on("exit", () => fs.writeFileSync(${JSON.stringify(witness)}, JSON.stringify({
+  title: process.title,
+  codingAgent: process.env.PI_CODING_AGENT,
+  warningSuppressed: process.emitWarning !== beforeWarning,
+  dispatcherInitialized: undici.getGlobalDispatcher() !== beforeDispatcher,
+  argv: process.argv,
+})));
+`);
+    const result = spawnSync(process.execPath, [hostSource, "--version"], {
+      cwd: repoRoot, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: `--require ${JSON.stringify(preload)}` },
+      timeout: 20_000,
+    });
+    expect(result).toMatchObject({ status: 0, stdout: "0.83.0\n", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(witness, "utf8"))).toEqual({
+      title: "pi", codingAgent: "true", warningSuppressed: true, dispatcherInitialized: true,
+      argv: [process.execPath, realCli.cli, "-e", canonicalPath(path.join(repoRoot, "picc", "index.ts")), "--version"],
+    });
+  });
+
+  it("rejects an unavailable installed runtime before interactive or administration bootstrap execution", () => {
     for (const category of ["missing", "corrupt", "version-mismatch"] as const) {
       for (const argv of [[], ["plugin", "list"], ["plugin", "details", "same@market"], ["mcp", "list"]]) {
         const root = makePackage({ source: false });
@@ -504,11 +835,10 @@ process.exit(23);
         const result = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), ...argv], {
           cwd: root, encoding: "utf8",
         });
-        expect(result.status, `${category}:${argv.join(" ")}`).toBe(1);
         expect(result.stdout).toBe("");
+        expect(result.status, `${category}:${argv.join(" ")}`).toBe(1);
         expect(result.stderr).toContain(category === "missing" ? "runtime is missing" : category === "corrupt" ? "runtime is damaged" : "runtime is version-incoherent");
         expect(result.stderr).toContain("TypeScript source was not used");
-        expect(result.stderr).toContain("picc update");
         expect(result.stderr).toContain("installation owner");
         expect(fs.existsSync(piCanary)).toBe(false);
         expect(fs.existsSync(sourceCanary)).toBe(false);
@@ -516,7 +846,7 @@ process.exit(23);
     }
   });
 
-  it("discloses source missing, ordinary drift, and package-version drift once on every runtime route", () => {
+  it("keeps the parent quiet while source administration discloses fallback once", () => {
     for (const state of ["missing", "source-stale", "package-drift"] as const) {
       const root = makePackage();
       installLauncher(root);
@@ -547,8 +877,9 @@ process.exit(23);
         });
         expect(result.status, `${state}:${argv.join(" ")}`).toBe(0);
         expect(result.stdout).toBe("");
-        expect(result.stderr.match(/PiCC is using TypeScript source/gu)).toHaveLength(1);
-        expect(result.stderr).toContain(state === "missing" ? "compiled runtime is missing" : "does not match this checkout");
+        const normalLaunch = argv[0] === "--theme";
+        expect(result.stderr.match(/PiCC is using TypeScript source/gu) ?? []).toHaveLength(normalLaunch ? 0 : 1);
+        if (!normalLaunch) expect(result.stderr).toContain(state === "missing" ? "compiled runtime is missing" : "does not match this checkout");
       }
       expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual([
         "-e", canonicalPath(path.join(root, "picc", "index.ts")), "--theme", "dark",
@@ -556,7 +887,7 @@ process.exit(23);
     }
   });
 
-  it("refuses corrupt source-checkout output for interactive and plugin commands", () => {
+  it("rejects a corrupt source-checkout runtime before interactive or administration bootstrap execution", () => {
     const root = makePackage();
     installLauncher(root);
     installVerifiedRuntime(root, { sourceMatched: true });
@@ -598,14 +929,16 @@ process.exit(23);
       expect(result.stdout).toContain(state === "corrupt"
         ? "Runtime unavailable (corrupt): The source-checkout compiled runtime is damaged."
         : "Runtime source fallback (source-stale): PiCC is using TypeScript source because the compiled runtime does not match this checkout.");
-      expect(result.stdout).toContain("Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC");
+      expect(result.stdout).toContain(state === "corrupt"
+        ? "Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC"
+        : "Run `npm run build` from the PiCC checkout root; `/reload` cannot apply this runtime change, so exit PiCC and relaunch");
       expect(result.stdout).toContain(state === "corrupt" ? "Runtime unavailable" : "Runtime source fallback");
       expect(result.stdout).not.toMatch(/[0-9a-f]{64}/u);
       expect(result.stdout).not.toContain(root);
     }
   });
 
-  it("keeps source-checkout recovery actionable when the runtime selector cannot import", () => {
+  it("keeps version and normal-launch recovery actionable when the selector cannot load", () => {
     const root = makePackage();
     installLauncher(root);
     fs.rmSync(path.join(root, "bin", "picc-runtime.mjs"));
@@ -627,7 +960,7 @@ process.exit(23);
         expected: {
           status: 1,
           stdout: "",
-          stderr: "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
+          stderr: "PiCC: The source-checkout runtime could not be verified. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC.\n",
         },
       },
     ] as const;
@@ -675,7 +1008,7 @@ process.exit(23);
     expect(mcp).toMatchObject({ status: 0, stdout: "compiled-mcp:add:name:--:node:--flag\n", stderr: "" });
     const canary = path.join(root, "pi-argv.json"); write(path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canary)}, JSON.stringify(process.argv.slice(2)));`);
     const near = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "mcpx", "list"], { cwd: root, encoding: "utf8" });
-    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.js")), "mcpx", "list"]);
+    expect(near.status).toBe(0); expect(JSON.parse(fs.readFileSync(canary, "utf8"))).toEqual(["-e", canonicalPath(path.join(root, "picc", "index.ts")), "mcpx", "list"]);
   });
 
   it("routes plugin argv before Pi resolution and reports an unavailable packaged entrypoint safely", () => {
@@ -1403,10 +1736,7 @@ require("node:module").syncBuiltinESMExports();
     const plugins = spawnSync(process.execPath, [path.join(root, "bin", "picc.mjs"), "plugins"], {
       cwd: root, encoding: "utf8",
     });
-    expect(plugins).toMatchObject({
-      status: 0, stdout: "",
-      stderr: "PiCC is using TypeScript source because the compiled runtime is missing. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC to restore compiled startup.\n",
-    });
+    expect(plugins).toMatchObject({ status: 0, stdout: "", stderr: "" });
     expect(JSON.parse(fs.readFileSync(piCanary, "utf8"))).toEqual([
       "-e", canonicalPath(path.join(root, "picc", "index.ts")), "plugins",
     ]);

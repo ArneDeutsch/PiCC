@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { Type } from "typebox";
-import {
-  defineTool,
-  withFileMutationQueue,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { Type } from "../../runtime-host.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, withFileMutationQueue } from "../../runtime-host.js";
 import {
   applyNotebookMutation,
   decodeNotebookText,

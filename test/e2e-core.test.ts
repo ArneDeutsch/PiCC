@@ -3,9 +3,8 @@ import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import os from "node:os";
-import { pathToFileURL } from "node:url";
 import {
   allText,
   BASH_AVAILABLE,
@@ -42,7 +41,10 @@ import {
  */
 
 const { startPi, runPi, launchedProcessCount, cleanup } = createE2ELive({ runtime: "compiled" });
-afterEach(cleanup);
+const { startPi: startDirectBootstrap, cleanup: cleanupDirectBootstrap } = createE2ELive({ runtime: "direct-bootstrap" });
+afterEach(async () => {
+  await Promise.all([cleanup(), cleanupDirectBootstrap()]);
+});
 
 const TOOL_ROW_PRESENTATION = /[○●✗■]|\u001b\[[0-?]*[ -/]*[@-~]/u;
 
@@ -144,38 +146,6 @@ function expectLifecycleAttribution(
   });
 }
 
-it.skipIf(cliMissing)("e2e core: Pi loads and reloads the compiled wrapper with the picc label", async () => {
-  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-e2e-loader-"));
-  try {
-    const interactiveModule = await import(pathToFileURL(
-      path.join(path.dirname(CLI_PATH), "modes", "interactive", "interactive-mode.js"),
-    ).href) as any;
-    const formatter = Object.create(interactiveModule.InteractiveMode.prototype) as any;
-    const loader = new DefaultResourceLoader({
-      cwd: agentDir,
-      agentDir,
-      additionalExtensionPaths: [path.resolve("picc", "index.js")],
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-    });
-    for (let generation = 0; generation < 2; generation += 1) {
-      await loader.reload();
-      const loaded = loader.getExtensions();
-      expect(loaded.errors).toEqual([]);
-      expect(loaded.extensions).toHaveLength(1);
-      const observedPath = loaded.extensions[0]!.path;
-      expect(path.basename(observedPath)).toBe("index.js");
-      expect(path.basename(path.dirname(observedPath))).toBe("picc");
-      expect(observedPath).not.toContain(`${path.sep}src${path.sep}`);
-      expect(formatter.getCompactExtensionLabels(loaded.extensions)).toEqual(["picc"]);
-    }
-  } finally {
-    fs.rmSync(agentDir, { recursive: true, force: true });
-  }
-});
-
 function expectNoToolRowPresentation(value: unknown, source: string): void {
   if (typeof value === "string") {
     expect(value, source).not.toMatch(TOOL_ROW_PRESENTATION);
@@ -222,7 +192,7 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
       'fs.appendFileSync("rpc-bash-marker.json",JSON.stringify({skip:process.env.PI_SKIP_VERSION_CHECK??null,launcher:process.env.PICC_LAUNCHER_PID??null})+"\\n")',
     ].join(";");
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)}`;
-    const live = await startPi({
+    const live = await startDirectBootstrap({
       script: [],
       prompt: "unused",
       modeArgs: ["--mode", "rpc"],
@@ -375,6 +345,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           const first = await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 1, 30_000);
           await live.waitForText("GENERATION_A_FIRST", 30_000);
           expect(first).toBeDefined();
+          expect(toolNames(first).filter((name) => name === "Agent")).toHaveLength(1);
           const dataMatch = /DATA=([^\s]+)/u.exec(allText(first));
           expect(dataMatch).toBeDefined();
           const locations = createLifecycleLocations({
@@ -461,8 +432,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           expect(updated.status, updated.stderr).toBe(0);
           expect(fs.readFileSync(path.join(dataDir, "preserved.txt"), "utf8")).toContain("preserved across immutable update");
 
-          const pidBeforeReload = live.pid;
-          originalPid = pidBeforeReload;
+          const launcherPidBeforeReload = live.pid;
           live.sendInput("/reload-plugins");
           const reloadDeadline = Date.now() + 30_000;
           while (true) {
@@ -474,7 +444,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             }
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
-          expect(live.pid).toBe(pidBeforeReload);
+          expect(live.pid).toBe(launcherPidBeforeReload);
           await live.waitForText("Reloaded keybindings, extensions", 30_000);
           live.sendInput(command);
           await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
@@ -486,7 +456,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             ["SessionEnd", null, "reload"],
             ["SessionStart", "startup", null],
           ]);
-          expectLifecycleAttribution(successfulReloadTrace, hookRunId, live.pid);
+          const piPid = successfulReloadTrace[0]!.hookPiPid!;
+          expect(piPid).not.toBe(live.pid);
+          originalPid = piPid;
+          expectLifecycleAttribution(successfulReloadTrace, hookRunId, piPid);
           expect(fs.existsSync(lifecycle!.runtimeCanary)).toBe(false);
           expect(fs.existsSync(preloadCanary)).toBe(false);
 
@@ -496,7 +469,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           live.sendInput("/reload-plugins");
           await live.waitForText("Activation is unconfirmed and this session cannot", 30_000);
           const failed = await live.completion;
-          expect(failed.pid).toBe(pidBeforeReload);
+          expect(failed.pid).toBe(launcherPidBeforeReload);
           expect(failed.forcedTermination).toBeNull();
           expect(failed.code).not.toBeNull();
           expect(failed.requests).toHaveLength(requestCountBeforeFailure);
@@ -513,7 +486,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           assertTreeSecretFree(root);
           const completedTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(completedTrace.slice(0, 3)).toEqual(successfulTrace.slice(0, 3));
-          expectLifecycleAttribution(completedTrace, hookRunId, live.pid);
+          expectLifecycleAttribution(completedTrace, hookRunId, piPid);
           for (const record of completedTrace) {
             expect(() => process.kill(record.hookChildPid, 0)).toThrow();
           }
@@ -544,19 +517,22 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           script: [{ text: "GENERATION_B_RELAUNCHED" }],
         });
         try {
-          expect(relaunched.pid).not.toBe(originalPid);
           relaunched.sendInput(command);
           await relaunched.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
           await relaunched.waitForText("GENERATION_B_RELAUNCHED", 30_000);
           const relaunchTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(relaunchTrace.length).toBeGreaterThan(relaunchTraceBaseline);
           expect(relaunchTrace.at(-1)).toMatchObject({ event: "SessionStart", source: "startup" });
-          expectLifecycleAttribution(relaunchTrace.slice(relaunchTraceBaseline), hookRunId, relaunched.pid, relaunchTraceBaseline);
+          const relaunchedPiPid = relaunchTrace.at(-1)!.hookPiPid!;
+          expect(relaunchedPiPid).not.toBe(originalPid);
+          expect(relaunchedPiPid).not.toBe(relaunched.pid);
+          expectLifecycleAttribution(relaunchTrace.slice(relaunchTraceBaseline), hookRunId, relaunchedPiPid, relaunchTraceBaseline);
           const traceLengthBeforeQuit = relaunchTrace.length;
           relaunched.sendInput("/quit");
           relaunched.closeInput();
           const result = await relaunched.completion;
           expect(result.code, result.stderr).toBe(0);
+          expect(result.stderr).toBe("");
           expect(result.forcedTermination).toBeNull();
           expect(result.pid).not.toBeUndefined();
           expect(`${result.stdout}\n${result.stderr}`).not.toContain(canary);
@@ -568,7 +544,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           const finalTrace = readLifecycleHookTrace(lifecycle!.lifecycleTrace);
           expect(finalTrace.length).toBeGreaterThan(traceLengthBeforeQuit);
           expect(finalTrace.at(-1)).toMatchObject({ event: "SessionEnd" });
-          expectLifecycleAttribution(finalTrace.slice(relaunchTraceBaseline), hookRunId, relaunched.pid, relaunchTraceBaseline);
+          expectLifecycleAttribution(finalTrace.slice(relaunchTraceBaseline), hookRunId, relaunchedPiPid, relaunchTraceBaseline);
           for (const record of finalTrace) {
             expect(() => process.kill(record.hookChildPid, 0)).toThrow();
           }
@@ -609,7 +585,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       });
 
       expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
       expect(result.requests).toHaveLength(2);
+      expect(toolNames(result.requests[0]!).filter((name) => name === "Grep")).toHaveLength(1);
       const expected = [
         "search-target.txt:1:MODEL_BOUNDARY_NEEDLE first distinct payload",
         "search-target.txt:3:MODEL_BOUNDARY_NEEDLE second distinct payload",
@@ -784,7 +762,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       });
 
       expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
       expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
+      expect(toolNames(result.requests[0]!).filter((name) => name === "write")).toHaveLength(1);
       const records = result.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line) as any);
       expect(result.stdout).not.toMatch(TOOL_ROW_PRESENTATION);
       expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
@@ -918,10 +898,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           expect(result.stderr).toContain("UV_HANDLE_CLOSING");
         } else {
           expect(result.code, result.stderr).toBe(0);
+          expect(result.stderr).toBe("");
         }
         expect(result.requests.map((request) => request.requestKind)).toEqual([
           "ordinary", "ordinary", "compaction", "ordinary", "ordinary",
         ]);
+        expect(toolNames(result.requests[0]!).filter((name) => name === "write")).toHaveLength(1);
         const ordinaryRequests = result.requests.filter((request) => request.requestKind === "ordinary");
         const orderedUserTurns = ordinaryRequests.map(userTurns);
         expect(orderedUserTurns[0]).toEqual([userTurn(initialPrompt)]);

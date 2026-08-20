@@ -1,18 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as piTui from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { waitUntil } from "./helpers/async.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
-const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = piRequire("@earendil-works/pi-tui") as any;
 const bindingDefinitions = {
   ...piTui.TUI_KEYBINDINGS,
-  "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+  "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
 };
 
 const cases = [

@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import { toolResultHasGuardClipping } from "./guard.js";
 import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import { sanitizeDisplayText, themedFg } from "./render-util.js";

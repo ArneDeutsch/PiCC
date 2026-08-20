@@ -1,4 +1,4 @@
-import { Type } from "typebox";
+import { Type } from "../runtime-host.js";
 import type { Diagnostic } from "../types.js";
 import { agentTrailerFrame, agentTrailerLine, isAgentId } from "../util/subagent-transcripts.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";

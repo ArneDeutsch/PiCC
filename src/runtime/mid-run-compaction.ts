@@ -1,7 +1,7 @@
 /** Session-local coordination for proactive mid-run context checkpoints. */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { calculateContextTokens } from "@earendil-works/pi-agent-core";
+import { calculateContextTokens } from "../runtime-host.js";
 import { isProactiveCompactionApi } from "../registry/capability-registry.js";
 import { toolResultHasGuardClipping } from "./guard.js";
 
@@ -1506,7 +1506,7 @@ export class MidRunCompactionController {
    * controller publishes exactly once *whenever every adapter promise it awaits settles*.
    * It cannot make `compact`, `replay`, `replayComplete`, or `cancelAndJoin` return, so a
    * host that never answers still parks the transition joining it. Totality of those
-   * waits belongs to the resume adapter's `conclude` in `src/index.ts`, which ends the
+   * waits belongs to the resume adapter's `conclude` in `src/extension.ts`, which ends the
    * resumed run on every exit instead of waiting for a host event that may never arrive.
    */
   private publishExit(

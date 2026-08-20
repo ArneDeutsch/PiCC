@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 
 // Shared width/theme discipline for PiCC-owned TUI rows. Theme methods are
 // untrusted extension seams: accept only balanced SGR that preserves the exact

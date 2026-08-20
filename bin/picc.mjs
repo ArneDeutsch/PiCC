@@ -53,7 +53,7 @@ async function main() {
     ]);
     const packageRoot = admin.findPackageRoot(import.meta.url);
     const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-    if (manifest?.name !== "@arnedeutsch/picc" || !admin.parseStableExactVersion(manifest.version)) throw new Error("invalid manifest");
+    if (manifest?.name !== "@arnedeutsch/picc" || manifest.type !== "module" || !admin.parseStableExactVersion(manifest.version)) throw new Error("invalid manifest");
     const installationKind = admin.classifyInstallation({ packageRoot });
     const argv = process.argv.slice(2);
     const first = argv[0];
@@ -118,25 +118,12 @@ async function main() {
       return;
     }
 
-    let selection;
+    let host;
     try {
-      selection = await selectRuntime(packageRoot, installationKind);
-    } catch {
-      return fail(installationKind === "source"
-        ? "PiCC: runtime selection is unavailable. Run `npm run build` from the PiCC checkout root, then exit and relaunch PiCC."
-        : "PiCC: runtime selection is unavailable. TypeScript source was not used. Run `picc update`; if PiCC is managed by another installation owner, repair or reinstall it through that owner.");
-    }
-    if (!selection.ok) return fail(runtimeFailure(selection, installationKind));
-    if (selection.notice) console.error(selection.notice.message);
-
-    const resolution = admin.resolvePiCli(packageRoot);
-    if (!resolution.ok) return fail(`PiCC: ${resolution.reason}`);
-    let extension;
-    try {
-      extension = admin.canonicalPath(path.join(packageRoot, ...selection.entries.extensionPath.split("/")));
-      if (!admin.isPathInside(extension, packageRoot) || !fs.statSync(extension).isFile()) throw new Error();
+      host = admin.physicalPath(path.join(packageRoot, "bin", "picc-host.mjs"));
+      if (!admin.isPathInside(host, packageRoot) || !fs.statSync(host).isFile()) throw new Error();
     } catch { return fail(INITIALIZATION_FAILED); }
-    const child = spawn(process.execPath, ["--enable-source-maps", resolution.cli, "-e", extension, ...argv], {
+    const child = spawn(process.execPath, ["--enable-source-maps", host, ...argv], {
       stdio: "inherit",
       env: {
         ...process.env,
@@ -147,7 +134,7 @@ async function main() {
       },
     });
     admin.wireChildLifecycle(child, {
-      onSpawnError: () => fail(SPAWN_FAILED),
+      onSpawnError: () => { fail(SPAWN_FAILED); },
       onExitCode: (code) => { process.exitCode = code; },
       onSignal: (signal) => { process.kill(process.pid, signal); },
     });

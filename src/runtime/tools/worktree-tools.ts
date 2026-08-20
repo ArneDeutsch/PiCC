@@ -1,6 +1,6 @@
 import path from "node:path";
-import { Type } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "../../runtime-host.js";
+import { StringEnum } from "../../runtime-host.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HookRunner } from "../../engine/hook-runner.js";
 import type { HookOutcome } from "../../types.js";

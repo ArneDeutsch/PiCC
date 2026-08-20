@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "../runtime-host.js";
 import type { PostCommitStage } from "./mid-run-compaction.js";
 import type { RetainedInputReport } from "./retained-input-report.js";
 

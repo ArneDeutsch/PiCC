@@ -29,7 +29,7 @@ import { projectIdentities } from "../src/util/project-identity.js";
  *    request the model receives carries any `mcp__*` tool definition and the
  *    system prompt is identical to a no-MCP baseline.
  * 2. Round-trip + death: an enabled stdio server's tool is advertised on the
- *    first request (the first-turn settle barrier in src/index.ts — a
+ *    first request (the first-turn settle barrier in src/extension.ts — a
  *    contract, not a race),
  *    the model calls it, the real result rides the next request's tool
  *    message, and the server process dies with the session.

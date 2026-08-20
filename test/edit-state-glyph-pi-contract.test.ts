@@ -1,10 +1,9 @@
-import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import {
+  Box,
   getKeybindings,
   KeybindingsManager,
   setKeybindings,
@@ -26,9 +25,6 @@ import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js"
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { waitUntil } from "./helpers/async.js";
 
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
-
 function stripAnsi(value: string): string {
   return value
     .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
@@ -48,19 +44,14 @@ function productionDefinition(definition: EditDefinition): ToolDefinition {
 }
 
 function installExpandBinding(): () => void {
-  const previousRoot = getKeybindings();
-  const previousPi = piTui.getKeybindings();
+  const previous = getKeybindings();
   const bindings: KeybindingsConfig = { "app.tools.expand": ["ctrl+o"] };
   const definitions = {
     ...TUI_KEYBINDINGS,
     "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
   };
-  setKeybindings(new KeybindingsManager(definitions, { "app.tools.expand": ["ctrl+k"] }));
-  piTui.setKeybindings(new piTui.KeybindingsManager(definitions, bindings));
-  return () => {
-    piTui.setKeybindings(previousPi);
-    setKeybindings(previousRoot);
-  };
+  setKeybindings(new KeybindingsManager(definitions, bindings));
+  return () => { setKeybindings(previous); };
 }
 
 function initializedTheme(): Theme {
@@ -86,12 +77,26 @@ function expectNativeDiffForeground(calls: Array<[color: ThemeColor, text: strin
   ]));
 }
 
+function expectRootEditBoxBackgroundNeutralized(): void {
+  const background = vi.fn((text: string) => text);
+  const box = new Box(0, 0, background);
+  box.addChild({ render: () => ["root Edit content"], invalidate() {} });
+  const definition = withRoutineToolRendering({
+    name: "edit",
+    execute() {},
+    renderCall: () => box,
+  } as unknown as ToolDefinition);
+  const component = definition.renderCall?.({}, undefined as never, {} as never);
+  expect(component?.render(80).map((line) => line.trimEnd())).toEqual(["root Edit content"]);
+  expect(background).not.toHaveBeenCalled();
+}
+
 describe("Edit state glyph production composition", () => {
-  it("neutralizes pending/success/error backgrounds across Edit preview and repeated result renders", async () => {
+  it("neutralizes a public-root Edit Box while retaining pending/success/error lifecycle and glyph behavior", async () => {
     initTheme();
     const theme = initializedTheme();
-    const bg = vi.spyOn(theme, "bg");
     const fg = vi.spyOn(theme, "fg");
+    expectRootEditBoxBackgroundNeutralized();
     const restoreBinding = installExpandBinding();
     const directory = mkdtempSync(join(tmpdir(), "picc-edit-glyph-"));
     const filePath = "target.ts";
@@ -163,20 +168,15 @@ describe("Edit state glyph production composition", () => {
       expectOneGlyph(error, "✗");
       expect(stripAnsi(error.join("\n"))).toContain("Edit failed visibly");
 
-      expect(bg.mock.calls.filter(([slot]) =>
-        slot === "toolPendingBg" || slot === "toolSuccessBg" || slot === "toolErrorBg"
-      )).toEqual([]);
     } finally {
       fg.mockRestore();
-      bg.mockRestore();
       restoreBinding();
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  it("retains preview-failure refusal while keeping its elaborated Edit row background-free", async () => {
+  it("retains preview-failure refusal in the elaborated Edit row", async () => {
     initTheme();
-    const bg = vi.spyOn(initializedTheme(), "bg");
     const restoreBinding = installExpandBinding();
     const directory = mkdtempSync(join(tmpdir(), "picc-edit-glyph-preview-failure-"));
     try {
@@ -199,9 +199,7 @@ describe("Edit state glyph production composition", () => {
       expectOneGlyph(lines, "●");
       expect(stripAnsi(lines.join("\n"))).toContain("Edit preview failed:");
       expect(stripAnsi(lines.join("\n"))).toContain("old");
-      expect(bg.mock.calls.filter(([slot]) => String(slot).startsWith("tool") && String(slot).endsWith("Bg"))).toEqual([]);
     } finally {
-      bg.mockRestore();
       restoreBinding();
       rmSync(directory, { recursive: true, force: true });
     }

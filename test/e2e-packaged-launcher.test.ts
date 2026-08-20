@@ -15,6 +15,7 @@ import {
   systemText,
   toolNames,
   toolResultText,
+  userText,
 } from "./helpers/e2e-live.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import {
@@ -52,7 +53,7 @@ function readSourceManifest(): SourceManifest {
   };
 }
 
-const { runPi, cleanup } = createE2ELive({ runtime: "installed-launcher" });
+const { startPi, runPi, cleanup } = createE2ELive({ runtime: "installed-launcher" });
 const sourceManifest = readSourceManifest();
 const expectedPiPins = PI_SUITE_PACKAGES.map((name) => sourceManifest.dependencies[name]);
 const expectedPiVersion = expectedPiPins[0]!;
@@ -242,9 +243,6 @@ it(
     const fixtureSource = path.join(REPO_ROOT, "examples", "full-surface");
     const fixtureBefore = treeSnapshot(fixtureSource);
     const packageBefore = treeSnapshot(packageRoot);
-    const runtimeEntrypoint = path.join(packageRoot, "picc", "index.ts");
-    const savedRuntimeEntrypoint = fs.readFileSync(runtimeEntrypoint);
-    const packagedRuntimeCanary = path.join(root, "packaged-runtime-canary");
     const preloadCanary = path.join(root, "packaged-preload-canary");
     const preloadScript = path.join(root, "packaged-preload-canary.cjs");
     fs.writeFileSync(preloadScript, `require("node:fs").writeFileSync(${JSON.stringify(preloadCanary)}, "executed");\n`);
@@ -283,7 +281,6 @@ it(
       });
     });
     try {
-      fs.writeFileSync(runtimeEntrypoint, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(packagedRuntimeCanary)}, "executed"); export default function canary() {}\n`);
       const added = await run([
         "marketplace", "add", LIFECYCLE_MARKETPLACE,
         "--source", "local-directory", path.join(lifecycle.project, "lifecycle-marketplace"),
@@ -347,14 +344,12 @@ it(
       expect(networkDescriptor).toContain("127.0.0.1");
       expect(fs.existsSync(lifecycle.lifecycleTrace)).toBe(false);
       expect(fs.existsSync(lifecycle.runtimeCanary)).toBe(false);
-      expect(fs.existsSync(packagedRuntimeCanary)).toBe(false);
       expect(fs.existsSync(preloadCanary)).toBe(false);
     } finally {
       const cleanupErrors: unknown[] = [];
       const cleanupStep = async (step: () => void | Promise<void>) => {
         try { await step(); } catch (error) { cleanupErrors.push(error); }
       };
-      await cleanupStep(() => fs.writeFileSync(runtimeEntrypoint, savedRuntimeEntrypoint));
       await cleanupStep(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
       await cleanupStep(() => lifecycle.cleanup());
       await cleanupStep(() => cleanupFixture(project));
@@ -412,7 +407,8 @@ describe("installed release tarball", () => {
         "CONTRIBUTING.md", "LICENSE", "README.md", "bin", "dist", "doc", "examples",
         "package.json", "picc", "src",
       ]);
-      expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.js", "index.ts"]);
+      expect(fs.readdirSync(path.join(packageRoot, "picc")).sort()).toEqual(["index.ts"]);
+      expect(fs.statSync(path.join(packageRoot, "bin", "picc-host.mjs")).isFile()).toBe(true);
       expect(fs.existsSync(path.join(packageRoot, "scripts"))).toBe(false);
       expect(fs.existsSync(path.join(packageRoot, "tsconfig.runtime.json"))).toBe(false);
       const runtimeManifest = JSON.parse(
@@ -422,10 +418,12 @@ describe("installed release tarball", () => {
         files: Array<{ path: string }>;
       };
       expect(runtimeManifest.entries).toEqual({
-        extension: "picc/index.js",
+        extension: "picc/index.ts",
         pluginInventory: "dist/plugin-inventory-cli.js",
         mcpAdministration: "dist/mcp-administration-cli.js",
       });
+      expect(runtimeManifest.files.filter((record) => record.path.startsWith("picc/")))
+        .toEqual([{ path: "picc/index.ts", sha256: expect.any(String) }]);
       for (const entry of [
         "dist/index.js",
         "dist/plugin-inventory-cli.js",
@@ -450,26 +448,74 @@ describe("installed release tarball", () => {
       expect(version).toContain("Install installed");
 
       const command = "node -e 'const e=process.env; console.log(JSON.stringify({sessionId:e.PI_SESSION_ID??null,sessionFile:e.PI_SESSION_FILE??null,provider:e.PI_PROVIDER??null,model:e.PI_MODEL??null,reasoning:e.PI_REASONING_LEVEL??null,project:e.CLAUDE_PROJECT_DIR??null,setting:e.PACKAGED_SETTING??null,skip:e.PI_SKIP_VERSION_CHECK??null,launcher:e.PICC_LAUNCHER_PID??null}))'";
-      const result = await runPi({
+      const packagedProbePrompt = "run the packaged environment probe";
+      const live = await startPi({
         launcherPath: launcher,
-        fixture: "full-surface",
-        agent: "selected-main",
-        prompt: "run the packaged environment probe",
+        fixture: "hello-claude",
+        agent: "packaged-main",
+        prompt: "unused",
+        interactiveTerminal: true,
         script: [
           { toolCalls: [{ name: "bash", args: { command } }] },
           { text: "PACKAGED_EXTENSION_OK" },
+          { text: "PACKAGED_AFTER_RELOAD" },
         ],
         setup(fixture) {
+          fs.writeFileSync(
+            path.join(fixture, ".claude", "agents", "packaged-main.md"),
+            [
+              "---",
+              "name: packaged-main",
+              "description: Minimal selected identity for the packaged launcher witness",
+              "tools:",
+              "  - Bash",
+              "  - Agent",
+              "initialPrompt: \"PACKAGED-MAIN-INITIAL\"",
+              "---",
+              "PACKAGED-MAIN-BODY",
+              "",
+            ].join("\n"),
+          );
           const settingsPath = path.join(fixture, ".claude", "settings.json");
           const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
           settings.env = { PACKAGED_SETTING: "configured-value" };
           fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
         },
       });
+      const firstPhaseDeadline = Date.now() + 60_000;
+      const remainingFirstPhaseBudget = (milestone: string): number => {
+        const remainingMs = firstPhaseDeadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error(`Packaged launch first-phase budget exhausted before ${milestone}`);
+        }
+        return remainingMs;
+      };
+      await live.waitForText(
+        "PACKAGED-MAIN-INITIAL",
+        remainingFirstPhaseBudget("packaged-main readiness"),
+      );
+      live.sendInput(packagedProbePrompt);
+      await live.waitForRequest(
+        (request) => userText(request).includes(packagedProbePrompt),
+        1,
+        remainingFirstPhaseBudget("packaged probe request admission"),
+      );
+      await live.waitForText(
+        "PACKAGED_EXTENSION_OK",
+        remainingFirstPhaseBudget("packaged extension response"),
+      );
+      live.sendInput("/reload");
+      await live.waitForText("Reloaded keybindings, extensions", 30_000);
+      live.sendInput("prove the packaged runtime after reload");
+      await live.waitForText("PACKAGED_AFTER_RELOAD", 30_000);
+      live.sendInput("/quit");
+      live.closeInput();
+      const result = await live.completion;
 
       expect(result.code, result.stderr).toBe(0);
-      expect(result.requests.length).toBeGreaterThanOrEqual(2);
-      expect(systemText(result.requests[0]!)).toContain("FS-SELECTED-MAIN-BODY");
+      expect(result.requests.length).toBeGreaterThanOrEqual(3);
+      expect(systemText(result.requests[0]!)).toContain("PACKAGED-MAIN-BODY");
+      expect(systemText(result.requests.at(-1)!)).toContain("PACKAGED-MAIN-BODY");
       expect(toolNames(result.requests[0]!)).toContain("Agent");
       const bash = toolResultText(result.requests[1]!);
       expect(bash).toContain('"sessionId":null');
@@ -482,18 +528,16 @@ describe("installed release tarball", () => {
       expect(bash).toContain('"launcher":null');
       expect(bash).toContain(`"project":${JSON.stringify(result.fixture)}`);
       expect(result.stdout).toContain("PACKAGED_EXTENSION_OK");
+      expect(result.stdout).toContain("PACKAGED_AFTER_RELOAD");
       expect(result.stderr).not.toMatch(/latest-version|api\.openai\.com|anthropic\.com/iu);
 
-      const compiledEntry = path.join(packageRoot, "dist", "index.js");
-      const sourceEntry = path.join(packageRoot, "picc", "index.ts");
-      const originalCompiled = fs.readFileSync(compiledEntry);
-      const originalSource = fs.readFileSync(sourceEntry);
-      const sourceCanary = path.join(temporaryDirectory("picc-packaged-tamper-"), "source-executed");
+      const bootstrapEntry = path.join(packageRoot, "picc", "index.ts");
+      const originalBootstrap = fs.readFileSync(bootstrapEntry);
+      const bootstrapCanary = path.join(temporaryDirectory("picc-packaged-tamper-"), "bootstrap-executed");
       try {
-        fs.appendFileSync(compiledEntry, "\n");
         fs.writeFileSync(
-          sourceEntry,
-          `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sourceCanary)}, "executed"); export default function canary() {}\n`,
+          bootstrapEntry,
+          `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(bootstrapCanary)}, "executed"); export default function canary() {}\n`,
         );
         const tampered = await runPi({
           launcherPath: launcher,
@@ -503,10 +547,9 @@ describe("installed release tarball", () => {
         expect(tampered.code).toBe(1);
         expect(tampered.requests).toHaveLength(0);
         expect(tampered.stderr).toContain("installed PiCC runtime is damaged");
-        expect(fs.existsSync(sourceCanary)).toBe(false);
+        expect(fs.existsSync(bootstrapCanary)).toBe(false);
       } finally {
-        fs.writeFileSync(compiledEntry, originalCompiled);
-        fs.writeFileSync(sourceEntry, originalSource);
+        fs.writeFileSync(bootstrapEntry, originalBootstrap);
       }
     },
     TEST_TIMEOUT_MS,

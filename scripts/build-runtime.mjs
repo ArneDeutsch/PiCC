@@ -102,7 +102,7 @@ export function buildRuntime({
 
     const files = [
       ...outputPaths.map((output) => ({ path: `dist/${output}`, sha256: sha256File(fileSystem, path.join(stage, ...output.split("/"))) })),
-      { path: "picc/index.js", sha256: sha256File(fileSystem, path.join(root, "picc", "index.js")) },
+      { path: "picc/index.ts", sha256: sha256File(fileSystem, path.join(root, "picc", "index.ts")) },
     ].sort((left, right) => bytewiseCompare(left.path, right.path));
     const runtimeDigest = createHash("sha256").update(Buffer.from(JSON.stringify(files), "utf8")).digest("hex");
     const after = collectCompilationIdentity(root);
@@ -116,7 +116,7 @@ export function buildRuntime({
       sourceDigest: before.sourceDigest,
       files,
       runtimeDigest,
-      entries: { extension: "picc/index.js", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
+      entries: { extension: "picc/index.ts", pluginInventory: "dist/plugin-inventory-cli.js", mcpAdministration: "dist/mcp-administration-cli.js" },
     };
     fileSystem.writeFileSync(path.join(stage, "picc-runtime.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
 

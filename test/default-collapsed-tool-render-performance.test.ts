@@ -1,8 +1,11 @@
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
+import {
+  getKeybindings,
+  KeybindingsManager,
+  setKeybindings,
+  TUI_KEYBINDINGS,
+} from "@earendil-works/pi-tui";
 import {
   type DisplayOperationAuthority,
   withDefaultCollapsedToolRendering,
@@ -15,20 +18,18 @@ interface RenderTool {
   renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): Component;
 }
 
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
 const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
-let previousBindings: ReturnType<typeof piTui.getKeybindings>;
+let previousBindings: ReturnType<typeof getKeybindings>;
 
 beforeEach(() => {
-  previousBindings = piTui.getKeybindings();
-  piTui.setKeybindings(new piTui.KeybindingsManager({
+  previousBindings = getKeybindings();
+  setKeybindings(new KeybindingsManager({
     ...TUI_KEYBINDINGS,
     "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
   }, { "app.tools.expand": ["ctrl+o"] }));
 });
 
-afterEach(() => piTui.setKeybindings(previousBindings));
+afterEach(() => setKeybindings(previousBindings));
 
 function countedEnvelope(text: string, extra: Record<string, unknown> = {}) {
   const counts = { envelopeGets: 0, blockGets: 0, bodyGets: 0, ownKeys: 0 };

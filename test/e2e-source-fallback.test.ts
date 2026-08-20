@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { PI_SUITE_PACKAGES } from "../bin/picc-admin.mjs";
+import { canonicalPath, PI_SUITE_PACKAGES } from "../bin/picc-admin.mjs";
 import {
   allText,
   cliMissing,
@@ -81,22 +81,6 @@ function isolatedCheckout(): {
   materializeNodeModules(root);
   const extensionCanary = path.join(root, "source-extension-canary.jsonl");
   const pluginCanary = path.join(root, "source-plugin-canary.jsonl");
-  fs.writeFileSync(path.join(root, "picc", "index.ts"), [
-    'import fs from "node:fs";',
-    'import picc from "../src/index.js";',
-    `const witness = ${JSON.stringify(extensionCanary)};`,
-    'const sourcePath = import.meta.url;',
-    'const record = (type: string) => fs.appendFileSync(witness, JSON.stringify({ type, producerPid: process.pid, sourcePath }) + "\\n");',
-    'export default async function sourceWitness(pi: any) {',
-    '  record("source-factory");',
-    '  await picc(pi);',
-    `  pi.registerCommand(${JSON.stringify(SOURCE_RELOAD_COMMAND)}, {`,
-    '    description: "Reload the isolated source representation witness",',
-    '    handler: async (_args: string, ctx: any) => { await ctx.reload(); },',
-    '  });',
-    '}',
-    '',
-  ].join("\n"));
   const driftedSource = path.join(root, "src", "plugin-inventory-cli.ts");
   fs.appendFileSync(driftedSource, [
     '',
@@ -166,6 +150,18 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
       prompt: "unused",
       modeArgs: ["--mode", "rpc"],
       lifecycleIsolation: true,
+      setup(fixtureDir) {
+        const extensionDir = path.join(fixtureDir, ".pi", "extensions");
+        fs.mkdirSync(extensionDir, { recursive: true });
+        fs.writeFileSync(path.join(extensionDir, "source-host-witness.ts"), [
+          'import fs from "node:fs";',
+          `const witness = ${JSON.stringify(isolated.extensionCanary)};`,
+          'export default function sourceHostWitness(pi: any) {',
+          '  fs.appendFileSync(witness, JSON.stringify({ type: "host-extension", producerPid: process.pid, parentPid: process.ppid, argv: process.argv.slice(2), cliPath: process.argv[1] }) + "\\n");',
+          `  pi.registerCommand(${JSON.stringify(SOURCE_RELOAD_COMMAND)}, { description: "Reload source witness", handler: async (_args: string, ctx: any) => { await ctx.reload(); } });`,
+          '}',
+        ].join("\n"));
+      },
       extraEnv: {
         PICC_SOURCE_PLUGIN_CANARY: isolated.pluginCanary,
         PICC_CLAUDE_USER_DIR: lifecycle.userDir,
@@ -187,16 +183,19 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
         throw new Error(`${String(error)}\nstdout:\n${failed.stdout}\nstderr:\n${failed.stderr}`);
       }
 
-      const readSourceFactories = () => fs.readFileSync(isolated.extensionCanary, "utf8").trim().split(/\r?\n/u)
+      const readHostObservations = () => fs.readFileSync(isolated.extensionCanary, "utf8").trim().split(/\r?\n/u)
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { type: string; producerPid: number; sourcePath: string })
-        .filter((observation) => observation.type === "source-factory");
-      const initialFactories = readSourceFactories();
-      expect(initialFactories.length).toBeGreaterThan(0);
-      expect(initialFactories.every((observation) => Number.isSafeInteger(observation.producerPid) &&
-        observation.producerPid !== process.pid && observation.sourcePath.endsWith("/picc/index.ts"))).toBe(true);
-      const childPid = initialFactories.at(-1)!.producerPid;
-      const childFactoryCount = initialFactories.filter((observation) => observation.producerPid === childPid).length;
+        .map((line) => JSON.parse(line) as { type: string; producerPid: number; parentPid: number; argv: string[]; cliPath: string })
+        .filter((observation) => observation.type === "host-extension");
+      const initialHosts = readHostObservations();
+      const nativeBootstrap = canonicalPath(path.join(isolated.root, "picc", "index.ts"));
+      const nativeCli = canonicalPath(path.join(isolated.root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"));
+      expect(initialHosts.length).toBeGreaterThan(0);
+      expect(initialHosts.every((observation) => Number.isSafeInteger(observation.producerPid) &&
+        observation.producerPid !== process.pid && observation.producerPid !== live.pid && observation.parentPid === live.pid &&
+        observation.argv.slice(0, 2).join("\0") === ["-e", nativeBootstrap].join("\0") && observation.cliPath === nativeCli)).toBe(true);
+      const childPid = initialHosts.at(-1)!.producerPid;
+      const childFactoryCount = initialHosts.filter((observation) => observation.producerPid === childPid).length;
 
       fs.writeFileSync(isolated.driftedSource, fs.readFileSync(path.join(REPO_ROOT, "src", "plugin-inventory-cli.ts")));
       expect(fs.readFileSync(isolated.driftedSource).equals(
@@ -215,11 +214,12 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
       }));
       await live.waitForOutput((record) => record.type === "response" &&
         record.id === "reload-source-witness" && record.command === "prompt" && record.success === true, 150_000);
-      const reloadedFactories = readSourceFactories();
-      expect(reloadedFactories.filter((observation) => observation.producerPid === childPid).length)
+      const reloadedHosts = readHostObservations();
+      expect(reloadedHosts.filter((observation) => observation.producerPid === childPid).length)
         .toBeGreaterThan(childFactoryCount);
-      expect(reloadedFactories.every((observation) => observation.producerPid !== process.pid &&
-        observation.sourcePath.endsWith("/picc/index.ts"))).toBe(true);
+      expect(reloadedHosts.every((observation) => observation.producerPid !== process.pid &&
+        observation.producerPid !== live.pid && observation.parentPid === live.pid &&
+        observation.argv.slice(0, 2).join("\0") === ["-e", nativeBootstrap].join("\0") && observation.cliPath === nativeCli)).toBe(true);
 
       live.sendInput(JSON.stringify({ id: "second", type: "prompt", message: "second source turn" }));
       await live.waitForOutput((record) => record.type === "message_end" &&
@@ -229,7 +229,7 @@ describe.skipIf(cliMissing)("source-checkout fallback", () => {
       const result = await live.completion;
       if (process.platform === "win32" && result.code !== 0) expect(result.code, result.stderr).toBe(3221226505);
       else expect(result.code, result.stderr).toBe(0);
-      expect(result.stderr).toContain("PiCC is using TypeScript source because the compiled runtime does not match this checkout.");
+      expect(result.stderr.match(/PiCC is using TypeScript source because the compiled runtime does not match this checkout\./gu)).toHaveLength(1);
       expect(result.stdout).toContain("SOURCE_FALLBACK_FIRST");
       expect(result.stdout).toContain("SOURCE_FALLBACK_AFTER_BUILD");
       expect(fs.existsSync(preloadCanary)).toBe(false);

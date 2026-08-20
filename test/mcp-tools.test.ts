@@ -1,12 +1,8 @@
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import { buildMcpProxyTool, buildMcpProxyTools, normalizeMcpSchema, type McpToolSource } from "../src/runtime/mcp-tools.js";
 import type { McpToolInfo } from "../src/runtime/mcp.js";
 
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
 const bindingDefinitions = {
   ...TUI_KEYBINDINGS,
   "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
@@ -14,14 +10,9 @@ const bindingDefinitions = {
 const plainTheme = { fg: (_slot: string, text: string) => text };
 
 function withBinding<T>(keys: string[], run: () => T): T {
-  const previousRoot = getKeybindings();
-  const previousPi = piTui.getKeybindings();
-  setKeybindings(new KeybindingsManager(bindingDefinitions));
-  piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions, { "app.tools.expand": keys as never }));
-  try { return run(); } finally {
-    piTui.setKeybindings(previousPi);
-    setKeybindings(previousRoot);
-  }
+  const previous = getKeybindings();
+  setKeybindings(new KeybindingsManager(bindingDefinitions, { "app.tools.expand": keys as never }));
+  try { return run(); } finally { setKeybindings(previous); }
 }
 
 // ---------------------------------------------------------------------------

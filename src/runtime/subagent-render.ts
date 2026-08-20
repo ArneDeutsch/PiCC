@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import {
   formatUsagePresentation,
   sanitizeProgressText,
@@ -24,7 +24,7 @@ import type { SubagentAdmission } from "./subagent-registry.js";
 // --- live-progress + result rendering helpers ---
 //
 // The Agent tool's renderCall/renderResult return a STRUCTURAL pi-tui Component
-// ({ render(width): string[] }) — the same untyped contract index.ts's control
+// ({ render(width): string[] }) — the same untyped contract src/extension.ts's control
 // renderers use, so no pi-tui import is needed. The width/theme helpers
 // (clampLines, pushWrapped, pushColored, themedFg, themedBold) live in
 // render-util.ts, shared with the subagent status panel.
@@ -1999,7 +1999,7 @@ export function renderTaskStopResult(
 
 /**
  * Renderer for the `picc-settlement` custom MESSAGE (registered via
- * `pi.registerMessageRenderer` in index.ts): a never-awaited background
+ * `pi.registerMessageRenderer` in src/extension.ts): a never-awaited background
  * settlement's notice renders as the SAME collapsed-expandable completion
  * record the tool renderers draw, keyed off the structured `details` the
  * settlement send attaches. Only the rendering changes — the model-facing

@@ -147,7 +147,7 @@ describe("toNativeSafeTempForm", () => {
   });
 });
 
-describe("computeSessionScratchDir (index.ts computation seam — revert-catcher)", () => {
+describe("computeSessionScratchDir (src/extension.ts computation seam — revert-catcher)", () => {
   // A backslash-joining stub so the win32 root-selection path is exercised on any host.
   const winJoin = (a: string, b: string) => `${a}\\${b}`;
 

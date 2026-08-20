@@ -10,12 +10,13 @@ import { resolveRealPiCli } from "../../scripts/resolve-real-pi-cli.mjs";
 import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 
 /**
- * Shared harness for the live end-to-end tests: the REAL Pi CLI (dist/cli.js)
- * runs the assembled PiCC extension against a materialized fixture, driven by a
- * local mock OpenAI-compatible model server — no real network, no subscription.
+ * Shared harness for the live end-to-end tests: compiled mode runs through the
+ * PiCC launcher and child host, with a narrow direct-bootstrap mode for the
+ * independent-verification witness. A local mock OpenAI-compatible model server
+ * drives the assembled PiCC extension — no real network, no subscription.
  *
- * Each scenario scripts the model's turns, spawns `pi -p`, and asserts on the
- * requests Pi actually sent to the "model" plus on-disk side effects.
+ * Each scenario scripts the model's turns, starts the selected live runtime,
+ * and asserts on the requests Pi actually sent to the "model" plus on-disk side effects.
  *
  * The stateful part (`runPi` + its per-run temp/fixture bookkeeping) is exposed
  * via the `createE2ELive()` factory so every split `test/e2e-*.test.ts` file gets
@@ -29,7 +30,8 @@ import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const realPiCli = resolveRealPiCli({ repoRoot: REPO_ROOT });
 export const CLI_PATH = realPiCli.cliPath;
-export const COMPILED_EXTENSION_PATH = path.join(REPO_ROOT, "picc", "index.js");
+export const CANONICAL_BOOTSTRAP_PATH = path.join(REPO_ROOT, "picc", "index.ts");
+export const COMPILED_LAUNCHER_PATH = path.join(REPO_ROOT, "bin", "picc.mjs");
 export const cliMissing = realPiCli.missing;
 export const RUN_TIMEOUT_MS = 90_000;
 export const TEST_TIMEOUT_MS = 120_000;
@@ -147,7 +149,7 @@ export interface StartedPi {
   stop(): Promise<void>;
 }
 
-export type E2ERuntime = "compiled" | "source-fallback" | "installed-launcher";
+export type E2ERuntime = "compiled" | "direct-bootstrap" | "source-fallback" | "installed-launcher";
 
 export interface E2ELive {
   startPi: (opts: RunPiOptions) => Promise<StartedPi>;
@@ -344,6 +346,8 @@ export function createE2ELive({
     let forcedTermination: RunResult["forcedTermination"] = null;
     let stdout = "";
     let stderr = "";
+    let spawnErrorOutcome: { code: string | undefined; name: string } | undefined;
+    let closeOutcome: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let closed: Promise<number | null> | undefined;
     const outputRecords: Record<string, unknown>[] = [];
     const outputWaiters = new Set<{
@@ -395,10 +399,10 @@ export function createE2ELive({
     };
     const stop = (): Promise<void> => stopFor("harness-stop");
     try {
-      if (runtime === "compiled" && opts.launcherPath !== undefined) {
-        throw new Error("The compiled E2E runtime selects the verified wrapper directly; launcherPath is forbidden");
+      if ((runtime === "compiled" || runtime === "direct-bootstrap") && opts.launcherPath !== undefined) {
+        throw new Error(`${runtime} E2E runtime owns its launch path; launcherPath is forbidden`);
       }
-      if (runtime !== "compiled" && opts.launcherPath === undefined) {
+      if ((runtime === "source-fallback" || runtime === "installed-launcher") && opts.launcherPath === undefined) {
         throw new Error(`${runtime} E2E runtime requires launcherPath`);
       }
       if (opts.interactiveTerminal && opts.modeArgs !== undefined) {
@@ -450,8 +454,10 @@ export function createE2ELive({
         process.execPath,
         [
           ...(runtime === "compiled"
-            ? [CLI_PATH, "-e", COMPILED_EXTENSION_PATH]
-            : [opts.launcherPath!]),
+            ? [COMPILED_LAUNCHER_PATH]
+            : runtime === "direct-bootstrap"
+              ? [CLI_PATH, "-e", CANONICAL_BOOTSTRAP_PATH]
+              : [opts.launcherPath!]),
           ...(opts.persistSession ? [] : ["--no-session"]),
           ...(opts.agent === undefined ? [] : ["--agent", opts.agent]),
           ...(opts.interactiveTerminal
@@ -494,9 +500,13 @@ export function createE2ELive({
       });
       child.stderr!.on("data", (d: Buffer) => (stderr += d.toString()));
       closed = new Promise<number | null>((resolve, reject) => {
-        child!.once("error", reject);
-        child!.once("close", (code) => {
+        child!.once("error", (error: NodeJS.ErrnoException) => {
+          spawnErrorOutcome = { code: error.code, name: error.name };
+          reject(error);
+        });
+        child!.once("close", (code, signal) => {
           processClosed = true;
+          closeOutcome = { code, signal };
           resolve(code);
         });
       });
@@ -511,6 +521,7 @@ export function createE2ELive({
           await finalizeRun(false);
         }
       })();
+      void completion.catch(() => undefined);
       started = {
         pid: childPid,
         requests: mock.requests,
@@ -531,8 +542,25 @@ export function createE2ELive({
         },
         waitForText: async (text, timeoutMs = 10_000, count = 1) => {
           const deadline = Date.now() + timeoutMs;
-          while ([...`${stdout}\n${stderr}`.matchAll(new RegExp(text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu"))].length < count) {
-            if (Date.now() >= deadline) throw new Error(`Timed out waiting for text ${JSON.stringify(text)}; captured ${stdout.length + stderr.length} bytes`);
+          const pattern = new RegExp(text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu");
+          while ([...`${stdout}\n${stderr}`.matchAll(pattern)].length < count) {
+            const outcome = spawnErrorOutcome
+              ? `spawn error code ${JSON.stringify(spawnErrorOutcome.code ?? null)}; spawn error name ${JSON.stringify(spawnErrorOutcome.name)}`
+              : closeOutcome
+                ? `exit code ${JSON.stringify(closeOutcome.code)}; signal ${JSON.stringify(closeOutcome.signal)}`
+                : undefined;
+            if (outcome) {
+              throw new Error(
+                `Pi process ended before text ${JSON.stringify(text)}; ${outcome}; `
+                + `stdout code units ${stdout.length}; stderr code units ${stderr.length}; mock requests ${mock.requests.length}`,
+              );
+            }
+            if (Date.now() >= deadline) {
+              throw new Error(
+                `Timed out waiting for text ${JSON.stringify(text)}; `
+                + `stdout code units ${stdout.length}; stderr code units ${stderr.length}; mock requests ${mock.requests.length}`,
+              );
+            }
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
         },

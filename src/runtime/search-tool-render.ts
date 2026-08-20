@@ -1,8 +1,4 @@
-import {
-  truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_GREP_HEAD_LIMIT,

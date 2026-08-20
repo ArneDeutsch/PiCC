@@ -1,5 +1,5 @@
 import path from "node:path";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "../runtime-host.js";
 import { sanitizeDisplayText, themedFg } from "./render-util.js";
 
 export interface DisplayComponent { render(width: number): string[] }

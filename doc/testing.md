@@ -91,15 +91,16 @@ This is the canonical list of lanes.
 
 ```bash
 npm ci                   # installs the lockfile, including Pi's CLI for the e2e layer
-npm run typecheck        # strict TypeScript over src/**, no emit
-npm run typecheck:test   # type-check the test suite (test/** + vitest.config.ts)
-npm run typecheck:all    # both of the above
+npm run typecheck           # strict TypeScript over src/**, no emit
+npm run typecheck:test      # type-check the test suite (test/** + vitest.config.ts)
+npm run typecheck:bootstrap # type-check the canonical TypeScript bootstrap
+npm run typecheck:all       # all three type-check lanes above
 npm test                 # unit lane (same as test:unit)
 npm run test:unit        # isolated and mixed unit-owned files
 npm run test:integration # offline whole-extension integration lane
 npm run test:source      # unit/integration, then the build-seeded source-fallback witness
 npm run test:e2e         # packaged, broad compiled, then narrow source-fallback real-Pi lanes
-npm run test:e2e:compiled        # broad real-Pi behavior through explicit compiled selection
+npm run test:e2e:compiled        # broad real-Pi behavior through the compiled launcher/child host
 npm run test:e2e:source-fallback # build-seeded source-selection/reload boundary witness
 npm run test:packaged            # exact scripts-disabled, hard-offline packaged witness
 npm run test:all         # unit, then integration, then e2e
@@ -139,10 +140,10 @@ npm run test:e2e:source-fallback -- test/e2e-source-fallback.test.ts
 npm run test:packaged -- test/e2e-packaged-launcher.test.ts
 ```
 
-Run broad real-Pi files through `test:e2e:compiled`; it explicitly supplies the verified JavaScript
-wrapper and cannot silently substitute source. The source-fallback and packaged files each have a
-separate narrow owning lane. All three focused forms retain the installed-Pi preflight. To select one
-test, pass an anchored
+Run broad real-Pi files through `test:e2e:compiled`; it launches the ordinary compiled
+launcher/child-host boundary and cannot silently substitute source. The source-fallback and packaged
+files each have a separate narrow owning lane. All three focused forms retain the installed-Pi
+preflight. To select one test, pass an anchored
 regular expression containing the full Vitest name, including its `describe` ancestry:
 
 ```bash
@@ -152,9 +153,10 @@ npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool na
 Vitest's `-t` is a regular-expression filter, so an unanchored leaf name is not exact.
 
 The runner is [vitest](https://vitest.dev). Unit and integration tests are TypeScript run through
-`tsx`/vitest and do not require a PiCC runtime build. The e2e layer needs Pi's compiled CLI at
-`node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm ci` provides it. Broad compiled e2e
-requires the current verified PiCC runtime produced by `npm run build` or `npm run setup`.
+`tsx`/vitest and do not require a PiCC runtime build. The e2e layer needs Pi's installed CLI;
+`npm ci` provides it. Broad
+compiled e2e requires the current verified PiCC runtime produced by `npm run build` or
+`npm run setup`.
 `test:e2e:source-fallback` requires the same preparation to seed `dist` before its isolated witness
 copies the product and drifts its own source; it then performs its intentional isolated-checkout
 rebuild during the reload check. Therefore `test:source` also requires one of those preparations,
@@ -221,12 +223,14 @@ degrade. It is the fastest way to test cross-subsystem wiring.
 
 ## Layer 3 — live e2e (real Pi CLI + mock OpenAI model)
 
-The `test/e2e-*.test.ts` files are the highest-fidelity layer. The broad files **spawn the real Pi
-CLI** with explicit `picc/index.js` compiled selection in a materialized `examples/` fixture, pointed
-at a local **mock OpenAI-compatible model server** (`test/helpers/mock-openai.ts`) via a throwaway Pi
-agent dir. No live model or subscription is used, and model traffic stays local. A separate isolated
-source-fallback file proves the disclosed TypeScript path remains source-hosted across reload rather
-than duplicating the broad matrix. The packaged-launcher file performs one lock-driven, hard-offline
+The `test/e2e-*.test.ts` files are the highest-fidelity layer. The broad files **spawn the ordinary
+PiCC launcher and its child-hosted real Pi CLI** with compiled selection in a materialized
+`examples/` fixture, pointed at a local **mock OpenAI-compatible model server**
+(`test/helpers/mock-openai.ts`) via a throwaway Pi agent dir. No live model or subscription is used,
+and model traffic stays local. A narrow case in the broad suite loads the canonical bootstrap
+directly to witness independent verification without duplicating the matrix. A separate isolated
+source-fallback file proves the disclosed TypeScript representation remains source-hosted across
+reload. The packaged-launcher file performs one lock-driven, hard-offline
 consumer install with lifecycle scripts disabled, then proves the exact packed product and its
 fail-closed installed boundary using package archives cached by the preceding repository dependency
 installation.

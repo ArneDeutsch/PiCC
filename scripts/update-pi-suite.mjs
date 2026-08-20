@@ -6,7 +6,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
   PI_SUITE_PACKAGES,
-  canonicalPath,
+  physicalPath,
   discoverNpmCommand,
   discoverTrustedGit,
   findPackageRoot,
@@ -34,7 +34,7 @@ export async function runPiSuiteUpdate(options = {}) {
   const argv = options.argv ?? process.argv.slice(2);
   if (argv.length !== 1 || !parseStableExactVersion(argv[0])) return fail(output, USAGE);
   let root;
-  try { root = canonicalPath(options.packageRoot ?? findPackageRoot(import.meta.url)); }
+  try { root = physicalPath(options.packageRoot ?? findPackageRoot(import.meta.url)); }
   catch { return fail(output, "package root is unavailable."); }
   const git = options.discoverGit ? options.discoverGit() : discoverTrustedGit();
   const npm = options.discoverNpm ? options.discoverNpm() : discoverNpmCommand();

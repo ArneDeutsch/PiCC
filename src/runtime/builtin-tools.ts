@@ -10,6 +10,7 @@
 import { open as fsOpen } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
+import { runtimeHostGraph } from "../runtime-host.js";
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import type { CwdState } from "./cwd-state.js";
 import {
@@ -296,7 +297,7 @@ async function routeReadExecute(
   if (rawPath.toLowerCase().endsWith(".ipynb")) {
     const abs = resolveReadTarget(rawPath, cwd);
     try {
-      const { withFileMutationQueue } = await import("@earendil-works/pi-coding-agent");
+      const { withFileMutationQueue } = runtimeHostGraph.codingAgent;
       const { MAX_NOTEBOOK_BYTES, renderNotebook } = await import("./notebook-render.js");
       const { decodeNotebookText, parseNotebookDocument } = await import("./notebook-edit-core.js");
       const {

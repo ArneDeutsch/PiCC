@@ -1,10 +1,4 @@
-import {
-  getImageDimensions,
-  imageFallback,
-  truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+import { getImageDimensions, imageFallback, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../runtime-host.js";
 import { piTuiCapabilities } from "./pi-tui-runtime.js";
 import { formatToolDisplayName } from "./tool-display.js";
 

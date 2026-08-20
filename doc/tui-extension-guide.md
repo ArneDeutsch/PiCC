@@ -20,10 +20,10 @@ companion to both.
 
 ## 1. The one mental model
 
-**PiCC is a Pi extension, not a fork of Pi's renderer.** The entry point is
-`export default function picc(pi)` in `src/index.ts`, where `pi` is Pi's `ExtensionAPI`. PiCC
-does **not** own the render loop, the scrollback model, or the terminal — it hangs behavior off
-the hooks Pi exposes.
+**PiCC is a Pi extension, not a fork of Pi's renderer.** The implementation entry is
+`export default function picc(pi)` in `src/extension.ts`, where `pi` is Pi's `ExtensionAPI`;
+`picc/index.ts` and `src/index.ts` are bootstrap surfaces. PiCC does **not** own the render loop,
+the scrollback model, or the terminal — it hangs behavior off the hooks Pi exposes.
 
 So the ceiling on "how adaptable is the TUI" is exactly **the extension API surface**. Anything
 inside that API is fair game and upgrade-stable-ish. Anything outside it means patching or
@@ -101,11 +101,11 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see "Colors and themes"). The supported package layout recorded in
-[`doc/pi-integration.md`](pi-integration.md) contains both PiCC's direct `pi-tui` dependency and Pi's
-nested copy. Structural components and stateless width helpers may cross that tested package
-boundary; mutable singleton state and constructor-sensitive operations must resolve through
-`pi-tui-runtime.ts` from Pi's package context. Physical deduplication is optional, not assumed.
+argument **is** Pi's `Theme` (see "Colors and themes"). npm may retain duplicate physical package
+files, but the Pi-hosted process evaluates one host-owned Pi-suite and TypeBox graph. TUI helpers,
+mutable singleton state, and constructor-sensitive operations all come from that graph through
+`runtime-host.ts`; do not construct an independent package instance. See “How PiCC attaches to Pi”
+in [`doc/pi-integration.md`](pi-integration.md).
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
@@ -172,7 +172,7 @@ overview row is PiCC-defined interactive presentation, not Claude Code rendering
   `createCallFallback` (bold tool title) and `createResultFallback` (`getTextOutput` result text),
   so a renderer-less tool gets the same glyph frame without a bespoke renderer.
 - **Built-ins** (`bash`/`read`/`write`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
-  re-registers these for cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block). Their
+  re-registers these for cwd-swap in `src/extension.ts`. Their
   renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`
   factory strips `renderCall`/`renderResult` via `wrapToolDefinition` — while **`execute` stays
   sourced from the plain factory until the one outer checkpoint wrapper**. Edit's narrow call
@@ -363,7 +363,7 @@ and reports conflicts.
   `app.tools.expand` do. That is the user's `keybindings.json`. From code your only levers are:
   - **`ctx.ui.onTerminalInput(handler)`** — raw byte interception; return `{ consume: true }` to
     swallow a key or `{ data }` to rewrite it. **PiCC already uses this** to make forked skills
-    Esc-cancellable (the `pi.on("input", …)` handler in `src/index.ts`). Powerful but
+    Esc-cancellable (the `pi.on("input", …)` handler in `src/extension.ts`). Powerful but
     order-/precedence-sensitive and bypasses the keybinding abstraction — use sparingly and
     document it.
   - **`ctx.ui.setEditorComponent(factory)`** — replace the whole input editor by subclassing
@@ -378,7 +378,7 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 ## 8. Other adaptable surfaces (for completeness)
 
 - **Slash commands** — `pi.registerCommand(name, { description, handler, getArgumentCompletions })`.
-  PiCC's control commands live here (`src/index.ts`).
+  PiCC's control commands live here (`src/extension.ts`).
 - **Custom transcript entries** — `pi.appendEntry(customType, data)` + `pi.registerEntryRenderer`
   (PiCC uses these for control-command output and appends checkpoint lifecycle records; entries do
   **not** enter LLM context). For custom *messages* that do participate, `pi.sendMessage` +

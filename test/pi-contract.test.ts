@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import fs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -29,6 +31,7 @@ import {
 import { fakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
+import { runtimeHostGraph } from "../src/runtime-host.js";
 import {
   genericCallComponent,
   setToolRowOutcome,
@@ -56,6 +59,7 @@ import {
   PI_SUITE_PACKAGES,
   validatePiSuite,
 } from "../bin/picc-admin.mjs";
+import { buildRuntime } from "../scripts/build-runtime.mjs";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -1852,7 +1856,7 @@ describe("pi 0.83.0 API contract", () => {
   });
 
   it("registerMessageRenderer exists on the real ExtensionAPI and sendMessage threads a details param", async () => {
-    // The picc-settlement completion record hangs off BOTH seams: index.ts
+    // The picc-settlement completion record hangs off BOTH seams: src/extension.ts
     // registers a custom-message renderer via pi.registerMessageRenderer and
     // attaches the structured record payload as sendMessage's `details`. A Pi
     // rename/drop must fail here first, not degrade the settlement notice
@@ -2207,7 +2211,7 @@ describe("Codex standalone-summary transport contract", () => {
     const delegated = vi.fn(() => createAssistantMessageEventStream());
     const injectedFetch = vi.fn(async () => new Response()) as typeof fetch;
     vi.resetModules();
-    vi.doMock("@earendil-works/pi-ai/compat", () => ({
+    vi.doMock("../src/runtime-host.js", () => ({
       openAICodexResponsesApi: () => ({ streamSimple: delegated }),
     }));
     try {
@@ -2232,7 +2236,7 @@ describe("Codex standalone-summary transport contract", () => {
         maxRetries: 0,
       });
     } finally {
-      vi.doUnmock("@earendil-works/pi-ai/compat");
+      vi.doUnmock("../src/runtime-host.js");
       vi.resetModules();
     }
   });
@@ -2437,8 +2441,7 @@ describe("real Pi compact-search composition", () => {
   it.each(cases)("keeps real Pi $name remapped and explicitly-unbound detail reachable", async (search) => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     sdk.initTheme();
-    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const piTui: any = runtimeHostGraph.tui;
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
       "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
@@ -2539,8 +2542,7 @@ describe("real Pi compact-search composition", () => {
   });
 
   it.each(cases)("keeps $name HTML export generic under remap and fail-open under explicit unbind", async (search) => {
-    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const piTui: any = runtimeHostGraph.tui;
     const definitions = {
       ...piTui.TUI_KEYBINDINGS,
       "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
@@ -3291,4 +3293,219 @@ describe("ToolExecutionComponent threads the prior render component as ctx.lastC
     expect(call.returned[0]).not.toBe(result.returned[0]);
     expect(result.seen[1]).not.toBe(call.returned[0]);
   });
+});
+
+describe("real Pi loader runtime graph", () => {
+  it("keeps compiled, source, and direct source entries on Pi aliases in exactly the default and forced-native children", () => {
+    const scratchRoot = fs.realpathSync.native(mkdtempSync(join(tmpdir(), "picc-real-loader-")));
+    const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+    const childScript = String.raw`
+      import { createHash } from "node:crypto";
+      import fs from "node:fs";
+      import path from "node:path";
+      import { pathToFileURL } from "node:url";
+      import * as sdk from "@earendil-works/pi-coding-agent";
+
+      const repositoryRoot = process.env.PICC_TEST_ROOT;
+      const scratch = process.env.PICC_TEST_SCRATCH;
+      const seedDist = process.env.PICC_TEST_SEED_DIST;
+      const productFiles = ["bin", "picc", "src", "package.json", "package-lock.json", "tsconfig.runtime.json"];
+      const runtimeDependencies = ["@modelcontextprotocol/sdk", "jsonc-parser", "picomatch", "semver", "tar-stream", "yaml", "yauzl"];
+      const copyProduct = (target) => {
+        fs.mkdirSync(target, { recursive: true });
+        for (const name of productFiles) fs.cpSync(path.join(repositoryRoot, name), path.join(target, name), { recursive: true });
+        const copied = new Set();
+        const copyDependency = (name) => {
+          if (copied.has(name)) return;
+          copied.add(name);
+          const source = path.join(repositoryRoot, "node_modules", ...name.split("/"));
+          if (!fs.existsSync(source)) return;
+          const manifest = JSON.parse(fs.readFileSync(path.join(source, "package.json"), "utf8"));
+          const destination = path.join(target, "node_modules", ...name.split("/"));
+          fs.mkdirSync(path.dirname(destination), { recursive: true });
+          fs.cpSync(source, destination, { recursive: true, filter: (candidate) => !path.relative(source, candidate).split(path.sep).includes("node_modules") });
+          for (const dependency of Object.keys({ ...manifest.dependencies, ...manifest.optionalDependencies })) copyDependency(dependency);
+        };
+        for (const dependency of runtimeDependencies) copyDependency(dependency);
+        const typescriptTarget = path.join(target, "node_modules", "typescript");
+        fs.mkdirSync(typescriptTarget, { recursive: true });
+        fs.copyFileSync(path.join(repositoryRoot, "node_modules", "typescript", "package.json"), path.join(typescriptTarget, "package.json"));
+      };
+      const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+      const compactDigest = (value) => sha256(Buffer.from(JSON.stringify(value), "utf8"));
+      const installHostileCandidates = (root, marker) => {
+        for (const name of ["@earendil-works/pi-agent-core", "@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
+          const directory = path.join(root, "node_modules", ...name.split("/"));
+          fs.rmSync(directory, { recursive: true, force: true });
+          fs.mkdirSync(directory, { recursive: true });
+          fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
+            name, version: "0.0.0-hostile", type: "module",
+            exports: { ".": "./index.js", "./compat": "./index.js", "./compile": "./index.js" },
+          }));
+          fs.writeFileSync(path.join(directory, "index.js"),
+            'import fs from "node:fs"; fs.appendFileSync(' + JSON.stringify(marker) + ', "evaluated\\n"); throw new Error("hostile alias candidate evaluated");');
+        }
+      };
+      const compiledRoot = path.join(scratch, "compiled-product");
+      const sourceRoot = path.join(scratch, "source-product");
+      const compiledSeed = path.join(scratch, "compiled-seed");
+      const hostileCwd = path.join(scratch, "hostile-project");
+      const hostileMarker = path.join(scratch, "hostile-evaluated");
+      copyProduct(compiledRoot);
+      copyProduct(sourceRoot);
+      fs.cpSync(seedDist, path.join(compiledRoot, "dist"), { recursive: true });
+      fs.cpSync(seedDist, compiledSeed, { recursive: true });
+      fs.mkdirSync(path.join(sourceRoot, ".git"));
+      fs.mkdirSync(hostileCwd);
+      installHostileCandidates(hostileCwd, hostileMarker);
+      installHostileCandidates(compiledRoot, hostileMarker);
+      installHostileCandidates(sourceRoot, hostileMarker);
+
+      const probe = path.join(scratch, "host-probe.ts");
+      fs.writeFileSync(probe, [
+        'import * as agentCore from "@earendil-works/pi-agent-core";',
+        'import * as ai from "@earendil-works/pi-ai";',
+        'import * as aiCompat from "@earendil-works/pi-ai/compat";',
+        'import * as codingAgent from "@earendil-works/pi-coding-agent";',
+        'import * as tui from "@earendil-works/pi-tui";',
+        'import * as typebox from "typebox";',
+        'import * as typeboxCompile from "typebox/compile";',
+        'globalThis[Symbol.for("picc.test-host-probe")] = { agentCore, ai, aiCompat, codingAgent, tui, typebox, typeboxCompile };',
+        'export default function probe() {}',
+      ].join("\n"));
+      const options = (root, ...entries) => ({
+        cwd: hostileCwd,
+        agentDir: path.join(scratch, "agent-" + path.basename(root)),
+        settingsManager: sdk.SettingsManager.inMemory({}),
+        additionalExtensionPaths: [probe, ...entries],
+        noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      });
+      const witnesses = {
+        agentCore: ["Agent", "calculateContextTokens"],
+        ai: ["StringEnum", "Type"],
+        aiCompat: ["StringEnum", "openAICodexResponsesApi"],
+        codingAgent: ["SessionManager", "createAgentSession", "defineTool", "withFileMutationQueue"],
+        tui: ["Box", "KeybindingsManager", "getKeybindings", "visibleWidth"],
+        typebox: ["Type", "Object"],
+        typeboxCompile: ["Compile", "Validator"],
+      };
+      const assertGraph = async (root) => {
+        const runtime = await import(pathToFileURL(path.join(root, "bin", "picc-runtime.mjs")).href);
+        const graph = runtime.getRuntimeHostGraph();
+        const host = globalThis[Symbol.for("picc.test-host-probe")];
+        if (!Object.isFrozen(graph)) throw new Error("host graph is mutable");
+        for (const [name, exports] of Object.entries(witnesses)) for (const exported of exports) {
+          if (graph[name][exported] !== host[name][exported]) throw new Error(name + "." + exported + " identity split");
+        }
+        return { runtime, graph };
+      };
+      const extension = (loader) => {
+        const state = loader.getExtensions();
+        if (state.errors.length !== 0) throw new Error(JSON.stringify(state.errors));
+        const found = state.extensions.find((candidate) => candidate.path.endsWith(path.join("picc", "index.ts")));
+        if (!found || path.basename(path.dirname(found.path)) !== "picc") throw new Error("canonical picc label is not visible");
+        return found;
+      };
+      const directExtension = (loader) => {
+        const state = loader.getExtensions();
+        if (state.errors.length !== 0) throw new Error(JSON.stringify(state.errors));
+        const found = state.extensions.find((candidate) => candidate.path.endsWith(path.join("src", "index.ts")));
+        if (!found) throw new Error("direct source entry failed: " + JSON.stringify(state.errors));
+        return found;
+      };
+
+      const compiledLoader = new sdk.DefaultResourceLoader(options(compiledRoot, path.join(compiledRoot, "picc", "index.ts")));
+      await compiledLoader.reload();
+      const compiledFirst = extension(compiledLoader);
+      const compiledState = await assertGraph(compiledRoot);
+      const compiledSelection = compiledState.runtime.selectPiccRuntime({ packageRoot: compiledRoot, installationKind: "installed" });
+      const compiledPin = compiledState.runtime.pinPiccRuntime({ packageRoot: compiledRoot, installationKind: "installed", selection: compiledSelection });
+      if (compiledPin.mode !== "compiled") throw new Error("compiled representation was not pinned");
+      const changedFile = path.join(compiledRoot, "dist", "extension.js");
+      fs.appendFileSync(changedFile, "\n");
+      const manifestPath = path.join(compiledRoot, "dist", "picc-runtime.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      const changedRecord = manifest.files.find((record) => record.path === "dist/extension.js");
+      changedRecord.sha256 = sha256(fs.readFileSync(changedFile));
+      manifest.runtimeDigest = compactDigest(manifest.files);
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      await compiledLoader.reload();
+      const replacementErrors = compiledLoader.getExtensions().errors;
+      if (replacementErrors.length === 0 || !JSON.stringify(replacementErrors).includes("runtime changed")) {
+        throw new Error("compiled valid-generation replacement was not refused: " + JSON.stringify(replacementErrors));
+      }
+
+      const canonicalSourceEntry = path.join(sourceRoot, "picc", "index.ts");
+      const directSourceEntry = path.join(sourceRoot, "src", "index.ts");
+      const sourcePaths = [probe, canonicalSourceEntry];
+      const sourceLoader = new sdk.DefaultResourceLoader({ ...options(sourceRoot), additionalExtensionPaths: sourcePaths });
+      await sourceLoader.reload();
+      const sourceFirst = extension(sourceLoader);
+      const sourceState = await assertGraph(sourceRoot);
+      sourcePaths.splice(1, 1, directSourceEntry);
+      await sourceLoader.reload();
+      const directFirst = directExtension(sourceLoader);
+      await sourceLoader.reload();
+      const directSecond = directExtension(sourceLoader);
+      if (directFirst === directSecond) throw new Error("direct source factory state did not refresh");
+      if (sourceState.runtime.getRuntimeHostGraph() !== sourceState.graph) throw new Error("direct source replaced the retained graph");
+      const sourceSelection = sourceState.runtime.selectPiccRuntime({ packageRoot: sourceRoot, installationKind: "source" });
+      const sourcePin = sourceState.runtime.pinPiccRuntime({ packageRoot: sourceRoot, installationKind: "source", selection: sourceSelection });
+      if (sourcePin.mode !== "source") throw new Error("source representation was not pinned");
+      fs.cpSync(compiledSeed, path.join(sourceRoot, "dist"), { recursive: true });
+      sourcePaths.splice(1, 1, canonicalSourceEntry);
+      await sourceLoader.reload();
+      const sourceSecond = extension(sourceLoader);
+      if (sourceFirst === sourceSecond) throw new Error("source factory state did not refresh");
+      const builtSelection = sourceState.runtime.selectPiccRuntime({ packageRoot: sourceRoot, installationKind: "source" });
+      const retainedSource = sourceState.runtime.pinPiccRuntime({ packageRoot: sourceRoot, installationKind: "source", selection: builtSelection });
+      if (builtSelection.mode !== "compiled" || retainedSource !== sourcePin || retainedSource.mode !== "source") throw new Error("source reload adopted compiled mode: " + JSON.stringify({ builtSelection, samePin: retainedSource === sourcePin, retainedMode: retainedSource.mode }));
+      if (fs.existsSync(hostileMarker)) throw new Error("a hostile cwd or product-root alias candidate evaluated");
+      console.log(JSON.stringify({ compiled: compiledFirst.path, source: sourceSecond.path }));
+    `;
+    try {
+      const seedRoot = join(scratchRoot, "compiled-seed-root");
+      mkdirSync(seedRoot);
+      for (const name of ["src", "picc", "package.json", "package-lock.json", "tsconfig.runtime.json"]) {
+        fs.cpSync(join(repositoryRoot, name), join(seedRoot, name), { recursive: true });
+      }
+      const seedNodeModules = join(seedRoot, "node_modules");
+      fs.symlinkSync(join(repositoryRoot, "node_modules"), seedNodeModules, "junction");
+      try {
+        buildRuntime({ packageRoot: seedRoot });
+      } finally {
+        try {
+          fs.rmSync(seedNodeModules, { recursive: true, force: true });
+        } finally {
+          if (fs.existsSync(seedNodeModules)) throw new Error("isolated build node_modules link remained after seed compilation");
+        }
+      }
+      const seedDist = join(seedRoot, "dist");
+      for (const forced of [false, true]) {
+        const caseScratch = join(scratchRoot, forced ? "forced-native" : "true-default");
+        mkdirSync(caseScratch);
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          PICC_TEST_ROOT: repositoryRoot,
+          PICC_TEST_SCRATCH: caseScratch,
+          PICC_TEST_SEED_DIST: seedDist,
+        };
+        if (forced) env.JITI_TRY_NATIVE = "true";
+        else delete env.JITI_TRY_NATIVE;
+        const result = spawnSync(process.execPath, ["--input-type=module", "-e", childScript], {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          env,
+          timeout: 120_000,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        const observation = JSON.parse(result.stdout.trim()) as { compiled: string; source: string };
+        expect(observation.compiled.replaceAll("\\", "/")).toContain("/compiled-product/picc/index.ts");
+        expect(observation.source.replaceAll("\\", "/")).toContain("/source-product/picc/index.ts");
+        expect((result.stderr.match(/PiCC is using TypeScript source/gu) ?? []).length).toBe(1);
+      }
+    } finally {
+      rmSync(scratchRoot, { recursive: true, force: true });
+    }
+  }, 240_000);
 });

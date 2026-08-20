@@ -1,39 +1,21 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-
-/**
- * Built-in agents wired through the WHOLE extension:
- * Agent/Task registration without project agents, catalog listing, the
- * Explore/Plan CLAUDE.md-skipping prompt, and agent `memory:` injection.
- *
- * The Pi SDK is partially mocked: subagent dispatches get a fake session and a
- * capturing resource loader, everything else stays real.
- */
-
-const h = vi.hoisted(() => ({
-  created: [] as Array<Record<string, unknown>>,
-}));
-
-vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
-  const real = await importOriginal<Record<string, unknown>>();
-  // Shared fake-SDK builder: the session/loader fakes live in one place.
-  const { fakeSdk } = await import("./helpers/fake-sdk.js");
-  const { sdk } = fakeSdk({ replies: ["bi-done"], created: h.created });
-  return {
-    ...real,
-    createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
-    DefaultResourceLoader: sdk.DefaultResourceLoader,
-    SessionManager: { inMemory: () => ({}) },
-    SettingsManager: { inMemory: () => ({}) },
-    getAgentDir: () => "/fake-agent-dir",
-  };
-});
-
 import picc from "../src/index.js";
 import { MEMORY_WRITE_POLICY } from "../src/runtime/context-assembly.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { fakeSdk } from "./helpers/fake-sdk.js";
+
+/**
+ * Built-in agents wired through the whole extension: registration uses the real
+ * installed runtime host, while subagent execution receives a seam-injected fake
+ * SDK. Package mocking is intentionally avoided at the runtime-host bootstrap
+ * boundary because its factory can re-enter the package while it is evaluating.
+ */
+
+const created: Array<Record<string, unknown>> = [];
+const { sdk } = fakeSdk({ replies: ["bi-done"], created });
 
 let dir: string;
 let pi: FakePi;
@@ -45,13 +27,13 @@ async function dispatchAndGetPrompt(subagentType: string): Promise<string> {
   const agentTool = pi.tools.get("Agent");
   // Background is the default, but this helper inspects the subagent session
   // created synchronously during dispatch — pin run_in_background: false so the
-  // dispatch runs foreground and h.created is populated before execute() returns.
+  // dispatch runs foreground and created is populated before execute() returns.
   await agentTool.execute("t", {
     subagent_type: subagentType,
     prompt: "task",
     run_in_background: false,
   });
-  const options = h.created[h.created.length - 1]!;
+  const options = created[created.length - 1]!;
   const loader = options.resourceLoader as { options: Record<string, unknown> };
   return (loader.options.systemPromptOverride as () => string)();
 }
@@ -102,7 +84,7 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  picc(pi.api as never, { sdk, onInitializationSettled: pi.captureInitialization });
   await pi.waitForInitialization();
   await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
@@ -128,7 +110,7 @@ describe("built-in agents through the extension", () => {
       fs.writeFileSync(path.join(bare, "CLAUDE.md"), "bare\n");
       process.chdir(bare);
       const pi2 = fakePi();
-      picc(pi2.api as never, { onInitializationSettled: pi2.captureInitialization });
+      picc(pi2.api as never, { sdk, onInitializationSettled: pi2.captureInitialization });
       await pi2.waitForInitialization();
       await pi2.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
       for (const name of ["Agent", "Task", "TaskOutput", "TaskStop"]) {
@@ -178,8 +160,8 @@ describe("built-in agents through the extension", () => {
   });
 
   it("main-session prompt DOES include the interaction posture", async () => {
-    // Proves index.ts:1046 (before_agent_start) passes includeInteractionPosture: true,
-    // while the :623 subagent call site leaves it unset.
+    // Proves the main-session `before_agent_start` handler in src/extension.ts passes
+    // includeInteractionPosture: true, while buildSubagentSystemPrompt leaves it unset.
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }))
       .systemPrompt as string;
     expect(prompt).toContain("## Working with the user");
