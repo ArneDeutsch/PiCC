@@ -2580,7 +2580,11 @@ export class MainSessionCheckpointGate {
     const observation = { terminated: false, truncated };
     this.batch.successful.set(id, observation);
     this.beginBatch();
-    if (!this.handle || !this.batch.ids.includes(id)) {
+    if (!this.handle) {
+      if (this.generation !== undefined) this.invalidate();
+      return result;
+    }
+    if (!this.batch.ids.includes(id)) {
       this.invalidate();
       return result;
     }

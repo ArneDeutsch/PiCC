@@ -1392,6 +1392,74 @@ describe("MainSessionCheckpointGate", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
+  it("keeps a low ordinary tool turn from poisoning a later explicit high-usage batch", async () => {
+    const { controller, gate } = setup();
+    const lifecycle: string[] = [];
+    let aborts = 0;
+    gate.attachExecution({
+      compact: async () => ({ ok: true }),
+      progress: (event) => lifecycle.push(event.category),
+    });
+    const staleLowCtx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+      hasPendingMessages: () => false,
+      abort: () => { aborts += 1; },
+    };
+    const wrapped: any = gate.wrapTool({
+      name: "probe",
+      execute: async (id: string) => ({ content: [{ type: "text", text: id }], details: { id } }),
+    });
+
+    gate.assistantMessageEnded(completedAssistant(["low"], 100), staleLowCtx);
+    const first = await wrapped.execute("low", {}, undefined, undefined, staleLowCtx);
+    expect(first).toEqual({ content: [{ type: "text", text: "low" }], details: { id: "low" } });
+    gate.toolExecutionEnded({ toolCallId: "low", result: first, isError: false });
+    expect(gate.turnEnded(staleLowCtx, "json")).toBeUndefined();
+    expect(controller.snapshot()).toMatchObject({ generation: 0, phase: "idle" });
+
+    gate.assistantMessageEnded(completedAssistant(["high"], 900), staleLowCtx);
+    const second = await wrapped.execute("high", {}, undefined, undefined, staleLowCtx);
+    expect(second).toEqual({
+      content: [{ type: "text", text: "high" }], details: { id: "high" }, terminate: true,
+    });
+    gate.toolExecutionEnded({ toolCallId: "high", result: second, isError: false });
+    expect(gate.turnEnded(staleLowCtx, "json")?.stop).toBe("terminate");
+    expect(lifecycle.filter((category) => category === "checkpoint-armed")).toHaveLength(1);
+    expect(aborts).toBe(0);
+  });
+
+  it("keeps armed missing and mismatched tool handles fail closed", async () => {
+    const highCtx = {
+      model: { api: "openai-responses", contextWindow: 1000 },
+      getContextUsage: () => usage,
+      hasPendingMessages: () => false,
+      abort: vi.fn(),
+    };
+
+    const missing = new MainSessionCheckpointGate("missing-armed-handle", 90, {}, "total-host");
+    missing.assistantMessageEnded(completedAssistant([], 100, "stop"), highCtx);
+    const missingWrapped: any = missing.wrapTool({
+      name: "probe", execute: async () => ({ content: [], details: {} }),
+    });
+    expect(await missingWrapped.execute("unannounced", {}, undefined, undefined, highCtx))
+      .not.toHaveProperty("terminate", true);
+    expect(missing.settlementGeneration(highCtx)).toBe(missing.currentController().snapshot().generation);
+    expect(missing.currentController().snapshot()).toMatchObject({
+      phase: "exhausted", failureCategory: "operational",
+    });
+
+    const mismatched = setup();
+    mismatched.gate.assistantMessageEnded(completedAssistant(["expected"]), highCtx);
+    const mismatchWrapped: any = mismatched.gate.wrapTool({
+      name: "probe", execute: async () => ({ content: [], details: {} }),
+    });
+    const mismatchResult = await mismatchWrapped.execute("other", {}, undefined, undefined, highCtx);
+    expect(mismatchResult).not.toHaveProperty("terminate", true);
+    mismatched.gate.toolExecutionEnded({ toolCallId: "other", result: mismatchResult, isError: false });
+    expect(mismatched.gate.turnEnded(highCtx)?.stop).toBe("abort");
+  });
+
   it.each(["armed", "stopping"] as const)(
     "makes a %s phase total only under the explicit production host-settlement contract",
     async (phase) => {
