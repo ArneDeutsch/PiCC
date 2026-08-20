@@ -1721,6 +1721,7 @@ interface DefensiveCutoffIdentity {
   batch: MainBatchObservation;
   handle: ToolBatchHandle;
   run: object;
+  occurrence: number;
 }
 
 interface DefensiveContextOccurrence extends DefensiveCutoffIdentity {
@@ -1729,9 +1730,9 @@ interface DefensiveContextOccurrence extends DefensiveCutoffIdentity {
 }
 
 type DefensiveCutoffAuthority =
-  | ({ state: "offered"; context: DefensiveContextOccurrence } & DefensiveCutoffIdentity)
-  | ({ state: "issued"; context: DefensiveContextOccurrence } & DefensiveCutoffIdentity)
-  | ({ state: "bound"; context: DefensiveContextOccurrence; terminal: object } & DefensiveCutoffIdentity);
+  | ({ state: "offered" } & DefensiveCutoffIdentity)
+  | ({ state: "issued" } & DefensiveCutoffIdentity)
+  | ({ state: "bound"; terminal: object } & DefensiveCutoffIdentity);
 
 export interface CheckpointExecutionAdapter {
   compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
@@ -1901,6 +1902,8 @@ export class MainSessionCheckpointGate {
   private abortIssued: { generation: number; run: object } | undefined;
   private defensiveCutoff: DefensiveCutoffAuthority | undefined;
   private defensiveContextOccurrence: DefensiveContextOccurrence | undefined;
+  private defensiveTerminalInputFenceAvailable = false;
+  private occurrence = 0;
   private acceptedBeforeArm: ExpectedInput[] = [];
   private trackedOccurrences: TrackedInputOccurrence[] = [];
   private ambiguousInput = false;
@@ -1972,6 +1975,7 @@ export class MainSessionCheckpointGate {
     this.settledStoppedResume = undefined;
     this.defensiveCutoff = undefined;
     this.defensiveContextOccurrence = undefined;
+    this.occurrence += 1;
   }
 
   /** Revoke run-scoped authority only at a true user-visible settlement. */
@@ -1981,6 +1985,7 @@ export class MainSessionCheckpointGate {
     this.settledStoppedResume = undefined;
     this.defensiveCutoff = undefined;
     this.defensiveContextOccurrence = undefined;
+    this.occurrence += 1;
   }
 
   isLogicalRunStopped(): boolean {
@@ -2077,13 +2082,11 @@ export class MainSessionCheckpointGate {
     };
   }
 
-  /** Bind the one guard-owned custom-message occurrence without trusting its visible fields. */
+  /** Retain opaque occurrence identity only; this send cannot offer or issue cutoff authority. */
   authorizeDefensiveContextSend<T extends Record<string, unknown>>(message: T): T {
     if (this.generation === undefined || !this.handle || this.controller.snapshot().phase !== "stopping") return message;
     if (this.defensiveContextOccurrence) {
-      this.defensiveContextOccurrence = undefined;
-      this.ambiguousInput = true;
-      this.invalidate();
+      this.revokeDefensiveCutoff();
       return message;
     }
     const occurrence: DefensiveContextOccurrence = {
@@ -2094,24 +2097,41 @@ export class MainSessionCheckpointGate {
       batch: this.batch,
       handle: this.handle,
       run: this.batch.run,
+      occurrence: this.occurrence,
       envelope: Object.freeze({}),
     };
     this.defensiveContextOccurrence = occurrence;
     return { ...message, details: occurrence.envelope };
   }
 
+  /** Bind automatic TUI cutoff classification to a live, removable raw-input fence. */
+  setDefensiveTerminalInputFenceAvailable(available: boolean): void {
+    this.defensiveTerminalInputFenceAvailable = available;
+    if (!available) this.revokeDefensiveCutoff();
+  }
+
+  /** Raw TUI input revokes only a live defensive-cutoff window and is never consumed here. */
+  revokeDefensiveCutoffForTerminalInput(): boolean {
+    if (!this.defensiveCutoff) return false;
+    this.revokeDefensiveCutoff();
+    return true;
+  }
+
   assistantMessageEnded(message: unknown, ctx?: MainGateContext): void {
-    if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") return;
     const cutoff = this.defensiveCutoff;
-    const occurrence = this.defensiveContextOccurrence;
-    if (cutoff?.state === "issued" && occurrence === cutoff.context && occurrence.startedMessage &&
-        (message as { stopReason?: unknown }).stopReason === "error" &&
-        this.defensiveCutoffIdentityMatches(cutoff, true) && this.defensiveCutoffIdentityMatches(occurrence, true)) {
+    if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") {
+      if (cutoff) this.defensiveCutoff = undefined;
+      this.defensiveContextOccurrence = undefined;
+      return;
+    }
+    if (cutoff?.state === "issued" && (message as { stopReason?: unknown }).stopReason === "error" &&
+        this.defensiveCutoffIdentityMatches(cutoff, true)) {
       this.defensiveCutoff = { ...cutoff, state: "bound", terminal: message };
+      this.defensiveContextOccurrence = undefined;
     } else if (cutoff?.state !== "bound" || cutoff.terminal !== message) {
       this.defensiveCutoff = undefined;
+      this.defensiveContextOccurrence = undefined;
     }
-    this.defensiveContextOccurrence = undefined;
     const ids = toolCallIds(message);
     if (this.generationSource === "assistant" && this.controller.snapshot().phase === "stopping" &&
         ids.length === this.batch.ids.length && ids.every((id, index) => id === this.batch.ids[index])) return;
@@ -2131,13 +2151,17 @@ export class MainSessionCheckpointGate {
     if (event.isError === true || truncated) this.invalidate();
   }
 
-  turnEnded(ctx: MainGateContext): ToolBatchDisposition | undefined {
+  turnEnded(ctx: MainGateContext, mode?: unknown): ToolBatchDisposition | undefined {
     let pending = false;
     try {
       pending = ctx.hasPendingMessages?.() === true;
     } catch {
       pending = true;
     }
+    const guardOccurrence = this.defensiveContextOccurrence;
+    const ownedGuardPending = pending && guardOccurrence !== undefined &&
+      this.defensiveCutoffIdentityMatches(guardOccurrence, true) && !this.hasUnrelatedPendingInput();
+    const unrelatedPending = pending && !ownedGuardPending;
 
     let completedHandle: ToolBatchHandle | undefined;
     try {
@@ -2155,7 +2179,8 @@ export class MainSessionCheckpointGate {
               }
             }
             if (this.batch.final.size !== this.batch.ids.length ||
-                [...this.batch.final.keys()].some((id) => !this.batch.ids.includes(id)) || pending || this.ambiguousInput) {
+                [...this.batch.final.keys()].some((id) => !this.batch.ids.includes(id)) ||
+                unrelatedPending || this.ambiguousInput) {
               this.controller.invalidateToolBatch(completedHandle);
             }
           }
@@ -2166,18 +2191,16 @@ export class MainSessionCheckpointGate {
     }
 
     if (this.logicalRunStop) {
-      this.abortAfterBatch(ctx);
+      this.abortAfterBatch(ctx, mode);
       return undefined;
     }
     if (!completedHandle) return undefined;
     if (this.batch.toolAborted) this.controller.invalidateToolBatch(completedHandle);
     const disposition = this.controller.completeToolBatch(completedHandle);
-    const context = this.defensiveContextOccurrence;
-    if (disposition.stop === "terminate" && this.handle === completedHandle && context &&
-        this.defensiveCutoffIdentityMatches(context, true) && !this.hasUnrelatedPendingInput()) {
+    if (disposition.complete && disposition.stop === "terminate" && this.handle === completedHandle &&
+        this.automaticDefensiveCutoffAllowed(mode) && !this.hasUnrelatedPendingInput()) {
       this.defensiveCutoff = {
         state: "offered",
-        context,
         controller: this.controller,
         epoch: this.sessionEpoch,
         logicalRun: this.logicalRunIdentity,
@@ -2185,15 +2208,17 @@ export class MainSessionCheckpointGate {
         batch: this.batch,
         handle: completedHandle,
         run: this.batch.run,
+        occurrence: this.occurrence,
       };
     } else {
       this.defensiveCutoff = undefined;
+      this.defensiveContextOccurrence = undefined;
     }
-    if (disposition.stop === "abort") this.abortAfterBatch(ctx);
+    if (disposition.stop === "abort") this.abortAfterBatch(ctx, mode);
     return disposition;
   }
 
-  async beforeProviderRequest(ctx: MainGateContext): Promise<void> {
+  async beforeProviderRequest(ctx: MainGateContext, mode?: unknown): Promise<void> {
     this.resetCompletedGeneration();
     if (!this.logicalRunStop && this.generation === undefined && isProactiveCompactionApi(ctx.model?.api)) {
       let usage: ContextUsageShape | undefined;
@@ -2204,12 +2229,12 @@ export class MainSessionCheckpointGate {
       }
       this.armWithUsage(usage, "admission");
     }
-    await this.defensiveLatch(ctx);
+    await this.defensiveLatch(ctx, mode);
   }
 
-  async defensiveLatch(ctx: MainGateContext): Promise<void> {
+  async defensiveLatch(ctx: MainGateContext, mode?: unknown): Promise<void> {
     if (this.logicalRunStop) {
-      this.abortAfterBatch(ctx);
+      this.abortAfterBatch(ctx, mode);
       return;
     }
     const generation = this.generation;
@@ -2221,7 +2246,7 @@ export class MainSessionCheckpointGate {
       try {
         await barrier.promise;
       } catch {
-        this.abortAfterBatch(ctx);
+        this.abortAfterBatch(ctx, mode);
         return;
       }
       // Opening the latch is not itself transport authority. Cancellation or a
@@ -2231,34 +2256,46 @@ export class MainSessionCheckpointGate {
       const current = this.controller.snapshot();
       if (this.generation !== generation || this.resumeBarrier !== barrier ||
           current.generation !== generation || !this.controller.providerAdmissionAllowed(generation)) {
-        this.abortAfterBatch(ctx);
+        this.abortAfterBatch(ctx, mode);
       }
       return;
     }
     const cutoff = this.defensiveCutoff;
+    if (cutoff?.state === "offered" && !this.automaticDefensiveCutoffAllowed(mode)) {
+      this.abortAfterBatch(ctx, mode);
+      this.revokeDefensiveCutoff();
+      return;
+    }
     const signal = cutoff?.state === "offered" ? publicAbortSignal(ctx.signal) : undefined;
     if (cutoff?.state === "offered" && (!signal || signal.aborted)) {
       this.defensiveCutoff = undefined;
+      this.defensiveContextOccurrence = undefined;
       return;
     }
     const canIssueCutoff = cutoff?.state === "offered" && this.abortIssued === undefined &&
       this.defensiveCutoffIdentityMatches(cutoff, true) && !this.hasUnrelatedPendingInput();
-    const issued = this.abortAfterBatch(ctx);
+    const issued = this.abortAfterBatch(ctx, mode);
     if (canIssueCutoff && issued && signal?.aborted === true && this.defensiveCutoff === cutoff &&
         this.defensiveCutoffIdentityMatches(cutoff, true)) {
       this.defensiveCutoff = { ...cutoff, state: "issued" };
     } else if (cutoff?.state === "offered") {
       this.defensiveCutoff = undefined;
+      this.defensiveContextOccurrence = undefined;
     }
   }
 
   /** Consume the exact Pi-persisted error produced by this gate's clean defensive cutoff. */
-  consumeDefensiveCutoff(terminal: unknown): boolean {
+  consumeDefensiveCutoff(terminal: unknown, mode?: unknown): boolean {
+    if (!this.automaticDefensiveCutoffAllowed(mode)) {
+      this.revokeDefensiveCutoff();
+      return false;
+    }
     const cutoff = this.defensiveCutoff;
-    if (cutoff?.state !== "bound" || cutoff.terminal !== terminal || !cutoff.context.startedMessage ||
-        !this.defensiveCutoffIdentityMatches(cutoff) || !this.defensiveCutoffIdentityMatches(cutoff.context) ||
-        this.hasUnrelatedPendingInput() || !this.controller.isPreCommitAwaitingSettlement(cutoff.generation)) return false;
+    if (cutoff?.state !== "bound" || cutoff.terminal !== terminal ||
+        !this.defensiveCutoffIdentityMatches(cutoff) || this.hasUnrelatedPendingInput() ||
+        !this.controller.isPreCommitAwaitingSettlement(cutoff.generation)) return false;
     this.defensiveCutoff = undefined;
+    this.defensiveContextOccurrence = undefined;
     return true;
   }
 
@@ -2418,6 +2455,8 @@ export class MainSessionCheckpointGate {
   ): QueuedInputShadow | undefined {
     if (!isProactiveCompactionApi(ctx.model?.api)) return undefined;
     this.defensiveCutoff = undefined;
+    this.defensiveContextOccurrence = undefined;
+    this.occurrence += 1;
     const content = acceptedContent(text, images);
     // Input is evidence to reconcile, never an executor. Tool completion or a true
     // settlement must name the generation that can actually run compaction.
@@ -2436,19 +2475,16 @@ export class MainSessionCheckpointGate {
     if (!message || typeof message !== "object") return undefined;
     const role = (message as { role?: unknown }).role;
     const contextOccurrence = this.defensiveContextOccurrence;
-    if (contextOccurrence && (role === "custom" || role === "user")) {
-      if (role === "custom" && !contextOccurrence.startedMessage &&
-          (message as { details?: unknown }).details === contextOccurrence.envelope &&
-          this.defensiveCutoffIdentityMatches(contextOccurrence, true)) {
-        contextOccurrence.startedMessage = message;
-        return undefined;
-      }
-      this.defensiveCutoff = undefined;
-      this.defensiveContextOccurrence = undefined;
-      this.ambiguousInput = true;
-      this.invalidate();
+    const cutoff = this.defensiveCutoff;
+    if (role === "custom" && contextOccurrence && !contextOccurrence.startedMessage &&
+        (cutoff?.state === "offered" || cutoff?.state === "issued") &&
+        (message as { details?: unknown }).details === contextOccurrence.envelope &&
+        this.defensiveCutoffIdentityMatches(contextOccurrence, true) &&
+        this.defensiveCutoffIdentityMatches(cutoff, true)) {
+      contextOccurrence.startedMessage = message;
       return undefined;
     }
+    if (role === "custom" || role === "user") this.revokeDefensiveCutoff();
     if (role !== "user") return undefined;
     const observed = reconciliationContent((message as { content?: unknown }).content);
     if (this.generation === undefined) {
@@ -2615,11 +2651,22 @@ export class MainSessionCheckpointGate {
     this.batch.abortCleanups.clear();
   }
 
+  private revokeDefensiveCutoff(): void {
+    if (this.defensiveCutoff || this.defensiveContextOccurrence) this.occurrence += 1;
+    this.defensiveCutoff = undefined;
+    this.defensiveContextOccurrence = undefined;
+  }
+
+  private automaticDefensiveCutoffAllowed(mode: unknown): boolean {
+    return mode === "print" || mode === "json" ||
+      (mode === "tui" && this.defensiveTerminalInputFenceAvailable);
+  }
+
   private defensiveCutoffIdentityMatches(identity: DefensiveCutoffIdentity, requireActiveBatch = false): boolean {
     return identity.controller === this.controller && identity.epoch === this.sessionEpoch &&
       identity.logicalRun === this.logicalRunIdentity && identity.generation === this.generation &&
       identity.generation === this.controller.snapshot().generation && identity.handle.generation === identity.generation &&
-      identity.run === identity.batch.run && !identity.batch.toolAborted && (!requireActiveBatch ||
+      identity.run === identity.batch.run && identity.occurrence === this.occurrence && !identity.batch.toolAborted && (!requireActiveBatch ||
         (identity.batch === this.batch && identity.handle === this.handle));
   }
 
@@ -2646,13 +2693,17 @@ export class MainSessionCheckpointGate {
     else this.ambiguousInput = true;
   }
 
-  private abortAfterBatch(ctx: MainGateContext): boolean {
+  private abortAfterBatch(ctx: MainGateContext, mode?: unknown): boolean {
     const generation = this.generation;
     if (generation === undefined ||
         (this.abortIssued?.generation === generation && this.abortIssued.run === this.batch.run) ||
         typeof ctx.abort !== "function") return false;
     let editor: string | undefined;
-    if (ctx.mode === "tui") {
+    let preserveTuiEditor = mode === "tui";
+    if (mode === undefined) {
+      try { preserveTuiEditor = ctx.mode === "tui"; } catch { preserveTuiEditor = false; }
+    }
+    if (preserveTuiEditor) {
       try { editor = ctx.ui?.getEditorText?.(); } catch { editor = undefined; }
     }
     try {
@@ -2741,6 +2792,8 @@ export class MainSessionCheckpointGate {
     this.abortIssued = undefined;
     this.defensiveCutoff = undefined;
     this.defensiveContextOccurrence = undefined;
+    this.defensiveTerminalInputFenceAvailable = false;
+    this.occurrence += 1;
     this.acceptedBeforeArm = [];
     this.trackedOccurrences = [];
     this.ambiguousInput = false;

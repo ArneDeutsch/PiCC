@@ -2557,6 +2557,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return mode === "tui" || mode === "rpc" || mode === "json" || mode === "print" ? mode : undefined;
     } catch { return undefined; }
   };
+  let stopDefensiveTerminalInputFence: (() => void) | undefined;
+  const clearDefensiveTerminalInputFence = (): void => {
+    mainCheckpointGate.setDefensiveTerminalInputFenceAvailable(false);
+    const stop = stopDefensiveTerminalInputFence;
+    stopDefensiveTerminalInputFence = undefined;
+    try { stop?.(); } catch { /* listener cleanup cannot own session lifecycle */ }
+  };
+  const bindDefensiveTerminalInputFence = (ctx: any, mode: CheckpointMode | undefined): void => {
+    clearDefensiveTerminalInputFence();
+    if (mode !== "tui" || typeof ctx?.ui?.onTerminalInput !== "function") return;
+    try {
+      const stop = ctx.ui.onTerminalInput((_data: string) => {
+        mainCheckpointGate.revokeDefensiveCutoffForTerminalInput();
+        return undefined;
+      });
+      if (typeof stop !== "function") return;
+      stopDefensiveTerminalInputFence = stop;
+      mainCheckpointGate.setDefensiveTerminalInputFenceAvailable(true);
+    } catch { /* a missing fence fails only the optional automatic cutoff classification */ }
+  };
 
   const checkpointMode = (ctx: any): CheckpointMode | undefined => {
     const mode = readableContextMode(ctx);
@@ -4182,10 +4202,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   };
 
   pi.on("session_before_switch", async (_event: any, ctx: any) => {
+    clearDefensiveTerminalInputFence();
     // The controller cancels first; the old nested agent_settled or host callback
     // is the only authority that can confirm the logical run has joined.
     const result = await mainCheckpointGate.beforeSessionSwitch();
     if (result?.cancel) {
+      bindDefensiveTerminalInputFence(ctx, checkpointMode(ctx));
       if (mainCheckpointGate.currentController().isProcessTerminal()) {
         const terminalSnapshot = mainCheckpointGate.currentController().snapshot();
         const notice = terminalSnapshot.failureCategory === "restart-required"
@@ -4909,11 +4931,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     sessionRenderingStopped = false;
     sessionShutdownBoundary = false;
     mainShutdownRetainedInputAtRisk = false;
+    clearDefensiveTerminalInputFence();
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
     rotateCheckpointSessionEpoch();
     checkpointModeLatch = undefined;
-    checkpointMode(ctx);
+    const mode = checkpointMode(ctx);
+    bindDefensiveTerminalInputFence(ctx, mode);
     const sessionStartEpoch = checkpointSessionEpoch;
     const sessionStartController = mainCheckpointGate.currentController();
     activeCompactionOperation = undefined;
@@ -5111,11 +5135,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("turn_end", (_event: any, ctx: any) => {
     checkpointContext = ctx;
-    mainCheckpointGate.turnEnded(ctx);
+    mainCheckpointGate.turnEnded(ctx, checkpointMode(ctx));
   });
 
   pi.on("turn_start", async (_event: any, ctx: any) => {
-    await mainCheckpointGate.defensiveLatch(ctx);
+    await mainCheckpointGate.defensiveLatch(ctx, checkpointMode(ctx));
   });
 
   pi.on("before_provider_request", async (_event: any, ctx: any) => {
@@ -5123,13 +5147,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try { ctx?.abort?.(); } catch { /* admission remains closed */ }
       throw new Error("PiCC selected-main admission is closed");
     }
-    await mainCheckpointGate.beforeProviderRequest(ctx);
+    await mainCheckpointGate.beforeProviderRequest(ctx, checkpointMode(ctx));
   });
 
   const retainedPersistenceLocators = new WeakMap<object, RetainedInputPersistenceLocator>();
 
   pi.on("session_shutdown", async (event: any) => {
     clearRetentionHeartbeat();
+    clearDefensiveTerminalInputFence();
     // `quit` is the one reason Pi has already stopped the renderer for (`dispose()`); the
     // switch reasons (`new`/`resume`/`fork`) and `reload` all leave a live UI behind.
     // Latched before the cancellation, because the cancellation is what announces the
@@ -6001,7 +6026,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const terminalAssistant = latestAssistantMessage(ctx);
     const physicalUnsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
     const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "error" &&
-      activeMainResume === undefined && mainCheckpointGate.consumeDefensiveCutoff(terminalAssistant);
+      activeMainResume === undefined &&
+      mainCheckpointGate.consumeDefensiveCutoff(terminalAssistant, checkpointMode(ctx));
     const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
     if (unsuccessful && terminalAssistant.stopReason === "pending") {
       const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";

@@ -2233,6 +2233,12 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-proactive-"));
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# Test project\n");
+    fs.mkdirSync(path.join(dir, "guard-context"), { recursive: true });
+    fs.mkdirSync(path.join(dir, ".claude", "rules"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "rules", "guard-context.md"),
+      "---\npaths:\n  - guard-context/**\n---\n# Guard context\n",
+    );
     // A PreCompact hook keyed on the trigger (manual|auto): each matcher appends its own
     // trigger to a marker so a test can read back which trigger PiCC presented.
     fs.writeFileSync(
@@ -4785,20 +4791,32 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   ) => {
     await pi.fire("session_start", { reason: "new" }, ctx);
     mainCheckpointGate.assistantMessageEnded({
-      role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
-    });
-    let guardContext: Record<string, unknown> | undefined;
-    const wrapped: any = mainCheckpointGate.wrapTool({
-      name: "probe", execute: async () => {
-        if (sendGuardContext) {
-          guardContext = mainCheckpointGate.authorizeDefensiveContextSend({ content: "guard context" });
-        }
-        return { content: [{ type: "text", text: "done" }] };
+      role: "assistant",
+      stopReason: "toolUse",
+      content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
+      usage: {
+        input: 900, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 900,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
+    }, ctx);
+    let guardContext: Record<string, unknown> | undefined;
+    if (sendGuardContext) {
+      const nested = path.join(dir, "guard-context");
+      const baseline = pi.messages.length;
+      await pi.fire("tool_call", {
+        toolName: "read", toolCallId: id, input: { path: path.join(nested, "target.txt") },
+      }, ctx);
+      guardContext = pi.messages.slice(baseline)
+        .find((entry) => entry.message.customType === "picc-context")?.message;
+      expect(guardContext).toBeDefined();
+      expect(guardContext?.details).toBeTypeOf("object");
+    }
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
     });
     const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
     mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: checkpointAbortRequested });
-    mainCheckpointGate.turnEnded(ctx);
+    mainCheckpointGate.turnEnded(ctx, ctx.mode);
     if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
     const controller = mainCheckpointGate.currentController();
     expect(controller.snapshot()).toMatchObject({
@@ -4809,13 +4827,54 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     return { controller, generation: controller.snapshot().generation, guardContext };
   };
 
-  it("settles only the real-order exact custom context and terminal objects once", async () => {
+  it.each([false, true])(
+    "settles the exact cutoff in real order with optional guard context %s",
+    async (sendGuardContext) => {
+      let compactions = 0;
+      let aborts = 0;
+      let branch: any[] = [];
+      const defensiveAbort = new AbortController();
+      const terminal = { role: "assistant", content: [{ type: "text", text: "opaque diagnostic" }], stopReason: "error" };
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses", contextWindow: 1000 },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => sendGuardContext,
+        sessionManager: { getBranch: () => branch },
+        signal: defensiveAbort.signal,
+        abort: () => { aborts += 1; defensiveAbort.abort(); },
+        compact: (options: any) => {
+          compactions += 1;
+          queueMicrotask(() => options.onError(new Error("summary unavailable")));
+        },
+      });
+      const { controller, guardContext } = await armCheckpoint(
+        ctx, `exact-defensive-cutoff-${sendGuardContext}`, undefined, false, sendGuardContext,
+      );
+      await pi.fire("turn_start", {}, ctx);
+      expect(aborts).toBe(1);
+      if (guardContext) {
+        await pi.fire("message_start", {
+          message: { role: "custom", content: "Pi reconstruction", details: guardContext.details },
+        }, ctx);
+      }
+      await pi.fire("message_end", { message: terminal }, ctx);
+      branch = [{ type: "message", message: terminal }];
+      await pi.fire("agent_settled", {}, ctx);
+      await pi.fire("agent_settled", {}, ctx);
+      expect(compactions).toBe(1);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+    },
+  );
+
+  it("settles a clean exact TUI cutoff through an installed terminal fence without raw input", async () => {
+    let branch: any[] = [];
     let compactions = 0;
     let aborts = 0;
-    let branch: any[] = [];
     const defensiveAbort = new AbortController();
-    const terminal = { role: "assistant", content: [{ type: "text", text: "opaque diagnostic" }], stopReason: "error" };
-    const ctx = pi.printCtx({
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    const ctx = pi.tuiCtx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => false,
@@ -4827,14 +4886,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         queueMicrotask(() => options.onError(new Error("summary unavailable")));
       },
     });
-    const { controller, guardContext } = await armCheckpoint(
-      ctx, "authenticated-defensive-cutoff", undefined, false, true,
-    );
+    const { controller } = await armCheckpoint(ctx, "exact-tui-defensive-cutoff");
+    expect(pi.terminalInputHandlers).toHaveLength(1);
     await pi.fire("turn_start", {}, ctx);
     expect(aborts).toBe(1);
-    await pi.fire("message_start", {
-      message: { role: "custom", content: "reconstructed by Pi", details: guardContext!.details },
-    }, ctx);
     await pi.fire("message_end", { message: terminal }, ctx);
     branch = [{ type: "message", message: terminal }];
     await pi.fire("agent_settled", {}, ctx);
@@ -4845,12 +4900,182 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
   });
 
+  it("rebinds one TUI terminal fence after a refused switch and revokes through it once", async () => {
+    let branch: any[] = [];
+    let compactions = 0;
+    const defensiveAbort = new AbortController();
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => branch },
+      signal: defensiveAbort.signal,
+      abort: () => defensiveAbort.abort(),
+      compact: () => { compactions += 1; },
+    });
+    await pi.fire("session_start", { reason: "new" }, ctx);
+    expect(pi.terminalInputHandlers).toHaveLength(1);
+
+    const originalBeforeSessionSwitch = mainCheckpointGate.beforeSessionSwitch;
+    mainCheckpointGate.beforeSessionSwitch = async () => ({ cancel: true });
+    try {
+      await expect(pi.fire("session_before_switch", {}, ctx)).resolves.toEqual({ cancel: true });
+    } finally {
+      mainCheckpointGate.beforeSessionSwitch = originalBeforeSessionSwitch;
+    }
+    expect(pi.terminalInputHandlers).toHaveLength(1);
+
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant",
+      stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "refused-switch-cutoff", name: "probe", arguments: {} }],
+      usage: {
+        input: 900, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 900,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    }, ctx);
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute("refused-switch-cutoff", {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: "refused-switch-cutoff", result, isError: false });
+    expect(mainCheckpointGate.turnEnded(ctx, ctx.mode)?.stop).toBe("terminate");
+    const controller = mainCheckpointGate.currentController();
+
+    const revoke = vi.spyOn(mainCheckpointGate, "revokeDefensiveCutoffForTerminalInput");
+    expect(pi.feedTerminalInput("raw-after-refused-switch")).toEqual({
+      consumed: false, data: "raw-after-refused-switch",
+    });
+    expect(revoke).toHaveBeenCalledOnce();
+    revoke.mockRestore();
+    await pi.fire("turn_start", {}, ctx);
+    await pi.fire("message_end", { message: terminal }, ctx);
+    branch = [{ type: "message", message: terminal }];
+    await pi.fire("agent_settled", {}, ctx);
+    expect(compactions).toBe(0);
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+    });
+  });
+
+  it("revokes offered, issued, and bound authority on non-consuming TUI input", async () => {
+    for (const state of ["offered", "issued", "bound"] as const) {
+      let branch: any[] = [];
+      let compactions = 0;
+      const defensiveAbort = new AbortController();
+      const terminal = { role: "assistant", stopReason: "error", content: [] };
+      const ctx = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => branch },
+        signal: defensiveAbort.signal,
+        abort: () => defensiveAbort.abort(),
+        compact: () => { compactions += 1; },
+      });
+      const { controller } = await armCheckpoint(ctx, `tui-input-${state}`);
+      if (state !== "offered") await pi.fire("turn_start", {}, ctx);
+      if (state === "bound") await pi.fire("message_end", { message: terminal }, ctx);
+      expect(pi.feedTerminalInput(`raw-${state}`)).toEqual({ consumed: false, data: `raw-${state}` });
+      if (state === "offered") await pi.fire("turn_start", {}, ctx);
+      if (state !== "bound") await pi.fire("message_end", { message: terminal }, ctx);
+      branch = [{ type: "message", message: terminal }];
+      await pi.fire("agent_settled", {}, ctx);
+      expect(compactions).toBe(0);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+    }
+  });
+
+  it("keeps TUI input inert outside the authority window and rebinds without listener leaks", async () => {
+    const idle = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+      hasPendingMessages: () => false,
+    });
+    await pi.fire("session_start", { reason: "new" }, idle);
+    expect(pi.terminalInputHandlers).toHaveLength(1);
+    expect(pi.feedTerminalInput("outside")).toEqual({ consumed: false, data: "outside" });
+    await pi.fire("session_start", { reason: "reload" }, idle);
+    expect(pi.terminalInputHandlers).toHaveLength(1);
+    await expect(pi.fire("session_before_switch", {}, idle)).resolves.toBeUndefined();
+    expect(pi.terminalInputHandlers).toHaveLength(0);
+    await pi.fire("session_start", { reason: "new" }, idle);
+    expect(pi.terminalInputHandlers).toHaveLength(1);
+  });
+
+  it.each(["missing", "throwing", "nonfunction"] as const)(
+    "fails TUI automatic cutoff closed when terminal fence installation is %s",
+    async (failure) => {
+      let branch: any[] = [];
+      let compactions = 0;
+      const defensiveAbort = new AbortController();
+      const ctx = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => branch },
+        signal: defensiveAbort.signal,
+        abort: () => defensiveAbort.abort(),
+        compact: () => { compactions += 1; },
+      });
+      const ui = ctx.ui as any;
+      if (failure === "missing") ui.onTerminalInput = undefined;
+      else if (failure === "throwing") ui.onTerminalInput = () => { throw new Error("unavailable"); };
+      else ui.onTerminalInput = () => 7;
+
+      const { controller } = await armCheckpoint(ctx, `tui-fence-${failure}`);
+      expect(pi.terminalInputHandlers).toHaveLength(0);
+      await pi.fire("turn_start", {}, ctx);
+      const terminal = { role: "assistant", stopReason: "error", content: [] };
+      await pi.fire("message_end", { message: terminal }, ctx);
+      branch = [{ type: "message", message: terminal }];
+      await pi.fire("agent_settled", {}, ctx);
+      expect(compactions).toBe(0);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+      });
+    },
+  );
+
+  it("fails RPC defensive cutoff closed while preserving manual precommit recovery", async () => {
+    let branch: any[] = [];
+    let compactions = 0;
+    let aborts = 0;
+    const defensiveAbort = new AbortController();
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    const ctx = pi.rpcCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => branch },
+      signal: defensiveAbort.signal,
+      abort: () => { aborts += 1; defensiveAbort.abort(); },
+      compact: () => { compactions += 1; },
+    });
+    const { controller } = await armCheckpoint(ctx, "rpc-defensive-cutoff");
+    Object.defineProperty(ctx, "mode", { configurable: true, get: () => { throw new Error("stale runner"); } });
+    await pi.fire("turn_start", {}, ctx);
+    expect(aborts).toBe(1);
+    await pi.fire("message_end", { message: terminal }, ctx);
+    branch = [{ type: "message", message: terminal }];
+    await pi.fire("agent_settled", {}, ctx);
+    expect(compactions).toBe(0);
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "recoverable-rejection", failureCategory: "operational",
+    });
+    expect(pi.entries.some((entry) => entry.customType === "picc-checkpoint-lifecycle" &&
+      entry.data.category === "checkpoint-exhausted" && entry.data.action === "manual-recovery")).toBe(true);
+  });
+
   let defensiveAuthorityCase = 0;
   const prepareDefensiveAuthority = async (options: {
     ids?: string[];
     resultError?: boolean;
     pending?: boolean;
-    contextSends?: number;
+    optionalContext?: boolean;
     leakToolAbortListener?: boolean;
   } = {}) => {
     defensiveAuthorityCase += 1;
@@ -4861,6 +5086,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       vi.spyOn(defensiveAbort.signal, "removeEventListener").mockImplementation(() => undefined);
     }
     const ctx = {
+      mode: "print",
       model: { api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => options.pending === true,
@@ -4872,87 +5098,168 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       role: "assistant",
       content: ids.map((id) => ({ type: "toolCall", id, name: "probe", arguments: {} })),
     });
-    const contexts: Record<string, unknown>[] = [];
+    let guardContext: Record<string, unknown> | undefined;
     const wrapped: any = gate.wrapTool({
       name: "probe",
       execute: async () => {
-        for (let index = 0; index < (options.contextSends ?? 1); index += 1) {
-          contexts.push(gate.authorizeDefensiveContextSend({ content: `context-${index}` }));
+        if (options.optionalContext) {
+          guardContext = gate.authorizeDefensiveContextSend({ content: "guard context" });
         }
         return { content: [{ type: "text", text: "done" }] };
       },
     });
     const result = await wrapped.execute(ids[0] ?? "", {}, undefined, undefined, ctx);
     gate.toolExecutionEnded({ toolCallId: ids[0], result, isError: options.resultError === true });
-    const disposition = gate.turnEnded(ctx);
+    const disposition = gate.turnEnded(ctx, "print");
     return {
-      gate, controller: gate.currentController(), ctx, contexts, disposition,
+      gate, controller: gate.currentController(), ctx, disposition, guardContext,
       aborts: () => aborts,
       userAbort: () => defensiveAbort.abort(),
     };
   };
 
   const startExactDefensiveCutoff = async (prepared: Awaited<ReturnType<typeof prepareDefensiveAuthority>>) => {
-    await prepared.gate.defensiveLatch(prepared.ctx);
-    const custom = { role: "custom", content: "Pi custom record", details: prepared.contexts[0]!.details };
-    prepared.gate.userMessageStarted(custom);
-    return custom;
+    await prepared.gate.defensiveLatch(prepared.ctx, "print");
+    if (prepared.guardContext) {
+      prepared.gate.userMessageStarted({
+        role: "custom", content: "Pi reconstruction", details: prepared.guardContext.details,
+      });
+    }
   };
 
-  it("requires authenticated context before binding the exact opaque terminal object", async () => {
-    const unauthenticated = await prepareDefensiveAuthority({ contextSends: 0 });
-    await unauthenticated.gate.defensiveLatch(unauthenticated.ctx);
-    const unauthenticatedTerminal = { role: "assistant", stopReason: "error", content: [] };
-    unauthenticated.gate.assistantMessageEnded(unauthenticatedTerminal);
-    expect(unauthenticated.gate.consumeDefensiveCutoff(unauthenticatedTerminal)).toBe(false);
-
-    const missing = await prepareDefensiveAuthority();
-    await missing.gate.defensiveLatch(missing.ctx);
-    const missingTerminal = { role: "assistant", stopReason: "error", content: [] };
-    missing.gate.assistantMessageEnded(missingTerminal);
-    expect(missing.gate.consumeDefensiveCutoff(missingTerminal)).toBe(false);
-
-    const exact = await prepareDefensiveAuthority();
+  it.each([false, true])("binds the first exact terminal object once with optional context %s", async (optionalContext) => {
+    const exact = await prepareDefensiveAuthority({ optionalContext });
     await startExactDefensiveCutoff(exact);
     const terminal = { role: "assistant", stopReason: "error", content: [{ type: "image", data: "x" }] };
     exact.gate.assistantMessageEnded(terminal);
-    expect(exact.gate.consumeDefensiveCutoff(structuredClone(terminal))).toBe(false);
-    expect(exact.gate.consumeDefensiveCutoff({ ...terminal })).toBe(false);
-    expect(exact.gate.consumeDefensiveCutoff(terminal)).toBe(true);
-    expect(exact.gate.consumeDefensiveCutoff(terminal)).toBe(false);
-
-    const aborted = await prepareDefensiveAuthority();
-    await startExactDefensiveCutoff(aborted);
-    const abortedTerminal = { role: "assistant", stopReason: "aborted", content: [] };
-    aborted.gate.assistantMessageEnded(abortedTerminal);
-    expect(aborted.gate.consumeDefensiveCutoff(abortedTerminal)).toBe(false);
+    expect(exact.gate.consumeDefensiveCutoff(structuredClone(terminal), "print")).toBe(false);
+    expect(exact.gate.consumeDefensiveCutoff({ ...terminal }, "print")).toBe(false);
+    expect(exact.gate.consumeDefensiveCutoff(terminal, "print")).toBe(true);
+    expect(exact.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
   });
 
-  it("rejects cloned, user-role, duplicate, second-send, and unrelated custom occurrences", async () => {
+  it("tolerates only the exact guard-owned pending occurrence in Pi's real event order", async () => {
+    const prepared = await prepareDefensiveAuthority({ pending: true, optionalContext: true });
+    expect(prepared.disposition?.stop).toBe("terminate");
+    await prepared.gate.defensiveLatch(prepared.ctx, "print");
+    expect(prepared.aborts()).toBe(1);
+    prepared.gate.userMessageStarted({
+      role: "custom", content: "Pi reconstruction", details: prepared.guardContext!.details,
+    });
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    prepared.gate.assistantMessageEnded(terminal);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(true);
+  });
+
+  it("revokes guard-pending authority when any later unrelated occurrence starts", async () => {
+    for (const unrelated of [
+      { role: "user", content: [{ type: "text", text: "later user" }] },
+      { role: "custom", content: "later custom" },
+    ]) {
+      const prepared = await prepareDefensiveAuthority({ pending: true, optionalContext: true });
+      await prepared.gate.defensiveLatch(prepared.ctx, "print");
+      prepared.gate.userMessageStarted({ role: "custom", details: prepared.guardContext!.details });
+      prepared.gate.userMessageStarted(unrelated);
+      const terminal = { role: "assistant", stopReason: "error", content: [] };
+      prepared.gate.assistantMessageEnded(terminal);
+      expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+    }
+  });
+
+  it("fails automatic cutoff closed when no epoch-bound mode is supplied", async () => {
+    const prepared = await prepareDefensiveAuthority();
+    expect(prepared.disposition?.stop).toBe("terminate");
+    await prepared.gate.defensiveLatch(prepared.ctx, undefined);
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    prepared.gate.assistantMessageEnded(terminal);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, undefined)).toBe(false);
+  });
+
+  it.each(["aborted", "stop", "length"] as const)("rejects a non-error %s terminal", async (stopReason) => {
+    const prepared = await prepareDefensiveAuthority();
+    await startExactDefensiveCutoff(prepared);
+    const terminal = { role: "assistant", stopReason, content: [] };
+    prepared.gate.assistantMessageEnded(terminal);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+  });
+
+  it("revokes cloned, duplicate, wrong-role, wrong-envelope, and unrelated guard occurrences", async () => {
     const terminal = { role: "assistant", stopReason: "error", content: [] };
     const reject = async (
-      prepared: Awaited<ReturnType<typeof prepareDefensiveAuthority>>,
-      starts: Record<string, unknown>[],
+      messages: (prepared: Awaited<ReturnType<typeof prepareDefensiveAuthority>>) => Record<string, unknown>[],
     ) => {
-      await prepared.gate.defensiveLatch(prepared.ctx);
-      for (const message of starts) prepared.gate.userMessageStarted(message);
+      const prepared = await prepareDefensiveAuthority({ optionalContext: true });
+      await prepared.gate.defensiveLatch(prepared.ctx, "print");
+      for (const message of messages(prepared)) prepared.gate.userMessageStarted(message);
       prepared.gate.assistantMessageEnded(terminal);
-      expect(prepared.gate.consumeDefensiveCutoff(terminal)).toBe(false);
+      expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
     };
-    const cloned = await prepareDefensiveAuthority();
-    await reject(cloned, [{ role: "custom", details: structuredClone(cloned.contexts[0]!.details) }]);
-    const userRole = await prepareDefensiveAuthority();
-    await reject(userRole, [{ role: "user", details: userRole.contexts[0]!.details }]);
-    const duplicate = await prepareDefensiveAuthority();
-    await reject(duplicate, [
-      { role: "custom", details: duplicate.contexts[0]!.details },
-      { role: "custom", details: duplicate.contexts[0]!.details },
-    ]);
-    const secondSend = await prepareDefensiveAuthority({ contextSends: 2 });
-    expect(secondSend.disposition?.stop).toBe("abort");
-    await reject(secondSend, [{ role: "custom", details: secondSend.contexts[0]!.details }]);
-    const unrelated = await prepareDefensiveAuthority();
-    await reject(unrelated, [{ role: "custom", details: Object.freeze({ unrelated: true }) }]);
+
+    const cloned = await prepareDefensiveAuthority({ optionalContext: true });
+    await cloned.gate.defensiveLatch(cloned.ctx, "print");
+    cloned.gate.userMessageStarted({
+      role: "custom", details: structuredClone(cloned.guardContext!.details),
+    });
+    cloned.gate.assistantMessageEnded(terminal);
+    expect(cloned.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+
+    const duplicate = await prepareDefensiveAuthority({ optionalContext: true });
+    await duplicate.gate.defensiveLatch(duplicate.ctx, "print");
+    const exact = { role: "custom", details: duplicate.guardContext!.details };
+    duplicate.gate.userMessageStarted(exact);
+    duplicate.gate.userMessageStarted({ ...exact });
+    duplicate.gate.assistantMessageEnded(terminal);
+    expect(duplicate.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+
+    await reject((prepared) => [{ role: "user", details: prepared.guardContext?.details }]);
+    await reject(() => [{ role: "custom", details: Object.freeze({ wrong: true }) }]);
+    await reject(() => [{ role: "custom", content: "unrelated" }]);
+  });
+
+  it("revokes on accepted or started user/custom occurrences even after queues drain", async () => {
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+
+    const accepted = await prepareDefensiveAuthority();
+    await startExactDefensiveCutoff(accepted);
+    accepted.gate.captureAcceptedInput(accepted.ctx, "accepted-after-issue", undefined, "followUp");
+    accepted.gate.userMessageStarted({
+      role: "user", content: [{ type: "text", text: "accepted-after-issue" }],
+    }, "followUp");
+    expect(accepted.controller.queuedInputSnapshot()).toEqual([]);
+    accepted.gate.assistantMessageEnded(terminal);
+    expect(accepted.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+
+    for (const message of [
+      { role: "user", content: [{ type: "text", text: "started-only" }] },
+      { role: "custom", content: "unrelated custom occurrence" },
+    ]) {
+      const started = await prepareDefensiveAuthority();
+      await startExactDefensiveCutoff(started);
+      started.gate.userMessageStarted(message);
+      expect(started.controller.queuedInputSnapshot()).toEqual([]);
+      started.gate.assistantMessageEnded(terminal);
+      expect(started.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+    }
+  });
+
+  it("rejects ordinary provider errors and wrong or intervening terminal objects", async () => {
+    const ordinary = await prepareDefensiveAuthority();
+    const ordinaryError = { role: "assistant", stopReason: "error", content: [] };
+    ordinary.gate.assistantMessageEnded(ordinaryError);
+    expect(ordinary.gate.consumeDefensiveCutoff(ordinaryError, "print")).toBe(false);
+
+    const wrongRole = await prepareDefensiveAuthority();
+    await startExactDefensiveCutoff(wrongRole);
+    wrongRole.gate.assistantMessageEnded({ role: "toolResult", stopReason: "error", content: [] });
+    wrongRole.gate.assistantMessageEnded(ordinaryError);
+    expect(wrongRole.gate.consumeDefensiveCutoff(ordinaryError, "print")).toBe(false);
+
+    const second = await prepareDefensiveAuthority();
+    await startExactDefensiveCutoff(second);
+    const first = { role: "assistant", stopReason: "error", content: [] };
+    second.gate.assistantMessageEnded(first);
+    second.gate.assistantMessageEnded({ role: "assistant", stopReason: "error", content: [] });
+    expect(second.gate.consumeDefensiveCutoff(first, "print")).toBe(false);
   });
 
   it("fails closed for failed, malformed, pending, and genuinely ambiguous batches", async () => {
@@ -4961,54 +5268,57 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const pending = await prepareDefensiveAuthority({ pending: true });
     for (const candidate of [failed, malformed, pending]) {
       expect(candidate.disposition?.stop).toBe("abort");
-      await candidate.gate.defensiveLatch(candidate.ctx);
+      await candidate.gate.defensiveLatch(candidate.ctx, "print");
       const terminal = { role: "assistant", stopReason: "error", content: [] };
       candidate.gate.assistantMessageEnded(terminal);
-      expect(candidate.gate.consumeDefensiveCutoff(terminal)).toBe(false);
+      expect(candidate.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
     }
     const ambiguous = await prepareDefensiveAuthority();
     ambiguous.gate.captureAcceptedInput(ambiguous.ctx, "unrelated queued input", undefined, "followUp");
-    await ambiguous.gate.defensiveLatch(ambiguous.ctx);
-    ambiguous.gate.userMessageStarted({ role: "custom", details: ambiguous.contexts[0]!.details });
+    await ambiguous.gate.defensiveLatch(ambiguous.ctx, "print");
     const terminal = { role: "assistant", stopReason: "error", content: [] };
     ambiguous.gate.assistantMessageEnded(terminal);
-    expect(ambiguous.gate.consumeDefensiveCutoff(terminal)).toBe(false);
+    expect(ambiguous.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
   });
 
-  it.each(["before", "during", "after-return"] as const)(
-    "invalidates a successful tool when user cancellation occurs %s execution settlement",
-    async (timing) => {
-      const gate = new MainSessionCheckpointGate(`tool-user-abort-${timing}`, 90);
-      const userAbort = new AbortController();
+  it.each((["execution", "context"] as const).flatMap((source) =>
+    (["before", "during", "after-return"] as const).map((timing) => [source, timing] as const)))(
+    "invalidates a successful tool when the distinct %s signal aborts %s execution settlement",
+    async (source, timing) => {
+      const gate = new MainSessionCheckpointGate(`tool-user-abort-${source}-${timing}`, 90);
+      const executionAbort = new AbortController();
+      const contextAbort = new AbortController();
+      const selected = source === "execution" ? executionAbort : contextAbort;
+      const other = source === "execution" ? contextAbort : executionAbort;
       const ctx = {
         model: { api: "openai-responses" },
         getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
         hasPendingMessages: () => false,
-        signal: userAbort.signal,
+        signal: contextAbort.signal,
         abort: vi.fn(),
       };
       gate.assistantMessageEnded({
         role: "assistant",
         content: [{ type: "toolCall", id: "tool", name: "probe", arguments: {} }],
       });
-      if (timing === "before") userAbort.abort();
+      if (timing === "before") selected.abort();
       const wrapped: any = gate.wrapTool({
         name: "probe",
         execute: async () => {
-          gate.authorizeDefensiveContextSend({ content: "context" });
-          if (timing === "during") userAbort.abort();
+          if (timing === "during") selected.abort();
           return { content: [{ type: "text", text: "success despite abort" }] };
         },
       });
-      const result = await wrapped.execute("tool", {}, userAbort.signal, undefined, ctx);
-      if (timing === "after-return") userAbort.abort();
+      const result = await wrapped.execute("tool", {}, executionAbort.signal, undefined, ctx);
+      if (timing === "after-return") selected.abort();
+      expect(other.signal.aborted).toBe(false);
       if (timing !== "after-return") expect(result).not.toHaveProperty("terminate", true);
       gate.toolExecutionEnded({ toolCallId: "tool", result, isError: false });
       expect(gate.turnEnded(ctx)?.stop).toBe("abort");
     },
   );
 
-  it("removes tool abort observers when a below-threshold batch returns early", async () => {
+  it("removes an execution-only abort observer when a below-threshold batch returns early", async () => {
     const gate = new MainSessionCheckpointGate("below-threshold-listener-cleanup", 90);
     const abortListeners = new Set<unknown>();
     const signal = {
@@ -5035,7 +5345,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       name: "probe",
       execute: async () => ({ content: [{ type: "text", text: "done" }] }),
     });
-    const result = await wrapped.execute("low", {}, undefined, undefined, ctx);
+    const result = await wrapped.execute("low", {}, signal, undefined, { ...ctx, signal: undefined });
     expect(abortListeners.size).toBe(1);
     gate.toolExecutionEnded({ toolCallId: "low", result, isError: false });
     expect(gate.turnEnded(ctx)).toBeUndefined();
@@ -5050,41 +5360,38 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(prepared.ctx.signal.aborted).toBe(true);
     const terminal = { role: "assistant", stopReason: "error", content: [] };
     prepared.gate.assistantMessageEnded(terminal);
-    expect(prepared.gate.consumeDefensiveCutoff(terminal)).toBe(true);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(true);
   });
 
   it("fails closed when the public signal is absent or the defensive abort does not flip it", async () => {
     const missing = await prepareDefensiveAuthority();
     delete (missing.ctx as { signal?: AbortSignal }).signal;
-    await missing.gate.defensiveLatch(missing.ctx);
+    await missing.gate.defensiveLatch(missing.ctx, "print");
     expect(missing.aborts()).toBe(0);
     const missingTerminal = { role: "assistant", stopReason: "error", content: [] };
-    missing.gate.userMessageStarted({ role: "custom", details: missing.contexts[0]!.details });
     missing.gate.assistantMessageEnded(missingTerminal);
-    expect(missing.gate.consumeDefensiveCutoff(missingTerminal)).toBe(false);
+    expect(missing.gate.consumeDefensiveCutoff(missingTerminal, "print")).toBe(false);
 
     const unchanged = await prepareDefensiveAuthority();
     const abortWithoutSignal = vi.fn();
     unchanged.ctx.abort = abortWithoutSignal;
-    await unchanged.gate.defensiveLatch(unchanged.ctx);
+    await unchanged.gate.defensiveLatch(unchanged.ctx, "print");
     expect(abortWithoutSignal).toHaveBeenCalledOnce();
     expect(unchanged.ctx.signal.aborted).toBe(false);
     const unchangedTerminal = { role: "assistant", stopReason: "error", content: [] };
-    unchanged.gate.userMessageStarted({ role: "custom", details: unchanged.contexts[0]!.details });
     unchanged.gate.assistantMessageEnded(unchangedTerminal);
-    expect(unchanged.gate.consumeDefensiveCutoff(unchangedTerminal)).toBe(false);
+    expect(unchanged.gate.consumeDefensiveCutoff(unchangedTerminal, "print")).toBe(false);
   });
 
   it("does not reclassify a between-turn user abort before the defensive latch", async () => {
     const prepared = await prepareDefensiveAuthority();
     expect(prepared.disposition?.stop).toBe("terminate");
     prepared.userAbort();
-    await prepared.gate.defensiveLatch(prepared.ctx);
+    await prepared.gate.defensiveLatch(prepared.ctx, "print");
     expect(prepared.aborts()).toBe(0);
     const terminal = { role: "assistant", stopReason: "error", content: [] };
-    prepared.gate.userMessageStarted({ role: "custom", details: prepared.contexts[0]!.details });
     prepared.gate.assistantMessageEnded(terminal);
-    expect(prepared.gate.consumeDefensiveCutoff(terminal)).toBe(false);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
   });
 
   it("requires tool-abort listener cleanup before defensive authority can survive", async () => {
@@ -5093,7 +5400,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await startExactDefensiveCutoff(leaked);
     const terminal = { role: "assistant", stopReason: "error", content: [] };
     leaked.gate.assistantMessageEnded(terminal);
-    expect(leaked.gate.consumeDefensiveCutoff(terminal)).toBe(false);
+    expect(leaked.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
   });
 
   it("revokes authority on stale identities, commit, resume, and postcommit failure", async () => {
@@ -5106,20 +5413,20 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     };
     const staleSession = await bind();
     await staleSession.gate.startSession("replacement-controller-session-epoch");
-    expect(staleSession.gate.consumeDefensiveCutoff(staleSession.terminal)).toBe(false);
+    expect(staleSession.gate.consumeDefensiveCutoff(staleSession.terminal, "print")).toBe(false);
     const staleRun = await bind();
     staleRun.gate.acceptedLogicalRun();
-    expect(staleRun.gate.consumeDefensiveCutoff(staleRun.terminal)).toBe(false);
+    expect(staleRun.gate.consumeDefensiveCutoff(staleRun.terminal, "print")).toBe(false);
     const staleBatch = await bind();
     staleBatch.gate.assistantMessageEnded({ role: "assistant", stopReason: "error", content: [] });
-    expect(staleBatch.gate.consumeDefensiveCutoff(staleBatch.terminal)).toBe(false);
+    expect(staleBatch.gate.consumeDefensiveCutoff(staleBatch.terminal, "print")).toBe(false);
     const staleGeneration = await bind();
     expect(staleGeneration.controller.exhaustUnsuccessfulAwaitingSettlement(staleGeneration.generation)).toBe(true);
     const recovery = staleGeneration.controller.recoveryToken(staleGeneration.generation)!;
     expect(staleGeneration.controller.recoverAfterManualCompaction(recovery).recovered).toBe(true);
     expect(staleGeneration.controller.sample({ tokens: 900, contextWindow: 1000, percent: 90 }, "settled"))
       .toBe(staleGeneration.generation + 1);
-    expect(staleGeneration.gate.consumeDefensiveCutoff(staleGeneration.terminal)).toBe(false);
+    expect(staleGeneration.gate.consumeDefensiveCutoff(staleGeneration.terminal, "print")).toBe(false);
     const resumed = await bind();
     const resumedSettlement = deferred<void>();
     resumed.gate.attachExecution({
@@ -5135,14 +5442,14 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       description: "stale cutoff authority to reach resumed work",
       predicate: () => resumed.controller.snapshot().phase === "resuming",
     });
-    expect(resumed.gate.consumeDefensiveCutoff(resumed.terminal)).toBe(false);
+    expect(resumed.gate.consumeDefensiveCutoff(resumed.terminal, "print")).toBe(false);
     resumedSettlement.resolve();
     await resumedRun;
     const committed = await bind();
     expect(committed.controller.observeCompactionCommit(committed.generation)).toBe(true);
-    expect(committed.gate.consumeDefensiveCutoff(committed.terminal)).toBe(false);
+    expect(committed.gate.consumeDefensiveCutoff(committed.terminal, "print")).toBe(false);
     await committed.controller.failAfterCommittedSummary(committed.generation, "resumed-work");
-    expect(committed.gate.consumeDefensiveCutoff(committed.terminal)).toBe(false);
+    expect(committed.gate.consumeDefensiveCutoff(committed.terminal, "print")).toBe(false);
   });
 
   it.each(["pending", "error", "aborted"] as const)(
