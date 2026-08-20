@@ -1,25 +1,57 @@
 import { execFile } from "node:child_process";
 
-const LAUNCHER_ONLY_ENV_KEYS = [
+const HOST_ONLY_ENV_KEYS = [
   "PICC_LAUNCHER_PID",
   "PICC_INSTALL_KIND",
   "PICC_VERSION",
   "PI_SKIP_VERSION_CHECK",
+  "AI_AGENT",
 ] as const;
+
+function deleteEnvironmentKey(
+  env: Record<string, string | undefined>,
+  key: string,
+  caseInsensitive: boolean,
+): void {
+  if (!caseInsensitive) {
+    delete env[key];
+    return;
+  }
+  const normalized = key.toLowerCase();
+  for (const candidate of Object.keys(env)) {
+    if (candidate.toLowerCase() === normalized) delete env[candidate];
+  }
+}
+
+function applyEnvironmentOverlay(
+  env: Record<string, string | undefined>,
+  overlay: Record<string, string | undefined>,
+  caseInsensitive: boolean,
+): void {
+  for (const [key, value] of Object.entries(overlay)) {
+    deleteEnvironmentKey(env, key, caseInsensitive);
+    env[key] = value;
+  }
+}
 
 /**
  * Build a managed-child environment in the required precedence order: inherit,
- * remove PiCC launcher context, apply deliberate settings, then surface-required
- * values. Launcher markers are process lineage hints, not child authority.
+ * remove PiCC launcher/host-only context, apply deliberate settings, then
+ * surface-required values. On Windows, overlays replace every inherited casing
+ * alias because the process environment treats keys case-insensitively.
  */
 export function sanitizedSubprocessEnv(
   inherited: Record<string, string | undefined>,
   explicit: Record<string, string | undefined> = {},
   required: Record<string, string | undefined> = {},
+  platform: NodeJS.Platform = process.platform,
 ): Record<string, string | undefined> {
   const out = { ...inherited };
-  for (const key of LAUNCHER_ONLY_ENV_KEYS) delete out[key];
-  return { ...out, ...explicit, ...required };
+  const caseInsensitive = platform === "win32";
+  for (const key of HOST_ONLY_ENV_KEYS) deleteEnvironmentKey(out, key, caseInsensitive);
+  applyEnvironmentOverlay(out, explicit, caseInsensitive);
+  applyEnvironmentOverlay(out, required, caseInsensitive);
+  return out;
 }
 
 export function sanitizedExecFile(

@@ -187,8 +187,10 @@ export interface SubagentRegistryRecord {
   worktreePath?: string;
   /** On-disk transcript path (from the persisted manager) — reopened on resume. */
   transcriptPath?: string;
-  /** True when the agent can be continued (persisted transcript, not one-shot). */
+  /** True when lifecycle state permits continuation; transcript availability is checked separately. */
   resumable: boolean;
+  /** Narrow terminal reason retained when PiCC cannot retrieve a deferred response. */
+  nonResumabilityReason?: "deferred-response-unavailable";
   /** True for one-shot builtins (Explore/Plan) — never resumable, refuse steer too. */
   oneShot: boolean;
   /** Whether the dispatch is currently running (steerable) or has settled. */
@@ -306,6 +308,7 @@ export interface RegisterInput {
   worktreePath?: string;
   transcriptPath?: string;
   resumable: boolean;
+  nonResumabilityReason?: "deferred-response-unavailable";
   oneShot: boolean;
   session?: SteerableSession;
   checkpointPaused?: boolean;
@@ -401,6 +404,10 @@ export class SubagentRegistry {
       existing.worktreePath = input.worktreePath;
       existing.transcriptPath = input.transcriptPath;
       existing.resumable = input.resumable;
+      existing.nonResumabilityReason = input.nonResumabilityReason;
+      if (input.nonResumabilityReason === "deferred-response-unavailable") {
+        existing.finalText = undefined;
+      }
       existing.oneShot = input.oneShot;
       existing.session = input.session;
       existing.checkpointPaused = input.checkpointPaused;
@@ -430,6 +437,7 @@ export class SubagentRegistry {
       worktreePath: input.worktreePath,
       transcriptPath: input.transcriptPath,
       resumable: input.resumable,
+      nonResumabilityReason: input.nonResumabilityReason,
       oneShot: input.oneShot,
       state: "running",
       dispatchGeneration: 1,

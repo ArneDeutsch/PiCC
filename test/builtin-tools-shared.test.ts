@@ -26,6 +26,7 @@ describe("built-in bash spawnHook env matrix (shared factory)", () => {
     PICC_INSTALL_KIND: "source",
     PICC_VERSION: "1.2.3",
     PI_SKIP_VERSION_CHECK: "1",
+    AI_AGENT: "pi",
   };
 
   function spawnEnv() {
@@ -62,11 +63,14 @@ describe("built-in bash spawnHook env matrix (shared factory)", () => {
     expect(env.PICC_INSTALL_KIND).toBeUndefined();
     expect(env.PICC_VERSION).toBeUndefined();
     expect(env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+    expect(env.AI_AGENT).toBeUndefined();
     expect(env.PROJECT_SETTING).toBe("yes");
   });
 
-  it("lets settings win over inherited on a key collision", () => {
+  it("lets settings win over inherited on a key collision, including deliberate AI_AGENT", () => {
     expect(spawnEnv().SHARED_KEY).toBe("from-settings");
+    expect(buildBashSpawnEnv({ AI_AGENT: "pi" }, { AI_AGENT: "project-agent" }, PROJECT_ROOT).AI_AGENT)
+      .toBe("project-agent");
   });
 
   it("preserves the passthrough command and cwd", () => {
@@ -129,6 +133,8 @@ describe("buildStockBuiltinTools structure (main + subagent shared path)", () =>
     const inst = (kind: string) => (cwd: string) => ({
       kind,
       cwd,
+      parameters: { schemaCanary: `schema:${kind}` },
+      constrainedSampling: process.env.PI_EXPERIMENTAL === "1" ? { type: "json_schema" } : undefined,
       execute: async () => `${kind}@${cwd}`,
     });
     const def = (kind: string) => (cwd: string) => ({
@@ -140,7 +146,13 @@ describe("buildStockBuiltinTools structure (main + subagent shared path)", () =>
     const sdk: BuiltinToolSdk = {
       createBashTool: (cwd: string, options: unknown) => {
         bashOptions.push(options);
-        return { kind: "bash", cwd, execute: async () => `bash@${cwd}` };
+        return {
+          kind: "bash",
+          cwd,
+          parameters: { schemaCanary: "schema:bash" },
+          constrainedSampling: process.env.PI_EXPERIMENTAL === "1" ? { type: "json_schema" } : undefined,
+          execute: async () => `bash@${cwd}`,
+        };
       },
       createReadTool: inst("read"),
       createWriteTool: inst("write"),
@@ -190,6 +202,36 @@ describe("buildStockBuiltinTools structure (main + subagent shared path)", () =>
         exposeSessionEnvironment: false,
         spawnHook: expect.any(Function),
       });
+    }
+  });
+
+  it("neutralizes ambient constrained sampling identically for main and child definitions", () => {
+    const previous = process.env.PI_EXPERIMENTAL;
+    process.env.PI_EXPERIMENTAL = "1";
+    try {
+      const { sdk } = fakeSdk();
+      const sessions = ["/main", "/child"].map((cwd) => buildStockBuiltinTools(
+        sdk,
+        new CwdState(cwd),
+        { settingsEnv: {}, projectRoot: PROJECT_ROOT },
+      ));
+      for (const tools of sessions) {
+        for (const name of ["bash", "read", "write", "edit"]) {
+          const tool = tools.find((candidate) => candidate.name === name)!;
+          expect(tool.def.parameters).toEqual({ schemaCanary: `schema:${name}` });
+          expect(tool.def.constrainedSampling).toBe(false);
+          expect(tool.def.execute).toEqual(expect.any(Function));
+          expect(tool.def.renderCall).toEqual(expect.any(Function));
+          expect(tool.def.renderResult).toEqual(expect.any(Function));
+        }
+        for (const name of ["grep", "find", "ls"]) {
+          expect(tools.find((candidate) => candidate.name === name)!.def.constrainedSampling)
+            .toEqual({ type: "json_schema" });
+        }
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_EXPERIMENTAL;
+      else process.env.PI_EXPERIMENTAL = previous;
     }
   });
 

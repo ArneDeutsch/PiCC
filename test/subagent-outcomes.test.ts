@@ -2,13 +2,21 @@ import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { validateAgentMcpAdmission } from "../src/index.js";
 import { normalizeAgentMcpDeclaration } from "../src/claude/agent-mcp.js";
-import { createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
+import {
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+  type PiSdk,
+} from "../src/runtime/subagents.js";
 import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
 } from "../src/runtime/background-tasks.js";
-import { SubagentRegistry, type SteerableSession } from "../src/runtime/subagent-registry.js";
+import {
+  SUBAGENT_FINAL_TEXT_CAP,
+  SubagentRegistry,
+  type SteerableSession,
+} from "../src/runtime/subagent-registry.js";
 import { SubagentRecoveryProgress } from "../src/runtime/subagent-recovery.js";
 import { createRetainedInputReport } from "../src/runtime/retained-input-report.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
@@ -567,6 +575,106 @@ describe("dispatch outcome classification", () => {
     expect(result.terminalAssistantError).toBeUndefined();
     expect(result.recoveryDisposition).toBeUndefined();
     expect(h.promptCalls()).toBe(1);
+  });
+
+  it("retains only a fork's terminal deferred partial output, bounded, with no recovery or retry", async () => {
+    const registry = new SubagentRegistry();
+    const partial = "p".repeat(SUBAGENT_FINAL_TEXT_CAP + 100);
+    const inherited = "inherited assistant history must not be retained";
+    const canaries = "provider_handle=h-secret credential=sk-secret path=C:/secret raw-diagnostic-canary";
+    const h = fakeSdk({
+      fakePersistedSessions: true,
+      forkSeed: [{
+        role: "assistant",
+        content: [{ type: "text", text: inherited }],
+        stopReason: "stop",
+      }],
+      replies: [{ text: partial, stopReason: "deferred", errorMessage: canaries }],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      getMainSessionFile: () => "/sessions/main.jsonl",
+      subagentRegistry: registry,
+    });
+    const result = await runtime.dispatch({ subagentType: "fork", prompt: "p", depth: 1 });
+
+    expect(result).toMatchObject({
+      ok: false,
+      outcome: "failed",
+      resumable: false,
+      error: "Agent ended with a deferred assistant response that PiCC cannot retrieve; the task is incomplete. Dispatch a new agent.",
+    });
+    expect(result.finalMessage).toHaveLength(SUBAGENT_FINAL_TEXT_CAP);
+    expect(result.finalMessage).toBe(
+      `${partial.slice(0, SUBAGENT_FINAL_TEXT_CAP - "\n\n[deferred output truncated]".length)}\n\n[deferred output truncated]`,
+    );
+    expect(result.finalMessage).not.toContain(inherited);
+    expect(result.error).not.toMatch(/provider_handle|h-secret|credential|sk-secret|C:\/secret|raw-diagnostic/iu);
+    expect(result.error).not.toMatch(/[\r\n]/u);
+    expect(result.diagnostics).toEqual([]);
+    expect(result.terminalAssistantError).toBeUndefined();
+    expect(result.recoveryDisposition).toBeUndefined();
+    expect(h.promptCalls()).toBe(1);
+    expect(registry.get(result.agentId)).toMatchObject({
+      state: "settled",
+      outcome: "failed",
+      resumable: false,
+      nonResumabilityReason: "deferred-response-unavailable",
+    });
+    expect(registry.get(result.agentId)?.outcome).not.toBe("completed");
+  });
+
+  it("excludes resumed history from an empty deferred result and later refuses for absent retrieval", async () => {
+    const registry = new SubagentRegistry();
+    const h = fakeSdk({
+      fakePersistedSessions: true,
+      replies: [
+        "prior assistant history",
+        { stopReason: "deferred", errorMessage: "provider_handle=hidden raw-diagnostic-canary" },
+      ],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      getMainSessionFile: () => "/sessions/main.jsonl",
+      subagentRegistry: registry,
+    });
+    const first = await runtime.dispatch({ subagentType: "reviewer", prompt: "first", depth: 1 });
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "continue",
+      depth: 1,
+      agentId: first.agentId,
+      resume: { transcriptPath: first.transcriptPath!, cwd: process.cwd() },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      outcome: "failed",
+      finalMessage: "",
+      resumable: false,
+      error: "Agent ended with a deferred assistant response that PiCC cannot retrieve; the task is incomplete. Dispatch a new agent.",
+    });
+    expect(result.finalMessage).not.toContain("prior assistant history");
+    expect(result.recoveryDisposition).toBeUndefined();
+    expect(h.promptCalls()).toBe(2);
+    expect(registry.get(result.agentId)).toMatchObject({
+      state: "settled",
+      outcome: "failed",
+      resumable: false,
+      nonResumabilityReason: "deferred-response-unavailable",
+    });
+    expect(registry.get(result.agentId)?.finalText).toBeUndefined();
+
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    }) as unknown as ToolLike;
+    const refusal = await send.execute("send", { to: result.agentId, message: "continue" })
+      .catch((cause: Error) => cause);
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(
+      `Agent ${result.agentId} ("reviewer") is not resumable: PiCC has no retrieval path for the terminal deferred assistant response. Dispatch a new agent instead.`,
+    );
+    expect((refusal as Error).message).not.toMatch(/provider_handle|hidden|raw-diagnostic-canary/iu);
+    expect(h.promptCalls()).toBe(2);
   });
 
   it("retracts streamed content when the same response ends pending and final observation confirms it", () => {

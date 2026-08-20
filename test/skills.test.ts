@@ -1115,18 +1115,26 @@ describe("shell injection env inheritance", () => {
     }
   });
 
-  it.runIf(hasBash())("strips launcher inheritance while preserving an explicit skill-shell value", async () => {
+  it.runIf(hasBash())("strips launcher/host inheritance while preserving explicit skill-shell values", async () => {
+    const previous = {
+      PICC_LAUNCHER_PID: process.env.PICC_LAUNCHER_PID,
+      PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK,
+      AI_AGENT: process.env.AI_AGENT,
+    };
     process.env.PICC_LAUNCHER_PID = "99";
     process.env.PI_SKIP_VERSION_CHECK = "1";
+    process.env.AI_AGENT = "pi";
     try {
       const { text } = await preprocessShellInjection(
-        'V: !`printf "%s|%s|%s" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$SKILL_SETTING"`',
-        { ...baseOpts, env: { SKILL_SETTING: "kept" }, shell: "bash" },
+        'V: !`printf "%s|%s|%s|%s" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$AI_AGENT" "$SKILL_SETTING"`',
+        { ...baseOpts, env: { AI_AGENT: "project-agent", SKILL_SETTING: "kept" }, shell: "bash" },
       );
-      expect(text).toBe("V: ||kept");
+      expect(text).toBe("V: ||project-agent|kept");
     } finally {
-      delete process.env.PICC_LAUNCHER_PID;
-      delete process.env.PI_SKIP_VERSION_CHECK;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 
