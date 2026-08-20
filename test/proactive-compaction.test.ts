@@ -4909,6 +4909,89 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     return { controller, generation: controller.snapshot().generation, guardContext };
   };
 
+  it("refuses matching native compaction origins before proactive ownership and accepts the manual callback", async () => {
+    const precompactLog = path.join(dir, ".claude", ".precompact-log");
+    const compactTrace = path.join(dir, ".claude", ".compact-trace");
+    for (const file of [precompactLog, compactTrace]) fs.rmSync(file, { force: true });
+    const releaseManual = deferred<void>();
+    const collisionsObserved = deferred<void>();
+    const nativeResults: unknown[] = [];
+    const traceAfterNative: boolean[] = [];
+    let manualResult: unknown;
+    let physical: Promise<void> | undefined;
+    let usagePercent = 90;
+    let ctx: any;
+    ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({
+        tokens: usagePercent * 10, contextWindow: 1000, percent: usagePercent,
+      }),
+      hasPendingMessages: () => false,
+      compact: (options: any) => {
+        physical = (async () => {
+          for (const reason of ["threshold", "overflow"] as const) {
+            nativeResults.push(await pi.fire("session_before_compact", { reason }, ctx));
+            traceAfterNative.push(fs.existsSync(precompactLog) || fs.existsSync(compactTrace));
+          }
+          collisionsObserved.resolve();
+          await releaseManual.promise;
+          manualResult = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if ((manualResult as { cancel?: boolean } | undefined)?.cancel) {
+            options.onError(new Error("manual callback refused"));
+            return;
+          }
+          await pi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "summary" },
+          }, ctx);
+          options.onComplete({ summary: "summary" });
+        })();
+        void physical.catch((error) => {
+          collisionsObserved.reject(error);
+          options.onError(error);
+        });
+      },
+    });
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const { controller, generation } = await armCheckpoint(ctx, "native-origin-collision");
+      const notificationBaseline = pi.notifications.length;
+      const entryBaseline = pi.entries.length;
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await collisionsObserved.promise;
+
+      expect(nativeResults).toEqual([{ cancel: true }, { cancel: true }]);
+      expect(traceAfterNative).toEqual([false, false]);
+      expect(pi.notifications).toHaveLength(notificationBaseline);
+      expect(pi.entries).toHaveLength(entryBaseline);
+      expect(errors.some((message) => message.includes("this compaction did not run"))).toBe(false);
+      expect(pi.entries.some((entry) =>
+        entry.data.category === "checkpoint-manual-compaction-refused")).toBe(false);
+      expect(controller.snapshot()).toMatchObject({ generation, phase: "compacting" });
+
+      releaseManual.resolve();
+      await waitUntil({
+        description: "manual-labelled proactive callback to start resumption",
+        predicate: () => controller.snapshot().phase === "resuming",
+      });
+      expect(manualResult).toBeUndefined();
+      expect(fs.readFileSync(precompactLog, "utf8").trim().split(/\r?\n/u)).toEqual(["auto"]);
+      expect(fs.readFileSync(compactTrace, "utf8").trim().split(/\r?\n/u)).toEqual(["pre", "start", "post"]);
+      usagePercent = 10;
+      await pi.fire("agent_settled", {}, ctx);
+      await outer;
+      await physical;
+      expect(controller.snapshot()).toMatchObject({ generation, phase: "idle", admission: "open" });
+    } finally {
+      releaseManual.resolve();
+      await physical?.catch(() => undefined);
+      errorSpy.mockRestore();
+      for (const file of [precompactLog, compactTrace]) fs.rmSync(file, { force: true });
+    }
+  });
+
   it.each([false, true])(
     "settles the exact cutoff in real order with optional guard context %s",
     async (sendGuardContext) => {

@@ -6277,8 +6277,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const controller = mainCheckpointGate.currentController();
     const generation = controller.snapshot().generation;
     const attempt = checkpointAttempt;
-    const proactive = controller.isCompactionSummaryActive(generation) &&
+    const matchesProactiveAttempt = controller.isCompactionSummaryActive(generation) &&
       attempt?.epoch === epoch && attempt.controller === controller && attempt.generation === generation;
+    const proactive = event.reason === "manual" && matchesProactiveAttempt;
+    if (event.reason !== "manual" && matchesProactiveAttempt) return { cancel: true };
     const replacingStaleManual = event.reason === "manual" && !proactive &&
       activeCompactionOperation?.origin === "user-manual" &&
       activeCompactionOperation.epoch === epoch && activeCompactionOperation.controller === controller &&
