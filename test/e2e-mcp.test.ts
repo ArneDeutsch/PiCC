@@ -242,6 +242,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
         });
 
         expect(barrier!.publishedPids()).toEqual([]);
+        await live.waitForText("[Extensions]", 30_000);
         live.sendInput("/mcp enable");
         await live.waitForText("Enable · eligible", 30_000);
         live.sendInput("");
