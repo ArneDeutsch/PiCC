@@ -611,27 +611,29 @@ describe.skipIf(cliMissing)(
       async () => {
         // Child completion and the parent's continuation can reach the mock
         // concurrently, so route by real request shape rather than script order.
-        const isExplore = (r: CapturedRequest) =>
-          systemText(r).includes("read-only exploration agent");
-        const isParent = (r: CapturedRequest) => !isExplore(r);
+        const isReviewer = (r: CapturedRequest) =>
+          systemText(r).includes("Review the given target. Reply with EXACTLY");
+        const isParent = (r: CapturedRequest) => !isReviewer(r);
         const malformedArguments = {
           summary: "review complete",
           findings: [],
           recommendation: "approve",
         };
         const result = await runPi({
+          fixture: "full-surface",
+          piSettings: { defaultTools: [] },
           script: [
             {
               toolCalls: [{
                 name: "Agent",
                 args: {
-                  subagent_type: "Explore",
+                  subagent_type: "reviewer",
                   prompt: "return the structured review result before the malformed contrast",
                   run_in_background: true,
                 },
               }],
             },
-            { when: isExplore, text: STRUCTURED_SUBAGENT_RESULT },
+            { when: isReviewer, text: STRUCTURED_SUBAGENT_RESULT },
             { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
             { when: isParent, toolCalls: [{ name: "TaskOutput", args: malformedArguments }] },
             { when: isParent, text: "malformed call rejected" },
@@ -640,6 +642,12 @@ describe.skipIf(cliMissing)(
         });
 
         expect(result.code).toBe(0);
+        const parentFirst = result.requests.find(isParent);
+        const reviewerFirst = result.requests.find(isReviewer);
+        expect(parentFirst).toBeDefined();
+        expect(reviewerFirst).toBeDefined();
+        expect(toolNames(parentFirst!)).toEqual(expect.arrayContaining(["read", "write", "bash", "Agent", "TaskOutput"]));
+        expect(new Set(toolNames(reviewerFirst!))).toEqual(new Set(["read", "grep", "find", "ls", "Grep", "Glob"]));
         const startResult = result.requests.find((request) =>
           /Background task task-\d+ accepted/.test(toolResultText(request)),
         );
