@@ -4921,9 +4921,11 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       await pi.fire("turn_start", {}, ctx);
       expect(aborts).toBe(1);
       if (guardContext) {
-        await pi.fire("message_start", {
-          message: { role: "custom", content: "Pi reconstruction", details: guardContext.details },
-        }, ctx);
+        const guardOccurrence = {
+          role: "custom", content: "Pi reconstruction", details: guardContext.details,
+        };
+        await pi.fire("message_start", { message: guardOccurrence }, ctx);
+        await pi.fire("message_end", { message: guardOccurrence }, ctx);
       }
       await pi.fire("message_end", { message: terminal }, ctx);
       branch = [{ type: "message", message: terminal }];
@@ -5189,9 +5191,11 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   const startExactDefensiveCutoff = async (prepared: Awaited<ReturnType<typeof prepareDefensiveAuthority>>) => {
     await prepared.gate.defensiveLatch(prepared.ctx, "print");
     if (prepared.guardContext) {
-      prepared.gate.userMessageStarted({
+      const occurrence = {
         role: "custom", content: "Pi reconstruction", details: prepared.guardContext.details,
-      });
+      };
+      prepared.gate.userMessageStarted(occurrence);
+      prepared.gate.assistantMessageEnded(occurrence);
     }
   };
 
@@ -5206,17 +5210,71 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(exact.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
   });
 
-  it("tolerates only the exact guard-owned pending occurrence in Pi's real event order", async () => {
-    const prepared = await prepareDefensiveAuthority({ pending: true, optionalContext: true });
-    expect(prepared.disposition?.stop).toBe("terminate");
+  it("does not bind when a guard-owned custom occurrence starts without its exact end", async () => {
+    const prepared = await prepareDefensiveAuthority({ optionalContext: true });
     await prepared.gate.defensiveLatch(prepared.ctx, "print");
-    expect(prepared.aborts()).toBe(1);
     prepared.gate.userMessageStarted({
       role: "custom", content: "Pi reconstruction", details: prepared.guardContext!.details,
     });
     const terminal = { role: "assistant", stopReason: "error", content: [] };
     prepared.gate.assistantMessageEnded(terminal);
+    expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+  });
+
+  it("tolerates only the exact guard-owned pending occurrence in Pi's real event order", async () => {
+    const prepared = await prepareDefensiveAuthority({ pending: true, optionalContext: true });
+    expect(prepared.disposition?.stop).toBe("terminate");
+    await prepared.gate.defensiveLatch(prepared.ctx, "print");
+    expect(prepared.aborts()).toBe(1);
+    const guardOccurrence = {
+      role: "custom", content: "Pi reconstruction", details: prepared.guardContext!.details,
+    };
+    prepared.gate.userMessageStarted(guardOccurrence);
+    prepared.gate.assistantMessageEnded(guardOccurrence);
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    prepared.gate.assistantMessageEnded(terminal);
     expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(true);
+  });
+
+  it("rejects cloned, duplicate, mutated, and stale guard-owned custom ends", async () => {
+    const terminal = { role: "assistant", stopReason: "error", content: [] };
+    const prepareStarted = async () => {
+      const prepared = await prepareDefensiveAuthority({ optionalContext: true });
+      await prepared.gate.defensiveLatch(prepared.ctx, "print");
+      const occurrence: Record<string, unknown> = {
+        role: "custom", content: "ignored", details: prepared.guardContext!.details,
+      };
+      prepared.gate.userMessageStarted(occurrence);
+      return { prepared, occurrence };
+    };
+    const reject = (prepared: Awaited<ReturnType<typeof prepareDefensiveAuthority>>) => {
+      prepared.gate.assistantMessageEnded(terminal);
+      expect(prepared.gate.consumeDefensiveCutoff(terminal, "print")).toBe(false);
+    };
+
+    const cloned = await prepareStarted();
+    cloned.prepared.gate.assistantMessageEnded({ ...cloned.occurrence });
+    reject(cloned.prepared);
+
+    const duplicate = await prepareStarted();
+    duplicate.prepared.gate.assistantMessageEnded(duplicate.occurrence);
+    duplicate.prepared.gate.assistantMessageEnded(duplicate.occurrence);
+    reject(duplicate.prepared);
+
+    for (const mutation of [
+      (occurrence: Record<string, unknown>) => { occurrence.role = "user"; },
+      (occurrence: Record<string, unknown>) => { occurrence.details = {}; },
+    ]) {
+      const mutated = await prepareStarted();
+      mutation(mutated.occurrence);
+      mutated.prepared.gate.assistantMessageEnded(mutated.occurrence);
+      reject(mutated.prepared);
+    }
+
+    const stale = await prepareStarted();
+    stale.prepared.gate.acceptedLogicalRun();
+    stale.prepared.gate.assistantMessageEnded(stale.occurrence);
+    reject(stale.prepared);
   });
 
   it("revokes guard-pending authority when any later unrelated occurrence starts", async () => {

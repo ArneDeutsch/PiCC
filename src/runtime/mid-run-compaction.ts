@@ -1727,6 +1727,7 @@ interface DefensiveCutoffIdentity {
 interface DefensiveContextOccurrence extends DefensiveCutoffIdentity {
   envelope: object;
   startedMessage?: object;
+  endedMessage?: object;
 }
 
 type DefensiveCutoffAuthority =
@@ -2119,20 +2120,41 @@ export class MainSessionCheckpointGate {
 
   assistantMessageEnded(message: unknown, ctx?: MainGateContext): void {
     const cutoff = this.defensiveCutoff;
-    if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") {
-      if (cutoff) this.defensiveCutoff = undefined;
-      this.defensiveContextOccurrence = undefined;
+    const messageObject = message !== null && typeof message === "object"
+      ? message as Record<string, unknown>
+      : undefined;
+    if (messageObject?.role !== "assistant") {
+      const contextOccurrence = this.defensiveContextOccurrence;
+      const matchingContextEnd = messageObject?.role === "custom" && contextOccurrence !== undefined &&
+        contextOccurrence.startedMessage === messageObject && contextOccurrence.endedMessage === undefined &&
+        messageObject.details === contextOccurrence.envelope &&
+        (cutoff?.state === "offered" || cutoff?.state === "issued") &&
+        this.defensiveCutoffIdentityMatches(contextOccurrence, true) &&
+        this.defensiveCutoffIdentityMatches(cutoff, true) && !this.hasUnrelatedPendingInput();
+      if (matchingContextEnd) {
+        contextOccurrence.endedMessage = messageObject;
+        return;
+      }
+      this.revokeDefensiveCutoff();
       return;
     }
-    if (cutoff?.state === "issued" && (message as { stopReason?: unknown }).stopReason === "error" &&
+    const contextOccurrence = this.defensiveContextOccurrence;
+    const noUnrelatedInput = !this.hasUnrelatedPendingInput();
+    const contextComplete = contextOccurrence === undefined ||
+      (contextOccurrence.startedMessage !== undefined &&
+        contextOccurrence.endedMessage === contextOccurrence.startedMessage &&
+        (contextOccurrence.startedMessage as { role?: unknown }).role === "custom" &&
+        (contextOccurrence.startedMessage as { details?: unknown }).details === contextOccurrence.envelope &&
+        this.defensiveCutoffIdentityMatches(contextOccurrence, true));
+    if (cutoff?.state === "issued" && messageObject.stopReason === "error" && contextComplete && noUnrelatedInput &&
         this.defensiveCutoffIdentityMatches(cutoff, true)) {
-      this.defensiveCutoff = { ...cutoff, state: "bound", terminal: message };
+      this.defensiveCutoff = { ...cutoff, state: "bound", terminal: messageObject };
       this.defensiveContextOccurrence = undefined;
-    } else if (cutoff?.state !== "bound" || cutoff.terminal !== message) {
+    } else if (cutoff?.state !== "bound" || cutoff.terminal !== messageObject) {
       this.defensiveCutoff = undefined;
       this.defensiveContextOccurrence = undefined;
     }
-    const ids = toolCallIds(message);
+    const ids = toolCallIds(messageObject);
     if (this.generationSource === "assistant" && this.controller.snapshot().phase === "stopping" &&
         ids.length === this.batch.ids.length && ids.every((id, index) => id === this.batch.ids[index])) return;
     this.finishToolAbortObservation();
