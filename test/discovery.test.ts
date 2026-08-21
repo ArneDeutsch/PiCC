@@ -248,6 +248,32 @@ describe("loadSettings — precedence & merging", () => {
     expect(settings.cleanupPeriodDays).toBe(10);
   });
 
+  it.each([
+    ["win32", { ScOpE_aLiAs: "managed" }],
+    ["linux", {
+      Scope_Alias: "user",
+      SCOPE_ALIAS: "project",
+      scope_alias: "local",
+      ScOpE_aLiAs: "managed",
+    }],
+  ] as const)("merges env aliases with %s target-platform semantics", (platform, expected) => {
+    const scopes = makeScopes();
+    const managedFile = scopes.absentManaged[0]!;
+    writeJson(path.join(scopes.userDir, "settings.json"), { env: { Scope_Alias: "user" } });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { env: { SCOPE_ALIAS: "project" } });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), { env: { scope_alias: "local" } });
+    writeJson(managedFile, { env: { ScOpE_aLiAs: "managed" } });
+
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: [managedFile],
+      platform,
+    });
+    expect(settings.env).toEqual(expected);
+  });
+
   it("gives managed settings the highest precedence", () => {
     const scopes = makeScopes();
     const managedFile = scopes.absentManaged[0]!;

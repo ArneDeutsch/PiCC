@@ -836,29 +836,33 @@ describe("HookRunner placeholders and environment", () => {
     expect(outcome.stdout).toBe(`${projectDir}\n${projectDir}`);
   });
 
-  it("exposes CLAUDE/settings env while stripping inherited launcher context", async () => {
+  it("exposes CLAUDE/settings env while stripping inherited launcher/host context", async () => {
     const previous = {
       PICC_LAUNCHER_PID: process.env.PICC_LAUNCHER_PID,
       PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK,
+      AI_AGENT: process.env.AI_AGENT,
     };
     process.env.PICC_LAUNCHER_PID = "99";
     process.env.PI_SKIP_VERSION_CHECK = "1";
+    process.env.AI_AGENT = "pi";
     try {
       const { runner } = makeRunner(
         {
           UserPromptSubmit: [
-            { hooks: [`printf '%s|%s|%s|%s|%s' "$CLAUDE_HOOK_EVENT" "$CLAUDE_SESSION_ID" "$MY_SETTING" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK"`] },
+            { hooks: [`printf '%s|%s|%s|%s|%s|%s' "$CLAUDE_HOOK_EVENT" "$CLAUDE_SESSION_ID" "$MY_SETTING" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$AI_AGENT"`] },
           ],
         },
         { sessionId: "sess-42", env: { MY_SETTING: "from-settings" } },
       );
       const outcome = await runner.fire("UserPromptSubmit", {});
-      expect(outcome.stdout).toBe("UserPromptSubmit|sess-42|from-settings||");
+      expect(outcome.stdout).toBe("UserPromptSubmit|sess-42|from-settings|||");
     } finally {
       if (previous.PICC_LAUNCHER_PID === undefined) delete process.env.PICC_LAUNCHER_PID;
       else process.env.PICC_LAUNCHER_PID = previous.PICC_LAUNCHER_PID;
       if (previous.PI_SKIP_VERSION_CHECK === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
       else process.env.PI_SKIP_VERSION_CHECK = previous.PI_SKIP_VERSION_CHECK;
+      if (previous.AI_AGENT === undefined) delete process.env.AI_AGENT;
+      else process.env.AI_AGENT = previous.AI_AGENT;
     }
   });
 

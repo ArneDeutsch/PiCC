@@ -110,7 +110,7 @@ describe("global same-version runtime repair", () => {
       validateRuntime: () => fs.readFileSync(runtime, "utf8") === "verified-runtime\n"
         ? { ok: true, entries: {}, manifest: {} }
         : { ok: false, reason: "The installed runtime is damaged." },
-      validateSuite: () => ({ ok: true, version: "0.83.0" }),
+      validateSuite: () => ({ ok: true, version: "0.84.2" }),
       output: { log() {}, error(value: unknown) { errors.push(String(value)); } },
     });
 

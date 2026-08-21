@@ -18,7 +18,7 @@ What it exercises:
 Try it (from this directory, with PiCC installed — see the user guide):
 
 ```bash
-picc            # or: pi -e <path-to-picc>/src/index.ts
+picc            # or: pi -nc -e <path-to-picc>/src/index.ts
 > /greet Ada
 > ask the reviewer agent to review src/hello.js
 ```

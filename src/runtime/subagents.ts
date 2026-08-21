@@ -35,6 +35,7 @@ import type {
   CheckpointStopTerminalEvidence,
 } from "./subagent-registry.js";
 import {
+  SUBAGENT_FINAL_TEXT_CAP,
   formatRetainedInputReport,
   guardSteer,
   oneShotRefusal,
@@ -3542,6 +3543,24 @@ export class SubagentRuntime {
       const live = session;
       let truncated = false;
       let truncationDiagnosed = false;
+      const disableRegistryResume = (): void => {
+        const registry = this.deps.subagentRegistry;
+        const record = registry?.get(agentId);
+        if (!registry || !record) return;
+        registry.register({
+          agentId,
+          agentName: record.agentName,
+          agentProvenance: record.agentProvenance,
+          depth: record.depth,
+          cwd: record.cwd,
+          worktreePath: record.worktreePath,
+          transcriptPath: record.transcriptPath,
+          resumable: false,
+          nonResumabilityReason: "deferred-response-unavailable",
+          oneShot: record.oneShot,
+          session: record.session,
+        });
+      };
       const terminalOutcome = (): DispatchResult | undefined => {
         const last = lastAssistantMessage(live);
         if (last?.stopReason === "error") {
@@ -3619,6 +3638,26 @@ export class SubagentRuntime {
             worktreePath,
             usage: captureUsage(),
             error: "Agent ended with an incomplete pending assistant response.",
+            diagnostics,
+          };
+        }
+        if (last?.stopReason === "deferred") {
+          settledOutcome = "failed";
+          settledFinalText = boundedDeferredAssistantText(last);
+          disableRegistryResume();
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: settledFinalText,
+            agentId,
+            transcriptPath,
+            resumable: false,
+            truncated: false,
+            isFork,
+            agentName: agent.name,
+            worktreePath,
+            usage: captureUsage(),
+            error: "Agent ended with a deferred assistant response that PiCC cannot retrieve; the task is incomplete. Dispatch a new agent.",
             diagnostics,
           };
         }
@@ -3956,6 +3995,17 @@ function assistantTextSoFar(session: PiSession): string {
     .map((m) => extractText(m.content))
     .filter((t) => t.trim())
     .join("\n\n");
+}
+
+const DEFERRED_OUTPUT_TRUNCATION = "\n\n[deferred output truncated]";
+
+function boundedDeferredAssistantText(message: PiSessionMessage): string {
+  const text = extractText(message.content);
+  if (text.length <= SUBAGENT_FINAL_TEXT_CAP) return text;
+  const end = SUBAGENT_FINAL_TEXT_CAP - DEFERRED_OUTPUT_TRUNCATION.length;
+  let prefix = text.slice(0, end);
+  if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+  return `${prefix}${DEFERRED_OUTPUT_TRUNCATION}`;
 }
 
 /** Model-visible error text stays short: capped ~500 chars, never enriched. */
@@ -4649,15 +4699,15 @@ export function createSendMessageToolDefinition(
       }
 
       // Settled → resume. Refuse the non-resumable cleanly — never silently start
-      // a fresh context-less run. Two shapes: no persisted transcript (in-memory
-      // fallback / one-shot builtin) OR a persisted transcript that is still
-      // non-resumable (a fork persists its inherited transcript but its
-      // context — the parent conversation at fork time — cannot be safely
-      // re-derived). Give each an honest reason (tests assert refusal, not wording).
+      // a fresh context-less run. Deferred settlement retains its own narrow
+      // reason because the missing capability is response retrieval, not context
+      // reconstruction. Other records retain the established transcript split.
       if (!record.resumable || !record.transcriptPath) {
-        const reason = record.transcriptPath
-          ? "its context cannot be safely re-derived (e.g. a fork's inherited parent conversation, or another non-resumable run)"
-          : "it ran without a persisted transcript (print/no-session mode or a one-shot builtin)";
+        const reason = record.nonResumabilityReason === "deferred-response-unavailable"
+          ? "PiCC has no retrieval path for the terminal deferred assistant response"
+          : record.transcriptPath
+            ? "its context cannot be safely re-derived (e.g. a fork's inherited parent conversation, or another non-resumable run)"
+            : "it ran without a persisted transcript (print/no-session mode or a one-shot builtin)";
         throw new Error(
           `Agent ${record.agentId} ("${record.agentName}") is not resumable: ${reason}. Dispatch a new agent instead.`,
         );

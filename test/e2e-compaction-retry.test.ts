@@ -415,9 +415,9 @@ describe.skipIf(cliMissing)("e2e compaction retries through the real Pi stack", 
       "main/ordinary", "child/ordinary", "child/ordinary", "child/compaction",
       "child/compaction", "child/ordinary", "main/ordinary",
     ]);
-    expect(fixtureTrace(result.fixture, "physical-compaction.txt")).toEqual(["start", "commit"]);
+    expect(fixtureTrace(result.fixture, "physical-compaction.txt")).toEqual(["start", "start", "commit"]);
     expect(fixtureTrace(result.fixture, "compact-hooks.txt")).toEqual([
-      "PreCompact", "SessionStartCompact", "PostCompact",
+      "PreCompact", "PreCompact", "SessionStartCompact", "PostCompact",
     ]);
     expect(toolResultText(result.requests.at(-1)!)).toContain("CHILD_RETRY_RESUMED");
     expect(toolResultText(result.requests.at(-1)!).match(/CHILD_RETRY_RESUMED/g)).toHaveLength(1);

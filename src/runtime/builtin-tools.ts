@@ -463,6 +463,11 @@ export function buildStockBuiltinTools(
         renderCall: def.renderCall,
         renderResult: def.renderResult,
         execute,
+        // PiCC does not opt Claude-compatible tools into ambient experimental
+        // provider-side schema enforcement; false is Pi's public neutral value.
+        ...(["bash", "read", "write", "edit"].includes(name)
+          ? { constrainedSampling: false }
+          : {}),
       },
     });
   }

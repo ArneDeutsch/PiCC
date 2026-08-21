@@ -19,9 +19,11 @@ import type {
   AgentSession,
   AgentSessionEvent,
   AgentSessionEventListener,
+  ExtensionAPI,
   MessageRenderOptions,
   NewSessionOptions,
   SessionStats,
+  ToolCallEventResult,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 // Value imports for public static/function surfaces; still never executed —
@@ -41,6 +43,7 @@ export const stopReasonVocabulary: Record<StopReason, true> = {
   toolUse: true,
   error: true,
   aborted: true,
+  deferred: true,
 };
 
 // stopReason is REQUIRED on AssistantMessage...
@@ -53,6 +56,15 @@ export const errorMessageOptional: AssistantMessage["errorMessage"] = undefined;
 export const errorMessageString: AssistantMessage["errorMessage"] = "terminal failure";
 export const rawStopReasonOptional: AssistantMessage["rawStopReason"] = undefined;
 export const rawStopReasonString: AssistantMessage["rawStopReason"] = "provider-specific-terminal";
+export const deferredHandleOptional: AssistantMessage["deferred"] = undefined;
+export const deferredHandle: AssistantMessage["deferred"] = {
+  provider: "contract",
+  modelId: "contract-model",
+  api: "openai-completions",
+  id: "deferred-contract",
+};
+export const endTurnOptional: AssistantMessage["endTurn"] = undefined;
+export const endTurnBoolean: AssistantMessage["endTurn"] = true;
 export const retryClassifierArg: Parameters<typeof isRetryableAssistantError>[0] = {} as AssistantMessage;
 export const retryClassifierResult: ReturnType<typeof isRetryableAssistantError> = true;
 export const overflowClassifierArgs: Parameters<typeof isContextOverflow> = [{} as AssistantMessage, 100_000];
@@ -72,6 +84,14 @@ export const executeSignalOptional: Parameters<Exec>[2] = undefined;
 // A Pi change that removes the field or the "self" member fails to compile here.
 export const renderShellSelf: NonNullable<ToolDefinition["renderShell"]> = "self";
 export const messageRendererOutputPad: MessageRenderOptions["outputPad"] = 1;
+export const blockedToolTerminate: ToolCallEventResult = { block: true, terminate: true };
+export const defaultToolsSelection: Parameters<typeof SettingsManager.inMemory>[0] = {
+  defaultTools: ["read", "bash"],
+};
+export const expandedUserMessageOptions: Parameters<ExtensionAPI["sendUserMessage"]>[1] = {
+  deliverAs: "followUp",
+  expandPromptTemplates: true,
+};
 
 // --- subagent transcript persistence surface ---
 

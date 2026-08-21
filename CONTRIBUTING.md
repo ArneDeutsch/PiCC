@@ -31,7 +31,7 @@ host it through an external Pi:
 ```bash
 node <path-to-PiCC>/bin/picc.mjs
 # explicit source development:
-pi -e <path-to-PiCC>/src/index.ts
+pi -nc -e <path-to-PiCC>/src/index.ts
 ```
 
 After source changes, run `npm run build`. The build publishes JavaScript and external source maps

@@ -22,8 +22,10 @@ companion to both.
 
 **PiCC is a Pi extension, not a fork of Pi's renderer.** The implementation entry is
 `export default function picc(pi)` in `src/extension.ts`, where `pi` is Pi's `ExtensionAPI`;
-`picc/index.ts` and `src/index.ts` are bootstrap surfaces. PiCC does **not** own the render loop,
-the scrollback model, or the terminal — it hangs behavior off the hooks Pi exposes.
+`picc/index.ts` and `src/index.ts` are bootstrap surfaces. PiCC does **not** own renderer-mode
+selection, the render loop, global layout, the scrollback/viewport model, or the terminal — it hangs
+behavior off the hooks Pi exposes. PiCC's established compatibility target is Pi's regular TUI;
+fullscreen is not a PiCC compatibility commitment.
 
 So the ceiling on "how adaptable is the TUI" is exactly **the extension API surface**. Anything
 inside that API is fair game and upgrade-stable-ish. Anything outside it means patching or
@@ -41,11 +43,12 @@ Two objects matter:
 
 ### 1.1 Two caveats that gate almost everything
 
-1. **Mode-gating — interactive UI is TUI-only.** `ctx.mode` is one of `"tui" | "rpc" | "json" |
-   "print"`. Every interactive verb (`custom`, widgets, footer/header, shortcuts, raw input,
-   spinner) only does something in `"tui"`. PiCC also runs headless (print/RPC), so **always
-   guard**: check `ctx.mode === "tui"` (or `ctx.hasUI` for dialog-capable modes, which is true in
-   TUI *and* RPC) and provide a text-mode degrade. Never let UI code throw into a headless run.
+1. **Mode-gating — interactive UI is TUI-only.** `ctx.mode` distinguishes `"tui"` from RPC, JSON,
+   and print; Pi's renderer-mode selection within TUI is separate and not an extension-defined global
+   layout switch. Every interactive verb (`custom`, widgets, footer/header, shortcuts, raw input,
+   spinner) needs TUI gating. PiCC validates regular TUI behavior, so **always guard** with
+   `ctx.mode === "tui"` (or `ctx.hasUI` only for dialog-capable modes, where RPC also qualifies) and
+   provide a text-mode degrade. Never let UI code throw into a headless run.
 
 2. **You need a `ctx`, and you only get one at specific entry points.** UI verbs live on `ctx.ui`,
    and a `ctx` is only handed to you inside:
@@ -79,7 +82,7 @@ Two objects matter:
 | Rebind an **existing Pi action** (Esc, Ctrl-O, …) from code | **Not exposed / Hard** | user's `keybindings.json` only; from code you can only *intercept* (`onTerminalInput`) or replace the editor |
 | Custom transcript entries / messages | **Easy (entries already done)** | `pi.registerEntryRenderer` / `pi.registerMessageRenderer` |
 | Slash commands, CLI flags, terminal title, autocomplete | **Easy** | `pi.registerCommand`, `pi.registerFlag`, `ctx.ui.setTitle`, `ctx.ui.addAutocompleteProvider` |
-| Global transcript layout / spacing / scrollback | **Impossible (without forking Pi)** | render-loop internal |
+| Arbitrary global transcript/viewport layout | **Not exposed** | Pi owns renderer mode and global layout; extensions can use only the specific header, footer, widget, overlay, and component seams |
 
 ---
 
@@ -230,16 +233,9 @@ These are not style preferences — violating them crashes the app or leaks term
 
 ### 4.1 The model
 
-`Theme` (`dist/modes/interactive/theme/theme.d.ts`) is a fixed vocabulary of **semantic color
-slots**, not a free palette:
-
-- `ThemeColor` (~45 slots): `accent`, `border`, `success`, `error`, `warning`, `muted`, `dim`,
-  `text`, `toolTitle`, `toolOutput`, `mdHeading`, `mdCode`, `mdCodeBlock`, `toolDiffAdded`,
-  `toolDiffRemoved`, `syntaxKeyword`/`syntaxString`/… , `thinkingOff`…`thinkingMax`, `bashMode`, …
-- `ThemeBg` (6 slots, all of them): `selectedBg`, `userMessageBg`, `customMessageBg`,
-  `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`.
-- Methods: `fg(slot, text)`, `bg(slot, text)`, `bold/italic/underline/inverse/strikethrough`,
-  `getFgAnsi(slot)`, `getColorMode()` (`truecolor` | `256color`).
+`Theme` (`dist/modes/interactive/theme/theme.d.ts`) is a fixed vocabulary of semantic foreground
+and background slots, not a free palette. The exact closed unions, methods, and defaults belong to
+Pi's declarations; use those declarations rather than copying their members into PiCC guidance.
 
 ### 4.2 What you can do
 
@@ -340,14 +336,9 @@ Several dedicated hooks — all low-risk:
 ### 7.1 The model
 
 There is a real `KeybindingsManager` (`dist/core/keybindings.d.ts`) backed by a user
-`keybindings.json`. Every action has a stable id and default keys, across three namespaces:
-
-- `tui.editor.*` / `tui.input.*` / `tui.select.*` — text editing and list navigation,
-- `app.*` — app actions: `app.interrupt` (Esc), `app.clear` (Ctrl-C), `app.exit` (Ctrl-D),
-  `app.tools.expand` (Ctrl-O), `app.model.select` (Ctrl-L), `app.thinking.cycle` (Shift-Tab), …
-
-Users override any of them in `keybindings.json`; the manager resolves user bindings over defaults
-and reports conflicts.
+`keybindings.json`. Pi owns the action namespaces, including renderer/viewport actions, and their
+current defaults. Extensions should match action ids through the injected manager instead of copying
+closed member/default inventories. User bindings override defaults and the manager reports conflicts.
 
 ### 7.2 What an extension can do
 
@@ -414,16 +405,17 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   unbound rows keep it inside the frame; malformed display fields fall back to a concise
   warning (see "`renderShell` — this is how you control blank lines and framing").
 
-**Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`,
-`ctx.ui.setWorkingIndicator`/`setWorkingMessage`, full `ctx.ui.setTheme`,
-`ctx.ui.addAutocompleteProvider`, `ctx.ui.setTitle`, `ctx.ui.setToolsExpanded`.
+Additional public UI seams include custom header/footer, working-state presentation, theme
+selection, autocomplete, terminal title, and tool-expansion state; consult the pinned Pi declarations
+for the current exact surface.
 
 ---
 
 ## 10. Hard boundaries — design around these
 
-- **Global transcript layout, inter-block spacing, scrollback model** — render-loop internal, not
-  exposed. No extension knob.
+- **Renderer-mode selection and arbitrary global transcript/viewport layout** — Pi-owned and not
+  exposed as extension layout authority. Regular TUI is PiCC's validated target; specific component,
+  widget, header/footer, and overlay seams do not imply fullscreen compatibility.
 - **New named theme roles** — closed vocabulary (see "What you cannot do" under "Colors and
   themes").
 - **Global rebinding of Pi's built-in key actions from code** — user config only; extensions add or

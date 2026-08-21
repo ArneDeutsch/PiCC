@@ -13,6 +13,7 @@ import {
 import { fakePi } from "./helpers/fake-pi.js";
 import { HookRunner } from "../src/engine/hook-runner.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
+import { deferred } from "./helpers/async.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -174,12 +175,15 @@ describe("extension command boundary", () => {
         loadBuiltinSdk: async () => { throw new Error("SDK unavailable"); },
         onInitializationSettled: pi.captureInitialization,
       });
-      expect(pi.handlers.get("user_bash")).toHaveLength(1);
+      expect(pi.handlers.get("user_bash")).toHaveLength(2);
       expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
-      await pi.fire("user_bash", { command: "echo hi" });
+      const operationsResult = await pi.fire("user_bash", { command: "echo hi" });
       expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+      await expect(operationsResult.operations.exec("echo hi", root, { env: {} })).rejects.toThrow(
+        "PiCC direct Bash is unavailable because startup initialization failed. Check the PiCC installation, then restart PiCC.",
+      );
       await pi.waitForInitialization();
-      expect(pi.handlers.get("user_bash")).toHaveLength(1);
+      expect(pi.handlers.get("user_bash")).toHaveLength(2);
     } finally {
       process.chdir(savedCwd);
       for (const key of Object.keys(process.env)) delete process.env[key];
@@ -187,20 +191,38 @@ describe("extension command boundary", () => {
     }
   });
 
-  it("replaces local-Bash operations only when it can pin the shell", async () => {
+  it("wraps local-Bash operations on every platform with the project subprocess environment", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-update-local-bash-"));
     roots.push(root);
     fs.writeFileSync(path.join(root, "CLAUDE.md"), "fixture\n", "utf8");
+    fs.mkdirSync(path.join(root, ".claude"));
+    fs.writeFileSync(
+      path.join(root, ".claude", "settings.json"),
+      JSON.stringify({ env: {
+        AI_AGENT: "configured-agent",
+        CONFIGURED_ONLY: "configured",
+        INHERITED_OVERLAY: "configured-wins",
+      } }),
+      "utf8",
+    );
     const savedCwd = process.cwd();
     const saved = { ...process.env };
     const shellPath = resolveGitBashPath();
-    const operationOptions: Array<Record<string, unknown>> = [];
+    const sdkReady = deferred<any>();
+    const operationOptions: Array<Record<string, unknown> | undefined> = [];
+    const delegated: Array<{ command: string; cwd: string; options: Record<string, unknown> }> = [];
+    const delegateResult = { exitCode: 17 };
     const instance = () => ({ execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
     const definition = () => ({});
     const sdk = {
-      createLocalBashOperations: (options: Record<string, unknown>) => {
+      createLocalBashOperations: (options?: Record<string, unknown>) => {
         operationOptions.push(options);
-        return { execute: async () => undefined };
+        return {
+          exec: async (command: string, cwd: string, execOptions: Record<string, unknown>) => {
+            delegated.push({ command, cwd, options: execOptions });
+            return delegateResult;
+          },
+        };
       },
       createBashTool: instance,
       createReadTool: instance,
@@ -222,17 +244,77 @@ describe("extension command boundary", () => {
       Object.assign(process.env, directEnv({
         PICC_LAUNCHER_PID: String(process.ppid),
         PICC_VERSION: "0.1.1",
+        AI_AGENT: "pi",
+        INHERITED_OVERLAY: "inherited-loses",
       }));
       const pi = fakePi();
       picc(pi.api as never, {
-        loadBuiltinSdk: async () => sdk,
+        loadBuiltinSdk: () => sdkReady.promise,
         onInitializationSettled: pi.captureInitialization,
       });
-      await pi.waitForInitialization();
-      expect(pi.handlers.get("user_bash")).toHaveLength(shellPath ? 2 : 1);
-      await pi.fire("user_bash", { command: "echo hi" });
+      expect(pi.handlers.get("user_bash")).toHaveLength(2);
+
+      const onData = vi.fn();
+      const signal = new AbortController().signal;
+      const operationsResult = await pi.fire("user_bash", { command: "echo hi" });
       expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
-      expect(operationOptions).toEqual(shellPath ? [{ shellPath }] : []);
+      const execution = operationsResult.operations.exec("printf delegated", root, {
+        onData,
+        signal,
+        timeout: 321,
+        backend: "local-backend-canary",
+        env: {
+          PI_SKIP_VERSION_CHECK: "1",
+          PICC_LAUNCHER_PID: "41",
+          PICC_INSTALL_KIND: "installed",
+          PICC_VERSION: "1.2.3",
+          AI_AGENT: "pi",
+          INHERITED_OVERLAY: "inherited-loses",
+        },
+      });
+      let executionSettled = false;
+      void execution.then(
+        () => { executionSettled = true; },
+        () => { executionSettled = true; },
+      );
+      await Promise.resolve();
+      expect(executionSettled).toBe(false);
+      expect(operationOptions).toEqual([]);
+      expect(delegated).toEqual([]);
+
+      sdkReady.resolve(sdk);
+      const result = await execution;
+      await pi.waitForInitialization();
+      expect(operationOptions).toEqual([shellPath ? { shellPath } : undefined]);
+      expect(result).toBe(delegateResult);
+      expect(delegated).toHaveLength(1);
+      expect(delegated[0]).toMatchObject({
+        command: "printf delegated",
+        cwd: root,
+        options: { onData, signal, timeout: 321, backend: "local-backend-canary" },
+      });
+      expect(delegated[0]!.options.env).toMatchObject({
+        AI_AGENT: "configured-agent",
+        CONFIGURED_ONLY: "configured",
+        INHERITED_OVERLAY: "configured-wins",
+        CLAUDE_PROJECT_DIR: root,
+      });
+      expect(delegated[0]!.options.env).not.toHaveProperty("PI_SKIP_VERSION_CHECK");
+      expect(delegated[0]!.options.env).not.toHaveProperty("PICC_LAUNCHER_PID");
+      expect(delegated[0]!.options.env).not.toHaveProperty("PICC_INSTALL_KIND");
+      expect(delegated[0]!.options.env).not.toHaveProperty("PICC_VERSION");
+
+      const { createLocalBashOperations: _unavailable, ...sdkWithoutLocalOperations } = sdk;
+      const unavailablePi = fakePi();
+      picc(unavailablePi.api as never, {
+        loadBuiltinSdk: async () => sdkWithoutLocalOperations,
+        onInitializationSettled: unavailablePi.captureInitialization,
+      });
+      const unavailableResult = await unavailablePi.fire("user_bash", { command: "echo unavailable" });
+      await expect(unavailableResult.operations.exec("echo unavailable", root, { env: {} })).rejects.toThrow(
+        "PiCC direct Bash is unavailable in this Pi installation. Update or repair Pi, then restart PiCC.",
+      );
+      await unavailablePi.waitForInitialization();
     } finally {
       process.chdir(savedCwd);
       for (const key of Object.keys(process.env)) delete process.env[key];

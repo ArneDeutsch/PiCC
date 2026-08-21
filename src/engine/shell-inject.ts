@@ -271,7 +271,7 @@ function runCommand(cmd: string, opts: ShellInjectionOptions): Promise<RunResult
         args,
         {
           cwd: opts.cwd,
-          // Explicit Claude/settings values win after launcher-only inheritance is stripped.
+          // Explicit Claude/settings values win after launcher/host-only inheritance is stripped.
           env: unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(process.env, opts.env)),
           timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           maxBuffer: MAX_OUTPUT_BYTES,

@@ -97,7 +97,7 @@ import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { renderMainSessionTool } from "./runtime/main-session-tool-render.js";
-import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
+import { buildBashSpawnEnv, buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
   UnconfirmedHostDeadlineError,
@@ -1059,6 +1059,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("user_bash", () => {
     clearStartupSuppression();
   });
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: async (command: string, cwd: string, options: Record<string, any>) => {
+        const readiness = await builtInRegistration;
+        if (!readiness.ok) {
+          throw new Error("PiCC direct Bash is unavailable because startup initialization failed. Check the PiCC installation, then restart PiCC.");
+        }
+        const localOperations = readiness.localBashOperations;
+        if (!localOperations) {
+          throw new Error("PiCC direct Bash is unavailable in this Pi installation. Update or repair Pi, then restart PiCC.");
+        }
+        return localOperations.exec(command, cwd, {
+          ...options,
+          env: buildBashSpawnEnv(options.env ?? process.env, project.settings.env ?? {}, project.root),
+        });
+      },
+    },
+  }));
 
   const config = loadPiCCConfig(project.root);
   // Config-validation findings (malformed file, out-of-range compaction knob reverted
@@ -1487,14 +1505,38 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * that was abandoned and its successor.
    */
   let printWriteChain: { epoch: object; tail: Promise<void> } | undefined;
+  type StopContinuationSettlement = "pending" | "admitted" | "refused";
   interface StopContinuationCapability {
     readonly epoch: object;
     readonly controller: MidRunCompactionController;
     readonly generation: number;
     readonly resumeToken: ResumeToken;
     readonly text: string;
-    consumed: boolean;
+    readonly admission: Promise<boolean>;
+    readonly settlement: () => StopContinuationSettlement;
+    readonly resolveAdmission: (admitted: boolean) => boolean;
   }
+  const STOP_CONTINUATION_ADMISSION_TIMEOUT_MS = 1_000;
+  const createStopContinuationCapability = (
+    identity: Omit<StopContinuationCapability, "admission" | "settlement" | "resolveAdmission">,
+  ): StopContinuationCapability => {
+    let resolveResult!: (admitted: boolean) => void;
+    let state: StopContinuationSettlement = "pending";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const admission = new Promise<boolean>((resolve) => { resolveResult = resolve; });
+    const resolveAdmission = (admitted: boolean): boolean => {
+      if (state !== "pending") return false;
+      state = admitted ? "admitted" : "refused";
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      resolveResult(admitted);
+      return true;
+    };
+    timer = setTimeout(() => resolveAdmission(false), STOP_CONTINUATION_ADMISSION_TIMEOUT_MS);
+    return { ...identity, admission, settlement: () => state, resolveAdmission };
+  };
   const stopContinuationAdmission = new AsyncLocalStorage<StopContinuationCapability>();
   type CompactionOperationOrigin = "picc-proactive" | "pi-native-auto" | "user-manual";
   interface CompactionLifecycleOperation {
@@ -1539,9 +1581,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
      * dispatched through an API whose completion Pi announces (see the `triggerTurn`
      * note at the send site for the one precondition that carries), or the
      * `agent_settled` handler invocation currently deciding this run's ending. It
-     * goes false at exactly one place — the Stop-continuation hand-off, where PiCC
-     * has bet on a `pi.sendUserMessage` that returns void and that Pi may drop
-     * without ever starting a turn.
+     * goes false at exactly one place — the Stop-continuation hand-off, after the
+     * bounded identity-authenticated asynchronous admission resolves successfully.
+     * Refusal or timeout keeps custody with PiCC and concludes fail closed.
      *
      * It is a claim about who owes a settlement, not a proof: the handler
      * invocation's own coverage has one exception, named at the `agent_settled`
@@ -2533,6 +2575,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return mode === "tui" || mode === "rpc" || mode === "json" || mode === "print" ? mode : undefined;
     } catch { return undefined; }
   };
+  let stopDefensiveTerminalInputFence: (() => void) | undefined;
+  const clearDefensiveTerminalInputFence = (): void => {
+    mainCheckpointGate.setDefensiveTerminalInputFenceAvailable(false);
+    const stop = stopDefensiveTerminalInputFence;
+    stopDefensiveTerminalInputFence = undefined;
+    try { stop?.(); } catch { /* listener cleanup cannot own session lifecycle */ }
+  };
+  const bindDefensiveTerminalInputFence = (ctx: any, mode: CheckpointMode | undefined): void => {
+    clearDefensiveTerminalInputFence();
+    if (mode !== "tui" || typeof ctx?.ui?.onTerminalInput !== "function") return;
+    try {
+      const stop = ctx.ui.onTerminalInput((_data: string) => {
+        mainCheckpointGate.revokeDefensiveCutoffForTerminalInput();
+        return undefined;
+      });
+      if (typeof stop !== "function") return;
+      stopDefensiveTerminalInputFence = stop;
+      mainCheckpointGate.setDefensiveTerminalInputFenceAvailable(true);
+    } catch { /* a missing fence fails only the optional automatic cutoff classification */ }
+  };
 
   const checkpointMode = (ctx: any): CheckpointMode | undefined => {
     const mode = readableContextMode(ctx);
@@ -2690,8 +2752,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return;
     }
     const mode = checkpointMode(ctx);
-    // `stderr` is the TUI once Pi has stopped it: the ending still has to reach the reader,
-    // and their scrollback is what survives the teardown.
+    // After renderer teardown, stderr is the remaining visible channel regardless of
+    // the active renderer's exit or scrollback policy.
     const surface = mode === "tui" && sessionRenderingStopped ? "stderr" : mode;
     const baseText = checkpointText(event);
     // Every headless exhaustion is rephrased, the post-commit one included: it is the
@@ -3089,7 +3151,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           mainCheckpointGate.withReplayAuthorization(input, () => {
             pi.sendUserMessage(input.content as any, { deliverAs: input.delivery });
           });
-          // Pi's void return proves enqueue/admission only. The controller keeps
+          // Pi's void return proves only that the call returned. The controller keeps
           // custody until the matching authenticated message_start confirms host start.
           return { delivered: true, pendingHostStart: true } as const;
         },
@@ -3436,7 +3498,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // the same built-in registration settlement.
   const coreToolNames = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   type BuiltInReadiness =
-    | { ok: true }
+    | { ok: true; localBashOperations?: { exec: (...args: any[]) => any } }
     | { ok: false; cause: string; possiblePartialCommit: boolean; cleanup: string; cleanupVerified: boolean };
   const boundedCause = (value: unknown): string => {
     let candidate: unknown = value;
@@ -3496,12 +3558,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ) as unknown as Record<string, unknown>;
         return mainCheckpointGate.wrapTool(rendered);
       });
+      const createdLocalBashOperations = typeof sdk.createLocalBashOperations === "function"
+        ? sdk.createLocalBashOperations(shellPath ? { shellPath } : undefined)
+        : undefined;
+      const localBashOperations = createdLocalBashOperations
+        && typeof createdLocalBashOperations.exec === "function"
+        ? createdLocalBashOperations
+        : undefined;
       registrationBegan = true;
       for (const definition of prepared) pi.registerTool(definition);
-      if (shellPath && typeof sdk.createLocalBashOperations === "function") {
-        pi.on("user_bash", () => ({ operations: sdk.createLocalBashOperations({ shellPath }) }));
-      }
-      return { ok: true };
+      return { ok: true, ...(localBashOperations ? { localBashOperations } : {}) };
     } catch (err) {
       return {
         ok: false,
@@ -3888,6 +3954,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Guard: deny rules + PreToolUse/PostToolUse hooks + on-touch context injection
   // ---------------------------------------------------------------------------
+  const checkpointAwareGuardPi = {
+    on: pi.on.bind(pi),
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) =>
+      pi.sendMessage(mainCheckpointGate.authorizeDefensiveContextSend(message), options),
+  };
   createGuardExtension({
     engine: permissionEngine,
     hooks: hookRunnerFacade,
@@ -3912,7 +3983,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       return decision;
     },
-  })(pi);
+  })(checkpointAwareGuardPi);
 
   // ---------------------------------------------------------------------------
   // System prompt assembly (every turn — also compaction preservation)
@@ -4153,10 +4224,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   };
 
   pi.on("session_before_switch", async (_event: any, ctx: any) => {
+    clearDefensiveTerminalInputFence();
     // The controller cancels first; the old nested agent_settled or host callback
     // is the only authority that can confirm the logical run has joined.
     const result = await mainCheckpointGate.beforeSessionSwitch();
     if (result?.cancel) {
+      bindDefensiveTerminalInputFence(ctx, checkpointMode(ctx));
       if (mainCheckpointGate.currentController().isProcessTerminal()) {
         const terminalSnapshot = mainCheckpointGate.currentController().snapshot();
         const notice = terminalSnapshot.failureCategory === "restart-required"
@@ -4880,11 +4953,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     sessionRenderingStopped = false;
     sessionShutdownBoundary = false;
     mainShutdownRetainedInputAtRisk = false;
+    clearDefensiveTerminalInputFence();
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
     rotateCheckpointSessionEpoch();
     checkpointModeLatch = undefined;
-    checkpointMode(ctx);
+    const mode = checkpointMode(ctx);
+    bindDefensiveTerminalInputFence(ctx, mode);
     const sessionStartEpoch = checkpointSessionEpoch;
     const sessionStartController = mainCheckpointGate.currentController();
     activeCompactionOperation = undefined;
@@ -5043,7 +5118,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("message_end", (event: any, ctx: any) => {
-    mainCheckpointGate.assistantMessageEnded(event?.message, ctx);
+    const role = event?.message?.role;
+    if (role === "assistant" || role === "custom") {
+      mainCheckpointGate.assistantMessageEnded(event.message, ctx);
+    }
     const resume = activeMainResume;
     if (resume?.triggerStarted && event?.message?.role === "assistant" && event.message.stopReason === "aborted" &&
         mainCheckpointGate.currentController().resumedAborted(resume.token)) {
@@ -5082,11 +5160,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("turn_end", (_event: any, ctx: any) => {
     checkpointContext = ctx;
-    mainCheckpointGate.turnEnded(ctx);
+    mainCheckpointGate.turnEnded(ctx, checkpointMode(ctx));
   });
 
   pi.on("turn_start", async (_event: any, ctx: any) => {
-    await mainCheckpointGate.defensiveLatch(ctx);
+    await mainCheckpointGate.defensiveLatch(ctx, checkpointMode(ctx));
   });
 
   pi.on("before_provider_request", async (_event: any, ctx: any) => {
@@ -5094,13 +5172,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try { ctx?.abort?.(); } catch { /* admission remains closed */ }
       throw new Error("PiCC selected-main admission is closed");
     }
-    await mainCheckpointGate.beforeProviderRequest(ctx);
+    await mainCheckpointGate.beforeProviderRequest(ctx, checkpointMode(ctx));
   });
 
   const retainedPersistenceLocators = new WeakMap<object, RetainedInputPersistenceLocator>();
 
   pi.on("session_shutdown", async (event: any) => {
     clearRetentionHeartbeat();
+    clearDefensiveTerminalInputFence();
     // `quit` is the one reason Pi has already stopped the renderer for (`dispose()`); the
     // switch reasons (`new`/`resume`/`fork`) and `reload` all leave a live UI behind.
     // Latched before the cancellation, because the cancellation is what announces the
@@ -5343,37 +5422,46 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   pi.on("input", async (event: any, ctx: any) => {
+    const stopCapability = stopContinuationAdmission.getStore();
+    let exactStopContinuation = false;
     try {
+      exactStopContinuation = stopCapability !== undefined && event.source === "extension" &&
+        event.text === stopCapability.text && event.images === undefined &&
+        event.streamingBehavior === undefined;
       // Extension continuations are internal. Every other admitted input is a
       // user boundary and clears the retained Pi startup flag before processing.
       if (event.source !== "extension") clearStartupSuppression();
       if (selectedMainAdmissionFailure !== undefined) {
+        stopCapability?.resolveAdmission(false);
         selectedMainNotice(ctx, selectedMainAdmissionFailure, "error");
         return { action: "handled" };
       }
-      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
-      const stopCapability = stopContinuationAdmission.getStore();
       if (stopCapability) {
-        if (!stopCapability.consumed && event.source === "extension" &&
-            event.text === stopCapability.text && event.images === undefined &&
-            event.streamingBehavior === undefined) {
-          const controller = mainCheckpointGate.currentController();
-          const snapshot = controller.snapshot();
-          const resume = activeMainResume;
-          if (stopCapability.epoch === checkpointSessionEpoch &&
-              stopCapability.controller === controller &&
-              stopCapability.generation === snapshot.generation &&
-              stopCapability.resumeToken === resume?.token &&
-              resume.epoch === stopCapability.epoch &&
-              resume.generation === stopCapability.generation &&
-              resume.token.generation === stopCapability.generation &&
-              snapshot.phase === "resuming") {
-            stopCapability.consumed = true;
-            return { action: "continue" };
+        if (stopCapability.settlement() === "pending") {
+          if (exactStopContinuation) {
+            const controller = mainCheckpointGate.currentController();
+            const snapshot = controller.snapshot();
+            const resume = activeMainResume;
+            if (stopCapability.epoch === checkpointSessionEpoch &&
+                stopCapability.controller === controller &&
+                stopCapability.generation === snapshot.generation &&
+                stopCapability.resumeToken === resume?.token &&
+                resume.epoch === stopCapability.epoch &&
+                resume.generation === stopCapability.generation &&
+                resume.token.generation === stopCapability.generation &&
+                snapshot.phase === "resuming" && stopCapability.resolveAdmission(true)) {
+              return { action: "continue" };
+            }
           }
+          stopCapability.resolveAdmission(false);
+          return { action: "handled" };
         }
-        return { action: "handled" };
+        // AsyncLocalStorage descendants retain the capability after its waiter settles.
+        // Consume only the duplicate continuation; unrelated extension work has no
+        // authority from this capability and follows ordinary admission below.
+        if (exactStopContinuation) return { action: "handled" };
       }
+      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition !== "accept" && inputDisposition !== "quarantine") {
         rejectOrdinaryInput(inputDisposition, event, ctx);
@@ -5762,6 +5850,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return accept({ action: "continue" });
     } catch (err) {
       debug(`input handler error: ${(err as Error).message}`);
+      if (stopCapability &&
+          (stopCapability.settlement() === "pending" || exactStopContinuation)) {
+        stopCapability.resolveAdmission(false);
+        return { action: "handled" };
+      }
       // Once a checkpoint has closed admission, capture/hook/pipeline failures
       // cannot reopen transport by falling through to Pi. If quarantine could not
       // reach the normal capture path, preserve/report the raw input here.
@@ -5791,10 +5884,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   /**
    * `settled` false means a Stop hook blocked and a continuation was issued instead.
-   * `continuationAdmitted` then reports PiCC's own admission decision, which is the
-   * one way a continuation can fail to start a turn that PiCC can actually see —
-   * Pi's `sendUserMessage` returns void, and its other ways of ending without a turn
-   * (no model, expired credentials, a pre-turn throw) are invisible from here.
+   * `continuationAdmitted` then reports PiCC's own bounded admission decision, which
+   * is the one way a continuation can fail to start a turn that PiCC can actually
+   * see. Pi's extension wrapper returns before asynchronous input admission settles;
+   * other ways of ending after admission but without a turn remain invisible here.
    *
    * It is reported as refused whenever a resumed run is live and the continuation
    * went out without a capability, because PiCC then refuses it in its own `input`
@@ -5862,23 +5955,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (resume && resume.epoch === checkpointSessionEpoch &&
             resume.generation === snapshot.generation &&
             resume.token.generation === snapshot.generation && snapshot.phase === "resuming") {
-          const capability: StopContinuationCapability = {
+          const capability = createStopContinuationCapability({
             epoch: checkpointSessionEpoch,
             controller,
             generation: snapshot.generation,
             resumeToken: resume.token,
             text: continuation,
-            consumed: false,
-          };
-          // Pi reaches the `input` event synchronously from `sendUserMessage`, and
-          // PiCC's own admission decides in that handler's synchronous prefix, so
-          // `consumed` is already final when the send returns. That depends on PiCC
-          // being the first extension registering an `input` handler: Pi awaits each
-          // handler in extension order, so an extension ahead of PiCC whose handler
-          // awaits would defer this decision past the send and make `consumed` read a
-          // stale `false` — abandoning a run that is in fact healthy.
-          stopContinuationAdmission.run(capability, () => pi.sendUserMessage(continuation));
-          return { settled: false, continuationAdmitted: capability.consumed };
+          });
+          try {
+            const sent = stopContinuationAdmission.run(
+              capability,
+              () => pi.sendUserMessage(continuation) as unknown,
+            );
+            if (sent && typeof (sent as PromiseLike<unknown>).then === "function") {
+              void Promise.resolve(sent).catch(() => { capability.resolveAdmission(false); });
+            }
+          } catch {
+            capability.resolveAdmission(false);
+          }
+          return { settled: false, continuationAdmitted: await capability.admission };
         }
         // No capability could be minted — either no resumed run is carrying this
         // continuation, or authority moved while the hook ran. In the first case
@@ -5955,14 +6050,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     checkpointContext = ctx;
     const terminalAssistant = latestAssistantMessage(ctx);
     const physicalUnsuccessful = ["pending", "error", "aborted"].includes(terminalAssistant?.stopReason);
-    const checkpointSnapshot = mainCheckpointGate.currentController().snapshot();
-    // Pi persists either PiCC-owned pre-commit stop mechanism as aborted. The
-    // active awaiting generation still owns the authorized checkpoint settlement.
-    // `checkpointAbortRequested` only selects abort instead of terminate and is
-    // deliberately excluded from this exception's eligibility.
-    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "aborted" &&
-      activeMainResume === undefined && mainCheckpointGate.isActive() &&
-      checkpointSnapshot.phase === "awaiting-settlement";
+    const preCommitCheckpointCutoff = terminalAssistant?.stopReason === "error" &&
+      activeMainResume === undefined &&
+      mainCheckpointGate.consumeDefensiveCutoff(terminalAssistant, checkpointMode(ctx));
     const unsuccessful = physicalUnsuccessful && !preCommitCheckpointCutoff;
     if (unsuccessful && terminalAssistant.stopReason === "pending") {
       const notice = "The assistant response ended incomplete (pending); it was not accepted as a completed turn.";
@@ -6018,7 +6108,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           : "abandoned");
       } else {
         if (resume === undefined && !mainCheckpointGate.isLogicalRunStopped() &&
-            terminalAssistant.stopReason !== "aborted" && snapshot.phase === "awaiting-settlement") {
+            snapshot.phase === "awaiting-settlement") {
           controller.exhaustUnsuccessfulAwaitingSettlement(snapshot.generation);
         }
         // Ordinary unsuccessful settlement still revokes callbacks captured by its run.
@@ -6209,8 +6299,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const controller = mainCheckpointGate.currentController();
     const generation = controller.snapshot().generation;
     const attempt = checkpointAttempt;
-    const proactive = controller.isCompactionSummaryActive(generation) &&
+    const matchesProactiveAttempt = controller.isCompactionSummaryActive(generation) &&
       attempt?.epoch === epoch && attempt.controller === controller && attempt.generation === generation;
+    const proactive = event.reason === "manual" && matchesProactiveAttempt;
+    if (event.reason !== "manual" && matchesProactiveAttempt) return { cancel: true };
     const replacingStaleManual = event.reason === "manual" && !proactive &&
       activeCompactionOperation?.origin === "user-manual" &&
       activeCompactionOperation.epoch === epoch && activeCompactionOperation.controller === controller &&
@@ -6375,17 +6467,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         await controller.failAfterCommittedSummary(generation, "restoration");
       } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
-        if (recovered.recovered) {
-          const recoveryMode = readableContextMode(checkpointContext);
-          if (recoveryMode === "print" || recoveryMode === "json" || recoveryMode === "rpc") {
-            publishCheckpoint({
-              category: "checkpoint-recovered",
-              generation,
-              action: "manual-recovery",
-            }, checkpointContext);
-          }
-          reportRejectedShadows(recovered.rejected, checkpointContext);
-        }
+        if (recovered.recovered) reportRejectedShadows(recovered.rejected, checkpointContext);
       }
     }
     if (activeCompactionOperation === operation) activeCompactionOperation = undefined;

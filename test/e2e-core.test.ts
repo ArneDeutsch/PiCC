@@ -162,6 +162,54 @@ function expectNoToolRowPresentation(value: unknown, source: string): void {
   }
 }
 
+function expectDeltaOnlyAssistantStream(records: any[], finalCanary: string): void {
+  const matchingEnds = records
+    .map((record, index) => ({ record, index }))
+    .filter(({ record }) => record.type === "message_end" && record.message?.role === "assistant" &&
+      JSON.stringify(record.message).includes(finalCanary));
+  expect(matchingEnds).toHaveLength(1);
+  const end = matchingEnds[0]!;
+  let priorAssistantEnd = -1;
+  for (let index = end.index - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record.type === "message_end" && record.message?.role === "assistant") {
+      priorAssistantEnd = index;
+      break;
+    }
+  }
+  const starts = records
+    .map((record, index) => ({ record, index }))
+    .filter(({ record, index }) => index > priorAssistantEnd && index < end.index &&
+      record.type === "message_start" && record.message?.role === "assistant");
+  expect(starts).toHaveLength(1);
+  const updates = records.slice(starts[0]!.index + 1, end.index)
+    .filter((record) => record.type === "message_update");
+  expect(updates.length).toBeGreaterThan(1);
+  for (const update of updates) {
+    expect(update).not.toHaveProperty("message");
+    expect(update.assistantMessageEvent).not.toHaveProperty("partial");
+    expect(update).toHaveProperty("usage");
+  }
+  const reconstructed = updates
+    .filter((update) => update.assistantMessageEvent?.type === "text_delta")
+    .map((update) => update.assistantMessageEvent.delta)
+    .join("");
+  const authoritative = end.record.message.content
+    .filter((part: any) => part.type === "text")
+    .map((part: any) => part.text)
+    .join("");
+  expect(reconstructed).toBe(authoritative);
+  expect(authoritative).toContain(finalCanary);
+  for (let index = 1; index < updates.length; index += 1) {
+    const previous = updates[index - 1]!.usage;
+    const current = updates[index]!.usage;
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+      expect(current[key], `${key} must be cumulative at update ${index}`).toBeGreaterThanOrEqual(previous[key]);
+    }
+  }
+  expect(updates.at(-1)!.usage).toEqual(end.record.message.usage);
+}
+
 function expectCanonicalWriteResult(
   records: any[],
   expectedText: string,
@@ -189,13 +237,14 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
   async () => {
     const childScript = [
       'const fs=require("node:fs")',
-      'fs.appendFileSync("rpc-bash-marker.json",JSON.stringify({skip:process.env.PI_SKIP_VERSION_CHECK??null,launcher:process.env.PICC_LAUNCHER_PID??null})+"\\n")',
+      'fs.appendFileSync("rpc-bash-marker.json",JSON.stringify({skip:process.env.PI_SKIP_VERSION_CHECK??null,launcher:process.env.PICC_LAUNCHER_PID??null,aiAgent:process.env.AI_AGENT??null})+"\\n")',
     ].join(";");
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)}`;
     const live = await startDirectBootstrap({
       script: [],
       prompt: "unused",
       modeArgs: ["--mode", "rpc"],
+      extraEnv: { AI_AGENT: "inherited-host-canary-must-not-reach-bash" },
     });
     try {
       const requestId = "rpc-picc-user-bash";
@@ -214,7 +263,9 @@ it.skipIf(cliMissing || !BASH_AVAILABLE)(
       const markerLines = fs.readFileSync(path.join(result.fixture, "rpc-bash-marker.json"), "utf8")
         .trim().split(/\r?\n/u);
       expect(markerLines).toHaveLength(1);
-      expect(JSON.parse(markerLines[0]!)).toEqual({ skip: "1", launcher: null });
+      const marker = JSON.parse(markerLines[0]!);
+      expect(marker).toEqual({ skip: null, launcher: null, aiAgent: null });
+      expect(JSON.stringify(marker)).not.toContain("inherited-host-canary-must-not-reach-bash");
     } finally {
       live.closeInput();
       await live.stop();
@@ -321,6 +372,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       try {
         const live = await startPi({
           interactiveTerminal: true,
+          piSettings: { tuiMode: "regular" },
           lifecycleIsolation: true,
           persistSession: true,
           prompt: "unused",
@@ -341,8 +393,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           ],
         });
         try {
+          await live.waitForText("[Extensions]", 30_000);
+          await live.waitForText(lifecycle!.project, 30_000);
           live.sendInput(command);
-          const first = await live.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 1, 30_000);
+          const first = await live.waitForRequest(
+            (request) => allText(request).includes("FS-LIFECYCLE-GENERATION-1.0.0"), 1, 30_000,
+          );
           await live.waitForText("GENERATION_A_FIRST", 30_000);
           expect(first).toBeDefined();
           expect(toolNames(first).filter((name) => name === "Agent")).toHaveLength(1);
@@ -404,13 +460,11 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           const inventoryHintCount = live.capturedText().split(inventoryHint).length - 1;
           live.sendInput("");
           await live.waitForText(inventoryHint, 30_000, inventoryHintCount + 1);
-          const editorPath = lifecycle!.project;
-          const editorRenderCount = live.capturedText().split(editorPath).length - 1;
-          live.sendInput("\u0003");
-          await live.waitForText(editorPath, 30_000, editorRenderCount + 1);
-
+          const requestsBeforeEscape = live.requests.length;
+          live.sendInput("\u001b[27u");
           live.sendInput("/reload-plugins");
           await live.waitForText("Plugin reload preflight was rejected", 30_000);
+          expect(live.requests).toHaveLength(requestsBeforeEscape);
           const repaired = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { enabledPlugins: Record<string, boolean> };
           delete repaired.enabledPlugins["missing@full-surface-local"];
           fs.writeFileSync(settingsPath, JSON.stringify(repaired));
@@ -517,6 +571,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           script: [{ text: "GENERATION_B_RELAUNCHED" }],
         });
         try {
+          await relaunched.waitForText("[Extensions]", 30_000);
           relaunched.sendInput(command);
           await relaunched.waitForRequest((request) => allText(request).includes("FS-LIFECYCLE-GENERATION-2.0.0"), 1, 30_000);
           await relaunched.waitForText("GENERATION_B_RELAUNCHED", 30_000);
@@ -618,7 +673,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const live = await startPi({
         persistSession: true,
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
-        piSettings: CHECKPOINT_PI_SETTINGS,
+        piSettings: {
+          ...CHECKPOINT_PI_SETTINGS,
+          compaction: { ...CHECKPOINT_PI_SETTINGS.compaction, keepRecentTokens: 32 },
+        },
         setup(fixtureDir) {
           writeCheckpointConfig(fixtureDir);
           fs.writeFileSync(
@@ -632,32 +690,52 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             toolCalls: [
               { name: "write", args: { path: "batch-a.txt", content: "result-a" } },
               { name: "write", args: { path: "batch-b.txt", content: "result-b" } },
-              { name: "read", args: { path: ".env" } },
-              { name: "write", args: { path: ".env", content: "must not land" } },
             ],
             usage: CHECKPOINT_USAGE,
           },
-          { text: summaryCanary, gate: summaryGate },
+          { when: (request) => request.requestKind === "compaction", text: summaryCanary, gate: summaryGate },
+          {
+            toolCalls: [
+              { name: "write", args: { path: "after-compact.txt", content: "allowed" } },
+              { name: "read", args: { path: ".env" } },
+              { name: "write", args: { path: ".env", content: "must not land" } },
+            ],
+          },
           { text: "RESUMED_FINAL_T05" },
         ],
         prompt: `complete both writes; internal sentinels ${secretSentinel} ${pathSentinel}`,
       });
       try {
-        const summaryRequest = await summaryGate.entered;
+        const summaryRequest = await summaryGate.entered.catch(async (error: unknown) => {
+          const result = await live.completion;
+          throw new Error(
+            `Clean high-usage batch did not reach compaction; requests=${result.requests.map((request) => request.requestKind).join(",")} stderr=${result.stderr} stdout=${result.stdout}`,
+            { cause: error },
+          );
+        });
         expect(summaryRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
         const summaryInput = allText(summaryRequest);
-        expect(summaryInput).toContain("Successfully wrote");
-        expect(summaryInput).toContain("PiCC: blocked by permission deny rule Read(.env)");
-        expect(summaryInput).toContain("PiCC: blocked by permission deny rule Write(.env)");
+        expect(summaryInput).not.toContain("Successfully wrote");
+        expect(summaryInput).not.toContain("PiCC: blocked by permission deny rule");
         expect(summaryInput).not.toContain("TOP-SECRET-VALUE");
         expect(live.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
         summaryGate.release();
-        await live.waitForRequest((request) => request.requestKind === "ordinary", 2);
+        await live.waitForRequest((request) => request.requestKind === "ordinary", 3);
         const result = await live.completion;
+        const deniedFeedback = toolResultText(result.requests[3]!);
+        const successfulWritePosition = deniedFeedback.indexOf("Successfully wrote 7 bytes to after-compact.txt");
+        const readDenyPosition = deniedFeedback.indexOf("PiCC: blocked by permission deny rule Read(.env)");
+        const writeDenyPosition = deniedFeedback.indexOf("PiCC: blocked by permission deny rule Write(.env)");
+        expect(successfulWritePosition).toBeGreaterThanOrEqual(0);
+        expect(readDenyPosition).toBeGreaterThanOrEqual(0);
+        expect(writeDenyPosition).toBeGreaterThanOrEqual(0);
+        expect(successfulWritePosition).toBeLessThan(readDenyPosition);
+        expect(readDenyPosition).toBeLessThan(writeDenyPosition);
 
         expect(result.code).toBe(0);
         expect(fs.readFileSync(path.join(result.fixture, "batch-a.txt"), "utf8")).toBe("result-a");
         expect(fs.readFileSync(path.join(result.fixture, "batch-b.txt"), "utf8")).toBe("result-b");
+        expect(fs.readFileSync(path.join(result.fixture, "after-compact.txt"), "utf8")).toBe("allowed");
         expect(fs.readFileSync(path.join(result.fixture, ".env"), "utf8")).toBe("SECRET=TOP-SECRET-VALUE\n");
         for (const [index, request] of result.requests.entries()) {
           expect(allText(request), `request ${index} must not leak .env content`).not.toContain(
@@ -667,6 +745,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(result.requests.map((request) => `${request.sessionKind}/${request.requestKind}`)).toEqual([
           "main/ordinary",
           "main/compaction",
+          "main/ordinary",
           "main/ordinary",
         ]);
         expect(
@@ -761,7 +840,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         prompt: "unused mode-args prompt",
       });
 
-      expect(result.code).toBe(0);
+      expect(result.code, `${result.stderr}\n${result.stdout}`).toBe(0);
       expect(result.stderr).toBe("");
       expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
       expect(toolNames(result.requests[0]!).filter((name) => name === "write")).toHaveLength(1);
@@ -770,6 +849,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
       expectNoToolRowPresentation(records, "decoded JSON output");
       expectCanonicalWriteResult(records, "Successfully wrote 8 bytes to json-cycle.txt");
+      expectDeltaOnlyAssistantStream(records, "JSON_RESUMED_FINAL_T05");
       const resumedLifecycle = records.findIndex((record) =>
         record.type === "entry_appended" && record.entry?.customType === "picc-checkpoint-lifecycle" &&
         record.entry?.data?.category === "checkpoint-resumed");
@@ -805,6 +885,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const summaryGate = createResponseGate();
       const consumedSentinel = "RPC_CONSUMED_BEFORE_ARM_T02";
       const pendingSentinel = "RPC_PENDING_DURING_COMPACTION_T02";
+      const continuationPrompt = "RPC_EXPLICIT_POST_COMPACTION_CONTINUATION_T02";
       const initialPrompt = "run RPC checkpoint replay witness";
       const userTurn = (text: string) => [{ type: "text", text }];
       const userTurns = (request: { messages: Array<Record<string, unknown>> }) => request.messages
@@ -863,7 +944,24 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         ]);
         sentinelGate.release();
 
-        const summaryRequest = await summaryGate.entered;
+        const exhausted = await live.waitForOutput((record) => {
+          if (record.type !== "entry_appended" || record.entry === null || typeof record.entry !== "object") {
+            return false;
+          }
+          const entry = record.entry as Record<string, unknown>;
+          if (entry.data === null || typeof entry.data !== "object") return false;
+          return entry.customType === "picc-checkpoint-lifecycle" &&
+            (entry.data as Record<string, unknown>).category === "checkpoint-exhausted";
+        }, 30_000);
+        expect(exhausted.entry).toMatchObject({
+          customType: "picc-checkpoint-lifecycle",
+          data: { category: "checkpoint-exhausted", action: "manual-recovery", failureCategory: "operational" },
+        });
+        await live.waitForOutput((record) => record.type === "agent_settled", 30_000);
+        live.sendInput(JSON.stringify({ id: "rpc-compact-t02", type: "compact" }));
+        const summaryRequest = await live.waitForRequest(
+          (request) => request.requestKind === "compaction", 1, 30_000,
+        );
         expect(summaryRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
         expect(live.requests.map((request) => request.requestKind)).toEqual([
           "ordinary", "ordinary", "compaction",
@@ -880,17 +978,38 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         }));
         const pendingAck = await live.waitForOutput((record) =>
           record.type === "response" && record.id === "rpc-pending-t02", 30_000);
-        expect(pendingAck).toMatchObject({ command: "prompt", success: true });
+        expect(pendingAck).toMatchObject({ command: "prompt", success: false });
         expect(live.requests).toHaveLength(3);
         summaryGate.release();
+        const compactAck = await live.waitForOutput((record) =>
+          record.type === "response" && record.id === "rpc-compact-t02", 30_000);
+        expect(compactAck).toMatchObject({ command: "compact", success: true });
+        live.sendInput(JSON.stringify({
+          id: "rpc-continuation-t02",
+          type: "prompt",
+          message: continuationPrompt,
+        }));
+        const continuationAck = await live.waitForOutput((record) =>
+          record.type === "response" && record.id === "rpc-continuation-t02", 30_000);
+        expect(continuationAck).toMatchObject({ command: "prompt", success: true });
 
         await live.waitForRequest((request) => request.requestKind === "ordinary", 3, 30_000);
         await live.waitForOutput((record) => record.type === "message_end" &&
           JSON.stringify(record).includes("RPC_HIDDEN_CONTINUATION_T02"), 30_000);
+        await live.waitForOutput((record) => record.type === "agent_settled", 30_000, 2);
+        expect(live.requests).toHaveLength(4);
+        live.sendInput(JSON.stringify({
+          id: "rpc-pending-retry-t02",
+          type: "prompt",
+          message: pendingSentinel,
+        }));
+        const retryAck = await live.waitForOutput((record) =>
+          record.type === "response" && record.id === "rpc-pending-retry-t02", 30_000);
+        expect(retryAck).toMatchObject({ command: "prompt", success: true });
         await live.waitForRequest((request) => request.requestKind === "ordinary", 4, 30_000);
         await live.waitForOutput((record) => record.type === "message_end" &&
           JSON.stringify(record).includes("RPC_PENDING_FINAL_T02"), 30_000);
-        await live.waitForOutput((record) => record.type === "agent_settled", 30_000, 2);
+        await live.waitForOutput((record) => record.type === "agent_settled", 30_000, 3);
         live.closeInput();
         const result = await live.completion;
         if (process.platform === "win32" && result.code !== 0) {
@@ -914,6 +1033,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(exactOccurrences(orderedUserTurns[1]!, consumedSentinel)).toHaveLength(1);
         expect(exactOccurrences(orderedUserTurns[2]!, consumedSentinel)).toHaveLength(0);
         expect(exactOccurrences(orderedUserTurns[3]!, consumedSentinel)).toHaveLength(0);
+        expect(exactOccurrences(orderedUserTurns[2]!, continuationPrompt)).toHaveLength(1);
         expect(exactOccurrences(orderedUserTurns[0]!, pendingSentinel)).toHaveLength(0);
         expect(exactOccurrences(orderedUserTurns[1]!, pendingSentinel)).toHaveLength(0);
         expect(exactOccurrences(orderedUserTurns[2]!, pendingSentinel)).toHaveLength(0);
@@ -924,14 +1044,27 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
         expectNoToolRowPresentation(records, "decoded RPC output");
         expectCanonicalWriteResult(records, "Successfully wrote 8 bytes to rpc-cycle.txt");
+        expectDeltaOnlyAssistantStream(records, "RPC_PENDING_FINAL_T02");
         const lifecycle = records.filter((record) => record.type === "entry_appended" &&
           record.entry?.customType === "picc-checkpoint-lifecycle");
         expect(lifecycle.map((record) => record.entry.data.category)).toEqual([
-          "checkpoint-armed", "checkpoint-complete", "checkpoint-resumed",
+          "checkpoint-armed", "checkpoint-exhausted", "checkpoint-recovered",
         ]);
+        expect(lifecycle[1]!.entry.data).toMatchObject({
+          action: "manual-recovery", failureCategory: "operational",
+        });
+        expect(lifecycle[2]!.entry.data).toMatchObject({
+          generation: lifecycle[1]!.entry.data.generation,
+          action: "manual-recovery",
+        });
         expect(lifecycle.every((record) => record.id === undefined)).toBe(true);
         expect(records.filter((record) => record.type === "response" &&
-          ["rpc-initial-t02", "rpc-sentinel-t02", "rpc-pending-t02"].includes(record.id))).toHaveLength(3);
+          [
+            "rpc-initial-t02", "rpc-sentinel-t02", "rpc-compact-t02", "rpc-pending-t02",
+            "rpc-continuation-t02", "rpc-pending-retry-t02",
+          ].includes(record.id))).toHaveLength(6);
+        expect(records.filter((record) => record.type === "response" &&
+          record.id === "rpc-continuation-t02")).toHaveLength(1);
         const hiddenTerminal = records.filter((record) => record.type === "message_end" &&
           JSON.stringify(record).includes("RPC_HIDDEN_CONTINUATION_T02"));
         const pendingTerminal = records.filter((record) => record.type === "message_end" &&
@@ -944,13 +1077,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         const settlements = records
           .map((record, index) => ({ record, index }))
           .filter(({ record }) => record.type === "agent_settled");
-        const physicalSettlements = settlements.slice(0, -1);
-        const logicalSettlements = settlements.slice(-1);
-        expect(physicalSettlements).toHaveLength(1);
-        expect(physicalSettlements[0]!.index).toBeGreaterThan(pendingTerminalIndex);
-        expect(logicalSettlements.filter(({ index }) => index < pendingTerminalIndex)).toHaveLength(0);
-        expect(logicalSettlements.filter(({ index }) => index > pendingTerminalIndex)).toHaveLength(1);
-        expect(records.at(-1)).toBe(logicalSettlements[0]!.record);
+        expect(settlements).toHaveLength(3);
+        expect(settlements[0]!.index).toBeLessThan(hiddenTerminalIndex);
+        expect(settlements[1]!.index).toBeGreaterThan(hiddenTerminalIndex);
+        expect(settlements[1]!.index).toBeLessThan(pendingTerminalIndex);
+        expect(settlements[2]!.index).toBeGreaterThan(pendingTerminalIndex);
+        expect(records.at(-1)).toBe(settlements[2]!.record);
       } finally {
         initialGate.release();
         sentinelGate.release();
@@ -1086,6 +1218,11 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         await waitForOutput("initial tool result", (record) => record.type === "message_end" &&
           record.message !== null && typeof record.message === "object" &&
           (record.message as { role?: unknown }).role === "toolResult");
+        await waitForOutput("first native threshold compaction_start", (record) =>
+          record.type === "compaction_start" && record.reason === "threshold", 1);
+        await waitForOutput("first aborted native compaction_end", (record) =>
+          record.type === "compaction_end" && record.reason === "threshold" && record.aborted === true, 1);
+        live.sendInput(JSON.stringify({ id: "rpc-repeat-compact-one-t02", type: "compact" }));
         const firstSummaryRequest = await live.waitForRequest(
           (request) => request.requestKind === "compaction", 1, 30_000,
         );
@@ -1095,6 +1232,17 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(allText(firstSummaryRequest)).not.toContain(initialRetainedCanary);
         expect(allText(firstSummaryRequest)).not.toContain(postSummaryDiscardBegin);
         firstSummaryGate.release();
+        const firstCompactAck = await waitForOutput("first manual compact response", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-compact-one-t02");
+        expect(firstCompactAck).toMatchObject({ command: "compact", success: true });
+        live.sendInput(JSON.stringify({
+          id: "rpc-repeat-continuation-t02",
+          type: "prompt",
+          message: hiddenContinuation,
+        }));
+        const continuationAck = await waitForOutput("explicit continuation acknowledgement", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-continuation-t02");
+        expect(continuationAck).toMatchObject({ command: "prompt", success: true });
 
         const hiddenRequest = await live.waitForRequest(
           (request) => request.requestKind === "ordinary" &&
@@ -1124,10 +1272,8 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
 
         await waitForOutput("resumed high-usage agent_end", (record) => record.type === "agent_end" &&
           JSON.stringify(record).includes(hiddenCanary));
-        await waitForOutput("native threshold compaction_start", (record) => record.type === "compaction_start" &&
-          record.reason === "threshold");
-        await waitForOutput("aborted native compaction_end", (record) => record.type === "compaction_end" &&
-          record.reason === "threshold" && record.aborted === true);
+        await waitForOutput("second native threshold compaction_start", (record) => record.type === "compaction_start" &&
+          record.reason === "threshold", 2);
 
         const fallbackSummaryRequest = await live.waitForRequest(
           (request) => request.requestKind === "compaction" &&
@@ -1163,8 +1309,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           firstSummaryRequest, fallbackSummaryRequest, fallbackPrefixRequest,
         ]);
         fallbackPrefixGate.release();
-        await waitForOutput("fallback manual compaction_end", (record) => record.type === "compaction_end" &&
-          record.reason === "manual" && JSON.stringify(record).includes(secondPrefixCanary));
+        await waitForOutput("successful second native threshold compaction_end", (record) =>
+          record.type === "compaction_end" && record.reason === "threshold" && record.aborted === false &&
+          JSON.stringify(record).includes(secondSummaryCanary), 1);
         await waitForOutput("resumed-run public settlement", (record) => record.type === "agent_settled", 2);
 
         live.sendInput(JSON.stringify({
@@ -1214,9 +1361,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           requestUserTurns(request.messages).includes(usefulPrompt))).toEqual([
           finalRequest,
         ]);
-        expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/checkpoint-(?:exhausted|cancelled)/u);
-        expect(`${result.stdout}\n${result.stderr}`).not.toContain("restart the process");
-
         const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
         const indexed = (predicate: (record: any) => boolean) => records
           .map((record, index) => ({ record, index }))
@@ -1228,24 +1372,29 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         };
         const resumedAgentEnd = singleIndex("resumed high-usage agent_end", (record) =>
           record.type === "agent_end" && JSON.stringify(record).includes(hiddenCanary));
-        const nativeStart = singleIndex("native threshold start", (record) =>
+        const nativeStarts = indexed((record) =>
           record.type === "compaction_start" && record.reason === "threshold");
-        const nativeEnd = singleIndex("aborted native threshold end", (record) =>
+        const abortedNativeEnds = indexed((record) =>
           record.type === "compaction_end" && record.reason === "threshold" && record.aborted === true);
+        const completedNativeEnds = indexed((record) =>
+          record.type === "compaction_end" && record.reason === "threshold" && record.aborted === false);
         const manualStarts = indexed((record) => record.type === "compaction_start" && record.reason === "manual");
         const manualEnds = indexed((record) => record.type === "compaction_end" &&
           record.reason === "manual" && record.aborted === false);
-        expect(manualStarts).toHaveLength(2);
-        expect(manualEnds).toHaveLength(2);
-        const fallbackStart = manualStarts[1]!.index;
-        const fallbackEnd = manualEnds[1]!.index;
+        expect(nativeStarts).toHaveLength(2);
+        expect(abortedNativeEnds).toHaveLength(1);
+        expect(completedNativeEnds).toHaveLength(1);
+        expect(manualStarts).toHaveLength(1);
+        expect(manualEnds).toHaveLength(1);
+        const fallbackStart = nativeStarts[1]!.index;
+        const fallbackEnd = completedNativeEnds[0]!.index;
+        expect(nativeStarts[0]!.index).toBeLessThan(abortedNativeEnds[0]!.index);
+        expect(abortedNativeEnds[0]!.index).toBeLessThan(manualStarts[0]!.index);
         expect(manualStarts[0]!.index).toBeLessThan(manualEnds[0]!.index);
         expect(manualEnds[0]!.index).toBeLessThan(resumedAgentEnd);
-        expect(resumedAgentEnd).toBeLessThan(nativeStart);
-        expect(nativeStart).toBeLessThan(nativeEnd);
-        expect(nativeEnd).toBeLessThan(fallbackStart);
+        expect(resumedAgentEnd).toBeLessThan(fallbackStart);
         expect(fallbackStart).toBeLessThan(fallbackEnd);
-        expect(records[nativeEnd]).not.toHaveProperty("result");
+        expect(records[abortedNativeEnds[0]!.index]).not.toHaveProperty("result");
         expect(JSON.stringify(records[fallbackEnd])).toContain(secondSummaryCanary);
         expect(indexed((record) => record.type === "compaction_start")).toHaveLength(3);
         expect(indexed((record) => record.type === "compaction_end")).toHaveLength(3);
@@ -1257,29 +1406,24 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           record.message.content?.some((block: any) => block.type === "text" && block.text === finalCanary));
         const settlements = indexed((record) => record.type === "agent_settled");
         expect(settlements).toHaveLength(3);
-        const parentSettlements = settlements.filter(({ index }) =>
-          index > resumedAgentEnd && index < fallbackEnd);
-        const resumedSettlements = settlements.filter(({ index }) =>
-          index > fallbackEnd && index < usefulAckIndex);
-        const finalSettlements = settlements.filter(({ index }) => index > finalCanaryIndex);
-        expect(parentSettlements).toHaveLength(1);
-        expect(parentSettlements[0]!.index).toBeGreaterThan(fallbackStart);
-        expect(resumedSettlements).toHaveLength(1);
-        expect(finalSettlements).toHaveLength(1);
-        expect(parentSettlements[0]!.index).toBeLessThan(resumedSettlements[0]!.index);
-        expect(resumedSettlements[0]!.index).toBeLessThan(usefulAckIndex);
+        expect(abortedNativeEnds[0]!.index).toBeLessThan(settlements[0]!.index);
+        expect(settlements[0]!.index).toBeLessThan(manualStarts[0]!.index);
+        expect(fallbackEnd).toBeLessThan(settlements[1]!.index);
+        expect(settlements[1]!.index).toBeLessThan(usefulAckIndex);
         expect(usefulAckIndex).toBeLessThan(finalCanaryIndex);
-        expect(finalCanaryIndex).toBeLessThan(finalSettlements[0]!.index);
+        expect(finalCanaryIndex).toBeLessThan(settlements[2]!.index);
 
         const lifecycle = records.filter((record) => record.type === "entry_appended" &&
           record.entry?.customType === "picc-checkpoint-lifecycle");
         expect(lifecycle.map((record) => [record.entry.data.generation, record.entry.data.category])).toEqual([
           [1, "checkpoint-armed"],
-          [1, "checkpoint-complete"],
-          [1, "checkpoint-resumed"],
-          [2, "checkpoint-armed"],
-          [2, "checkpoint-complete"],
+          [1, "checkpoint-exhausted"],
+          [1, "checkpoint-recovered"],
         ]);
+        expect(lifecycle[2]!.entry.data).toMatchObject({
+          generation: lifecycle[1]!.entry.data.generation,
+          action: "manual-recovery",
+        });
 
         const mainFiles = findSessionFiles(result.agentDir).filter((file) => !file.includes(".subagents"));
         expect(mainFiles).toHaveLength(1);
@@ -1300,8 +1444,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         const exactTurns = (role: string, text: string) => messageEntries.filter((entry) =>
           entry.message.role === role && exactText(entry.message) === text);
         const initialTurns = exactTurns("user", initialPrompt);
-        const continuationEntries = entries.filter((entry) => entry.type === "custom_message" &&
-          entry.customType === "picc-checkpoint-continuation" && entry.content === hiddenContinuation);
+        const continuationEntries = exactTurns("user", hiddenContinuation);
         const collisionTurns = exactTurns("user", collisionInput);
         const interimTurns = exactTurns("assistant", "RPC_REPEAT_INTERIM_T02");
         const hiddenTurns = exactTurns("assistant", hiddenResponse);
@@ -1363,7 +1506,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const result = await runPi({
         persistSession: true,
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
-        piSettings: CHECKPOINT_PI_SETTINGS,
+        piSettings: {
+          ...CHECKPOINT_PI_SETTINGS,
+          compaction: { ...CHECKPOINT_PI_SETTINGS.compaction, keepRecentTokens: 20 },
+        },
         setup(fixtureDir) {
           const claudeDir = path.join(fixtureDir, ".claude");
           writeCheckpointConfig(fixtureDir);
@@ -1378,7 +1524,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         script: [
           { toolCalls: [{ name: "write", args: { path: "stop-transfer-a.txt", content: "complete-a" } }] },
           { toolCalls: [{ name: "write", args: { path: "stop-transfer-b.txt", content: "complete-b" } }], usage: CHECKPOINT_USAGE },
-          { text: "STOP_TRANSFER_SUMMARY_T05" },
+          { when: (request) => request.requestKind === "compaction", text: "STOP_TRANSFER_SUMMARY_T05" },
           { text: "INTERIM_MUST_NOT_BE_OUTER_FINAL" },
           { text: "STOP_TRANSFER_FINAL_T05" },
         ],
@@ -1386,12 +1532,25 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         modeArgs: ["--mode", "json", "-p", "run stop transfer"],
       });
 
-      expect(result.code).toBe(0);
+      expect(result.code, `${result.stderr}\n${result.stdout}`).toBe(0);
       expect(result.requests.map((request) => request.requestKind), `${result.stderr}\n${result.stdout}`).toEqual(["ordinary", "ordinary", "compaction", "ordinary", "ordinary"]);
+      expect(result.requests.filter((request) => request.requestKind === "compaction")).toHaveLength(1);
       expect(fs.readFileSync(path.join(result.fixture, "hook-trace.txt"), "utf8").trim().split(/\r?\n/u)).toEqual([
         "PreCompact(auto)", "SessionStart(compact)", "PostCompact", "Stop",
       ]);
       const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
+      const lifecycle = records.filter((record) => record.type === "entry_appended" &&
+        record.entry?.customType === "picc-checkpoint-lifecycle");
+      expect(lifecycle.map((record) => record.entry.data.category)).toEqual([
+        "checkpoint-armed", "checkpoint-complete", "checkpoint-resumed",
+      ]);
+      expect(JSON.stringify(records)).not.toContain("checkpoint-exhausted");
+      const mainFiles = findSessionFiles(result.agentDir).filter((file) => !file.includes(".subagents"));
+      expect(mainFiles).toHaveLength(1);
+      const compactions = SessionManager.open(mainFiles[0]!).getEntries()
+        .filter((entry) => entry.type === "compaction");
+      expect(compactions).toHaveLength(1);
+      expect((compactions[0] as { summary: string }).summary).toContain("STOP_TRANSFER_SUMMARY_T05");
       const final = records.filter((record) => record.type === "message_end" &&
         JSON.stringify(record.message).includes("STOP_TRANSFER_FINAL_T05"));
       expect(final).toHaveLength(1);
@@ -1422,6 +1581,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       agent: "selected-main",
       prompt: "ordinary selected request",
       script: [{ text: "selected first complete" }],
+      piSettings: { defaultTools: ["write", "bash"] },
     });
     expect(created.code, created.stderr).toBe(0);
     expect(created.requests).toHaveLength(1);
@@ -1429,6 +1589,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     expect(systemText(created.requests[0]!)).not.toContain("## Working with the user");
     expect(userText(created.requests[0]!)).toMatch(/FS-SELECTED-MAIN-INITIAL[\s\S]*ordinary selected request/u);
     expect(toolNames(created.requests[0]!)).toContain("read");
+    expect(toolNames(created.requests[0]!)).toContain("bash");
     expect(toolNames(created.requests[0]!)).not.toContain("write");
     const [sessionFile] = findSessionFiles(created.agentDir);
     expect(sessionFile).toBeTruthy();
@@ -1486,6 +1647,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         fixture: "full-surface",
         script: [{ text: "done" }],
         prompt: "/deploy staging 7.7",
+        piSettings: { defaultTools: [] },
+        setup(fixtureDir) {
+          fs.writeFileSync(path.join(fixtureDir, "AGENTS.md"), "NATIVE_AGENTS_CANARY_MUST_BE_ABSENT");
+          fs.writeFileSync(path.join(fixtureDir, "AGENTS.override.md"), "NATIVE_AGENTS_OVERRIDE_CANARY_MUST_BE_ABSENT");
+          fs.writeFileSync(path.join(fixtureDir, "package.json"), JSON.stringify({ pi: { resources: { extensions: [null, 7], skills: "malformed" } } }));
+        },
       });
 
       expect(result.code).toBe(0);
@@ -1496,7 +1663,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(names, `tool ${expected} advertised`).toContain(expected);
       }
       const system = systemText(first);
-      expect(system).toContain("FS-ROOT-CLAUDE-MD");
+      expect(system.match(/FS-ROOT-CLAUDE-MD/gu)).toHaveLength(1);
+      expect(system).not.toContain("NATIVE_AGENTS_CANARY_MUST_BE_ABSENT");
+      expect(system).not.toContain("NATIVE_AGENTS_OVERRIDE_CANARY_MUST_BE_ABSENT");
       expect(system).toContain("FS-IMPORT-HOP-1");
       expect(system).toContain("FS-IMPORT-HOP-2");
       expect(system).toContain("FS-CLAUDE-LOCAL-MD");

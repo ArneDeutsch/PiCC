@@ -11,29 +11,56 @@ import {
 } from "../src/util/env.js";
 
 describe("sanitizedSubprocessEnv", () => {
-  it("strips launcher-only inheritance before overlays and preserves explicit settings", () => {
+  it("strips launcher/host-only inheritance before overlays and preserves explicit settings", () => {
     const inherited = {
       PATH: "/bin",
       PICC_LAUNCHER_PID: "10",
       PICC_INSTALL_KIND: "source",
       PICC_VERSION: "1.2.3",
       PI_SKIP_VERSION_CHECK: "1",
+      AI_AGENT: "pi",
       SETTING: "inherited",
     };
     const out = sanitizedSubprocessEnv(
       inherited,
-      { SETTING: "explicit", PI_SKIP_VERSION_CHECK: "deliberate-setting" },
+      { SETTING: "explicit", PI_SKIP_VERSION_CHECK: "deliberate-setting", AI_AGENT: "project-agent" },
       { CLAUDE_PROJECT_DIR: "/project" },
     );
     expect(out).toMatchObject({
       PATH: "/bin",
       SETTING: "explicit",
       PI_SKIP_VERSION_CHECK: "deliberate-setting",
+      AI_AGENT: "project-agent",
       CLAUDE_PROJECT_DIR: "/project",
     });
     expect(out.PICC_LAUNCHER_PID).toBeUndefined();
     expect(out.PICC_INSTALL_KIND).toBeUndefined();
     expect(out.PICC_VERSION).toBeUndefined();
+  });
+
+  it("applies Windows removal and overlay precedence across mixed-case aliases", () => {
+    const out = sanitizedSubprocessEnv(
+      { Ai_AgEnT: "pi", PATH: "inherited", Path: "duplicate" },
+      { ai_agent: "project-agent", path: "setting" },
+      { PaTh: "required" },
+      "win32",
+    );
+    expect(out).toEqual({ ai_agent: "project-agent", PaTh: "required" });
+  });
+
+  it("retains POSIX case-sensitive aliases while removing only the exact host key", () => {
+    const out = sanitizedSubprocessEnv(
+      { AI_AGENT: "pi", ai_agent: "ordinary-lowercase", PATH: "upper" },
+      { Ai_Agent: "project-agent", path: "lower" },
+      {},
+      "linux",
+    );
+    expect(out).toEqual({
+      ai_agent: "ordinary-lowercase",
+      Ai_Agent: "project-agent",
+      PATH: "upper",
+      path: "lower",
+    });
   });
 
   it("lets surface-required values win after explicit settings", () => {
@@ -44,13 +71,14 @@ describe("sanitizedSubprocessEnv", () => {
   it("runs startup/worktree executors with sanitized inheritance and explicit settings", async () => {
     const result = await sanitizedExecFile(process.execPath, [
       "-e",
-      "process.stdout.write(JSON.stringify({pid:process.env.PICC_LAUNCHER_PID,skip:process.env.PI_SKIP_VERSION_CHECK,setting:process.env.EXPLICIT_SETTING}))",
+      "process.stdout.write(JSON.stringify({pid:process.env.PICC_LAUNCHER_PID,skip:process.env.PI_SKIP_VERSION_CHECK,agent:process.env.AI_AGENT,setting:process.env.EXPLICIT_SETTING}))",
     ], {
       cwd: process.cwd(),
       inherited: {
         ...process.env,
         PICC_LAUNCHER_PID: "99",
         PI_SKIP_VERSION_CHECK: "1",
+        AI_AGENT: "pi",
       },
       explicit: { EXPLICIT_SETTING: "kept" },
     });

@@ -1288,6 +1288,7 @@ describe("McpRuntime stdio lifecycle", () => {
       PICC_INSTALL_KIND: "source",
       PICC_VERSION: "1.2.3",
       PI_SKIP_VERSION_CHECK: "1",
+      AI_AGENT: "pi",
     };
     // Prove unicodeSafeSubprocessEnv participates: the default only applies
     // when the base does not already set it.
@@ -1314,6 +1315,7 @@ describe("McpRuntime stdio lifecycle", () => {
           PROJECT_SETTING: "from-project-settings",
           MCP_FIXTURE_VAR: "from-settings",
           CLAUDE_CODE_SESSION_ID: "settings-must-lose-to-default",
+          AI_AGENT: "project-agent",
         },
       }),
     );
@@ -1330,6 +1332,7 @@ describe("McpRuntime stdio lifecycle", () => {
         "PICC_INSTALL_KIND",
         "PICC_VERSION",
         "PI_SKIP_VERSION_CHECK",
+        "AI_AGENT",
       ];
       const result = await runtime.callTool("fixture", "report-env", { names });
       const reported = JSON.parse(firstText(result)) as Record<string, string | null>;
@@ -1344,6 +1347,7 @@ describe("McpRuntime stdio lifecycle", () => {
         PICC_INSTALL_KIND: null,
         PICC_VERSION: null,
         PI_SKIP_VERSION_CHECK: null,
+        AI_AGENT: "project-agent",
       });
     } finally {
       await runtime.shutdown();

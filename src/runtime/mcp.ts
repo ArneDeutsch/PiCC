@@ -184,7 +184,7 @@ export interface McpRuntimeDeps {
   sessionId: string;
   /**
    * Ambient environment for the servers and timeout settings. Defaults to
-   * `process.env`; launcher-only values are removed before any overlay.
+   * `process.env`; launcher/host-only values are removed before any overlay.
    */
   env?: Record<string, string | undefined>;
   /** Project `settings.env`, applied after sanitized ambient inheritance. */

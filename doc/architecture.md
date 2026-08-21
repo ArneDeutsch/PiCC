@@ -461,13 +461,15 @@ where to start reading, not the extent of its cluster.
   tool-requesting assistant usage, queues threshold pressure while the requested tools finish, handles
   complete batches at `turn_end`, and samples again at final provider admission. Newly known pressure
   blocks that ordinary request before provider transport. `agent_settled` is the only boundary that
-  may start one physical Pi-owned compaction transaction if the checkpoint is still required, and only
-  after no provider response or tool batch remains unresolved; the controller then owns queued-input
+  may start a PiCC-owned physical compaction transaction if the checkpoint is still required, and only
+  after no provider response or tool batch remains unresolved. Exactly one belongs to each PiCC-owned
+  generation; native automatic and client-manual physical origins remain separate. The controller then
+  owns queued-input
   reconciliation, resume, cancellation, and exhaustion. Confirmed pre-commit operational or hook
   exhaustion remains recoverable in-session. After a committed summary, the only safe cancellation
   exception is an exact aborted assistant terminal followed by settlement of that same selected-branch
   message: the main TUI restores text to the editor, while child input becomes one canonical retained
-  report. The main-session reuse exception is TUI-only. Pi 0.83 RPC abort does not reclaim native
+  report. The main-session reuse exception is regular-TUI-only. RPC `abort()` does not reclaim native
   queued input, so any authenticated live-RPC cancellation outcome leaves the shared controller
   exhausted with admission closed, requires status 3 and external PiCC process plus session
   replacement, and never permits same-session resubmission. The cancellation handoff authenticates
@@ -630,7 +632,9 @@ The wiring lives in `src/extension.ts`, which registers tools and Pi event handl
 
 5. **Tool calls → `guard`.** Each call is translated to its Claude name, checked against deny rules,
    run through PreToolUse hooks, and — on file-touching tools — triggers nested-CLAUDE.md and
-   path-scoped rule/skill injection. PostToolUse / PostToolUseFailure hooks fire on the result.
+   path-scoped rule/skill injection. Permission and `PreToolUse` denials stop before execution and do
+   not synthesize `PostToolUseFailure`; PostToolUse or PostToolUseFailure fires only on a result after
+   execution starts.
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`. A supported named
    agent resolves its admitted MCP declaration after SubagentStart and initial worktree admission;
@@ -646,8 +650,11 @@ The wiring lives in `src/extension.ts`, which registers tools and Pi event handl
    successful assistant response that requests tools can queue threshold pressure while the requested
    tools finish. `turn_end` handles the complete batch; immediately before any next ordinary provider
    request, the controller samples again and blocks transport when newly known pressure arms the
-   checkpoint. `agent_settled` is the only boundary that may start one physical compaction transaction
-   if the checkpoint is still required, and only after provider and tool work is resolved. It then
+   checkpoint. `agent_settled` is the only boundary that may start a PiCC-owned physical compaction
+   transaction if the checkpoint is still required, and only after provider and tool work is resolved.
+   The exactly-one guarantee applies to that PiCC generation; colliding native automatic attempts may
+   be cancelled, client manual recovery may commit, and a later idle-controller native threshold
+   transaction may complete. It then
    awaits `ctx.compact()` (or the child SDK equivalent), lets Pi own eligible retries inside that one
    transaction, and resumes the same logical run after restoration and queued-input
    reconciliation. The controller permits its own summary request through the provider gate. Mixed,

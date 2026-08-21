@@ -13,6 +13,7 @@ const { runPi, cleanup } = createE2ELive({ runtime: "compiled" });
 afterEach(cleanup);
 
 const MACHINE_PRESENTATION = /\u001b|[○●✗■╭╮╰╯│─]|notebook write|Ctrl\+O|\bexpansion\b|\bexpand(?:ed|s|ing|able)?\b/iu;
+const PORTABLE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAAAAADhZOFXAAAADElEQVR4nGNgoA4AAABIAAEuuDx+AAAAAElFTkSuQmCC";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -69,15 +70,23 @@ interface NotebookEditRecord {
   readonly details: NotebookEditDetails;
 }
 
-function notebookEditResult(records: readonly Record<string, unknown>[], callId: string): NotebookEditRecord {
+function toolResult(
+  records: readonly Record<string, unknown>[],
+  toolName: string,
+  callId: string,
+): Record<string, unknown> {
   const matches = records.flatMap((record) => {
     if (record.type !== "message_end" || !isRecord(record.message)) return [];
     const message = record.message;
-    return message.role === "toolResult" && message.toolName === "NotebookEdit" &&
+    return message.role === "toolResult" && message.toolName === toolName &&
       message.toolCallId === callId ? [message] : [];
   });
-  expect(matches, `JSON NotebookEdit result for ${callId}`).toHaveLength(1);
-  const message = matches[0]!;
+  expect(matches, `JSON ${toolName} result for ${callId}`).toHaveLength(1);
+  return matches[0]!;
+}
+
+function notebookEditResult(records: readonly Record<string, unknown>[], callId: string): NotebookEditRecord {
+  const message = toolResult(records, "NotebookEdit", callId);
   const details = requireRecord(message.details, `NotebookEdit details for ${callId}`);
   const requiredDetails = [
     "new_source", "cell_id", "cell_type", "language", "edit_mode",
@@ -201,6 +210,14 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
     expectNoMachinePresentation(result.stdout, "raw JSON stdout");
     expectNoMachinePresentation(result.stderr, "JSON stderr");
 
+    const read = toolResult(records, "read", "call_0_0");
+    expect(read.details).toEqual({ truncated: false });
+    const readContent = JSON.stringify(read.content);
+    expect(readContent.match(/<image\/png output elided/gu)).toHaveLength(1);
+    expect(readContent.match(/Current model does not support images/gu)).toHaveLength(1);
+    expect(readContent).not.toContain(PORTABLE_PNG);
+    expect(readContent.match(/\[Image (?:converted|resized)[^\]]*\]/gu) ?? []).toHaveLength(0);
+
     const replace = notebookEditResult(records, "call_1_0");
     const insert = notebookEditResult(records, "call_2_0");
     const remove = notebookEditResult(records, "call_3_0");
@@ -302,7 +319,7 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
         metadata: {},
         data: {
           "text/plain": ["<Figure size 640x480 with 1 Axes>"],
-          "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAAAAADhZOFXAAAADElEQVR4nGNgoA4AAABIAAEuuDx+AAAAAElFTkSuQmCC",
+          "image/png": PORTABLE_PNG,
         },
       }],
     });
